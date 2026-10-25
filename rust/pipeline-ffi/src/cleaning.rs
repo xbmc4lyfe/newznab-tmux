@@ -33310,3 +33310,1782 @@ pub mod w47_irc_stream_cloudflare_proxy {
         }
     }
 }
+
+pub mod w48_proxy_verdict_captcha_breach_reglog {
+    //! Wave 48 batch kernels for ProxyVerdict, TurnstileService, RecaptchaService,
+    //! PasswordBreachService and RegistrationFailureLogService. Every export fills fixed
+    //! `i64` words per item followed by one FNV-1a 64 digest of those words.
+
+    use super::w47_irc_stream_cloudflare_proxy::{Ip, php_ip, php_trim, split_nul};
+    use std::collections::HashMap;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+
+    /// Containers PHP's `json_decode()` accepts at its default depth of 512.
+    pub const MAX_JSON_DEPTH: usize = 511;
+
+    /// Borrows a caller span; an empty span may be null.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+        let (a, b) = (a as usize, b as usize);
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// PHP `unpack('J', hash('fnv1a64', pack('P*', ...$words), true))[1]`.
+    pub fn fnv1a64(words: &[i64]) -> i64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for word in words {
+            for b in word.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        h as i64
+    }
+
+    /// Validates the output window for `count * per_item + 1` words, lets `body` push the item
+    /// words, appends their digest and copies everything to `out`. Returns the bytes written,
+    /// `-needed` when `cap` is short, or -1 for a malformed batch.
+    unsafe fn run(
+        out: *mut u8,
+        cap: usize,
+        count: usize,
+        per_item: usize,
+        inputs: &[(*const u8, usize)],
+        body: impl FnOnce(&mut Vec<i64>) -> bool,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if count > MAX_ITEMS {
+                return -1;
+            }
+            let words = count * per_item + 1;
+            let needed = words * 8;
+            if out.is_null() || cap > isize::MAX as usize {
+                return -1;
+            }
+            if needed > cap {
+                return -(needed as isize);
+            }
+            if inputs
+                .iter()
+                .any(|&(ptr, len)| overlaps(ptr, len, out, needed))
+            {
+                return -1;
+            }
+            let mut buf = Vec::with_capacity(words);
+            if !body(&mut buf) || buf.len() != words - 1 {
+                return -1;
+            }
+            buf.push(fnv1a64(&buf));
+            for (i, word) in buf.iter().enumerate() {
+                // `needed` bytes were checked against `cap` above.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(word.to_le_bytes().as_ptr(), out.add(i * 8), 8);
+                }
+            }
+            needed as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Exactly `count` NUL-separated entries, or None when the column holds another number.
+    pub fn rows(column: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+        if count == 0 {
+            return column.is_empty().then(Vec::new);
+        }
+        let mut rows = Vec::with_capacity(count);
+        for entry in split_nul(column) {
+            if rows.len() == count {
+                return None;
+            }
+            rows.push(entry);
+        }
+        (rows.len() == count).then_some(rows)
+    }
+
+    const CRC_TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+                k += 1;
+            }
+            table[i] = c;
+            i += 1;
+        }
+        table
+    };
+
+    /// PHP `crc32()`.
+    pub fn crc32(bytes: &[u8]) -> i64 {
+        let crc = bytes.iter().fold(!0u32, |c, &b| {
+            CRC_TABLE[((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8)
+        });
+        i64::from(!crc)
+    }
+
+    /// Loopback, RFC 1918, link-local and CGNAT IPv4; IPv6 loopback, ULA and link-local.
+    fn private(ip: Ip) -> bool {
+        match ip {
+            Ip::V4([a, b, ..]) => {
+                a == 10
+                    || a == 127
+                    || (a == 172 && b & 0xf0 == 16)
+                    || (a == 192 && b == 168)
+                    || (a == 169 && b == 254)
+                    || (a == 100 && b & 0xc0 == 64)
+            }
+            Ip::V6(b) => {
+                u128::from_be_bytes(b) == 1
+                    || b[0] & 0xfe == 0xfc
+                    || (b[0] == 0xfe && b[1] & 0xc0 == 0x80)
+            }
+        }
+    }
+
+    fn digits(s: &[u8], max: usize) -> Option<i64> {
+        if s.is_empty() || s.len() > max || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(s.iter().fold(0i64, |n, d| n * 10 + i64::from(d - b'0')))
+    }
+
+    /// `str_contains()`: first-byte scan, then a tail comparison.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        let Some((&first, rest)) = needle.split_first() else {
+            return true;
+        };
+        if needle.len() > haystack.len() {
+            return false;
+        }
+        let last = haystack.len() - needle.len();
+        let mut at = 0;
+        while at <= last {
+            match haystack[at..=last].iter().position(|&b| b == first) {
+                Some(p) => at += p,
+                None => return false,
+            }
+            if &haystack[at + 1..at + needle.len()] == rest {
+                return true;
+            }
+            at += 1;
+        }
+        false
+    }
+
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+
+    /// Whether any byte of `x` is below `n` (n <= 128).
+    fn has_less(x: u64, n: u8) -> bool {
+        x.wrapping_sub(ONES * u64::from(n)) & !x & HIGHS != 0
+    }
+
+    /// Whether any byte of `x` equals `b`.
+    fn has_byte(x: u64, b: u8) -> bool {
+        let y = x ^ (ONES * u64::from(b));
+        y.wrapping_sub(ONES) & !y & HIGHS != 0
+    }
+
+    // ---- ProxyVerdict reason aggregation ------------------------------------------------------
+
+    /// `[a-z0-9_]{1,32}` reason names.
+    fn reason_name(name: &[u8]) -> bool {
+        !name.is_empty()
+            && name.len() <= 32
+            && name
+                .iter()
+                .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    }
+
+    /// `/24` IPv4 or `/48` IPv6 aggregation key, family in bits 48..49.
+    pub fn subnet(ip: &[u8]) -> Option<i64> {
+        Some(match php_ip(ip)? {
+            Ip::V4([a, b, c, _]) => 1 << 48 | i64::from(a) << 16 | i64::from(b) << 8 | i64::from(c),
+            Ip::V6(b) => 2 << 48 | i64::from_be_bytes([0, 0, b[0], b[1], b[2], b[3], b[4], b[5]]),
+        })
+    }
+
+    /// One `name:points,...` spec: (verdict word, blocked, crc32 of the top reason name).
+    pub fn verdict<'a>(
+        spec: &'a [u8],
+        threshold: i64,
+        reasons: &mut Vec<(&'a [u8], i64)>,
+    ) -> (i64, bool, i64) {
+        reasons.clear();
+        let mut invalid = 0i64;
+        for raw in spec.split(|&b| b == b',') {
+            let part = php_trim(raw);
+            if part.is_empty() {
+                continue;
+            }
+            let (name, points) = match part.iter().position(|&b| b == b':') {
+                Some(colon) => (&part[..colon], &part[colon + 1..]),
+                None => (&b""[..], &b""[..]),
+            };
+            let (negative, magnitude) = match points.split_first() {
+                Some((b'-', rest)) => (true, rest),
+                _ => (false, points),
+            };
+            let value = match digits(magnitude, 4) {
+                Some(value) if reason_name(name) => {
+                    if negative {
+                        -value
+                    } else {
+                        value
+                    }
+                }
+                _ => {
+                    invalid += 1;
+                    continue;
+                }
+            };
+            match reasons.iter_mut().find(|(n, _)| *n == name) {
+                Some(entry) => entry.1 = value,
+                None => reasons.push((name, value)),
+            }
+        }
+        let score = reasons.iter().map(|r| r.1).sum::<i64>().clamp(0, 1000);
+        let blocked = score >= threshold;
+        let confidence = if threshold > 0 {
+            (score * 100 / threshold).min(100)
+        } else {
+            100
+        };
+        let mut top: Option<(&[u8], i64)> = None;
+        for &(name, value) in reasons.iter() {
+            if top.is_none_or(|(_, best)| value > best) {
+                top = Some((name, value));
+            }
+        }
+        let (top_crc, top_points) = top.map_or((0, 0), |(name, value)| (crc32(name), value));
+        let word = score
+            | i64::from(blocked) << 10
+            | confidence << 11
+            | (reasons.len() as i64).min(255) << 18
+            | invalid.min(255) << 26
+            | (top_points + 10_000) << 34;
+        (word, blocked, top_crc)
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w48_proxy_verdict_aggregate_batch(
+        ips: *const u8,
+        ips_len: usize,
+        reasons: *const u8,
+        reasons_len: usize,
+        count: usize,
+        threshold: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let inputs = [(ips, ips_len), (reasons, reasons_len)];
+        unsafe {
+            run(out, cap, count, 3, &inputs, |o| {
+                let (Some(ips), Some(specs)) = (span(ips, ips_len), span(reasons, reasons_len))
+                else {
+                    return false;
+                };
+                let (Some(ips), Some(specs)) = (rows(ips, count), rows(specs, count)) else {
+                    return false;
+                };
+                let mut scratch = Vec::new();
+                let mut groups: HashMap<i64, (i64, i64)> = HashMap::with_capacity(count);
+                let mut items = Vec::with_capacity(count);
+                for (ip, spec) in ips.iter().zip(&specs) {
+                    let (word, blocked, top_crc) = verdict(spec, threshold, &mut scratch);
+                    let key = subnet(ip);
+                    if let Some(key) = key {
+                        let group = groups.entry(key).or_default();
+                        group.0 += 1;
+                        group.1 += i64::from(blocked);
+                    }
+                    items.push((word, key, top_crc));
+                }
+                for (word, key, top_crc) in items {
+                    let (peers, blocked) = key.map_or((0, 0), |k| groups[&k]);
+                    o.push(word);
+                    o.push(key.unwrap_or(-1));
+                    o.push(peers.min(65_535) | blocked.min(65_535) << 16 | top_crc << 32);
+                }
+                true
+            })
+        }
+    }
+
+    // ---- Siteverify JSON (Turnstile and reCAPTCHA) --------------------------------------------
+
+    /// Hex digit values; 0xff for anything else.
+    const HEX_VALUE: [u8; 256] = {
+        let mut table = [0xffu8; 256];
+        let mut i = 0u8;
+        while i < 10 {
+            table[(b'0' + i) as usize] = i;
+            i += 1;
+        }
+        let mut i = 0u8;
+        while i < 6 {
+            table[(b'a' + i) as usize] = 10 + i;
+            table[(b'A' + i) as usize] = 10 + i;
+            i += 1;
+        }
+        table
+    };
+
+    struct Json<'a> {
+        s: &'a [u8],
+        i: usize,
+    }
+
+    impl Json<'_> {
+        fn ws(&mut self) {
+            while matches!(self.s.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                self.i += 1;
+                // Pretty-printed indentation: eight spaces at a time.
+                while self.s.get(self.i..self.i + 8) == Some(b"        ") {
+                    self.i += 8;
+                }
+            }
+        }
+
+        fn peek(&self) -> Option<u8> {
+            self.s.get(self.i).copied()
+        }
+
+        fn literal(&mut self, word: &[u8]) -> Option<()> {
+            self.s
+                .get(self.i..)?
+                .starts_with(word)
+                .then(|| self.i += word.len())
+        }
+
+        fn run_digits(&self, mut i: usize) -> usize {
+            while matches!(self.s.get(i), Some(b'0'..=b'9')) {
+                i += 1;
+            }
+            i
+        }
+
+        fn number(&mut self) -> Option<()> {
+            let mut i = self.i + usize::from(self.peek() == Some(b'-'));
+            match self.s.get(i)? {
+                b'0' => i += 1,
+                b'1'..=b'9' => i = self.run_digits(i + 1),
+                _ => return None,
+            }
+            if self.s.get(i) == Some(&b'.') {
+                let end = self.run_digits(i + 1);
+                if end == i + 1 {
+                    return None;
+                }
+                i = end;
+            }
+            if matches!(self.s.get(i), Some(b'e' | b'E')) {
+                i += 1;
+                if matches!(self.s.get(i), Some(b'+' | b'-')) {
+                    i += 1;
+                }
+                let end = self.run_digits(i);
+                if end == i {
+                    return None;
+                }
+                i = end;
+            }
+            self.i = i;
+            Some(())
+        }
+
+        fn hex4(&self, at: usize) -> Option<u32> {
+            let h = self.s.get(at..at + 4)?;
+            let [a, b, c, d] = [h[0], h[1], h[2], h[3]].map(|x| HEX_VALUE[usize::from(x)]);
+            ((a | b | c | d) & 0xf0 == 0)
+                .then(|| u32::from(a) << 12 | u32::from(b) << 8 | u32::from(c) << 4 | u32::from(d))
+        }
+
+        /// Validates the string at `"` like PHP's scanner (UTF-8, control bytes, escapes and
+        /// UTF-16 surrogate pairs), appending the decoded bytes to `out` when given. True when
+        /// the string held an escape.
+        fn string(&mut self, mut out: Option<&mut Vec<u8>>) -> Option<bool> {
+            let s = self.s;
+            let mut i = self.i + 1;
+            let mut seg = i;
+            let mut escaped = false;
+            loop {
+                // Skip eight plain bytes at a time; UTF-8 is validated per segment below.
+                while let Some(chunk) = s.get(i..i + 8) {
+                    let x = u64::from_le_bytes(chunk.try_into().ok()?);
+                    if has_less(x, 0x20) || has_byte(x, b'"') || has_byte(x, b'\\') {
+                        break;
+                    }
+                    i += 8;
+                }
+                let b = *s.get(i)?;
+                if b == b'"' || b == b'\\' {
+                    let part = &s[seg..i];
+                    if !part.is_ascii() && std::str::from_utf8(part).is_err() {
+                        return None;
+                    }
+                    if let Some(o) = out.as_deref_mut() {
+                        o.extend_from_slice(part);
+                    }
+                    if b == b'"' {
+                        self.i = i + 1;
+                        return Some(escaped);
+                    }
+                    escaped = true;
+                    let (code, used) = match *s.get(i + 1)? {
+                        b'"' => (0x22, 2),
+                        b'\\' => (0x5c, 2),
+                        b'/' => (0x2f, 2),
+                        b'b' => (0x08, 2),
+                        b'f' => (0x0c, 2),
+                        b'n' => (0x0a, 2),
+                        b'r' => (0x0d, 2),
+                        b't' => (0x09, 2),
+                        b'u' => {
+                            let hi = self.hex4(i + 2)?;
+                            if (0xD800..0xDC00).contains(&hi) {
+                                if s.get(i + 6..i + 8) != Some(b"\\u") {
+                                    return None;
+                                }
+                                let lo = self.hex4(i + 8)?;
+                                if !(0xDC00..0xE000).contains(&lo) {
+                                    return None;
+                                }
+                                (0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00), 12)
+                            } else if (0xDC00..0xE000).contains(&hi) {
+                                return None;
+                            } else {
+                                (hi, 6)
+                            }
+                        }
+                        _ => return None,
+                    };
+                    if let Some(o) = out.as_deref_mut() {
+                        let mut utf8 = [0u8; 4];
+                        o.extend_from_slice(
+                            char::from_u32(code)?.encode_utf8(&mut utf8).as_bytes(),
+                        );
+                    }
+                    i += used;
+                    seg = i;
+                } else if b < 0x20 {
+                    return None;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        /// Validates one value with `depth` containers already open.
+        fn value(&mut self, depth: usize) -> Option<()> {
+            match self.peek()? {
+                open @ (b'{' | b'[') => {
+                    if depth >= MAX_JSON_DEPTH {
+                        return None;
+                    }
+                    let close = if open == b'{' { b'}' } else { b']' };
+                    self.i += 1;
+                    self.ws();
+                    if self.peek()? == close {
+                        self.i += 1;
+                        return Some(());
+                    }
+                    loop {
+                        if open == b'{' {
+                            if self.peek()? != b'"' {
+                                return None;
+                            }
+                            self.string(None)?;
+                            self.ws();
+                            if self.peek()? != b':' {
+                                return None;
+                            }
+                            self.i += 1;
+                            self.ws();
+                        }
+                        self.value(depth + 1)?;
+                        self.ws();
+                        match self.peek()? {
+                            b',' => {
+                                self.i += 1;
+                                self.ws();
+                            }
+                            b if b == close => {
+                                self.i += 1;
+                                return Some(());
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                b'"' => self.string(None).map(drop),
+                b't' => self.literal(b"true"),
+                b'f' => self.literal(b"false"),
+                b'n' => self.literal(b"null"),
+                _ => self.number(),
+            }
+        }
+
+        /// After a member value: true at `,` (consumed), false at `close` (consumed).
+        fn next_member(&mut self, close: u8) -> Option<bool> {
+            self.ws();
+            let b = self.peek()?;
+            self.i += 1;
+            if b == b',' {
+                self.ws();
+                Some(true)
+            } else {
+                (b == close).then_some(false)
+            }
+        }
+    }
+
+    /// Reads a member key and its `:`; the raw bytes when escape-free, else decoded into `buf`.
+    fn read_key<'b, 's: 'b>(buf: &'b mut Vec<u8>, p: &mut Json<'s>) -> Option<&'b [u8]> {
+        if p.peek()? != b'"' {
+            return None;
+        }
+        let start = p.i;
+        let escaped = p.string(None)?;
+        let end = p.i;
+        p.ws();
+        if p.peek()? != b':' {
+            return None;
+        }
+        p.i += 1;
+        p.ws();
+        if !escaped {
+            return Some(&p.s[start + 1..end - 1]);
+        }
+        buf.clear();
+        Json { s: p.s, i: start }.string(Some(buf))?;
+        Some(buf)
+    }
+
+    /// Turnstile/reCAPTCHA `error-codes`: bit index of each known code, 7 for any other string.
+    pub const ERROR_CODES: [&[u8]; 7] = [
+        b"missing-input-secret",
+        b"invalid-input-secret",
+        b"missing-input-response",
+        b"invalid-input-response",
+        b"bad-request",
+        b"timeout-or-duplicate",
+        b"internal-error",
+    ];
+
+    fn code_bit(code: &[u8]) -> i8 {
+        ERROR_CODES
+            .iter()
+            .position(|known| *known == code)
+            .map_or(7, |i| i as i8)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum Score {
+        Absent,
+        Number(f64),
+        Other,
+    }
+
+    /// The top-level siteverify fields of a `json_decode($body, true)` result; later
+    /// duplicate keys replace earlier ones as in PHP arrays.
+    pub struct Siteverify {
+        pub is_array: bool,
+        pub success: bool,
+        pub score: Score,
+        pub has_host: bool,
+        pub host: Vec<u8>,
+        pub has_action: bool,
+        pub action: Vec<u8>,
+        pub err_mask: i64,
+        pub err_count: i64,
+        key: Vec<u8>,
+        scratch: Vec<u8>,
+        codes: Vec<(Vec<u8>, i8)>,
+    }
+
+    impl Default for Siteverify {
+        fn default() -> Self {
+            Self {
+                is_array: false,
+                success: false,
+                score: Score::Absent,
+                has_host: false,
+                host: Vec::new(),
+                has_action: false,
+                action: Vec::new(),
+                err_mask: 0,
+                err_count: 0,
+                key: Vec::new(),
+                scratch: Vec::new(),
+                codes: Vec::new(),
+            }
+        }
+    }
+
+    impl Siteverify {
+        fn reset(&mut self) {
+            self.is_array = false;
+            self.success = false;
+            self.score = Score::Absent;
+            self.has_host = false;
+            self.has_action = false;
+            self.err_mask = 0;
+            self.err_count = 0;
+        }
+
+        /// Parses `body`; afterwards `is_array` is false for anything `json_decode()` rejects
+        /// or decodes to a scalar.
+        pub fn parse(&mut self, body: &[u8]) {
+            self.reset();
+            let mut p = Json { s: body, i: 0 };
+            p.ws();
+            let container = matches!(p.peek(), Some(b'{' | b'['));
+            let parsed = if p.peek() == Some(b'{') {
+                self.object(&mut p)
+            } else {
+                p.value(0)
+            };
+            p.ws();
+            if parsed.is_some() && p.i == body.len() {
+                self.is_array = container;
+            } else {
+                self.reset();
+            }
+        }
+
+        fn object(&mut self, p: &mut Json) -> Option<()> {
+            p.i += 1;
+            p.ws();
+            if p.peek()? == b'}' {
+                p.i += 1;
+                return Some(());
+            }
+            loop {
+                let field = match read_key(&mut self.key, p)? {
+                    b"success" => 1,
+                    b"score" => 2,
+                    b"hostname" => 3,
+                    b"action" => 4,
+                    b"error-codes" => 5,
+                    _ => 0,
+                };
+                let start = p.i;
+                match field {
+                    1 => {
+                        p.value(1)?;
+                        self.success = &p.s[start..p.i] == b"true";
+                    }
+                    2 => {
+                        let numeric = matches!(p.peek()?, b'-' | b'0'..=b'9');
+                        p.value(1)?;
+                        self.score = if numeric {
+                            Score::Number(std::str::from_utf8(&p.s[start..p.i]).ok()?.parse().ok()?)
+                        } else {
+                            Score::Other
+                        };
+                    }
+                    3 | 4 => {
+                        let is_string = p.peek()? == b'"';
+                        let target = if field == 3 {
+                            &mut self.host
+                        } else {
+                            &mut self.action
+                        };
+                        target.clear();
+                        if is_string {
+                            p.string(Some(target))?;
+                        } else {
+                            p.value(1)?;
+                        }
+                        if field == 3 {
+                            self.has_host = is_string;
+                        } else {
+                            self.has_action = is_string;
+                        }
+                    }
+                    5 => self.error_codes(p)?,
+                    _ => p.value(1)?,
+                }
+                if !p.next_member(b'}')? {
+                    return Some(());
+                }
+            }
+        }
+
+        fn error_codes(&mut self, p: &mut Json) -> Option<()> {
+            self.err_mask = 0;
+            self.err_count = 0;
+            let open = p.peek()?;
+            if open != b'[' && open != b'{' {
+                return p.value(1);
+            }
+            let close = if open == b'[' { b']' } else { b'}' };
+            self.codes.clear();
+            p.i += 1;
+            p.ws();
+            let mut more = if p.peek()? == close {
+                p.i += 1;
+                false
+            } else {
+                true
+            };
+            while more {
+                let key_at = p.i;
+                if open == b'{' {
+                    read_key(&mut self.key, p)?;
+                }
+                let code = if p.peek()? == b'"' {
+                    self.scratch.clear();
+                    p.string(Some(&mut self.scratch))?;
+                    code_bit(&self.scratch)
+                } else {
+                    p.value(2)?;
+                    -1
+                };
+                if open == b'[' {
+                    if code >= 0 {
+                        self.err_mask |= 1 << code;
+                        self.err_count += 1;
+                    }
+                } else {
+                    let key = read_key(&mut self.key, &mut Json { s: p.s, i: key_at })?.to_vec();
+                    match self.codes.iter_mut().find(|(k, _)| *k == key) {
+                        Some(entry) => entry.1 = code,
+                        None => self.codes.push((key, code)),
+                    }
+                }
+                more = p.next_member(close)?;
+            }
+            for &(_, code) in &self.codes {
+                if code >= 0 {
+                    self.err_mask |= 1 << code;
+                    self.err_count += 1;
+                }
+            }
+            Some(())
+        }
+    }
+
+    fn token_byte(b: u8) -> bool {
+        ((b | 0x20).wrapping_sub(b'a') < 26)
+            | (b.wrapping_sub(b'0') < 10)
+            | (b == b'_')
+            | (b == b'.')
+            | (b == b'-')
+    }
+
+    /// Turnstile tokens: 1..2048 bytes of `[A-Za-z0-9_.-]`, 32 branch-free bytes at a time.
+    fn token_ok(token: &[u8]) -> bool {
+        if token.is_empty() || token.len() > 2048 {
+            return false;
+        }
+        let mut chunks = token.chunks_exact(32);
+        for chunk in &mut chunks {
+            if chunk
+                .iter()
+                .fold(0u8, |bad, &b| bad | u8::from(!token_byte(b)))
+                != 0
+            {
+                return false;
+            }
+        }
+        chunks.remainder().iter().all(|&b| token_byte(b))
+    }
+
+    /// TurnstileService::evaluateSiteverifyPhp() for one token and siteverify body.
+    pub fn turnstile(
+        sv: &mut Siteverify,
+        token: &[u8],
+        body: &[u8],
+        host: &[u8],
+        action: &[u8],
+        lower: &mut Vec<u8>,
+    ) -> (i64, i64) {
+        sv.parse(body);
+        let host_match = sv.has_host && !host.is_empty() && sv.host.eq_ignore_ascii_case(host);
+        let action_match = sv.has_action && sv.action == action;
+        let token_ok = token_ok(token);
+        let outcome = if !token_ok {
+            1
+        } else if !sv.is_array {
+            2
+        } else if !sv.success {
+            3
+        } else if !host.is_empty() && !host_match {
+            4
+        } else if !action.is_empty() && !action_match {
+            5
+        } else {
+            0
+        };
+        let word = outcome
+            | sv.err_mask << 4
+            | i64::from(sv.has_host) << 12
+            | i64::from(host_match) << 13
+            | i64::from(sv.has_action) << 14
+            | i64::from(action_match) << 15
+            | (token.len() as i64).min(4095) << 16
+            | sv.err_count.min(255) << 28
+            | i64::from(sv.is_array) << 36
+            | i64::from(sv.success) << 37;
+        let host_crc = if sv.has_host {
+            lower.clear();
+            lower.extend(sv.host.iter().map(u8::to_ascii_lowercase));
+            crc32(lower)
+        } else {
+            -1
+        };
+        (word, host_crc)
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w48_turnstile_siteverify_batch(
+        tokens: *const u8,
+        tokens_len: usize,
+        bodies: *const u8,
+        bodies_len: usize,
+        count: usize,
+        hostname: *const u8,
+        hostname_len: usize,
+        action: *const u8,
+        action_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let inputs = [
+            (tokens, tokens_len),
+            (bodies, bodies_len),
+            (hostname, hostname_len),
+            (action, action_len),
+        ];
+        unsafe {
+            run(out, cap, count, 2, &inputs, |o| {
+                let (Some(tokens), Some(bodies), Some(host), Some(action)) = (
+                    span(tokens, tokens_len),
+                    span(bodies, bodies_len),
+                    span(hostname, hostname_len),
+                    span(action, action_len),
+                ) else {
+                    return false;
+                };
+                let (Some(tokens), Some(bodies)) = (rows(tokens, count), rows(bodies, count))
+                else {
+                    return false;
+                };
+                let mut sv = Siteverify::default();
+                let mut lower = Vec::new();
+                for (token, body) in tokens.iter().zip(&bodies) {
+                    let (word, host_crc) =
+                        turnstile(&mut sv, token, body, host, action, &mut lower);
+                    o.push(word);
+                    o.push(host_crc);
+                }
+                true
+            })
+        }
+    }
+
+    /// RecaptchaService::assessResponsesPhp() for one siteverify body.
+    pub fn recaptcha(
+        sv: &mut Siteverify,
+        body: &[u8],
+        threshold: f64,
+        action: &[u8],
+        host: &[u8],
+    ) -> (i64, i64) {
+        sv.parse(body);
+        let v3 = sv.score != Score::Absent;
+        let (micros, value) = match sv.score {
+            Score::Absent => (-1, 0.0),
+            Score::Number(v) if (0.0..=1.0).contains(&v) => ((v * 1e6).floor() as i64, v),
+            _ => (-2, 0.0),
+        };
+        let host_match = sv.has_host && !host.is_empty() && sv.host.eq_ignore_ascii_case(host);
+        let action_match = sv.has_action && sv.action == action;
+        let outcome = if !sv.is_array {
+            1
+        } else if !sv.success {
+            2
+        } else if v3 && micros < 0 {
+            6
+        } else if v3 && value < threshold {
+            3
+        } else if v3 && !action.is_empty() && !action_match {
+            4
+        } else if !host.is_empty() && !host_match {
+            5
+        } else {
+            0
+        };
+        let word = outcome
+            | sv.err_mask << 4
+            | (1 + i64::from(v3)) << 12
+            | i64::from(host_match) << 14
+            | i64::from(action_match) << 15
+            | sv.err_count.min(255) << 16
+            | i64::from(sv.is_array) << 24
+            | i64::from(sv.success) << 25
+            | i64::from(sv.has_host) << 26
+            | i64::from(sv.has_action) << 27;
+        (word, micros)
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w48_recaptcha_assess_batch(
+        bodies: *const u8,
+        bodies_len: usize,
+        count: usize,
+        threshold: f64,
+        action: *const u8,
+        action_len: usize,
+        hostname: *const u8,
+        hostname_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let inputs = [
+            (bodies, bodies_len),
+            (action, action_len),
+            (hostname, hostname_len),
+        ];
+        unsafe {
+            run(out, cap, count, 2, &inputs, |o| {
+                let (Some(bodies), Some(action), Some(host)) = (
+                    span(bodies, bodies_len),
+                    span(action, action_len),
+                    span(hostname, hostname_len),
+                ) else {
+                    return false;
+                };
+                let Some(bodies) = rows(bodies, count) else {
+                    return false;
+                };
+                let mut sv = Siteverify::default();
+                for body in bodies {
+                    let (word, micros) = recaptcha(&mut sv, body, threshold, action, host);
+                    o.push(word);
+                    o.push(micros);
+                }
+                true
+            })
+        }
+    }
+
+    // ---- PasswordBreachService k-anonymity range lookups --------------------------------------
+
+    /// SHA-1 digest.
+    pub fn sha1(data: &[u8]) -> [u8; 20] {
+        fn compress(h: &mut [u32; 5], block: &[u8]) {
+            let mut w = [0u32; 80];
+            for (t, chunk) in block.chunks_exact(4).enumerate() {
+                w[t] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+            for t in 16..80 {
+                w[t] = (w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16]).rotate_left(1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e] = *h;
+            for (t, &wt) in w.iter().enumerate() {
+                let (f, k) = match t {
+                    0..=19 => ((b & c) | (!b & d), 0x5A82_7999),
+                    20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                    _ => (b ^ c ^ d, 0xCA62_C1D6),
+                };
+                let temp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(wt);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+            for (state, v) in h.iter_mut().zip([a, b, c, d, e]) {
+                *state = state.wrapping_add(v);
+            }
+        }
+        let mut h = [
+            0x6745_2301u32,
+            0xEFCD_AB89,
+            0x98BA_DCFE,
+            0x1032_5476,
+            0xC3D2_E1F0,
+        ];
+        let mut blocks = data.chunks_exact(64);
+        for block in &mut blocks {
+            compress(&mut h, block);
+        }
+        let rest = blocks.remainder();
+        let mut tail = [0u8; 128];
+        tail[..rest.len()].copy_from_slice(rest);
+        tail[rest.len()] = 0x80;
+        let end = if rest.len() < 56 { 64 } else { 128 };
+        tail[end - 8..end].copy_from_slice(&((data.len() as u64).wrapping_mul(8)).to_be_bytes());
+        for block in tail[..end].chunks_exact(64) {
+            compress(&mut h, block);
+        }
+        let mut digest = [0u8; 20];
+        for (chunk, v) in digest.chunks_exact_mut(4).zip(h) {
+            chunk.copy_from_slice(&v.to_be_bytes());
+        }
+        digest
+    }
+
+    /// PasswordBreachService::lookupBreachCountsPhp() for one password and range body.
+    pub fn breach(password: &[u8], body: &[u8], threshold: i64) -> (i64, i64) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let digest = sha1(password);
+        let mut hex = [0u8; 40];
+        for (i, byte) in digest.iter().enumerate() {
+            hex[i * 2] = HEX[usize::from(byte >> 4)];
+            hex[i * 2 + 1] = HEX[usize::from(byte & 15)];
+        }
+        let suffix = &hex[5..];
+        let prefix =
+            i64::from(digest[0]) << 12 | i64::from(digest[1]) << 4 | i64::from(digest[2] >> 4);
+        let (mut found, mut count) = (false, 0i64);
+        let (mut lines, mut malformed, mut padding) = (0i64, 0i64, 0i64);
+        for raw in body.split(|&b| b == b'\n') {
+            let line = php_trim(raw);
+            if line.is_empty() {
+                continue;
+            }
+            let (candidate, tally) = match line.iter().position(|&b| b == b':') {
+                Some(colon) => (&line[..colon], &line[colon + 1..]),
+                None => (line, &b""[..]),
+            };
+            let n = match digits(tally, 10) {
+                Some(n) if candidate.len() == 35 && candidate.iter().all(u8::is_ascii_hexdigit) => {
+                    n
+                }
+                _ => {
+                    malformed += 1;
+                    continue;
+                }
+            };
+            lines += 1;
+            padding += i64::from(n == 0);
+            if !found
+                && candidate
+                    .iter()
+                    .zip(suffix)
+                    .all(|(a, b)| a.to_ascii_uppercase() == *b)
+            {
+                found = true;
+                count = n;
+            }
+        }
+        let breached = found && count > threshold;
+        (
+            count | i64::from(found) << 40 | i64::from(breached) << 41,
+            prefix
+                | lines.min(65_535) << 20
+                | malformed.min(65_535) << 36
+                | padding.min(2047) << 52,
+        )
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w48_password_breach_range_batch(
+        passwords: *const u8,
+        passwords_len: usize,
+        bodies: *const u8,
+        bodies_len: usize,
+        count: usize,
+        threshold: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let inputs = [(passwords, passwords_len), (bodies, bodies_len)];
+        unsafe {
+            run(out, cap, count, 2, &inputs, |o| {
+                let (Some(passwords), Some(bodies)) =
+                    (span(passwords, passwords_len), span(bodies, bodies_len))
+                else {
+                    return false;
+                };
+                let (Some(passwords), Some(bodies)) = (rows(passwords, count), rows(bodies, count))
+                else {
+                    return false;
+                };
+                for (password, body) in passwords.iter().zip(&bodies) {
+                    let (found, range) = breach(password, body, threshold);
+                    o.push(found);
+                    o.push(range);
+                }
+                true
+            })
+        }
+    }
+
+    // ---- RegistrationFailureLogService failure digests ----------------------------------------
+
+    /// Normalized reason codes 1..=10; '' is 0 and anything else 15.
+    pub const REASONS: [&[u8]; 10] = [
+        b"captcha_failed",
+        b"invalid_invite",
+        b"email_taken",
+        b"username_taken",
+        b"disposable_email",
+        b"registration_closed",
+        b"proxy_detected",
+        b"rate_limited",
+        b"validation_failed",
+        b"password_breached",
+    ];
+
+    /// Bot needles, then script needles, then `mozilla/`, as one bit each.
+    const AGENT_NEEDLES: [&[u8]; 11] = [
+        b"bot",
+        b"spider",
+        b"crawl",
+        b"curl/",
+        b"wget/",
+        b"python-requests",
+        b"go-http-client",
+        b"okhttp",
+        b"libwww",
+        b"java/",
+        b"mozilla/",
+    ];
+
+    /// Needle bits by first byte.
+    const AGENT_FIRST: [u16; 256] = {
+        let mut table = [0u16; 256];
+        let mut i = 0;
+        while i < AGENT_NEEDLES.len() {
+            table[AGENT_NEEDLES[i][0] as usize] |= 1 << i;
+            i += 1;
+        }
+        table
+    };
+
+    /// Agent class of a control-free lowercase agent in one pass over its bytes.
+    fn agent_class(agent: &[u8]) -> i64 {
+        if agent.is_empty() {
+            return 0;
+        }
+        let mut found = 0u16;
+        for (at, &b) in agent.iter().enumerate() {
+            let mut candidates = AGENT_FIRST[usize::from(b)] & !found;
+            while candidates != 0 {
+                let bit = candidates.trailing_zeros() as usize;
+                candidates &= candidates - 1;
+                if agent[at..].starts_with(AGENT_NEEDLES[bit]) {
+                    found |= 1 << bit;
+                }
+            }
+            if found & 0b111 != 0 {
+                return 1;
+            }
+        }
+        if found & 0b11_1111_1000 != 0 {
+            2
+        } else if found != 0 {
+            3
+        } else {
+            4
+        }
+    }
+
+    /// Timestamps and the window clamp to 0..=2^40 so differences cannot overflow.
+    pub const MAX_STAMP: i64 = 1 << 40;
+
+    /// `trim(preg_replace('/[^a-z0-9]+/', '_', strtolower(trim($reason))), '_')`.
+    pub fn normalize_reason(reason: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        let mut gap = false;
+        for &b in php_trim(reason) {
+            let b = b.to_ascii_lowercase();
+            if b.is_ascii_lowercase() || b.is_ascii_digit() {
+                if gap && !out.is_empty() {
+                    out.push(b'_');
+                }
+                gap = false;
+                out.push(b);
+            } else {
+                gap = true;
+            }
+        }
+    }
+
+    fn email_ok(email: &[u8], local: &[u8], domain: &[u8]) -> bool {
+        email.iter().filter(|&&b| b == b'@').count() == 1
+            && !local.is_empty()
+            && local.len() <= 64
+            && (3..=253).contains(&domain.len())
+            && domain
+                .iter()
+                .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+            && domain.contains(&b'.')
+            && domain[0] != b'.'
+            && domain[domain.len() - 1] != b'.'
+            && !contains(domain, b"..")
+            && local.iter().all(|&b| b > 0x20 && b != 0x7f)
+    }
+
+    /// The per-record words before the rate window: (flags word, crc pair word).
+    pub fn failure(
+        ip: Option<Ip>,
+        email: &[u8],
+        reason: &[u8],
+        agent: &[u8],
+        email_buf: &mut Vec<u8>,
+        buf: &mut Vec<u8>,
+    ) -> (i64, i64) {
+        let family = match ip {
+            None => 0,
+            Some(Ip::V4(_)) => 1,
+            Some(Ip::V6(_)) => 2,
+        };
+        let is_private = ip.is_some_and(private);
+        email_buf.clear();
+        email_buf.extend(php_trim(email).iter().map(u8::to_ascii_lowercase));
+        let email = &email_buf[..];
+        let (local, domain) = match email.iter().rposition(|&b| b == b'@') {
+            Some(at) => (&email[..at], &email[at + 1..]),
+            None => (&email[..], &b""[..]),
+        };
+        let email_ok = email_ok(email, local, domain);
+        let domain_crc = crc32(domain);
+        normalize_reason(reason, buf);
+        let reason_code = if buf.is_empty() {
+            0
+        } else {
+            REASONS
+                .iter()
+                .position(|known| *known == buf.as_slice())
+                .map_or(15, |i| i as i64 + 1)
+        };
+        let reason_crc = crc32(buf);
+        buf.clear();
+        buf.extend(agent.iter().filter(|&&b| b >= 0x20 && b != 0x7f));
+        let removed = (agent.len() - buf.len()) as i64;
+        let truncated = buf.len() > 255;
+        buf.truncate(255);
+        buf.make_ascii_lowercase();
+        let class = agent_class(buf);
+        let word = family
+            | i64::from(is_private) << 2
+            | i64::from(email_ok) << 3
+            | reason_code << 4
+            | class << 8
+            | i64::from(truncated) << 11
+            | removed.min(255) << 12
+            | (buf.len() as i64) << 20
+            | (email.len() as i64).min(1023) << 28;
+        (word, domain_crc | reason_crc << 32)
+    }
+
+    /// Hashable identity of an address: (IPv6, packed value).
+    fn group_key(ip: Ip) -> (bool, u128) {
+        match ip {
+            Ip::V4(b) => (false, u128::from(u32::from_be_bytes(b))),
+            Ip::V6(b) => (true, u128::from_be_bytes(b)),
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w48_registration_failure_batch(
+        ips: *const u8,
+        ips_len: usize,
+        emails: *const u8,
+        emails_len: usize,
+        reasons: *const u8,
+        reasons_len: usize,
+        agents: *const u8,
+        agents_len: usize,
+        agent_lens: *const u8,
+        agent_lens_len: usize,
+        stamps: *const u8,
+        stamps_len: usize,
+        count: usize,
+        window: i64,
+        limit: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let inputs = [
+            (ips, ips_len),
+            (emails, emails_len),
+            (reasons, reasons_len),
+            (agents, agents_len),
+            (agent_lens, agent_lens_len),
+            (stamps, stamps_len),
+        ];
+        unsafe {
+            run(out, cap, count, 3, &inputs, |o| {
+                let (
+                    Some(ips),
+                    Some(emails),
+                    Some(reasons),
+                    Some(agents),
+                    Some(lens),
+                    Some(stamps),
+                ) = (
+                    span(ips, ips_len),
+                    span(emails, emails_len),
+                    span(reasons, reasons_len),
+                    span(agents, agents_len),
+                    span(agent_lens, agent_lens_len),
+                    span(stamps, stamps_len),
+                )
+                else {
+                    return false;
+                };
+                if Some(stamps.len()) != count.checked_mul(8)
+                    || Some(lens.len()) != count.checked_mul(4)
+                {
+                    return false;
+                }
+                let (Some(ips), Some(emails), Some(reasons)) =
+                    (rows(ips, count), rows(emails, count), rows(reasons, count))
+                else {
+                    return false;
+                };
+                // Agents may hold NUL bytes, so they arrive concatenated with u32 lengths.
+                let mut agent_rows = Vec::with_capacity(count);
+                let mut at = 0usize;
+                for len in lens.chunks_exact(4) {
+                    let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
+                    let Some(agent) = agents.get(at..at.saturating_add(len)) else {
+                        return false;
+                    };
+                    agent_rows.push(agent);
+                    at += len;
+                }
+                if at != agents.len() {
+                    return false;
+                }
+                let window = window.clamp(0, MAX_STAMP);
+                let stamps: Vec<i64> = stamps
+                    .chunks_exact(8)
+                    .map(|c| {
+                        i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+                            .clamp(0, MAX_STAMP)
+                    })
+                    .collect();
+                let keys: Vec<Option<Ip>> = ips.iter().map(|ip| php_ip(ip)).collect();
+                // (address, timestamp) sorted, so each address is one run ordered by time.
+                let mut sorted: Vec<((bool, u128), i64)> = keys
+                    .iter()
+                    .zip(&stamps)
+                    .filter_map(|(key, &stamp)| key.map(|key| (group_key(key), stamp)))
+                    .collect();
+                sorted.sort_unstable();
+                let mut buf = Vec::new();
+                let mut email = Vec::new();
+                for i in 0..count {
+                    let (mut word, crcs) = failure(
+                        keys[i],
+                        emails[i],
+                        reasons[i],
+                        agent_rows[i],
+                        &mut email,
+                        &mut buf,
+                    );
+                    let (within, size) = keys[i].map_or((0, 0), |ip| {
+                        let key = group_key(ip);
+                        let lo = sorted.partition_point(|e| e.0 < key);
+                        let run = &sorted[lo..lo + sorted[lo..].partition_point(|e| e.0 == key)];
+                        let upper = run.partition_point(|e| e.1 <= stamps[i]);
+                        let lower = run.partition_point(|e| e.1 < stamps[i] - window);
+                        ((upper - lower) as i64, run.len() as i64)
+                    });
+                    word |= i64::from(keys[i].is_some() && within >= limit) << 38;
+                    o.push(word);
+                    o.push(crcs);
+                    o.push(within.min(65_535) | size.min(65_535) << 16);
+                }
+                true
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn words(bytes: &[u8]) -> Vec<i64> {
+            bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        }
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        #[test]
+        fn cleaning_w48_digests_match_php_builtins() {
+            assert_eq!(fnv1a64(&[]) as u64, 0xcbf2_9ce4_8422_2325);
+            assert_eq!(crc32(b""), 0);
+            assert_eq!(
+                crc32(b"The quick brown fox jumps over the lazy dog"),
+                0x414F_A339
+            );
+            assert_eq!(hex(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+            assert_eq!(
+                hex(&sha1(b"abc")),
+                "a9993e364706816aba3e25717850c26c9cd0d89d"
+            );
+            assert_eq!(
+                hex(&sha1(&[b'a'; 1_000])),
+                "291e9a6c66994949b57ba5e650361e98fc36b1ba"
+            );
+            for len in [55, 56, 63, 64, 65, 119, 120] {
+                assert_eq!(sha1(&vec![b'x'; len]).len(), 20);
+            }
+        }
+
+        #[test]
+        fn cleaning_w48_proxy_verdicts_aggregate_subnets() {
+            let ips = "10.0.0.1\010.0.0.9\0bad\02001:db8::1";
+            let specs = "ratio:40, burst:25\0ratio:5,ratio:-5,x\0\0agent:60,ua:60";
+            let mut out = vec![0u8; 13 * 8];
+            let n = unsafe {
+                nntmux_w48_proxy_verdict_aggregate_batch(
+                    ips.as_ptr(),
+                    ips.len(),
+                    specs.as_ptr(),
+                    specs.len(),
+                    4,
+                    50,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(n, 104);
+            let w = words(&out);
+            assert_eq!(w[0], 65 | 1 << 10 | 100 << 11 | 2 << 18 | 10_040 << 34);
+            assert_eq!(w[1], 1 << 48 | 10 << 16);
+            assert_eq!(w[2], 2 | 1 << 16 | crc32(b"ratio") << 32);
+            assert_eq!(w[3], 1 << 18 | 1 << 26 | 9_995 << 34);
+            assert_eq!(w[5], 2 | 1 << 16 | crc32(b"ratio") << 32);
+            assert_eq!((w[6], w[7], w[8]), (10_000 << 34, -1, 0));
+            assert_eq!(w[9] & 1023, 120);
+            assert_eq!(w[10], 2 << 48 | 0x2001_0db8_0000);
+            assert_eq!(w[11] >> 32 & 0xffff_ffff, crc32(b"agent"));
+            assert_eq!(w[12], fnv1a64(&w[..12]));
+        }
+
+        #[test]
+        fn cleaning_w48_siteverify_json_mirrors_json_decode() {
+            let mut sv = Siteverify::default();
+            for (body, is_array) in [
+                (&b"{}"[..], true),
+                (b"[]", true),
+                (
+                    b" [1, 2.5e3, -0, \"x\", null, true, false, {\"a\": []}] ",
+                    true,
+                ),
+                (b"1", false),
+                (b"\"x\"", false),
+                (b"", false),
+                (b"{\"a\":1,}", false),
+                (b"[01]", false),
+                (b"[1.]", false),
+                (b"[\"\\ud800\"]", false),
+                (b"[\"\\udc00\"]", false),
+                (b"[\"\\ud83d\\ude00\"]", true),
+                (b"[\"\xed\xa0\x80\"]", false),
+                (b"[\"\x7f\"]", true),
+                (b"[\"\x01\"]", false),
+                (b"[truex]", false),
+                (b"\xef\xbb\xbf{}", false),
+            ] {
+                sv.parse(body);
+                assert_eq!(sv.is_array, is_array, "{}", String::from_utf8_lossy(body));
+            }
+            let deep = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+            sv.parse(deep(511).as_bytes());
+            assert!(sv.is_array);
+            sv.parse(deep(512).as_bytes());
+            assert!(!sv.is_array);
+            sv.parse(
+                br#"{"success":true,"success":false,"hostname":"A\u002ecom","error\u002dcodes":{"a":"bad-request","a":1,"b":"nope"},"score":0.7}"#,
+            );
+            assert!(sv.is_array && !sv.success && sv.has_host);
+            assert_eq!(sv.host, b"A.com");
+            assert_eq!((sv.err_mask, sv.err_count), (1 << 7, 1));
+            assert_eq!(sv.score, Score::Number(0.7));
+        }
+
+        #[test]
+        fn cleaning_w48_captcha_outcomes() {
+            let mut sv = Siteverify::default();
+            let mut lower = Vec::new();
+            let ok =
+                br#"{"success":true,"hostname":"Example.COM","action":"login","error-codes":[]}"#;
+            let (w, crc) = turnstile(
+                &mut sv,
+                b"0.abc-DEF_1",
+                ok,
+                b"example.com",
+                b"login",
+                &mut lower,
+            );
+            assert_eq!(w & 15, 0);
+            assert_eq!(crc, crc32(b"example.com"));
+            assert_eq!(
+                turnstile(&mut sv, b"bad token", ok, b"", b"", &mut lower).0 & 15,
+                1
+            );
+            assert_eq!(
+                turnstile(&mut sv, b"t", b"nope", b"", b"", &mut lower),
+                (2 | 1 << 16, -1)
+            );
+            assert_eq!(
+                turnstile(&mut sv, b"t", ok, b"other.org", b"", &mut lower).0 & 15,
+                4
+            );
+            assert_eq!(
+                turnstile(&mut sv, b"t", ok, b"", b"signup", &mut lower).0 & 15,
+                5
+            );
+            let v3 = br#"{"success":true,"score":0.3,"action":"login","hostname":"example.com"}"#;
+            assert_eq!(recaptcha(&mut sv, v3, 0.5, b"login", b"").0 & 15, 3);
+            assert_eq!(
+                recaptcha(&mut sv, v3, 0.3, b"login", b"example.com"),
+                (
+                    2 << 12 | 1 << 14 | 1 << 15 | 1 << 24 | 1 << 25 | 1 << 26 | 1 << 27,
+                    300_000
+                )
+            );
+            assert_eq!(recaptcha(&mut sv, v3, 0.3, b"signup", b"").0 & 15, 4);
+            assert_eq!(
+                recaptcha(&mut sv, br#"{"success":true,"score":"1"}"#, 0.0, b"", b"").1,
+                -2
+            );
+            assert_eq!(
+                recaptcha(&mut sv, br#"{"success":true}"#, 0.9, b"x", b"").0 & 15,
+                0
+            );
+        }
+
+        #[test]
+        fn cleaning_w48_breach_ranges() {
+            // sha1("password") = 5BAA6 1E4C9B93F3F0682250B6CF8331B7EE68FD8
+            let body = b"0018A45C4D1DEF81644B54AB7F969B88D65:1\r\n1e4c9b93f3f0682250b6cf8331b7ee68fd8:3861493\r\nZZ:1\n003D68EB55068C33ACE09247EE4C639306B:0\n\n";
+            let (found, range) = breach(b"password", body, 1);
+            assert_eq!(found, 3_861_493 | 1 << 40 | 1 << 41);
+            assert_eq!(range, 0x5BAA6 | 3 << 20 | 1 << 36 | 1 << 52);
+            assert_eq!(breach(b"password", body, 3_861_493).0, 3_861_493 | 1 << 40);
+            assert_eq!(
+                breach(b"other", b"", 0),
+                (
+                    0,
+                    i64::from(sha1(b"other")[0]) << 12
+                        | i64::from(sha1(b"other")[1]) << 4
+                        | i64::from(sha1(b"other")[2] >> 4)
+                )
+            );
+        }
+
+        #[test]
+        fn cleaning_w48_registration_failures_window() {
+            let ips = "10.0.0.1\010.0.0.1\0bad\010.0.0.1";
+            let emails = " User@Example.com \0a@@b.com\0\0x@y.z";
+            let reasons = "Captcha Failed\0--weird reason--\0\0RATE_LIMITED";
+            let agents = "Mozilla/5.0curl/8\x01Googlebot";
+            let lens: Vec<u8> = [11u32, 7, 0, 9]
+                .iter()
+                .flat_map(|l| l.to_le_bytes())
+                .collect();
+            let stamps: Vec<u8> = [100i64, 150, 160, 400]
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect();
+            let mut out = vec![0u8; 13 * 8];
+            let n = unsafe {
+                nntmux_w48_registration_failure_batch(
+                    ips.as_ptr(),
+                    ips.len(),
+                    emails.as_ptr(),
+                    emails.len(),
+                    reasons.as_ptr(),
+                    reasons.len(),
+                    agents.as_ptr(),
+                    agents.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    stamps.as_ptr(),
+                    stamps.len(),
+                    4,
+                    60,
+                    2,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(n, 104);
+            let w = words(&out);
+            assert_eq!(
+                w[0],
+                1 | 1 << 2 | 1 << 3 | 1 << 4 | 3 << 8 | 11 << 20 | 16 << 28
+            );
+            assert_eq!(w[1], crc32(b"example.com") | crc32(b"captcha_failed") << 32);
+            assert_eq!(w[2], 1 | 3 << 16);
+            assert_eq!(w[3] & 0xff, 1 | 1 << 2 | 15 << 4);
+            assert_eq!(w[3] >> 8 & 15, 2);
+            assert_eq!(w[3] >> 12 & 255, 1);
+            assert_eq!(w[3] >> 38, 1);
+            assert_eq!(w[4] >> 32 & 0xffff_ffff, crc32(b"weird_reason"));
+            assert_eq!(w[5], 2 | 3 << 16);
+            assert_eq!((w[6], w[8]), (0, 0));
+            assert_eq!(w[9] >> 4 & 15, 8);
+            assert_eq!(w[9] >> 8 & 7, 1);
+            assert_eq!(w[11], 1 | 3 << 16);
+            assert_eq!(w[12], fnv1a64(&w[..12]));
+        }
+
+        #[test]
+        fn cleaning_w48_malformed_batches_decline() {
+            let mut out = vec![0u8; 64];
+            let input = b"a\0b";
+            let run = |count: usize, cap: usize, out: &mut [u8]| unsafe {
+                nntmux_w48_password_breach_range_batch(
+                    input.as_ptr(),
+                    3,
+                    input.as_ptr(),
+                    3,
+                    count,
+                    0,
+                    out.as_mut_ptr(),
+                    cap,
+                )
+            };
+            assert_eq!(run(1, 64, &mut out), -1);
+            assert_eq!(run(2, 8, &mut out), -40);
+            assert_eq!(run(2, 64, &mut out), 40);
+            let n = unsafe {
+                nntmux_w48_recaptcha_assess_batch(
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0.5,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    8,
+                )
+            };
+            assert_eq!(n, 8);
+            assert_eq!(words(&out[..8]), vec![fnv1a64(&[])]);
+            let n = unsafe {
+                nntmux_w48_turnstile_siteverify_batch(
+                    input.as_ptr(),
+                    3,
+                    input.as_ptr(),
+                    3,
+                    2,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    input.as_ptr() as *mut u8,
+                    64,
+                )
+            };
+            assert_eq!(n, -1);
+            let n = unsafe {
+                nntmux_w48_registration_failure_batch(
+                    input.as_ptr(),
+                    1,
+                    input.as_ptr(),
+                    1,
+                    input.as_ptr(),
+                    1,
+                    input.as_ptr(),
+                    1,
+                    [1u8, 0, 0, 0].as_ptr(),
+                    4,
+                    input.as_ptr(),
+                    3,
+                    1,
+                    60,
+                    2,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(n, -1);
+            let stamp = 5i64.to_le_bytes();
+            let call = |lens: [u8; 4]| unsafe {
+                let mut out = vec![0u8; 32];
+                nntmux_w48_registration_failure_batch(
+                    input.as_ptr(),
+                    1,
+                    input.as_ptr(),
+                    1,
+                    input.as_ptr(),
+                    1,
+                    input.as_ptr(),
+                    3,
+                    lens.as_ptr(),
+                    4,
+                    stamp.as_ptr(),
+                    8,
+                    1,
+                    60,
+                    2,
+                    out.as_mut_ptr(),
+                    32,
+                )
+            };
+            assert_eq!(call([3, 0, 0, 0]), 32);
+            assert_eq!(call([2, 0, 0, 0]), -1);
+            assert_eq!(call([4, 0, 0, 0]), -1);
+            assert_eq!(call([255, 255, 255, 255]), -1);
+            let n = unsafe {
+                nntmux_w48_proxy_verdict_aggregate_batch(
+                    input.as_ptr(),
+                    3,
+                    input.as_ptr(),
+                    1,
+                    2,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(n, -1);
+        }
+    }
+}
