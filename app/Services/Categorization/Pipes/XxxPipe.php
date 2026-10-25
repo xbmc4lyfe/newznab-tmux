@@ -10,6 +10,7 @@ use App\Services\Categorization\Categorizers\XxxCategorizer;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -416,5 +417,186 @@ class XxxPipe extends AbstractCategorizationPipe
         }
 
         return self::$w433RustFfiHandle === false ? null : self::$w433RustFfiHandle;
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 54.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 4.05x, p99 2.24x; uncommon mean 4.02x, p99 2.89x); see RustXxxPipeIgdbClientCompanyGamePlatformW54ParityTest. */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    public const string W54_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w544_xxx_adult_signal_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** W433_ADULT_SIGNAL_MARKERS classes by code. */
+    private const array W54_ADULT_CLASSES = [1 => 'studio', 2 => 'jav', 3 => 'keyword'];
+
+    /**
+     * summarizeAdultSignalBatchPhp() per release name instead of as totals. Each name yields four
+     * words: the class code (unknown 0, studio 1, jav 2, keyword 3) | 4 when it holds a
+     * W433_XXX_TAG_MARKERS entry, the index of the first matching marker within its class (-1
+     * for unknown), that marker's byte offset in the name (-1) and the byte offset of the first
+     * xxx tag (-1). Matching is ASCII case-insensitive, as strtolower() is.
+     *
+     * @param  list<string>  $releaseNames
+     * @return list<int>
+     */
+    public static function adultSignalRowBatch(array $releaseNames): array
+    {
+        return self::usesW54RustFfi()
+            ? self::adultSignalRowBatchNative($releaseNames)
+            : self::adultSignalRowBatchPhp($releaseNames);
+    }
+
+    /**
+     * @param  list<string>  $releaseNames
+     * @return list<int>
+     */
+    public static function adultSignalRowBatchNative(array $releaseNames): array
+    {
+        self::w54AssertList($releaseNames);
+        $count = \count($releaseNames);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w54Call(implode("\0", $releaseNames), '', $count, 4)
+            ?? self::adultSignalRowBatchPhp($releaseNames);
+    }
+
+    /**
+     * @param  list<string>  $releaseNames
+     * @return list<int>
+     */
+    public static function adultSignalRowBatchPhp(array $releaseNames): array
+    {
+        self::w54AssertList($releaseNames);
+        $tag = self::W433_XXX_TAG_MARKERS[0];
+        $out = [];
+        foreach ($releaseNames as $releaseName) {
+            $name = strtolower($releaseName);
+            $xxx = strpos($name, $tag);
+            $class = 0;
+            $index = -1;
+            $at = -1;
+            foreach (self::W54_ADULT_CLASSES as $code => $key) {
+                foreach (self::W433_ADULT_SIGNAL_MARKERS[$key] as $k => $needle) {
+                    $found = strpos($name, $needle);
+                    if ($found !== false) {
+                        $class = $code;
+                        $index = $k;
+                        $at = $found;
+
+                        break 2;
+                    }
+                }
+            }
+            array_push($out, $xxx === false ? $class : $class | 4, $index, $at, $xxx === false ? -1 : $xxx);
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     */
+    private static function w54AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new \InvalidArgumentException('W54 batch input must be a list.');
+        }
+    }
+
+    public static function usesW54RustFfi(): bool
+    {
+        $enabled = self::w54RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W54 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('enabled');
+        self::w54RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text columns and packed int64 columns in,
+     * `$words` int64 words back per record. Null when the library is missing or declines
+     * (a value holding a NUL byte adds a field, which the export rejects).
+     *
+     * @return list<int>|null
+     */
+    private static function w54Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            $state = self::w54RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w54', self::W54_FFI_CDEF) ?? false;
+                self::w54RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w54RustFfiState('out', $out);
+                self::w54RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W54_FFI_CDEF.)
+            $written = $ffi->nntmux_w544_xxx_adult_signal_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W54 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }

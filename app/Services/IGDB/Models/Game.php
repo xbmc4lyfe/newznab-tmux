@@ -6,6 +6,7 @@ namespace App\Services\IGDB\Models;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 class Game extends BaseModel
@@ -399,5 +400,199 @@ class Game extends BaseModel
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 54.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 3.91x, p99 2.25x; uncommon mean 4.36x, p99 3.06x); see RustXxxPipeIgdbClientCompanyGamePlatformW54ParityTest. */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    public const string W54_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w544_igdb_game_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * normalizeGameLookupSpecPhp() for many lookups at once, as lengths and offsets instead of
+     * copies. Each (title, limit, platform id) yields five words: the search as a span (trimmed
+     * offset << 32 | collapsed length), the escaped length, the clamped limit, the platform id
+     * (-1 when not positive) and the Apicalypse query length.
+     *
+     * @param  list<string>  $titles
+     * @param  list<int>  $limits
+     * @param  list<int>  $platformIds
+     * @return list<int>
+     */
+    public static function gameLookupRowBatch(array $titles, array $limits, array $platformIds): array
+    {
+        return self::usesW54RustFfi()
+            ? self::gameLookupRowBatchNative($titles, $limits, $platformIds)
+            : self::gameLookupRowBatchPhp($titles, $limits, $platformIds);
+    }
+
+    /**
+     * @param  list<string>  $titles
+     * @param  list<int>  $limits
+     * @param  list<int>  $platformIds
+     * @return list<int>
+     */
+    public static function gameLookupRowBatchNative(array $titles, array $limits, array $platformIds): array
+    {
+        $count = self::w54AssertColumns($titles, $limits, $platformIds);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w54Call(implode("\0", $titles), pack('P*', ...$limits, ...$platformIds), $count, 5)
+            ?? self::gameLookupRowBatchPhp($titles, $limits, $platformIds);
+    }
+
+    /**
+     * @param  list<string>  $titles
+     * @param  list<int>  $limits
+     * @param  list<int>  $platformIds
+     * @return list<int>
+     */
+    public static function gameLookupRowBatchPhp(array $titles, array $limits, array $platformIds): array
+    {
+        self::w54AssertColumns($titles, $limits, $platformIds);
+        $out = [];
+        foreach ($titles as $i => $title) {
+            $search = preg_replace('/[ \t\n\r\0\x0B\x0C]+/', ' ', trim($title, self::WHITESPACE)) ?? '';
+            $escaped = addcslashes($search, '"\\');
+            $limit = max(self::LIMIT_MIN, min(self::LIMIT_MAX, $limits[$i]));
+            $platformId = $platformIds[$i];
+            $where = $platformId > 0 ? "where platforms = ({$platformId}); " : '';
+            array_push(
+                $out,
+                strspn($title, self::WHITESPACE) << 32 | \strlen($search),
+                \strlen($escaped),
+                $limit,
+                $platformId > 0 ? $platformId : -1,
+                \strlen("search \"{$escaped}\"; fields *; {$where}limit {$limit};"),
+            );
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $first
+     * @param  array<array-key, mixed>  $second
+     * @param  array<array-key, mixed>  $third
+     */
+    private static function w54AssertColumns(array $first, array $second, array $third): int
+    {
+        self::w54AssertList($first);
+        self::w54AssertList($second);
+        self::w54AssertList($third);
+        $count = \count($first);
+        if (\count($second) !== $count || \count($third) !== $count) {
+            throw new \InvalidArgumentException('W54 batch columns must have the same length.');
+        }
+
+        return $count;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     */
+    private static function w54AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new \InvalidArgumentException('W54 batch input must be a list.');
+        }
+    }
+
+    public static function usesW54RustFfi(): bool
+    {
+        $enabled = self::w54RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W54 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('enabled');
+        self::w54RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text columns and packed int64 columns in,
+     * `$words` int64 words back per record. Null when the library is missing or declines
+     * (a value holding a NUL byte adds a field, which the export rejects).
+     *
+     * @return list<int>|null
+     */
+    private static function w54Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            $state = self::w54RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w54', self::W54_FFI_CDEF) ?? false;
+                self::w54RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w54RustFfiState('out', $out);
+                self::w54RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W54_FFI_CDEF.)
+            $written = $ffi->nntmux_w544_igdb_game_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W54 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }
