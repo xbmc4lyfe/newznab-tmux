@@ -18,6 +18,30 @@ use FFI;
  */
 class CategorizationService
 {
+    /**
+     * Wave 40.3 production default is PHP: the paired benchmark in
+     * tests/Unit/RustCategorizationServiceGroupNameFixerW40ParityTest.php measures only
+     * 1.21-1.24x mean / 1.03-1.22x p99 on the common batch, below the 1.5x adoption threshold, so Rust
+     * stays behind useW403RustFfi(true). Named W403 so it stays distinct from other Rust FFI toggles.
+     */
+    public const bool W403_RUST_FFI_DEFAULT = false;
+
+    public const string W403_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w403_category_distribution(
+            const char *values_ptr,
+            size_t values_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /** Category IDs from 0 through this value fall in a major root bucket; others are invalid. */
+    public const int W403_MAX_CATEGORY_ID = 8999;
+
+    private static ?bool $w403RustFfiOverride = null;
+
+    private static FFI|false|null $w403RustFfiHandle = null;
+
     public const string FFI_CDEF = <<<'C'
         int32_t nntmux_categorize_passable_should_stop(uint32_t locked_to_misc, double confidence);
         int32_t nntmux_categorize_passable_should_update_best(int64_t cand_cat_id, double cand_conf, const char *cand_matched_ptr, size_t cand_matched_len, int64_t best_cat_id, double best_conf, const char *best_matched_ptr, size_t best_matched_len);
@@ -402,5 +426,160 @@ class CategorizationService
                 'class' => get_class($categorizer),
             ];
         })->toArray();
+    }
+
+    public static function useW403RustFfi(?bool $enabled): void
+    {
+        self::$w403RustFfiOverride = $enabled;
+    }
+
+    public static function usesW403RustFfi(): bool
+    {
+        return self::$w403RustFfiOverride ?? self::W403_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW403RustFfi(): void
+    {
+        self::$w403RustFfiOverride = null;
+        self::$w403RustFfiHandle = null;
+    }
+
+    /**
+     * Category assignment counts per major root: Console (1000s), Movies (2000s), Audio (3000s),
+     * PC (4000s), TV (5000s), XXX (6000s), Books (7000s) and Other (0-999 and 8000s). Non-integer,
+     * negative and above W403_MAX_CATEGORY_ID IDs are invalid.
+     *
+     * @param  array<array-key, mixed>  $categoryIds
+     * @return array{total: int, valid: int, console: int, movies: int, audio: int, pc: int, tv: int, xxx: int, books: int, other: int, invalid: int}
+     */
+    public static function summarizeCategoryDistribution(array $categoryIds): array
+    {
+        return (self::usesW403RustFfi() ? self::summarizeCategoryDistributionNative($categoryIds) : null)
+            ?? self::summarizeCategoryDistributionPhp($categoryIds);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $categoryIds
+     * @return array{total: int, valid: int, console: int, movies: int, audio: int, pc: int, tv: int, xxx: int, books: int, other: int, invalid: int}
+     */
+    public static function summarizeCategoryDistributionPhp(array $categoryIds): array
+    {
+        // Console, Movies, Audio, PC, TV, XXX, Books, Other.
+        $buckets = [0, 0, 0, 0, 0, 0, 0, 0];
+        $invalid = 0;
+        foreach ($categoryIds as $id) {
+            if (! \is_int($id) || $id < 0 || $id > self::W403_MAX_CATEGORY_ID) {
+                $invalid++;
+
+                continue;
+            }
+            $root = intdiv($id, 1000);
+            $buckets[$root === 0 || $root === 8 ? 7 : $root - 1]++;
+        }
+        $total = \count($categoryIds);
+
+        return [
+            'total' => $total,
+            'valid' => $total - $invalid,
+            'console' => $buckets[0],
+            'movies' => $buckets[1],
+            'audio' => $buckets[2],
+            'pc' => $buckets[3],
+            'tv' => $buckets[4],
+            'xxx' => $buckets[5],
+            'books' => $buckets[6],
+            'other' => $buckets[7],
+            'invalid' => $invalid,
+        ];
+    }
+
+    /**
+     * Declines (null) for non-integer IDs so PHP counts them.
+     *
+     * @param  array<array-key, mixed>  $categoryIds
+     * @return array{total: int, valid: int, console: int, movies: int, audio: int, pc: int, tv: int, xxx: int, books: int, other: int, invalid: int}|null
+     */
+    public static function summarizeCategoryDistributionNative(array $categoryIds): ?array
+    {
+        foreach ($categoryIds as $item) {
+            if (! \is_int($item)) {
+                return null;
+            }
+        }
+        $packed = pack('P*', ...array_values($categoryIds));
+        $fields = self::callW403Native('nntmux_w403_category_distribution', [$packed, \strlen($packed)], 128, 11);
+        if ($fields === null) {
+            return null;
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'valid' => (int) $fields[1],
+            'console' => (int) $fields[2],
+            'movies' => (int) $fields[3],
+            'audio' => (int) $fields[4],
+            'pc' => (int) $fields[5],
+            'tv' => (int) $fields[6],
+            'xxx' => (int) $fields[7],
+            'books' => (int) $fields[8],
+            'other' => (int) $fields[9],
+            'invalid' => (int) $fields[10],
+        ];
+    }
+
+    /**
+     * Calls a Wave 40.3 export with the shared scratch buffer, retrying once at the size it asks for.
+     * Returns its fields only when there are exactly $fieldCount, all of them decimal.
+     *
+     * @param  list<int|string>  $args  arguments preceding the caller-owned output buffer
+     * @return list<string>|null
+     */
+    private static function callW403Native(string $symbol, array $args, int $minBytes, int $fieldCount): ?array
+    {
+        $ffi = self::w403RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            $written = $ffi->$symbol(...[...$args, $buffer, $capacity]);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol(...[...$args, $buffer, $capacity]);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $fields = explode("\x1F", FFI::string($buffer, $written));
+            if (\count($fields) !== $fieldCount) {
+                return null;
+            }
+            foreach ($fields as $field) {
+                if (\strlen($field) > 19 || ! ctype_digit($field)) {
+                    return null;
+                }
+            }
+
+            return $fields;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private static function w403RustFfi(): ?FFI
+    {
+        if (self::$w403RustFfiHandle === null) {
+            self::$w403RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w403', self::W403_FFI_CDEF) ?? false;
+        }
+
+        return self::$w403RustFfiHandle === false ? null : self::$w403RustFfiHandle;
     }
 }

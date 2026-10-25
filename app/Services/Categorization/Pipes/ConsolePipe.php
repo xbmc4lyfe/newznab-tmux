@@ -17,6 +17,43 @@ use Throwable;
  */
 class ConsolePipe extends AbstractCategorizationPipe
 {
+    /**
+     * Wave 40.3 production default is Rust: the paired benchmark in
+     * tests/Unit/RustCategorizationServiceGroupNameFixerW40ParityTest.php measures at least 2.0x
+     * (mean and p99, common and uncommon batches). PHP stays the fallback when the library is
+     * unavailable. Named W403 so it stays distinct from other Rust FFI toggles.
+     */
+    public const bool W403_RUST_FFI_DEFAULT = true;
+
+    public const string W403_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w403_cleaned_filename_batch(
+            const char *blob_ptr,
+            size_t blob_len,
+            const char *lens_ptr,
+            size_t lens_len,
+            int64_t min_plausible_length,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /** Trailing extensions of 1 to this many ASCII letters and digits are stripped from the stem. */
+    public const int W403_MAX_EXTENSION_LENGTH = 4;
+
+    private const string W403_ASCII_ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+    /** Lowercased stems that carry no release identity. */
+    private const array W403_GENERIC_STEMS = [
+        'sample' => true, 'proof' => true, 'cover' => true, 'covers' => true, 'thumbs' => true,
+        'folder' => true, 'index' => true, 'readme' => true, 'screens' => true, 'screenshot' => true,
+        'subs' => true, 'setup' => true, 'install' => true, 'info' => true, 'nfo' => true,
+        'sfv' => true, 'par2' => true, 'extras' => true, 'default' => true, 'untitled' => true,
+    ];
+
+    private static ?bool $w403RustFfiOverride = null;
+
+    private static FFI|false|null $w403RustFfiHandle = null;
+
     public const string PIPE_SPEC_FFI_CDEF = <<<'C'
         ssize_t nntmux_categorize_pipes_spec_name(uint8_t kind, char *out_buf, size_t out_cap);
         int64_t nntmux_categorize_pipes_spec_priority(uint8_t kind);
@@ -209,5 +246,174 @@ class ConsolePipe extends AbstractCategorizationPipe
         }
 
         return self::$pipeSpecFfi === false ? null : self::$pipeSpecFfi;
+    }
+
+    public static function useW403RustFfi(?bool $enabled): void
+    {
+        self::$w403RustFfiOverride = $enabled;
+    }
+
+    public static function usesW403RustFfi(): bool
+    {
+        return self::$w403RustFfiOverride ?? self::W403_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW403RustFfi(): void
+    {
+        self::$w403RustFfiOverride = null;
+        self::$w403RustFfiHandle = null;
+    }
+
+    /**
+     * Cleaning summary for a batch of filenames. Each name is trimmed (PHP's default set), cut after
+     * its last "/" or "\\", loses a trailing extension of 1 to W403_MAX_EXTENSION_LENGTH ASCII
+     * alphanumerics (when the dot is not the first byte), then is trimmed of whitespace, ".", "-" and
+     * "_". Stems shorter than $minPlausibleLength bytes are too short; all-digit and generic stems are
+     * junk; the rest are plausible candidates, deduplicated case-insensitively. Non-strings count as
+     * empty.
+     *
+     * @param  array<array-key, mixed>  $filenames
+     * @return array{total: int, plausible: int, too_short: int, generic_junk: int, unique_candidates: int}
+     */
+    public static function summarizeCleanedFilenameBatch(array $filenames, int $minPlausibleLength = 5): array
+    {
+        return (self::usesW403RustFfi() ? self::summarizeCleanedFilenameBatchNative($filenames, $minPlausibleLength) : null)
+            ?? self::summarizeCleanedFilenameBatchPhp($filenames, $minPlausibleLength);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $filenames
+     * @return array{total: int, plausible: int, too_short: int, generic_junk: int, unique_candidates: int}
+     */
+    public static function summarizeCleanedFilenameBatchPhp(array $filenames, int $minPlausibleLength = 5): array
+    {
+        $plausible = 0;
+        $tooShort = 0;
+        $junk = 0;
+        $seen = [];
+        foreach ($filenames as $filename) {
+            $name = trim(\is_string($filename) ? $filename : '');
+            $slash = strrpos($name, '/');
+            $backslash = strrpos($name, '\\');
+            $cut = max($slash === false ? -1 : $slash, $backslash === false ? -1 : $backslash);
+            $stem = $cut >= 0 ? substr($name, $cut + 1) : $name;
+            $dot = strrpos($stem, '.');
+            if ($dot !== false && $dot > 0) {
+                $extensionLength = \strlen($stem) - $dot - 1;
+                if ($extensionLength >= 1 && $extensionLength <= self::W403_MAX_EXTENSION_LENGTH
+                    && strspn($stem, self::W403_ASCII_ALNUM, $dot + 1) === $extensionLength) {
+                    $stem = substr($stem, 0, $dot);
+                }
+            }
+            $stem = trim($stem, " \t\n\r\0\x0B.-_");
+            if (\strlen($stem) < $minPlausibleLength) {
+                $tooShort++;
+
+                continue;
+            }
+            $lower = strtolower($stem);
+            if (strspn($lower, '0123456789') === \strlen($lower) || isset(self::W403_GENERIC_STEMS[$lower])) {
+                $junk++;
+
+                continue;
+            }
+            $plausible++;
+            $seen[$lower] = true;
+        }
+
+        return [
+            'total' => \count($filenames),
+            'plausible' => $plausible,
+            'too_short' => $tooShort,
+            'generic_junk' => $junk,
+            'unique_candidates' => \count($seen),
+        ];
+    }
+
+    /**
+     * Declines (null) for non-string filenames so PHP counts them.
+     *
+     * @param  array<array-key, mixed>  $filenames
+     * @return array{total: int, plausible: int, too_short: int, generic_junk: int, unique_candidates: int}|null
+     */
+    public static function summarizeCleanedFilenameBatchNative(array $filenames, int $minPlausibleLength = 5): ?array
+    {
+        $lengths = [];
+        foreach ($filenames as $item) {
+            if (! \is_string($item)) {
+                return null;
+            }
+            $lengths[] = \strlen($item);
+        }
+        $blob = implode('', $filenames);
+        $lens = pack('V*', ...$lengths);
+        $fields = self::callW403Native('nntmux_w403_cleaned_filename_batch', [$blob, \strlen($blob), $lens, \strlen($lens), $minPlausibleLength], 96, 5);
+        if ($fields === null) {
+            return null;
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'plausible' => (int) $fields[1],
+            'too_short' => (int) $fields[2],
+            'generic_junk' => (int) $fields[3],
+            'unique_candidates' => (int) $fields[4],
+        ];
+    }
+
+    /**
+     * Calls a Wave 40.3 export with the shared scratch buffer, retrying once at the size it asks for.
+     * Returns its fields only when there are exactly $fieldCount, all of them decimal.
+     *
+     * @param  list<int|string>  $args  arguments preceding the caller-owned output buffer
+     * @return list<string>|null
+     */
+    private static function callW403Native(string $symbol, array $args, int $minBytes, int $fieldCount): ?array
+    {
+        $ffi = self::w403RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            $written = $ffi->$symbol(...[...$args, $buffer, $capacity]);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol(...[...$args, $buffer, $capacity]);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $fields = explode("\x1F", FFI::string($buffer, $written));
+            if (\count($fields) !== $fieldCount) {
+                return null;
+            }
+            foreach ($fields as $field) {
+                if (\strlen($field) > 19 || ! ctype_digit($field)) {
+                    return null;
+                }
+            }
+
+            return $fields;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w403RustFfi(): ?FFI
+    {
+        if (self::$w403RustFfiHandle === null) {
+            self::$w403RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w403', self::W403_FFI_CDEF) ?? false;
+        }
+
+        return self::$w403RustFfiHandle === false ? null : self::$w403RustFfiHandle;
     }
 }
