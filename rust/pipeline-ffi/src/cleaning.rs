@@ -23943,3 +23943,535 @@ mod wave34_regex_ingestion_config_models_tests {
         }
     }
 }
+
+/// Wave 35.1: pure normalization helpers for the `BackfillDaysMode`, `GroupScanMode` and
+/// `TmuxBackfillMode` enums and the `TmuxCleanupRule` and `TmuxColorExclusion` models.
+///
+/// Outputs are `0x1F`-separated decimal integers and strings with `0x1E` alone for PHP `null`.
+/// Every encoding has several fields, so a result is never a single byte and `-1` (decline) never
+/// doubles as "needs one byte". A cleanup rule that embeds either marker byte declines with `-1` so
+/// PHP keeps its own implementation. A result that does not fit returns `-required` without
+/// touching `out_buf`.
+pub mod wave35_ingestion_tmux_enums_cleanup_models {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    const NULL_MARK: u8 = 0x1E;
+    /// PHP's default `trim()` set: " \t\n\r\0\x0B".
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B";
+    const U32_MAX: i64 = 4_294_967_295;
+    const SCAN_DAYS_MAX: i64 = 36_500;
+    const COLOR_MAX: i64 = 255;
+
+    /// `SettingsPageCatalog::cleanupRules()` order.
+    pub const CLEANUP_RULES: [&str; 14] = [
+        "blacklist",
+        "blfiles",
+        "executable",
+        "gibberish",
+        "hashed",
+        "installbin",
+        "passworded",
+        "passwordurl",
+        "sample",
+        "scr",
+        "short",
+        "size",
+        "nzb",
+        "codec",
+    ];
+
+    pub const BACKFILL_DAYS_PER_GROUP: i64 = 1;
+    pub const BACKFILL_SAFE_DATE: i64 = 2;
+    pub const SCAN_POSTS: i64 = 0;
+    pub const SCAN_DAYS: i64 = 1;
+    pub const TMUX_BACKFILL_DISABLED: i64 = 0;
+    pub const TMUX_BACKFILL_ALL: i64 = 1;
+    pub const TMUX_BACKFILL_SAFE: i64 = 4;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    /// Joins fields with the separator; `None` encodes PHP `null`.
+    fn encode(fields: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(fields.iter().map(|f| f.map_or(1, <[u8]>::len) + 1).sum());
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field.unwrap_or(&[NULL_MARK]));
+        }
+        out
+    }
+
+    #[inline]
+    fn bool_bytes(value: bool) -> &'static [u8] {
+        if value { b"1" } else { b"0" }
+    }
+
+    /// `BackfillDaysMode::normalizeModeSelectionPhp()`: `(mode, is_valid, uses_group_target, uses_safe_date)`.
+    pub fn backfill_days_mode(raw_mode: i64) -> (i64, bool, bool, bool) {
+        let mode = if raw_mode == BACKFILL_SAFE_DATE {
+            BACKFILL_SAFE_DATE
+        } else {
+            BACKFILL_DAYS_PER_GROUP
+        };
+        (
+            mode,
+            raw_mode == BACKFILL_DAYS_PER_GROUP || raw_mode == BACKFILL_SAFE_DATE,
+            mode == BACKFILL_DAYS_PER_GROUP,
+            mode == BACKFILL_SAFE_DATE,
+        )
+    }
+
+    /// `GroupScanMode::normalizeScanSelectionPhp()`: `(mode, is_valid, unit, target)`.
+    pub fn group_scan_mode(
+        raw_mode: i64,
+        days: i64,
+        messages: i64,
+    ) -> (i64, bool, &'static str, i64) {
+        if raw_mode == SCAN_DAYS {
+            (SCAN_DAYS, true, "days", days.clamp(1, SCAN_DAYS_MAX))
+        } else {
+            (
+                SCAN_POSTS,
+                raw_mode == SCAN_POSTS,
+                "posts",
+                messages.clamp(0, U32_MAX),
+            )
+        }
+    }
+
+    /// `TmuxBackfillMode::normalizeBackfillDispatchPhp()`:
+    /// `(mode, is_valid, enabled, command, group_count)`.
+    pub fn tmux_backfill_mode(
+        raw_mode: i64,
+        group_count: i64,
+    ) -> (i64, bool, bool, Option<&'static str>, i64) {
+        match raw_mode {
+            TMUX_BACKFILL_ALL => (
+                TMUX_BACKFILL_ALL,
+                true,
+                true,
+                Some("multiprocessing:backfill"),
+                group_count.clamp(1, U32_MAX),
+            ),
+            TMUX_BACKFILL_SAFE => (
+                TMUX_BACKFILL_SAFE,
+                true,
+                true,
+                Some("multiprocessing:safe backfill"),
+                1,
+            ),
+            _ => (
+                TMUX_BACKFILL_DISABLED,
+                raw_mode == TMUX_BACKFILL_DISABLED,
+                false,
+                None,
+                0,
+            ),
+        }
+    }
+
+    /// `TmuxCleanupRule::normalizeCleanupPatternPhp()`: `(rule, position)`; `None` when the input
+    /// embeds a wire marker byte.
+    pub fn cleanup_pattern(raw: &[u8]) -> Option<(Vec<u8>, Option<usize>)> {
+        if raw.contains(&FIELD_SEP) || raw.contains(&NULL_MARK) {
+            return None;
+        }
+        let start = raw
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(raw.len());
+        let end = raw
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        let rule = raw[start..end].to_ascii_lowercase();
+        let position = CLEANUP_RULES
+            .iter()
+            .position(|known| known.as_bytes() == rule.as_slice());
+        Some((rule, position))
+    }
+
+    /// `TmuxColorExclusion::normalizeExcludedColorCodePhp()`:
+    /// `(color, is_valid, in_palette, range_start, range_end)`.
+    pub fn excluded_color(
+        raw: i64,
+        colors_start: i64,
+        colors_end: i64,
+    ) -> (i64, bool, bool, i64, i64) {
+        let start = colors_start.clamp(0, COLOR_MAX);
+        let end = colors_end.clamp(0, COLOR_MAX);
+        let (low, high) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let color = raw.clamp(0, COLOR_MAX);
+        let is_valid = (0..=COLOR_MAX).contains(&raw);
+        (
+            color,
+            is_valid,
+            is_valid && (low..=high).contains(&color),
+            low,
+            high,
+        )
+    }
+
+    /// `BackfillDaysMode::normalizeModeSelection()`.
+    ///
+    /// # Safety
+    /// `out_buf` must be valid for writes of `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w35_backfill_days_mode_normalize(
+        raw_mode: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (mode, is_valid, group_target, safe_date) = backfill_days_mode(raw_mode);
+            let mode = mode.to_string();
+            let encoded = encode(&[
+                Some(mode.as_bytes()),
+                Some(bool_bytes(is_valid)),
+                Some(bool_bytes(group_target)),
+                Some(bool_bytes(safe_date)),
+            ]);
+            unsafe { write_bytes(&encoded, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `GroupScanMode::normalizeScanSelection()`.
+    ///
+    /// # Safety
+    /// `out_buf` must be valid for writes of `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w35_group_scan_mode_normalize(
+        raw_mode: i64,
+        days_to_scan: i64,
+        messages_to_scan: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (mode, is_valid, unit, target) =
+                group_scan_mode(raw_mode, days_to_scan, messages_to_scan);
+            let (mode, target) = (mode.to_string(), target.to_string());
+            let encoded = encode(&[
+                Some(mode.as_bytes()),
+                Some(bool_bytes(is_valid)),
+                Some(unit.as_bytes()),
+                Some(target.as_bytes()),
+            ]);
+            unsafe { write_bytes(&encoded, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `TmuxBackfillMode::normalizeBackfillDispatch()`.
+    ///
+    /// # Safety
+    /// `out_buf` must be valid for writes of `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w35_tmux_backfill_mode_normalize(
+        raw_mode: i64,
+        group_count: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (mode, is_valid, enabled, command, groups) =
+                tmux_backfill_mode(raw_mode, group_count);
+            let (mode, groups) = (mode.to_string(), groups.to_string());
+            let encoded = encode(&[
+                Some(mode.as_bytes()),
+                Some(bool_bytes(is_valid)),
+                Some(bool_bytes(enabled)),
+                command.map(str::as_bytes),
+                Some(groups.as_bytes()),
+            ]);
+            unsafe { write_bytes(&encoded, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `TmuxCleanupRule::normalizeCleanupPattern()`.
+    ///
+    /// # Safety
+    /// `input_ptr` must be valid for reads of `input_len` bytes and `out_buf` for writes of
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w35_tmux_cleanup_rule_normalize(
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            let Some((rule, position)) = cleanup_pattern(input) else {
+                return DECLINE;
+            };
+            let position = position.map(|p| p.to_string());
+            let encoded = encode(&[
+                Some(rule.as_slice()),
+                Some(bool_bytes(position.is_some())),
+                position.as_deref().map(str::as_bytes),
+            ]);
+            unsafe { write_bytes(&encoded, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `TmuxColorExclusion::normalizeExcludedColorCode()`.
+    ///
+    /// # Safety
+    /// `out_buf` must be valid for writes of `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w35_tmux_color_exclusion_normalize(
+        raw_color: i64,
+        colors_start: i64,
+        colors_end: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (color, is_valid, in_palette, low, high) =
+                excluded_color(raw_color, colors_start, colors_end);
+            let (color, low, high) = (color.to_string(), low.to_string(), high.to_string());
+            let encoded = encode(&[
+                Some(color.as_bytes()),
+                Some(bool_bytes(is_valid)),
+                Some(bool_bytes(in_palette)),
+                Some(low.as_bytes()),
+                Some(high.as_bytes()),
+            ]);
+            unsafe { write_bytes(&encoded, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+}
+
+#[cfg(test)]
+mod wave35_ingestion_tmux_enums_cleanup_models_tests {
+    use super::wave35_ingestion_tmux_enums_cleanup_models::*;
+
+    fn call(f: impl Fn(*mut u8, usize) -> isize) -> Vec<u8> {
+        let needed = f(std::ptr::NonNull::<u8>::dangling().as_ptr(), 0);
+        assert!(needed < -1, "unexpected {needed}");
+        let mut out = vec![0_u8; (-needed) as usize];
+        let written = f(out.as_mut_ptr(), out.len());
+        assert_eq!(written, out.len() as isize);
+        out
+    }
+
+    #[test]
+    fn enum_modes_normalize_like_php() {
+        assert_eq!(backfill_days_mode(1), (1, true, true, false));
+        assert_eq!(backfill_days_mode(2), (2, true, false, true));
+        assert_eq!(backfill_days_mode(0), (1, false, true, false));
+        assert_eq!(backfill_days_mode(i64::MIN), (1, false, true, false));
+
+        assert_eq!(group_scan_mode(1, 0, 5), (1, true, "days", 1));
+        assert_eq!(group_scan_mode(1, i64::MAX, 5), (1, true, "days", 36_500));
+        assert_eq!(group_scan_mode(0, 3, -5), (0, true, "posts", 0));
+        assert_eq!(
+            group_scan_mode(7, 3, i64::MAX),
+            (0, false, "posts", 4_294_967_295)
+        );
+
+        assert_eq!(
+            tmux_backfill_mode(1, 0),
+            (1, true, true, Some("multiprocessing:backfill"), 1)
+        );
+        assert_eq!(
+            tmux_backfill_mode(4, 99),
+            (4, true, true, Some("multiprocessing:safe backfill"), 1)
+        );
+        assert_eq!(tmux_backfill_mode(0, 99), (0, true, false, None, 0));
+        assert_eq!(tmux_backfill_mode(2, 99), (0, false, false, None, 0));
+    }
+
+    #[test]
+    fn cleanup_rules_and_colors_normalize_like_php() {
+        assert_eq!(
+            cleanup_pattern(b" Blacklist \n"),
+            Some((b"blacklist".to_vec(), Some(0)))
+        );
+        assert_eq!(
+            cleanup_pattern(b"\x0Ccodec"),
+            Some((b"\x0ccodec".to_vec(), None))
+        );
+        assert_eq!(
+            cleanup_pattern(b"CODEC\0"),
+            Some((b"codec".to_vec(), Some(13)))
+        );
+        assert_eq!(
+            cleanup_pattern("Ünïcode".as_bytes()),
+            Some(("Ünïcode".as_bytes().to_ascii_lowercase(), None))
+        );
+        assert_eq!(cleanup_pattern(b"a\x1Fb"), None);
+        assert_eq!(cleanup_pattern(b"\x1E"), None);
+
+        assert_eq!(excluded_color(5, 1, 250), (5, true, true, 1, 250));
+        assert_eq!(excluded_color(0, 1, 250), (0, true, false, 1, 250));
+        assert_eq!(excluded_color(300, 1, 250), (255, false, false, 1, 250));
+        assert_eq!(excluded_color(-1, 300, -9), (0, false, false, 0, 255));
+        assert_eq!(excluded_color(20, 40, 10), (20, true, true, 10, 40));
+    }
+
+    #[test]
+    fn exports_encode_fields_and_report_capacity() {
+        unsafe {
+            assert_eq!(
+                call(|o, c| nntmux_w35_backfill_days_mode_normalize(2, o, c)),
+                b"2\x1F1\x1F0\x1F1"
+            );
+            assert_eq!(
+                call(|o, c| nntmux_w35_group_scan_mode_normalize(1, 9, 1, o, c)),
+                b"1\x1F1\x1Fdays\x1F9"
+            );
+            assert_eq!(
+                call(|o, c| nntmux_w35_tmux_backfill_mode_normalize(9, 9, o, c)),
+                b"0\x1F0\x1F0\x1F\x1E\x1F0"
+            );
+            let rule = b" NZB ";
+            assert_eq!(
+                call(|o, c| nntmux_w35_tmux_cleanup_rule_normalize(
+                    rule.as_ptr(),
+                    rule.len(),
+                    o,
+                    c
+                )),
+                b"nzb\x1F1\x1F12"
+            );
+            assert_eq!(
+                call(|o, c| nntmux_w35_tmux_cleanup_rule_normalize(rule.as_ptr(), 0, o, c)),
+                b"\x1F0\x1F\x1E"
+            );
+            assert_eq!(
+                call(|o, c| nntmux_w35_tmux_color_exclusion_normalize(7, 1, 250, o, c)),
+                b"7\x1F1\x1F1\x1F1\x1F250"
+            );
+        }
+    }
+
+    #[test]
+    fn exports_decline_malformed_pointers_and_markers() {
+        let mut target = [0xab_u8; 64];
+        let marker = b"a\x1Fb";
+        unsafe {
+            assert_eq!(
+                nntmux_w35_backfill_days_mode_normalize(1, std::ptr::null_mut(), 64),
+                DECLINE
+            );
+            assert_eq!(
+                nntmux_w35_group_scan_mode_normalize(1, 1, 1, std::ptr::null_mut(), 64),
+                DECLINE
+            );
+            assert_eq!(
+                nntmux_w35_tmux_backfill_mode_normalize(1, 1, std::ptr::null_mut(), 64),
+                DECLINE
+            );
+            assert_eq!(
+                nntmux_w35_tmux_color_exclusion_normalize(1, 1, 1, std::ptr::null_mut(), 64),
+                DECLINE
+            );
+            assert_eq!(
+                nntmux_w35_tmux_cleanup_rule_normalize(
+                    std::ptr::null(),
+                    0,
+                    target.as_mut_ptr(),
+                    64
+                ),
+                DECLINE
+            );
+            assert_eq!(
+                nntmux_w35_tmux_cleanup_rule_normalize(
+                    marker.as_ptr(),
+                    marker.len(),
+                    target.as_mut_ptr(),
+                    64
+                ),
+                DECLINE
+            );
+            assert_eq!(
+                nntmux_w35_tmux_cleanup_rule_normalize(
+                    marker.as_ptr(),
+                    usize::MAX,
+                    target.as_mut_ptr(),
+                    64
+                ),
+                DECLINE
+            );
+            assert_eq!(
+                nntmux_w35_tmux_cleanup_rule_normalize(
+                    marker.as_ptr(),
+                    1,
+                    target.as_mut_ptr(),
+                    usize::MAX
+                ),
+                DECLINE
+            );
+            assert_eq!(
+                nntmux_w35_tmux_backfill_mode_normalize(1, 1, target.as_mut_ptr(), 3),
+                -32
+            );
+            assert!(target.iter().all(|byte| *byte == 0xab));
+        }
+    }
+}
