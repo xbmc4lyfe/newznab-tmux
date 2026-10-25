@@ -25042,3 +25042,316 @@ mod w326_installer_tests {
         assert_eq!(out, [0x5a; 128]);
     }
 }
+
+// Wave 33 Slice 33.6: verification lock and uptime CPU candidates.
+// The frame is a sequence of big-endian u32 lengths and uninterpreted byte strings.
+// Operation-specific field counts are strict; output is committed only after capacity checks.
+const W336_MAX_INPUT: usize = 64 * 1024 * 1024;
+
+fn w336_fields(mut input: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        let header: [u8; 4] = input.get(..4)?.try_into().ok()?;
+        let length = u32::from_be_bytes(header) as usize;
+        input = &input[4..];
+        fields.push(input.get(..length)?);
+        input = &input[length..];
+    }
+    input.is_empty().then_some(fields)
+}
+
+fn w336_frame(fields: &[&[u8]]) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    for field in fields {
+        let length = u32::try_from(field.len()).ok()?;
+        output.extend_from_slice(&length.to_be_bytes());
+        output.extend_from_slice(field);
+    }
+    Some(output)
+}
+
+fn w336_compute(
+    operation: u8,
+    input: &[u8],
+    first: i64,
+    second: i64,
+    value: f64,
+    flag: u8,
+) -> Option<Vec<u8>> {
+    if flag > 1 {
+        return None;
+    }
+    match operation {
+        1 => {
+            let fields = w336_fields(input, 2)?;
+            let digest = crate::metadata::candidate_inventory::sha256(fields[1]);
+            let mut path = fields[0].to_vec();
+            path.push(b'/');
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for byte in digest {
+                path.push(HEX[(byte >> 4) as usize]);
+                path.push(HEX[(byte & 15) as usize]);
+            }
+            path.extend_from_slice(b".lock");
+            w336_frame(&[&path])
+        }
+        2 => {
+            w336_fields(input, 0)?;
+            // Reject PHP's float-promoting overflow rather than silently saturating.
+            let offset = second.max(0).checked_mul(1_000_000_000)?;
+            let deadline = first.checked_add(offset)?.to_string();
+            w336_frame(&[deadline.as_bytes()])
+        }
+        3 => {
+            let fields = w336_fields(input, 1)?;
+            let timeout = first.max(0).to_string();
+            w336_frame(&[fields[0], timeout.as_bytes()])
+        }
+        4 => {
+            w336_fields(input, 0)?;
+            let depth = first.max(0);
+            let joined = depth > 0 || flag == 1;
+            let next = if joined { depth.checked_add(1)? } else { 0 }.to_string();
+            w336_frame(&[
+                if joined { b"1" } else { b"0" },
+                next.as_bytes(),
+                if depth == 0 { b"1" } else { b"0" },
+            ])
+        }
+        5 => {
+            let fields = w336_fields(input, 1)?;
+            // PHP/libc retains responsibility for non-finite, huge and tie rounding.
+            let scaled = value * 10.0;
+            if !value.is_finite()
+                || value.abs() >= 1e12
+                || ((scaled - scaled.trunc()).abs() - 0.5).abs() <= 1e-6
+            {
+                return None;
+            }
+            let mut message = b"Waiting for ".to_vec();
+            message.extend_from_slice(fields[0]);
+            // PHP sprintf drops the sign of an exact negative zero, but retains
+            // the sign when a small negative nonzero value rounds to zero.
+            let value = if value == 0.0 { 0.0 } else { value };
+            message.extend_from_slice(format!(" ({value:.1}s elapsed)...").as_bytes());
+            w336_frame(&[&message])
+        }
+        6 => {
+            let fields = w336_fields(input, 3)?;
+            let mut percentage = w306_number_format_2(value)?;
+            percentage.push(b'%');
+            w336_frame(&[
+                fields[0],
+                fields[1],
+                &percentage,
+                if flag == 1 { fields[2] } else { b"never" },
+            ])
+        }
+        _ => None,
+    }
+}
+
+/// Pure helpers only: no filesystem operations, clock reads or lock ownership changes.
+/// Returns the framed byte count, `-needed` on insufficient capacity, or `-1` on
+/// invalid/unsupported input. No output bytes are written on any negative return.
+///
+/// # Safety
+/// Non-null input/output pointers must address readable/writable allocations of
+/// their declared lengths. The caller owns both allocations for the whole call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w336_locks_uptime(
+    operation: u8,
+    input: *const u8,
+    input_len: usize,
+    first: i64,
+    second: i64,
+    value: f64,
+    flag: u8,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !add23_valid_out_buf(out, out_cap) {
+            return -1;
+        }
+        let Some(input) = (unsafe { add23_valid_slice(input, input_len, W336_MAX_INPUT) }) else {
+            return -1;
+        };
+        let Some(result) = w336_compute(operation, input, first, second, value, flag) else {
+            return -1;
+        };
+        unsafe { add23_write_slices(out, out_cap, &[&result], 1) }
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w336_locks_uptime_tests {
+    use super::*;
+
+    #[test]
+    fn contracts_keep_binary_fields_and_numeric_boundaries() {
+        let input = w336_frame(&[b"/locks", b"worker"]).unwrap();
+        let output = w336_compute(1, &input, 0, 0, 0.0, 0).unwrap();
+        let fields = w336_fields(&output, 1).unwrap();
+        assert_eq!(fields[0].len(), 76);
+        assert!(fields[0].starts_with(b"/locks/"));
+        assert!(fields[0].ends_with(b".lock"));
+        for (now, seconds, expected) in [
+            (100, 2, "2000000100"),
+            (-100, -1, "-100"),
+            (i64::MIN, 1, "-9223372035854775808"),
+            (i64::MAX, 0, "9223372036854775807"),
+        ] {
+            let output = w336_compute(2, b"", now, seconds, 0.0, 0).unwrap();
+            assert_eq!(w336_fields(&output, 1).unwrap(), [expected.as_bytes()]);
+        }
+        assert!(w336_compute(2, b"", i64::MAX, 1, 0.0, 0).is_none());
+        assert!(w336_compute(2, b"", 0, i64::MAX, 0.0, 0).is_none());
+        for timeout in [i64::MIN, -1, 0, 10, i64::MAX] {
+            let input = w336_frame(&[b" \0\xff"]).unwrap();
+            let output = w336_compute(3, &input, timeout, 0, 0.0, 0).unwrap();
+            assert_eq!(
+                w336_fields(&output, 2).unwrap(),
+                [b" \0\xff".as_slice(), timeout.max(0).to_string().as_bytes()]
+            );
+        }
+        for (depth, acquired, expected) in [
+            (0, 0, ["0", "0", "1"]),
+            (-1, 1, ["1", "1", "1"]),
+            (2, 0, ["1", "3", "0"]),
+        ] {
+            let output = w336_compute(4, b"", depth, 0, 0.0, acquired).unwrap();
+            assert_eq!(
+                w336_fields(&output, 3).unwrap(),
+                expected.map(str::as_bytes)
+            );
+        }
+        assert!(w336_compute(4, b"", i64::MAX, 0, 0.0, 1).is_none());
+        let input = w336_frame(&[b"git\0\xff"]).unwrap();
+        let output = w336_compute(5, &input, 0, 0, 1.24, 0).unwrap();
+        assert_eq!(
+            w336_fields(&output, 1).unwrap(),
+            [b"Waiting for git\0\xff (1.2s elapsed)...".as_slice()]
+        );
+        for (value, expected) in [(-0.0, "0.0"), (-0.04, "-0.0")] {
+            let output = w336_compute(5, &input, 0, 0, value, 0).unwrap();
+            let mut expected_message = b"Waiting for git\0\xff".to_vec();
+            expected_message.extend_from_slice(format!(" ({expected}s elapsed)...").as_bytes());
+            assert_eq!(w336_fields(&output, 1).unwrap(), [&expected_message[..]]);
+        }
+        let input = w336_frame(&[b"db\xff", b"up", b""]).unwrap();
+        for (value, flag, percentage, checked) in [
+            (1234.567, 0, "1,234.57%", "never"),
+            (-0.004, 1, "0.00%", ""),
+            (-12.346, 0, "-12.35%", "never"),
+        ] {
+            let output = w336_compute(6, &input, 0, 0, value, flag).unwrap();
+            assert_eq!(
+                w336_fields(&output, 4).unwrap(),
+                [
+                    b"db\xff".as_slice(),
+                    b"up",
+                    percentage.as_bytes(),
+                    checked.as_bytes()
+                ]
+            );
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, 1.005] {
+            assert!(w336_compute(6, &input, 0, 0, value, 0).is_none());
+        }
+    }
+
+    #[test]
+    fn ffi_rejects_invalid_input_and_never_partially_writes() {
+        let mut output = [0x5a; 256];
+        let input = w336_frame(&[b"worker"]).unwrap();
+        let call = |op, ptr, len, flag, out, cap| unsafe {
+            nntmux_w336_locks_uptime(op, ptr, len, 10, 0, 99.99, flag, out, cap)
+        };
+        assert_eq!(
+            call(3, std::ptr::null(), 0, 0, output.as_mut_ptr(), 256),
+            -1
+        );
+        assert_eq!(
+            call(3, input.as_ptr(), usize::MAX, 0, output.as_mut_ptr(), 256),
+            -1
+        );
+        assert_eq!(
+            call(3, input.as_ptr(), input.len(), 0, std::ptr::null_mut(), 256),
+            -1
+        );
+        assert_eq!(
+            call(
+                3,
+                input.as_ptr(),
+                input.len(),
+                0,
+                output.as_mut_ptr(),
+                usize::MAX
+            ),
+            -1
+        );
+        assert_eq!(
+            call(3, input.as_ptr(), input.len(), 2, output.as_mut_ptr(), 256),
+            -1
+        );
+        for len in 0..input.len() {
+            assert_eq!(
+                call(3, input.as_ptr(), len, 0, output.as_mut_ptr(), 256),
+                -1
+            );
+        }
+        let mut trailing = input.clone();
+        trailing.push(0);
+        assert_eq!(
+            call(
+                3,
+                trailing.as_ptr(),
+                trailing.len(),
+                0,
+                output.as_mut_ptr(),
+                256
+            ),
+            -1
+        );
+        for op in 0..=7 {
+            let fields: Vec<&[u8]> = match op {
+                1 => vec![b"/tmp", b"worker"],
+                3 | 5 => vec![b"worker"],
+                6 => vec![b"db", b"up", b""],
+                _ => vec![],
+            };
+            let input = w336_frame(&fields).unwrap();
+            let expected = w336_compute(op, &input, 10, 0, 99.99, 0);
+            if let Some(expected) = expected {
+                for cap in [0, 1, expected.len() - 1] {
+                    assert_eq!(
+                        call(op, input.as_ptr(), input.len(), 0, output.as_mut_ptr(), cap),
+                        -(expected.len() as isize)
+                    );
+                    assert_eq!(output, [0x5a; 256]);
+                }
+                assert_eq!(
+                    call(
+                        op,
+                        input.as_ptr(),
+                        input.len(),
+                        0,
+                        output.as_mut_ptr(),
+                        expected.len()
+                    ),
+                    expected.len() as isize
+                );
+                assert_eq!(&output[..expected.len()], expected);
+                output.fill(0x5a);
+            } else {
+                assert_eq!(
+                    call(op, input.as_ptr(), input.len(), 0, output.as_mut_ptr(), 256),
+                    -1
+                );
+            }
+        }
+        assert_eq!(output, [0x5a; 256]);
+    }
+}
