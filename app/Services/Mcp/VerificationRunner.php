@@ -6,6 +6,7 @@ namespace App\Services\Mcp;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
 use RecursiveDirectoryIterator;
@@ -394,5 +395,179 @@ class VerificationRunner
         $output = self::transformNative(8, self::encodeFrames([(string) count($planned), ...$planned, ...$allowed]));
 
         return is_string($output) ? self::decodeFrames($output) : null;
+    }
+
+    /** Wave 54.2 paired benchmarks decide this default; see RustMcpProcessProbeVerificationPlannerRunnerDbFpCollectorW54ParityTest. */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    private const string W54_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w542_verification_result_plan_batch(const char *names, size_t names_len, const char *statuses, size_t statuses_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 54 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w54', self::W54_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w54RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW54RustFfi(): bool
+    {
+        $enabled = self::w54RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planResultBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    /** The default `nntmux-mcp.check_profiles.targeted` checks runTargeted() falls back to. */
+    private const array W54_TARGETED_CHECKS = ['phpunit', 'pint', 'phpstan', 'php-lint', 'frontend', 'composer', 'diff'];
+
+    /**
+     * Batch result plan, as run() reduces check results to its status and truncated flag. One
+     * word per result: `flags | status code << 8 | crc32(name) << 32`. Status codes: 1 passed,
+     * 2 skipped, 3 failed, 4 timed_out, else 0. Flags: 1 failing (neither passed nor skipped),
+     * 2 truncated, 4 the name passes validFilterPhp(), 8 a default targeted check, 16 a `diff-`
+     * name. The run status (1 failed), whether any result is truncated, failing, skipped and
+     * passed counts, the distinct names and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $names
+     * @param  list<string>  $statuses
+     * @param  list<bool>  $truncated
+     * @return list<int>
+     */
+    public static function planResultBatch(array $names, array $statuses, array $truncated): array
+    {
+        return self::usesW54RustFfi()
+            ? self::planResultBatchNative($names, $statuses, $truncated)
+            : self::planResultBatchPhp($names, $statuses, $truncated);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @param  list<string>  $statuses
+     * @param  list<bool>  $truncated
+     * @return list<int>
+     */
+    public static function planResultBatchPhp(array $names, array $statuses, array $truncated): array
+    {
+        [$statuses, $truncated] = [array_values($statuses), array_values($truncated)];
+        $out = $distinct = [];
+        $failing = $skipped = $passed = $anyTruncated = 0;
+        foreach (array_values($names) as $i => $name) {
+            $status = $statuses[$i] ?? '';
+            $code = match ($status) {
+                'passed' => 1,
+                'skipped' => 2,
+                'failed' => 3,
+                'timed_out' => 4,
+                default => 0,
+            };
+            $fails = ! \in_array($status, ['passed', 'skipped'], true);
+            $cut = (bool) ($truncated[$i] ?? false);
+            $distinct[$name] = true;
+            $failing += (int) $fails;
+            $skipped += (int) ($code === 2);
+            $passed += (int) ($code === 1);
+            $anyTruncated |= (int) $cut;
+            $out[] = ($fails ? 1 : 0) | ($cut ? 2 : 0) | (self::validFilterPhp($name) ? 4 : 0)
+                | (\in_array($name, self::W54_TARGETED_CHECKS, true) ? 8 : 0) | (str_starts_with($name, 'diff-') ? 16 : 0)
+                | $code << 8 | crc32($name) << 32;
+        }
+        array_push($out, $failing > 0 ? 1 : 0, $anyTruncated, $failing, $skipped, $passed, \count($distinct));
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * are not lists, a name or status holds a NUL byte, or the PCRE backtrack limit could fail
+     * the filter pattern.
+     *
+     * @param  list<string>  $names
+     * @param  list<string>  $statuses
+     * @param  list<bool>  $truncated
+     * @return list<int>
+     */
+    public static function planResultBatchNative(array $names, array $statuses, array $truncated): array
+    {
+        $count = \count($names);
+        $words = $count + 7;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w54RustFfiState('out', $words);
+        if ($state === null || \count($statuses) !== $count || \count($truncated) !== $count
+            || ! array_is_list($names) || ! array_is_list($statuses) || ! array_is_list($truncated)) {
+            return self::planResultBatchPhp($names, $statuses, $truncated);
+        }
+        $joined = implode("\0", $names);
+        if ((int) ini_get('pcre.backtrack_limit') < \strlen($joined) + 16) {
+            return self::planResultBatchPhp($names, $statuses, $truncated);
+        }
+        $states = implode("\0", $statuses);
+        $ints = pack('P*', ...$truncated);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W54_FFI_CDEF.)
+            $written = $ffi->nntmux_w542_verification_result_plan_batch($joined, \strlen($joined), $states, \strlen($states), $ints, \strlen($ints), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planResultBatchPhp($names, $statuses, $truncated);
     }
 }
