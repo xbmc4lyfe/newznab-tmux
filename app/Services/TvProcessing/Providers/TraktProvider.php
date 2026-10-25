@@ -391,7 +391,7 @@ class TraktProvider extends AbstractTvProvider
     private const bool W49_RUST_FFI_DEFAULT = true;
 
     public const string W49_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w49_tv_trakt_ids_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        ssize_t nntmux_w49_tv_trakt_provider_ids_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
         C;
 
     private static ?bool $useW49RustFfi = null;
@@ -504,7 +504,7 @@ class TraktProvider extends AbstractTvProvider
                 $out = self::$w49Out = $ffi->new('int64_t['.self::$w49OutCap.']');
             }
             // @phpstan-ignore method.notFound (Declared by W49_FFI_CDEF.)
-            $written = $ffi->nntmux_w49_tv_trakt_ids_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w49OutCap);
+            $written = $ffi->nntmux_w49_tv_trakt_provider_ids_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w49OutCap);
             if ($written !== $need) {
                 return null;
             }
