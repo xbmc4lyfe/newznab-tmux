@@ -630,4 +630,116 @@ final class PartHandler
     {
         return ! empty($this->parts);
     }
+
+    /**
+     * PHP stays the default for summarizePartRowBatch(): the paired benchmark in
+     * tests/Unit/RustBinariesTransactionMissedPartBackfillW42ParityTest.php does not clear 1.5x.
+     */
+    public const bool W421_RUST_FFI_DEFAULT = false;
+
+    private const array W421_PART_KEYS = ['parts', 'invalid_rows', 'bad_binary', 'bad_part_number', 'bad_message_id', 'bad_size', 'duplicate_keys',
+        'unsorted', 'total_size'];
+
+    private static ?bool $w421UseRustFfi = null;
+
+    private static FFI|false|null $w421Ffi = null;
+
+    /**
+     * Summarizes pending part rows (`binaries_id`, `partnumber`, `messageid`, `size`): a binary id or part number that
+     * is not a positive int (or 1-18 digit string) is bad, a message id fails like validationErrorPhp() (not a string,
+     * or trim()med to '', over 255 bytes or not printable ASCII), and a size that is not a non-negative int is bad
+     * while other sizes add to the total (saturating at PHP_INT_MAX). Among rows with a valid (binary, part) key,
+     * repeated keys are duplicates and a key below the previous one is unsorted. Non-array rows are invalid.
+     *
+     * @param  array<array-key, mixed>  $parts
+     * @return array<string, int>
+     */
+    public static function summarizePartRowBatch(array $parts): array
+    {
+        return (self::usesW421RustFfi() ? self::summarizePartRowBatchNative($parts) : null)
+            ?? self::summarizePartRowBatchPhp($parts);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $parts
+     * @return array<string, int>
+     */
+    public static function summarizePartRowBatchPhp(array $parts): array
+    {
+        $summary = array_fill_keys(self::W421_PART_KEYS, 0);
+        $summary['parts'] = \count($parts);
+        $seen = [];
+        $previous = null;
+        foreach ($parts as $part) {
+            if (! \is_array($part)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $binary = BinariesService::w411Int($part['binaries_id'] ?? null);
+            $binary = $binary !== null && $binary > 0 ? $binary : null;
+            $partNumber = BinariesService::w411Int($part['partnumber'] ?? null);
+            $partNumber = $partNumber !== null && $partNumber > 0 ? $partNumber : null;
+            $summary['bad_binary'] += (int) ($binary === null);
+            $summary['bad_part_number'] += (int) ($partNumber === null);
+            $messageId = $part['messageid'] ?? null;
+            $messageId = \is_string($messageId) ? trim($messageId) : '';
+            $summary['bad_message_id'] += (int) ($messageId === '' || \strlen($messageId) > 255 || preg_match('/^[\x20-\x7E]+$/D', $messageId) !== 1);
+            $size = BinariesService::w411Int($part['size'] ?? null);
+            if ($size === null || $size < 0) {
+                $summary['bad_size']++;
+            } else {
+                $summary['total_size'] = HeaderStorageTransaction::w421SaturatingAdd($summary['total_size'], $size);
+            }
+            if ($binary === null || $partNumber === null) {
+                continue;
+            }
+            $key = $binary.':'.$partNumber;
+            $summary['duplicate_keys'] += (int) isset($seen[$key]);
+            $seen[$key] = true;
+            if ($previous !== null && ($binary < $previous[0] || ($binary === $previous[0] && $partNumber < $previous[1]))) {
+                $summary['unsorted']++;
+            }
+            $previous = [$binary, $partNumber];
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $parts
+     * @return array<string, int>|null
+     */
+    public static function summarizePartRowBatchNative(array $parts): ?array
+    {
+        $words = [\count($parts)];
+        $blob = [];
+        foreach ($parts as $part) {
+            if (\is_array($part)) {
+                BinariesService::w411PackRow($words, $blob, [$part['binaries_id'] ?? null, $part['partnumber'] ?? null, $part['messageid'] ?? null,
+                    $part['size'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = HeaderStorageTransaction::w421Invoke(self::$w421Ffi, 3, $words, $blob);
+
+        return $values !== null && \count($values) === \count(self::W421_PART_KEYS) ? array_combine(self::W421_PART_KEYS, $values) : null;
+    }
+
+    public static function useW421RustFfi(bool $enable = true): void
+    {
+        self::$w421UseRustFfi = $enable;
+    }
+
+    public static function usesW421RustFfi(): bool
+    {
+        return self::$w421UseRustFfi ?? self::W421_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW421RustFfi(): void
+    {
+        self::$w421UseRustFfi = null;
+        self::$w421Ffi = null;
+    }
 }

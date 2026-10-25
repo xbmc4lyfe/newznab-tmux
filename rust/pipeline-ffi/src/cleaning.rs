@@ -28791,3 +28791,620 @@ mod wave41_1_binaries_config_service_handler_header_tests {
         assert_eq!(&out[56..], &[0x5a; 8]);
     }
 }
+
+// Wave 42.1: second-pass summaries for header storage rollback cleanup plans, missed part repair
+// queues, pending part rows, backfill settings and backfill chunk plans. Frames use the Wave 39.1
+// encoding: an i64 word count, that many native-endian i64 words and a byte blob, with one
+// array/other marker per row followed by its values.
+pub mod wave42_1_binaries_transaction_missed_part_backfill {
+    use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    use super::php_trim_ascii;
+    use super::wave39_1_admin_regex_category_release_blacklist::{Frame, Value};
+
+    pub const DECLINE: isize = -1;
+    pub const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    pub const OP_CLEANUP_PLAN: u32 = 1;
+    pub const OP_MISSED_PARTS: u32 = 2;
+    pub const OP_PART_ROWS: u32 = 3;
+    pub const OP_BACKFILL_SETTINGS: u32 = 4;
+    pub const OP_BACKFILL_CHUNKS: u32 = 5;
+
+    fn with_total(count: usize, counts: &[i64]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(counts.len() + 1);
+        out.push(count as i64);
+        out.extend_from_slice(counts);
+        out
+    }
+
+    /// `ceil(count / size)` for a non-negative count and a positive size.
+    fn chunks(count: i64, size: i64) -> i64 {
+        count / size + i64::from(count % size != 0)
+    }
+
+    /// A non-negative int (or 1-18 digit string).
+    fn non_negative(value: Value) -> Option<i64> {
+        value.int().filter(|value| *value >= 0)
+    }
+
+    /// A positive int (or 1-18 digit string).
+    fn positive(value: Value) -> Option<i64> {
+        value.int().filter(|value| *value > 0)
+    }
+
+    /// `HeaderStorageTransaction::summarizeCleanupPlanBatchPhp()`.
+    fn cleanup_plan(frame: &mut Frame) -> Option<Vec<i64>> {
+        let size = frame.int()?.max(1);
+        let count = frame.count()?;
+        let mut counts = [0_i64; 7];
+        let [invalid, bad, inserted, all, hashes, noise, statements] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (b, i, a, h) = (
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+            );
+            let (Some(b), Some(i), Some(a), Some(h)) = (
+                non_negative(b),
+                non_negative(i),
+                non_negative(a),
+                non_negative(h),
+            ) else {
+                *bad += 1;
+                continue;
+            };
+            let collections = if i > 0 {
+                *inserted += 1;
+                chunks(i, size)
+            } else if a > 0 {
+                *all += 1;
+                chunks(a, size)
+            } else if h > 0 {
+                *hashes += 1;
+                chunks(h, size)
+            } else {
+                *noise += 1;
+                1
+            };
+            *statements = statements
+                .saturating_add(chunks(b, size).saturating_mul(2))
+                .saturating_add(collections.saturating_mul(3));
+        }
+        Some(with_total(count, &counts))
+    }
+
+    /// `MissedPartHandler::summarizeMissedPartBatchPhp()`.
+    fn missed_parts(frame: &mut Frame) -> Option<Vec<i64>> {
+        let max_tries = frame.int()?;
+        let count = frame.count()?;
+        let mut counts = [0_i64; 9];
+        let mut seen: HashSet<(i64, i64)> = HashSet::new();
+        let mut any = false;
+        let [
+            invalid,
+            bad_number,
+            bad_group,
+            bad_attempts,
+            exhausted,
+            retryable,
+            duplicates,
+            min,
+            max,
+        ] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (number, group, attempts) = (frame.value()?, frame.value()?, frame.value()?);
+            let (number, group) = (positive(number), positive(group));
+            *bad_number += i64::from(number.is_none());
+            *bad_group += i64::from(group.is_none());
+            match non_negative(attempts) {
+                Some(attempts) if attempts >= max_tries => *exhausted += 1,
+                Some(_) => *retryable += 1,
+                None => *bad_attempts += 1,
+            }
+            if let Some(number) = number {
+                if any {
+                    *min = (*min).min(number);
+                    *max = (*max).max(number);
+                } else {
+                    (*min, *max, any) = (number, number, true);
+                }
+                if let Some(group) = group {
+                    *duplicates += i64::from(!seen.insert((group, number)));
+                }
+            }
+        }
+        Some(with_total(count, &counts))
+    }
+
+    /// `PartHandler::validationErrorPhp()` message ids: trim()med, 1-255 bytes of printable ASCII.
+    pub fn valid_message_id(value: &[u8]) -> bool {
+        let trimmed = php_trim_ascii(value);
+        !trimmed.is_empty()
+            && trimmed.len() <= 255
+            && trimmed.iter().all(|byte| (0x20..=0x7e).contains(byte))
+    }
+
+    /// `PartHandler::summarizePartRowBatchPhp()`.
+    fn part_rows(frame: &mut Frame) -> Option<Vec<i64>> {
+        let count = frame.count()?;
+        let mut counts = [0_i64; 8];
+        let mut seen: HashSet<(i64, i64)> = HashSet::new();
+        let mut previous: Option<(i64, i64)> = None;
+        let [
+            invalid,
+            bad_binary,
+            bad_part,
+            bad_message,
+            bad_size,
+            duplicates,
+            unsorted,
+            total,
+        ] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (binary, part, message, size) = (
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+            );
+            let (binary, part) = (positive(binary), positive(part));
+            *bad_binary += i64::from(binary.is_none());
+            *bad_part += i64::from(part.is_none());
+            *bad_message += i64::from(!message.str().is_some_and(valid_message_id));
+            match non_negative(size) {
+                Some(size) => *total = total.saturating_add(size),
+                None => *bad_size += 1,
+            }
+            if let (Some(binary), Some(part)) = (binary, part) {
+                let key = (binary, part);
+                *duplicates += i64::from(!seen.insert(key));
+                *unsorted += i64::from(previous.is_some_and(|previous| key < previous));
+                previous = Some(key);
+            }
+        }
+        Some(with_total(count, &counts))
+    }
+
+    /// `preg_match('/^(\d{4})-(\d{2})-(\d{2})$/D')` followed by `checkdate()`.
+    pub fn valid_date(value: &[u8]) -> bool {
+        let digits = |range: std::ops::Range<usize>| {
+            value[range].iter().try_fold(0_i64, |acc, byte| {
+                byte.is_ascii_digit()
+                    .then(|| acc * 10 + i64::from(byte - b'0'))
+            })
+        };
+        if value.len() != 10 || value[4] != b'-' || value[7] != b'-' {
+            return false;
+        }
+        let (Some(year), Some(month), Some(day)) = (digits(0..4), digits(5..7), digits(8..10))
+        else {
+            return false;
+        };
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return false,
+        };
+        year >= 1 && (1..=days).contains(&day)
+    }
+
+    /// `BackfillConfig::summarizeBackfillSettingsBatchPhp()`.
+    fn backfill_settings(frame: &mut Frame) -> Option<Vec<i64>> {
+        let count = frame.count()?;
+        let mut counts = [0_i64; 7];
+        let [
+            invalid,
+            bad_date,
+            update,
+            backfill,
+            bad_mode,
+            compressed,
+            disable,
+        ] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (date, mode, compressed_headers, disable_group) = (
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+            );
+            *bad_date += i64::from(!date.str().is_some_and(valid_date));
+            match mode.str() {
+                Some(b"update") => *update += 1,
+                Some(b"backfill") => *backfill += 1,
+                _ => *bad_mode += 1,
+            }
+            *compressed += i64::from(compressed_headers.int().is_some_and(|v| v != 0));
+            *disable += i64::from(disable_group.int().is_some_and(|v| v != 0));
+        }
+        Some(with_total(count, &counts))
+    }
+
+    /// `BackfillService::summarizeBackfillChunkPlanBatchPhp()`.
+    fn backfill_chunks(frame: &mut Frame) -> Option<Vec<i64>> {
+        let size = frame.int()?.max(1);
+        let count = frame.count()?;
+        let mut counts = [0_i64; 7];
+        let [
+            invalid,
+            bad,
+            exhausted,
+            runnable,
+            total_chunks,
+            total_articles,
+            max_chunks,
+        ] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (first, target, oldest) = (frame.value()?, frame.value()?, frame.value()?);
+            let (Some(first), Some(target), Some(oldest)) = (
+                non_negative(first),
+                non_negative(target),
+                non_negative(oldest),
+            ) else {
+                *bad += 1;
+                continue;
+            };
+            if target >= first || first <= oldest {
+                *exhausted += 1;
+                continue;
+            }
+            *runnable += 1;
+            let articles = first - target.max(oldest);
+            let planned = chunks(articles, size);
+            *total_chunks = total_chunks.saturating_add(planned);
+            *total_articles = total_articles.saturating_add(articles);
+            *max_chunks = (*max_chunks).max(planned);
+        }
+        Some(with_total(count, &counts))
+    }
+
+    pub fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<u8>> {
+        if flags != 0 {
+            return None;
+        }
+        let mut frame = Frame::new(bytes)?;
+        let values = match operation {
+            OP_CLEANUP_PLAN => cleanup_plan(&mut frame)?,
+            OP_MISSED_PARTS => missed_parts(&mut frame)?,
+            OP_PART_ROWS => part_rows(&mut frame)?,
+            OP_BACKFILL_SETTINGS => backfill_settings(&mut frame)?,
+            OP_BACKFILL_CHUNKS => backfill_chunks(&mut frame)?,
+            _ => return None,
+        };
+        if !frame.done() || values.len().checked_mul(8)? > MAX_INPUT {
+            return None;
+        }
+        Some(values.iter().flat_map(|v| v.to_ne_bytes()).collect())
+    }
+
+    /// Returns bytes written, `-required` when `out_cap` is too small, or -1 for an unknown
+    /// operation, a nonzero flag word, a malformed frame, invalid/overlapping pointer ranges or a
+    /// caught panic. Negative returns never modify `out_buf`; the caller owns both buffers.
+    ///
+    /// # Safety
+    /// `input` must be readable for `input_len` bytes and `out_buf` writable for `out_cap`
+    /// bytes. Both pointers must be nonnull and the ranges must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w421_binaries_transaction_missed_part_backfill(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !(OP_CLEANUP_PLAN..=OP_BACKFILL_CHUNKS).contains(&operation)
+                || flags != 0
+                || input.is_null()
+                || out_buf.is_null()
+                || input_len > MAX_INPUT
+                || out_cap > isize::MAX as usize
+            {
+                return DECLINE;
+            }
+            let Some(input_end) = (input as usize).checked_add(input_len) else {
+                return DECLINE;
+            };
+            let Some(out_end) = (out_buf as usize).checked_add(out_cap) else {
+                return DECLINE;
+            };
+            if input_len != 0
+                && out_cap != 0
+                && (input as usize) < out_end
+                && (out_buf as usize) < input_end
+            {
+                return DECLINE;
+            }
+            let bytes = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(input, input_len) }
+            };
+            let Some(result) = compute(operation, flags, bytes) else {
+                return DECLINE;
+            };
+            if result.len() > out_cap {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+            result.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+}
+
+#[cfg(test)]
+mod wave42_1_binaries_transaction_missed_part_backfill_tests {
+    use super::wave39_1_admin_regex_category_release_blacklist::Value;
+    use super::wave42_1_binaries_transaction_missed_part_backfill::*;
+
+    #[derive(Default)]
+    struct Builder {
+        words: Vec<i64>,
+        blob: Vec<u8>,
+    }
+
+    impl Builder {
+        fn int(mut self, value: i64) -> Self {
+            self.words.push(value);
+            self
+        }
+
+        fn value(mut self, value: Value) -> Self {
+            match value {
+                Value::Other => self.words.push(-1),
+                Value::Int(v) => self.words.extend([-2, v]),
+                Value::Float(v) => {
+                    self.words.push(-3);
+                    self.blob.extend(v.to_ne_bytes());
+                }
+                Value::Str(s) => {
+                    self.words.push(s.len() as i64);
+                    self.blob.extend_from_slice(s);
+                }
+            }
+            self
+        }
+
+        fn row(self, fields: &[Value]) -> Self {
+            fields.iter().fold(self.int(1), |b, v| b.value(*v))
+        }
+
+        fn build(&self) -> Vec<u8> {
+            let mut out = (self.words.len() as i64).to_ne_bytes().to_vec();
+            out.extend(self.words.iter().flat_map(|w| w.to_ne_bytes()));
+            out.extend_from_slice(&self.blob);
+            out
+        }
+    }
+
+    fn run(operation: u32, builder: &Builder) -> Vec<i64> {
+        compute(operation, 0, &builder.build())
+            .expect("frame accepted")
+            .chunks(8)
+            .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    use Value::{Float, Int, Other, Str};
+
+    #[test]
+    fn w421_cleanup_plan_picks_strategies_and_counts_statements() {
+        let frame = Builder::default()
+            .int(500)
+            .int(7)
+            .row(&[Int(1_000), Int(501), Int(900), Int(3)])
+            .row(&[Str(b"0"), Int(0), Str(b"1"), Int(9)])
+            .row(&[Int(0), Int(0), Int(0), Int(2)])
+            .row(&[Int(0), Int(0), Int(0), Int(0)])
+            .row(&[Int(-1), Int(0), Int(0), Int(0)])
+            .row(&[Float(1.0), Int(0), Int(0), Int(0)])
+            .int(0);
+        // 2*2 + 3*2, 0 + 3, 0 + 3, 0 + 3.
+        assert_eq!(run(OP_CLEANUP_PLAN, &frame), [7, 1, 2, 1, 1, 1, 1, 19]);
+        let saturate =
+            Builder::default()
+                .int(0)
+                .int(1)
+                .row(&[Int(i64::MAX), Int(i64::MAX), Int(0), Int(0)]);
+        assert_eq!(
+            run(OP_CLEANUP_PLAN, &saturate),
+            [1, 0, 0, 1, 0, 0, 0, i64::MAX]
+        );
+    }
+
+    #[test]
+    fn w421_missed_parts_classify_attempts_and_duplicates() {
+        let frame = Builder::default()
+            .int(3)
+            .int(7)
+            .row(&[Int(100), Int(1), Int(0)])
+            .row(&[Str(b"100"), Str(b"1"), Str(b"3")])
+            .row(&[Int(100), Int(2), Int(5)])
+            .row(&[Int(0), Int(1), Int(-1)])
+            .row(&[Int(7), Other, Float(1.0)])
+            .row(&[Int(i64::MAX), Int(1), Int(2)])
+            .int(0);
+        assert_eq!(
+            run(OP_MISSED_PARTS, &frame),
+            [7, 1, 1, 1, 2, 2, 2, 1, 7, i64::MAX]
+        );
+        let none = Builder::default()
+            .int(0)
+            .int(1)
+            .row(&[Int(-5), Int(1), Int(0)]);
+        assert_eq!(run(OP_MISSED_PARTS, &none), [1, 0, 1, 0, 0, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn w421_message_ids_and_dates_match_php() {
+        assert!(valid_message_id(b"<a@b>"));
+        assert!(valid_message_id(b" \t<a b>\n\0"));
+        assert!(!valid_message_id(b" \x0b "));
+        assert!(!valid_message_id(b"<a\x0cb>"));
+        assert!(!valid_message_id(b"<a\x7fb>"));
+        assert!(!valid_message_id("<ä>".as_bytes()));
+        assert!(valid_message_id(&[b'a'; 255]));
+        assert!(!valid_message_id(&[b'a'; 256]));
+        assert!(valid_date(b"2012-08-14"));
+        assert!(valid_date(b"2024-02-29"));
+        assert!(valid_date(b"2000-02-29"));
+        assert!(!valid_date(b"1900-02-29"));
+        assert!(!valid_date(b"2023-02-29"));
+        assert!(!valid_date(b"2023-04-31"));
+        assert!(!valid_date(b"2023-13-01"));
+        assert!(!valid_date(b"2023-00-10"));
+        assert!(!valid_date(b"2023-01-00"));
+        assert!(!valid_date(b"0000-01-01"));
+        assert!(!valid_date(b"2023-1-01x"));
+        assert!(!valid_date(b"2023/01/01"));
+        assert!(!valid_date(b"2023-01-01\n"));
+        assert!(!valid_date(b""));
+    }
+
+    #[test]
+    fn w421_part_rows_flag_keys_order_and_sizes() {
+        let frame = Builder::default()
+            .int(7)
+            .row(&[Int(2), Int(1), Str(b"<a@b>"), Int(100)])
+            .row(&[Int(1), Int(5), Str(b" <c@d> "), Str(b"20")])
+            .row(&[Str(b"1"), Str(b"5"), Str(b""), Int(-1)])
+            .row(&[Int(0), Int(3), Other, Float(1.0)])
+            .row(&[Int(3), Int(1), Str(b"<\x01>"), Int(i64::MAX)])
+            .row(&[Int(3), Int(0), Str(b"<e@f>"), Int(0)])
+            .int(0);
+        assert_eq!(
+            run(OP_PART_ROWS, &frame),
+            [7, 1, 1, 1, 3, 2, 1, 1, i64::MAX]
+        );
+    }
+
+    #[test]
+    fn w421_backfill_settings_count_modes_and_flags() {
+        let frame = Builder::default()
+            .int(6)
+            .row(&[Str(b"2012-08-14"), Str(b"backfill"), Int(1), Int(0)])
+            .row(&[Str(b"2012-02-30"), Str(b"update"), Str(b"0"), Str(b"7")])
+            .row(&[Other, Str(b"Update"), Other, Float(1.0)])
+            .row(&[Str(b"1999-12-31"), Int(1), Int(-3), Int(1)])
+            .row(&[Str(b"2012-08-14 "), Str(b"backfill"), Str(b"x"), Str(b"1")])
+            .int(0);
+        assert_eq!(run(OP_BACKFILL_SETTINGS, &frame), [6, 1, 3, 1, 2, 2, 2, 3]);
+    }
+
+    #[test]
+    fn w421_backfill_chunks_plan_ranges() {
+        let frame = Builder::default()
+            .int(100)
+            .int(8)
+            .row(&[Int(1_000), Int(500), Int(0)])
+            .row(&[Str(b"1000"), Str(b"0"), Str(b"950")])
+            .row(&[Int(1_000), Int(1_000), Int(0)])
+            .row(&[Int(1_000), Int(10), Int(1_000)])
+            .row(&[Int(-1), Int(0), Int(0)])
+            .row(&[Int(i64::MAX), Int(0), Int(0)])
+            .row(&[Int(5), Other, Int(0)])
+            .int(0);
+        let big = i64::MAX / 100 + 1;
+        assert_eq!(
+            run(OP_BACKFILL_CHUNKS, &frame),
+            [8, 1, 2, 2, 3, 5 + 1 + big, i64::MAX, big]
+        );
+        let tiny = Builder::default()
+            .int(-5)
+            .int(1)
+            .row(&[Int(3), Int(0), Int(0)]);
+        assert_eq!(run(OP_BACKFILL_CHUNKS, &tiny), [1, 0, 0, 0, 1, 3, 3, 3]);
+    }
+
+    #[test]
+    fn w421_malformed_frames_decline() {
+        let empty = Builder::default().int(0).build();
+        for operation in [0, 6, u32::MAX] {
+            assert!(compute(operation, 0, &empty).is_none());
+        }
+        assert!(compute(OP_PART_ROWS, 1, &empty).is_none());
+        assert!(compute(OP_PART_ROWS, 0, &[]).is_none());
+        assert!(compute(OP_PART_ROWS, 0, &i64::MAX.to_ne_bytes()).is_none());
+        assert!(compute(OP_PART_ROWS, 0, &Builder::default().int(-1).build()).is_none());
+        assert!(compute(OP_PART_ROWS, 0, &Builder::default().int(2).int(0).build()).is_none());
+        assert!(compute(OP_PART_ROWS, 0, &Builder::default().int(1).int(2).build()).is_none());
+        let mut trailing = empty.clone();
+        trailing.push(0);
+        assert!(compute(OP_PART_ROWS, 0, &trailing).is_none());
+        let short = Builder::default().int(1).int(1).int(5).int(-1).build();
+        assert!(compute(OP_BACKFILL_SETTINGS, 0, &short).is_none());
+        let bad_tag = Builder::default().int(1).int(1).int(-9).int(-1).build();
+        assert!(compute(OP_BACKFILL_SETTINGS, 0, &bad_tag).is_none());
+        assert!(compute(OP_MISSED_PARTS, 0, &empty).is_none());
+        assert!(compute(OP_PART_ROWS, 0, &empty).is_some());
+    }
+
+    #[test]
+    fn w421_export_validates_pointers_and_capacity_without_partial_writes() {
+        let input = Builder::default().int(0).build();
+        let call = |op, flags, ptr, len, out, cap| unsafe {
+            nntmux_w421_binaries_transaction_missed_part_backfill(op, flags, ptr, len, out, cap)
+        };
+        let mut out = [0x5a_u8; 80];
+        let (ptr, len) = (input.as_ptr(), input.len());
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), 71), -72);
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), 0), -72);
+        assert_eq!(call(0, 0, ptr, len, out.as_mut_ptr(), 80), DECLINE);
+        assert_eq!(call(6, 0, ptr, len, out.as_mut_ptr(), 80), DECLINE);
+        assert_eq!(call(3, 1, ptr, len, out.as_mut_ptr(), 80), DECLINE);
+        assert_eq!(
+            call(3, 0, std::ptr::null(), len, out.as_mut_ptr(), 80),
+            DECLINE
+        );
+        assert_eq!(call(3, 0, ptr, len, std::ptr::null_mut(), 80), DECLINE);
+        assert_eq!(
+            call(3, 0, ptr, MAX_INPUT + 1, out.as_mut_ptr(), 80),
+            DECLINE
+        );
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), usize::MAX), DECLINE);
+        assert_eq!(
+            call(3, 0, usize::MAX as *const u8, 16, out.as_mut_ptr(), 80),
+            DECLINE
+        );
+        assert_eq!(call(3, 0, ptr, len, usize::MAX as *mut u8, 80), DECLINE);
+        assert_eq!(call(3, 0, ptr, len - 1, out.as_mut_ptr(), 80), DECLINE);
+        assert_eq!(out, [0x5a; 80]);
+        let mut overlapping = input.clone();
+        let overlap_ptr = overlapping.as_mut_ptr();
+        assert_eq!(call(3, 0, overlap_ptr, len, overlap_ptr, 80), DECLINE);
+        assert_eq!(overlapping, input);
+
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), 80), 72);
+        assert_eq!(&out[..72], &[0_u8; 72][..]);
+        assert_eq!(&out[72..], &[0x5a; 8]);
+    }
+}

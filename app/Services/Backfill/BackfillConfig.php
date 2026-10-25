@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Backfill;
 
+use App\Services\Binaries\BinariesService;
+use App\Services\Binaries\HeaderStorageTransaction;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Support\RustPipelineLibrary;
 use FFI;
@@ -142,5 +144,122 @@ final readonly class BackfillConfig
     public static function useRustFfi(bool $enabled): void
     {
         self::rustEnabled($enabled);
+    }
+
+    /**
+     * PHP stays the default for summarizeBackfillSettingsBatch(): the paired benchmark in
+     * tests/Unit/RustBinariesTransactionMissedPartBackfillW42ParityTest.php does not clear 1.5x.
+     */
+    public const bool W421_RUST_FFI_DEFAULT = false;
+
+    private const array W421_SETTINGS_KEYS = ['configs', 'invalid_rows', 'bad_date', 'update_mode', 'backfill_mode', 'bad_mode', 'compressed',
+        'disable_group'];
+
+    /**
+     * Summarizes candidate backfill settings rows (`safeBackFillDate`, `safePartRepair`, `compressedHeaders`,
+     * `disableBackfillGroup`): a date that is not a `YYYY-MM-DD` string passing checkdate() is bad, a repair mode other
+     * than exactly 'update' or 'backfill' is bad, and a flag is set when it is true or a nonzero int (or 1-18 digit
+     * string). Non-array rows are invalid.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeBackfillSettingsBatch(array $rows): array
+    {
+        return (self::usesW421RustFfi() ? self::summarizeBackfillSettingsBatchNative($rows) : null)
+            ?? self::summarizeBackfillSettingsBatchPhp($rows);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeBackfillSettingsBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W421_SETTINGS_KEYS, 0);
+        $summary['configs'] = count($rows);
+        foreach ($rows as $row) {
+            if (! is_array($row)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $date = $row['safeBackFillDate'] ?? null;
+            $summary['bad_date'] += (int) ! (is_string($date) && preg_match('/^(\d{4})-(\d{2})-(\d{2})$/D', $date, $parts) === 1
+                && checkdate((int) $parts[2], (int) $parts[3], (int) $parts[1]));
+            $mode = $row['safePartRepair'] ?? null;
+            if ($mode === 'update') {
+                $summary['update_mode']++;
+            } elseif ($mode === 'backfill') {
+                $summary['backfill_mode']++;
+            } else {
+                $summary['bad_mode']++;
+            }
+            foreach (['compressedHeaders' => 'compressed', 'disableBackfillGroup' => 'disable_group'] as $field => $key) {
+                $flag = $row[$field] ?? null;
+                $summary[$key] += (int) ($flag === true || (($value = BinariesService::w411Int($flag)) !== null && $value !== 0));
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>|null
+     */
+    public static function summarizeBackfillSettingsBatchNative(array $rows): ?array
+    {
+        $words = [count($rows)];
+        $blob = [];
+        foreach ($rows as $row) {
+            if (is_array($row)) {
+                $compressed = $row['compressedHeaders'] ?? null;
+                $disable = $row['disableBackfillGroup'] ?? null;
+                BinariesService::w411PackRow($words, $blob, [$row['safeBackFillDate'] ?? null, $row['safePartRepair'] ?? null,
+                    is_bool($compressed) ? (int) $compressed : $compressed, is_bool($disable) ? (int) $disable : $disable]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = HeaderStorageTransaction::w421Invoke(self::w421FfiSlot(), 4, $words, $blob);
+
+        return $values !== null && count($values) === count(self::W421_SETTINGS_KEYS) ? array_combine(self::W421_SETTINGS_KEYS, $values) : null;
+    }
+
+    public static function useW421RustFfi(bool $enable = true): void
+    {
+        self::w421ToggleState($enable, true);
+    }
+
+    public static function usesW421RustFfi(): bool
+    {
+        return self::w421ToggleState() ?? self::W421_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW421RustFfi(): void
+    {
+        self::w421ToggleState(null, true);
+        $slot = &self::w421FfiSlot();
+        $slot = null;
+    }
+
+    private static function w421ToggleState(?bool $next = null, bool $write = false): ?bool
+    {
+        // Readonly classes cannot declare static properties.
+        static $useRustFfi = null;
+        if ($write) {
+            $useRustFfi = $next;
+        }
+
+        return $useRustFfi;
+    }
+
+    /** The cached Wave 42.1 library handle, by reference (readonly classes cannot declare static properties). */
+    private static function &w421FfiSlot(): FFI|false|null
+    {
+        static $ffi = null;
+
+        return $ffi;
     }
 }
