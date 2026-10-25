@@ -592,4 +592,110 @@ final class BinaryHandler
 
         return md5('subject:'.mb_strtolower(trim($subject))."\0poster:".mb_strtolower(trim($poster)));
     }
+
+    /**
+     * PHP stays the default for summarizeBinaryRecordBatch(): the paired benchmark in
+     * tests/Unit/RustBinariesConfigServiceHandlerHeaderW41ParityTest.php does not clear 1.5x.
+     */
+    public const bool W411_RUST_FFI_DEFAULT = false;
+
+    private const array W411_RECORD_KEYS = ['records', 'invalid_rows', 'bad_hash', 'bad_collection', 'duplicate_keys', 'file_over_total', 'total_parts'];
+
+    private static ?bool $w411UseRustFfi = null;
+
+    private static \FFI|false|null $w411Ffi = null;
+
+    /**
+     * Summarizes pending binary rows (`hash`, `collections_id`, `totalparts`, `filenumber`): a hash that is not a
+     * 32-character lowercase hex string is bad, a collection id that is not a positive int (or 1-18 digit string) is
+     * bad, and rows with both repeat an earlier row's collection/hash key as duplicates. A file number above a positive
+     * part total is flagged, and positive part totals add to the total (saturating at PHP_INT_MAX); non-array rows are
+     * invalid.
+     *
+     * @param  array<array-key, mixed>  $records
+     * @return array<string, int>
+     */
+    public static function summarizeBinaryRecordBatch(array $records): array
+    {
+        return (self::usesW411RustFfi() ? self::summarizeBinaryRecordBatchNative($records) : null)
+            ?? self::summarizeBinaryRecordBatchPhp($records);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $records
+     * @return array<string, int>
+     */
+    public static function summarizeBinaryRecordBatchPhp(array $records): array
+    {
+        $summary = array_fill_keys(self::W411_RECORD_KEYS, 0);
+        $summary['records'] = \count($records);
+        $seen = [];
+        foreach ($records as $record) {
+            if (! \is_array($record)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $hash = $record['hash'] ?? null;
+            $hashOk = \is_string($hash) && \strlen($hash) === 32 && strspn($hash, '0123456789abcdef') === 32;
+            $collection = BinariesService::w411Int($record['collections_id'] ?? null);
+            $collectionOk = $collection !== null && $collection > 0;
+            $summary['bad_hash'] += (int) ! $hashOk;
+            $summary['bad_collection'] += (int) ! $collectionOk;
+            if ($hashOk && $collectionOk) {
+                $key = $collection.':'.$hash;
+                if (isset($seen[$key])) {
+                    $summary['duplicate_keys']++;
+                } else {
+                    $seen[$key] = true;
+                }
+            }
+            $parts = BinariesService::w411Int($record['totalparts'] ?? null);
+            $number = BinariesService::w411Int($record['filenumber'] ?? null);
+            $summary['file_over_total'] += (int) ($parts !== null && $number !== null && $parts > 0 && $number > $parts);
+            if ($parts !== null && $parts > 0) {
+                $total = $summary['total_parts'];
+                $summary['total_parts'] = $parts > PHP_INT_MAX - $total ? PHP_INT_MAX : $total + $parts;
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $records
+     * @return array<string, int>|null
+     */
+    public static function summarizeBinaryRecordBatchNative(array $records): ?array
+    {
+        $words = [\count($records)];
+        $blob = [];
+        foreach ($records as $record) {
+            if (\is_array($record)) {
+                BinariesService::w411PackRow($words, $blob, [$record['hash'] ?? null, $record['collections_id'] ?? null,
+                    $record['totalparts'] ?? null, $record['filenumber'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = BinariesService::w411Invoke(self::$w411Ffi, 3, $words, $blob);
+
+        return $values !== null && \count($values) === \count(self::W411_RECORD_KEYS) ? array_combine(self::W411_RECORD_KEYS, $values) : null;
+    }
+
+    public static function useW411RustFfi(bool $enable = true): void
+    {
+        self::$w411UseRustFfi = $enable;
+    }
+
+    public static function usesW411RustFfi(): bool
+    {
+        return self::$w411UseRustFfi ?? self::W411_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW411RustFfi(): void
+    {
+        self::$w411UseRustFfi = null;
+        self::$w411Ffi = null;
+    }
 }
