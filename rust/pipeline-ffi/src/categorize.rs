@@ -26124,3 +26124,707 @@ pub mod categorization_providers_events_inform {
         }
     }
 }
+/// Wave 36.3: pure classification helpers for the release-verification exceptions
+/// `CandidateMetadataBudgetExceeded`, `ArticleBudgetExceeded`, `ArticleIntegrityFailure`,
+/// `CandidateAdmissionDeferredException` and `LeaseLostException`.
+///
+/// Outputs are `0x1F`-separated fields. Caller strings are emitted last (the lease key is
+/// length-prefixed) so they may contain any byte. Unknown flag bits, null pointers, oversized
+/// inputs and text for an absent string decline with `-1` so PHP keeps its own implementation.
+/// A result that does not fit returns `-required` without touching `out_buf`.
+pub mod verification_budget_integrity_exceptions {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    /// Bytes that may not appear in a valid message id (besides the single `@`).
+    const MESSAGE_ID_FORBIDDEN: &[u8] = b" \t\n\r\x0B\x0C\0<>";
+    const CRC_MAX: i64 = 0xFFFF_FFFF;
+    const PERCENT_CAP: i64 = 1000;
+    const DEFAULT_RETRY_DELAY_MS: i64 = 1_000;
+    const MAX_RETRY_DELAY_MS: i64 = 300_000;
+    const QUEUE_BACKOFF_CAP: i64 = 1_000;
+    const QUEUE_BACKOFF_STEP_MS: i64 = 10;
+    const LEASE_TOKEN_MAX: usize = 128;
+
+    const HAS_MESSAGE_ID: u32 = 1;
+    const HAS_CANDIDATE_KEY: u32 = 1;
+    const HAS_OWNER_TOKEN: u32 = 2;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    /// An optional caller string: absent strings must have zero length (the pointer may be null).
+    unsafe fn optional_slice<'a>(
+        present: bool,
+        ptr: *const u8,
+        len: usize,
+    ) -> Option<Option<&'a [u8]>> {
+        if present {
+            unsafe { valid_slice(ptr, len) }.map(Some)
+        } else if len == 0 {
+            Some(None)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    /// Field writer; every encoding has many fields, so a one-byte result (which would collide
+    /// with DECLINE as "needs one byte") is impossible.
+    struct Fields(Vec<u8>);
+
+    impl Fields {
+        fn new() -> Self {
+            Fields(Vec::with_capacity(160))
+        }
+
+        fn raw(&mut self, value: &[u8]) -> &mut Self {
+            if !self.0.is_empty() {
+                self.0.push(FIELD_SEP);
+            }
+            self.0.extend_from_slice(value);
+            self
+        }
+
+        fn int(&mut self, value: i64) -> &mut Self {
+            self.raw(value.to_string().as_bytes())
+        }
+
+        fn flag(&mut self, value: bool) -> &mut Self {
+            self.raw(if value { b"1" } else { b"0" })
+        }
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")` on bytes.
+    fn trim_ws(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// `min(1000, consumed * 100 / budget)` without overflow, matching the PHP integer formula.
+    pub fn usage_percent(consumed: i64, budget: i64) -> i64 {
+        if budget == 0 {
+            return 0;
+        }
+        let percent = if consumed > i64::MAX / 100 {
+            consumed / (budget / 100).max(1)
+        } else {
+            consumed * 100 / budget
+        };
+        percent.min(PERCENT_CAP)
+    }
+
+    /// `CandidateMetadataBudgetExceeded::summarizeBudgetOverrunPhp()`.
+    pub fn metadata_budget(consumed: i64, budget: i64, files: i64, max_files: i64) -> Vec<u8> {
+        let (consumed, budget, files, max_files) = (
+            consumed.max(0),
+            budget.max(0),
+            files.max(0),
+            max_files.max(0),
+        );
+        let bytes_exceeded = budget > 0 && consumed > budget;
+        let files_exceeded = max_files > 0 && files > max_files;
+        let reason: &[u8] = match (bytes_exceeded, files_exceeded) {
+            (true, true) => b"bytes_and_files",
+            (true, false) => b"bytes",
+            (false, true) => b"files",
+            (false, false) => b"within_budget",
+        };
+        let mut out = Fields::new();
+        out.int(consumed)
+            .int(budget)
+            .int(files)
+            .int(max_files)
+            .flag(bytes_exceeded)
+            .flag(files_exceeded)
+            .int(if bytes_exceeded { consumed - budget } else { 0 })
+            .int(if files_exceeded { files - max_files } else { 0 })
+            .int(usage_percent(consumed, budget))
+            .raw(reason)
+            .flag(bytes_exceeded || files_exceeded);
+        out.0
+    }
+
+    /// `ArticleBudgetExceeded::summarizeArticleBudgetOverrunPhp()`.
+    pub fn article_budget(articles: i64, max_articles: i64, bytes: i64, max_bytes: i64) -> Vec<u8> {
+        let (articles, max_articles, bytes, max_bytes) = (
+            articles.max(0),
+            max_articles.max(0),
+            bytes.max(0),
+            max_bytes.max(0),
+        );
+        let articles_exceeded = max_articles > 0 && articles > max_articles;
+        let bytes_exceeded = max_bytes > 0 && bytes > max_bytes;
+        let remaining = |used: i64, limit: i64| if limit > 0 { (limit - used).max(0) } else { -1 };
+        let reason: &[u8] = match (articles_exceeded, bytes_exceeded) {
+            (true, true) => b"articles_and_bytes",
+            (true, false) => b"articles",
+            (false, true) => b"bytes",
+            (false, false) => b"within_budget",
+        };
+        let exceeded = articles_exceeded || bytes_exceeded;
+        let mut out = Fields::new();
+        out.int(articles)
+            .int(max_articles)
+            .int(bytes)
+            .int(max_bytes)
+            .flag(articles_exceeded)
+            .flag(bytes_exceeded)
+            .int(if articles_exceeded {
+                articles - max_articles
+            } else {
+                0
+            })
+            .int(if bytes_exceeded { bytes - max_bytes } else { 0 })
+            .int(remaining(articles, max_articles))
+            .int(remaining(bytes, max_bytes))
+            .raw(reason)
+            .flag(exceeded)
+            .flag(!exceeded);
+        out.0
+    }
+
+    /// Trimmed message id with one surrounding `<...>` pair removed; `None` when empty.
+    fn normalize_message_id(raw: &[u8]) -> Option<&[u8]> {
+        let mut id = trim_ws(raw);
+        if id.len() >= 2 && id[0] == b'<' && id[id.len() - 1] == b'>' {
+            id = &id[1..id.len() - 1];
+        }
+        (!id.is_empty()).then_some(id)
+    }
+
+    /// One `@` with text on both sides and no whitespace, NUL or angle brackets.
+    fn is_valid_message_id(id: &[u8]) -> bool {
+        let mut ats = id.iter().enumerate().filter(|&(_, &b)| b == b'@');
+        let Some((at, _)) = ats.next() else {
+            return false;
+        };
+        ats.next().is_none()
+            && at > 0
+            && at + 1 < id.len()
+            && !id.iter().any(|b| MESSAGE_ID_FORBIDDEN.contains(b))
+    }
+
+    /// `ArticleIntegrityFailure::classifyIntegrityFailurePhp()`; the message id is the last field.
+    pub fn integrity(
+        message_id: Option<&[u8]>,
+        expected: i64,
+        actual: i64,
+        decoded: i64,
+    ) -> Vec<u8> {
+        let id = message_id.and_then(normalize_message_id);
+        let in_range = (0..=CRC_MAX).contains(&expected) && (0..=CRC_MAX).contains(&actual);
+        let (expected, actual) = (expected & CRC_MAX, actual & CRC_MAX);
+        let decoded = decoded.max(0);
+        let crc_match = expected == actual;
+        let kind: &[u8] = if decoded == 0 {
+            b"empty_payload"
+        } else if !in_range {
+            b"invalid_crc"
+        } else if !crc_match {
+            b"crc_mismatch"
+        } else {
+            b"none"
+        };
+        let mut out = Fields::new();
+        out.int(expected)
+            .int(actual)
+            .raw(format!("{expected:08x}").as_bytes())
+            .raw(format!("{actual:08x}").as_bytes())
+            .flag(in_range)
+            .flag(crc_match)
+            .int(decoded)
+            .raw(kind)
+            .flag(kind != b"none")
+            .flag(kind == b"crc_mismatch" || kind == b"empty_payload")
+            .flag(id.is_some())
+            .flag(id.is_some_and(is_valid_message_id))
+            .raw(id.unwrap_or_default());
+        out.0
+    }
+
+    /// `CandidateAdmissionDeferredException::summarizeDeferralPolicyPhp()`.
+    pub fn deferral(active: i64, max_workers: i64, depth: i64, retry_delay: i64) -> Vec<u8> {
+        let (active, max_workers, depth) = (active.max(0), max_workers.max(0), depth.max(0));
+        let available = (max_workers - active).max(0);
+        let saturated = available == 0;
+        let clamped = retry_delay <= 0 || retry_delay > MAX_RETRY_DELAY_MS;
+        let base = if retry_delay <= 0 {
+            DEFAULT_RETRY_DELAY_MS
+        } else {
+            retry_delay.min(MAX_RETRY_DELAY_MS)
+        };
+        let delay = if saturated {
+            (base + depth.min(QUEUE_BACKOFF_CAP) * QUEUE_BACKOFF_STEP_MS).min(MAX_RETRY_DELAY_MS)
+        } else {
+            base
+        };
+        let pressure: &[u8] = match (saturated, active == 0 && depth == 0, depth > 0) {
+            (false, true, _) => b"idle",
+            (false, false, _) => b"available",
+            (true, _, true) => b"backlogged",
+            (true, _, false) => b"saturated",
+        };
+        let mut out = Fields::new();
+        out.int(active)
+            .int(max_workers)
+            .int(depth)
+            .int(available)
+            .flag(saturated)
+            .flag(saturated)
+            .int(delay)
+            .flag(clamped)
+            .raw(pressure);
+        out.0
+    }
+
+    /// `LeaseLostException::classifyLeaseLossPhp()`; ends with the key length, key and token.
+    pub fn lease_loss(key: Option<&[u8]>, token: Option<&[u8]>, elapsed: i64, ttl: i64) -> Vec<u8> {
+        let key = key.map(trim_ws).filter(|k| !k.is_empty());
+        let token = token.map(trim_ws).filter(|t| !t.is_empty());
+        let token_valid = token.is_some_and(|t| {
+            t.len() <= LEASE_TOKEN_MAX
+                && t.iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+        let (elapsed, ttl) = (elapsed.max(0), ttl.max(0));
+        let expired = ttl > 0 && elapsed >= ttl;
+        let reason: &[u8] = if key.is_none() {
+            b"missing_candidate"
+        } else if token.is_none() {
+            b"missing_owner"
+        } else if !token_valid {
+            b"invalid_owner"
+        } else if expired {
+            b"expired"
+        } else {
+            b"stolen"
+        };
+        let key_bytes = key.unwrap_or_default();
+        let mut out = Fields::new();
+        out.flag(key.is_some())
+            .flag(token.is_some())
+            .flag(token_valid)
+            .int(elapsed)
+            .int(ttl)
+            .flag(expired)
+            .int(if expired { elapsed - ttl } else { 0 })
+            .int(if ttl > 0 { (ttl - elapsed).max(0) } else { 0 })
+            .raw(reason)
+            .flag(expired)
+            .int(key_bytes.len() as i64)
+            .raw(key_bytes)
+            .raw(token.unwrap_or_default());
+        out.0
+    }
+
+    /// # Safety
+    /// `out_buf` must be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_candidate_metadata_budget_summarize(
+        consumed_bytes: i64,
+        budget_bytes: i64,
+        file_count: i64,
+        max_files: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let bytes = metadata_budget(consumed_bytes, budget_bytes, file_count, max_files);
+            unsafe { write_bytes(&bytes, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `out_buf` must be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_article_budget_summarize(
+        articles_read: i64,
+        max_articles: i64,
+        bytes_read: i64,
+        max_bytes: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let bytes = article_budget(articles_read, max_articles, bytes_read, max_bytes);
+            unsafe { write_bytes(&bytes, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `id_ptr` must be valid for `id_len` readable bytes when `HAS_MESSAGE_ID` is set, and
+    /// `out_buf` must be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_article_integrity_classify(
+        flags: u32,
+        id_ptr: *const u8,
+        id_len: usize,
+        expected_crc: i64,
+        actual_crc: i64,
+        decoded_bytes: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags & !HAS_MESSAGE_ID != 0 || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(id) = (unsafe { optional_slice(flags & HAS_MESSAGE_ID != 0, id_ptr, id_len) })
+            else {
+                return DECLINE;
+            };
+            let bytes = integrity(id, expected_crc, actual_crc, decoded_bytes);
+            unsafe { write_bytes(&bytes, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `out_buf` must be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_candidate_admission_deferral_summarize(
+        active_workers: i64,
+        max_workers: i64,
+        queue_depth: i64,
+        retry_delay_ms: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let bytes = deferral(active_workers, max_workers, queue_depth, retry_delay_ms);
+            unsafe { write_bytes(&bytes, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `key_ptr`/`token_ptr` must be valid for their lengths when the matching flag is set, and
+    /// `out_buf` must be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_lease_lost_classify(
+        flags: u32,
+        key_ptr: *const u8,
+        key_len: usize,
+        token_ptr: *const u8,
+        token_len: usize,
+        elapsed_ms: i64,
+        ttl_ms: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags & !(HAS_CANDIDATE_KEY | HAS_OWNER_TOKEN) != 0
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(key) =
+                (unsafe { optional_slice(flags & HAS_CANDIDATE_KEY != 0, key_ptr, key_len) })
+            else {
+                return DECLINE;
+            };
+            let Some(token) =
+                (unsafe { optional_slice(flags & HAS_OWNER_TOKEN != 0, token_ptr, token_len) })
+            else {
+                return DECLINE;
+            };
+            let bytes = lease_loss(key, token, elapsed_ms, ttl_ms);
+            unsafe { write_bytes(&bytes, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn call(f: impl Fn(*mut u8, usize) -> isize) -> Result<String, isize> {
+            let mut buf = vec![0u8; 1024];
+            let rc = f(buf.as_mut_ptr(), buf.len());
+            if rc < 0 {
+                return Err(rc);
+            }
+            buf.truncate(rc as usize);
+            Ok(String::from_utf8_lossy(&buf).replace('\x1F', "|"))
+        }
+
+        #[test]
+        fn metadata_budget_classifies_overruns() {
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_candidate_metadata_budget_summarize(150, 100, 3, 2, b, c)
+                }),
+                Ok("150|100|3|2|1|1|50|1|150|bytes_and_files|1".into())
+            );
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_candidate_metadata_budget_summarize(-5, 0, 9, 0, b, c)
+                }),
+                Ok("0|0|9|0|0|0|0|0|0|within_budget|0".into())
+            );
+            assert_eq!(usage_percent(i64::MAX, 1), PERCENT_CAP);
+            assert_eq!(usage_percent(i64::MAX, i64::MAX), 100);
+            assert_eq!(usage_percent(99, 100), 99);
+        }
+
+        #[test]
+        fn article_budget_reports_remaining_and_refetch() {
+            assert_eq!(
+                call(|b, c| unsafe { nntmux_article_budget_summarize(4, 5, 900, 800, b, c) }),
+                Ok("4|5|900|800|0|1|0|100|1|0|bytes|1|0".into())
+            );
+            assert_eq!(
+                call(|b, c| unsafe { nntmux_article_budget_summarize(i64::MIN, 0, 1, 0, b, c) }),
+                Ok("0|0|1|0|0|0|0|0|-1|-1|within_budget|0|1".into())
+            );
+        }
+
+        #[test]
+        fn integrity_classifies_crc_and_message_id() {
+            let id = b" <abc@news.example> ";
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_article_integrity_classify(
+                        1,
+                        id.as_ptr(),
+                        id.len(),
+                        0xDEADBEEF,
+                        1,
+                        10,
+                        b,
+                        c,
+                    )
+                }),
+                Ok(
+                    "3735928559|1|deadbeef|00000001|1|0|10|crc_mismatch|1|1|1|1|abc@news.example"
+                        .into()
+                )
+            );
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_article_integrity_classify(0, ptr::null(), 0, -1, 4294967295, 0, b, c)
+                }),
+                Ok("4294967295|4294967295|ffffffff|ffffffff|0|1|0|empty_payload|1|1|0|0|".into())
+            );
+            assert!(is_valid_message_id(b"a@b"));
+            assert!(!is_valid_message_id(b"a@@b"));
+            assert!(!is_valid_message_id(b"@b"));
+            assert!(!is_valid_message_id(b"a b@c"));
+        }
+
+        #[test]
+        fn deferral_backs_off_when_saturated() {
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_candidate_admission_deferral_summarize(4, 4, 50, 2000, b, c)
+                }),
+                Ok("4|4|50|0|1|1|2500|0|backlogged".into())
+            );
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_candidate_admission_deferral_summarize(0, 4, 0, 0, b, c)
+                }),
+                Ok("0|4|0|4|0|0|1000|1|idle".into())
+            );
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_candidate_admission_deferral_summarize(9, 2, i64::MAX, i64::MAX, b, c)
+                }),
+                Ok("9|2|9223372036854775807|0|1|1|300000|1|backlogged".into())
+            );
+        }
+
+        #[test]
+        fn lease_loss_classifies_reason() {
+            let (key, token) = (b" cand\x1Fkey ", b"tok-1_A");
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_lease_lost_classify(
+                        3,
+                        key.as_ptr(),
+                        key.len(),
+                        token.as_ptr(),
+                        token.len(),
+                        70,
+                        60,
+                        b,
+                        c,
+                    )
+                }),
+                Ok("1|1|1|70|60|1|10|0|expired|1|8|cand|key|tok-1_A".into())
+            );
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_lease_lost_classify(
+                        2,
+                        ptr::null(),
+                        0,
+                        b"bad tok".as_ptr(),
+                        7,
+                        1,
+                        60,
+                        b,
+                        c,
+                    )
+                }),
+                Ok("0|1|0|1|60|0|0|59|missing_candidate|0|0||bad tok".into())
+            );
+        }
+
+        #[test]
+        fn exports_validate_pointers_flags_and_capacity() {
+            let mut small = [b'Z'; 4];
+            let rc = unsafe {
+                nntmux_candidate_metadata_budget_summarize(
+                    1,
+                    2,
+                    3,
+                    4,
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            };
+            assert!(rc < DECLINE);
+            assert_eq!(small, [b'Z'; 4]);
+            let mut big = vec![0u8; (-rc) as usize];
+            let rc2 = unsafe {
+                nntmux_candidate_metadata_budget_summarize(1, 2, 3, 4, big.as_mut_ptr(), big.len())
+            };
+            assert_eq!(rc2, -rc);
+
+            let mut out = vec![0u8; 256];
+            let (b, c) = (out.as_mut_ptr(), out.len());
+            unsafe {
+                assert_eq!(
+                    nntmux_candidate_metadata_budget_summarize(0, 0, 0, 0, ptr::null_mut(), 64),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_article_budget_summarize(0, 0, 0, 0, ptr::null_mut(), 64),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_candidate_admission_deferral_summarize(0, 0, 0, 0, ptr::null_mut(), 64),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_article_budget_summarize(0, 0, 0, 0, b, isize::MAX as usize + 1),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_article_integrity_classify(2, ptr::null(), 0, 0, 0, 1, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_article_integrity_classify(1, ptr::null(), 0, 0, 0, 1, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_article_integrity_classify(0, b"x".as_ptr(), 1, 0, 0, 1, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_article_integrity_classify(
+                        1,
+                        b"x".as_ptr(),
+                        MAX_INPUT + 1,
+                        0,
+                        0,
+                        1,
+                        b,
+                        c
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_lease_lost_classify(4, ptr::null(), 0, ptr::null(), 0, 0, 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_lease_lost_classify(1, ptr::null(), 0, ptr::null(), 0, 0, 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_lease_lost_classify(2, ptr::null(), 0, ptr::null(), 0, 0, 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_lease_lost_classify(0, b"k".as_ptr(), 1, ptr::null(), 0, 0, 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_lease_lost_classify(
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        0,
+                        ptr::null_mut(),
+                        8
+                    ),
+                    DECLINE
+                );
+                assert!(
+                    nntmux_lease_lost_classify(0, ptr::null(), 0, ptr::null(), 0, 0, 0, b, c) > 0
+                );
+            }
+        }
+    }
+}
