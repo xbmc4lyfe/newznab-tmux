@@ -27832,3 +27832,510 @@ mod w406_tests {
         assert_eq!(w406_compute(1, &short), None);
     }
 }
+
+#[cfg(test)]
+mod w416_tests {
+    use super::nntmux_w416_additional_candidate_diag_orch_console_nzb as call;
+
+    fn frame(p1: i64, p2: i64, rows: &[&[i64]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&p1.to_ne_bytes());
+        bytes.extend_from_slice(&p2.to_ne_bytes());
+        bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        for row in rows {
+            for value in *row {
+                bytes.extend_from_slice(&value.to_ne_bytes());
+            }
+        }
+        bytes
+    }
+
+    fn assert_result(op: u8, input: &[u8], expected: &[i64]) {
+        let mut output = [0x5a; 80];
+        let length = expected.len() * 8;
+        assert_eq!(
+            unsafe { call(op, input.as_ptr(), input.len(), output.as_mut_ptr(), length) },
+            length as i32
+        );
+        let actual: Vec<i64> = output[..length]
+            .chunks_exact(8)
+            .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(output[length..].iter().all(|byte| *byte == 0x5a));
+    }
+
+    fn assert_invalid(op: u8, input: &[u8]) {
+        for capacity in [0, 1, 80] {
+            let mut output = [0x5a; 80];
+            assert_eq!(
+                unsafe {
+                    call(
+                        op,
+                        input.as_ptr(),
+                        input.len(),
+                        output.as_mut_ptr(),
+                        capacity,
+                    )
+                },
+                -1
+            );
+            assert_eq!(output, [0x5a; 80]);
+        }
+    }
+
+    #[test]
+    fn w416_candidate_literal_precedence_and_inclusive_bounds() {
+        assert_result(
+            1,
+            &frame(
+                10,
+                20,
+                &[
+                    &[9, -1, -1, 1],
+                    &[10, -1, -1, 1],
+                    &[20, -1, -1, 1],
+                    &[21, -1, -1, 1],
+                    &[0, 0, -1, 1],
+                    &[30, -1, 0, 1],
+                    &[15, -1, -1, 0],
+                ],
+            ),
+            &[7, 2, 1, 1, 3, 0],
+        );
+        assert_result(
+            1,
+            &frame(i64::MIN, 0, &[&[0, -1, -1, 1], &[i64::MAX, -1, -1, 1]]),
+            &[2, 2, 0, 0, 0, 0],
+        );
+        assert_result(1, &frame(20, 10, &[&[15, -1, -1, 1]]), &[1, 0, 1, 0, 0, 0]);
+        assert_result(
+            1,
+            &frame(0, i64::MIN, &[&[i64::MAX, -1, -1, 1]]),
+            &[1, 1, 0, 0, 0, 0],
+        );
+    }
+
+    #[test]
+    fn w416_diagnostic_literal_clamps_and_thresholds() {
+        assert_result(
+            2,
+            &frame(
+                40,
+                0,
+                &[
+                    &[2, 10, 3, 10, 3],
+                    &[-1, 0, -3, -1, -5],
+                    &[4, 20, 25, 0, 1],
+                    &[1, 1, 33, 0, 0],
+                    &[1, 501, 1, 0, 0],
+                ],
+            ),
+            &[5, 8, 501, 1, 2, 0],
+        );
+        assert_result(2, &frame(0, 0, &[&[0, 1, 32, 0, 0]]), &[1, 0, 32, 1, 0, 0]);
+        assert_result(
+            2,
+            &frame(
+                i64::MIN,
+                0,
+                &[&[i64::MIN, i64::MIN, i64::MIN, i64::MIN, i64::MIN]],
+            ),
+            &[1, 0, 1, 1, 0, 0],
+        );
+    }
+
+    #[test]
+    fn w416_diagnostic_saturates_all_nonnegative_arithmetic() {
+        assert_result(
+            2,
+            &frame(
+                i64::MAX,
+                0,
+                &[&[i64::MAX, i64::MAX, 2, 0, 2], &[1, 1, 1, i64::MAX, 1]],
+            ),
+            &[2, i64::MAX, i64::MAX, 2, 1, 0],
+        );
+    }
+
+    #[test]
+    fn w416_orchestration_counts_elapsed_for_every_row() {
+        assert_result(
+            3,
+            &frame(
+                50,
+                0,
+                &[&[0, 8, 30], &[1, 0, 10], &[1, -2, -5], &[1, 3, 10]],
+            ),
+            &[4, 1, 2, 1, 50, 1, 0],
+        );
+        assert_result(3, &frame(51, 0, &[&[1, 2, 50]]), &[1, 0, 0, 1, 50, 0, 0]);
+        assert_result(
+            3,
+            &frame(i64::MIN, 0, &[&[0, i64::MIN, i64::MIN]]),
+            &[1, 1, 0, 0, 0, 1, 0],
+        );
+        assert_result(
+            3,
+            &frame(i64::MAX, 0, &[&[1, 1, i64::MAX], &[0, 1, 1]]),
+            &[2, 1, 0, 1, i64::MAX, 1, 0],
+        );
+    }
+
+    #[test]
+    fn w416_console_literal_and_saturation() {
+        assert_result(
+            4,
+            &frame(10, 0, &[&[0, 1], &[1, 2], &[2, 3], &[3, 4]]),
+            &[4, 1, 1, 1, 10, 0, 0],
+        );
+        assert_result(4, &frame(9, 0, &[&[0, 10]]), &[1, 0, 0, 0, 10, 1, 0]);
+        assert_result(4, &frame(i64::MIN, 0, &[&[1, 0]]), &[1, 1, 0, 0, 0, 0, 0]);
+        assert_result(
+            4,
+            &frame(i64::MAX, 0, &[&[3, i64::MAX], &[3, 1]]),
+            &[2, 0, 0, 2, i64::MAX, 0, 0],
+        );
+    }
+
+    #[test]
+    fn w416_nzb_literal_and_saturation() {
+        assert_result(
+            5,
+            &frame(3, 0, &[&[0, 10], &[1, 20], &[2, 30]]),
+            &[3, 1, 3, 60, 0, 0],
+        );
+        assert_result(5, &frame(2, 0, &[&[3, 0]]), &[1, 0, 3, 0, 0, 1]);
+        assert_result(5, &frame(i64::MIN, 0, &[&[0, 0]]), &[1, 1, 0, 0, 0, 0]);
+        assert_result(
+            5,
+            &frame(i64::MAX, 0, &[&[i64::MAX, i64::MAX], &[1, 1]]),
+            &[2, 0, i64::MAX, i64::MAX, 0, 0],
+        );
+    }
+
+    #[test]
+    fn w416_empty_results_are_fixed_width() {
+        for op in 1..=5 {
+            let zeros: &[i64] = if op == 3 || op == 4 { &[0; 7] } else { &[0; 6] };
+            assert_result(op, &frame(i64::MIN, 0, &[]), zeros);
+        }
+    }
+
+    #[test]
+    fn w416_all_truncations_trailing_bytes_counts_and_numeric_errors_are_rejected() {
+        let rows: [&[i64]; 5] = [
+            &[0, -1, -1, 1],
+            &[0, 1, 1, 0, 0],
+            &[1, 1, 0],
+            &[0, 0],
+            &[0, 0],
+        ];
+        for (index, row) in rows.iter().enumerate() {
+            let op = index as u8 + 1;
+            let input = frame(0, 0, &[row]);
+            for length in 0..input.len() {
+                assert_invalid(op, &input[..length]);
+            }
+            let mut trailing = input.clone();
+            trailing.push(0);
+            assert_invalid(op, &trailing);
+            for count in [0_u32, 2, 100_001, u32::MAX] {
+                let mut wrong = input.clone();
+                wrong[16..20].copy_from_slice(&count.to_le_bytes());
+                assert_invalid(op, &wrong);
+            }
+            if op != 1 {
+                assert_invalid(op, &frame(0, 1, &[row]));
+                assert_invalid(op, &frame(0, i64::MIN, &[row]));
+            }
+        }
+        for op in [0, 6, 255] {
+            assert_invalid(op, &frame(0, 0, &[]));
+        }
+        for row in [&[-1, -1, -1, 1][..], &[i64::MIN, 0, 0, 0][..]] {
+            assert_invalid(1, &frame(0, 0, &[row]));
+        }
+        for setup in [-1, 2, i64::MAX] {
+            assert_invalid(3, &frame(0, 0, &[&[setup, 0, 0]]));
+        }
+        for row in [&[-1, 0][..], &[4, 0][..], &[0, -1][..]] {
+            assert_invalid(4, &frame(0, 0, &[row]));
+        }
+        for row in [&[-1, 0][..], &[0, -1][..]] {
+            assert_invalid(5, &frame(0, 0, &[row]));
+        }
+    }
+
+    #[test]
+    fn w416_maximum_row_count_is_accepted_but_next_row_is_rejected() {
+        let row = [0_i64, 0];
+        let rows = vec![row.as_slice(); 100_000];
+        assert_result(5, &frame(0, 0, &rows), &[100_000, 100_000, 0, 0, 0, 0]);
+        let rows = vec![row.as_slice(); 100_001];
+        assert_invalid(5, &frame(0, 0, &rows));
+    }
+
+    #[test]
+    fn w416_ffi_rejects_pointer_ranges_before_reading_or_writing() {
+        let input = frame(0, 0, &[]);
+        let mut output = [0x5a; 80];
+        let limit = 16_777_216;
+        let invalid = [
+            (std::ptr::null(), input.len(), output.as_mut_ptr(), 80),
+            (input.as_ptr(), input.len(), std::ptr::null_mut(), 80),
+            (input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+            (input.as_ptr(), limit + 1, output.as_mut_ptr(), 80),
+            (input.as_ptr(), usize::MAX, output.as_mut_ptr(), 80),
+            (input.as_ptr(), input.len(), output.as_mut_ptr(), limit + 1),
+            (input.as_ptr(), input.len(), output.as_mut_ptr(), usize::MAX),
+            (
+                usize::MAX as *const u8,
+                input.len(),
+                output.as_mut_ptr(),
+                80,
+            ),
+            (input.as_ptr(), input.len(), usize::MAX as *mut u8, 80),
+            (
+                (usize::MAX - 10) as *const u8,
+                input.len(),
+                output.as_mut_ptr(),
+                80,
+            ),
+            (
+                input.as_ptr(),
+                input.len(),
+                (usize::MAX - 10) as *mut u8,
+                80,
+            ),
+        ];
+        for (p, length, out, capacity) in invalid {
+            assert_eq!(unsafe { call(1, p, length, out, capacity) }, -1);
+            assert_eq!(output, [0x5a; 80]);
+        }
+        let mut shared = [0x5a; 256];
+        for (input_offset, output_offset) in [(0, 0), (0, 1), (0, 19), (1, 0), (47, 0)] {
+            let p = unsafe { shared.as_ptr().add(input_offset) };
+            let out = unsafe { shared.as_mut_ptr().add(output_offset) };
+            assert_eq!(unsafe { call(1, p, 20, out, 48) }, -1);
+            assert_eq!(shared, [0x5a; 256]);
+        }
+    }
+
+    #[test]
+    fn w416_capacity_queries_and_short_buffers_never_write() {
+        for op in 1..=5 {
+            let input = frame(0, 0, &[]);
+            let required = if op == 3 || op == 4 { 56 } else { 48 };
+            for capacity in 0..required {
+                let mut output = [0x5a; 80];
+                assert_eq!(
+                    unsafe {
+                        call(
+                            op,
+                            input.as_ptr(),
+                            input.len(),
+                            output.as_mut_ptr(),
+                            capacity,
+                        )
+                    },
+                    -(required as i32)
+                );
+                assert_eq!(output, [0x5a; 80]);
+            }
+            // An adjacent output range is valid; no alignment is required for byte buffers.
+            let mut shared = [0x5a; 100];
+            shared[1..21].copy_from_slice(&input);
+            assert_eq!(
+                unsafe {
+                    call(
+                        op,
+                        shared.as_ptr().add(1),
+                        20,
+                        shared.as_mut_ptr().add(21),
+                        required,
+                    )
+                },
+                required as i32
+            );
+            assert_eq!(&shared[1..21], input.as_slice());
+            assert!(shared[21..21 + required].iter().all(|byte| *byte == 0));
+            assert_eq!(shared[0], 0x5a);
+            assert!(shared[21 + required..].iter().all(|byte| *byte == 0x5a));
+        }
+    }
+}
+
+const W416_MAX_BYTES: usize = 16_777_216;
+const W416_MAX_ROWS: usize = 100_000;
+
+fn w416_compute(operation: u8, input: &[u8]) -> Option<([i64; 7], usize)> {
+    let row_bytes = match operation {
+        1 => 32,
+        2 => 40,
+        3 => 24,
+        4 | 5 => 16,
+        _ => return None,
+    };
+    let p1 = i64::from_ne_bytes(input.get(..8)?.try_into().ok()?);
+    let p2 = i64::from_ne_bytes(input.get(8..16)?.try_into().ok()?);
+    let count = u32::from_le_bytes(input.get(16..20)?.try_into().ok()?) as usize;
+    if (operation != 1 && p2 != 0)
+        || count > W416_MAX_ROWS
+        || input.len() != 20_usize.checked_add(count.checked_mul(row_bytes)?)?
+    {
+        return None;
+    }
+
+    let mut result = [0_i64; 7];
+    result[0] = count as i64;
+    for row in input[20..].chunks_exact(row_bytes) {
+        // Exact frame and row sizes above guarantee each requested i64 is present.
+        let value =
+            |index: usize| i64::from_ne_bytes(row[index * 8..(index + 1) * 8].try_into().unwrap());
+        match operation {
+            1 => {
+                let size = value(0);
+                if size < 0 {
+                    return None;
+                }
+                let bucket = if value(1) != -1 || value(2) != -1 || value(3) != 1 {
+                    4
+                } else if size < p1.max(0) {
+                    2
+                } else if p2 > 0 && size > p2 {
+                    3
+                } else {
+                    1
+                };
+                result[bucket] += 1;
+            }
+            2 => {
+                let stale = value(0).max(0);
+                let batch = value(1).max(1);
+                let threads = value(2).max(1);
+                let capacity = batch.saturating_mul(threads);
+                let lifetime = value(3)
+                    .max(0)
+                    .saturating_add(value(4).max(0).saturating_mul(batch));
+                result[1] = result[1].saturating_add(stale);
+                result[2] = result[2].max(capacity);
+                result[3] += i64::from(p1 <= lifetime);
+                result[4] += i64::from(capacity > 500 || threads > 32);
+            }
+            3 => {
+                let bucket = match value(0) {
+                    0 => 1,
+                    1 if value(1) <= 0 => 2,
+                    1 => 3,
+                    _ => return None,
+                };
+                result[bucket] += 1;
+                result[4] = result[4].saturating_add(value(2).max(0));
+            }
+            4 => {
+                let kind = value(0);
+                let length = value(1);
+                if !(0..=3).contains(&kind) || length < 0 {
+                    return None;
+                }
+                if kind != 0 {
+                    result[kind as usize] += 1;
+                }
+                result[4] = result[4].saturating_add(length);
+            }
+            5 => {
+                let segments = value(0);
+                let bytes = value(1);
+                if segments < 0 || bytes < 0 {
+                    return None;
+                }
+                result[1] += i64::from(segments == 0);
+                result[2] = result[2].saturating_add(segments);
+                result[3] = result[3].saturating_add(bytes);
+            }
+            _ => return None,
+        }
+    }
+    match operation {
+        3 => result[5] = i64::from(count > 0 && result[4] >= p1.max(0)),
+        4 => result[5] = i64::from(result[4] > p1.max(0)),
+        5 => result[5] = i64::from(result[2] > p1.max(0)),
+        _ => {}
+    }
+    Some((
+        result,
+        if operation == 3 || operation == 4 {
+            7
+        } else {
+            6
+        },
+    ))
+}
+
+/// Computes the Wave 41.6 candidate, diagnostic, orchestration, console or NZB summary.
+///
+/// The frame is two native-endian i64 parameters, a little-endian u32 row count,
+/// then fixed-width native-endian i64 rows. Operations 1 through 5 use respectively
+/// 4, 5, 3, 2 and 2 slots per row. The second parameter must be zero except for
+/// operation 1. Results contain six i64 slots (seven for operations 3 and 4).
+/// Returns the positive result byte count, its negative when capacity is too small,
+/// or -1 for invalid input. Negative returns never write to the output buffer.
+///
+/// # Safety
+///
+/// The caller must provide nonnull pointers. The input must be initialized and
+/// readable for `input_len` bytes, and output writable for `out_cap` bytes, each
+/// within a single live allocation for the entire call. The ranges must not overlap.
+/// The caller must prevent concurrent input mutation and all concurrent access to
+/// the output being written. Byte buffers need no additional alignment. This
+/// function checks nullness, lengths, address overflow and overlap before reading,
+/// but cannot prove allocation liveness, bounds, provenance or access permissions.
+/// A nonnull output with zero capacity is allowed for a capacity query.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w416_additional_candidate_diag_orch_console_nzb(
+    operation: u8,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(1..=5).contains(&operation)
+            || input.is_null()
+            || out_buf.is_null()
+            || !(20..=W416_MAX_BYTES).contains(&input_len)
+            || out_cap > W416_MAX_BYTES
+        {
+            return -1;
+        }
+        let input_start = input as usize;
+        let output_start = out_buf as usize;
+        let Some(input_end) = input_start.checked_add(input_len) else {
+            return -1;
+        };
+        let Some(output_end) = output_start.checked_add(out_cap) else {
+            return -1;
+        };
+        if out_cap != 0 && input_start < output_end && output_start < input_end {
+            return -1;
+        }
+        // All mechanically checkable pointer conditions precede the first read.
+        let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+        let Some((result, slots)) = w416_compute(operation, bytes) else {
+            return -1;
+        };
+        let required = slots * 8;
+        if out_cap < required {
+            return -(required as i32);
+        }
+        let mut encoded = [0_u8; 56];
+        for (destination, value) in encoded.chunks_exact_mut(8).zip(result) {
+            destination.copy_from_slice(&value.to_ne_bytes());
+        }
+        // No writes occur until the complete frame and output capacity are valid.
+        unsafe { std::ptr::copy_nonoverlapping(encoded.as_ptr(), out_buf, required) };
+        required as i32
+    }))
+    .unwrap_or(-1)
+}

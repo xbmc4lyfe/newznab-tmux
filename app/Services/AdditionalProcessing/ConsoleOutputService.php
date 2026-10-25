@@ -305,4 +305,142 @@ class ConsoleOutputService
     {
         return $this->echoCLI;
     }
+
+    public const bool W416_RUST_FFI_DEFAULT = false;
+
+    private const string W416_FFI_CDEF = 'int32_t nntmux_w416_additional_candidate_diag_orch_console_nzb(uint8_t operation, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
+
+    private static ?bool $w416UseRustFfi = null;
+
+    private static FFI|false|null $w416Ffi = null;
+
+    public static function useW416RustFfi(bool $enable = true): void
+    {
+        self::$w416UseRustFfi = $enable;
+    }
+
+    public static function usesW416RustFfi(): bool
+    {
+        return self::$w416UseRustFfi ?? self::W416_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW416RustFfi(): void
+    {
+        self::$w416UseRustFfi = null;
+        self::$w416Ffi = null;
+    }
+
+    /** @return list<int>|null */
+    private static function w416Slots(int $operation, string $input, int $count): ?array
+    {
+        if (\strlen($input) > 16_777_216) {
+            return null;
+        }
+        try {
+            self::$w416Ffi ??= RustPipelineLibrary::resolveDomain('additional', self::W416_FFI_CDEF) ?? false;
+            if (self::$w416Ffi === false) {
+                return null;
+            }
+            $bytes = $count * 8;
+            $buffer = self::$w416Ffi->new('char['.$bytes.']');
+            // @phpstan-ignore method.notFound
+            $written = self::$w416Ffi->nntmux_w416_additional_candidate_diag_orch_console_nzb($operation, $input, \strlen($input), $buffer, $bytes);
+            if ($written !== $bytes) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $bytes));
+            if ($values === false || \count($values) !== $count) {
+                return null;
+            }
+            foreach ($values as $value) {
+                if (! \is_int($value) || $value < 0) {
+                    return null;
+                }
+            }
+
+            return array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w416Add(int $left, int $right): int
+    {
+        return $left > PHP_INT_MAX - $right ? PHP_INT_MAX : $left + $right;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $events
+     * @return array{total: int, warnings: int, errors: int, progress: int, text_bytes: int, truncated: bool, invalid: int}
+     */
+    public static function summarizeConsoleEventBatch(array $events, int $maxBytes = 65536): array
+    {
+        return self::usesW416RustFfi()
+            ? self::summarizeConsoleEventBatchNative($events, $maxBytes)
+            : self::summarizeConsoleEventBatchPhp($events, $maxBytes);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $events
+     * @return array{total: int, warnings: int, errors: int, progress: int, text_bytes: int, truncated: bool, invalid: int}
+     */
+    public static function summarizeConsoleEventBatchPhp(array $events, int $maxBytes = 65536): array
+    {
+        $result = ['total' => \count($events), 'warnings' => 0, 'errors' => 0, 'progress' => 0, 'text_bytes' => 0, 'truncated' => false, 'invalid' => 0];
+        foreach ($events as $row) {
+            if (! \is_array($row) || ! \is_string($row['kind'] ?? null) || ! \is_string($row['text'] ?? null)) {
+                $result['invalid']++;
+
+                continue;
+            }
+            $key = match ($row['kind']) {
+                'warning' => 'warnings',
+                'error' => 'errors',
+                'progress' => 'progress',
+                default => null,
+            };
+            if ($key !== null) {
+                $result[$key]++;
+            }
+            $result['text_bytes'] = self::w416Add($result['text_bytes'], \strlen($row['text']));
+        }
+        $result['truncated'] = $result['text_bytes'] > max(0, $maxBytes);
+
+        return $result;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $events
+     * @return array{total: int, warnings: int, errors: int, progress: int, text_bytes: int, truncated: bool, invalid: int}
+     */
+    public static function summarizeConsoleEventBatchNative(array $events, int $maxBytes = 65536): array
+    {
+        $total = \count($events);
+        if ($total > 100_000) {
+            return self::summarizeConsoleEventBatchPhp($events, $maxBytes);
+        }
+        $frame = pack('qqV', $maxBytes, 0, $total);
+        foreach ($events as $row) {
+            if (! \is_array($row) || ! \is_string($row['kind'] ?? null) || ! \is_string($row['text'] ?? null)) {
+                return self::summarizeConsoleEventBatchPhp($events, $maxBytes);
+            }
+            $frame .= pack('qq', match ($row['kind']) {
+                'warning' => 1, 'error' => 2, 'progress' => 3, default => 0
+            }, \strlen($row['text']));
+        }
+        $slots = self::w416Slots(4, $frame, 7);
+        if ($slots === null || $slots[0] !== $total || $slots[6] !== 0 || $slots[5] > 1 || $slots[5] !== (int) ($slots[4] > max(0, $maxBytes)) || $slots[1] > $total || $slots[2] > $total || $slots[3] > $total || $total < $slots[1] + $slots[2] + $slots[3]) {
+            return self::summarizeConsoleEventBatchPhp($events, $maxBytes);
+        }
+
+        return [
+            'total' => $slots[0],
+            'warnings' => $slots[1],
+            'errors' => $slots[2],
+            'progress' => $slots[3],
+            'text_bytes' => $slots[4],
+            'truncated' => $slots[5] === 1,
+            'invalid' => $slots[6],
+        ];
+    }
 }
