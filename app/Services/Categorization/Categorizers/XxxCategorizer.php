@@ -16,6 +16,52 @@ use Throwable;
  */
 class XxxCategorizer extends AbstractCategorizer
 {
+    /**
+     * Wave 43.3 production default is Rust: the paired benchmark in
+     * tests/Unit/RustCategorizersMusicPcTvXxxPipeW43ParityTest.php measures at least 3.7x
+     * (mean and p99, common and uncommon batches). PHP stays the fallback when the library is
+     * unavailable.
+     * Named W433 so it stays distinct from other Rust FFI toggles.
+     */
+    public const bool W433_RUST_FFI_DEFAULT = true;
+
+    public const string W433_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w433_xxx_format_batch(
+            const char *blob_ptr,
+            size_t blob_len,
+            const char *lens_ptr,
+            size_t lens_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /**
+     * XXX format marker substrings, in match order. The first class with a substring of the
+     * lowercased release name wins.
+     *
+     * @var array<string, list<string>>
+     */
+    public const array W433_XXX_FORMAT_MARKERS = [
+        'onlyfans' => ['onlyfans', 'fansly', 'manyvids'],
+        'vr' => ['vr180', 'vr360', 'oculus', 'gearvr', 'psvr', 'sidebyside'],
+        'uhd' => ['2160p', '4k', 'uhd'],
+        'hd' => ['1080p', '720p'],
+        'imageset' => ['imageset', 'image.set', 'pics', 'photos'],
+        'dvd' => ['dvdrip', 'dvd5', 'dvd9', 'dvdr'],
+        'sd' => ['480p', 'xvid', '.wmv', 'mp4'],
+    ];
+
+    /** @var list<string> */
+    public const array W433_PACK_MARKERS = ['pack', 'siterip'];
+
+    /** Exactly 10 0x1F-separated decimals of 1-19 digits. */
+    private const string W433_FIELDS_PATTERN = '/\A(?:\d{1,19}\x1F){9}\d{1,19}\z/';
+
+    private static ?bool $w433RustFfiOverride = null;
+
+    private static FFI|false|null $w433RustFfiHandle = null;
+
     protected int $priority = 10; // High priority - should run early
 
     protected const JACQUIE_ET_MICHEL = 'Jacquie[._ -]?Et[._ -]?Michel(?:[._ -]?(?:TV|Elite))?';
@@ -563,5 +609,215 @@ CDEF;
         }
 
         return null;
+    }
+
+    /**
+     * Enables (true) or disables (false) the Wave 43.3 Rust helper; null restores
+     * W433_RUST_FFI_DEFAULT.
+     */
+    public static function useW433RustFfi(?bool $enable = true): void
+    {
+        self::$w433RustFfiOverride = $enable;
+    }
+
+    public static function usesW433RustFfi(): bool
+    {
+        return self::$w433RustFfiOverride ?? self::W433_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW433RustFfi(): void
+    {
+        self::$w433RustFfiOverride = null;
+        self::$w433RustFfiHandle = null;
+    }
+
+    /**
+     * XXX format summary for a batch of release names. Each lowercased name adds to its first
+     * W433_XXX_FORMAT_MARKERS class, else to unknown, and separately to pack when it holds any
+     * W433_PACK_MARKERS entry. Non-strings count as empty names.
+     *
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, onlyfans: int, vr: int, uhd: int, hd: int, imageset: int, dvd: int, sd: int, unknown: int, pack: int}
+     */
+    public static function summarizeXxxFormatBatch(array $releaseNames): array
+    {
+        return (self::usesW433RustFfi() ? self::summarizeXxxFormatBatchNative($releaseNames) : null)
+            ?? self::summarizeXxxFormatBatchPhp($releaseNames);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, onlyfans: int, vr: int, uhd: int, hd: int, imageset: int, dvd: int, sd: int, unknown: int, pack: int}
+     */
+    public static function summarizeXxxFormatBatchPhp(array $releaseNames): array
+    {
+        $onlyfans = 0;
+        $vr = 0;
+        $uhd = 0;
+        $hd = 0;
+        $imageset = 0;
+        $dvd = 0;
+        $sd = 0;
+        $unknown = 0;
+        $packCount = 0;
+        foreach ($releaseNames as $releaseName) {
+            $name = strtolower(\is_string($releaseName) ? $releaseName : '');
+            foreach (self::W433_PACK_MARKERS as $needle) {
+                if (str_contains($name, $needle)) {
+                    $packCount++;
+
+                    break;
+                }
+            }
+            foreach (self::W433_XXX_FORMAT_MARKERS['onlyfans'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $onlyfans++;
+
+                    continue 2;
+                }
+            }
+            foreach (self::W433_XXX_FORMAT_MARKERS['vr'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $vr++;
+
+                    continue 2;
+                }
+            }
+            foreach (self::W433_XXX_FORMAT_MARKERS['uhd'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $uhd++;
+
+                    continue 2;
+                }
+            }
+            foreach (self::W433_XXX_FORMAT_MARKERS['hd'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $hd++;
+
+                    continue 2;
+                }
+            }
+            foreach (self::W433_XXX_FORMAT_MARKERS['imageset'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $imageset++;
+
+                    continue 2;
+                }
+            }
+            foreach (self::W433_XXX_FORMAT_MARKERS['dvd'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $dvd++;
+
+                    continue 2;
+                }
+            }
+            foreach (self::W433_XXX_FORMAT_MARKERS['sd'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $sd++;
+
+                    continue 2;
+                }
+            }
+            $unknown++;
+        }
+
+        return [
+            'total' => \count($releaseNames),
+            'onlyfans' => $onlyfans,
+            'vr' => $vr,
+            'uhd' => $uhd,
+            'hd' => $hd,
+            'imageset' => $imageset,
+            'dvd' => $dvd,
+            'sd' => $sd,
+            'unknown' => $unknown,
+            'pack' => $packCount,
+        ];
+    }
+
+    /**
+     * Declines (null) for non-string items so PHP counts them.
+     *
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, onlyfans: int, vr: int, uhd: int, hd: int, imageset: int, dvd: int, sd: int, unknown: int, pack: int}|null
+     */
+    public static function summarizeXxxFormatBatchNative(array $releaseNames): ?array
+    {
+        $lengths = [];
+        foreach ($releaseNames as $item) {
+            if (! \is_string($item)) {
+                return null;
+            }
+            $lengths[] = \strlen($item);
+        }
+        $blob = implode('', $releaseNames);
+        $lens = pack('V*', ...$lengths);
+        $fields = self::callW433Native($blob, $lens);
+        if ($fields === null) {
+            return null;
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'onlyfans' => (int) $fields[1],
+            'vr' => (int) $fields[2],
+            'uhd' => (int) $fields[3],
+            'hd' => (int) $fields[4],
+            'imageset' => (int) $fields[5],
+            'dvd' => (int) $fields[6],
+            'sd' => (int) $fields[7],
+            'unknown' => (int) $fields[8],
+            'pack' => (int) $fields[9],
+        ];
+    }
+
+    /**
+     * Calls this class's Wave 43.3 export with the shared scratch buffer, retrying once at the size
+     * it asks for. Returns its fields only when they match W433_FIELDS_PATTERN: exactly the expected
+     * count of 1-19 digit decimals.
+     *
+     * @return list<string>|null
+     */
+    private static function callW433Native(string $blob, string $lens): ?array
+    {
+        $ffi = self::w433RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 128, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w433_xxx_format_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w433_xxx_format_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $raw = FFI::string($buffer, $written);
+
+            return preg_match(self::W433_FIELDS_PATTERN, $raw) === 1 ? explode("\x1F", $raw) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w433RustFfi(): ?FFI
+    {
+        if (self::$w433RustFfiHandle === null) {
+            self::$w433RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w433', self::W433_FFI_CDEF) ?? false;
+        }
+
+        return self::$w433RustFfiHandle === false ? null : self::$w433RustFfiHandle;
     }
 }
