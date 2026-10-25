@@ -22,6 +22,11 @@ final class ManifestStore
 {
     private static bool $useRustFfi = true;
 
+    /** Wave 39.6 paired benchmarks decide this default; see RustVerificationStorePrelockManifestResetW39ParityTest. */
+    public const bool W396_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w396UseRustFfi = null;
+
     public static function setUseRustFfi(bool $enabled): void
     {
         self::$useRustFfi = $enabled;
@@ -510,5 +515,84 @@ final class ManifestStore
         $status = $ffi->nntmux_verification_manifest_consumes(strlen($body), $json, strlen($json), $inflated, strlen($inflated), inflate_get_read_len($inflater), inflate_get_status($inflater));
 
         return $status >= 0 ? $status === 1 : null;
+    }
+
+    public static function useW396RustFfi(?bool $enabled): void
+    {
+        self::$w396UseRustFfi = $enabled;
+    }
+
+    public static function usesW396RustFfi(): bool
+    {
+        return self::$w396UseRustFfi ?? self::W396_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW396RustFfi(): void
+    {
+        self::$w396UseRustFfi = null;
+    }
+
+    /**
+     * Admit manifest bodies, in order, against a byte budget of max(0, $maxTotalBytes). Non-integer and
+     * non-positive sizes are empty and skipped; the first non-empty size that no longer fits records its
+     * position in exceeded_index (else -1) and closes admission for the rest of the batch.
+     *
+     * @param  array<array-key, mixed>  $byteSizes
+     * @return array{items: int, non_empty: int, empty: int, accepted_bytes: int, exceeded_index: int, accepted: int}
+     */
+    public static function summarizeManifestStorageBatch(array $byteSizes, int $maxTotalBytes = 67108864): array
+    {
+        return (self::usesW396RustFfi() ? self::summarizeManifestStorageBatchNative($byteSizes, $maxTotalBytes) : null)
+            ?? self::summarizeManifestStorageBatchPhp($byteSizes, $maxTotalBytes);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $byteSizes
+     * @return array{items: int, non_empty: int, empty: int, accepted_bytes: int, exceeded_index: int, accepted: int}
+     */
+    public static function summarizeManifestStorageBatchPhp(array $byteSizes, int $maxTotalBytes = 67108864): array
+    {
+        $budget = max(0, $maxTotalBytes);
+        $items = $nonEmpty = $empty = $bytes = $accepted = 0;
+        $exceeded = -1;
+        foreach ($byteSizes as $size) {
+            $index = $items++;
+            if (! \is_int($size) || $size <= 0) {
+                $empty++;
+
+                continue;
+            }
+            $nonEmpty++;
+            if ($exceeded < 0) {
+                // $bytes never exceeds $budget, so the difference cannot overflow.
+                if ($size <= $budget - $bytes) {
+                    $bytes += $size;
+                    $accepted++;
+                } else {
+                    $exceeded = $index;
+                }
+            }
+        }
+
+        return ['items' => $items, 'non_empty' => $nonEmpty, 'empty' => $empty, 'accepted_bytes' => $bytes, 'exceeded_index' => $exceeded, 'accepted' => $accepted];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $byteSizes
+     * @return array{items: int, non_empty: int, empty: int, accepted_bytes: int, exceeded_index: int, accepted: int}|null
+     */
+    public static function summarizeManifestStorageBatchNative(array $byteSizes, int $maxTotalBytes = 67108864): ?array
+    {
+        $sizes = [];
+        foreach ($byteSizes as $size) {
+            $sizes[] = \is_int($size) ? $size : 0;
+        }
+        $slots = CollectionReleasePolicy::w396Slots(2, 0, pack('q2', $maxTotalBytes, \count($sizes)).($sizes === [] ? '' : pack('q*', ...$sizes)), 6);
+        if ($slots === null || $slots[0] !== \count($sizes) || $slots[1] < 0 || $slots[2] < 0 || $slots[0] !== $slots[1] + $slots[2]
+            || $slots[3] < 0 || $slots[4] < -1 || $slots[4] >= $slots[0] || $slots[5] < 0 || $slots[5] > $slots[1]) {
+            return null;
+        }
+
+        return ['items' => $slots[0], 'non_empty' => $slots[1], 'empty' => $slots[2], 'accepted_bytes' => $slots[3], 'exceeded_index' => $slots[4], 'accepted' => $slots[5]];
     }
 }

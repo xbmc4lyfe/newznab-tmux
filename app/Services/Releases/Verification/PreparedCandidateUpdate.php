@@ -32,6 +32,23 @@ final class PreparedCandidateUpdate
 
     private static ?bool $useRustFfi = null;
 
+    /** Wave 39.6 paired benchmarks decide this default; see RustVerificationStorePrelockManifestResetW39ParityTest. */
+    public const bool W396_RUST_FFI_DEFAULT = false;
+
+    /** Wave 39.6 transition codes; published, rejected and expired are terminal. */
+    public const array W396_STATUSES = [0 => 'waiting_upload', 1 => 'verifying', 2 => 'ready', 3 => 'retry', 4 => 'published', 5 => 'rejected', 6 => 'expired'];
+
+    /** Permitted targets per non-terminal status. */
+    private const array W396_TRANSITIONS = [0 => [1, 6], 1 => [2, 3, 5, 6], 2 => [3, 4, 5], 3 => [1, 5, 6]];
+
+    private const int W396_VERIFYING = 1;
+
+    private const int W396_RETRY = 3;
+
+    private const array W396_REASONS = ['none', 'unknown_status', 'terminal_current', 'unchanged', 'not_permitted', 'attempts_exhausted'];
+
+    private static ?bool $w396UseRustFfi = null;
+
     private static ?Closure $macro = null;
 
     private ?PDO $pdo = null;
@@ -185,5 +202,75 @@ final class PreparedCandidateUpdate
         if ($registered === null) {
             Connection::macro('runPreparedCandidateUpdate', self::$macro);
         }
+    }
+
+    public static function useW396RustFfi(?bool $enabled): void
+    {
+        self::$w396UseRustFfi = $enabled;
+    }
+
+    public static function usesW396RustFfi(): bool
+    {
+        return self::$w396UseRustFfi ?? self::W396_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW396RustFfi(): void
+    {
+        self::$w396UseRustFfi = null;
+    }
+
+    /**
+     * Validate a candidate status transition over the W396_STATUSES codes. Checks run in order: an unknown
+     * code, a terminal current status, an unchanged status, a transition W396_TRANSITIONS does not permit,
+     * then a move to verifying or retry once max(0, $attemptCount) reaches max(1, $maxAttempts). An
+     * allowed move to verifying consumes one attempt.
+     *
+     * @return array{allowed: bool, terminal_target: bool, attempts_exhausted: bool, next_attempt_count: int, reason: string}
+     */
+    public static function validateUpdateTransition(int $currentStatus, int $targetStatus, int $attemptCount, int $maxAttempts = 5): array
+    {
+        return (self::usesW396RustFfi() ? self::validateUpdateTransitionNative($currentStatus, $targetStatus, $attemptCount, $maxAttempts) : null)
+            ?? self::validateUpdateTransitionPhp($currentStatus, $targetStatus, $attemptCount, $maxAttempts);
+    }
+
+    /** @return array{allowed: bool, terminal_target: bool, attempts_exhausted: bool, next_attempt_count: int, reason: string} */
+    public static function validateUpdateTransitionPhp(int $currentStatus, int $targetStatus, int $attemptCount, int $maxAttempts = 5): array
+    {
+        $attempts = max(0, $attemptCount);
+        $exhausted = $attempts >= max(1, $maxAttempts);
+        $reason = match (true) {
+            ! isset(self::W396_STATUSES[$currentStatus], self::W396_STATUSES[$targetStatus]) => 'unknown_status',
+            ! isset(self::W396_TRANSITIONS[$currentStatus]) => 'terminal_current',
+            $currentStatus === $targetStatus => 'unchanged',
+            ! \in_array($targetStatus, self::W396_TRANSITIONS[$currentStatus], true) => 'not_permitted',
+            ($targetStatus === self::W396_VERIFYING || $targetStatus === self::W396_RETRY) && $exhausted => 'attempts_exhausted',
+            default => 'none',
+        };
+
+        return [
+            'allowed' => $reason === 'none',
+            'terminal_target' => isset(self::W396_STATUSES[$targetStatus]) && ! isset(self::W396_TRANSITIONS[$targetStatus]),
+            'attempts_exhausted' => $exhausted,
+            'next_attempt_count' => $reason === 'none' && $targetStatus === self::W396_VERIFYING ? $attempts + 1 : $attempts,
+            'reason' => $reason,
+        ];
+    }
+
+    /** @return array{allowed: bool, terminal_target: bool, attempts_exhausted: bool, next_attempt_count: int, reason: string}|null */
+    public static function validateUpdateTransitionNative(int $currentStatus, int $targetStatus, int $attemptCount, int $maxAttempts = 5): ?array
+    {
+        $slots = CollectionReleasePolicy::w396Slots(3, 0, pack('q4', $currentStatus, $targetStatus, $attemptCount, $maxAttempts), 5);
+        if ($slots === null || ($slots[0] & ~1) !== 0 || ($slots[1] & ~1) !== 0 || ($slots[2] & ~1) !== 0 || $slots[3] < 0
+            || ! isset(self::W396_REASONS[$slots[4]]) || ($slots[0] === 1) !== ($slots[4] === 0)) {
+            return null;
+        }
+
+        return [
+            'allowed' => $slots[0] === 1,
+            'terminal_target' => $slots[1] === 1,
+            'attempts_exhausted' => $slots[2] === 1,
+            'next_attempt_count' => $slots[3],
+            'reason' => self::W396_REASONS[$slots[4]],
+        ];
     }
 }
