@@ -13,9 +13,11 @@ use dariusiii\rarinfo\Par2Info;
 use dariusiii\rarinfo\RarInfo;
 use dariusiii\rarinfo\SzipInfo;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Process;
+use InvalidArgumentException;
 use Symfony\Component\Process\Process as SymfonyProcess;
 use Throwable;
 
@@ -1293,5 +1295,224 @@ class ArchiveExtractionService
         } catch (Throwable) {
             return null;
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 52.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 3.48x, p99 2.58x; uncommon mean 4.22x, p99 2.91x); see RustWorkPlannerArchiveConfigConsoleMediaExtractW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w524_extracted_entry_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** extractedEntryBatch() flags. */
+    public const int W52_ENTRY_EMPTY = 1;
+
+    public const int W52_ENTRY_ABSOLUTE = 2;
+
+    public const int W52_ENTRY_TRAVERSAL = 4;
+
+    public const int W52_ENTRY_NUL = 8;
+
+    public const int W52_ENTRY_EXECUTABLE = 16;
+
+    public const int W52_ENTRY_ARCHIVE = 32;
+
+    public const int W52_ENTRY_NFO = 64;
+
+    private const array W52_ARCHIVE_EXTENSIONS = ['rar' => true, 'zip' => true, '7z' => true];
+
+    private const array W52_NFO_EXTENSIONS = ['nfo' => true, 'diz' => true, 'inf' => true];
+
+    /**
+     * Audit extracted archive member paths, two ints each: [flags, base name offset << 32 |
+     * length, the text after the last '/' or '\\']. Flags: 1 empty, 2 absolute (leading '/' or
+     * '\\'), 4 '..' segment, 8 NUL byte, 16 executable or script extension, 32 nested archive
+     * (rar, zip, 7z, rNN or NNN), 64 nfo/diz/inf. Empty, absolute, traversal and NUL members
+     * are the ones summarizeExtractedEntriesSafety() rejects.
+     *
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function extractedEntryBatch(array $paths): array
+    {
+        return self::usesW52RustFfi()
+            ? self::extractedEntryBatchNative($paths)
+            : self::extractedEntryBatchPhp($paths);
+    }
+
+    /**
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function extractedEntryBatchNative(array $paths): array
+    {
+        self::w52AssertList($paths);
+        if ($paths === []) {
+            return [];
+        }
+
+        [$text, $twin] = self::w52Text($paths);
+
+        return self::w52Call($text, $twin, \count($paths))
+            ?? self::extractedEntryBatchPhp($paths);
+    }
+
+    /**
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function extractedEntryBatchPhp(array $paths): array
+    {
+        self::w52AssertList($paths);
+        $out = [];
+        foreach ($paths as $path) {
+            if ($path === '') {
+                $out[] = self::W52_ENTRY_EMPTY;
+                $out[] = 0;
+
+                continue;
+            }
+            $normalized = strtr($path, '\\', '/');
+            $flags = $normalized[0] === '/' ? self::W52_ENTRY_ABSOLUTE : 0;
+            if (\in_array('..', explode('/', $normalized), true)) {
+                $flags |= self::W52_ENTRY_TRAVERSAL;
+            }
+            if (str_contains($path, "\0")) {
+                $flags |= self::W52_ENTRY_NUL;
+            }
+            $slash = strrpos($normalized, '/');
+            $at = $slash === false ? 0 : $slash + 1;
+            $dot = strrpos($normalized, '.', $at);
+            $extension = $dot === false ? '' : strtolower(substr($normalized, $dot + 1));
+            if (isset(self::W406_EXECUTABLE_EXTENSIONS[$extension])) {
+                $flags |= self::W52_ENTRY_EXECUTABLE;
+            }
+            if (isset(self::W52_ARCHIVE_EXTENSIONS[$extension]) || preg_match('/^(?:r\d\d|\d{3})\z/', $extension) === 1) {
+                $flags |= self::W52_ENTRY_ARCHIVE;
+            }
+            if (isset(self::W52_NFO_EXTENSIONS[$extension])) {
+                $flags |= self::W52_ENTRY_NFO;
+            }
+            $out[] = $flags;
+            $out[] = ($at << 32) | (\strlen($path) - $at);
+        }
+
+        return $out;
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W52 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('enabled');
+        self::w52RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: encoded text and packed int64 columns in, 2 int64
+     * words back per record. Null when the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            $state = self::w52RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w52', self::W52_FFI_CDEF) ?? false;
+                self::w52RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * 2;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w52RustFfiState('out', $out);
+                self::w52RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w524_extracted_entry_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Text column encoding: NUL-joined values and, when a value holds a NUL byte, the same
+     * values joined with 0x01 so Rust finds the separators where the two buffers differ.
+     *
+     * @param  list<string>  $values
+     * @return array{0: string, 1: string}
+     */
+    private static function w52Text(array $values): array
+    {
+        $joined = implode("\0", $values);
+
+        return [$joined, substr_count($joined, "\0") === \count($values) - 1 ? '' : implode("\x01", $values)];
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w52AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new InvalidArgumentException('W52 batch input must be a list.');
+        }
+    }
+
+    /**
+     * W52 routing override and cached binding. Readonly classes cannot declare static
+     * properties, so they live in a function static: no arguments returns the state, one
+     * argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }
