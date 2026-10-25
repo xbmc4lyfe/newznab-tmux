@@ -13,6 +13,48 @@ use Throwable;
 
 class BookCategorizer extends AbstractCategorizer
 {
+    /**
+     * Wave 42.3 production default is Rust: the paired benchmark in
+     * tests/Unit/RustCategorizersBookConsoleGroupMiscMovieW42ParityTest.php measures at least 5.1x
+     * (mean and p99, common and uncommon batches). PHP stays the fallback when the library is
+     * unavailable.
+     * Named W423 so it stays distinct from other Rust FFI toggles.
+     */
+    public const bool W423_RUST_FFI_DEFAULT = true;
+
+    public const string W423_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w423_book_format_batch(
+            const char *blob_ptr,
+            size_t blob_len,
+            const char *lens_ptr,
+            size_t lens_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /**
+     * Book format marker substrings, in match order. The first class with a substring of the
+     * lowercased release name wins.
+     *
+     * @var array<string, list<string>>
+     */
+    public const array W423_BOOK_FORMAT_MARKERS = [
+        'comic' => ['.cbr', '.cbz', '.cb7', 'comic', 'manga'],
+        'audiobook' => ['audiobook', '.m4b', 'audible', 'unabridged'],
+        'magazine' => ['magazine', 'weekly', 'monthly', 'issue'],
+        'ebook' => ['epub', 'mobi', 'azw3', '.pdf', 'ebook'],
+    ];
+
+    public const string W423_RETAIL_MARKER = 'retail';
+
+    /** Exactly 7 0x1F-separated decimals of 1-19 digits. */
+    private const string W423_FIELDS_PATTERN = '/\A(?:\d{1,19}\x1F){6}\d{1,19}\z/';
+
+    private static ?bool $w423RustFfiOverride = null;
+
+    private static FFI|false|null $w423RustFfiHandle = null;
+
     protected int $priority = 45;
 
     /**
@@ -333,5 +375,155 @@ CDEF;
     {
         return preg_match('/\b(?:720p|1080p|2160p|4k)\b/i', $name) === 1
             && preg_match('/\b(?:WEB[._ -]?DL|WEBRip|HDTV|BluRay|BDRip|DVDRip|x264|x265|HEVC|HDR|Remux|AVC)\b/i', $name) === 1;
+    }
+
+    public static function useW423RustFfi(bool $enable = true): void
+    {
+        self::$w423RustFfiOverride = $enable;
+    }
+
+    public static function usesW423RustFfi(): bool
+    {
+        return self::$w423RustFfiOverride ?? self::W423_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW423RustFfi(): void
+    {
+        self::$w423RustFfiOverride = null;
+        self::$w423RustFfiHandle = null;
+    }
+
+    /**
+     * Book format summary for a batch of release names. Each lowercased name adds to its first
+     * W423_BOOK_FORMAT_MARKERS class, else to unknown, and separately to retail when it holds
+     * W423_RETAIL_MARKER. Non-strings count as empty names.
+     *
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, comic: int, audiobook: int, magazine: int, ebook: int, unknown: int, retail: int}
+     */
+    public static function summarizeBookFormatBatch(array $releaseNames): array
+    {
+        return (self::usesW423RustFfi() ? self::summarizeBookFormatBatchNative($releaseNames) : null)
+            ?? self::summarizeBookFormatBatchPhp($releaseNames);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, comic: int, audiobook: int, magazine: int, ebook: int, unknown: int, retail: int}
+     */
+    public static function summarizeBookFormatBatchPhp(array $releaseNames): array
+    {
+        $classes = ['comic' => 0, 'audiobook' => 0, 'magazine' => 0, 'ebook' => 0];
+        $unknown = 0;
+        $retail = 0;
+        foreach ($releaseNames as $releaseName) {
+            $name = strtolower(\is_string($releaseName) ? $releaseName : '');
+            if (str_contains($name, self::W423_RETAIL_MARKER)) {
+                $retail++;
+            }
+            foreach (self::W423_BOOK_FORMAT_MARKERS as $class => $needles) {
+                foreach ($needles as $needle) {
+                    if (str_contains($name, $needle)) {
+                        $classes[$class]++;
+
+                        continue 3;
+                    }
+                }
+            }
+            $unknown++;
+        }
+
+        return [
+            'total' => \count($releaseNames),
+            'comic' => $classes['comic'],
+            'audiobook' => $classes['audiobook'],
+            'magazine' => $classes['magazine'],
+            'ebook' => $classes['ebook'],
+            'unknown' => $unknown,
+            'retail' => $retail,
+        ];
+    }
+
+    /**
+     * Declines (null) for non-string items so PHP counts them.
+     *
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, comic: int, audiobook: int, magazine: int, ebook: int, unknown: int, retail: int}|null
+     */
+    public static function summarizeBookFormatBatchNative(array $releaseNames): ?array
+    {
+        $lengths = [];
+        foreach ($releaseNames as $item) {
+            if (! \is_string($item)) {
+                return null;
+            }
+            $lengths[] = \strlen($item);
+        }
+        $blob = implode('', $releaseNames);
+        $lens = pack('V*', ...$lengths);
+        $fields = self::callW423Native($blob, $lens);
+        if ($fields === null) {
+            return null;
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'comic' => (int) $fields[1],
+            'audiobook' => (int) $fields[2],
+            'magazine' => (int) $fields[3],
+            'ebook' => (int) $fields[4],
+            'unknown' => (int) $fields[5],
+            'retail' => (int) $fields[6],
+        ];
+    }
+
+    /**
+     * Calls this class's Wave 42.3 export with the shared scratch buffer, retrying once at the size
+     * it asks for. Returns its fields only when they match W423_FIELDS_PATTERN: exactly the expected
+     * count of 1-19 digit decimals.
+     *
+     * @return list<string>|null
+     */
+    private static function callW423Native(string $blob, string $lens): ?array
+    {
+        $ffi = self::w423RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 128, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w423_book_format_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w423_book_format_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $raw = FFI::string($buffer, $written);
+
+            return preg_match(self::W423_FIELDS_PATTERN, $raw) === 1 ? explode("\x1F", $raw) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w423RustFfi(): ?FFI
+    {
+        if (self::$w423RustFfiHandle === null) {
+            self::$w423RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w423', self::W423_FFI_CDEF) ?? false;
+        }
+
+        return self::$w423RustFfiHandle === false ? null : self::$w423RustFfiHandle;
     }
 }

@@ -31523,3 +31523,884 @@ pub mod categorization_pipeline_result_music_pc_tv_w413 {
         }
     }
 }
+
+/// Wave 42.3 batch summaries for the Book, Console, GroupName, Misc and Movie categorizers.
+///
+/// Every export takes a packed string list (`blob` plus little-endian `u32` lengths) and writes
+/// `0x1F`-separated decimals, returning the byte count, `-required` (without writing) when the
+/// output does not fit, or `-1` for invalid input.
+pub mod categorizers_book_console_group_misc_movie_w423 {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    /// PHP `trim()` default character set.
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B";
+    /// `GroupNameCategorizer::W423_GROUP_PREFIX`.
+    const GROUP_PREFIX: &[u8] = b"alt.binaries.";
+    /// `MiscCategorizer::W423_HASH_LENGTHS`.
+    const HASH_LENGTHS: [usize; 3] = [32, 40, 64];
+
+    /// Substring needles tagged with their class, searched in one pass per name.
+    struct NeedleSet<const N: usize> {
+        needles: [(&'static [u8], usize); N],
+        by_first_byte: [u32; 256],
+        by_second_byte: [u32; 256],
+    }
+
+    impl<const N: usize> NeedleSet<N> {
+        /// Every needle must be lowercase and at least two bytes long; at most 32 needles fit the
+        /// masks. The byte tables index both cases so names are matched without lowercasing them.
+        const fn new(needles: [(&'static [u8], usize); N]) -> Self {
+            assert!(N <= 32);
+            let mut by_first_byte = [0u32; 256];
+            let mut by_second_byte = [0u32; 256];
+            let mut k = 0;
+            while k < N {
+                let needle = needles[k].0;
+                assert!(needle.len() >= 2);
+                let mut j = 0;
+                while j < needle.len() {
+                    assert!(!needle[j].is_ascii_uppercase());
+                    j += 1;
+                }
+                let (first, second) = (needle[0], needle[1]);
+                by_first_byte[first as usize] |= 1 << k;
+                by_first_byte[first.to_ascii_uppercase() as usize] |= 1 << k;
+                by_second_byte[second as usize] |= 1 << k;
+                by_second_byte[second.to_ascii_uppercase() as usize] |= 1 << k;
+                k += 1;
+            }
+            NeedleSet {
+                needles,
+                by_first_byte,
+                by_second_byte,
+            }
+        }
+
+        /// Bitmask of the needles belonging to `class`.
+        const fn class_mask(&self, class: usize) -> u32 {
+            let mut mask = 0u32;
+            let mut k = 0;
+            while k < N {
+                if self.needles[k].1 == class {
+                    mask |= 1 << k;
+                }
+                k += 1;
+            }
+            mask
+        }
+
+        /// Bitmask of the needles that occur anywhere in `name`, ignoring ASCII case like a
+        /// `str_contains()` over PHP 8.2+ `strtolower($name)`.
+        fn matches(&self, name: &[u8]) -> u32 {
+            let Some((&first, rest)) = name.split_first() else {
+                return 0;
+            };
+            let mut matched = 0u32;
+            // Needles whose first byte is the previous byte; `i` is where that byte sits.
+            let mut pending = self.by_first_byte[first as usize];
+            for (i, &b) in rest.iter().enumerate() {
+                let mut candidates = pending & self.by_second_byte[b as usize] & !matched;
+                pending = self.by_first_byte[b as usize];
+                while candidates != 0 {
+                    let k = candidates.trailing_zeros() as usize;
+                    candidates &= candidates - 1;
+                    let needle = self.needles[k].0;
+                    if name
+                        .get(i..i + needle.len())
+                        .is_some_and(|window| window.eq_ignore_ascii_case(needle))
+                    {
+                        matched |= 1 << k;
+                    }
+                }
+            }
+            matched
+        }
+    }
+
+    /// Index of the first class in `masks` that `matched` hits, else `masks.len()`.
+    #[inline]
+    fn first_class(matched: u32, masks: &[u32]) -> usize {
+        masks
+            .iter()
+            .position(|&mask| matched & mask != 0)
+            .unwrap_or(masks.len())
+    }
+
+    /// `BookCategorizer::W423_BOOK_FORMAT_MARKERS` (comic, audiobook, magazine, ebook), then the
+    /// retail marker.
+    const BOOK_NEEDLES: NeedleSet<19> = NeedleSet::new([
+        (b".cbr", 0),
+        (b".cbz", 0),
+        (b".cb7", 0),
+        (b"comic", 0),
+        (b"manga", 0),
+        (b"audiobook", 1),
+        (b".m4b", 1),
+        (b"audible", 1),
+        (b"unabridged", 1),
+        (b"magazine", 2),
+        (b"weekly", 2),
+        (b"monthly", 2),
+        (b"issue", 2),
+        (b"epub", 3),
+        (b"mobi", 3),
+        (b"azw3", 3),
+        (b".pdf", 3),
+        (b"ebook", 3),
+        (b"retail", 4),
+    ]);
+    static BOOK_NEEDLE_SET: NeedleSet<19> = BOOK_NEEDLES;
+    const BOOK_CLASS_MASKS: [u32; 4] = [
+        BOOK_NEEDLES.class_mask(0),
+        BOOK_NEEDLES.class_mask(1),
+        BOOK_NEEDLES.class_mask(2),
+        BOOK_NEEDLES.class_mask(3),
+    ];
+    const RETAIL_MASK: u32 = BOOK_NEEDLES.class_mask(4);
+
+    /// `ConsoleCategorizer::W423_CONSOLE_FAMILY_MARKERS` (playstation, xbox, nintendo), then the
+    /// region markers.
+    const CONSOLE_NEEDLES: NeedleSet<23> = NeedleSet::new([
+        (b"ps5", 0),
+        (b"ps4", 0),
+        (b"ps3", 0),
+        (b"psvita", 0),
+        (b"psp", 0),
+        (b"playstation", 0),
+        (b"xbox", 1),
+        (b"x360", 1),
+        (b"xbone", 1),
+        (b"xbsx", 1),
+        (b"switch", 2),
+        (b"nsw", 2),
+        (b"wiiu", 2),
+        (b"wii", 2),
+        (b"3ds", 2),
+        (b"nds", 2),
+        (b"nintendo", 2),
+        (b"pal", 3),
+        (b"ntsc", 3),
+        (b"usa", 3),
+        (b"eur", 3),
+        (b"jpn", 3),
+        (b"region.free", 3),
+    ]);
+    static CONSOLE_NEEDLE_SET: NeedleSet<23> = CONSOLE_NEEDLES;
+    const CONSOLE_CLASS_MASKS: [u32; 3] = [
+        CONSOLE_NEEDLES.class_mask(0),
+        CONSOLE_NEEDLES.class_mask(1),
+        CONSOLE_NEEDLES.class_mask(2),
+    ];
+    const REGION_MASK: u32 = CONSOLE_NEEDLES.class_mask(3);
+
+    /// `GroupNameCategorizer::W423_GROUP_TOPIC_MARKERS` (anime, tv, movie, xxx, music, game, pc,
+    /// book).
+    const GROUP_NEEDLES: NeedleSet<27> = NeedleSet::new([
+        (b"anime", 0),
+        (b"hdtv", 1),
+        (b"tvseries", 1),
+        (b".tv", 1),
+        (b"teevee", 1),
+        (b"movies", 2),
+        (b"movie", 2),
+        (b"dvd", 2),
+        (b"bluray", 2),
+        (b"x264", 2),
+        (b"erotica", 3),
+        (b"xxx", 3),
+        (b"mp3", 4),
+        (b"sounds", 4),
+        (b"music", 4),
+        (b"lossless", 4),
+        (b"games", 5),
+        (b"console", 5),
+        (b"psx", 5),
+        (b"nintendo", 5),
+        (b"warez", 6),
+        (b"0day", 6),
+        (b"apps", 6),
+        (b"software", 6),
+        (b"ebook", 7),
+        (b"e-book", 7),
+        (b"comics", 7),
+    ]);
+    static GROUP_NEEDLE_SET: NeedleSet<27> = GROUP_NEEDLES;
+    const GROUP_CLASS_MASKS: [u32; 8] = [
+        GROUP_NEEDLES.class_mask(0),
+        GROUP_NEEDLES.class_mask(1),
+        GROUP_NEEDLES.class_mask(2),
+        GROUP_NEEDLES.class_mask(3),
+        GROUP_NEEDLES.class_mask(4),
+        GROUP_NEEDLES.class_mask(5),
+        GROUP_NEEDLES.class_mask(6),
+        GROUP_NEEDLES.class_mask(7),
+    ];
+
+    /// `MiscCategorizer::W423_MISC_CONTENT_MARKERS` (archive, dataset).
+    const MISC_NEEDLES: NeedleSet<11> = NeedleSet::new([
+        (b".rar", 0),
+        (b".zip", 0),
+        (b".7z", 0),
+        (b".par2", 0),
+        (b".tar", 0),
+        (b".001", 0),
+        (b"dataset", 1),
+        (b".csv", 1),
+        (b".sql", 1),
+        (b"dump", 1),
+        (b"backup", 1),
+    ]);
+    static MISC_NEEDLE_SET: NeedleSet<11> = MISC_NEEDLES;
+    const MISC_CLASS_MASKS: [u32; 2] = [MISC_NEEDLES.class_mask(0), MISC_NEEDLES.class_mask(1)];
+
+    /// `MovieCategorizer::W423_MOVIE_RESOLUTION_MARKERS` (uhd, hd, sd), then the HEVC and Blu-ray
+    /// markers.
+    const MOVIE_NEEDLES: NeedleSet<19> = NeedleSet::new([
+        (b"2160p", 0),
+        (b"4k", 0),
+        (b"uhd", 0),
+        (b"1080p", 1),
+        (b"1080i", 1),
+        (b"720p", 1),
+        (b"480p", 2),
+        (b"576p", 2),
+        (b"dvdrip", 2),
+        (b"xvid", 2),
+        (b"sdtv", 2),
+        (b"x265", 3),
+        (b"hevc", 3),
+        (b"h265", 3),
+        (b"h.265", 3),
+        (b"bluray", 4),
+        (b"blu-ray", 4),
+        (b"bdremux", 4),
+        (b"bdrip", 4),
+    ]);
+    static MOVIE_NEEDLE_SET: NeedleSet<19> = MOVIE_NEEDLES;
+    const MOVIE_CLASS_MASKS: [u32; 3] = [
+        MOVIE_NEEDLES.class_mask(0),
+        MOVIE_NEEDLES.class_mask(1),
+        MOVIE_NEEDLES.class_mask(2),
+    ];
+    const HEVC_MASK: u32 = MOVIE_NEEDLES.class_mask(3);
+    const BLURAY_MASK: u32 = MOVIE_NEEDLES.class_mask(4);
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Whether `[a, a + a_len)` and `[b, b + b_len)` share a byte (empty ranges never do).
+    #[inline]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        if a_len == 0 || b_len == 0 {
+            return false;
+        }
+        match (a.checked_add(a_len), b.checked_add(b_len)) {
+            (Some(a_end), Some(b_end)) => a < b_end && b < a_end,
+            _ => true,
+        }
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    /// Renders `values` as `0x1F`-separated decimals.
+    fn fields(values: &[u64]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 4);
+        for (i, &value) in values.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            let mut digits = [0u8; 20];
+            let mut n = value;
+            let mut at = digits.len();
+            loop {
+                at -= 1;
+                digits[at] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            out.extend_from_slice(&digits[at..]);
+        }
+        out
+    }
+
+    /// Splits `blob` by packed little-endian `u32` lengths; the lengths must cover it exactly.
+    fn split_blob<'a>(blob: &'a [u8], lens: &[u8]) -> Option<Vec<&'a [u8]>> {
+        let (chunks, []) = lens.as_chunks::<4>() else {
+            return None;
+        };
+        let mut items = Vec::with_capacity(chunks.len());
+        let mut offset = 0usize;
+        for chunk in chunks {
+            let len = u32::from_le_bytes(*chunk) as usize;
+            let end = offset.checked_add(len)?;
+            items.push(blob.get(offset..end)?);
+            offset = end;
+        }
+        (offset == blob.len()).then_some(items)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    /// `BookCategorizer::summarizeBookFormatBatch()`: total, comic, audiobook, magazine, ebook,
+    /// unknown, retail.
+    pub fn book_format_batch(names: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 5];
+        let mut retail = 0u64;
+        for name in names {
+            let matched = BOOK_NEEDLE_SET.matches(name);
+            counts[first_class(matched, &BOOK_CLASS_MASKS)] += 1;
+            retail += u64::from(matched & RETAIL_MASK != 0);
+        }
+        fields(&[
+            names.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+            retail,
+        ])
+    }
+
+    /// `ConsoleCategorizer::summarizeConsolePlatformBatch()`: total, playstation, xbox, nintendo,
+    /// unknown, region.
+    pub fn console_platform_batch(names: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 4];
+        let mut region = 0u64;
+        for name in names {
+            let matched = CONSOLE_NEEDLE_SET.matches(name);
+            counts[first_class(matched, &CONSOLE_CLASS_MASKS)] += 1;
+            region += u64::from(matched & REGION_MASK != 0);
+        }
+        fields(&[
+            names.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            region,
+        ])
+    }
+
+    /// `GroupNameCategorizer::summarizeGroupNameBatch()`: total, alt_binaries, anime, tv, movie,
+    /// xxx, music, game, pc, book, other, empty.
+    pub fn group_name_batch(groups: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 9];
+        let mut prefixed = 0u64;
+        let mut empty = 0u64;
+        for group in groups {
+            empty += u64::from(group.is_empty());
+            prefixed += u64::from(
+                group
+                    .get(..GROUP_PREFIX.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(GROUP_PREFIX)),
+            );
+            counts[first_class(GROUP_NEEDLE_SET.matches(group), &GROUP_CLASS_MASKS)] += 1;
+        }
+        let mut values = Vec::with_capacity(12);
+        values.push(groups.len() as u64);
+        values.push(prefixed);
+        values.extend_from_slice(&counts);
+        values.push(empty);
+        fields(&values)
+    }
+
+    /// `MiscCategorizer::summarizeMiscContentBatch()`: total, hash, archive, dataset, other, empty.
+    pub fn misc_content_batch(names: &[&[u8]]) -> Vec<u8> {
+        let mut hash = 0u64;
+        let mut counts = [0u64; 3];
+        let mut empty = 0u64;
+        for name in names {
+            let name = trim(name);
+            empty += u64::from(name.is_empty());
+            if HASH_LENGTHS.contains(&name.len()) && name.iter().all(u8::is_ascii_hexdigit) {
+                hash += 1;
+                continue;
+            }
+            counts[first_class(MISC_NEEDLE_SET.matches(name), &MISC_CLASS_MASKS)] += 1;
+        }
+        fields(&[
+            names.len() as u64,
+            hash,
+            counts[0],
+            counts[1],
+            counts[2],
+            empty,
+        ])
+    }
+
+    /// `MovieCategorizer::summarizeMovieQualityBatch()`: total, uhd, hd, sd, unknown, hevc, bluray.
+    pub fn movie_quality_batch(names: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 4];
+        let mut hevc = 0u64;
+        let mut bluray = 0u64;
+        for name in names {
+            let matched = MOVIE_NEEDLE_SET.matches(name);
+            counts[first_class(matched, &MOVIE_CLASS_MASKS)] += 1;
+            hevc += u64::from(matched & HEVC_MASK != 0);
+            bluray += u64::from(matched & BLURAY_MASK != 0);
+        }
+        fields(&[
+            names.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            hevc,
+            bluray,
+        ])
+    }
+
+    /// Validates a packed string list and the output buffer, then writes `render(items)`.
+    unsafe fn with_strings(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+        render: fn(&[&[u8]]) -> Vec<u8>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap)
+                || overlaps(out_buf as usize, out_cap, blob_ptr as usize, blob_len)
+                || overlaps(out_buf as usize, out_cap, lens_ptr as usize, lens_len)
+            {
+                return DECLINE;
+            }
+            let (Some(blob), Some(lens)) = (unsafe { valid_slice(blob_ptr, blob_len) }, unsafe {
+                valid_slice(lens_ptr, lens_len)
+            }) else {
+                return DECLINE;
+            };
+            let Some(items) = split_blob(blob, lens) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&render(&items), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w423_book_format_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                book_format_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w423_console_platform_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                console_platform_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w423_group_name_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                group_name_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w423_misc_content_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                misc_content_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w423_movie_quality_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                movie_quality_batch,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const u8, usize, *mut u8, usize) -> isize;
+
+        const EXPORTS: [Export; 5] = [
+            nntmux_w423_book_format_batch,
+            nntmux_w423_console_platform_batch,
+            nntmux_w423_group_name_batch,
+            nntmux_w423_misc_content_batch,
+            nntmux_w423_movie_quality_batch,
+        ];
+
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8_lossy(bytes).replace('\x1F', "|")
+        }
+
+        fn packed(items: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+            let blob = items.concat();
+            let lens = items
+                .iter()
+                .flat_map(|i| (i.len() as u32).to_le_bytes())
+                .collect();
+            (blob, lens)
+        }
+
+        fn call(export: Export, items: &[&[u8]]) -> String {
+            let (blob, lens) = packed(items);
+            let mut buf = vec![0u8; 256];
+            let n = unsafe {
+                export(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n > 0, "call declined: {n}");
+            text(&buf[..n as usize])
+        }
+
+        #[test]
+        fn w423_book_format_counts() {
+            let names: [&[u8]; 8] = [
+                b"Batman.001.2024.Digital.CBZ",
+                b"Author - Title (Unabridged) M4B",
+                b"Some.Magazine.Weekly.Issue.12",
+                b"Author.Title.2024.RETAIL.EPUB",
+                b"Manga.Vol.3.epub",
+                b"Plain.Name",
+                b"",
+                b"Retail.Only",
+            ];
+            assert_eq!(text(&book_format_batch(&names)), "8|2|1|1|1|3|2");
+            assert_eq!(text(&book_format_batch(&[])), "0|0|0|0|0|0|0");
+            assert_eq!(
+                call(nntmux_w423_book_format_batch, &names),
+                "8|2|1|1|1|3|2"
+            );
+        }
+
+        #[test]
+        fn w423_console_platform_counts() {
+            let names: [&[u8]; 7] = [
+                b"Game.PS4-GRP",
+                b"Game.XBOX360.PAL",
+                b"Game.NSW.USA",
+                b"Game.Wii.NTSC",
+                b"Some.PlayStation.Xbox.Mix",
+                b"Plain.Name",
+                b"",
+            ];
+            assert_eq!(text(&console_platform_batch(&names)), "7|2|1|2|2|3");
+            assert_eq!(text(&console_platform_batch(&[])), "0|0|0|0|0|0");
+            assert_eq!(
+                call(nntmux_w423_console_platform_batch, &names),
+                "7|2|1|2|2|3"
+            );
+        }
+
+        #[test]
+        fn w423_group_name_counts() {
+            let groups: [&[u8]; 11] = [
+                b"alt.binaries.anime",
+                b"ALT.BINARIES.HDTV.X264",
+                b"alt.binaries.movies.divx",
+                b"alt.binaries.erotica",
+                b"alt.binaries.sounds.mp3",
+                b"alt.binaries.games.xbox",
+                b"alt.binaries.warez",
+                b"alt.binaries.e-book",
+                b"alt.binaries.misc",
+                b"alt.binaries",
+                b"",
+            ];
+            assert_eq!(
+                text(&group_name_batch(&groups)),
+                "11|9|1|1|1|1|1|1|1|1|3|1"
+            );
+            assert_eq!(text(&group_name_batch(&[])), "0|0|0|0|0|0|0|0|0|0|0|0");
+            assert_eq!(
+                call(nntmux_w423_group_name_batch, &groups),
+                "11|9|1|1|1|1|1|1|1|1|3|1"
+            );
+        }
+
+        #[test]
+        fn w423_misc_content_counts() {
+            let names: [&[u8]; 9] = [
+                b"d41d8cd98f00b204e9800998ecf8427e",
+                b"  DA39A3EE5E6B4B0D3255BFEF95601890AFD80709\t",
+                b"d41d8cd98f00b204e9800998ecf8427",
+                b"g41d8cd98f00b204e9800998ecf8427e",
+                b"Some.Archive.part01.RAR",
+                b"Customer.Dataset.csv",
+                b"Plain.Name",
+                b" \0 ",
+                b"",
+            ];
+            assert_eq!(text(&misc_content_batch(&names)), "9|2|1|1|5|2");
+            assert_eq!(text(&misc_content_batch(&[])), "0|0|0|0|0|0");
+            assert_eq!(
+                call(nntmux_w423_misc_content_batch, &names),
+                "9|2|1|1|5|2"
+            );
+        }
+
+        #[test]
+        fn w423_movie_quality_counts() {
+            let names: [&[u8]; 7] = [
+                b"Movie.2024.2160p.UHD.BluRay.x265-GRP",
+                b"Movie.2024.1080p.WEB-DL.H.265-GRP",
+                b"Movie.2024.720p.BDRip.x264-GRP",
+                b"Movie.2004.DVDRip.XviD-GRP",
+                b"Movie.4K.HDR",
+                b"Plain.Name",
+                b"",
+            ];
+            assert_eq!(text(&movie_quality_batch(&names)), "7|2|2|1|2|2|2");
+            assert_eq!(text(&movie_quality_batch(&[])), "0|0|0|0|0|0|0");
+            assert_eq!(
+                call(nntmux_w423_movie_quality_batch, &names),
+                "7|2|2|1|2|2|2"
+            );
+        }
+
+        #[test]
+        fn w423_needles_match_across_positions_and_case() {
+            for pad in 0..40 {
+                let filler = "z".repeat(pad);
+                let name = format!("{filler}.ePuB.{filler}");
+                assert_eq!(text(&book_format_batch(&[name.as_bytes()])), "1|0|0|0|1|0|0");
+                let name = format!("{filler}PS5{filler}");
+                assert_eq!(
+                    text(&console_platform_batch(&[name.as_bytes()])),
+                    "1|1|0|0|0|0"
+                );
+                let name = format!("{filler}Region.Free");
+                assert_eq!(
+                    text(&console_platform_batch(&[name.as_bytes()])),
+                    "1|0|0|0|1|1"
+                );
+                let name = format!("{filler}.H.265.2160P");
+                assert_eq!(
+                    text(&movie_quality_batch(&[name.as_bytes()])),
+                    "1|1|0|0|0|1|0"
+                );
+            }
+            // Overlapping prefixes ("wii" inside "wiiu", "movie" inside "movies") still match.
+            assert_eq!(text(&console_platform_batch(&[b"WIIU"])), "1|0|0|1|0|0");
+            assert_eq!(
+                text(&group_name_batch(&[b"a.movies"])),
+                "1|0|0|0|1|0|0|0|0|0|0|0"
+            );
+            // A truncated needle at the end of a name does not match.
+            assert_eq!(text(&movie_quality_batch(&[b"x.2160"])), "1|0|0|0|1|0|0");
+            assert_eq!(text(&misc_content_batch(&[b"a.ra"])), "1|0|0|0|1|0");
+        }
+
+        #[test]
+        fn w423_exports_validate_inputs_and_capacity() {
+            let x = b"x".as_ptr();
+            let lens1 = 1u32.to_le_bytes();
+            unsafe {
+                for export in EXPORTS {
+                    let mut small = [b'Z'; 4];
+                    let needed = export(x, 1, lens1.as_ptr(), 4, small.as_mut_ptr(), 2);
+                    assert!(needed < -2, "needed {needed}");
+                    assert_eq!(small, [b'Z'; 4]);
+                    let mut exact = vec![0u8; (-needed) as usize];
+                    assert_eq!(
+                        export(x, 1, lens1.as_ptr(), 4, exact.as_mut_ptr(), exact.len()),
+                        -needed
+                    );
+                    let mut short = vec![b'Z'; (-needed - 1) as usize];
+                    assert_eq!(
+                        export(x, 1, lens1.as_ptr(), 4, short.as_mut_ptr(), short.len()),
+                        needed
+                    );
+                    assert!(short.iter().all(|&b| b == b'Z'));
+
+                    let mut out = [0u8; 128];
+                    let (b, c) = (out.as_mut_ptr(), out.len());
+                    assert_eq!(export(x, 1, lens1.as_ptr(), 4, ptr::null_mut(), 8), DECLINE);
+                    assert_eq!(export(ptr::null(), 0, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, 0, ptr::null(), 0, b, c), DECLINE);
+                    // Ragged lengths and inconsistent blobs decline.
+                    assert_eq!(export(x, 1, lens1.as_ptr(), 3, b, c), DECLINE);
+                    assert_eq!(export(x, 0, lens1.as_ptr(), 4, b, c), DECLINE);
+                    let two = 2u32.to_le_bytes();
+                    assert_eq!(export(x, 1, two.as_ptr(), 4, b, c), DECLINE);
+                    let huge = u32::MAX.to_le_bytes();
+                    assert_eq!(export(x, 1, huge.as_ptr(), 4, b, c), DECLINE);
+                    // Oversized inputs and wrapping ranges decline.
+                    assert_eq!(export(x, MAX_INPUT + 1, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, usize::MAX, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, 0, x, 0, usize::MAX as *mut u8, 8), DECLINE);
+                    assert_eq!(export(x, 0, x, 0, b, isize::MAX as usize + 1), DECLINE);
+                    // An output buffer overlapping an input declines without writing.
+                    let mut shared =
+                        *b"sample\x06\0\0\0..............................................";
+                    let p = shared.as_mut_ptr();
+                    assert_eq!(export(p, 6, p.add(6), 4, p.add(3), 40), DECLINE);
+                    assert_eq!(export(p, 6, p.add(6), 4, p.add(9), 40), DECLINE);
+                    assert_eq!(&shared[..10], b"sample\x06\0\0\0");
+                    assert!(export(p, 6, p.add(6), 4, p.add(10), 40) > 0);
+                    // Empty lists are valid.
+                    assert!(export(x, 0, x, 0, b, c) > 0);
+                }
+            }
+        }
+
+        #[test]
+        fn w423_helpers() {
+            assert!(!overlaps(10, 0, 10, 5));
+            assert!(overlaps(10, 5, 14, 1));
+            assert!(!overlaps(10, 5, 15, 1));
+            assert!(overlaps(usize::MAX, 2, 0, 1));
+            assert_eq!(trim(b" \t\n\r\0\x0Bab c\x0B"), b"ab c");
+            assert_eq!(trim(b"\x0C a"), b"\x0C a");
+            assert_eq!(trim(b"   "), b"");
+            assert_eq!(text(&fields(&[0, 7, u64::MAX])), "0|7|18446744073709551615");
+            assert_eq!(first_class(0, &[1, 2]), 2);
+            assert_eq!(first_class(6, &[1, 2, 4]), 1);
+        }
+    }
+}
