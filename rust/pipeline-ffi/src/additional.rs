@@ -34260,3 +34260,957 @@ mod w486_additional_dto_batch_tests {
         assert_eq!((status, out[5]), (1, 1));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 49.6: AdditionalProcessing batch helpers (`nntmux_w49_*`) for
+// ReleaseProcessingResult, FfmpegFrameGrabber, DownloadKind, MappingConfidence
+// and VideoContainer. Same conventions as Wave 48.6: one crossing per batch,
+// NUL-joined strings (plus, when a value holds a NUL, the same list joined with
+// 0x01), fixed 960-byte head records with `pack('V*')` lengths, machine-order `int64_t` columns
+// in, fixed-width `int64_t` rows out (read with `unpack('P*')`). Every export
+// returns 1, -1 for invalid input or -2 when `out` is null, misaligned or too
+// small, and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+/// Largest Matroska clock hour accepted, so a nanosecond total fits an integer.
+const W49_CLOCK_HOURS_CAP: i64 = 2_000_000;
+
+/// `total + value`, saturating at `W47_TOTAL_CAP` for any non-negative value.
+#[inline]
+fn w49_add(total: i64, value: i64) -> i64 {
+    if value > W47_TOTAL_CAP - total {
+        W47_TOTAL_CAP
+    } else {
+        total + value
+    }
+}
+
+/// PCRE `\s` without UTF/UCP (VT included).
+#[inline]
+fn w49_pcre_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
+}
+
+/// `count` items from NUL-joined bytes. A non-empty `twin` is the same list
+/// joined with 0x01, so separators are exactly the offsets where the two differ
+/// and items may hold NULs; PHP builds both with `implode()`.
+fn w49_items<'a>(joined: &'a [u8], twin: &[u8], count: usize) -> Option<Vec<&'a [u8]>> {
+    if count > W47_MAX_ITEMS {
+        return None;
+    }
+    if twin.is_empty() {
+        return w466_split(joined, count);
+    }
+    if twin.len() != joined.len() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(count);
+    let (mut start, mut at, len) = (0, 0, joined.len());
+    while at < len {
+        if at + 8 <= len && joined[at..at + 8] == twin[at..at + 8] {
+            at += 8;
+            continue;
+        }
+        if joined[at] != twin[at] {
+            if joined[at] != 0 || twin[at] != 1 || parts.len() + 1 >= count {
+                return None;
+            }
+            parts.push(&joined[start..at]);
+            start = at + 1;
+        }
+        at += 1;
+    }
+    parts.push(&joined[start..]);
+    (parts.len() == count).then_some(parts)
+}
+
+/// Bytes of a video head `detect_video_container()` can read: its transport
+/// stream limits saturate at 940 (188-byte) and 960 (192-byte) bytes.
+pub(crate) const W49_HEAD_STRIDE: usize = 960;
+
+/// `count` heads from 960-byte records (PHP `pack('a960...')`) and their
+/// original `pack('V*')` lengths, each cut to the record.
+fn w49_heads<'a>(records: &'a [u8], lens: &[u8], count: usize) -> Option<Vec<&'a [u8]>> {
+    if count > W47_MAX_ITEMS
+        || records.len() != count.checked_mul(W49_HEAD_STRIDE)?
+        || lens.len() != count.checked_mul(4)?
+    {
+        return None;
+    }
+    Some(
+        records
+            .chunks_exact(W49_HEAD_STRIDE)
+            .zip(lens.as_chunks::<4>().0)
+            .map(|(record, len)| {
+                &record[..(u32::from_le_bytes(*len) as usize).min(W49_HEAD_STRIDE)]
+            })
+            .collect(),
+    )
+}
+
+unsafe fn w49_run(
+    out: *mut i64,
+    out_count: usize,
+    compute: impl FnOnce() -> Option<Vec<i64>>,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let values = compute();
+        // SAFETY: forwarded output contract; `w466_write_i64s` rejects null and misaligned pointers.
+        unsafe { w47_finish(out, out_count, values) }
+    }))
+    .unwrap_or(-1)
+}
+
+// --- ReleaseProcessingResult::summarizeResultBatch ---------------------------
+
+pub(crate) const W49_RESULT_HEADER: usize = 28;
+
+/// `ints` holds four columns of `outcomes.len()` values: elapsed, stage, files
+/// added and duplicate message-id counts.
+pub(crate) fn w49_result_summary(outcomes: &[&[u8]], ints: &[i64], slow: i64) -> Vec<i64> {
+    let count = outcomes.len();
+    let mut out = vec![0i64; W49_RESULT_HEADER + count];
+    out[0] = count as i64;
+    out[22] = -1;
+    let mut digest = W47_FNV_OFFSET;
+    let mut elapsed_all = Vec::with_capacity(count);
+    for (index, outcome) in outcomes.iter().enumerate() {
+        let case = w47_outcome_index(outcome);
+        let successful = i64::from(case <= 2);
+        let elapsed = w47_clamp(ints[index]);
+        let stage = w47_clamp(ints[count + index]);
+        let unaccounted = (elapsed - stage).max(0);
+        let is_slow = i64::from(slow > 0 && elapsed >= slow);
+        out[1 + case] += 1;
+        out[14] += successful;
+        out[15] += is_slow;
+        out[16] = w47_add(out[16], elapsed);
+        out[17] = w47_add(out[17], stage);
+        out[18] = w47_add(out[18], unaccounted);
+        out[19] = w47_add(out[19], w47_clamp(ints[2 * count + index]));
+        out[20] = w47_add(out[20], w47_clamp(ints[3 * count + index]));
+        if out[22] < 0 || elapsed > out[21] {
+            out[21] = elapsed;
+            out[22] = index as i64;
+        }
+        digest = w47_fnv(
+            digest,
+            case as u32 | (successful as u32) << 4 | (is_slow as u32) << 5,
+        );
+        out[W49_RESULT_HEADER + index] =
+            case as i64 | successful << 4 | is_slow << 5 | unaccounted << 8;
+        elapsed_all.push(elapsed);
+    }
+    if count > 0 {
+        elapsed_all.sort_unstable();
+        for (slot, percent) in [(23, 50), (24, 90), (25, 99)] {
+            out[slot] = elapsed_all[(count * percent).div_ceil(100) - 1];
+        }
+        out[26] = out[14] * 1_000_000 / count as i64;
+    }
+    out[27] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w49_release_result_summary(
+    outcomes: *const u8,
+    outcomes_len: usize,
+    outcome_twin: *const u8,
+    outcome_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    slow_micros: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let outcomes = w49_items(
+                w15_input(outcomes, outcomes_len)?,
+                w15_input(outcome_twin, outcome_twin_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 4, count)?;
+            Some(w49_result_summary(&outcomes, &ints, slow_micros))
+        })
+    }
+}
+
+// --- FfmpegFrameGrabber::parseClockBatch -------------------------------------
+
+pub(crate) const W49_CLOCK_HEADER: usize = 8;
+
+/// Nanoseconds in a `^(\d+):(\d{2}):(\d{2})(?:\.(\d+))?$` clock (PCRE `$` also
+/// matches before one final newline); 0 when it does not match, is not
+/// positive or has more than `W49_CLOCK_HOURS_CAP` hours. Fractions keep nine digits.
+pub(crate) fn w49_clock_nanos(value: &[u8]) -> i64 {
+    let value = value.strip_suffix(b"\n").unwrap_or(value);
+    let Some(colon) = value.iter().position(|&byte| byte == b':') else {
+        return 0;
+    };
+    let (hours, rest) = (&value[..colon], &value[colon + 1..]);
+    if !w47_digits(hours)
+        || rest.len() < 5
+        || !w47_digits(&rest[..2])
+        || rest[2] != b':'
+        || !w47_digits(&rest[3..5])
+    {
+        return 0;
+    }
+    let tail = &rest[5..];
+    let fraction = match tail.split_first() {
+        None => &[][..],
+        Some((b'.', digits)) if w47_digits(digits) => digits,
+        Some(_) => return 0,
+    };
+    let start = hours
+        .iter()
+        .position(|&byte| byte != b'0')
+        .unwrap_or(hours.len());
+    if hours.len() - start > 7 {
+        return 0;
+    }
+    let hours = w47_parse(&hours[start..]);
+    if hours > W49_CLOCK_HOURS_CAP {
+        return 0;
+    }
+    let mut nanos = 0i64;
+    for position in 0..9 {
+        nanos = nanos * 10
+            + fraction
+                .get(position)
+                .map_or(0, |&digit| i64::from(digit - b'0'));
+    }
+    hours * 3_600_000_000_000
+        + w47_parse(&rest[..2]) * 60_000_000_000
+        + w47_parse(&rest[3..5]) * 1_000_000_000
+        + nanos
+}
+
+pub(crate) fn w49_clock_batch(values: &[&[u8]]) -> Vec<i64> {
+    let count = values.len();
+    let mut out = vec![0i64; W49_CLOCK_HEADER + count];
+    out[0] = count as i64;
+    out[5] = -1;
+    let mut digest = W47_FNV_OFFSET;
+    for (index, value) in values.iter().enumerate() {
+        let nanos = w49_clock_nanos(value);
+        if nanos > 0 {
+            out[1] += 1;
+            out[3] = w49_add(out[3], nanos);
+            if out[6] == 0 || nanos < out[6] {
+                out[6] = nanos;
+            }
+        } else {
+            out[2] += 1;
+        }
+        if nanos > out[4] {
+            out[4] = nanos;
+            out[5] = index as i64;
+        }
+        digest = w47_fnv(digest, ((nanos / 1_000_000_000) & 0xFFFF_FFFF) as u32);
+        out[W49_CLOCK_HEADER + index] = nanos;
+    }
+    out[7] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w49_ffmpeg_clock_batch(
+    values: *const u8,
+    values_len: usize,
+    value_twin: *const u8,
+    value_twin_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let values = w49_items(
+                w15_input(values, values_len)?,
+                w15_input(value_twin, value_twin_len)?,
+                count,
+            )?;
+            Some(w49_clock_batch(&values))
+        })
+    }
+}
+
+// --- DownloadKind::accountDownloadBatch --------------------------------------
+
+pub(crate) const W49_DOWNLOAD_HEADER: usize = 24;
+
+/// `DownloadKind` case index, 7 for an unknown backing value.
+pub(crate) fn w49_download_kind(value: &[u8]) -> usize {
+    match value {
+        b"sample" => 0,
+        b"media-info" => 1,
+        b"audio" => 2,
+        b"jpg" => 3,
+        b"compressed" => 4,
+        b"par2-index" => 5,
+        b"media-source" => 6,
+        _ => 7,
+    }
+}
+
+pub(crate) fn w49_download_account(kinds: &[&[u8]], bytes: &[i64], budget: i64) -> Vec<i64> {
+    let count = kinds.len();
+    let budget = budget.clamp(0, W47_TOTAL_CAP);
+    let mut out = vec![0i64; W49_DOWNLOAD_HEADER + count];
+    out[0] = count as i64;
+    out[21] = -1;
+    let mut used = 0i64;
+    let mut digest = W47_FNV_OFFSET;
+    for (index, kind) in kinds.iter().enumerate() {
+        let case = w49_download_kind(kind);
+        let size = w47_clamp(bytes[index]);
+        let preview = i64::from(matches!(case, 3 | 5 | 6));
+        let mut admitted = 1i64;
+        out[1 + case] += 1;
+        out[9 + case] = w47_add(out[9 + case], size);
+        if preview == 1 {
+            out[17] += 1;
+            if size <= budget - used {
+                used += size;
+            } else {
+                admitted = 0;
+                out[19] += 1;
+                out[20] = w47_add(out[20], size);
+                if out[21] < 0 {
+                    out[21] = index as i64;
+                }
+            }
+        }
+        digest = w47_fnv(
+            digest,
+            case as u32 | (preview as u32) << 4 | (admitted as u32) << 5,
+        );
+        out[W49_DOWNLOAD_HEADER + index] = case as i64 | preview << 4 | admitted << 5 | size << 8;
+    }
+    out[18] = used;
+    out[22] = budget - used;
+    out[23] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w49_download_kind_account(
+    kinds: *const u8,
+    kinds_len: usize,
+    kind_twin: *const u8,
+    kind_twin_len: usize,
+    bytes: *const u8,
+    bytes_len: usize,
+    count: usize,
+    budget: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let kinds = w49_items(
+                w15_input(kinds, kinds_len)?,
+                w15_input(kind_twin, kind_twin_len)?,
+                count,
+            )?;
+            let bytes = w47_ints(w15_input(bytes, bytes_len)?, 1, count)?;
+            Some(w49_download_account(&kinds, &bytes, budget))
+        })
+    }
+}
+
+// --- MappingConfidence::rankMappingBatch -------------------------------------
+
+pub(crate) const W49_MAPPING_HEADER: usize = 12;
+
+/// `MappingConfidence::tryFromNormalizedPhp()` case index, 2 when unknown.
+pub(crate) fn w49_mapping_case(value: &[u8]) -> usize {
+    let value = trim_php(value);
+    if value.eq_ignore_ascii_case(b"verified") {
+        return 0;
+    }
+    let unique = value.len() == 11
+        && value.iter().zip(b"unique-size").all(|(&byte, &expected)| {
+            (if byte == b'_' {
+                b'-'
+            } else {
+                byte.to_ascii_lowercase()
+            }) == expected
+        });
+    if unique { 1 } else { 2 }
+}
+
+pub(crate) fn w49_mapping_rank(values: &[&[u8]], sizes: &[i64]) -> Vec<i64> {
+    let count = values.len();
+    let mut out = vec![0i64; W49_MAPPING_HEADER + count];
+    out[0] = count as i64;
+    out[7] = -1;
+    out[8] = -1;
+    let mut digest = W47_FNV_OFFSET;
+    for (index, value) in values.iter().enumerate() {
+        let case = w49_mapping_case(value);
+        let rank = [2i64, 1, 0][case];
+        let size = w47_clamp(sizes[index]);
+        out[1 + case] += 1;
+        out[4 + case] = w47_add(out[4 + case], size);
+        if out[8] < 0 || rank < out[8] {
+            out[8] = rank;
+            out[7] = index as i64;
+        }
+        digest = w47_fnv(digest, case as u32);
+        out[W49_MAPPING_HEADER + index] = case as i64 | rank << 4 | size << 8;
+    }
+    if count > 0 {
+        out[9] = i64::from(out[1] == count as i64);
+        out[10] = (out[1] * 2 + out[2]) * 1_000_000 / (2 * count as i64);
+    }
+    out[11] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w49_mapping_confidence_rank(
+    values: *const u8,
+    values_len: usize,
+    value_twin: *const u8,
+    value_twin_len: usize,
+    sizes: *const u8,
+    sizes_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let values = w49_items(
+                w15_input(values, values_len)?,
+                w15_input(value_twin, value_twin_len)?,
+                count,
+            )?;
+            let sizes = w47_ints(w15_input(sizes, sizes_len)?, 1, count)?;
+            Some(w49_mapping_rank(&values, &sizes))
+        })
+    }
+}
+
+// --- VideoContainer::classifyContainerBatch ----------------------------------
+
+pub(crate) const W49_CONTAINER_HEADER: usize = 14;
+
+/// Index of the first byte below 0x23 at or after `at` (`bytes.len()` when none);
+/// eight bytes at a time, where the lowest flagged byte of `hasless` is exact.
+fn w49_next_low(bytes: &[u8], mut at: usize) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    while let Some(chunk) = bytes.get(at..at + 8) {
+        let word = u64::from_le_bytes(chunk.try_into().unwrap_or([0xFF; 8]));
+        let low = word.wrapping_sub(ONES * 0x23) & !word & (ONES * 0x80);
+        if low != 0 {
+            return at + (low.trailing_zeros() / 8) as usize;
+        }
+        at += 8;
+    }
+    while at < bytes.len() && bytes[at] >= 0x23 {
+        at += 1;
+    }
+    at
+}
+
+/// `VideoContainer::fromFileName()` code (case index + 1, 0 for none): the
+/// leftmost `\.([a-z0-9]{2,4})"?(?:\s|$)` match (case-insensitive) on the
+/// PHP-trimmed name decides. Every match ends at whitespace, a quote or the end
+/// (all below 0x23), and two matches cannot overlap, so the first terminator
+/// that closes `.` plus 2-4 alphanumerics is the leftmost match.
+pub(crate) fn w49_name_container(name: &[u8]) -> i64 {
+    let name = trim_php(name);
+    let len = name.len();
+    let terminated = |at: usize| at == len || w49_pcre_space(name[at]);
+    let mut at = 0;
+    loop {
+        let end = w49_next_low(name, at);
+        let closes =
+            end == len || w49_pcre_space(name[end]) || (name[end] == b'"' && terminated(end + 1));
+        if closes {
+            let mut start = end;
+            while start > 0 && end - start < 5 && name[start - 1].is_ascii_alphanumeric() {
+                start -= 1;
+            }
+            let run = end - start;
+            if (2..=4).contains(&run) && start > 0 && name[start - 1] == b'.' {
+                let mut extension = [0u8; 4];
+                for (slot, &byte) in extension.iter_mut().zip(&name[start..end]) {
+                    *slot = byte.to_ascii_lowercase();
+                }
+                return match &extension[..run] {
+                    b"mkv" | b"mk3d" | b"webm" => 1,
+                    b"avi" | b"divx" | b"xvid" => 2,
+                    b"mpg" | b"mpeg" | b"vob" | b"m2v" | b"mpv" => 3,
+                    b"ts" | b"m2ts" | b"mts" => 4,
+                    b"mp4" | b"m4v" | b"mov" | b"qt" => 5,
+                    b"wmv" | b"asf" => 6,
+                    b"ogv" | b"ogm" => 7,
+                    _ => 0,
+                };
+            }
+        }
+        if end >= len {
+            return 0;
+        }
+        at = end + 1;
+    }
+}
+
+pub(crate) fn w49_container_classify(names: &[&[u8]], heads: &[&[u8]]) -> Vec<i64> {
+    let count = names.len();
+    let mut out = vec![0i64; W49_CONTAINER_HEADER + count];
+    out[0] = count as i64;
+    let mut digest = W47_FNV_OFFSET;
+    for (index, (name, head)) in names.iter().zip(heads).enumerate() {
+        let header = i64::from(detect_video_container(head));
+        let named = w49_name_container(name);
+        let effective = if header != 0 { header } else { named };
+        let flags = i64::from(header != 0)
+            | i64::from(header == 0 && named != 0) << 1
+            | i64::from(header != 0 && named != 0 && header != named) << 2
+            | i64::from((1..=4).contains(&effective)) << 3;
+        out[1 + effective as usize] += 1;
+        out[9] += flags & 1;
+        out[10] += flags >> 1 & 1;
+        out[11] += flags >> 2 & 1;
+        out[12] += flags >> 3 & 1;
+        let code = header | named << 4 | effective << 8;
+        digest = w47_fnv(digest, code as u32);
+        out[W49_CONTAINER_HEADER + index] = code | flags << 12;
+    }
+    out[13] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w49_video_container_classify(
+    names: *const u8,
+    names_len: usize,
+    name_twin: *const u8,
+    name_twin_len: usize,
+    heads: *const u8,
+    heads_len: usize,
+    head_lens: *const u8,
+    head_lens_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let names = w49_items(
+                w15_input(names, names_len)?,
+                w15_input(name_twin, name_twin_len)?,
+                count,
+            )?;
+            let heads = w49_heads(
+                w15_input(heads, heads_len)?,
+                w15_input(head_lens, head_lens_len)?,
+                count,
+            )?;
+            Some(w49_container_classify(&names, &heads))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w496_additional_batch_tests {
+    use super::*;
+    use std::ptr::{null, null_mut};
+
+    fn joined(items: &[&[u8]]) -> Vec<u8> {
+        items.join(&0u8)
+    }
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    fn records(items: &[&[u8]]) -> Vec<u8> {
+        items
+            .iter()
+            .flat_map(|item| {
+                let mut record = item[..item.len().min(W49_HEAD_STRIDE)].to_vec();
+                record.resize(W49_HEAD_STRIDE, 0);
+                record
+            })
+            .collect()
+    }
+
+    fn lens(items: &[&[u8]]) -> Vec<u8> {
+        items
+            .iter()
+            .flat_map(|item| (item.len() as u32).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn result_summary_counts_percentiles_and_rows() {
+        let ints = [
+            100, 300, 2_000, -7, // elapsed
+            50, 400, 1_000, 0, // stage
+            1, 0, 5, 2, // files
+            0, 3, 0, PHP_MAX, // duplicates
+        ];
+        let out = w49_result_summary(
+            &[b"completed", b"failed", b"passworded", b"bogus"],
+            &ints,
+            300,
+        );
+        assert_eq!(out[0], 4);
+        assert_eq!((out[1], out[3], out[12], out[13]), (1, 1, 1, 1));
+        assert_eq!(
+            (out[14], out[15], out[16], out[17], out[18]),
+            (2, 2, 2_400, 1_450, 1_050)
+        );
+        assert_eq!(
+            (out[19], out[20], out[21], out[22]),
+            (8, 3 + W47_VALUE_CAP, 2_000, 2)
+        );
+        assert_eq!(
+            (out[23], out[24], out[25], out[26]),
+            (100, 2_000, 2_000, 500_000)
+        );
+        assert_eq!(out[W49_RESULT_HEADER], 1 << 4 | 50 << 8);
+        assert_eq!(out[W49_RESULT_HEADER + 1], 11 | 1 << 5);
+        assert_eq!(out[W49_RESULT_HEADER + 3], 12);
+        let empty = w49_result_summary(&[], &[], 0);
+        assert_eq!(
+            (empty.len(), empty[22], empty[23], empty[26]),
+            (W49_RESULT_HEADER, -1, 0, 0)
+        );
+    }
+
+    const PHP_MAX: i64 = i64::MAX;
+
+    #[test]
+    fn clock_parsing_matches_the_php_pattern() {
+        assert_eq!(w49_clock_nanos(b"01:02:03.5"), 3_723_500_000_000);
+        assert_eq!(w49_clock_nanos(b"00:00:01.0000000019"), 1_000_000_001);
+        assert_eq!(w49_clock_nanos(b"00:00:00.000000000"), 0);
+        assert_eq!(w49_clock_nanos(b"0000000000002:00:00\n"), 7_200_000_000_000);
+        assert_eq!(
+            w49_clock_nanos(b"2000000:99:99"),
+            2_000_000 * 3_600_000_000_000 + 99 * 61_000_000_000
+        );
+        for invalid in [
+            &b"2000001:00:00"[..],
+            b"12345678:00:00",
+            b"1:2:03",
+            b"01:02:03.",
+            b"01:02:03\n\n",
+            b":00:00",
+            b"01:02:03 ",
+            b"01:02:3a",
+            b"",
+        ] {
+            assert_eq!(w49_clock_nanos(invalid), 0, "{invalid:?}");
+        }
+        let out = w49_clock_batch(&[b"00:00:02", b"x", b"00:00:01"]);
+        assert_eq!(
+            &out[..7],
+            &[3, 2, 1, 3_000_000_000, 2_000_000_000, 0, 1_000_000_000]
+        );
+        assert_eq!(
+            w49_clock_batch(&[b"2000000:00:00", b"2000000:00:00"])[3],
+            W47_TOTAL_CAP
+        );
+    }
+
+    #[test]
+    fn download_budget_admits_previews_in_order() {
+        let out = w49_download_account(
+            &[b"jpg", b"sample", b"media-source", b"par2-index", b"Jpg"],
+            &[60, 500, 50, 40, -1],
+            100,
+        );
+        assert_eq!(&out[..2], &[5, 1]);
+        assert_eq!((out[4], out[6], out[7], out[8]), (1, 1, 1, 1));
+        assert_eq!(
+            (out[17], out[18], out[19], out[20], out[21], out[22]),
+            (3, 100, 1, 50, 2, 0)
+        );
+        assert_eq!(out[W49_DOWNLOAD_HEADER], 3 | 1 << 4 | 1 << 5 | 60 << 8);
+        assert_eq!(out[W49_DOWNLOAD_HEADER + 2], 6 | 1 << 4 | 50 << 8);
+        assert_eq!(out[W49_DOWNLOAD_HEADER + 4], 7 | 1 << 5);
+    }
+
+    #[test]
+    fn mapping_normalizes_and_ranks() {
+        assert_eq!(w49_mapping_case(b"\t VERIFIED\0"), 0);
+        assert_eq!(w49_mapping_case(b"Unique_Size"), 1);
+        assert_eq!(w49_mapping_case(b"unique size"), 2);
+        assert_eq!(w49_mapping_case(b"veri_fied"), 2);
+        let out = w49_mapping_rank(&[b"verified", b"unique-size", b"nope"], &[10, 20, 30]);
+        assert_eq!(&out[..11], &[3, 1, 1, 1, 10, 20, 30, 2, 0, 0, 500_000]);
+        assert_eq!(w49_mapping_rank(&[], &[])[7..11], [-1, -1, 0, 0]);
+    }
+
+    #[test]
+    fn container_names_follow_the_leftmost_regex_match() {
+        assert_eq!(w49_name_container(b"Movie.2024.mkv"), 1);
+        assert_eq!(w49_name_container(b"\"Show.S01E01.ts\" yEnc (1/50)"), 4);
+        assert_eq!(w49_name_container(b"[1/9] - \"Show.mp4\" yEnc"), 5);
+        assert_eq!(w49_name_container(b"a.MKV\x0Bb.avi"), 1);
+        assert_eq!(w49_name_container(b"a.nfo b.mkv"), 0);
+        assert_eq!(w49_name_container(b"a.mkvx b.avi"), 0);
+        assert_eq!(w49_name_container(b"a.mk3d\"x"), 0);
+        assert_eq!(w49_name_container(b"x."), 0);
+        let mut ts = vec![0u8; 960];
+        for at in [5usize, 193, 381, 569] {
+            ts[at] = 0x47;
+        }
+        let out = w49_container_classify(
+            &[b"a.mkv", b"b.avi", b"c.ts", b"d"],
+            &[b"\x1A\x45\xDF\xA3\0\0\0\0\0\0\0\0", b"short", &ts, b""],
+        );
+        assert_eq!(&out[..13], &[4, 1, 1, 1, 0, 1, 0, 0, 0, 2, 1, 0, 3]);
+        assert_eq!(out[W49_CONTAINER_HEADER], 1 | 1 << 4 | 1 << 8 | 9 << 12);
+        assert_eq!(out[W49_CONTAINER_HEADER + 1], 2 << 4 | 2 << 8 | 10 << 12);
+    }
+
+    #[test]
+    fn twin_joined_items_keep_embedded_nuls() {
+        let items: [&[u8]; 4] = [b"a\0b", b"", b"\x01\0", b"\0\0\0\0\0\0\0\0\0x"];
+        let (flat, twin) = (items.join(&0u8), items.join(&1u8));
+        assert_eq!(w49_items(&flat, &twin, 4).unwrap(), items.to_vec());
+        assert_eq!(w49_items(&flat, &twin, 3), None);
+        assert_eq!(w49_items(&flat, &twin, 5), None);
+        assert_eq!(w49_items(&flat, &twin[1..], 4), None);
+        let swapped = items.join(&2u8);
+        assert_eq!(w49_items(&flat, &swapped, 4), None);
+        assert_eq!(w49_items(b"a\0b", b"", 2).unwrap(), vec![&b"a"[..], b"b"]);
+        assert_eq!(w49_items(b"", b"", 0).unwrap(), Vec::<&[u8]>::new());
+        assert_eq!(w49_items(b"a\0b", b"a\0b", 1).unwrap(), vec![&b"a\0b"[..]]);
+
+        let names: [&[u8]; 2] = [b"x.mkv\0", b"y"];
+        let heads: [&[u8]; 2] = [b"OggS\0\0\0\0\0\0\0\0", b"\0"];
+        let (flat, twin, head_flat, head_lens) = (
+            names.join(&0u8),
+            names.join(&1u8),
+            records(&heads),
+            lens(&heads),
+        );
+        let mut out = [0i64; 32];
+        let status = unsafe {
+            nntmux_w49_video_container_classify(
+                flat.as_ptr(),
+                flat.len(),
+                twin.as_ptr(),
+                twin.len(),
+                head_flat.as_ptr(),
+                head_flat.len(),
+                head_lens.as_ptr(),
+                head_lens.len(),
+                2,
+                out.as_mut_ptr(),
+                32,
+            )
+        };
+        assert_eq!(status, 1);
+        assert_eq!(out[W49_CONTAINER_HEADER], 7 | 1 << 4 | 7 << 8 | 5 << 12);
+    }
+
+    #[test]
+    fn head_records_keep_what_detection_reads() {
+        let mut ts = vec![0xABu8; 5_000];
+        for at in (191..5_000).step_by(192) {
+            ts[at] = 0x47;
+        }
+        let heads: [&[u8]; 3] = [&ts, &ts[..959], b"OggS\0\0\0\0\0\0\0\0"];
+        let (records, lengths) = (records(&heads), lens(&heads));
+        let parsed = w49_heads(&records, &lengths, 3).unwrap();
+        assert_eq!(
+            parsed.iter().map(|head| head.len()).collect::<Vec<_>>(),
+            [960, 959, 12]
+        );
+        for (full, record) in heads.iter().zip(&parsed) {
+            assert_eq!(detect_video_container(full), detect_video_container(record));
+        }
+        assert_eq!(detect_video_container(parsed[0]), 4);
+        assert_eq!(detect_video_container(parsed[1]), 0);
+        assert_eq!(w49_heads(&records, &lengths, 2), None);
+        assert_eq!(w49_heads(&records[1..], &lengths, 3), None);
+        assert_eq!(w49_heads(&records, &lengths[1..], 3), None);
+        assert_eq!(w49_heads(b"", b"", 0).unwrap(), Vec::<&[u8]>::new());
+    }
+
+    #[test]
+    fn exports_reject_bad_pointers_and_small_buffers() {
+        let mut out = [7i64; 64];
+        let kinds = joined(&[b"jpg", b"audio"]);
+        let bytes = packed(&[1, 2]);
+        let call = |out: *mut i64, cap: usize, kinds_ptr: *const u8| unsafe {
+            nntmux_w49_download_kind_account(
+                kinds_ptr,
+                kinds.len(),
+                null(),
+                0,
+                bytes.as_ptr(),
+                bytes.len(),
+                2,
+                10,
+                out,
+                cap,
+            )
+        };
+        assert_eq!(call(null_mut(), 64, kinds.as_ptr()), -2);
+        assert_eq!(call(out.as_mut_ptr(), 3, kinds.as_ptr()), -2);
+        assert_eq!(call(out.as_mut_ptr(), 64, null()), -1);
+        assert_eq!(out[0], 7);
+        assert_eq!(call(out.as_mut_ptr(), 64, kinds.as_ptr()), 1);
+        assert_eq!(out[0], 2);
+
+        let values: [&[u8]; 3] = [b"01:00:00", b"a\0b", b"\x01"];
+        let flat = values.join(&0u8);
+        let twin = values.join(&1u8);
+        let status = unsafe {
+            nntmux_w49_ffmpeg_clock_batch(
+                flat.as_ptr(),
+                flat.len(),
+                twin.as_ptr(),
+                twin.len(),
+                3,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(
+            (status, out[0], out[1], out[W49_CLOCK_HEADER]),
+            (1, 3, 1, 3_600_000_000_000)
+        );
+        let status = unsafe {
+            nntmux_w49_ffmpeg_clock_batch(
+                flat.as_ptr(),
+                flat.len(),
+                twin.as_ptr(),
+                4,
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+
+        let outcomes = joined(&[b"completed"]);
+        let ints = packed(&[5, 1, 0, 0]);
+        let status = unsafe {
+            nntmux_w49_release_result_summary(
+                outcomes.as_ptr(),
+                outcomes.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                24,
+                1,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+        let status = unsafe {
+            nntmux_w49_release_result_summary(
+                outcomes.as_ptr(),
+                outcomes.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                1,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(
+            (status, out[1], out[W49_RESULT_HEADER]),
+            (1, 1, 1 << 4 | 4 << 8)
+        );
+
+        let sizes = packed(&[9]);
+        let mapping = joined(&[b"verified"]);
+        let status = unsafe {
+            nntmux_w49_mapping_confidence_rank(
+                mapping.as_ptr(),
+                mapping.len(),
+                null(),
+                0,
+                sizes.as_ptr(),
+                sizes.len(),
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[4]), (1, 1, 9));
+
+        let status = unsafe {
+            nntmux_w49_video_container_classify(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0]), (1, 0));
+        let status = unsafe {
+            nntmux_w49_video_container_classify(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        // One item needs one 960-byte head record and one length.
+        assert_eq!(status, -1);
+    }
+}
