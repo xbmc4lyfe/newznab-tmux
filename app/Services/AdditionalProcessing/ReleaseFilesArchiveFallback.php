@@ -11,6 +11,7 @@ use App\Services\AdditionalProcessing\Media\ImageCandidateRanker;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Facades\File;
 use Throwable;
@@ -617,5 +618,118 @@ class ReleaseFilesArchiveFallback
     private static function w426ValidRow(mixed $row): bool
     {
         return \is_array($row) && \is_string($row['name'] ?? null) && \is_int($row['size'] ?? null) && $row['size'] >= 0 && \is_int($row['pass'] ?? null) && \in_array($row['pass'], [0, 1], true) && \is_bool($row['stored'] ?? null);
+    }
+
+    /** Enabled: three paired runs cleared every 1.5x gate (common mean 3.35-3.41x, p99 2.54-3.05x; uncommon mean 3.50-3.56x, p99 3.03-3.39x); see RustReleaseFileArchiveProcessorSyncUsenetW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w523_archive_entry_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW52RustFfi = null;
+
+    private static FFI|false|null $w52Ffi = null;
+
+    private static ?CData $w52Out = null;
+
+    private static int $w52OutCap = 0;
+
+    public static function usesW52RustFfi(): bool
+    {
+        return self::$useW52RustFfi ?? self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 52 Rust path forced on or off, then restores the previous setting. */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW52RustFfi;
+        self::$useW52RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW52RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Classifies archive entry names: one `image | strlen(suffix) << 1` word per name, where image
+     * is isArchiveImageNamePhp() and suffix is extractedFileSuffixPhp(). Then the image count and
+     * the count of names with a suffix.
+     *
+     * @param  array<int, string>  $names
+     * @return list<int>
+     */
+    public static function w52ArchiveEntryBatch(array $names): array
+    {
+        return self::usesW52RustFfi() ? self::w52ArchiveEntryBatchNative($names) : self::w52ArchiveEntryBatchPhp($names);
+    }
+
+    /**
+     * @param  array<int, string>  $names
+     * @return list<int>
+     */
+    public static function w52ArchiveEntryBatchNative(array $names): array
+    {
+        $count = \count($names);
+
+        return self::w52Invoke(implode("\0", $names), '', $count, $count + 2)
+            ?? self::w52ArchiveEntryBatchPhp($names);
+    }
+
+    /**
+     * @param  array<int, string>  $names
+     * @return list<int>
+     */
+    public static function w52ArchiveEntryBatchPhp(array $names): array
+    {
+        $out = [];
+        $images = 0;
+        $suffixed = 0;
+        foreach ($names as $name) {
+            $name = (string) $name;
+            $image = self::isArchiveImageNamePhp($name);
+            $suffix = \strlen(self::extractedFileSuffixPhp($name));
+            $images += (int) $image;
+            $suffixed += (int) ($suffix > 0);
+            $out[] = (int) $image | $suffix << 1;
+        }
+        $out[] = $images;
+        $out[] = $suffixed;
+
+        return $out;
+    }
+
+    /**
+     * Calls the Wave 52 export with NUL-joined strings and packed `i64` integers. Null when the
+     * library is missing, the call declines (for example a string holding a NUL byte) or it writes
+     * more than $cap words, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Invoke(string $blob, string $ints, int $count, int $cap): ?array
+    {
+        self::$w52Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w52', self::W52_FFI_CDEF) ?? false;
+        $ffi = self::$w52Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w52Out === null || self::$w52OutCap < $cap) {
+                self::$w52OutCap = max(1024, $cap * 2);
+                self::$w52Out = $ffi->new('int64_t['.self::$w52OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w523_archive_entry_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w52Out, self::$w52OutCap);
+            if (! \is_int($written) || $written <= 0 || $written > $cap) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w52Out, $written * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
