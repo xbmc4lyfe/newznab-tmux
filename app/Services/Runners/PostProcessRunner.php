@@ -13,12 +13,119 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\NfoService;
 use App\Services\TempWorkspaceService;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
 class PostProcessRunner extends BaseRunner
 {
+    public const string W386_FFI_CDEF = 'ssize_t nntmux_w386_tmux_drain_stop_runners(uint8_t operation, uint8_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
+
+    // Paired caller benchmarks must qualify before enabling this separate candidate.
+    private static ?bool $useRustW386 = null;
+
+    public static function setUseRustW386(?bool $enabled): void
+    {
+        self::$useRustW386 = $enabled;
+    }
+
+    public static function usesRustW386(): bool
+    {
+        return self::$useRustW386 ?? false;
+    }
+
+    private static function w386Transform(int $flags, string $input): ?string
+    {
+        $length = strlen($input);
+        if ($length > 16_777_216) {
+            return null;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('additional_w386', self::W386_FFI_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $capacity = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w386_tmux_drain_stop_runners(4, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
+            if (is_int($written) && $written < -1 && -$written <= 16_777_216) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w386_tmux_drain_stop_runners(4, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
+            }
+            if (! is_int($written) || $written < 0 || $written > min($capacity, 16_777_216)) {
+                return null;
+            }
+
+            return $written === 0 ? '' : \FFI::string($scratch, $written);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * First-byte GUID buckets, preserving input order, empties and duplicates.
+     *
+     * @param  list<string>  $ids
+     * @return list<string>
+     */
+    public static function guidBucketPlan(array $ids): array
+    {
+        return (self::usesRustW386() ? self::guidBucketPlanNative($ids) : null)
+            ?? self::guidBucketPlanPhp($ids);
+    }
+
+    /**
+     * @param  list<string>  $ids
+     * @return list<string>
+     */
+    public static function guidBucketPlanPhp(array $ids): array
+    {
+        return array_map(static fn (string $id): string => substr($id, 0, 1), $ids);
+    }
+
+    /**
+     * @param  list<string>  $ids
+     * @return list<string>|null
+     */
+    public static function guidBucketPlanNative(array $ids): ?array
+    {
+        $input = pack('V', count($ids));
+        foreach ($ids as $id) {
+            $input .= pack('V', strlen($id)).$id;
+        }
+        $output = self::w386Transform(0, $input);
+        if ($output === null || strlen($output) < 4) {
+            return null;
+        }
+        $offset = 4;
+        $buckets = [];
+        foreach ($ids as $id) {
+            if ($offset + 4 > strlen($output)) {
+                return null;
+            }
+            /** @var array{size: int} $decoded */
+            $decoded = unpack('Vsize', $output, $offset);
+            $size = $decoded['size'];
+            $offset += 4;
+            if ($size > 1 || $offset + $size > strlen($output)) {
+                return null;
+            }
+            $buckets[] = substr($output, $offset, $size);
+            $offset += $size;
+        }
+
+        return $offset === strlen($output) ? $buckets : null;
+    }
+
     public const int ADDITIONAL_WORKER_MAX_BATCHES = 4;
 
     private function guidBucketExpression(string $column = 'leftguid'): string
