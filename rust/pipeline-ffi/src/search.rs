@@ -25207,3 +25207,949 @@ mod wave36_5_auth_requests_confirm_password {
         }
     }
 }
+/// Wave 37.5: Elasticsearch index creation plan, ES reindex command plan,
+/// offset-populate worker ranges, offset worker run plan and search index
+/// population plan.
+mod wave37_5_search_index_offset_worker_command {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 4096;
+    /// Bytes stripped by PHP's default `trim()`.
+    const PHP_TRIM: &[u8] = b" \t\n\r\0\x0B";
+    /// `NntmuxCreateESIndexes` / `NntmuxPopulateSearchIndexes` logical index order.
+    const SEARCH_INDEXES: [&[u8]; 10] = [
+        b"releases",
+        b"predb",
+        b"movies",
+        b"tvshows",
+        b"music",
+        b"books",
+        b"games",
+        b"console",
+        b"steam",
+        b"anime",
+    ];
+    const INVALID_INDEX_BYTES: &[u8] = b"\\/*?\"<>| ,#:";
+    const INDEX_MAX_BYTES: usize = 255;
+    const REINDEX_TARGETS: [&[u8]; 2] = [b"releases", b"predb"];
+    const OFFSET_ENGINES: [&[u8]; 2] = [b"manticore", b"elastic"];
+    const OFFSET_INDEXES: [&[u8]; 2] = [b"releases", b"predb"];
+    const MAX_PARALLEL: i64 = 512;
+    const OFFSET_DEFAULT_BATCH: i64 = 10_000;
+    const DEFAULT_MEMORY_LIMIT: &[u8] = b"4G";
+    const MEMORY_MAX_DIGITS: usize = 9;
+    const POPULATE_DEFAULT_CHUNK: i64 = 5000;
+    const POPULATE_DEFAULT_BATCH: i64 = 5000;
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > isize::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    fn php_trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !PHP_TRIM.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !PHP_TRIM.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"0" => Some(false),
+            b"1" => Some(true),
+            _ => None,
+        }
+    }
+
+    fn flag_bytes(value: bool) -> Vec<u8> {
+        if value { b"1".to_vec() } else { b"0".to_vec() }
+    }
+
+    fn text(value: i64) -> Vec<u8> {
+        value.to_string().into_bytes()
+    }
+
+    /// PHP `strtolower(trim($value))`: both are ASCII-only.
+    fn normalize(bytes: &[u8]) -> Vec<u8> {
+        php_trim(bytes).to_ascii_lowercase()
+    }
+
+    /// PHP passes a nullable string as a `0`/`1` flag plus its bytes; null carries no bytes.
+    fn nullable<'a>(present: &[u8], value: &'a [u8]) -> Option<Option<&'a [u8]>> {
+        match flag(present)? {
+            true => Some(Some(value)),
+            false if value.is_empty() => Some(None),
+            false => None,
+        }
+    }
+
+    fn push_choice(out: &mut Vec<Vec<u8>>, value: Option<&[u8]>) {
+        out.push(flag_bytes(value.is_some()));
+        out.push(value.unwrap_or_default().to_vec());
+    }
+
+    fn pick(candidates: &[&'static [u8]], value: &[u8]) -> Option<&'static [u8]> {
+        candidates.iter().copied().find(|c| *c == value)
+    }
+
+    /// Elasticsearch index naming rules plus a control-byte ban.
+    fn valid_index(name: &[u8]) -> bool {
+        !name.is_empty()
+            && name.len() <= INDEX_MAX_BYTES
+            && name != b"."
+            && name != b".."
+            && !matches!(name[0], b'-' | b'_' | b'+')
+            && !name.iter().any(|b| {
+                b.is_ascii_uppercase() || *b < 0x20 || *b == 0x7F || INVALID_INDEX_BYTES.contains(b)
+            })
+    }
+
+    /// POSIX single-quote shell quoting: `'` becomes `'\''`.
+    fn shell_quote(value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(value.len() + 2);
+        out.push(b'\'');
+        for &b in value {
+            if b == b'\'' {
+                out.extend_from_slice(b"'\\''");
+            } else {
+                out.push(b);
+            }
+        }
+        out.push(b'\'');
+        out
+    }
+
+    /// PHP `ini_set('memory_limit', ...)` shorthand accepted by the planners: `-1` or
+    /// 1-9 digits without a leading zero and an optional K/M/G suffix (uppercased).
+    fn memory_limit(raw: &[u8]) -> Vec<u8> {
+        let value = php_trim(raw);
+        if value == b"-1" {
+            return value.to_vec();
+        }
+        let (digits, suffix) = match value.last() {
+            Some(b) if matches!(b.to_ascii_uppercase(), b'K' | b'M' | b'G') => {
+                (&value[..value.len() - 1], Some(b.to_ascii_uppercase()))
+            }
+            _ => (value, None),
+        };
+        if digits.is_empty()
+            || digits.len() > MEMORY_MAX_DIGITS
+            || digits[0] == b'0'
+            || !digits.iter().all(u8::is_ascii_digit)
+        {
+            return DEFAULT_MEMORY_LIMIT.to_vec();
+        }
+        let mut out = digits.to_vec();
+        out.extend(suffix);
+        out
+    }
+
+    fn positive_or(value: i64, default: i64) -> i64 {
+        if value > 0 { value } else { default }
+    }
+
+    /// NntmuxCreateESIndexes::planIndexCreation.
+    fn index_creation(create_missing: &[u8], rest: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let create_missing = flag(create_missing)?;
+        let (configured, existing) = rest.split_at_checked(SEARCH_INDEXES.len() * 2)?;
+        let mut names: Vec<(&[u8], bool)> = Vec::with_capacity(SEARCH_INDEXES.len());
+        let mut counts = [0i64; 5];
+        let mut rows = Vec::with_capacity(SEARCH_INDEXES.len() * 4);
+        for (logical, pair) in SEARCH_INDEXES.iter().zip(configured.as_chunks::<2>().0) {
+            let name = nullable(pair[0], pair[1])?.unwrap_or(logical);
+            let valid = valid_index(name);
+            let exists = existing.contains(&name);
+            let duplicate = valid && names.iter().any(|(seen, ok)| *ok && *seen == name);
+            let (slot, action): (usize, &[u8]) = match (valid, duplicate, exists) {
+                (false, _, _) => (3, b"invalid"),
+                (true, true, _) => (4, b"duplicate"),
+                (true, false, true) if create_missing => (2, b"preserve"),
+                (true, false, true) => (1, b"recreate"),
+                (true, false, false) => (0, b"create"),
+            };
+            counts[slot] += 1;
+            names.push((name, valid));
+            rows.push(name.to_vec());
+            rows.push(flag_bytes(valid));
+            rows.push(flag_bytes(exists));
+            rows.push(action.to_vec());
+        }
+        let mut out: Vec<Vec<u8>> = counts.iter().map(|c| text(*c)).collect();
+        out.extend(rows);
+        Some(out)
+    }
+
+    /// NntmuxESReindex::planReindexCommands.
+    fn reindex_commands(app_path: &[u8], targets: &[&[u8]]) -> Vec<Vec<u8>> {
+        let mut selected: Vec<&[u8]> = Vec::with_capacity(REINDEX_TARGETS.len());
+        let mut skipped = 0i64;
+        if targets.is_empty() {
+            selected.extend(REINDEX_TARGETS);
+        }
+        for target in targets {
+            match pick(&REINDEX_TARGETS, &normalize(target)) {
+                Some(t) if !selected.contains(&t) => selected.push(t),
+                Some(_) => {}
+                None => skipped += 1,
+            }
+        }
+        let valid = !php_trim(app_path).is_empty() && !app_path.contains(&0);
+        let mut out = Vec::with_capacity(3 + selected.len() * 2 + 1);
+        out.push(flag_bytes(valid));
+        out.push(text(skipped));
+        out.push(text(selected.len() as i64));
+        out.extend(selected.iter().map(|t| t.to_vec()));
+        if valid {
+            let end = app_path
+                .iter()
+                .rposition(|b| *b != b'/')
+                .map_or(0, |i| i + 1);
+            let base = &app_path[..end];
+            let script = |name: &[u8]| {
+                let mut path = base.to_vec();
+                path.extend_from_slice(b"/../misc/elasticsearch/");
+                path.extend_from_slice(name);
+                let mut command = b"php ".to_vec();
+                command.extend(shell_quote(&path));
+                command
+            };
+            out.push(script(b"create_es_indexes.php"));
+            for target in &selected {
+                let mut command = script(b"populate_es_indexes.php");
+                command.push(b' ');
+                command.extend_from_slice(target);
+                out.push(command);
+            }
+        }
+        out
+    }
+
+    /// NntmuxOffsetPopulate::planOffsetRanges.
+    fn offset_ranges(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let [
+            engine_set,
+            engine,
+            index_set,
+            index,
+            total,
+            parallel,
+            batch,
+            memory,
+            disable_keys,
+        ] = parts
+        else {
+            return None;
+        };
+        let engine =
+            nullable(engine_set, engine)?.and_then(|e| pick(&OFFSET_ENGINES, &normalize(e)));
+        let index = nullable(index_set, index)?.and_then(|i| pick(&OFFSET_INDEXES, &normalize(i)));
+        let total = integer(total)?.max(0);
+        let parallel = integer(parallel)?.clamp(1, MAX_PARALLEL);
+        let batch = positive_or(integer(batch)?, OFFSET_DEFAULT_BATCH);
+        let memory = memory_limit(memory);
+        let disable_keys = flag(disable_keys)?;
+        let per = total / parallel + i64::from(total % parallel != 0);
+        let valid = engine.is_some() && index.is_some();
+        let mut ranges = Vec::new();
+        if let (Some(engine), Some(index)) = (engine, index) {
+            let mut offset = 0i64;
+            let mut worker = 0i64;
+            while worker < parallel && offset < total {
+                let limit = per.min(total - offset);
+                let mut args = Vec::with_capacity(160);
+                for piece in [b"--".as_slice(), engine, b" --", index, b" --offset="] {
+                    args.extend_from_slice(piece);
+                }
+                args.extend(text(offset));
+                args.extend_from_slice(b" --limit=");
+                args.extend(text(limit));
+                args.extend_from_slice(b" --worker-id=");
+                args.extend(text(worker));
+                args.extend_from_slice(b" --batch-size=");
+                args.extend(text(batch));
+                args.extend_from_slice(b" --memory-limit=");
+                args.extend_from_slice(&memory);
+                if disable_keys {
+                    args.extend_from_slice(b" --disable-keys");
+                }
+                ranges.push((offset, limit, worker, args));
+                offset += limit;
+                worker += 1;
+            }
+        }
+        let mut out = Vec::with_capacity(11 + ranges.len() * 4);
+        out.push(flag_bytes(valid));
+        push_choice(&mut out, engine);
+        push_choice(&mut out, index);
+        out.push(text(total));
+        out.push(text(parallel));
+        out.push(text(per));
+        out.push(text(batch));
+        out.push(memory);
+        out.push(text(ranges.len() as i64));
+        for (offset, limit, worker, args) in ranges {
+            out.push(text(offset));
+            out.push(text(limit));
+            out.push(text(worker));
+            out.push(args);
+        }
+        Some(out)
+    }
+
+    /// NntmuxOffsetWorker::planWorkerRun.
+    fn worker_run(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let [
+            manticore,
+            elastic,
+            releases,
+            predb,
+            offset,
+            limit,
+            worker,
+            batch,
+        ] = parts
+        else {
+            return None;
+        };
+        let engine: Option<&[u8]> = match (flag(manticore)?, flag(elastic)?) {
+            (true, _) => Some(b"manticore"),
+            (false, true) => Some(b"elastic"),
+            _ => None,
+        };
+        let index: Option<&[u8]> = match (flag(releases)?, flag(predb)?) {
+            (true, _) => Some(b"releases"),
+            (false, true) => Some(b"predb"),
+            _ => None,
+        };
+        let offset = integer(offset)?.max(0);
+        let limit = integer(limit)?.max(0);
+        let worker = integer(worker)?.max(0);
+        let batch = positive_or(integer(batch)?, OFFSET_DEFAULT_BATCH);
+        let end = offset.saturating_add(limit);
+        let batches = limit / batch + i64::from(limit % batch != 0);
+        let last = match limit % batch {
+            0 if limit == 0 => 0,
+            0 => batch,
+            rest => rest,
+        };
+        let mut message = b"Worker ".to_vec();
+        message.extend(text(worker));
+        message.extend_from_slice(b" starting: processing ");
+        message.extend(text(limit));
+        message.extend_from_slice(b" records from offset ");
+        message.extend(text(offset));
+        let mut out = Vec::with_capacity(13);
+        out.push(flag_bytes(engine.is_some() && index.is_some()));
+        push_choice(&mut out, engine);
+        push_choice(&mut out, index);
+        for value in [offset, limit, end, worker, batch, batches, last] {
+            out.push(text(value));
+        }
+        out.push(message);
+        Some(out)
+    }
+
+    /// NntmuxPopulateSearchIndexes::planPopulation.
+    fn population(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let [
+            manticore,
+            elastic,
+            all,
+            optimize,
+            count,
+            batch,
+            requested @ ..,
+        ] = parts
+        else {
+            return None;
+        };
+        let engine: Option<&[u8]> = match (flag(manticore)?, flag(elastic)?) {
+            (true, _) => Some(b"manticore"),
+            (false, true) => Some(b"elastic"),
+            _ => None,
+        };
+        let all = flag(all)?;
+        let optimize = flag(optimize)?;
+        let chunk = positive_or(integer(count)?, POPULATE_DEFAULT_CHUNK);
+        let batch = positive_or(integer(batch)?, POPULATE_DEFAULT_BATCH);
+        let mut wanted = [all; SEARCH_INDEXES.len()];
+        let mut unknown = 0i64;
+        for name in requested {
+            match SEARCH_INDEXES.iter().position(|i| *i == normalize(name)) {
+                Some(slot) => wanted[slot] = true,
+                None => unknown += 1,
+            }
+        }
+        let indexes: Vec<&[u8]> = SEARCH_INDEXES
+            .iter()
+            .zip(wanted)
+            .filter_map(|(index, on)| on.then_some(*index))
+            .collect();
+        let mode: &[u8] = match (optimize, engine) {
+            (true, _) => b"optimize",
+            (false, Some(_)) if !indexes.is_empty() => b"populate",
+            _ => b"invalid",
+        };
+        let mut out = Vec::with_capacity(7 + indexes.len() * 2);
+        out.push(mode.to_vec());
+        push_choice(&mut out, engine);
+        out.push(text(unknown));
+        out.push(text(chunk));
+        out.push(text(batch));
+        out.push(text(indexes.len() as i64));
+        out.extend(indexes.iter().map(|i| i.to_vec()));
+        if let (b"populate", Some(engine)) = (mode, engine) {
+            for index in &indexes {
+                let mut method = engine.to_vec();
+                method.push(index[0].to_ascii_uppercase());
+                method.extend_from_slice(&index[1..]);
+                out.push(method);
+            }
+        }
+        Some(out)
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        match (mode, parts) {
+            (1, [create_missing, rest @ ..]) => index_creation(create_missing, rest),
+            (2, [app_path, targets @ ..]) => Some(reindex_commands(app_path, targets)),
+            (3, _) => offset_ranges(parts),
+            (4, _) => worker_run(parts),
+            (5, _) => population(parts),
+            _ => None,
+        }
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input, mode or flags. Failure never writes to the output
+    /// buffer. Results are at least four bytes, so `-1` never means "one byte
+    /// needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output may overlap; the result is fully owned before any output write.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w37_search_index_offset_worker_command(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            if cap < result.len() || out.is_null() {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy(result.as_ptr(), out, result.len()) };
+            result.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() * 4 + (1 << 20)];
+            let written = unsafe {
+                nntmux_w37_search_index_offset_worker_command(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(unpack(&out)?.into_iter().map(<[u8]>::to_vec).collect())
+        }
+
+        fn strings(items: &[&str]) -> Vec<Vec<u8>> {
+            items.iter().map(|item| item.as_bytes().to_vec()).collect()
+        }
+
+        fn defaults(create_missing: &[u8]) -> Vec<&[u8]> {
+            let mut parts = vec![create_missing];
+            parts.extend(std::iter::repeat_n([b"0".as_slice(), b"".as_slice()], 10).flatten());
+            parts
+        }
+
+        #[test]
+        fn w37_index_creation_plan() {
+            let mut parts = defaults(b"1");
+            parts[1] = b"1";
+            parts[2] = b"nntmux_releases";
+            parts[3] = b"1";
+            parts[4] = b"nntmux_releases";
+            parts[5] = b"1";
+            parts[6] = b"Movies";
+            parts.push(b"predb");
+            parts.push(b"music");
+            let out = call(1, &parts).unwrap();
+            assert_eq!(out[..5], strings(&["7", "0", "1", "1", "1"]));
+            assert_eq!(out[5..9], strings(&["nntmux_releases", "1", "0", "create"]));
+            assert_eq!(
+                out[9..13],
+                strings(&["nntmux_releases", "1", "0", "duplicate"])
+            );
+            assert_eq!(out[13..17], strings(&["Movies", "0", "0", "invalid"]));
+            assert_eq!(out[21..25], strings(&["music", "1", "1", "preserve"]));
+            assert_eq!(out.len(), 45);
+
+            let mut parts = defaults(b"0");
+            parts.push(b"steam");
+            let out = call(1, &parts).unwrap();
+            assert_eq!(out[..5], strings(&["9", "1", "0", "0", "0"]));
+            assert_eq!(out[37..41], strings(&["steam", "1", "1", "recreate"]));
+
+            for name in [
+                &b""[..],
+                b".",
+                b"..",
+                b"-a",
+                b"_a",
+                b"+a",
+                b"a b",
+                b"a:b",
+                b"a\x01",
+                b"a#",
+            ] {
+                assert!(!valid_index(name), "{name:?}");
+            }
+            assert!(valid_index(&[b'a'; INDEX_MAX_BYTES]));
+            assert!(!valid_index(&[b'a'; INDEX_MAX_BYTES + 1]));
+            assert!(valid_index(b"caf\xc3\xa9.v1"));
+            assert_eq!(call(1, &defaults(b"2")), None);
+            assert_eq!(call(1, &defaults(b"0")[..20]), None);
+            let mut bad = defaults(b"0");
+            bad[2] = b"x";
+            assert_eq!(call(1, &bad), None);
+        }
+
+        #[test]
+        fn w37_reindex_command_plan() {
+            assert_eq!(
+                call(2, &[b"/srv/app/"]).unwrap(),
+                strings(&[
+                    "1",
+                    "0",
+                    "2",
+                    "releases",
+                    "predb",
+                    "php '/srv/app/../misc/elasticsearch/create_es_indexes.php'",
+                    "php '/srv/app/../misc/elasticsearch/populate_es_indexes.php' releases",
+                    "php '/srv/app/../misc/elasticsearch/populate_es_indexes.php' predb",
+                ])
+            );
+            assert_eq!(
+                call(2, &[b"/it's", b" PREDB\n", b"bogus", b"predb", b""]).unwrap(),
+                strings(&[
+                    "1",
+                    "2",
+                    "1",
+                    "predb",
+                    "php '/it'\\''s/../misc/elasticsearch/create_es_indexes.php'",
+                    "php '/it'\\''s/../misc/elasticsearch/populate_es_indexes.php' predb",
+                ])
+            );
+            assert_eq!(
+                call(2, &[b" \t", b"releases"]).unwrap(),
+                strings(&["0", "0", "1", "releases"])
+            );
+            assert_eq!(call(2, &[b"/a\0b"]).unwrap()[0], b"0".to_vec());
+            assert_eq!(
+                call(2, &[b"///"]).unwrap()[5],
+                b"php '/../misc/elasticsearch/create_es_indexes.php'".to_vec()
+            );
+            assert_eq!(call(2, &[]), None);
+        }
+
+        #[test]
+        fn w37_offset_range_plan() {
+            let out = call(
+                3,
+                &[
+                    b"1",
+                    b" Manticore ",
+                    b"1",
+                    b"releases",
+                    b"10",
+                    b"3",
+                    b"0",
+                    b" 512m ",
+                    b"1",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                out[..11],
+                strings(&[
+                    "1",
+                    "1",
+                    "manticore",
+                    "1",
+                    "releases",
+                    "10",
+                    "3",
+                    "4",
+                    "10000",
+                    "512M",
+                    "3"
+                ])
+            );
+            assert_eq!(
+                out[11..15],
+                strings(&[
+                    "0",
+                    "4",
+                    "0",
+                    "--manticore --releases --offset=0 --limit=4 --worker-id=0 --batch-size=10000 --memory-limit=512M --disable-keys"
+                ])
+            );
+            assert_eq!(out[19..22], strings(&["8", "2", "2"]));
+            let out = call(
+                3,
+                &[
+                    b"1", b"elastic", b"1", b"predb", b"2", b"8", b"5", b"08G", b"0",
+                ],
+            )
+            .unwrap();
+            assert_eq!(out[6..11], strings(&["8", "1", "5", "4G", "2"]));
+            assert_eq!(out[15..18], strings(&["1", "1", "1"]));
+            let out = call(
+                3,
+                &[b"0", b"", b"1", b"predb", b"-5", b"0", b"5", b"-1", b"0"],
+            )
+            .unwrap();
+            assert_eq!(
+                out,
+                strings(&["0", "0", "", "1", "predb", "0", "1", "0", "5", "-1", "0"])
+            );
+            let max = i64::MAX.to_string();
+            let out = call(
+                3,
+                &[
+                    b"1",
+                    b"elastic",
+                    b"1",
+                    b"predb",
+                    max.as_bytes(),
+                    b"9999",
+                    b"1",
+                    b"1234567890",
+                    b"0",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                out[6..11],
+                strings(&["512", "18014398509481984", "1", "4G", "512"])
+            );
+            let last = &out[out.len() - 4..];
+            assert_eq!(last[0], text(511 * 18014398509481984));
+            assert_eq!(last[1], text(i64::MAX - 511 * 18014398509481984));
+            assert_eq!(
+                call(3, &[b"1", b"x", b"1", b"y", b"1", b"1", b"1", b"1", b"2"]),
+                None
+            );
+            assert_eq!(
+                call(3, &[b"0", b"x", b"1", b"y", b"1", b"1", b"1", b"1", b"0"]),
+                None
+            );
+            assert_eq!(
+                call(3, &[b"1", b"x", b"1", b"y", b"01", b"1", b"1", b"1", b"0"]),
+                None
+            );
+            assert_eq!(
+                call(3, &[b"1", b"x", b"1", b"y", b"1", b"1", b"1", b"1"]),
+                None
+            );
+        }
+
+        #[test]
+        fn w37_worker_run_plan() {
+            assert_eq!(
+                call(
+                    4,
+                    &[b"1", b"1", b"0", b"1", b"100", b"25001", b"3", b"10000"]
+                )
+                .unwrap(),
+                strings(&[
+                    "1",
+                    "1",
+                    "manticore",
+                    "1",
+                    "predb",
+                    "100",
+                    "25001",
+                    "25101",
+                    "3",
+                    "10000",
+                    "3",
+                    "5001",
+                    "Worker 3 starting: processing 25001 records from offset 100",
+                ])
+            );
+            assert_eq!(
+                call(4, &[b"0", b"0", b"0", b"0", b"-4", b"-1", b"-2", b"0"]).unwrap(),
+                strings(&[
+                    "0",
+                    "0",
+                    "",
+                    "0",
+                    "",
+                    "0",
+                    "0",
+                    "0",
+                    "0",
+                    "10000",
+                    "0",
+                    "0",
+                    "Worker 0 starting: processing 0 records from offset 0",
+                ])
+            );
+            let max = i64::MAX.to_string();
+            let out = call(
+                4,
+                &[b"0", b"1", b"1", b"0", max.as_bytes(), b"20", b"1", b"10"],
+            )
+            .unwrap();
+            assert_eq!(
+                out[5..12],
+                strings(&[&max, "20", &max, "1", "10", "2", "10"])
+            );
+            assert_eq!(
+                call(4, &[b"1", b"0", b"0", b"0", b"0", b"0", b"0", b"x"]),
+                None
+            );
+            assert_eq!(
+                call(4, &[b"1", b"0", b"0", b"2", b"0", b"0", b"0", b"0"]),
+                None
+            );
+            assert_eq!(call(4, &[b"1", b"0", b"0", b"0", b"0", b"0", b"0"]), None);
+        }
+
+        #[test]
+        fn w37_population_plan() {
+            assert_eq!(
+                call(
+                    5,
+                    &[
+                        b"0",
+                        b"1",
+                        b"0",
+                        b"0",
+                        b"0",
+                        b"-3",
+                        b" TVShows ",
+                        b"anime",
+                        b"nope",
+                        b"anime"
+                    ]
+                )
+                .unwrap(),
+                strings(&[
+                    "populate",
+                    "1",
+                    "elastic",
+                    "1",
+                    "5000",
+                    "5000",
+                    "2",
+                    "tvshows",
+                    "anime",
+                    "elasticTvshows",
+                    "elasticAnime",
+                ])
+            );
+            let out = call(5, &[b"1", b"1", b"1", b"0", b"200", b"300"]).unwrap();
+            assert_eq!(
+                out[..7],
+                strings(&["populate", "1", "manticore", "0", "200", "300", "10"])
+            );
+            assert_eq!(out.len(), 27);
+            assert_eq!(out[17], b"manticoreReleases".to_vec());
+            assert_eq!(
+                call(5, &[b"0", b"0", b"1", b"1", b"1", b"1"]).unwrap(),
+                [
+                    strings(&["optimize", "0", "", "0", "1", "1", "10"]),
+                    SEARCH_INDEXES.iter().map(|i| i.to_vec()).collect()
+                ]
+                .concat()
+            );
+            assert_eq!(
+                call(5, &[b"1", b"0", b"0", b"0", b"1", b"1", b""]).unwrap(),
+                strings(&["invalid", "1", "manticore", "1", "1", "1", "0"])
+            );
+            assert_eq!(call(5, &[b"1", b"0", b"0", b"0", b"1"]), None);
+            assert_eq!(call(5, &[b"1", b"0", b"0", b"x", b"1", b"1"]), None);
+        }
+
+        #[test]
+        fn w37_malformed_null_and_capacity() {
+            let input = packet(&[b"/srv"]);
+            let mut out = [0x5a_u8; 128];
+            for (ptr, len, dst, cap) in [
+                (std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 8),
+                (input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            ] {
+                assert_eq!(
+                    unsafe { nntmux_w37_search_index_offset_worker_command(2, ptr, len, dst, cap) },
+                    DECLINE
+                );
+            }
+            let too_many = [
+                (MAX_PARTS as u32 + 1).to_le_bytes().to_vec(),
+                vec![0; 4 * (MAX_PARTS + 1)],
+            ]
+            .concat();
+            for bad in [
+                vec![],
+                vec![1, 0, 0],
+                vec![1, 0, 0, 0, 9, 0, 0, 0],
+                vec![65, 0, 0, 0],
+                too_many,
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w37_search_index_offset_worker_command(
+                            2,
+                            bad.as_ptr(),
+                            bad.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            for mode in [0u32, 6, 99, u32::MAX] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w37_search_index_offset_worker_command(
+                            mode,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            assert_eq!(out, [0x5a; 128]);
+            let full = call(2, &[b"/srv"])
+                .map(|parts| pack(&parts).unwrap().len())
+                .unwrap();
+            assert!(full > out.len());
+            for cap in [0usize, 1, out.len()] {
+                let dst = if cap == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    out.as_mut_ptr()
+                };
+                assert_eq!(
+                    unsafe {
+                        nntmux_w37_search_index_offset_worker_command(
+                            2,
+                            input.as_ptr(),
+                            input.len(),
+                            dst,
+                            cap,
+                        )
+                    },
+                    -(full as isize)
+                );
+            }
+            assert_eq!(out, [0x5a; 128]);
+            let mut alias = input.clone();
+            alias.resize(full.max(input.len()), 0);
+            let written = unsafe {
+                nntmux_w37_search_index_offset_worker_command(
+                    2,
+                    alias.as_ptr(),
+                    input.len(),
+                    alias.as_mut_ptr(),
+                    alias.len(),
+                )
+            };
+            assert_eq!(written, full as isize);
+            assert_eq!(unpack(&alias[..full]).unwrap()[3], b"releases");
+        }
+    }
+}
