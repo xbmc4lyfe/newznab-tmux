@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Monitoring\Prometheus;
 
+use App\Support\ReleaseSearchIndexDocument;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use Throwable;
@@ -22,7 +23,15 @@ final class TextFormatter
         int64_t nntmux_datetime_to_unix_utc(const char *input, size_t input_len);
         C;
 
+    /**
+     * Rust stays opt-in for the Wave 44.5 summary: common p99 missed 1.5x on small label batches; see
+     * tests/Unit/RustLogViewerIndexParserSearchPrometheusDocW44ParityTest.php.
+     */
+    public const bool W445_RUST_FFI_DEFAULT = false;
+
     private static FFI|false|null $ffi = null;
+
+    private static ?bool $useW445RustFfi = null;
 
     public function __construct(
         private readonly bool $useNative = true,
@@ -103,7 +112,7 @@ final class TextFormatter
         $pairs = [];
 
         foreach ($labels as $name => $value) {
-            $pairs[] = $name.'="'.str_replace(['\\', '"', "\n"], ['\\\\', '\\"', '\\n'], $value).'"';
+            $pairs[] = $name.'="'.$this->escapeLabelValue($value).'"';
         }
 
         return '{'.implode(',', $pairs).'}';
@@ -131,5 +140,87 @@ final class TextFormatter
     private function escapeHelp(string $help): string
     {
         return str_replace(['\\', "\n"], ['\\\\', '\\n'], $help);
+    }
+
+    private function escapeLabelValue(string $value): string
+    {
+        return str_replace(['\\', '"', "\n"], ['\\\\', '\\"', '\\n'], $value);
+    }
+
+    /** Pass null to restore {@see W445_RUST_FFI_DEFAULT}. */
+    public static function useW445RustFfi(?bool $enable = true): void
+    {
+        self::$useW445RustFfi = $enable;
+    }
+
+    public static function usesW445RustFfi(): bool
+    {
+        return self::$useW445RustFfi ?? self::W445_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW445RustFfi(): void
+    {
+        self::$useW445RustFfi = null;
+    }
+
+    /**
+     * Summarizes values as the formatter escapes them: values changed as a label value
+     * (`label_escaped`) or as help text (`help_escaped`), the escaped `backslashes`, `quotes` and
+     * `newlines`, `input_bytes`, escaped `label_bytes` / `help_bytes` and `distinct_values`.
+     * Non-strings are invalid.
+     *
+     * @param  array<array-key, mixed>  $values
+     * @return array{values: int, invalid: int, label_escaped: int, help_escaped: int, backslashes: int, quotes: int, newlines: int, input_bytes: int, label_bytes: int, help_bytes: int, distinct_values: int}
+     */
+    public function summarizeEscapeBatch(array $values): array
+    {
+        return self::usesW445RustFfi() ? $this->summarizeEscapeBatchNative($values) : $this->summarizeEscapeBatchPhp($values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     * @return array{values: int, invalid: int, label_escaped: int, help_escaped: int, backslashes: int, quotes: int, newlines: int, input_bytes: int, label_bytes: int, help_bytes: int, distinct_values: int}
+     */
+    public function summarizeEscapeBatchPhp(array $values): array
+    {
+        $summary = ['values' => \count($values), 'invalid' => 0, 'label_escaped' => 0, 'help_escaped' => 0, 'backslashes' => 0, 'quotes' => 0, 'newlines' => 0, 'input_bytes' => 0, 'label_bytes' => 0, 'help_bytes' => 0, 'distinct_values' => 0];
+        $distinct = [];
+        foreach ($values as $value) {
+            if (! \is_string($value)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $label = $this->escapeLabelValue($value);
+            $help = $this->escapeHelp($value);
+            $summary['label_escaped'] += (int) ($label !== $value);
+            $summary['help_escaped'] += (int) ($help !== $value);
+            $summary['backslashes'] += substr_count($value, '\\');
+            $summary['quotes'] += substr_count($value, '"');
+            $summary['newlines'] += substr_count($value, "\n");
+            $summary['input_bytes'] += \strlen($value);
+            $summary['label_bytes'] += \strlen($label);
+            $summary['help_bytes'] += \strlen($help);
+            $distinct[$value] = true;
+        }
+        $summary['distinct_values'] = \count($distinct);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     * @return array{values: int, invalid: int, label_escaped: int, help_escaped: int, backslashes: int, quotes: int, newlines: int, input_bytes: int, label_bytes: int, help_bytes: int, distinct_values: int}
+     */
+    public function summarizeEscapeBatchNative(array $values): array
+    {
+        $strings = array_values(array_filter($values, 'is_string'));
+        $fields = ReleaseSearchIndexDocument::evaluateW445Native(4, $strings, 9);
+        if ($fields === null) {
+            return $this->summarizeEscapeBatchPhp($values);
+        }
+
+        return ['values' => \count($values), 'invalid' => \count($values) - \count($strings)]
+            + array_combine(['label_escaped', 'help_escaped', 'backslashes', 'quotes', 'newlines', 'input_bytes', 'label_bytes', 'help_bytes', 'distinct_values'], $fields);
     }
 }
