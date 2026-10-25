@@ -25614,3 +25614,310 @@ mod w346_configuration_status_tests {
         assert_eq!(output, [90; 8]);
     }
 }
+
+// Wave 35.6: additional-processing DTO summaries and query-duration normalization.
+// Numeric fields use native-endian i64/f64 (PHP pack q/d); byte strings use a
+// little-endian u32 length followed by arbitrary bytes, including embedded NULs.
+const W356_MAX_BYTES: usize = 16_777_216;
+
+struct W356Reader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> W356Reader<'a> {
+    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+        let end = self.offset.checked_add(count)?;
+        let value = self.bytes.get(self.offset..end)?;
+        self.offset = end;
+        Some(value)
+    }
+
+    fn integer(&mut self) -> Option<i64> {
+        Some(i64::from_ne_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn float(&mut self) -> Option<f64> {
+        Some(f64::from_ne_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn count(&mut self) -> Option<usize> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?) as usize)
+    }
+
+    fn string(&mut self) -> Option<&'a [u8]> {
+        let size = self.count()?;
+        self.take(size)
+    }
+}
+
+fn w356_string(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    output.extend_from_slice(bytes);
+}
+
+fn w356_duration(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn w356_compute(operation: u8, bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut reader = W356Reader { bytes, offset: 0 };
+    let mut output = Vec::new();
+    match operation {
+        1 => {
+            // Six normalized counters, then cache-hit, byte-reuse and media-byte ratios.
+            let mut values = [0_i64; 6];
+            for value in &mut values {
+                *value = reader.integer()?.max(0);
+                output.extend_from_slice(&value.to_ne_bytes());
+            }
+            let ratio = |n: i64, d: i64| {
+                if d > 0 {
+                    (n as f64 / d as f64).min(1.0)
+                } else {
+                    0.0
+                }
+            };
+            let total = values[3] as f64 + values[4] as f64;
+            for value in [
+                ratio(values[2], values[0]),
+                if total > 0.0 {
+                    values[4] as f64 / total
+                } else {
+                    0.0
+                },
+                ratio(values[5], values[3]),
+            ] {
+                output.extend_from_slice(&value.to_ne_bytes());
+            }
+        }
+        2 => {
+            // Source, posted size, title, count, message IDs; first-seen unique IDs.
+            let source = reader.integer()?.max(0);
+            let size = reader.integer()?.max(0);
+            let title = trim_php(reader.string()?);
+            let count = reader.count()?;
+            if count > (bytes.len() - reader.offset) / 4 {
+                return None;
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut ids = Vec::new();
+            for _ in 0..count {
+                let id = trim_php(reader.string()?);
+                if !id.is_empty() && seen.insert(id) {
+                    ids.push(id);
+                }
+            }
+            output.extend_from_slice(&source.to_ne_bytes());
+            output.extend_from_slice(&size.to_ne_bytes());
+            w356_string(&mut output, title);
+            output.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+            for id in ids {
+                w356_string(&mut output, id);
+            }
+        }
+        3 => {
+            // Source, size, filename, confidence -> source, size, rank, filename, value.
+            let source = reader.integer()?.max(0);
+            let size = reader.integer()?.max(0);
+            let filename = trim_php(reader.string()?);
+            let normalized: Vec<u8> = trim_php(reader.string()?)
+                .iter()
+                .map(|b| {
+                    if *b == b'_' {
+                        b'-'
+                    } else {
+                        b.to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            let (confidence, rank): (&[u8], i64) = match normalized.as_slice() {
+                b"verified" => (b"verified", 2),
+                b"unique-size" => (b"unique-size", 1),
+                _ => (b"unknown", 0),
+            };
+            for value in [source, size, rank] {
+                output.extend_from_slice(&value.to_ne_bytes());
+            }
+            w356_string(&mut output, filename);
+            w356_string(&mut output, confidence);
+        }
+        4 => {
+            // Statements, milliseconds, sync requests/executions, mean ms, saved requests.
+            let statements = reader.integer()?.max(0);
+            let ms = w356_duration(reader.float()?);
+            let requests = reader.integer()?.max(0);
+            let executions = reader.integer()?.max(0);
+            output.extend_from_slice(&statements.to_ne_bytes());
+            output.extend_from_slice(&ms.to_ne_bytes());
+            output.extend_from_slice(&requests.to_ne_bytes());
+            output.extend_from_slice(&executions.to_ne_bytes());
+            let average = if statements > 0 {
+                ms / statements as f64
+            } else {
+                0.0
+            };
+            output.extend_from_slice(&average.to_ne_bytes());
+            output.extend_from_slice(&(requests - executions).max(0).to_ne_bytes());
+        }
+        5 => output.extend_from_slice(&w356_duration(reader.float()?).to_ne_bytes()),
+        _ => return None,
+    }
+    if reader.offset != bytes.len() || output.len() > W356_MAX_BYTES {
+        return None;
+    }
+    Some(output)
+}
+
+/// Returns bytes written, -needed for insufficient capacity, or -1 for malformed
+/// input, invalid pointers/ranges, unsupported operations or a caught panic.
+/// Negative returns never modify output. There is no terminator or Rust-owned buffer.
+///
+/// # Safety
+/// Input/output must point to live readable/writable allocations of their declared
+/// byte counts. Both pointers must be nonnull, with nonoverlapping ranges of at
+/// most 16 MiB. Byte alignment suffices; length-prefix and numeric reads are copied.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w356_dto_provider(
+    operation: u8,
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_capacity: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if !(1..=5).contains(&operation)
+            || input.is_null()
+            || output.is_null()
+            || input_len > W356_MAX_BYTES
+            || output_capacity > W356_MAX_BYTES
+        {
+            return -1;
+        }
+        let Some(input_end) = (input as usize).checked_add(input_len) else {
+            return -1;
+        };
+        let Some(output_end) = (output as usize).checked_add(output_capacity) else {
+            return -1;
+        };
+        if input_len != 0
+            && output_capacity != 0
+            && (input as usize) < output_end
+            && (output as usize) < input_end
+        {
+            return -1;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+        let Some(result) = w356_compute(operation, bytes) else {
+            return -1;
+        };
+        if output_capacity < result.len() {
+            return -(result.len() as isize);
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), output, result.len()) };
+        result.len() as isize
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w356_dto_provider_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_frames_and_nonfinite_durations() {
+        for operation in 0..=6 {
+            assert!(w356_compute(operation, &[]).is_none());
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0, -1.0] {
+            assert_eq!(
+                w356_compute(5, &value.to_ne_bytes()),
+                Some(0.0_f64.to_ne_bytes().to_vec())
+            );
+        }
+        assert_eq!(
+            w356_compute(5, &1.25_f64.to_ne_bytes()),
+            Some(1.25_f64.to_ne_bytes().to_vec())
+        );
+        let mut invalid = vec![0; 16];
+        invalid.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(w356_compute(2, &invalid).is_none());
+        assert!(w356_compute(3, &invalid).is_none());
+        invalid[16..20].copy_from_slice(&0_u32.to_le_bytes());
+        invalid.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(w356_compute(2, &invalid).is_none());
+    }
+
+    #[test]
+    fn boundaries_and_no_partial_output() {
+        let input: Vec<u8> = [i64::MIN, i64::MAX, i64::MAX, i64::MAX, i64::MAX, i64::MAX]
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+        let result = w356_compute(1, &input).unwrap();
+        assert_eq!(&result[48..56], &0.0_f64.to_ne_bytes());
+        assert_eq!(&result[56..64], &0.5_f64.to_ne_bytes());
+        assert_eq!(&result[64..72], &1.0_f64.to_ne_bytes());
+        let mut output = [90_u8; 80];
+        let call =
+            |op, ptr, len, out, cap| unsafe { nntmux_w356_dto_provider(op, ptr, len, out, cap) };
+        assert_eq!(
+            call(1, input.as_ptr(), input.len(), output.as_mut_ptr(), 71),
+            -72
+        );
+        assert_eq!(
+            call(1, std::ptr::null(), input.len(), output.as_mut_ptr(), 80),
+            -1
+        );
+        assert_eq!(
+            call(1, input.as_ptr(), input.len(), std::ptr::null_mut(), 80),
+            -1
+        );
+        assert_eq!(
+            call(1, input.as_ptr(), usize::MAX, output.as_mut_ptr(), 80),
+            -1
+        );
+        assert_eq!(
+            call(
+                1,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                usize::MAX
+            ),
+            -1
+        );
+        assert_eq!(
+            call(
+                1,
+                usize::MAX as *const u8,
+                input.len(),
+                output.as_mut_ptr(),
+                80
+            ),
+            -1
+        );
+        assert_eq!(
+            call(1, input.as_ptr(), input.len(), usize::MAX as *mut u8, 80),
+            -1
+        );
+        assert_eq!(
+            call(1, input.as_ptr(), input.len() - 1, output.as_mut_ptr(), 80),
+            -1
+        );
+        assert_eq!(output, [90; 80]);
+        let mut overlapping = input.clone();
+        assert_eq!(
+            call(1, overlapping.as_ptr(), 48, overlapping.as_mut_ptr(), 48),
+            -1
+        );
+        assert_eq!(overlapping, input);
+        assert_eq!(call(1, input.as_ptr(), 48, output.as_mut_ptr(), 80), 72);
+        assert_eq!(&output[..72], result.as_slice());
+        assert_eq!(&output[72..], &[90; 8]);
+    }
+}
