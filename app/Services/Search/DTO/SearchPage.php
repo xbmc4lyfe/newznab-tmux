@@ -18,6 +18,12 @@ final readonly class SearchPage
         C;
 
     /**
+     * Rust stays opt-in for the Wave 41.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustSearchDtoQueryCursorPageMediaCodecW41ParityTest.php.
+     */
+    public const bool W415_RUST_FFI_DEFAULT = false;
+
+    /**
      * @param  list<int>  $ids
      * @param  list<int|float|string>  $lastSortValues
      * @param  list<array<string, mixed>>  $documents
@@ -76,6 +82,148 @@ final readonly class SearchPage
         $ffi = self::ffiState();
 
         return $ffi instanceof FFI ? $ffi : null;
+    }
+
+    /**
+     * Wave 41.5 toggle state; readonly classes cannot declare static properties.
+     */
+    private static function w415State(bool $assign = false, ?bool $enable = null): ?bool
+    {
+        static $useRustFfi = null;
+        if ($assign) {
+            $useRustFfi = $enable;
+        }
+
+        return $useRustFfi;
+    }
+
+    public static function useW415RustFfi(bool $enable = true): void
+    {
+        self::w415State(true, $enable);
+    }
+
+    public static function usesW415RustFfi(): bool
+    {
+        return self::w415State() ?? self::W415_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW415RustFfi(): void
+    {
+        self::w415State(true);
+    }
+
+    /**
+     * Summarizes a batch of result pages. Non-page items are invalid. `id_count` counts every id of a
+     * valid page and `distinct_ids` the distinct integer ids across them; non-integer ids are skipped
+     * by `distinct_ids`. `max_total` is the largest page total (0 when none is larger) and
+     * `distinct_drivers` counts distinct driver names.
+     *
+     * @param  array<array-key, mixed>  $pages
+     * @return array{pages: int, invalid: int, available: int, fuzzy: int, has_more: int, id_count: int, distinct_ids: int, max_total: int, distinct_drivers: int}
+     */
+    public static function summarizePageBatch(array $pages): array
+    {
+        return self::usesW415RustFfi() ? self::summarizePageBatchNative($pages) : self::summarizePageBatchPhp($pages);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $pages
+     * @return array{pages: int, invalid: int, available: int, fuzzy: int, has_more: int, id_count: int, distinct_ids: int, max_total: int, distinct_drivers: int}
+     */
+    public static function summarizePageBatchPhp(array $pages): array
+    {
+        $invalid = 0;
+        $available = 0;
+        $fuzzy = 0;
+        $hasMore = 0;
+        $idCount = 0;
+        $maxTotal = 0;
+        $ids = [];
+        $drivers = [];
+        foreach ($pages as $page) {
+            if (! $page instanceof self) {
+                $invalid++;
+
+                continue;
+            }
+            $available += (int) $page->available;
+            $fuzzy += (int) $page->fuzzy;
+            $hasMore += (int) $page->hasMore;
+            $maxTotal = max($maxTotal, $page->total);
+            $drivers[$page->driver] = true;
+            $idCount += \count($page->ids);
+            foreach ($page->ids as $id) {
+                if (\is_int($id)) {
+                    $ids[$id] = true;
+                }
+            }
+        }
+
+        return [
+            'pages' => \count($pages),
+            'invalid' => $invalid,
+            'available' => $available,
+            'fuzzy' => $fuzzy,
+            'has_more' => $hasMore,
+            'id_count' => $idCount,
+            'distinct_ids' => \count($ids),
+            'max_total' => $maxTotal,
+            'distinct_drivers' => \count($drivers),
+        ];
+    }
+
+    /**
+     * Rust receives integer ids as little-endian 64-bit values; pages with non-list or non-integer
+     * ids stay in PHP.
+     *
+     * @param  array<array-key, mixed>  $pages
+     * @return array{pages: int, invalid: int, available: int, fuzzy: int, has_more: int, id_count: int, distinct_ids: int, max_total: int, distinct_drivers: int}
+     */
+    public static function summarizePageBatchNative(array $pages): array
+    {
+        $parts = [];
+        foreach ($pages as $page) {
+            if (! $page instanceof self) {
+                array_push($parts, '0', '', '', '', '', '', '');
+
+                continue;
+            }
+            $ids = $page->ids;
+            if (! array_is_list($ids)) {
+                return self::summarizePageBatchPhp($pages);
+            }
+            foreach ($ids as $id) {
+                if (! \is_int($id)) {
+                    return self::summarizePageBatchPhp($pages);
+                }
+            }
+            array_push(
+                $parts,
+                '1',
+                $page->available ? '1' : '0',
+                $page->fuzzy ? '1' : '0',
+                $page->hasMore ? '1' : '0',
+                (string) $page->total,
+                $page->driver,
+                $ids === [] ? '' : pack('P*', ...$ids),
+            );
+        }
+        $fields = SearchCursor::evaluateW415Native(3, $parts);
+        if ($fields === null || \count($fields) !== 9) {
+            return self::summarizePageBatchPhp($pages);
+        }
+
+        return [
+            'pages' => (int) $fields[0],
+            'invalid' => (int) $fields[1],
+            'available' => (int) $fields[2],
+            'fuzzy' => (int) $fields[3],
+            'has_more' => (int) $fields[4],
+            'id_count' => (int) $fields[5],
+            'distinct_ids' => (int) $fields[6],
+            'max_total' => (int) $fields[7],
+            'distinct_drivers' => (int) $fields[8],
+        ];
     }
 
     /** @return array{ids: list<int>, total: int, fuzzy: bool} */

@@ -20,6 +20,12 @@ final readonly class SearchCursorCodec
         C;
 
     /**
+     * Rust stays opt-in for the Wave 41.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustSearchDtoQueryCursorPageMediaCodecW41ParityTest.php.
+     */
+    public const bool W415_RUST_FFI_DEFAULT = false;
+
+    /**
      * The Rust payload codec stays opt-in: it is slower than json_encode/json_decode
      * in the paired benchmark (see RustSearchCursorAndLogIndexParityTest).
      */
@@ -145,6 +151,121 @@ final readonly class SearchCursorCodec
         }
 
         return new SearchCursor($sort, $total, $strings[0], $strings[1], $strings[2], $expires);
+    }
+
+    /**
+     * Wave 41.5 toggle state; readonly classes cannot declare static properties.
+     */
+    private static function w415State(bool $assign = false, ?bool $enable = null): ?bool
+    {
+        static $useRustFfi = null;
+        if ($assign) {
+            $useRustFfi = $enable;
+        }
+
+        return $useRustFfi;
+    }
+
+    public static function useW415RustFfi(bool $enable = true): void
+    {
+        self::w415State(true, $enable);
+    }
+
+    public static function usesW415RustFfi(): bool
+    {
+        return self::w415State() ?? self::W415_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW415RustFfi(): void
+    {
+        self::w415State(true);
+    }
+
+    /**
+     * Summarizes decoded cursor payloads with the acceptance rules of `decodePayloadPhp()`: a payload
+     * needs an array `sort`, and `(int) expires` (0 when missing) must not be before $now. Sort and
+     * driver statistics cover accepted payloads; a non-string driver counts as the empty driver.
+     *
+     * @param  array<array-key, mixed>  $payloads
+     * @return array{payloads: int, invalid_shape: int, expired: int, accepted: int, sort_values: int, max_sort_width: int, distinct_drivers: int}
+     */
+    public static function summarizePayloadBatch(array $payloads, int $now): array
+    {
+        return self::usesW415RustFfi() ? self::summarizePayloadBatchNative($payloads, $now) : self::summarizePayloadBatchPhp($payloads, $now);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $payloads
+     * @return array{payloads: int, invalid_shape: int, expired: int, accepted: int, sort_values: int, max_sort_width: int, distinct_drivers: int}
+     */
+    public static function summarizePayloadBatchPhp(array $payloads, int $now): array
+    {
+        $invalid = 0;
+        $expired = 0;
+        $accepted = 0;
+        $values = 0;
+        $widest = 0;
+        $drivers = [];
+        foreach ($payloads as $payload) {
+            if (! is_array($payload) || ! is_array($payload['sort'] ?? null)) {
+                $invalid++;
+
+                continue;
+            }
+            if ((int) ($payload['expires'] ?? 0) < $now) {
+                $expired++;
+
+                continue;
+            }
+            $accepted++;
+            $width = count($payload['sort']);
+            $values += $width;
+            $widest = max($widest, $width);
+            $driver = $payload['driver'] ?? '';
+            $drivers[is_string($driver) ? $driver : ''] = true;
+        }
+
+        return [
+            'payloads' => count($payloads),
+            'invalid_shape' => $invalid,
+            'expired' => $expired,
+            'accepted' => $accepted,
+            'sort_values' => $values,
+            'max_sort_width' => $widest,
+            'distinct_drivers' => count($drivers),
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $payloads
+     * @return array{payloads: int, invalid_shape: int, expired: int, accepted: int, sort_values: int, max_sort_width: int, distinct_drivers: int}
+     */
+    public static function summarizePayloadBatchNative(array $payloads, int $now): array
+    {
+        $parts = [(string) $now];
+        foreach ($payloads as $payload) {
+            if (! is_array($payload) || ! is_array($payload['sort'] ?? null)) {
+                array_push($parts, '0', '', '', '');
+
+                continue;
+            }
+            $driver = $payload['driver'] ?? '';
+            array_push($parts, '1', (string) (int) ($payload['expires'] ?? 0), (string) count($payload['sort']), is_string($driver) ? $driver : '');
+        }
+        $fields = SearchCursor::evaluateW415Native(5, $parts);
+        if ($fields === null || count($fields) !== 7) {
+            return self::summarizePayloadBatchPhp($payloads, $now);
+        }
+
+        return [
+            'payloads' => (int) $fields[0],
+            'invalid_shape' => (int) $fields[1],
+            'expired' => (int) $fields[2],
+            'accepted' => (int) $fields[3],
+            'sort_values' => (int) $fields[4],
+            'max_sort_width' => (int) $fields[5],
+            'distinct_drivers' => (int) $fields[6],
+        ];
     }
 
     private static function line(string $record, int &$p): string
