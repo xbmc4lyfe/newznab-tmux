@@ -10,6 +10,7 @@ use App\Services\TvProcessing\Providers\AbstractTvProvider;
 use App\Services\TvProcessing\TvPosterResolver;
 use App\Services\TvProcessing\TvProcessingPassable;
 use App\Services\TvProcessing\TvProcessingResult;
+use App\Services\TvProcessing\TvProcessingRunState;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use Illuminate\Support\Facades\Log;
@@ -57,6 +58,145 @@ abstract class AbstractApiProviderPipe extends AbstractTvProviderPipe
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * Wave 48.3 batch provider rate-limit, cache-skip, retry-after and eligibility evaluation.
+     * Disabled: seven paired runs missed the 1.5x uncommon p99 gate in one (min common mean 2.04x,
+     * p99 1.84x; uncommon mean 1.60x, p99 1.44x); PHP-side column packing dominates these short rows (see the W48 parity test).
+     */
+    public const bool W48_API_PROVIDER_RUST_FFI_DEFAULT = false;
+
+    public const string W48_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w48_tv_api_provider_gate_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, char *out, size_t out_cap);
+        C;
+
+    /** Seconds an open circuit (TvProcessingRunState::CIRCUIT_BREAKER_THRESHOLD failures) stays open after the last failure. */
+    public const int W48_BREAKER_COOLDOWN = 300;
+
+    /** Seconds a not-found title is skipped without a new search. */
+    public const int W48_NOT_FOUND_TTL = 21600;
+
+    /** Timestamps are clamped to [0, 2^52] so window arithmetic stays in integer range. */
+    public const int W48_MAX_TIMESTAMP = 1 << 52;
+
+    public const int W48_MAX_RETRY_AFTER = 86400;
+
+    /**
+     * Gate decisions: unconfigured, circuit open, rate limited, cached not found, no title,
+     * search, season pack, missing site id, episode lookup.
+     */
+    public const int W48_GATE_DECISIONS = 9;
+
+    private static ?bool $w48RustFfiOverride = null;
+
+    private static FFI|false|null $w48RustFfiHandle = null;
+
+    /** Null restores W48_API_PROVIDER_RUST_FFI_DEFAULT. */
+    public static function useW48ApiProviderRustFfi(?bool $enable = true): void
+    {
+        self::$w48RustFfiOverride = $enable;
+        if ($enable === null) {
+            self::$w48RustFfiHandle = null;
+        }
+    }
+
+    public static function usesW48ApiProviderRustFfi(): bool
+    {
+        return self::$w48RustFfiOverride ?? self::W48_API_PROVIDER_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Four values per item: the gate decision (see W48_GATE_DECISIONS, first that applies:
+     * not configured; failures at the breaker threshold within W48_BREAKER_COOLDOWN of the last
+     * failure; retry_after (clamped to [0, W48_MAX_RETRY_AFTER]) still pending since the last
+     * failure; without a show, a not-found mark younger than W48_NOT_FOUND_TTL; without a show,
+     * an empty normalized title or else a search; with one, a season pack, a site id <= 0 or
+     * else an episode lookup), the seconds to wait, the FNV-1a 32 cache key of
+     * `lowercase provider:normalized title` and the normalized title length. Then the nine
+     * decision counts, the max wait and the distinct lowercase provider count. Timestamps are
+     * clamped to [0, W48_MAX_TIMESTAMP]; flags are non-zero integers; missing keys read as '' or 0.
+     *
+     * @param  list<array<string, mixed>>  $items  provider, title, configured, has_show, season_pack, site_id, failures, last_failure_at, retry_after, not_found_at
+     * @return list<int>
+     */
+    public static function w48GateBatch(array $items, int $now): array
+    {
+        return self::usesW48ApiProviderRustFfi()
+            ? self::w48GateBatchNative($items, $now)
+            : self::w48GateBatchPhp($items, $now);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $items
+     * @return list<int>
+     */
+    public static function w48GateBatchNative(array $items, int $now): array
+    {
+        $count = \count($items);
+        $c = self::w48Columns($items, [
+            'provider' => '', 'title' => '', 'configured' => 0, 'has_show' => 0, 'season_pack' => 0, 'site_id' => 0,
+            'failures' => 0, 'last_failure_at' => 0, 'retry_after' => 0, 'not_found_at' => 0,
+        ]);
+
+        return self::w48Invoke(
+            self::w48RustFfi(),
+            'nntmux_w48_tv_api_provider_gate_batch',
+            [$c['provider'], $c['title']],
+            [$c['configured'], $c['has_show'], $c['season_pack'], $c['site_id'], $c['failures'], $c['last_failure_at'], $c['retry_after'], $c['not_found_at']],
+            $count,
+            $count * 4 + self::W48_GATE_DECISIONS + 2,
+            [$now],
+        ) ?? self::w48GateBatchPhp($items, $now);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $items
+     * @return list<int>
+     */
+    public static function w48GateBatchPhp(array $items, int $now): array
+    {
+        $now = max(0, min(self::W48_MAX_TIMESTAMP, $now));
+        $out = [];
+        $counts = array_fill(0, self::W48_GATE_DECISIONS, 0);
+        $maxWait = 0;
+        $providers = [];
+        foreach ($items as $item) {
+            $provider = strtolower((string) ($item['provider'] ?? ''));
+            $title = self::w48Normalize((string) ($item['title'] ?? ''));
+            $hasShow = (int) ($item['has_show'] ?? 0) !== 0;
+            $failures = max(0, (int) ($item['failures'] ?? 0));
+            $last = max(0, min(self::W48_MAX_TIMESTAMP, (int) ($item['last_failure_at'] ?? 0)));
+            $retryAfter = max(0, min(self::W48_MAX_RETRY_AFTER, (int) ($item['retry_after'] ?? 0)));
+            $notFoundAt = max(0, min(self::W48_MAX_TIMESTAMP, (int) ($item['not_found_at'] ?? 0)));
+            [$decision, $wait] = match (true) {
+                (int) ($item['configured'] ?? 0) === 0 => [0, 0],
+                $failures >= TvProcessingRunState::CIRCUIT_BREAKER_THRESHOLD && $last + self::W48_BREAKER_COOLDOWN > $now => [1, $last + self::W48_BREAKER_COOLDOWN - $now],
+                $retryAfter > 0 && $last + $retryAfter > $now => [2, $last + $retryAfter - $now],
+                ! $hasShow && $notFoundAt > 0 && $notFoundAt + self::W48_NOT_FOUND_TTL > $now => [3, $notFoundAt + self::W48_NOT_FOUND_TTL - $now],
+                ! $hasShow => [$title === '' ? 4 : 5, 0],
+                (int) ($item['season_pack'] ?? 0) !== 0 => [6, 0],
+                (int) ($item['site_id'] ?? 0) <= 0 => [7, 0],
+                default => [8, 0],
+            };
+            $counts[$decision]++;
+            $maxWait = max($maxWait, $wait);
+            $providers[$provider] = true;
+            array_push($out, $decision, $wait, self::w48Fnv($provider.':'.$title), \strlen($title));
+        }
+        array_push($out, ...$counts);
+        array_push($out, $maxWait, \count($providers));
+
+        return $out;
+    }
+
+    private static function w48RustFfi(): ?FFI
+    {
+        if (self::$w48RustFfiHandle === null) {
+            self::$w48RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w48', self::W48_FFI_CDEF) ?? false;
+        }
+
+        return self::$w48RustFfiHandle === false ? null : self::$w48RustFfiHandle;
     }
 
     public function __construct(

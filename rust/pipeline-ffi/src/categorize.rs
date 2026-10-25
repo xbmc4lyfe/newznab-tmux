@@ -36390,3 +36390,931 @@ pub mod tv_processing_parsed_context_passable_result_state_w473 {
         }
     }
 }
+
+/// Wave 48.3 batch helpers for `AbstractApiProviderPipe`, `AbstractTvProviderPipe`, `LocalDbPipe`,
+/// `ParseInfoPipe` and `TmdbPipe`. Every export takes NUL-joined strings (column-major where an
+/// item has several) plus, where needed, packed little-endian `i64` columns, and writes
+/// fixed-width little-endian `i64` values that PHP unpacks with `unpack('P*')`. A malformed batch
+/// returns `-1` so PHP falls back to its reference implementation; a short output buffer returns
+/// the negated byte count needed.
+pub mod tv_pipes_api_abstract_localdb_parseinfo_tmdb_w483 {
+    use std::collections::HashMap;
+
+    /// Declines the batch to PHP.
+    pub const DECLINE: isize = -1;
+
+    const FNV_OFFSET: u32 = 0x811C_9DC5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+    /// `AbstractApiProviderPipe::W48_MAX_TIMESTAMP`.
+    const MAX_TIMESTAMP: i64 = 1 << 52;
+    /// `AbstractApiProviderPipe::W48_MAX_RETRY_AFTER` and `AbstractTvProviderPipe::W48_MAX_RETRY_AFTER`.
+    const MAX_RETRY_AFTER: i64 = 86_400;
+    /// `TvProcessingRunState::CIRCUIT_BREAKER_THRESHOLD`.
+    const BREAKER_THRESHOLD: i64 = 3;
+    /// `AbstractApiProviderPipe::W48_BREAKER_COOLDOWN`.
+    const BREAKER_COOLDOWN: i64 = 300;
+    /// `AbstractApiProviderPipe::W48_NOT_FOUND_TTL`.
+    const NOT_FOUND_TTL: i64 = 21_600;
+    /// `AbstractApiProviderPipe::W48_GATE_DECISIONS`.
+    const GATE_DECISIONS: usize = 9;
+    /// `AbstractTvProviderPipe::W48_STATUS_CODES`, in code order.
+    const STATUSES: [&[u8]; 8] = [
+        b"matched",
+        b"season_pack",
+        b"episode_missing",
+        b"not_found",
+        b"parse_failed",
+        b"transient",
+        b"skipped",
+        b"pending",
+    ];
+    /// `AbstractTvProviderPipe::W48_PROVIDER_WEIGHTS` and `W48_DEFAULT_WEIGHT`.
+    const PROVIDER_WEIGHTS: [(&[u8], i64); 5] = [
+        (b"tvdb", 95),
+        (b"tvmaze", 90),
+        (b"tmdb", 85),
+        (b"trakt", 80),
+        (b"local db", 75),
+    ];
+    const DEFAULT_WEIGHT: i64 = 50;
+    /// `AbstractTvProviderPipe::W48_CONFIDENCE_THRESHOLD`.
+    const CONFIDENCE_THRESHOLD: i64 = 60;
+    /// `TmdbPipe::W48_MIN_SCORE`.
+    const TMDB_MIN_SCORE: i64 = 70;
+
+    #[inline]
+    fn fnv(mut h: u32, bytes: &[u8]) -> u32 {
+        for &b in bytes {
+            h = (h ^ u32::from(b)).wrapping_mul(FNV_PRIME);
+        }
+        h
+    }
+
+    #[inline]
+    fn fnv_lower(mut h: u32, bytes: &[u8]) -> u32 {
+        for &b in bytes {
+            h = (h ^ u32::from(b.to_ascii_lowercase())).wrapping_mul(FNV_PRIME);
+        }
+        h
+    }
+
+    /// Splits `blob` on NUL into exactly `count` pieces (an empty blob holds no pieces).
+    fn split_exact(blob: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+        if count == 0 {
+            return blob.is_empty().then(Vec::new);
+        }
+        let mut parts = Vec::with_capacity(count);
+        parts.extend(blob.split(|&b| b == 0));
+        (parts.len() == count).then_some(parts)
+    }
+
+    /// Reads the whole buffer as little-endian `i64`s.
+    fn read_ints(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        rest.is_empty()
+            .then(|| chunks.iter().map(|c| i64::from_le_bytes(*c)).collect())
+    }
+
+    /// PHP `implode(' ', preg_split('/[^a-z0-9]+/', strtolower($s), -1, PREG_SPLIT_NO_EMPTY))`.
+    fn normalize_into(src: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        let mut gap = false;
+        for &b in src {
+            let l = b.to_ascii_lowercase();
+            if l.is_ascii_lowercase() || l.is_ascii_digit() {
+                if gap && !out.is_empty() {
+                    out.push(b' ');
+                }
+                gap = false;
+                out.push(l);
+            } else {
+                gap = true;
+            }
+        }
+    }
+
+    /// A token keyed by its FNV-1a 64 hash; ordering by hash, then bytes, keeps sets exact.
+    type Token<'a> = (u64, &'a [u8]);
+
+    /// Distinct space-separated tokens of a normalized string, sorted by (hash, bytes).
+    fn token_set(norm: &[u8]) -> Vec<Token<'_>> {
+        if norm.is_empty() {
+            return Vec::new();
+        }
+        let mut set: Vec<Token<'_>> = norm
+            .split(|&b| b == b' ')
+            .map(|t| {
+                let h = t.iter().fold(0xCBF2_9CE4_8422_2325u64, |h, &b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+                });
+                (h, t)
+            })
+            .collect();
+        set.sort_unstable();
+        set.dedup();
+        set
+    }
+
+    /// Size of the intersection of two sorted distinct token sets.
+    fn common(a: &[Token<'_>], b: &[Token<'_>]) -> i64 {
+        let (mut i, mut j, mut n) = (0, 0, 0i64);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    n += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn all_digits(t: &[u8]) -> bool {
+        t.iter().all(u8::is_ascii_digit)
+    }
+
+    fn digits_value(t: &[u8]) -> i64 {
+        t.iter().fold(0i64, |a, &b| a * 10 + i64::from(b - b'0'))
+    }
+
+    /// `[0-9]{min,max}` as the whole of `t`.
+    fn digits_in(t: &[u8], min: usize, max: usize) -> Option<i64> {
+        (t.len() >= min && t.len() <= max && all_digits(t)).then(|| digits_value(t))
+    }
+
+    fn is_year(t: &[u8]) -> bool {
+        t.len() == 4 && all_digits(t) && (t.starts_with(b"19") || t.starts_with(b"20"))
+    }
+
+    /// Leading run of ASCII digits.
+    fn digit_run(t: &[u8]) -> usize {
+        t.iter().take_while(|b| b.is_ascii_digit()).count()
+    }
+
+    /// `AbstractApiProviderPipe::w48GateBatchPhp`: four values per item, then the nine decision
+    /// counts, the max wait and the distinct lowercase provider count.
+    fn gate_batch(blob: &[u8], ints: &[u8], count: usize) -> Option<Vec<i64>> {
+        let strings = split_exact(blob, count.checked_mul(2)?)?;
+        let ints = read_ints(ints)?;
+        if ints.len() != count.checked_mul(8)?.checked_add(1)? {
+            return None;
+        }
+        let col = |c: usize, i: usize| ints[1 + c * count + i];
+        let now = ints[0].clamp(0, MAX_TIMESTAMP);
+        let mut out = Vec::with_capacity(count * 4 + GATE_DECISIONS + 2);
+        let mut counts = [0i64; GATE_DECISIONS];
+        let mut max_wait = 0i64;
+        let mut norm = Vec::with_capacity(128);
+        let mut providers: Vec<Vec<u8>> = Vec::with_capacity(count);
+        for i in 0..count {
+            let (provider, title) = (strings[i], strings[count + i]);
+            let configured = col(0, i) != 0;
+            let has_show = col(1, i) != 0;
+            let season_pack = col(2, i) != 0;
+            let site_id = col(3, i);
+            let failures = col(4, i).max(0);
+            let last = col(5, i).clamp(0, MAX_TIMESTAMP);
+            let retry_after = col(6, i).clamp(0, MAX_RETRY_AFTER);
+            let not_found_at = col(7, i).clamp(0, MAX_TIMESTAMP);
+            normalize_into(title, &mut norm);
+            let (decision, wait) = if !configured {
+                (0, 0)
+            } else if failures >= BREAKER_THRESHOLD && last + BREAKER_COOLDOWN > now {
+                (1, last + BREAKER_COOLDOWN - now)
+            } else if retry_after > 0 && last + retry_after > now {
+                (2, last + retry_after - now)
+            } else if !has_show && not_found_at > 0 && not_found_at + NOT_FOUND_TTL > now {
+                (3, not_found_at + NOT_FOUND_TTL - now)
+            } else if !has_show {
+                (if norm.is_empty() { 4 } else { 5 }, 0)
+            } else if season_pack {
+                (6, 0)
+            } else if site_id <= 0 {
+                (7, 0)
+            } else {
+                (8, 0)
+            };
+            counts[decision] += 1;
+            max_wait = max_wait.max(wait);
+            let key = fnv(fnv(fnv_lower(FNV_OFFSET, provider), b":"), &norm);
+            providers.push(provider.to_ascii_lowercase());
+            out.extend([decision as i64, wait, i64::from(key), norm.len() as i64]);
+        }
+        providers.sort_unstable();
+        providers.dedup();
+        out.extend(counts);
+        out.extend([max_wait, providers.len() as i64]);
+        Some(out)
+    }
+
+    /// `AbstractTvProviderPipe::w48RoutingBatchPhp`: four values per item, then the four route
+    /// counts, the best resolved index, the max wait and the rolling batch digest.
+    fn routing_batch(blob: &[u8], ints: &[u8], count: usize) -> Option<Vec<i64>> {
+        let strings = split_exact(blob, count.checked_mul(2)?)?;
+        let ints = read_ints(ints)?;
+        if ints.len() != count.checked_mul(3)? {
+            return None;
+        }
+        let col = |c: usize, i: usize| ints[c * count + i];
+        let mut out = Vec::with_capacity(count * 4 + 7);
+        let mut routes = [0i64; 4];
+        let (mut best, mut best_eff, mut best_priority) = (-1i64, 0i64, 0i64);
+        let (mut max_wait, mut rolling) = (0i64, 0i64);
+        for i in 0..count {
+            let (status, provider) = (strings[i], strings[count + i]);
+            let code = STATUSES
+                .iter()
+                .position(|s| *s == status)
+                .map_or(-1, |p| p as i64);
+            let weight = PROVIDER_WEIGHTS
+                .iter()
+                .find(|(name, _)| provider.eq_ignore_ascii_case(name))
+                .map_or(DEFAULT_WEIGHT, |&(_, w)| w);
+            let confidence = col(0, i).clamp(0, 100);
+            let priority = col(1, i);
+            let effective = confidence * weight / 100;
+            let route: i64 = match code {
+                0 | 1 if effective >= CONFIDENCE_THRESHOLD => 0,
+                0 | 1 => 3,
+                4 => 0,
+                5 => 2,
+                2 | 3 | 6 | 7 => 1,
+                _ => 3,
+            };
+            let wait = if code == 5 {
+                col(2, i).clamp(0, MAX_RETRY_AFTER)
+            } else {
+                0
+            };
+            routes[route as usize] += 1;
+            max_wait = max_wait.max(wait);
+            if route == 0
+                && (code == 0 || code == 1)
+                && (best < 0
+                    || effective > best_eff
+                    || (effective == best_eff && priority < best_priority))
+            {
+                best = i as i64;
+                best_eff = effective;
+                best_priority = priority;
+            }
+            let mut h = fnv(fnv_lower(FNV_OFFSET, provider), b"\x1F");
+            h = fnv(fnv(h, status), b"\x1F");
+            h = fnv(h, &[b'0' + route as u8]);
+            let digest = i64::from(h);
+            rolling = (rolling * 31 + digest) & 0xFFFF_FFFF;
+            out.extend([code, route, effective, digest]);
+        }
+        out.extend(routes);
+        out.extend([best, max_wait, rolling]);
+        Some(out)
+    }
+
+    /// `LocalDbPipe::w48CandidateBatchPhp`: five values per item, then the three decision
+    /// counts, the best index and the best total.
+    fn candidate_batch(blob: &[u8], ints: &[u8], count: usize) -> Option<Vec<i64>> {
+        let strings = split_exact(blob, count.checked_mul(4)?)?;
+        let ints = read_ints(ints)?;
+        if ints.len() != count.checked_mul(8)? {
+            return None;
+        }
+        let col = |c: usize, i: usize| ints[c * count + i];
+        let mut out = Vec::with_capacity(count * 5 + 5);
+        let mut decisions = [0i64; 3];
+        let (mut best, mut best_total) = (-1i64, 0i64);
+        let (mut a, mut b) = (Vec::with_capacity(128), Vec::with_capacity(128));
+        for i in 0..count {
+            let (airdate, cand_airdate) = (strings[2 * count + i], strings[3 * count + i]);
+            normalize_into(strings[i], &mut a);
+            normalize_into(strings[count + i], &mut b);
+            let title_score = if !a.is_empty() && a == b {
+                100
+            } else {
+                let (sa, sb) = (token_set(&a), token_set(&b));
+                let shared = common(&sa, &sb);
+                let union = (sa.len() + sb.len()) as i64 - shared;
+                if union == 0 { 0 } else { 100 * shared / union }
+            };
+            let (season, episode) = (col(0, i), col(1, i));
+            let episode_code =
+                if season >= 0 && episode >= 0 && season == col(2, i) && episode == col(3, i) {
+                    2
+                } else if !airdate.is_empty() && airdate == cand_airdate {
+                    1
+                } else {
+                    0
+                };
+            let (mut matches, mut conflicts) = (0i64, 0i64);
+            for (id, cand) in [(col(4, i), col(5, i)), (col(6, i), col(7, i))] {
+                if id > 0 && cand > 0 {
+                    if id == cand {
+                        matches += 1;
+                    } else {
+                        conflicts += 1;
+                    }
+                }
+            }
+            let total =
+                title_score + [0, 40, 50][episode_code as usize] + 30 * matches - 60 * conflicts;
+            let decision = if conflicts > 0 {
+                0
+            } else if total >= 150 {
+                2
+            } else if total >= 90 {
+                1
+            } else {
+                0
+            };
+            decisions[decision] += 1;
+            if best < 0 || total > best_total {
+                best = i as i64;
+                best_total = total;
+            }
+            out.extend([
+                title_score,
+                episode_code,
+                total,
+                decision as i64,
+                i64::from(fnv(FNV_OFFSET, &b)),
+            ]);
+        }
+        out.extend(decisions);
+        out.extend([best, best_total]);
+        Some(out)
+    }
+
+    /// One release name's TV tokens: kind, season, episode, episode end, airdate, year, title
+    /// digest and title length.
+    fn parse_tokens(norm: &[u8], tokens: &mut Vec<(usize, usize)>) -> [i64; 8] {
+        tokens.clear();
+        let mut start = 0;
+        for (j, &c) in norm.iter().enumerate() {
+            if c == b' ' {
+                tokens.push((start, j));
+                start = j + 1;
+            }
+        }
+        if !norm.is_empty() {
+            tokens.push((start, norm.len()));
+        }
+        let tok = |k: usize| &norm[tokens[k].0..tokens[k].1];
+        let n = tokens.len();
+        let (mut kind, mut season, mut episode, mut end, mut airdate) = (0i64, -1, -1, -1, 0);
+        let mut marker = n;
+        for k in 0..n {
+            let t = tok(k);
+            if let Some((s, e, third)) = parse_se(t) {
+                let e_end = third.or_else(|| {
+                    (k + 1 < n)
+                        .then(|| tok(k + 1))
+                        .and_then(|next| next.strip_prefix(b"e"))
+                        .and_then(|d| digits_in(d, 1, 4))
+                });
+                (season, episode) = (s, e);
+                match e_end {
+                    Some(x) if x > e => (kind, end) = (2, x),
+                    _ => (kind, end) = (1, e),
+                }
+                marker = k;
+                break;
+            }
+            let run = digit_run(t);
+            if (1..=2).contains(&run)
+                && t.get(run) == Some(&b'x')
+                && let Some(e) = digits_in(&t[run + 1..], 2, 3)
+            {
+                (kind, season, episode, end) = (1, digits_value(&t[..run]), e, e);
+                marker = k;
+                break;
+            }
+            if let Some(s) = t.strip_prefix(b"s").and_then(|d| digits_in(d, 1, 3)) {
+                (kind, season) = (3, s);
+                marker = k;
+                break;
+            }
+            if is_year(t) && k + 2 < n {
+                let month = digits_in(tok(k + 1), 1, 2);
+                let day = digits_in(tok(k + 2), 1, 2);
+                if let (Some(m), Some(d)) = (month, day)
+                    && (1..=12).contains(&m)
+                    && (1..=31).contains(&d)
+                {
+                    kind = 4;
+                    airdate = digits_value(t) * 10_000 + m * 100 + d;
+                    marker = k;
+                    break;
+                }
+            }
+        }
+        let mut title_tokens = marker;
+        let mut year = 0;
+        if title_tokens > 1 && is_year(tok(title_tokens - 1)) {
+            year = digits_value(tok(title_tokens - 1));
+            title_tokens -= 1;
+        }
+        let title = if title_tokens == 0 {
+            &norm[..0]
+        } else {
+            &norm[..tokens[title_tokens - 1].1]
+        };
+        [
+            kind,
+            season,
+            episode,
+            end,
+            airdate,
+            year,
+            i64::from(fnv(FNV_OFFSET, title)),
+            title.len() as i64,
+        ]
+    }
+
+    /// `^s(\d{1,3})e(\d{1,4})(?:e(\d{1,4}))?$` on a lowercase token.
+    fn parse_se(t: &[u8]) -> Option<(i64, i64, Option<i64>)> {
+        let rest = t.strip_prefix(b"s")?;
+        let run = digit_run(rest);
+        let season = digits_in(&rest[..run], 1, 3)?;
+        let rest = rest[run..].strip_prefix(b"e")?;
+        let run = digit_run(rest);
+        let episode = digits_in(&rest[..run], 1, 4)?;
+        let rest = &rest[run..];
+        if rest.is_empty() {
+            return Some((season, episode, None));
+        }
+        let third = digits_in(rest.strip_prefix(b"e")?, 1, 4)?;
+        Some((season, episode, Some(third)))
+    }
+
+    /// `ParseInfoPipe::w48TokenBatchPhp`: eight values per name, then the five kind counts.
+    fn token_batch(blob: &[u8], count: usize) -> Option<Vec<i64>> {
+        let names = split_exact(blob, count)?;
+        let mut out = Vec::with_capacity(count * 8 + 5);
+        let mut kinds = [0i64; 5];
+        let mut norm = Vec::with_capacity(128);
+        let mut tokens = Vec::with_capacity(32);
+        for name in names {
+            normalize_into(name, &mut norm);
+            let parsed = parse_tokens(&norm, &mut tokens);
+            kinds[parsed[0] as usize] += 1;
+            out.extend(parsed);
+        }
+        out.extend(kinds);
+        Some(out)
+    }
+
+    /// Title similarity of a normalized query and candidate name.
+    fn similarity(q: &[u8], q_set: &[Token<'_>], name: &[u8]) -> i64 {
+        if q.is_empty() || name.is_empty() {
+            return 0;
+        }
+        if q == name {
+            return 100;
+        }
+        let prefixed = |long: &[u8], short: &[u8]| {
+            long.len() > short.len() && long.starts_with(short) && long[short.len()] == b' '
+        };
+        if prefixed(name, q) || prefixed(q, name) {
+            return 80;
+        }
+        let n_set = token_set(name);
+        200 * common(q_set, &n_set) / (q_set.len() + n_set.len()) as i64
+    }
+
+    /// `TmdbPipe::w48ScoreBatchPhp`: four values per candidate, then the selected count, the
+    /// distinct group count and the max score.
+    fn score_batch(blob: &[u8], ints: &[u8], count: usize) -> Option<Vec<i64>> {
+        let strings = split_exact(blob, count.checked_mul(7)?)?;
+        let ints = read_ints(ints)?;
+        if ints.len() != count.checked_mul(7)? {
+            return None;
+        }
+        let s = |c: usize, i: usize| strings[c * count + i];
+        let col = |c: usize, i: usize| ints[c * count + i];
+        let mut out = Vec::with_capacity(count * 4 + 3);
+        let mut scores = Vec::with_capacity(count);
+        let mut groups: HashMap<i64, Option<usize>> = HashMap::with_capacity(count);
+        let (mut q, mut name, mut original) = (Vec::new(), Vec::new(), Vec::new());
+        let mut max_score = 0i64;
+        for i in 0..count {
+            normalize_into(s(0, i), &mut q);
+            normalize_into(s(1, i), &mut name);
+            normalize_into(s(2, i), &mut original);
+            let q_set = token_set(&q);
+            let sim = similarity(&q, &q_set, &name).max(similarity(&q, &q_set, &original));
+            let air = s(3, i);
+            let cand_year = if air.len() >= 4 && all_digits(&air[..4]) {
+                digits_value(&air[..4])
+            } else {
+                0
+            };
+            let query_year = col(1, i).clamp(0, 9999);
+            let (delta, year_bonus) = if query_year > 0 && cand_year > 0 {
+                let d = (query_year - cand_year).abs();
+                (d, [20, 10].get(d as usize).copied().unwrap_or(-15))
+            } else {
+                (-1, 0)
+            };
+            let (country, origin) = (s(4, i), s(5, i));
+            let country_bonus = if !country.is_empty() && country.eq_ignore_ascii_case(origin) {
+                10
+            } else {
+                0
+            };
+            let popularity = (col(3, i).max(0) / 10).min(10);
+            let votes = if col(4, i) >= 100 { 5 } else { 0 };
+            let imdb = s(6, i);
+            let ext = if col(5, i) > 0 { 5 } else { 0 }
+                + if imdb.len() > 2 && imdb.starts_with(b"tt") && all_digits(&imdb[2..]) {
+                    5
+                } else {
+                    0
+                };
+            let (query_season, season_count) = (col(2, i), col(6, i));
+            let penalty = if query_season > 0 && season_count > 0 && query_season > season_count {
+                -20
+            } else {
+                0
+            };
+            let score = sim + year_bonus + country_bonus + popularity + votes + ext + penalty;
+            max_score = if i == 0 { score } else { max_score.max(score) };
+            scores.push(score);
+            let slot = groups.entry(col(0, i)).or_insert(None);
+            if score >= TMDB_MIN_SCORE && slot.is_none_or(|b| score > scores[b]) {
+                *slot = Some(i);
+            }
+            out.extend([score, sim, delta, 0]);
+        }
+        let mut selected = 0i64;
+        for &b in groups.values().flatten() {
+            out[b * 4 + 3] = 1;
+            selected += 1;
+        }
+        out.extend([selected, groups.len() as i64, max_score]);
+        Some(out)
+    }
+
+    /// # Safety
+    /// `ptr` must be valid for `len` readable bytes unless it is null with `len == 0`.
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() {
+            return (len == 0).then_some(&[]);
+        }
+        if len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// # Safety
+    /// `out` must be valid for `cap` writable bytes and must not overlap any input.
+    unsafe fn emit(values: Option<Vec<i64>>, out: *mut u8, cap: usize) -> isize {
+        let Some(values) = values else {
+            return DECLINE;
+        };
+        let needed = values.len() * 8;
+        if needed == 0 || out.is_null() {
+            return DECLINE;
+        }
+        if cap < needed {
+            return -(needed as isize);
+        }
+        let dst = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+        for (chunk, v) in dst.as_chunks_mut::<8>().0.iter_mut().zip(&values) {
+            chunk.copy_from_slice(&v.to_le_bytes());
+        }
+        needed as isize
+    }
+
+    /// A batch body over the string blob, the packed `i64` columns and the item count.
+    type Batch = fn(&[u8], &[u8], usize) -> Option<Vec<i64>>;
+
+    /// Shared body for the exports that take strings plus packed `i64` columns.
+    ///
+    /// # Safety
+    /// As for [`nntmux_w48_tv_api_provider_gate_batch`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn with_ints(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+        run: Batch,
+    ) -> isize {
+        let values = match unsafe { (input(blob, blob_len), input(ints, ints_len)) } {
+            (Some(b), Some(i)) => run(b, i, count),
+            _ => None,
+        };
+        unsafe { emit(values, out, out_cap) }
+    }
+
+    /// # Safety
+    /// `blob`/`ints` must be valid for their lengths in readable bytes and `out` for `out_cap`
+    /// writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w48_tv_api_provider_gate_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_ints(
+                blob, blob_len, ints, ints_len, count, out, out_cap, gate_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// As for [`nntmux_w48_tv_api_provider_gate_batch`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w48_tv_provider_routing_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_ints(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                routing_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// As for [`nntmux_w48_tv_api_provider_gate_batch`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w48_tv_local_db_candidate_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_ints(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                candidate_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob` must be valid for `blob_len` readable bytes and `out` for `out_cap` writable bytes,
+    /// not overlapping the input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w48_tv_parse_info_token_batch(
+        blob: *const u8,
+        blob_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let values = unsafe { input(blob, blob_len) }.and_then(|b| token_batch(b, count));
+        unsafe { emit(values, out, out_cap) }
+    }
+
+    /// # Safety
+    /// As for [`nntmux_w48_tv_api_provider_gate_batch`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w48_tv_tmdb_score_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_ints(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                score_batch,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn packed(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn h(bytes: &[u8]) -> i64 {
+            i64::from(fnv(FNV_OFFSET, bytes))
+        }
+
+        #[test]
+        fn normalizes_titles_to_lowercase_tokens() {
+            let mut out = Vec::new();
+            normalize_into(b"  The.Office__US (2005)!", &mut out);
+            assert_eq!(out, b"the office us 2005");
+            normalize_into(b"\xC3\xA9..", &mut out);
+            assert!(out.is_empty());
+        }
+
+        #[test]
+        fn gate_batch_orders_decisions() {
+            let blob = b"TVDB\0tvdb\0TMDB\0x\0x\0x\0Show.Name\0Show\0Show\0...\0Show\0Show";
+            let mut ints = vec![1000];
+            // configured, has_show, season_pack, site_id, failures, last, retry_after, not_found_at
+            ints.extend([0, 1, 1, 1, 1, 1]);
+            ints.extend([0, 0, 0, 0, 1, 1]);
+            ints.extend([0, 0, 0, 0, 1, 0]);
+            ints.extend([0, 0, 0, 0, 0, 5]);
+            ints.extend([0, 3, 0, 0, 0, 0]);
+            ints.extend([0, 900, 990, 0, 0, 0]);
+            ints.extend([0, 0, 30, 0, 0, 0]);
+            ints.extend([0, 0, 0, 0, 0, 0]);
+            let out = gate_batch(blob, &packed(&ints), 6).unwrap();
+            assert_eq!(out[0..4], [0, 0, h(b"tvdb:show name"), 9]);
+            assert_eq!(out[4..6], [1, 200]);
+            assert_eq!(out[8..10], [2, 20]);
+            assert_eq!(out[12], 4);
+            assert_eq!(out[16], 6);
+            assert_eq!(out[20], 8);
+            assert_eq!(out[24..], [1, 1, 1, 0, 1, 0, 1, 0, 1, 200, 3]);
+            assert!(gate_batch(blob, &packed(&ints[1..]), 6).is_none());
+        }
+
+        #[test]
+        fn routing_batch_selects_best_resolution() {
+            let blob = b"matched\0matched\0transient\0weird\0TVDB\0Trakt\0tvmaze\0";
+            let ints = packed(&[100, 90, 0, 50, 5, 1, 2, 3, 0, 0, 9_999_999, 0]);
+            let out = routing_batch(blob, &ints, 4).unwrap();
+            assert_eq!(out[0..3], [0, 0, 95]);
+            assert_eq!(out[4..7], [0, 0, 72]);
+            assert_eq!(out[8..10], [5, 2]);
+            assert_eq!(out[12..14], [-1, 3]);
+            assert_eq!(out[16..22], [2, 0, 1, 1, 0, 86_400]);
+        }
+
+        #[test]
+        fn candidate_batch_scores_titles_and_ids() {
+            let blob = b"The Office\0Show A B\0the.office\0Show C\x002005-01-01\0\x002005-01-01\0";
+            let ints = packed(&[1, -1, 2, 3, 1, 4, 2, 6, 10, 7, 10, 8, 0, 0, 0, 0]);
+            let out = candidate_batch(blob, &ints, 2).unwrap();
+            assert_eq!(out[0..5], [100, 2, 180, 2, h(b"the office")]);
+            assert_eq!(out[5..9], [25, 0, -35, 0]);
+            assert_eq!(out[10..], [1, 0, 1, 0, 180]);
+        }
+
+        #[test]
+        fn token_batch_classifies_markers() {
+            let blob = b"Show.Name.2019.S02E05E06.720p\0Show 3x07\0Show.S03.1080p\0Talk.2023.11.07.Guest\0S01E01-E03\0Plain.Title.1999";
+            let out = token_batch(blob, 6).unwrap();
+            assert_eq!(out[0..8], [2, 2, 5, 6, 0, 2019, h(b"show name"), 9]);
+            assert_eq!(out[8..12], [1, 3, 7, 7]);
+            assert_eq!(out[16..20], [3, 3, -1, -1]);
+            assert_eq!(out[24..30], [4, -1, -1, -1, 20_231_107, 0]);
+            assert_eq!(out[32..40], [2, 1, 1, 3, 0, 0, h(b""), 0]);
+            assert_eq!(out[40..48], [0, -1, -1, -1, 0, 1999, h(b"plain title"), 11]);
+            assert_eq!(out[48..], [1, 1, 2, 1, 1]);
+        }
+
+        #[test]
+        fn score_batch_selects_per_group() {
+            let blob = [
+                "Show\0Show\0Other",
+                "Show\0Show Name\0Nope",
+                "\0\0",
+                "2010-05-01\x002011\0x",
+                "US\0us\0",
+                "US\0US\0",
+                "tt123\0tt\0",
+            ]
+            .join("\0");
+            let blob = blob.as_bytes();
+            let ints = packed(&[
+                1, 1, 2, 2010, 2010, 0, 0, 0, 0, 500, 0, 0, 100, 0, 0, 1, 0, 0, 0, 0, 0,
+            ]);
+            let out = score_batch(blob, &ints, 3).unwrap();
+            assert_eq!(out[0..4], [100 + 20 + 10 + 10 + 5 + 10, 100, 0, 1]);
+            assert_eq!(out[4..8], [80 + 10 + 10, 80, 1, 0]);
+            assert_eq!(out[8..12], [0, 0, -1, 0]);
+            assert_eq!(out[12..], [1, 2, 155]);
+        }
+
+        #[test]
+        fn exports_decline_malformed_input() {
+            let mut out = [0u8; 256];
+            let o = out.as_mut_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w48_tv_parse_info_token_batch(b"a\0b".as_ptr(), 3, 1, o, 256),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w48_tv_parse_info_token_batch(b"S01E02".as_ptr(), 6, 1, o, 8),
+                    -(13 * 8)
+                );
+                assert_eq!(
+                    nntmux_w48_tv_parse_info_token_batch(ptr::null(), 0, 0, o, 256),
+                    40
+                );
+                let ints = packed(&[0, 0, 0]);
+                assert_eq!(
+                    nntmux_w48_tv_provider_routing_batch(
+                        b"matched\0tvdb".as_ptr(),
+                        12,
+                        ints.as_ptr(),
+                        24,
+                        1,
+                        o,
+                        256
+                    ),
+                    88
+                );
+                assert_eq!(
+                    nntmux_w48_tv_provider_routing_batch(
+                        b"matched\0tvdb".as_ptr(),
+                        12,
+                        ptr::null(),
+                        24,
+                        1,
+                        o,
+                        256
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w48_tv_tmdb_score_batch(ptr::null(), 0, ptr::null(), 0, 0, o, 256),
+                    24
+                );
+                assert_eq!(
+                    nntmux_w48_tv_local_db_candidate_batch(
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        o,
+                        256
+                    ),
+                    40
+                );
+                assert_eq!(
+                    nntmux_w48_tv_api_provider_gate_batch(
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        o,
+                        256
+                    ),
+                    DECLINE
+                );
+                let now = packed(&[0]);
+                assert_eq!(
+                    nntmux_w48_tv_api_provider_gate_batch(
+                        ptr::null(),
+                        0,
+                        now.as_ptr(),
+                        8,
+                        0,
+                        o,
+                        256
+                    ),
+                    11 * 8
+                );
+            }
+        }
+    }
+}
