@@ -633,4 +633,132 @@ final class AdditionalCandidateQuery
             return null;
         }
     }
+
+    public const bool W416_RUST_FFI_DEFAULT = false;
+
+    private const string W416_FFI_CDEF = 'int32_t nntmux_w416_additional_candidate_diag_orch_console_nzb(uint8_t operation, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
+
+    private static ?bool $w416UseRustFfi = null;
+
+    private static FFI|false|null $w416Ffi = null;
+
+    public static function useW416RustFfi(bool $enable = true): void
+    {
+        self::$w416UseRustFfi = $enable;
+    }
+
+    public static function usesW416RustFfi(): bool
+    {
+        return self::$w416UseRustFfi ?? self::W416_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW416RustFfi(): void
+    {
+        self::$w416UseRustFfi = null;
+        self::$w416Ffi = null;
+    }
+
+    /** @return list<int>|null */
+    private static function w416Slots(int $operation, string $input, int $count): ?array
+    {
+        if (\strlen($input) > 16_777_216) {
+            return null;
+        }
+        try {
+            self::$w416Ffi ??= RustPipelineLibrary::resolveDomain('additional', self::W416_FFI_CDEF) ?? false;
+            if (self::$w416Ffi === false) {
+                return null;
+            }
+            $bytes = $count * 8;
+            $buffer = self::$w416Ffi->new('char['.$bytes.']');
+            // @phpstan-ignore method.notFound
+            $written = self::$w416Ffi->nntmux_w416_additional_candidate_diag_orch_console_nzb($operation, $input, \strlen($input), $buffer, $bytes);
+            if ($written !== $bytes) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $bytes));
+            if ($values === false || \count($values) !== $count) {
+                return null;
+            }
+            foreach ($values as $value) {
+                if (! \is_int($value) || $value < 0) {
+                    return null;
+                }
+            }
+
+            return array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{total: int, eligible: int, too_small: int, too_large: int, blocked: int, invalid: int}
+     */
+    public static function summarizeCandidateEligibilityBatch(array $candidates, int $minBytes = 0, int $maxBytes = 0): array
+    {
+        return self::usesW416RustFfi()
+            ? self::summarizeCandidateEligibilityBatchNative($candidates, $minBytes, $maxBytes)
+            : self::summarizeCandidateEligibilityBatchPhp($candidates, $minBytes, $maxBytes);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{total: int, eligible: int, too_small: int, too_large: int, blocked: int, invalid: int}
+     */
+    public static function summarizeCandidateEligibilityBatchPhp(array $candidates, int $minBytes = 0, int $maxBytes = 0): array
+    {
+        $result = ['total' => \count($candidates), 'eligible' => 0, 'too_small' => 0, 'too_large' => 0, 'blocked' => 0, 'invalid' => 0];
+        foreach ($candidates as $row) {
+            if (! \is_array($row) || ! \is_int($row['size'] ?? null) || ! \is_int($row['passwordstatus'] ?? null) || ! \is_int($row['haspreview'] ?? null) || ! \is_int($row['nzbstatus'] ?? null) || $row['size'] < 0) {
+                $result['invalid']++;
+
+                continue;
+            }
+            if ($row['passwordstatus'] !== -1 || $row['haspreview'] !== -1 || $row['nzbstatus'] !== 1) {
+                $result['blocked']++;
+            } elseif ($row['size'] < max(0, $minBytes)) {
+                $result['too_small']++;
+            } elseif ($maxBytes > 0 && $row['size'] > $maxBytes) {
+                $result['too_large']++;
+            } else {
+                $result['eligible']++;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{total: int, eligible: int, too_small: int, too_large: int, blocked: int, invalid: int}
+     */
+    public static function summarizeCandidateEligibilityBatchNative(array $candidates, int $minBytes = 0, int $maxBytes = 0): array
+    {
+        $total = \count($candidates);
+        if ($total > 100_000) {
+            return self::summarizeCandidateEligibilityBatchPhp($candidates, $minBytes, $maxBytes);
+        }
+        $frame = pack('qqV', $minBytes, $maxBytes, $total);
+        foreach ($candidates as $row) {
+            if (! \is_array($row) || ! \is_int($row['size'] ?? null) || ! \is_int($row['passwordstatus'] ?? null) || ! \is_int($row['haspreview'] ?? null) || ! \is_int($row['nzbstatus'] ?? null) || $row['size'] < 0) {
+                return self::summarizeCandidateEligibilityBatchPhp($candidates, $minBytes, $maxBytes);
+            }
+            $frame .= pack('qqqq', $row['size'], $row['passwordstatus'], $row['haspreview'], $row['nzbstatus']);
+        }
+        $slots = self::w416Slots(1, $frame, 6);
+        if ($slots === null || $slots[0] !== $total || $slots[5] !== 0 || $slots[1] > $total || $slots[2] > $total || $slots[3] > $total || $slots[4] > $total || $total !== $slots[1] + $slots[2] + $slots[3] + $slots[4]) {
+            return self::summarizeCandidateEligibilityBatchPhp($candidates, $minBytes, $maxBytes);
+        }
+
+        return [
+            'total' => $slots[0],
+            'eligible' => $slots[1],
+            'too_small' => $slots[2],
+            'too_large' => $slots[3],
+            'blocked' => $slots[4],
+            'invalid' => $slots[5],
+        ];
+    }
 }

@@ -490,4 +490,138 @@ class AdditionalProcessingOrchestrator
         $this->claimToken = '';
         $this->lastSetupError = '';
     }
+
+    public const bool W416_RUST_FFI_DEFAULT = false;
+
+    private const string W416_FFI_CDEF = 'int32_t nntmux_w416_additional_candidate_diag_orch_console_nzb(uint8_t operation, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
+
+    private static ?bool $w416UseRustFfi = null;
+
+    private static FFI|false|null $w416Ffi = null;
+
+    public static function useW416RustFfi(bool $enable = true): void
+    {
+        self::$w416UseRustFfi = $enable;
+    }
+
+    public static function usesW416RustFfi(): bool
+    {
+        return self::$w416UseRustFfi ?? self::W416_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW416RustFfi(): void
+    {
+        self::$w416UseRustFfi = null;
+        self::$w416Ffi = null;
+    }
+
+    /** @return list<int>|null */
+    private static function w416Slots(int $operation, string $input, int $count): ?array
+    {
+        if (\strlen($input) > 16_777_216) {
+            return null;
+        }
+        try {
+            self::$w416Ffi ??= RustPipelineLibrary::resolveDomain('additional', self::W416_FFI_CDEF) ?? false;
+            if (self::$w416Ffi === false) {
+                return null;
+            }
+            $bytes = $count * 8;
+            $buffer = self::$w416Ffi->new('char['.$bytes.']');
+            // @phpstan-ignore method.notFound
+            $written = self::$w416Ffi->nntmux_w416_additional_candidate_diag_orch_console_nzb($operation, $input, \strlen($input), $buffer, $bytes);
+            if ($written !== $bytes) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $bytes));
+            if ($values === false || \count($values) !== $count) {
+                return null;
+            }
+            foreach ($values as $value) {
+                if (! \is_int($value) || $value < 0) {
+                    return null;
+                }
+            }
+
+            return array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w416Add(int $left, int $right): int
+    {
+        return $left > PHP_INT_MAX - $right ? PHP_INT_MAX : $left + $right;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $batches
+     * @return array{total: int, setup_failed: int, empty: int, processing: int, total_elapsed_ms: int, budget_exhausted: bool, invalid: int}
+     */
+    public static function summarizeOrchestrationBatch(array $batches, int $budgetMs = 60000): array
+    {
+        return self::usesW416RustFfi()
+            ? self::summarizeOrchestrationBatchNative($batches, $budgetMs)
+            : self::summarizeOrchestrationBatchPhp($batches, $budgetMs);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $batches
+     * @return array{total: int, setup_failed: int, empty: int, processing: int, total_elapsed_ms: int, budget_exhausted: bool, invalid: int}
+     */
+    public static function summarizeOrchestrationBatchPhp(array $batches, int $budgetMs = 60000): array
+    {
+        $result = ['total' => \count($batches), 'setup_failed' => 0, 'empty' => 0, 'processing' => 0, 'total_elapsed_ms' => 0, 'budget_exhausted' => false, 'invalid' => 0];
+        foreach ($batches as $row) {
+            if (! \is_array($row) || ! \is_int($row['release_count'] ?? null) || ! \is_int($row['elapsed_ms'] ?? null) || ! \is_bool($row['setup_ok'] ?? null)) {
+                $result['invalid']++;
+
+                continue;
+            }
+            $result['total_elapsed_ms'] = self::w416Add($result['total_elapsed_ms'], max(0, $row['elapsed_ms']));
+            if (! $row['setup_ok']) {
+                $result['setup_failed']++;
+            } elseif ($row['release_count'] <= 0) {
+                $result['empty']++;
+            } else {
+                $result['processing']++;
+            }
+        }
+        $result['budget_exhausted'] = $result['total'] > 0 && $result['total_elapsed_ms'] >= max(0, $budgetMs);
+
+        return $result;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $batches
+     * @return array{total: int, setup_failed: int, empty: int, processing: int, total_elapsed_ms: int, budget_exhausted: bool, invalid: int}
+     */
+    public static function summarizeOrchestrationBatchNative(array $batches, int $budgetMs = 60000): array
+    {
+        $total = \count($batches);
+        if ($total > 100_000) {
+            return self::summarizeOrchestrationBatchPhp($batches, $budgetMs);
+        }
+        $frame = pack('qqV', $budgetMs, 0, $total);
+        foreach ($batches as $row) {
+            if (! \is_array($row) || ! \is_int($row['release_count'] ?? null) || ! \is_int($row['elapsed_ms'] ?? null) || ! \is_bool($row['setup_ok'] ?? null)) {
+                return self::summarizeOrchestrationBatchPhp($batches, $budgetMs);
+            }
+            $frame .= pack('qqq', $row['setup_ok'] ? 1 : 0, $row['release_count'], $row['elapsed_ms']);
+        }
+        $slots = self::w416Slots(3, $frame, 7);
+        if ($slots === null || $slots[0] !== $total || $slots[6] !== 0 || $slots[5] > 1 || $slots[5] !== (int) ($total > 0 && $slots[4] >= max(0, $budgetMs)) || $slots[1] > $total || $slots[2] > $total || $slots[3] > $total || $total !== $slots[1] + $slots[2] + $slots[3]) {
+            return self::summarizeOrchestrationBatchPhp($batches, $budgetMs);
+        }
+
+        return [
+            'total' => $slots[0],
+            'setup_failed' => $slots[1],
+            'empty' => $slots[2],
+            'processing' => $slots[3],
+            'total_elapsed_ms' => $slots[4],
+            'budget_exhausted' => $slots[5] === 1,
+            'invalid' => $slots[6],
+        ];
+    }
 }
