@@ -7,8 +7,11 @@ namespace App\Services\Monitoring;
 use App\Models\User;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Str;
+use JsonException;
 use RuntimeException;
+use Throwable;
 
 /**
  * Signs short-lived RS256 tokens that Grafana's [auth.jwt] provider accepts.
@@ -29,6 +32,19 @@ class GrafanaJwtIssuer
         ssize_t nntmux_grafana_jwt_signing_input(const char *username, size_t username_len, const char *email, size_t email_len, const char *role, size_t role_len, const char *issuer, size_t issuer_len, const char *audience, size_t audience_len, int64_t now_ts, int64_t expires_at, const char *jti, size_t jti_len, uint32_t raw_claims_only, char *out_buf, size_t out_cap);
         C;
 
+    public const string W49_FFI_CDEF = 'int64_t nntmux_w49_grafana_jwt_signing_digest(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Rust: ~1.9-2.2x mean, p99 >=1.5x in 8 of 10 strict runs; see tests/Unit/RustMonitoringBoundedMetricFamilyExporterSnapshotJwtW49ParityTest.php. */
+    private const bool W49_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $w49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
     public static bool $useRustFfi = false;
 
     private static FFI|false|null $ffi = null;
@@ -47,6 +63,91 @@ class GrafanaJwtIssuer
         self::$ffi = RustPipelineLibrary::resolveDomain('media', self::FFI_CDEF) ?? false;
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$w49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49.5 batch helper routed to Rust or PHP, then restores the routing. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w49RustFfi;
+        self::$w49RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Digests many tokens' signing inputs. Per `[username, email, role, issuer, audience, now, expires_at,
+     * jti]` token (the {@see buildSigningInputPhp()} arguments): `[status, claims_len, signing_input_len,
+     * signing_input_xxh64]`; status -1 (other fields 0) when the claims cannot be JSON-encoded.
+     *
+     * @param  list<array{string, string, string, string, string, int, int, string}>  $tokens
+     * @return list<list<int>>
+     */
+    public static function signingDigestBatch(array $tokens): array
+    {
+        return self::usesW49RustFfi() ? self::signingDigestBatchNative($tokens) : self::signingDigestBatchPhp($tokens);
+    }
+
+    /**
+     * @param  list<array{string, string, string, string, string, int, int, string}>  $tokens
+     * @return list<list<int>>
+     */
+    public static function signingDigestBatchPhp(array $tokens): array
+    {
+        $issuer = new self;
+        $header = $issuer->encodePhp(['alg' => 'RS256', 'typ' => 'JWT']).'.';
+        $rows = [];
+
+        foreach ($tokens as [$username, $email, $role, $iss, $audience, $now, $expiresAt, $jti]) {
+            try {
+                $claims = $issuer->formatClaimsJsonPhp($username, $email, $role, $iss, $audience, $now, $expiresAt, $jti);
+            } catch (JsonException) {
+                $rows[] = [-1, 0, 0, 0];
+
+                continue;
+            }
+            $signingInput = $header.$issuer->base64UrlPhp($claims);
+            /** @var array{1: int} $hash */
+            $hash = unpack('J', hash('xxh64', $signingInput, true));
+            $rows[] = [0, \strlen($claims), \strlen($signingInput), $hash[1]];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  list<array{string, string, string, string, string, int, int, string}>  $tokens
+     * @return list<list<int>>
+     */
+    public static function signingDigestBatchNative(array $tokens): array
+    {
+        $count = \count($tokens);
+        if ($count === 0) {
+            return [];
+        }
+
+        // NUL-delimited columns (usernames, emails, roles, issuers, audiences, jtis); Rust declines a value
+        // holding NUL (the field count no longer matches) or an `nbf` overflow.
+        $data = implode("\0", array_merge(
+            array_column($tokens, 0),
+            array_column($tokens, 1),
+            array_column($tokens, 2),
+            array_column($tokens, 3),
+            array_column($tokens, 4),
+            array_column($tokens, 7),
+        ));
+        $times = pack('P*', ...array_column($tokens, 5), ...array_column($tokens, 6));
+        $words = self::w49Words($count, $data, $times, 4 * $count);
+
+        return $words === null ? self::signingDigestBatchPhp($tokens) : array_chunk($words, 4);
     }
 
     /**
@@ -350,5 +451,43 @@ class GrafanaJwtIssuer
     private function encodePhp(array $segment): string
     {
         return $this->base64UrlPhp(json_encode($segment, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
+    }
+
+    /**
+     * Exactly $words output words from the Wave 49.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return array<int, int>|null
+     */
+    private static function w49Words(int $count, string $data, string $ints, int $words): ?array
+    {
+        if (self::$w49Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w49Ffi = RustPipelineLibrary::resolveDomain('search_w49', self::W49_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w49Out = null;
+            self::$w49OutCap = 0;
+        }
+        $ffi = self::$w49Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w49Out === null || $words > self::$w49OutCap) {
+                $cap = max(1024, $words);
+                self::$w49Out = $ffi->new('int64_t['.$cap.']');
+                self::$w49OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_grafana_jwt_signing_digest($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w49Out, self::$w49OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w49Out, $words * 8));
+
+            return \is_array($values) ? $values : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

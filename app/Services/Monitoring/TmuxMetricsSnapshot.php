@@ -8,6 +8,7 @@ use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
 use Illuminate\Contracts\Cache\Repository as CacheRepository;
+use Throwable;
 
 /**
  * Hands the tmux monitor's latest statistics to the metrics exporter.
@@ -32,6 +33,22 @@ class TmuxMetricsSnapshot
         ssize_t nntmux_tmux_snapshot_normalize_connections_json(const char *input, size_t input_len, char *out_buf, size_t out_cap);
         C;
 
+    public const string W49_FFI_CDEF = 'int64_t nntmux_w49_tmux_metrics_snapshot_numeric(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * Stays PHP: the 64-value common batch takes only ~2-4us, and its p99 speedup missed 1.5x in 5 of 10 strict
+     * runs; see tests/Unit/RustMonitoringBoundedMetricFamilyExporterSnapshotJwtW49ParityTest.php.
+     */
+    private const bool W49_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
     public static bool $useRustFfi = false;
 
     private static FFI|false|null $ffi = null;
@@ -54,6 +71,86 @@ class TmuxMetricsSnapshot
         self::$ffi = RustPipelineLibrary::resolveDomain('media', self::FFI_CDEF) ?? false;
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$w49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49.5 batch helper routed to Rust or PHP, then restores the routing. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w49RustFfi;
+        self::$w49RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Normalizes many tmux statistic values like {@see numericValuesPhp()}. Returns two columns aligned with
+     * $values: kinds (0 non-numeric, 1 int, 2 float) and payloads (0, the int, or the float's IEEE-754 bits).
+     *
+     * @param  list<string>  $values
+     * @return array{list<int>, list<int>}
+     */
+    public static function numericValueBatch(array $values): array
+    {
+        return self::usesW49RustFfi() ? self::numericValueBatchNative($values) : self::numericValueBatchPhp($values);
+    }
+
+    /**
+     * @param  list<string>  $values
+     * @return array{list<int>, list<int>}
+     */
+    public static function numericValueBatchPhp(array $values): array
+    {
+        $kinds = [];
+        $payloads = [];
+
+        foreach ($values as $value) {
+            if (! is_numeric($value)) {
+                $kinds[] = 0;
+                $payloads[] = 0;
+
+                continue;
+            }
+            $number = $value + 0;
+            if (\is_int($number)) {
+                $kinds[] = 1;
+                $payloads[] = $number;
+
+                continue;
+            }
+            /** @var array{1: int} $bits */
+            $bits = unpack('P', pack('e', $number));
+            $kinds[] = 2;
+            $payloads[] = $bits[1];
+        }
+
+        return [$kinds, $payloads];
+    }
+
+    /**
+     * @param  list<string>  $values
+     * @return array{list<int>, list<int>}
+     */
+    public static function numericValueBatchNative(array $values): array
+    {
+        $count = \count($values);
+        if ($count === 0) {
+            return [[], []];
+        }
+
+        // NUL-delimited fields; Rust declines a value holding NUL (the field count no longer matches).
+        $data = implode("\0", $values);
+        $words = self::w49Words($count, $data, '', 2 * $count);
+
+        return $words === null ? self::numericValueBatchPhp($values) : [array_slice($words, 0, $count), array_slice($words, $count)];
     }
 
     /**
@@ -358,5 +455,43 @@ class TmuxMetricsSnapshot
         $decoded = json_decode(FFI::string($scratch, $written), true);
 
         return \is_array($decoded) ? $decoded : null;
+    }
+
+    /**
+     * Exactly $words output words from the Wave 49.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return array<int, int>|null
+     */
+    private static function w49Words(int $count, string $data, string $ints, int $words): ?array
+    {
+        if (self::$w49Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w49Ffi = RustPipelineLibrary::resolveDomain('search_w49', self::W49_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w49Out = null;
+            self::$w49OutCap = 0;
+        }
+        $ffi = self::$w49Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w49Out === null || $words > self::$w49OutCap) {
+                $cap = max(1024, $words);
+                self::$w49Out = $ffi->new('int64_t['.$cap.']');
+                self::$w49OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_tmux_metrics_snapshot_numeric($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w49Out, self::$w49OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w49Out, $words * 8));
+
+            return \is_array($values) ? $values : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

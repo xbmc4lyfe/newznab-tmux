@@ -6,7 +6,9 @@ namespace App\Services\Monitoring\Prometheus;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use InvalidArgumentException;
+use Throwable;
 
 /**
  * One Prometheus metric family: a name, type, help text and its samples.
@@ -17,6 +19,19 @@ final class MetricFamily
         int32_t nntmux_prometheus_validate_metric_definition(const char *name_ptr, size_t name_len, const char *type_ptr, size_t type_len);
         ssize_t nntmux_prometheus_normalize_labels_nul(const char *input_ptr, size_t input_len, size_t pair_count, size_t *out_invalid_index, char *out_buf, size_t out_cap);
         C;
+
+    public const string W49_FFI_CDEF = 'int64_t nntmux_w49_metric_family_definition_check(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Rust: ~1.9-2.2x mean, p99 >=1.5x in 9 of 10 strict runs; see tests/Unit/RustMonitoringBoundedMetricFamilyExporterSnapshotJwtW49ParityTest.php. */
+    private const bool W49_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $w49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
 
     public const string GAUGE = 'gauge';
 
@@ -45,6 +60,96 @@ final class MetricFamily
         self::$ffi = RustPipelineLibrary::resolveDomain('categorize', self::FFI_CDEF) ?? false;
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$w49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49.5 batch helper routed to Rust or PHP, then restores the routing. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w49RustFfi;
+        self::$w49RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Checks many `[name, type, label names]` definitions like {@see validateDefinitionPhp()} and
+     * {@see normalizeSamplePhp()}. Per definition: `[status, type_code, label_count, first_invalid_label,
+     * name_xxh64, schema_xxh64]` — status 0 valid, 1 invalid name, 2 unsupported type, 3 invalid label name;
+     * type code 0 gauge, 1 counter, -1 other; first invalid label index or -1; the schema hash covers
+     * `name{label,label}` so a changed label set changes the fingerprint.
+     *
+     * @param  list<array{string, string, list<string>}>  $definitions
+     * @return list<list<int>>
+     */
+    public static function definitionCheckBatch(array $definitions): array
+    {
+        return self::usesW49RustFfi() ? self::definitionCheckBatchNative($definitions) : self::definitionCheckBatchPhp($definitions);
+    }
+
+    /**
+     * @param  list<array{string, string, list<string>}>  $definitions
+     * @return list<list<int>>
+     */
+    public static function definitionCheckBatchPhp(array $definitions): array
+    {
+        $rows = [];
+
+        foreach ($definitions as [$name, $type, $labels]) {
+            $badLabel = -1;
+            foreach ($labels as $index => $label) {
+                if (preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $label) !== 1) {
+                    $badLabel = $index;
+                    break;
+                }
+            }
+            $typeCode = match ($type) {
+                self::GAUGE => 0,
+                self::COUNTER => 1,
+                default => -1,
+            };
+            $status = match (true) {
+                preg_match('/^[a-zA-Z_:][a-zA-Z0-9_:]*$/', $name) !== 1 => 1,
+                $typeCode < 0 => 2,
+                $badLabel >= 0 => 3,
+                default => 0,
+            };
+            /** @var array{1: int} $hash */
+            $hash = unpack('J', hash('xxh64', $name, true));
+            /** @var array{1: int} $schema */
+            $schema = unpack('J', hash('xxh64', $name.'{'.implode(',', $labels).'}', true));
+            $rows[] = [$status, $typeCode, \count($labels), $badLabel, $hash[1], $schema[1]];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  list<array{string, string, list<string>}>  $definitions
+     * @return list<list<int>>
+     */
+    public static function definitionCheckBatchNative(array $definitions): array
+    {
+        $count = \count($definitions);
+        if ($count === 0) {
+            return [];
+        }
+
+        // NUL-delimited columns (names, types, then every label); Rust declines a value holding NUL (the field count no longer matches).
+        $labels = array_column($definitions, 2);
+        $labelCounts = array_map(\count(...), $labels);
+        $data = implode("\0", array_merge(array_column($definitions, 0), array_column($definitions, 1), ...$labels));
+        $words = self::w49Words($count, $data, pack('P*', ...$labelCounts), 6 * $count);
+
+        return $words === null ? self::definitionCheckBatchPhp($definitions) : array_chunk($words, 6);
     }
 
     public function __construct(
@@ -282,5 +387,43 @@ final class MetricFamily
     public function samples(): array
     {
         return $this->samples;
+    }
+
+    /**
+     * Exactly $words output words from the Wave 49.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return array<int, int>|null
+     */
+    private static function w49Words(int $count, string $data, string $ints, int $words): ?array
+    {
+        if (self::$w49Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w49Ffi = RustPipelineLibrary::resolveDomain('search_w49', self::W49_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w49Out = null;
+            self::$w49OutCap = 0;
+        }
+        $ffi = self::$w49Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w49Out === null || $words > self::$w49OutCap) {
+                $cap = max(1024, $words);
+                self::$w49Out = $ffi->new('int64_t['.$cap.']');
+                self::$w49OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_metric_family_definition_check($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w49Out, self::$w49OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w49Out, $words * 8));
+
+            return \is_array($values) ? $values : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
