@@ -203,4 +203,171 @@ final class DirectorySyncBridge
 
         return $ok;
     }
+
+    /** The Wave 41.2 export shared by the directory sync, NFO import, coverage, creation claim and import status helpers. */
+    public const string W412_FFI_CDEF = <<<'C'
+        int32_t nntmux_w412_nzb_sync_nfo_import_coverage_candidate(
+            uint32_t operation,
+            uint32_t flags,
+            const char *input,
+            size_t input_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    public const string W412_FFI_DOMAIN = 'nfo_w412';
+
+    /**
+     * Default for the Wave 41.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbSyncNfoImportCoverageCandidateW41ParityTest.php is below 1.5x.
+     */
+    public const bool W412_RUST_FFI_DEFAULT = false;
+
+    public const int W412_MAX_INPUT = 16777216;
+
+    private static ?bool $useW412RustFfi = null;
+
+    public static function useW412RustFfi(bool $enable = true): void
+    {
+        self::$useW412RustFfi = $enable;
+    }
+
+    public static function usesW412RustFfi(): bool
+    {
+        return self::$useW412RustFfi ?? self::W412_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW412RustFfi(): void
+    {
+        self::$useW412RustFfi = null;
+    }
+
+    /**
+     * Run one Wave 41.2 operation; null whenever the library, input or answer is unusable, so callers fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    public static function evaluateW412Native(int $operation, string $input, int $slots): ?array
+    {
+        try {
+            if ($operation < 0 || $operation > 0xFFFFFFFF || $slots < 1 || $input === '' || \strlen($input) > self::W412_MAX_INPUT) {
+                return null;
+            }
+            $ffi = RustPipelineLibrary::resolveDomain(self::W412_FFI_DOMAIN, self::W412_FFI_CDEF, getenv('NNTMUX_PIPELINE_FFI_LIB') ?: null);
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $needed = $slots * 8;
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $capacity = 0;
+                $output = RustPipelineLibrary::obtainScratch($ffi, $needed, $capacity);
+                if ($output === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w412_nzb_sync_nfo_import_coverage_candidate($operation, 0, $input, \strlen($input), $output, $capacity);
+                if (! \is_int($written) || $written === -1 || $written > $capacity) {
+                    return null;
+                }
+                if ($written < 0) {
+                    // Too small: retry once with the reported capacity.
+                    $needed = -$written;
+
+                    continue;
+                }
+                if ($written !== $slots * 8) {
+                    return null;
+                }
+                $values = array_values(unpack('q'.$slots, FFI::string($output, $written)) ?: []);
+
+                return \count($values) === $slots ? $values : null;
+            }
+        } catch (Throwable) {
+        }
+
+        return null;
+    }
+
+    /**
+     * Summarize directory sync attempts (`function`, `extension`, `synced`, `elapsed_ms`) the way
+     * normalizeBridgeProbeResultPhp() classifies one probe: unsupported unless `function` is a non-empty string and
+     * `extension` is true, otherwise ok only when `synced` is true. Elapsed times count only as integers, negatives as
+     * zero; slow means above max(0, $slowMs). The elapsed total saturates at PHP_INT_MAX.
+     *
+     * @param  array<array-key, mixed>  $attempts
+     * @return array{attempts: int, ok: int, failed: int, unsupported: int, slow: int, total_elapsed_ms: int, max_elapsed_ms: int}
+     */
+    public static function summarizeDirectorySyncAttempts(array $attempts, int $slowMs = 250): array
+    {
+        return (self::usesW412RustFfi() ? self::summarizeDirectorySyncAttemptsNative($attempts, $slowMs) : null)
+            ?? self::summarizeDirectorySyncAttemptsPhp($attempts, $slowMs);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $attempts
+     * @return array{attempts: int, ok: int, failed: int, unsupported: int, slow: int, total_elapsed_ms: int, max_elapsed_ms: int}
+     */
+    public static function summarizeDirectorySyncAttemptsPhp(array $attempts, int $slowMs = 250): array
+    {
+        $threshold = max(0, $slowMs);
+        $ok = $failed = $unsupported = $slow = $total = $max = 0;
+        foreach ($attempts as $attempt) {
+            [$function, $extension, $synced, $elapsed] = self::syncAttemptFields($attempt);
+            $elapsed = max(0, $elapsed);
+            if ($function === 0 || $extension === 0) {
+                $unsupported++;
+            } elseif ($synced === 1) {
+                $ok++;
+            } else {
+                $failed++;
+            }
+            $slow += $elapsed > $threshold ? 1 : 0;
+            $total = $total > PHP_INT_MAX - $elapsed ? PHP_INT_MAX : $total + $elapsed;
+            $max = max($max, $elapsed);
+        }
+
+        return ['attempts' => \count($attempts), 'ok' => $ok, 'failed' => $failed, 'unsupported' => $unsupported, 'slow' => $slow,
+            'total_elapsed_ms' => $total, 'max_elapsed_ms' => $max];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $attempts
+     * @return array{attempts: int, ok: int, failed: int, unsupported: int, slow: int, total_elapsed_ms: int, max_elapsed_ms: int}|null
+     */
+    public static function summarizeDirectorySyncAttemptsNative(array $attempts, int $slowMs = 250): ?array
+    {
+        if (\count($attempts) * 4 + 1 > self::W412_MAX_INPUT / 8) {
+            return null;
+        }
+        $words = [$slowMs];
+        foreach ($attempts as $attempt) {
+            array_push($words, ...self::syncAttemptFields($attempt));
+        }
+        $slots = self::evaluateW412Native(0, pack('q*', ...$words), 7);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $ok, $failed, $unsupported, $slow, $total, $max] = $slots;
+        if ($count !== \count($attempts) || min($slots) < 0 || $ok + $failed + $unsupported !== $count || $slow > $count || $max > $total) {
+            return null;
+        }
+
+        return ['attempts' => $count, 'ok' => $ok, 'failed' => $failed, 'unsupported' => $unsupported, 'slow' => $slow,
+            'total_elapsed_ms' => $total, 'max_elapsed_ms' => $max];
+    }
+
+    /** @return array{0|1, 0|1, -1|0|1, int} function present, extension loaded, sync result (-1 none) and elapsed ms */
+    private static function syncAttemptFields(mixed $attempt): array
+    {
+        if (! \is_array($attempt)) {
+            return [0, 0, -1, 0];
+        }
+        $function = $attempt['function'] ?? null;
+        $synced = $attempt['synced'] ?? null;
+        $elapsed = $attempt['elapsed_ms'] ?? 0;
+
+        return [\is_string($function) && $function !== '' ? 1 : 0, ($attempt['extension'] ?? false) === true ? 1 : 0,
+            $synced === true ? 1 : ($synced === false ? 0 : -1), \is_int($elapsed) ? $elapsed : 0];
+    }
 }
