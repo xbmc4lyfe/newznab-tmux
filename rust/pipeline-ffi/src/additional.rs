@@ -35214,3 +35214,863 @@ mod w496_additional_batch_tests {
         assert_eq!(status, -1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 50.6: AdditionalProcessing batch helpers (`nntmux_w506_*`) for
+// ProcessingOutcome, ProcessingStage, SourcePosition, ArchivedMediaSlicer and
+// ContainerSplicer. Same conventions as Wave 49.6: one crossing per batch,
+// NUL-joined strings (plus, when a value holds a NUL, the same list joined with
+// 0x01), binary buffers concatenated with `pack('V*')` lengths, machine-order
+// `int64_t` columns in and fixed-width `int64_t` rows out (read with
+// `unpack('P*')`). Every export returns 1, -1 for invalid input or input PHP
+// must compute itself, or -2 when `out` is null, misaligned or too small, and
+// leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+/// `ProcessingOutcome` cases plus one unknown slot.
+const W506_OUTCOME_CASES: usize = 13;
+
+/// `total + value`, saturating at `W47_TOTAL_CAP` for any non-negative value.
+#[inline]
+fn w506_add(total: i64, value: i64) -> i64 {
+    if value > W47_TOTAL_CAP - total {
+        W47_TOTAL_CAP
+    } else {
+        total + value
+    }
+}
+
+/// PHP `(int)` of a string for the forms that need no float conversion:
+/// leading `" \t\n\r\v\f"`, an optional sign and decimal digits, then anything
+/// but `.`/`e`/`E`. `None` (PHP must convert) for those, `.` without digits and
+/// values outside `i64`.
+pub(crate) fn w506_php_int(value: &[u8]) -> Option<i64> {
+    let mut at = value
+        .iter()
+        .position(|&byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C))
+        .unwrap_or(value.len());
+    let negative = match value.get(at) {
+        Some(b'-') => {
+            at += 1;
+            true
+        }
+        Some(b'+') => {
+            at += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits = value[at..]
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(value.len() - at);
+    if matches!(value.get(at + digits), Some(b'.' | b'e' | b'E'))
+        && (digits > 0 || value.get(at + digits) == Some(&b'.'))
+    {
+        return None;
+    }
+    let mut total = 0i64;
+    for &digit in &value[at..at + digits] {
+        let digit = i64::from(digit - b'0');
+        total = total
+            .checked_mul(10)?
+            .checked_add(if negative { -digit } else { digit })?;
+    }
+    Some(total)
+}
+
+// --- ProcessingOutcome::classifyOutcomeBatch ---------------------------------
+
+pub(crate) const W506_OUTCOME_HEADER: usize = 20;
+
+/// `[0]` count, `[1..=13]` per case (13 unknown), `[14]` successful, `[15]`
+/// deleted, `[16]` first unknown and `[17]` first deleted index (-1 when none),
+/// `[18]` successful ppm, `[19]` FNV-1a digest; then `case | successful << 4 |
+/// deleted << 5` per value.
+pub(crate) fn w506_outcome_batch(values: &[&[u8]]) -> Vec<i64> {
+    let count = values.len();
+    let mut out = vec![0i64; W506_OUTCOME_HEADER + count];
+    out[0] = count as i64;
+    out[16] = -1;
+    out[17] = -1;
+    let mut digest = W47_FNV_OFFSET;
+    for (index, value) in values.iter().enumerate() {
+        let case = w47_outcome_index(value);
+        let successful = i64::from(case <= 2);
+        let deleted = i64::from((6..=8).contains(&case));
+        out[1 + case] += 1;
+        out[14] += successful;
+        out[15] += deleted;
+        if case == W506_OUTCOME_CASES - 1 && out[16] < 0 {
+            out[16] = index as i64;
+        }
+        if deleted == 1 && out[17] < 0 {
+            out[17] = index as i64;
+        }
+        let row = case as i64 | successful << 4 | deleted << 5;
+        digest = w47_fnv(digest, row as u32);
+        out[W506_OUTCOME_HEADER + index] = row;
+    }
+    if count > 0 {
+        out[18] = out[14] * 1_000_000 / count as i64;
+    }
+    out[19] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w506_processing_outcome_batch(
+    values: *const u8,
+    values_len: usize,
+    value_twin: *const u8,
+    value_twin_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let values = w49_items(
+                w15_input(values, values_len)?,
+                w15_input(value_twin, value_twin_len)?,
+                count,
+            )?;
+            Some(w506_outcome_batch(&values))
+        })
+    }
+}
+
+// --- ProcessingStage::rankStageBatch -----------------------------------------
+
+pub(crate) const W506_STAGE_HEADER: usize = 20;
+
+/// `[0]` count, `[1..=14]` per case (14 unknown), `[15]` highest rank (-1 when
+/// none resolves) and `[16]` its first index, `[17]` 1 when the resolved ranks
+/// never decrease, `[18]` label bytes, `[19]` FNV-1a digest; then `case |
+/// (rank + 1) << 4 | label length << 8` per value.
+pub(crate) fn w506_stage_batch(values: &[&[u8]]) -> Vec<i64> {
+    let table = &W21_PROCESSING_STAGE;
+    let unknown = table.values.len();
+    let count = values.len();
+    let mut out = vec![0i64; W506_STAGE_HEADER + count];
+    out[0] = count as i64;
+    out[15] = -1;
+    out[16] = -1;
+    out[17] = 1;
+    let (mut last, mut digest) = (-1i64, W47_FNV_OFFSET);
+    for (index, value) in values.iter().enumerate() {
+        let (case, rank, label) = match w21_enum_resolve(table, value) {
+            Some(case) => (
+                case,
+                i64::from(table.ranks[case]),
+                table.labels[case].len() as i64,
+            ),
+            None => (unknown, -1, 0),
+        };
+        out[1 + case] += 1;
+        if rank >= 0 {
+            if rank > out[15] {
+                out[15] = rank;
+                out[16] = index as i64;
+            }
+            if rank < last {
+                out[17] = 0;
+            }
+            last = rank;
+        }
+        out[18] += label;
+        let row = case as i64 | (rank + 1) << 4 | label << 8;
+        digest = w47_fnv(digest, row as u32);
+        out[W506_STAGE_HEADER + index] = row;
+    }
+    out[19] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w506_processing_stage_batch(
+    values: *const u8,
+    values_len: usize,
+    value_twin: *const u8,
+    value_twin_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let values = w49_items(
+                w15_input(values, values_len)?,
+                w15_input(value_twin, value_twin_len)?,
+                count,
+            )?;
+            Some(w506_stage_batch(&values))
+        })
+    }
+}
+
+// --- SourcePosition::rankPositionBatch ---------------------------------------
+
+pub(crate) const W506_POSITION_HEADER: usize = 13;
+
+/// `[0]` count, `[1..=4]` per case (4 unknown), `[5..=7]` bytes per case,
+/// `[8]` index, `[9]` rank and `[10]` size of the best copy (highest rank, then
+/// largest size, first on ties; -1, -1, 0 when none resolves), `[11]` 1 when a
+/// complete copy exists, `[12]` FNV-1a digest; then `case | (rank + 1) << 4 |
+/// size << 8` per value. Sizes are clamped to 0..2^40-1.
+pub(crate) fn w506_position_batch(values: &[&[u8]], sizes: &[i64]) -> Vec<i64> {
+    let table = &W21_SOURCE_POSITION;
+    let unknown = table.values.len();
+    let count = values.len();
+    let mut out = vec![0i64; W506_POSITION_HEADER + count];
+    out[0] = count as i64;
+    out[8] = -1;
+    out[9] = -1;
+    let mut digest = W47_FNV_OFFSET;
+    for (index, value) in values.iter().enumerate() {
+        let size = w47_clamp(sizes[index]);
+        let (case, rank) = match w21_enum_resolve(table, value) {
+            Some(case) => (case, i64::from(table.ranks[case])),
+            None => (unknown, -1),
+        };
+        out[1 + case] += 1;
+        if rank >= 0 {
+            out[5 + case] = w47_add(out[5 + case], size);
+            if rank > out[9] || (rank == out[9] && size > out[10]) {
+                out[8] = index as i64;
+                out[9] = rank;
+                out[10] = size;
+            }
+        }
+        digest = w47_fnv(digest, (case as i64 | (rank + 1) << 4) as u32);
+        out[W506_POSITION_HEADER + index] = case as i64 | (rank + 1) << 4 | size << 8;
+    }
+    out[11] = i64::from(out[1] > 0);
+    out[12] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w506_source_position_batch(
+    values: *const u8,
+    values_len: usize,
+    value_twin: *const u8,
+    value_twin_len: usize,
+    sizes: *const u8,
+    sizes_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let values = w49_items(
+                w15_input(values, values_len)?,
+                w15_input(value_twin, value_twin_len)?,
+                count,
+            )?;
+            let sizes = w47_ints(w15_input(sizes, sizes_len)?, 1, count)?;
+            Some(w506_position_batch(&values, &sizes))
+        })
+    }
+}
+
+// --- ArchivedMediaSlicer::planSliceBatch -------------------------------------
+
+pub(crate) const W506_SLICE_HEADER: usize = 9;
+pub(crate) const W506_SLICE_ROW: usize = 5;
+
+/// `ints` holds three columns of `ranges.len()` values: size, next offset and a
+/// has-next-offset flag. `[0]` count, `[1]` entries starting in the data, `[2]`
+/// entries outside it, `[3]` samples, `[4]` main videos in the data, `[5]` head
+/// bytes, `[6]` index and `[7]` size of the largest main video in the data
+/// (first on ties; -1 and 0 when none), `[8]` FNV-1a digest; then five values
+/// per entry: start, end, in-volume end, head length (0 outside the data) and
+/// `in data | sample << 1 | has next offset << 2`. `None` when PHP must compute
+/// it: a negative data length, a range PHP converts through a float, or an
+/// overflowing offset.
+pub(crate) fn w506_slice_batch(
+    ranges: &[&[u8]],
+    names: &[&[u8]],
+    ints: &[i64],
+    data_len: i64,
+    max_sample: i64,
+    min_main: i64,
+) -> Option<Vec<i64>> {
+    if data_len < 0 {
+        return None;
+    }
+    let count = ranges.len();
+    let mut out = vec![0i64; W506_SLICE_HEADER + W506_SLICE_ROW * count];
+    out[0] = count as i64;
+    out[6] = -1;
+    let mut digest = W47_FNV_OFFSET;
+    for (index, range) in ranges.iter().enumerate() {
+        let (start, end) = match range.iter().position(|&byte| byte == b'-') {
+            Some(dash) => (
+                w506_php_int(&range[..dash])?,
+                w506_php_int(&range[dash + 1..])?,
+            ),
+            None => (w506_php_int(range)?, -1),
+        };
+        let (size, next, has_next) = (
+            ints[index],
+            ints[count + index],
+            ints[2 * count + index] != 0,
+        );
+        let in_volume_end = if has_next && next > start {
+            next - 1
+        } else {
+            start.checked_add(size)?.checked_sub(1)?
+        };
+        let available = in_volume_end
+            .min(data_len - 1)
+            .checked_sub(start)?
+            .checked_add(1)?;
+        let sample = has_sample_token(names[index]) || size < min_main;
+        let in_data = start < data_len;
+        let mut head = 0;
+        if in_data {
+            let take = available.min(max_sample);
+            let rest = data_len - start;
+            head = if take >= 0 {
+                take.min(rest)
+            } else {
+                (rest + take).max(0)
+            };
+            out[1] += 1;
+            out[5] = w506_add(out[5], head);
+            if !sample {
+                out[4] += 1;
+                if out[6] < 0 || size > out[7] {
+                    out[6] = index as i64;
+                    out[7] = size;
+                }
+            }
+        } else {
+            out[2] += 1;
+        }
+        out[3] += i64::from(sample);
+        let flags = i64::from(in_data) | i64::from(sample) << 1 | i64::from(has_next) << 2;
+        digest = w47_fnv(digest, flags as u32);
+        let row = W506_SLICE_HEADER + W506_SLICE_ROW * index;
+        out[row..row + W506_SLICE_ROW].copy_from_slice(&[start, end, in_volume_end, head, flags]);
+    }
+    out[8] = i64::from(digest);
+    Some(out)
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w506_archived_media_slice_batch(
+    ranges: *const u8,
+    ranges_len: usize,
+    range_twin: *const u8,
+    range_twin_len: usize,
+    names: *const u8,
+    names_len: usize,
+    name_twin: *const u8,
+    name_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    data_len: i64,
+    max_sample_bytes: i64,
+    min_main_video_bytes: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let ranges = w49_items(
+                w15_input(ranges, ranges_len)?,
+                w15_input(range_twin, range_twin_len)?,
+                count,
+            )?;
+            let names = w49_items(
+                w15_input(names, names_len)?,
+                w15_input(name_twin, name_twin_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 3, count)?;
+            w506_slice_batch(
+                &ranges,
+                &names,
+                &ints,
+                data_len,
+                max_sample_bytes,
+                min_main_video_bytes,
+            )
+        })
+    }
+}
+
+// --- ContainerSplicer::planSpliceBatch ---------------------------------------
+
+pub(crate) const W506_SPLICE_HEADER: usize = 8;
+pub(crate) const W506_SPLICE_ROW: usize = 3;
+
+/// Bytes of a mid `transport_stream_offset()` can read: its 192-byte stride
+/// search ends within five packets, so PHP sends no more of a transport mid.
+pub(crate) const W506_TRANSPORT_WINDOW: usize = 960;
+
+/// `codes` holds one container code (case index + 1, 0 for none) per pair and
+/// `mid_sizes` the full length of each mid, of which `mids` may hold a prefix:
+/// a transport mid needs only `W506_TRANSPORT_WINDOW` bytes, other mids are
+/// whole. `None` when a size disagrees with its bytes.
+/// `[0]` count, `[1]` spliced, `[2]` supported without a resume point, `[3]`
+/// unsupported, `[4]` joined bytes, `[5]` largest joined length and `[6]` its
+/// first index (-1 when none), `[7]` FNV-1a digest; then three values per pair:
+/// `status | code << 4` (1 spliced, 0 no resume point, 2 unsupported), the head
+/// end and the mid start (both 0 unless spliced).
+pub(crate) fn w506_splice_batch(
+    heads: &[&[u8]],
+    mids: &[&[u8]],
+    mid_sizes: &[i64],
+    codes: &[u8],
+) -> Option<Vec<i64>> {
+    let count = codes.len();
+    let mut out = vec![0i64; W506_SPLICE_HEADER + W506_SPLICE_ROW * count];
+    out[0] = count as i64;
+    out[6] = -1;
+    let mut digest = W47_FNV_OFFSET;
+    for (index, &code) in codes.iter().enumerate() {
+        let (mid, size) = (mids[index], usize::try_from(mid_sizes[index]).ok()?);
+        if size != mid.len()
+            && (code != 4 || mid.len() != W506_TRANSPORT_WINDOW || size < mid.len())
+        {
+            return None;
+        }
+        let (status, head_end, mid_start) = if !(1..=4).contains(&code) {
+            (2, 0, 0)
+        } else if let Some((head_end, mid_start)) = container_splice(code, heads[index], mid) {
+            (1, head_end as i64, mid_start as i64)
+        } else {
+            (0, 0, 0)
+        };
+        out[[2, 1, 3][status as usize]] += 1;
+        if status == 1 {
+            let joined = head_end + (size as i64 - mid_start);
+            out[4] = w506_add(out[4], joined);
+            if joined > out[5] || out[6] < 0 {
+                out[5] = joined;
+                out[6] = index as i64;
+            }
+        }
+        let word = status | i64::from(code) << 4;
+        digest = w47_fnv(digest, word as u32);
+        let row = W506_SPLICE_HEADER + W506_SPLICE_ROW * index;
+        out[row..row + W506_SPLICE_ROW].copy_from_slice(&[word, head_end, mid_start]);
+    }
+    out[7] = i64::from(digest);
+    Some(out)
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w506_container_splice_batch(
+    heads: *const u8,
+    heads_len: usize,
+    head_lens: *const u8,
+    head_lens_len: usize,
+    mids: *const u8,
+    mids_len: usize,
+    mid_lens: *const u8,
+    mid_lens_len: usize,
+    mid_sizes: *const u8,
+    mid_sizes_len: usize,
+    codes: *const u8,
+    codes_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let codes = w15_input(codes, codes_len)?;
+            if codes.len() != count {
+                return None;
+            }
+            let heads = w47_items(
+                w15_input(heads, heads_len)?,
+                w15_input(head_lens, head_lens_len)?,
+                count,
+            )?;
+            let mids = w47_items(
+                w15_input(mids, mids_len)?,
+                w15_input(mid_lens, mid_lens_len)?,
+                count,
+            )?;
+            let mid_sizes = w47_ints(w15_input(mid_sizes, mid_sizes_len)?, 1, count)?;
+            w506_splice_batch(&heads, &mids, &mid_sizes, codes)
+        })
+    }
+}
+
+#[cfg(test)]
+mod w506_additional_batch_tests {
+    use super::*;
+    use std::ptr::{null, null_mut};
+
+    fn joined(items: &[&[u8]]) -> Vec<u8> {
+        items.join(&0u8)
+    }
+
+    fn lens(items: &[&[u8]]) -> Vec<u8> {
+        items
+            .iter()
+            .flat_map(|item| (item.len() as u32).to_le_bytes())
+            .collect()
+    }
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn php_int_matches_php_casts_or_defers() {
+        for (value, expected) in [
+            (&b""[..], Some(0)),
+            (b"12abc", Some(12)),
+            (b"  12  ", Some(12)),
+            (b"\x0B12", Some(12)),
+            (b"\x0C12", Some(12)),
+            (b"abc", Some(0)),
+            (b"-", Some(0)),
+            (b"+-1", Some(0)),
+            (b" +7", Some(7)),
+            (b"-42", Some(-42)),
+            (b"0x1A", Some(0)),
+            (b"5\0", Some(5)),
+            (b"00012", Some(12)),
+            (b"9223372036854775807", Some(i64::MAX)),
+            (b"-9223372036854775808", Some(i64::MIN)),
+            (b"9223372036854775808", None),
+            (b"1e3", None),
+            (b"1.9", None),
+            (b".5", None),
+            (b"e5", Some(0)),
+        ] {
+            assert_eq!(w506_php_int(value), expected, "{:?}", value);
+        }
+    }
+
+    #[test]
+    fn outcome_stage_and_position_batches_classify_cases() {
+        let out = w506_outcome_batch(&[b"completed", b"deleted-par2-only", b"bogus", b"failed"]);
+        assert_eq!(&out[..1], &[4]);
+        assert_eq!((out[1], out[9], out[12], out[13]), (1, 1, 1, 1));
+        assert_eq!(&out[14..19], &[1, 1, 2, 1, 250_000]);
+        assert_eq!(&out[W506_OUTCOME_HEADER..], &[1 << 4, 8 | 1 << 5, 12, 11]);
+
+        let out = w506_stage_batch(&[
+            b" NZB_Parsing\n",
+            b"finalization",
+            b"nope",
+            b"workspace-preparation",
+        ]);
+        assert_eq!((out[0], out[2], out[12], out[14]), (4, 1, 1, 1));
+        assert_eq!(&out[15..19], &[11, 1, 0, 11 + 12 + 21]);
+        assert_eq!(out[W506_STAGE_HEADER], 1 | 2 << 4 | 11 << 8);
+        assert_eq!(out[W506_STAGE_HEADER + 2], 13);
+
+        let out = w506_position_batch(&[b"HEAD", b"mid", b"x", b"head"], &[50, 900, 7, 80]);
+        assert_eq!(
+            &out[..W506_POSITION_HEADER - 1],
+            &[4, 0, 2, 1, 1, 0, 130, 900, 3, 1, 80, 0]
+        );
+        assert_eq!(out[W506_POSITION_HEADER + 2], 3 | 7 << 8);
+    }
+
+    #[test]
+    fn slice_batch_plans_entries_and_defers_float_conversions() {
+        let ints = [
+            100, 2_000, 50, // sizes
+            0, 300, 0, // next offsets
+            0, 1, 0, // has next
+        ];
+        let names: [&[u8]; 3] = [b"movie.mkv", b"Sample.mkv", b"far.mkv"];
+        let out = w506_slice_batch(
+            &[b"10-109", b"200", b"5000-5049"],
+            &names,
+            &ints,
+            1_000,
+            64,
+            75,
+        )
+        .unwrap();
+        assert_eq!(&out[..8], &[3, 2, 1, 2, 1, 64 + 64, 0, 100]);
+        assert_eq!(
+            &out[W506_SLICE_HEADER..W506_SLICE_HEADER + 5],
+            &[10, 109, 109, 64, 1]
+        );
+        assert_eq!(
+            &out[W506_SLICE_HEADER + 5..W506_SLICE_HEADER + 10],
+            &[200, -1, 299, 64, 0b111]
+        );
+        assert_eq!(&out[W506_SLICE_HEADER + 10..], &[5000, 5049, 5049, 0, 0b10]);
+        assert!(w506_slice_batch(&[b"1e3"], &[b"a"], &[1, 0, 0], 10, 1, 1).is_none());
+        assert!(
+            w506_slice_batch(&[b"9223372036854775807"], &[b"a"], &[2, 0, 0], 10, 1, 1).is_none()
+        );
+        assert!(w506_slice_batch(&[], &[], &[], -1, 1, 1).is_none());
+    }
+
+    #[test]
+    fn splice_batch_matches_single_splice() {
+        let head: &[u8] = b"\x1A\x45\xDF\xA3hdr\x1F\x43\xB6\x75rest";
+        let mid: &[u8] = b"junk\x1F\x43\xB6\x75frame";
+        let out = w506_splice_batch(
+            &[head, b"", b"x"],
+            &[mid, b"nothing", b"y"],
+            &[mid.len() as i64, 7, 1],
+            &[1, 4, 6],
+        )
+        .unwrap();
+        assert_eq!(&out[..7], &[3, 1, 1, 1, 7 + 9, 16, 0]);
+        assert_eq!(
+            &out[W506_SPLICE_HEADER..W506_SPLICE_HEADER + 3],
+            &[1 | 1 << 4, 7, 4]
+        );
+        assert_eq!(
+            &out[W506_SPLICE_HEADER + 3..],
+            &[4 << 4, 0, 0, 2 | 6 << 4, 0, 0]
+        );
+
+        // A transport mid may cross as its first five 192-byte packets.
+        let mut full = vec![0x10u8; 37];
+        while full.len() < 3_000 {
+            full.push(0x47);
+            full.extend(std::iter::repeat_n(0x11, 187));
+        }
+        let window = &full[..W506_TRANSPORT_WINDOW];
+        let whole = w506_splice_batch(&[b""], &[&full], &[full.len() as i64], &[4]).unwrap();
+        let cut = w506_splice_batch(&[b""], &[window], &[full.len() as i64], &[4]).unwrap();
+        assert_eq!(whole, cut);
+        assert_eq!(&cut[W506_SPLICE_HEADER..], &[1 | 4 << 4, 0, 37]);
+        assert_eq!(cut[4], full.len() as i64 - 37);
+        for (code, size) in [(1u8, full.len() as i64), (4, 959), (4, -1)] {
+            assert!(w506_splice_batch(&[b""], &[window], &[size], &[code]).is_none());
+        }
+        assert!(w506_splice_batch(&[b""], &[&window[..900]], &[3_000], &[4]).is_none());
+    }
+
+    #[test]
+    fn exports_validate_pointers_and_capacity() {
+        let mut out = [7i64; 64];
+        let values = joined(&[b"completed", b"failed"]);
+        let status = unsafe {
+            nntmux_w506_processing_outcome_batch(
+                values.as_ptr(),
+                values.len(),
+                null(),
+                0,
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[W506_OUTCOME_HEADER + 1]), (1, 2, 11));
+        let status = unsafe {
+            nntmux_w506_processing_outcome_batch(
+                values.as_ptr(),
+                values.len(),
+                null(),
+                0,
+                2,
+                null_mut(),
+                64,
+            )
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w506_processing_outcome_batch(
+                values.as_ptr(),
+                values.len(),
+                null(),
+                0,
+                2,
+                out.as_mut_ptr(),
+                3,
+            )
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w506_processing_outcome_batch(null(), 4, null(), 0, 1, out.as_mut_ptr(), 64)
+        };
+        assert_eq!(status, -1);
+        let status = unsafe {
+            nntmux_w506_processing_stage_batch(null(), 0, null(), 0, 0, out.as_mut_ptr(), 64)
+        };
+        assert_eq!((status, out[0], out[17]), (1, 0, 1));
+
+        let values = joined(&[b"mid", b"comp\0lete"]);
+        let twin: Vec<u8> = [&b"mid"[..], b"comp\0lete"].join(&1u8);
+        let sizes = packed(&[1, 2]);
+        let status = unsafe {
+            nntmux_w506_source_position_batch(
+                values.as_ptr(),
+                values.len(),
+                twin.as_ptr(),
+                twin.len(),
+                sizes.as_ptr(),
+                sizes.len(),
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[3], out[4]), (1, 1, 1));
+        let status = unsafe {
+            nntmux_w506_source_position_batch(
+                values.as_ptr(),
+                values.len(),
+                null(),
+                0,
+                sizes.as_ptr(),
+                8,
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+
+        let ranges = joined(&[b"0-9"]);
+        let names = joined(&[b"a.mkv"]);
+        let ints = packed(&[10, 0, 0]);
+        let status = unsafe {
+            nntmux_w506_archived_media_slice_batch(
+                ranges.as_ptr(),
+                ranges.len(),
+                null(),
+                0,
+                names.as_ptr(),
+                names.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                1,
+                20,
+                4,
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[W506_SLICE_HEADER + 3]), (1, 1, 4));
+        let status = unsafe {
+            nntmux_w506_archived_media_slice_batch(
+                ranges.as_ptr(),
+                ranges.len(),
+                null(),
+                0,
+                names.as_ptr(),
+                names.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                1,
+                20,
+                4,
+                1,
+                out.as_mut_ptr(),
+                W506_SLICE_HEADER + 4,
+            )
+        };
+        assert_eq!(status, -2);
+
+        let parts: [&[u8]; 2] = [b"\0\0\x01\xBA", b"ab"];
+        let mids: Vec<u8> = parts.concat();
+        let mid_lens = lens(&parts);
+        let head_lens = lens(&[b"", b""]);
+        let codes = [3u8, 0];
+        let mid_sizes = packed(&[4, 2]);
+        let status = unsafe {
+            nntmux_w506_container_splice_batch(
+                null(),
+                0,
+                head_lens.as_ptr(),
+                head_lens.len(),
+                mids.as_ptr(),
+                mids.len(),
+                mid_lens.as_ptr(),
+                mid_lens.len(),
+                mid_sizes.as_ptr(),
+                mid_sizes.len(),
+                codes.as_ptr(),
+                2,
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[3], out[4]), (1, 1, 1, 4));
+        let status = unsafe {
+            nntmux_w506_container_splice_batch(
+                null(),
+                0,
+                head_lens.as_ptr(),
+                head_lens.len(),
+                mids.as_ptr(),
+                mids.len(),
+                mid_lens.as_ptr(),
+                mid_lens.len(),
+                mid_sizes.as_ptr(),
+                mid_sizes.len(),
+                codes.as_ptr(),
+                1,
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+        let status = unsafe {
+            nntmux_w506_container_splice_batch(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0]), (1, 0));
+    }
+}
