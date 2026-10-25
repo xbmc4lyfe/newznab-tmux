@@ -26264,3 +26264,301 @@ mod w366_tests {
         }
     }
 }
+
+// Wave 37.6: byte-oriented, deterministic summaries. Frames use u32 LE string
+// lengths and native-endian i64 counts, matching PHP pack('V') / pack('q').
+const W376_MAX_INPUT: usize = 16_777_216;
+
+fn w376_flag(reader: &mut W356Reader<'_>) -> Option<bool> {
+    match reader.take(1)?[0] {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+fn w376_compute(operation: u8, input: &[u8]) -> Option<Vec<u8>> {
+    let mut reader = W356Reader {
+        bytes: input,
+        offset: 0,
+    };
+    let mut output = Vec::new();
+    match operation {
+        1 => {
+            let console = w376_flag(&mut reader)?;
+            let enabled = w376_flag(&mut reader)?;
+            let command = reader.string()?;
+            let prefixes: [&[u8]; 10] = [
+                b"tmux:",
+                b"multiprocessing:",
+                b"postprocess:",
+                b"update:",
+                b"releases:",
+                b"binaries:",
+                b"articles:",
+                b"backfill:",
+                b"group:",
+                b"predb:",
+            ];
+            // Only the ten prefixes used by AppServiceProvider::register qualify.
+            let matches = prefixes.iter().any(|prefix| command.starts_with(prefix));
+            output.push(u8::from(console && !enabled && matches));
+        }
+        2 => output.push(u8::from(w376_flag(&mut reader)?)),
+        3 => {
+            let sensitive = w376_flag(&mut reader)?;
+            let rules = reader.integer()?.max(0);
+            let options = reader.integer()?.max(0);
+            let control = reader.string()?;
+            output.extend_from_slice(&rules.to_ne_bytes());
+            output.extend_from_slice(&options.to_ne_bytes());
+            output.extend_from_slice(&[u8::from(sensitive), u8::from(options > 0)]);
+            w356_string(&mut output, control);
+        }
+        4 => {
+            let has_method = w376_flag(&mut reader)?;
+            let has_property = w376_flag(&mut reader)?;
+            let method = reader.string()?;
+            let property = reader.string()?;
+            if !has_property && !property.is_empty() {
+                return None;
+            }
+            w356_string(
+                &mut output,
+                if has_method {
+                    method
+                } else if has_property {
+                    property
+                } else {
+                    b"/home"
+                },
+            );
+        }
+        5 => {
+            let present = w376_flag(&mut reader)?;
+            let view = reader.string()?;
+            if !present && !view.is_empty() {
+                return None;
+            }
+            let view = if present { view } else { b"layouts.app" };
+            output.push(u8::from(view == b"layouts.app"));
+            w356_string(&mut output, view);
+        }
+        _ => return None,
+    }
+    (reader.offset == input.len() && output.len() <= W376_MAX_INPUT).then_some(output)
+}
+
+/// Returns bytes written, -required for a short output, or -1 for invalid input.
+/// Negative returns never write output; no NUL terminator is appended.
+///
+/// # Safety
+/// Pointers must designate live allocations of the declared readable/writable
+/// sizes, nonnull and nonoverlapping, at most MAX_INPUT each. Range checks cannot
+/// establish allocation ownership or liveness. Byte alignment is sufficient.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w376_app_rss_config_auth(
+    operation: u8,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(1..=5).contains(&operation)
+            || input.is_null()
+            || out_buf.is_null()
+            || input_len > W376_MAX_INPUT
+            || out_cap > W376_MAX_INPUT
+        {
+            return -1;
+        }
+        let Some(input_end) = (input as usize).checked_add(input_len) else {
+            return -1;
+        };
+        let Some(output_end) = (out_buf as usize).checked_add(out_cap) else {
+            return -1;
+        };
+        if input_len != 0
+            && out_cap != 0
+            && (input as usize) < output_end
+            && (out_buf as usize) < input_end
+        {
+            return -1;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+        let Some(result) = w376_compute(operation, bytes) else {
+            return -1;
+        };
+        if out_cap < result.len() {
+            return -(result.len() as isize);
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+        result.len() as isize
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w376_tests {
+    use super::*;
+
+    fn string(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        w356_string(&mut out, bytes);
+        out
+    }
+
+    fn fixtures() -> Vec<(u8, Vec<u8>, Vec<u8>)> {
+        let mut pulse = vec![1, 0];
+        pulse.extend(string(b"tmux:start"));
+        let mut field = vec![1];
+        field.extend_from_slice(&i64::MIN.to_ne_bytes());
+        field.extend_from_slice(&i64::MAX.to_ne_bytes());
+        field.extend(string(b"enum\0\xff"));
+        let mut field_out = 0_i64.to_ne_bytes().to_vec();
+        field_out.extend_from_slice(&i64::MAX.to_ne_bytes());
+        field_out.extend_from_slice(&[1, 1]);
+        field_out.extend(string(b"enum\0\xff"));
+        let mut redirect = vec![0, 0];
+        redirect.extend(string(b"unused"));
+        redirect.extend(string(b""));
+        let mut layout = vec![0];
+        layout.extend(string(b""));
+        let mut layout_out = vec![1];
+        layout_out.extend(string(b"layouts.app"));
+        vec![
+            (1, pulse, vec![1]),
+            (2, vec![1], vec![1]),
+            (3, field, field_out),
+            (4, redirect, string(b"/home")),
+            (5, layout, layout_out),
+        ]
+    }
+
+    #[test]
+    fn w376_literal_contracts() {
+        for (op, input, expected) in fixtures() {
+            assert_eq!(w376_compute(op, &input), Some(expected));
+        }
+        for prefix in [
+            "tmux",
+            "multiprocessing",
+            "postprocess",
+            "update",
+            "releases",
+            "binaries",
+            "articles",
+            "backfill",
+            "group",
+            "predb",
+        ] {
+            let mut frame = vec![1, 0];
+            frame.extend(string(format!("{prefix}:").as_bytes()));
+            assert_eq!(w376_compute(1, &frame), Some(vec![1]));
+            frame[0] = 0;
+            assert_eq!(w376_compute(1, &frame), Some(vec![0]));
+            frame[0] = 1;
+            frame[1] = 1;
+            assert_eq!(w376_compute(1, &frame), Some(vec![0]));
+        }
+        for command in [
+            b"TMUX:".as_slice(),
+            b" tmux:",
+            b"xtmux:",
+            b"tmux",
+            b"\xff:",
+            b"",
+        ] {
+            let mut frame = vec![1, 0];
+            frame.extend(string(command));
+            assert_eq!(w376_compute(1, &frame), Some(vec![0]));
+        }
+        let mut redirect = vec![1, 1];
+        redirect.extend(string(b""));
+        redirect.extend(string(b"property"));
+        assert_eq!(w376_compute(4, &redirect), Some(string(b"")));
+    }
+
+    #[test]
+    fn w376_invalid_and_short_frames_preserve_output() {
+        for (op, input, expected) in fixtures() {
+            let mut out = [90_u8; 128];
+            let call = |p, n, o, c| unsafe { nntmux_w376_app_rss_config_auth(op, p, n, o, c) };
+            for (p, n, o, c) in [
+                (std::ptr::null(), input.len(), out.as_mut_ptr(), 128),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 128),
+                (usize::MAX as *const u8, input.len(), out.as_mut_ptr(), 128),
+                (input.as_ptr(), input.len(), usize::MAX as *mut u8, 128),
+                (input.as_ptr(), usize::MAX, out.as_mut_ptr(), 128),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                (input.as_ptr(), W376_MAX_INPUT + 1, out.as_mut_ptr(), 128),
+                (
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    W376_MAX_INPUT + 1,
+                ),
+            ] {
+                assert_eq!(call(p, n, o, c), -1);
+            }
+            for len in 0..input.len() {
+                assert_eq!(call(input.as_ptr(), len, out.as_mut_ptr(), 128), -1);
+            }
+            let mut extra = input.clone();
+            extra.push(0);
+            assert_eq!(call(extra.as_ptr(), extra.len(), out.as_mut_ptr(), 128), -1);
+            let mut bad = input.clone();
+            bad[0] = 2;
+            assert_eq!(call(bad.as_ptr(), bad.len(), out.as_mut_ptr(), 128), -1);
+            assert_eq!(
+                call(input.as_ptr(), input.len(), out.as_mut_ptr(), 0),
+                -(expected.len() as isize)
+            );
+            assert_eq!(
+                call(
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    expected.len() - 1
+                ),
+                -(expected.len() as isize)
+            );
+            assert_eq!(out, [90; 128]);
+            let mut alias = input.clone();
+            assert_eq!(
+                call(alias.as_ptr(), alias.len(), alias.as_mut_ptr(), alias.len()),
+                -1
+            );
+            assert_eq!(alias, input);
+            assert_eq!(
+                call(
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    expected.len()
+                ),
+                expected.len() as isize
+            );
+            assert_eq!(&out[..expected.len()], expected);
+            assert!(out[expected.len()..].iter().all(|v| *v == 90));
+        }
+        for op in [0, 6, 255] {
+            let mut out = [90_u8; 128];
+            assert_eq!(
+                unsafe {
+                    nntmux_w376_app_rss_config_auth(op, b"".as_ptr(), 0, out.as_mut_ptr(), 128)
+                },
+                -1
+            );
+            assert_eq!(out, [90; 128]);
+        }
+        for (op, input) in [
+            (1, vec![1, 2, 0, 0, 0, 0]),
+            (4, vec![0, 2, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (5, vec![1, 255, 255, 255, 255]),
+        ] {
+            assert_eq!(w376_compute(op, &input), None);
+        }
+    }
+}
