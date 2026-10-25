@@ -9,6 +9,7 @@ use App\Support\RustPipelineLibrary;
 use DariusIII\TVMaze\Episode;
 use DariusIII\TVMaze\TVShow;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -149,6 +150,181 @@ class TvMazeProvider extends AbstractTvProvider
         }
 
         return ['total_episodes' => count($episodes), 'matching_season_count' => $matching, 'special_count' => $special, 'missing_airdate_count' => $missing, 'max_episode_number' => $maximum];
+    }
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean 2.91x, p99 2.62x; uncommon mean 2.30x, p99 1.79x); see RustTvCandidatePipelineTvMazeTvdbHydrationW50ParityTest. */
+    private const W50_RUST_FFI_DEFAULT = true;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w503_tvmaze_episode_format_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW50RustFfi = null;
+
+    private static FFI|false|null $w50Ffi = null;
+
+    private static ?CData $w50Out = null;
+
+    private static int $w50OutCap = 0;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::$useW50RustFfi ?? self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 50 Rust path forced on or off, then restores the previous setting. */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW50RustFfi;
+        self::$useW50RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW50RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Formats a batch of TVMaze episodes as formatEpisodes()/formatEpisodeInfo() do. Six values
+     * per episode: kept (1 when season is not null), the series and episode (`(int)` casts), the
+     * FNV-1a 32 hash of se_complete, the trimmed airdate as `YYYYMMDD` (a valid `YYYY-MM-DD`
+     * with a non-zero year, else 0) and flags (1 number is not null, 2 non-blank name, 4
+     * non-blank summary). Then the kept and dropped counts, and among kept episodes the special
+     * (series 0) and undated counts and the max non-null episode number (at least 0).
+     *
+     * @param  list<array<string, mixed>>  $episodes  season, number, airdate, name, summary
+     * @return list<int>
+     */
+    public static function w50EpisodeFormatBatch(array $episodes): array
+    {
+        return self::usesW50RustFfi() ? self::w50EpisodeFormatBatchNative($episodes) : self::w50EpisodeFormatBatchPhp($episodes);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $episodes
+     * @return list<int>
+     */
+    public static function w50EpisodeFormatBatchNative(array $episodes): array
+    {
+        $count = \count($episodes);
+        $columns = self::w50Columns($episodes, ['season' => null, 'number' => null, 'airdate' => '', 'name' => '', 'summary' => '']);
+        $nullSeasons = array_keys($columns['season'], null, true);
+        $nullNumbers = array_keys($columns['number'], null, true);
+        $blob = implode("\0", $columns['airdate'])."\0".implode("\0", $columns['name'])."\0".implode("\0", $columns['summary']);
+        $ints = pack('q*', \count($nullSeasons), ...$nullSeasons).pack('q*', \count($nullNumbers), ...$nullNumbers)
+            .pack('q*', ...$columns['season']).pack('q*', ...$columns['number']);
+
+        return self::w50Invoke($count === 0 ? '' : $blob, $ints, $count, $count * 6 + 5)
+            ?? self::w50EpisodeFormatBatchPhp($episodes);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $episodes
+     * @return list<int>
+     */
+    public static function w50EpisodeFormatBatchPhp(array $episodes): array
+    {
+        $out = [];
+        $kept = $dropped = $specials = $undated = $maxEpisode = 0;
+        foreach ($episodes as $item) {
+            $season = $item['season'] ?? null;
+            $number = $item['number'] ?? null;
+            $series = (int) $season;
+            $episode = (int) $number;
+            $airdate = 0;
+            if (preg_match('/^(\d{4})-(\d{2})-(\d{2})$/D', trim((string) ($item['airdate'] ?? '')), $m) === 1
+                && (int) $m[1] > 0 && checkdate((int) $m[2], (int) $m[3], (int) $m[1])) {
+                $airdate = (int) $m[1] * 10000 + (int) $m[2] * 100 + (int) $m[3];
+            }
+            if ($season === null) {
+                $dropped++;
+            } else {
+                $kept++;
+                $specials += $series === 0 ? 1 : 0;
+                $undated += $airdate === 0 ? 1 : 0;
+                if ($number !== null) {
+                    $maxEpisode = max($maxEpisode, $episode);
+                }
+            }
+            array_push(
+                $out,
+                $season === null ? 0 : 1,
+                $series,
+                $episode,
+                (int) hexdec(hash('fnv1a32', 'S'.sprintf('%02d', $series).'E'.sprintf('%02d', $episode))),
+                $airdate,
+                ($number !== null ? 1 : 0) | (trim((string) ($item['name'] ?? '')) !== '' ? 2 : 0)
+                    | (trim((string) ($item['summary'] ?? '')) !== '' ? 4 : 0),
+            );
+        }
+        array_push($out, $kept, $dropped, $specials, $undated, $maxEpisode);
+
+        return $out;
+    }
+
+    /**
+     * One column per key of $defaults. Rows missing a key read its default; present nulls stay
+     * null, which pack() and implode() read as 0 and '' like the defaults they replace.
+     *
+     * @param  list<array<string, mixed>>  $rows
+     * @param  array<string, mixed>  $defaults
+     * @return array<string, list<mixed>>
+     */
+    private static function w50Columns(array $rows, array $defaults): array
+    {
+        $count = \count($rows);
+        $columns = [];
+        foreach ($defaults as $key => $default) {
+            $column = array_column($rows, $key);
+            if (\count($column) !== $count) {
+                $filled = [];
+                foreach ($rows as $row) {
+                    $filled[] = $row + $defaults;
+                }
+                $columns = [];
+                foreach ($defaults as $name => $unused) {
+                    $columns[$name] = array_column($filled, $name);
+                }
+
+                return $columns;
+            }
+            $columns[$key] = $column;
+        }
+
+        return $columns;
+    }
+
+    /**
+     * Calls the Wave 50 export with NUL-joined strings and packed `i64` integers. Null when the
+     * library is missing or the call declines (for example a string holding a NUL byte), so the
+     * caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w50Invoke(string $blob, string $ints, int $count, int $words): ?array
+    {
+        self::$w50Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w50', self::W50_FFI_CDEF) ?? false;
+        $ffi = self::$w50Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w50Out === null || self::$w50OutCap < $words) {
+                self::$w50OutCap = max(1024, $words * 2);
+                self::$w50Out = $ffi->new('int64_t['.self::$w50OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W50_FFI_CDEF.)
+            $written = $ffi->nntmux_w503_tvmaze_episode_format_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w50Out, self::$w50OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w50Out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     public TvMazeClient $client;

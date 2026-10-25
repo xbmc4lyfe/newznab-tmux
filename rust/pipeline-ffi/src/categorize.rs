@@ -38152,3 +38152,1074 @@ pub mod tv_pipes_trakt_tvmaze_tvdb_providers_w493 {
         }
     }
 }
+
+/// Wave 50.3 batch helpers for `TvProcessingCandidateQuery`, `TvProcessingPipeline`,
+/// `TvMazeProvider`, `TvdbProvider` and `EpisodeHydrationService`.
+///
+/// Every export takes NUL-joined string columns (column-major), packed little-endian `i64`
+/// integers and the item count, writes fixed-width `i64` words to `out` and returns the word
+/// count. It returns `-needed` when `out_cap` is too small and [`DECLINE`] for malformed input
+/// (a string holding a NUL byte, a short integer table, null pointers or a panic), so PHP falls
+/// back to its reference implementation.
+pub mod tv_candidate_pipeline_tvmaze_tvdb_hydration_w503 {
+    use super::tv_pipes_api_abstract_localdb_parseinfo_tmdb_w483::{
+        FNV_OFFSET, fnv, normalize_into, read_ints, split_exact,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::io::Write;
+
+    /// Declines the batch to PHP.
+    pub const DECLINE: isize = -1;
+
+    /// Upper bound on `count`, so a corrupt count never drives a huge allocation.
+    const MAX_COUNT: usize = 1 << 24;
+
+    /// `Category::TV_ROOT`, `Category::TV_OTHER` and `Category::TV_ANIME`.
+    const TV_ROOT: i64 = 5000;
+    const TV_OTHER: i64 = 5999;
+    const TV_ANIME: i64 = 5070;
+    /// `TvLookupStatus::Pending` and `TvLookupStatus::EpisodeMissing`.
+    const STATUS_PENDING: i64 = 0;
+    const STATUS_EPISODE_MISSING: i64 = -11;
+    /// `TvProcessingCandidateQuery::MAX_EPISODE_ATTEMPTS`.
+    const MAX_EPISODE_ATTEMPTS: i64 = 6;
+
+    type Batch = fn(&[u8], &[i64], usize) -> Option<Vec<i64>>;
+
+    #[inline]
+    fn h(bytes: &[u8]) -> i64 {
+        i64::from(fnv(FNV_OFFSET, bytes))
+    }
+
+    /// PHP `trim()` with its default character set.
+    fn php_trim(s: &[u8]) -> &[u8] {
+        let keep = |b: &u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let Some(start) = s.iter().position(keep) else {
+            return &[];
+        };
+        let end = s.iter().rposition(keep).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    #[inline]
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    /// Integer value of 1-18 ASCII digits (callers check the shape).
+    #[inline]
+    fn digits(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |v, &b| v * 10 + i64::from(b - b'0'))
+    }
+
+    /// Days in month `m` of year `y` (0 for an invalid month), as PHP `checkdate()`.
+    fn month_days(y: i64, m: i64) -> i64 {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => 0,
+        }
+    }
+
+    /// `/^(\d{4})-(\d{2})-(\d{2})$/D` with a valid non-zero-year calendar date, as `YYYYMMDD`.
+    fn strict_date(s: &[u8]) -> i64 {
+        if s.len() != 10 || s[4] != b'-' || s[7] != b'-' {
+            return 0;
+        }
+        let (y, m, d) = (&s[..4], &s[5..7], &s[8..]);
+        if !all_digits(y) || !all_digits(m) || !all_digits(d) {
+            return 0;
+        }
+        let (y, m, d) = (digits(y), digits(m), digits(d));
+        if y == 0 || d < 1 || d > month_days(y, m) {
+            return 0;
+        }
+        y * 10_000 + m * 100 + d
+    }
+
+    /// Days since 1970-01-01 of a proleptic Gregorian date with `y >= 1`.
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    /// `tv_lookup_retry_at`: `(0, 0)` when empty, `(1, epoch)` for a valid UTC
+    /// `/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/D`, else `(2, 0)`.
+    fn retry_state(s: &[u8]) -> (i64, i64) {
+        if s.is_empty() {
+            return (0, 0);
+        }
+        if s.len() != 19 || !matches!(s[10], b' ' | b'T') || s[13] != b':' || s[16] != b':' {
+            return (2, 0);
+        }
+        let date = strict_date(&s[..10]);
+        let (hh, mm, ss) = (&s[11..13], &s[14..16], &s[17..19]);
+        if date == 0 || !all_digits(hh) || !all_digits(mm) || !all_digits(ss) {
+            return (2, 0);
+        }
+        let (hh, mm, ss) = (digits(hh), digits(mm), digits(ss));
+        if hh > 23 || mm > 59 || ss > 59 {
+            return (2, 0);
+        }
+        let days = days_from_civil(date / 10_000, date / 100 % 100, date % 100);
+        (1, days * 86_400 + hh * 3_600 + mm * 60 + ss)
+    }
+
+    /// PHP `sprintf('%02d', $value)` appended to `buf`.
+    #[inline]
+    fn push_02d(buf: &mut Vec<u8>, value: i64) {
+        if (0..100).contains(&value) {
+            buf.extend_from_slice(&[b'0' + (value / 10) as u8, b'0' + (value % 10) as u8]);
+        } else {
+            let _ = write!(buf, "{value:02}");
+        }
+    }
+
+    /// FNV-1a 32 of PHP `'S'.sprintf('%02d', $series).'E'.sprintf('%02d', $episode)`.
+    fn se_hash(series: i64, episode: i64, buf: &mut Vec<u8>) -> i64 {
+        buf.clear();
+        buf.push(b'S');
+        push_02d(buf, series);
+        buf.push(b'E');
+        push_02d(buf, episode);
+        h(buf)
+    }
+
+    /// Reads `k` then `k` item indices from `ints[at..]` into a mask; returns the next offset.
+    fn mask(ints: &[i64], at: usize, count: usize) -> Option<(Vec<bool>, usize)> {
+        let k = usize::try_from(*ints.get(at)?).ok()?;
+        let end = at.checked_add(1)?.checked_add(k)?;
+        let mut flags = vec![false; count];
+        for &i in ints.get(at + 1..end)? {
+            *flags.get_mut(usize::try_from(i).ok()?)? = true;
+        }
+        Some((flags, end))
+    }
+
+    /// The `fields` integer columns that fill `ints[at..]` exactly.
+    fn columns(ints: &[i64], at: usize, count: usize, fields: usize) -> Option<&[i64]> {
+        let cols = ints.get(at..)?;
+        (cols.len() == count.checked_mul(fields)?).then_some(cols)
+    }
+
+    /// `TvProcessingCandidateQuery::transientDelayPhp($attempts)`.
+    fn transient_delay(attempts: i64) -> i64 {
+        match attempts {
+            1 => 300,
+            2 => 900,
+            3 => 3_600,
+            _ => 21_600,
+        }
+    }
+
+    /// `TvProcessingCandidateQuery::episodeDelayPhp($attempts)`.
+    fn episode_delay(attempts: i64) -> i64 {
+        match attempts {
+            1 => 3_600,
+            2 => 21_600,
+            3 => 86_400,
+            4 => 259_200,
+            _ => 604_800,
+        }
+    }
+
+    /// Release rows: retry_at / header now, lookup mode / categories_id, size, videos_id,
+    /// tv_episodes_id, tv_lookup_attempts, isrenamed, late_article_candidate_id.
+    fn candidate_plan(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        let retry = split_exact(blob, count)?;
+        let (now, mode) = (*ints.first()?, *ints.get(1)?);
+        let cols = columns(ints, 2, count, 7)?;
+        let col = |field: usize, i: usize| cols[field * count + i];
+        let mut out = Vec::with_capacity(count * 4 + 9);
+        let mut tally = [0i64; 8];
+        let mut wake = i64::MAX;
+        for (i, retry_at) in retry.iter().enumerate() {
+            let (category, size, videos, episodes) = (col(0, i), col(1, i), col(2, i), col(3, i));
+            let (attempts, renamed, late) = (col(4, i), col(5, i), col(6, i));
+            let (state, epoch) = retry_state(retry_at);
+            let due = state == 0 || (state == 1 && epoch <= now);
+            let tv = (TV_ROOT..=TV_OTHER).contains(&category)
+                && category != TV_ANIME
+                && size > 1_048_576;
+            let bucket = if !tv {
+                0
+            } else if late != 0 {
+                6
+            } else if videos == 0 && episodes == STATUS_PENDING {
+                if mode <= 0 || (mode == 2 && renamed != 1) {
+                    7
+                } else if due {
+                    1
+                } else {
+                    2
+                }
+            } else if videos > 0 && episodes == STATUS_EPISODE_MISSING {
+                if attempts >= MAX_EPISODE_ATTEMPTS {
+                    5
+                } else if due {
+                    3
+                } else {
+                    4
+                }
+            } else {
+                7
+            };
+            let delay = match bucket {
+                1 | 2 => transient_delay(attempts),
+                3 | 4 => episode_delay(attempts),
+                _ => 0,
+            };
+            if matches!(bucket, 2 | 4) && state == 1 {
+                wake = wake.min(epoch);
+            }
+            tally[bucket] += 1;
+            out.extend_from_slice(&[bucket as i64, state, epoch, delay]);
+        }
+        out.extend_from_slice(&tally);
+        out.push(wake);
+        Some(out)
+    }
+
+    /// Pipeline results: status, provider, title / null-provider mask / video_id, episode_id.
+    fn result_tally(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        let strings = split_exact(blob, count.checked_mul(3)?)?;
+        let (null_provider, at) = mask(ints, 0, count)?;
+        let cols = columns(ints, at, count, 2)?;
+        let mut out = Vec::with_capacity(count * 5 + 7);
+        let mut slots: HashMap<&[u8], usize> = HashMap::new();
+        let mut slot_counts: Vec<i64> = Vec::new();
+        let mut titles: HashSet<Vec<u8>> = HashSet::new();
+        let mut buckets = [0i64; 4];
+        let mut norm = Vec::new();
+        for i in 0..count {
+            let status = strings[i];
+            let bucket = match status {
+                b"matched" | b"season_pack" => 0,
+                b"episode_missing" => 1,
+                b"not_found" => 2,
+                b"transient" => 3,
+                _ => 2,
+            };
+            normalize_into(strings[2 * count + i], &mut norm);
+            let mut slot = -1i64;
+            if bucket == 0 {
+                let provider: &[u8] = if null_provider[i] {
+                    b"unknown"
+                } else {
+                    strings[count + i]
+                };
+                let next = slots.len();
+                let index = *slots.entry(provider).or_insert(next);
+                if index == next {
+                    slot_counts.push(0);
+                }
+                slot_counts[index] += 1;
+                slot = index as i64;
+                if !titles.contains(&norm) {
+                    titles.insert(norm.clone());
+                }
+            }
+            buckets[bucket] += 1;
+            let flags = i64::from(cols[i] > 0)
+                | i64::from(cols[count + i] > 0) << 1
+                | i64::from(status == b"season_pack") << 2;
+            out.extend_from_slice(&[bucket as i64, slot, h(&norm), flags]);
+        }
+        out.push(count as i64);
+        out.extend_from_slice(&buckets);
+        out.push(slot_counts.len() as i64);
+        out.push(titles.len() as i64);
+        out.extend_from_slice(&slot_counts);
+        Some(out)
+    }
+
+    /// TVMaze episodes: airdate, name, summary / null-season and null-number masks / season, number.
+    fn tvmaze_format(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        let strings = split_exact(blob, count.checked_mul(3)?)?;
+        let (null_season, at) = mask(ints, 0, count)?;
+        let (null_number, at) = mask(ints, at, count)?;
+        let cols = columns(ints, at, count, 2)?;
+        let mut out = Vec::with_capacity(count * 6 + 5);
+        let (mut kept, mut dropped, mut specials, mut undated, mut max_episode) = (0, 0, 0, 0, 0);
+        let mut buf = Vec::with_capacity(48);
+        for i in 0..count {
+            let (series, episode) = (cols[i], cols[count + i]);
+            let airdate = strict_date(php_trim(strings[i]));
+            let flags = i64::from(!null_number[i])
+                | i64::from(!php_trim(strings[count + i]).is_empty()) << 1
+                | i64::from(!php_trim(strings[2 * count + i]).is_empty()) << 2;
+            if null_season[i] {
+                dropped += 1;
+            } else {
+                kept += 1;
+                specials += i64::from(series == 0);
+                undated += i64::from(airdate == 0);
+                if !null_number[i] {
+                    max_episode = max_episode.max(episode);
+                }
+            }
+            let se = se_hash(series, episode, &mut buf);
+            out.extend_from_slice(&[
+                i64::from(!null_season[i]),
+                series,
+                episode,
+                se,
+                airdate,
+                flags,
+            ]);
+        }
+        out.extend_from_slice(&[kept, dropped, specials, undated, max_episode]);
+        Some(out)
+    }
+
+    /// TVDB episode records: aired, name / target season, episode, null and empty masks for
+    /// seasonNumber and number / seasonNumber, number.
+    fn tvdb_match(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        let strings = split_exact(blob, count.checked_mul(2)?)?;
+        let (season, episode) = (*ints.first()?, *ints.get(1)?);
+        let (null_season, at) = mask(ints, 2, count)?;
+        let (empty_season, at) = mask(ints, at, count)?;
+        let (null_number, at) = mask(ints, at, count)?;
+        let (empty_number, at) = mask(ints, at, count)?;
+        let cols = columns(ints, at, count, 2)?;
+        let mut out = Vec::with_capacity(count * 6 + 4);
+        let (mut valid_count, mut first, mut latest, mut undated) = (0, -1i64, 0, 0);
+        let mut buf = Vec::with_capacity(48);
+        for i in 0..count {
+            let (s, e) = (cols[i], cols[count + i]);
+            let valid = !(null_season[i] || empty_season[i] || null_number[i] || empty_number[i]);
+            let aired = strict_date(strings[i]);
+            let matched = valid && s == season && e == episode;
+            if valid {
+                valid_count += 1;
+                latest = latest.max(aired);
+                undated += i64::from(aired == 0);
+                if matched && first < 0 {
+                    first = i as i64;
+                }
+            }
+            let flags =
+                i64::from(matched) | i64::from(!php_trim(strings[count + i]).is_empty()) << 1;
+            let se = se_hash(s, e, &mut buf);
+            out.extend_from_slice(&[i64::from(valid), s, e, se, aired, flags]);
+        }
+        out.extend_from_slice(&[valid_count, first, latest, undated]);
+        Some(out)
+    }
+
+    /// PCRE `\w` without the `u` modifier.
+    #[inline]
+    fn is_word(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    /// PCRE `[\s._-]` without the `u` modifier.
+    #[inline]
+    fn is_sep(b: u8) -> bool {
+        matches!(
+            b,
+            b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b'.' | b'_' | b'-'
+        )
+    }
+
+    /// End of the run of at most `max` ASCII digits starting at `at`.
+    #[inline]
+    fn digit_run(s: &[u8], at: usize, max: usize) -> usize {
+        let mut end = at;
+        while end < s.len() && end - at < max && s[end].is_ascii_digit() {
+            end += 1;
+        }
+        end
+    }
+
+    /// End of the `[\s._-]*` run starting at `at`.
+    #[inline]
+    fn skip_seps(s: &[u8], mut at: usize) -> usize {
+        while at < s.len() && is_sep(s[at]) {
+            at += 1;
+        }
+        at
+    }
+
+    /// `\b` after a word byte at `at - 1`.
+    #[inline]
+    fn ends_word(s: &[u8], at: usize) -> bool {
+        at == s.len() || !is_word(s[at])
+    }
+
+    /// `(\d{1,max})\b` at `at`: the digits' value and end. Shorter runs cannot backtrack into a
+    /// boundary because the next byte would be a digit.
+    #[inline]
+    fn bounded_number(s: &[u8], at: usize, max: usize) -> Option<(i64, usize)> {
+        let end = digit_run(s, at, max);
+        (end > at && ends_word(s, end)).then(|| (digits(&s[at..end]), end))
+    }
+
+    /// `EpisodeHydrationService::hydrateFromSearchname()` for a non-empty name missing at least
+    /// one number: `(series, episode)` with -1 for a number left unchanged. Every pattern opens
+    /// with `\b` and a word byte, so only word starts are tried, left to right per rule.
+    fn parse_searchname(s: &[u8], ms: bool, me: bool, starts: &mut Vec<usize>) -> (i64, i64) {
+        starts.clear();
+        let mut prev_word = false;
+        for (i, &b) in s.iter().enumerate() {
+            let word = is_word(b);
+            if word && !prev_word {
+                starts.push(i);
+            }
+            prev_word = word;
+        }
+        let pick = |series: i64, episode: i64| {
+            (if ms { series } else { -1 }, if me { episode } else { -1 })
+        };
+        // 1. `/\bS(\d{1,2})E(\d{1,3})\b/i`
+        for &p in starts.iter() {
+            if matches!(s[p], b'S' | b's') {
+                let d1 = digit_run(s, p + 1, 2);
+                if d1 > p + 1
+                    && matches!(s.get(d1), Some(b'E' | b'e'))
+                    && let Some((episode, _)) = bounded_number(s, d1 + 1, 3)
+                {
+                    return pick(digits(&s[p + 1..d1]), episode);
+                }
+            }
+        }
+        // 2. `/\b(\d{1,2})x(\d{1,3})\b/i`
+        for &p in starts.iter() {
+            if s[p].is_ascii_digit() {
+                let d1 = digit_run(s, p, 2);
+                if matches!(s.get(d1), Some(b'x' | b'X'))
+                    && let Some((episode, _)) = bounded_number(s, d1 + 1, 3)
+                {
+                    return pick(digits(&s[p..d1]), episode);
+                }
+            }
+        }
+        // 3. `/\bSeason[\s._-]*(\d{1,2})[\s._-]*Episode[\s._-]*(\d{1,3})\b/i`
+        for &p in starts.iter() {
+            if s.len() - p >= 15 && s[p..p + 6].eq_ignore_ascii_case(b"season") {
+                let d1_start = skip_seps(s, p + 6);
+                let d1 = digit_run(s, d1_start, 2);
+                if d1 > d1_start {
+                    let word = skip_seps(s, d1);
+                    if s.len() - word >= 7
+                        && s[word..word + 7].eq_ignore_ascii_case(b"episode")
+                        && let Some((episode, _)) = bounded_number(s, skip_seps(s, word + 7), 3)
+                    {
+                        return pick(digits(&s[d1_start..d1]), episode);
+                    }
+                }
+            }
+        }
+        // 4. `/\b(\d)(0[1-9]|[1-9]\d)\b/`, applied only when both numbers are missing.
+        if ms && me {
+            for &p in starts.iter() {
+                if s.len() - p >= 3
+                    && s[p..p + 3].iter().all(u8::is_ascii_digit)
+                    && &s[p + 1..p + 3] != b"00"
+                    && ends_word(s, p + 3)
+                {
+                    return (i64::from(s[p] - b'0'), digits(&s[p + 1..p + 3]));
+                }
+            }
+        }
+        // 5. `/\b(\d{4})[._-](\d{2})[._-](\d{2})\b/`
+        for &p in starts.iter() {
+            if s.len() - p >= 10
+                && all_digits(&s[p..p + 4])
+                && matches!(s[p + 4], b'.' | b'_' | b'-')
+                && all_digits(&s[p + 5..p + 7])
+                && matches!(s[p + 7], b'.' | b'_' | b'-')
+                && all_digits(&s[p + 8..p + 10])
+                && ends_word(s, p + 10)
+            {
+                return pick(
+                    digits(&s[p..p + 4]),
+                    digits(&s[p + 5..p + 7]) * 100 + digits(&s[p + 8..p + 10]),
+                );
+            }
+        }
+        if !me {
+            return (-1, -1);
+        }
+        // 6. `/\b(?:Part|Pt)[\s._-]*(\d{1,3})\b/i`
+        for &p in starts.iter() {
+            let keyword = if s.len() - p >= 4 && s[p..p + 4].eq_ignore_ascii_case(b"part") {
+                4
+            } else if s.len() - p >= 2 && s[p..p + 2].eq_ignore_ascii_case(b"pt") {
+                2
+            } else {
+                continue;
+            };
+            if let Some((episode, _)) = bounded_number(s, skip_seps(s, p + keyword), 3) {
+                return (if ms { 1 } else { -1 }, episode);
+            }
+        }
+        // 7. `/\bEp?[\s._-]*(\d{1,3})\b/i`
+        for &p in starts.iter() {
+            if matches!(s[p], b'E' | b'e') {
+                let after = if matches!(s.get(p + 1), Some(b'P' | b'p')) {
+                    p + 2
+                } else {
+                    p + 1
+                };
+                if let Some((episode, _)) = bounded_number(s, skip_seps(s, after), 3) {
+                    return (if ms { 1 } else { -1 }, episode);
+                }
+            }
+        }
+        (-1, -1)
+    }
+
+    /// Hydration rows: searchname / series, episode.
+    fn searchname_hydrate(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        let names = split_exact(blob, count)?;
+        let cols = columns(ints, 0, count, 2)?;
+        let mut out = Vec::with_capacity(count * 3 + 3);
+        let (mut skipped, mut unresolved, mut resolved) = (0, 0, 0);
+        let mut starts = Vec::with_capacity(32);
+        for (i, name) in names.iter().enumerate() {
+            let (series, episode) = (cols[i], cols[count + i]);
+            let (missing_series, missing_episode) = (series == 0, episode == 0);
+            if !(missing_series || missing_episode) || name.is_empty() || *name == b"0" {
+                skipped += 1;
+                out.extend_from_slice(&[series, episode, -1]);
+                continue;
+            }
+            let (s, e) = parse_searchname(name, missing_series, missing_episode, &mut starts);
+            let flags = i64::from(s >= 0) | i64::from(e >= 0) << 1;
+            if flags == 0 {
+                unresolved += 1;
+            } else {
+                resolved += 1;
+            }
+            out.extend_from_slice(&[
+                if s >= 0 { s } else { series },
+                if e >= 0 { e } else { episode },
+                flags,
+            ]);
+        }
+        out.extend_from_slice(&[skipped, unresolved, resolved]);
+        Some(out)
+    }
+
+    /// Validates the pointers, runs `body` under `catch_unwind` and copies its words to `out`.
+    ///
+    /// # Safety
+    /// `blob` and `ints` must be null or readable for their lengths, and `out` must be null or
+    /// writable for `out_cap` `i64` words that do not overlap either input.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        body: Batch,
+    ) -> isize {
+        if out.is_null()
+            || (blob.is_null() && blob_len != 0)
+            || (ints.is_null() && ints_len != 0)
+            || blob_len > isize::MAX as usize
+            || ints_len > isize::MAX as usize
+            || count > MAX_COUNT
+        {
+            return DECLINE;
+        }
+        let blob: &[u8] = if blob.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(blob, blob_len) }
+        };
+        let ints: &[u8] = if ints.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(ints, ints_len) }
+        };
+        let result = std::panic::catch_unwind(|| body(blob, &read_ints(ints)?, count));
+        let Ok(Some(values)) = result else {
+            return DECLINE;
+        };
+        if values.len() > out_cap {
+            return -(values.len() as isize);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr().cast::<u8>(),
+                out.cast::<u8>(),
+                values.len() * 8,
+            );
+        }
+        values.len() as isize
+    }
+
+    /// Four words per release (bucket, retry state, retry epoch, next delay) then the eight
+    /// bucket counts and the earliest waiting retry epoch (`i64::MAX` when none).
+    ///
+    /// # Safety
+    /// As for [`run`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w503_tv_candidate_plan_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                candidate_plan,
+            )
+        }
+    }
+
+    /// Four words per result (bucket, provider slot, title key, flags) then processed, the four
+    /// bucket counts, the provider count, the distinct matched-title count and per-slot counts.
+    ///
+    /// # Safety
+    /// As for [`run`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w503_tv_pipeline_result_tally_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                result_tally,
+            )
+        }
+    }
+
+    /// Six words per TVMaze episode (kept, series, episode, se_complete hash, airdate, flags)
+    /// then the kept, dropped, special, undated counts and the max episode.
+    ///
+    /// # Safety
+    /// As for [`run`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w503_tvmaze_episode_format_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                tvmaze_format,
+            )
+        }
+    }
+
+    /// Six words per TVDB record (valid, series, episode, se_complete hash, aired, flags) then
+    /// the valid count, the first target index, the latest aired date and the undated count.
+    ///
+    /// # Safety
+    /// As for [`run`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w503_tvdb_episode_match_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(
+                blob, blob_len, ints, ints_len, count, out, out_cap, tvdb_match,
+            )
+        }
+    }
+
+    /// Three words per release (series, episode, flags; flags -1 when skipped) then the
+    /// skipped, unresolved and resolved counts.
+    ///
+    /// # Safety
+    /// As for [`run`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w503_episode_searchname_hydrate_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                searchname_hydrate,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn packed(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        type Export = unsafe extern "C" fn(
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            usize,
+            *mut i64,
+            usize,
+        ) -> isize;
+
+        fn call(f: Export, blob: &[u8], ints: &[i64], count: usize) -> Result<Vec<i64>, isize> {
+            let ints = packed(ints);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    ints.as_ptr(),
+                    ints.len(),
+                    count,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        #[test]
+        fn retry_state_parses_strict_utc_timestamps() {
+            assert_eq!(retry_state(b""), (0, 0));
+            assert_eq!(retry_state(b"1970-01-01 00:00:00"), (1, 0));
+            assert_eq!(retry_state(b"2024-02-29T12:34:56"), (1, 1_709_210_096));
+            assert_eq!(retry_state(b"0001-01-01 00:00:00"), (1, -62_135_596_800));
+            assert_eq!(retry_state(b"2023-02-29 00:00:00"), (2, 0));
+            assert_eq!(retry_state(b"2024-01-01 24:00:00"), (2, 0));
+            assert_eq!(retry_state(b"2024-01-01 00:00:00\n"), (2, 0));
+            assert_eq!(retry_state(b"0000-01-01 00:00:00"), (2, 0));
+        }
+
+        #[test]
+        fn se_hash_matches_php_sprintf() {
+            let mut buf = Vec::new();
+            se_hash(1, 2, &mut buf);
+            assert_eq!(buf, b"S01E02");
+            se_hash(-5, 123, &mut buf);
+            assert_eq!(buf, b"S-5E123");
+            se_hash(i64::MIN, 0, &mut buf);
+            assert_eq!(buf, b"S-9223372036854775808E00");
+            se_hash(99, 100, &mut buf);
+            assert_eq!(buf, b"S99E100");
+            se_hash(-1, 7, &mut buf);
+            assert_eq!(buf, b"S-1E07");
+        }
+
+        #[test]
+        fn candidate_plan_buckets_rows() {
+            let blob = b"\x002020-01-01 00:00:00\0bad\0\x002030-01-01 00:00:00\0\0";
+            let now = 1_700_000_000;
+            #[rustfmt::skip]
+            let ints = [
+                now, 1,
+                5040, 5040, 5040, 5070, 5040, 5040, 5040,
+                2_000_000, 2_000_000, 2_000_000, 2_000_000, 2_000_000, 2_000_000, 2_000_000,
+                0, 0, 0, 0, 7, 7, 7,
+                0, 0, 0, 0, -11, -11, -11,
+                1, 2, 3, 0, 2, 6, 0,
+                0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 9,
+            ];
+            let out = call(nntmux_w503_tv_candidate_plan_batch, blob, &ints, 7).unwrap();
+            assert_eq!(out[0..4], [1, 0, 0, 300]);
+            assert_eq!(out[4..8], [1, 1, 1_577_836_800, 900]);
+            assert_eq!(out[8..12], [2, 2, 0, 3_600]);
+            assert_eq!(out[12..16], [0, 0, 0, 0]);
+            assert_eq!(out[16..20], [4, 1, 1_893_456_000, 21_600]);
+            assert_eq!(out[20..24], [5, 0, 0, 0]);
+            assert_eq!(out[24..28], [6, 0, 0, 0]);
+            assert_eq!(out[28..], [1, 2, 1, 0, 1, 1, 1, 0, 1_893_456_000]);
+
+            let renamed_only = [&[now, 2][..], &ints[2..]].concat();
+            let out = call(nntmux_w503_tv_candidate_plan_batch, blob, &renamed_only, 7).unwrap();
+            assert_eq!(out[0], 7);
+        }
+
+        #[test]
+        fn result_tally_counts_providers_and_titles() {
+            let blob = [
+                "matched\0season_pack\0transient\0bogus\0matched",
+                "tvdb\0\0tvdb\0x\0TVDB",
+                "The Office\0the.office!\0Lost\0\0Lost",
+            ]
+            .join("\0");
+            let ints = [1, 1, 5, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+            let out = call(
+                nntmux_w503_tv_pipeline_result_tally_batch,
+                blob.as_bytes(),
+                &ints,
+                5,
+            )
+            .unwrap();
+            assert_eq!(out[0..4], [0, 0, h(b"the office"), 1]);
+            assert_eq!(out[4..8], [0, 1, h(b"the office"), 4]);
+            assert_eq!(out[8..12], [3, -1, h(b"lost"), 0]);
+            assert_eq!(out[12..16], [2, -1, h(b""), 2]);
+            assert_eq!(out[16..20], [0, 2, h(b"lost"), 0]);
+            assert_eq!(out[20..], [5, 3, 0, 1, 1, 3, 2, 1, 1, 1]);
+        }
+
+        #[test]
+        fn tvmaze_format_keeps_seasoned_episodes() {
+            let blob = [
+                "2020-01-02\0 2021-06-30 \0bad",
+                "Pilot\0 \0Special",
+                "Sum\0\0\t",
+            ]
+            .join("\0");
+            let ints = [1, 2, 1, 1, 1, 0, 3, 2, 0, 9];
+            let out = call(
+                nntmux_w503_tvmaze_episode_format_batch,
+                blob.as_bytes(),
+                &ints,
+                3,
+            )
+            .unwrap();
+            assert_eq!(out[0..6], [1, 1, 2, h(b"S01E02"), 20_200_102, 7]);
+            assert_eq!(out[6..12], [1, 0, 0, h(b"S00E00"), 20_210_630, 0]);
+            assert_eq!(out[12..18], [0, 3, 9, h(b"S03E09"), 0, 3]);
+            assert_eq!(out[18..], [2, 1, 1, 0, 2]);
+        }
+
+        #[test]
+        fn tvdb_match_finds_target() {
+            let blob = "2020-01-02\0\0 2020-01-03\0Pilot\0\0x";
+            let ints = [1, 2, 0, 1, 2, 0, 0, 1, 1, 1, 2, 2, 2];
+            let out = call(
+                nntmux_w503_tvdb_episode_match_batch,
+                blob.as_bytes(),
+                &ints,
+                3,
+            )
+            .unwrap();
+            assert_eq!(out[0..6], [1, 1, 2, h(b"S01E02"), 20_200_102, 3]);
+            assert_eq!(out[6..12], [1, 1, 2, h(b"S01E02"), 0, 1]);
+            assert_eq!(out[12..18], [0, 1, 2, h(b"S01E02"), 0, 2]);
+            assert_eq!(out[18..], [2, 0, 20_200_102, 1]);
+        }
+
+        #[test]
+        fn searchname_hydrate_runs_the_cascade() {
+            let blob =
+                "Show.S02E05.720p\0Show 3x07\0Show.2024.01.15\0Show Part 4\0\x000\0Show.Name";
+            let ints = [0, 0, 5, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
+            let out = call(
+                nntmux_w503_episode_searchname_hydrate_batch,
+                blob.as_bytes(),
+                &ints,
+                7,
+            )
+            .unwrap();
+            assert_eq!(out[0..3], [2, 5, 3]);
+            assert_eq!(out[3..6], [3, 7, 3]);
+            assert_eq!(out[6..9], [5, 115, 2]);
+            assert_eq!(out[9..12], [1, 4, 3]);
+            assert_eq!(out[12..15], [0, 0, -1]);
+            assert_eq!(out[15..18], [0, 0, -1]);
+            assert_eq!(out[18..21], [7, 0, 0]);
+            assert_eq!(out[21..], [2, 1, 4]);
+        }
+
+        #[test]
+        fn parse_searchname_matches_the_shared_parser() {
+            let words: [&[u8]; 24] = [
+                b"S", b"s", b"E", b"e", b"Ep", b"x", b"X", b"Season", b"Episode", b"Part", b"Pt",
+                b"0", b"1", b"00", b"02", b"123", b"2024", b".", b" ", b"_", b"-", b"\xff", b"a",
+                b"\t",
+            ];
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut starts = Vec::new();
+            for _ in 0..50_000 {
+                let mut name = Vec::new();
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let mut seed = state;
+                for _ in 0..(seed % 9 + 1) {
+                    name.extend_from_slice(words[(seed >> 8) as usize % words.len()]);
+                    seed = seed.rotate_left(11).wrapping_mul(0x2545_F491_4F6C_DD1D);
+                }
+                for (ms, me) in [(true, true), (true, false), (false, true)] {
+                    let (s, e) = crate::additional::episode_parse_searchname(&name, ms, me);
+                    assert_eq!(
+                        parse_searchname(&name, ms, me, &mut starts),
+                        (i64::from(s), i64::from(e)),
+                        "{:?} {ms} {me}",
+                        String::from_utf8_lossy(&name)
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn exports_guard_pointers_and_capacity() {
+            let mut out = [0i64; 16];
+            let o = out.as_mut_ptr();
+            let exports: [Export; 5] = [
+                nntmux_w503_tv_candidate_plan_batch,
+                nntmux_w503_tv_pipeline_result_tally_batch,
+                nntmux_w503_tvmaze_episode_format_batch,
+                nntmux_w503_tvdb_episode_match_batch,
+                nntmux_w503_episode_searchname_hydrate_batch,
+            ];
+            for f in exports {
+                unsafe {
+                    assert_eq!(
+                        f(b"x".as_ptr(), 1, ptr::null(), 0, 1, ptr::null_mut(), 16),
+                        DECLINE
+                    );
+                    assert_eq!(f(ptr::null(), 1, ptr::null(), 0, 1, o, 16), DECLINE);
+                    assert_eq!(f(b"x".as_ptr(), 1, ptr::null(), 8, 1, o, 16), DECLINE);
+                    assert_eq!(
+                        f(ptr::null(), 0, ptr::null(), 0, MAX_COUNT + 1, o, 16),
+                        DECLINE
+                    );
+                    assert_eq!(
+                        f(b"x".as_ptr(), 1, b"1234567".as_ptr(), 7, 1, o, 16),
+                        DECLINE
+                    );
+                }
+            }
+            let empty_masks = packed(&[0, 0]);
+            let zero_cols = packed(&[0, 0]);
+            let bad_mask = packed(&[1, 5, 0, 0, 0]);
+            let two_empty = [0u8; 2];
+            unsafe {
+                assert_eq!(
+                    nntmux_w503_tv_pipeline_result_tally_batch(
+                        ptr::null(),
+                        0,
+                        empty_masks.as_ptr(),
+                        8,
+                        0,
+                        o,
+                        16
+                    ),
+                    7
+                );
+                assert_eq!(
+                    nntmux_w503_tvmaze_episode_format_batch(
+                        ptr::null(),
+                        0,
+                        empty_masks.as_ptr(),
+                        16,
+                        0,
+                        o,
+                        16
+                    ),
+                    5
+                );
+                assert_eq!(
+                    nntmux_w503_episode_searchname_hydrate_batch(
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        o,
+                        16
+                    ),
+                    3
+                );
+                assert_eq!(
+                    nntmux_w503_episode_searchname_hydrate_batch(
+                        b"S01E02".as_ptr(),
+                        6,
+                        zero_cols.as_ptr(),
+                        16,
+                        1,
+                        o,
+                        5
+                    ),
+                    -6
+                );
+                assert_eq!(
+                    nntmux_w503_episode_searchname_hydrate_batch(
+                        b"a\0b".as_ptr(),
+                        3,
+                        zero_cols.as_ptr(),
+                        16,
+                        1,
+                        o,
+                        16
+                    ),
+                    DECLINE
+                );
+                // A mask index outside the batch declines.
+                assert_eq!(
+                    nntmux_w503_tvmaze_episode_format_batch(
+                        two_empty.as_ptr(),
+                        2,
+                        bad_mask.as_ptr(),
+                        40,
+                        1,
+                        o,
+                        16
+                    ),
+                    DECLINE
+                );
+            }
+        }
+    }
+}
