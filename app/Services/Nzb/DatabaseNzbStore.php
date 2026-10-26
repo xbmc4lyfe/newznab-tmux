@@ -8,6 +8,7 @@ use App\Services\Releases\Fingerprint\DatabaseFingerprintQueue;
 use App\Support\ReleaseArchiveNamingEvidence;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
 
@@ -373,5 +374,181 @@ final class DatabaseNzbStore
     {
         return ['results' => $results, 'written' => $counts[0], 'skipped_existing' => $counts[1], 'failed' => $counts[2], 'slow_writes' => $counts[3],
             'bytes_written' => $total];
+    }
+
+    /** Wave 55.2 paired benchmarks decide this default; see RustNfoServiceDbNzbStoreNfoImportNzbContentsParserW55ParityTest. */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    private const string W55_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w552_nzb_store_integrity_plan_batch(const char *stored, size_t stored_len, const char *computed, size_t computed_len, const char *ints, size_t ints_len, size_t count, int64_t max_compressed, int64_t max_decoded, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 55 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w55', self::W55_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w55RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planPayloadIntegrityBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch integrity plan over stored rows, as read() filters a row and validPayload() checks
+     * its decoded payload. One word per row: `flags | crc32(stored digest) << 32`. Flags: 1
+     * readable (compressed bytes in 0..=$maxCompressed, decoded bytes at most $maxDecoded), 2 the
+     * stored digest equals the computed one, 4 the stored digest is 64 lowercase hex, 8 valid
+     * (readable, matching, decoded bytes not negative), 16 a negative size, 32 an empty stored
+     * digest. Readable, matching, valid and malformed-digest rows, the readable compressed bytes,
+     * the valid decoded bytes (both saturating at PHP_INT_MAX), the largest valid decoded size and
+     * the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $storedDigests
+     * @param  list<string>  $computedDigests
+     * @param  list<int>  $compressedBytes
+     * @param  list<int>  $decodedBytes
+     * @return list<int>
+     */
+    public static function planPayloadIntegrityBatch(array $storedDigests, array $computedDigests, array $compressedBytes, array $decodedBytes,
+        int $maxCompressed = self::MAX_COMPRESSED_BYTES, int $maxDecoded = self::MAX_DECODED_BYTES): array
+    {
+        return self::usesW55RustFfi()
+            ? self::planPayloadIntegrityBatchNative($storedDigests, $computedDigests, $compressedBytes, $decodedBytes, $maxCompressed, $maxDecoded)
+            : self::planPayloadIntegrityBatchPhp($storedDigests, $computedDigests, $compressedBytes, $decodedBytes, $maxCompressed, $maxDecoded);
+    }
+
+    /**
+     * @param  list<string>  $storedDigests
+     * @param  list<string>  $computedDigests
+     * @param  list<int>  $compressedBytes
+     * @param  list<int>  $decodedBytes
+     * @return list<int>
+     */
+    public static function planPayloadIntegrityBatchPhp(array $storedDigests, array $computedDigests, array $compressedBytes, array $decodedBytes,
+        int $maxCompressed = self::MAX_COMPRESSED_BYTES, int $maxDecoded = self::MAX_DECODED_BYTES): array
+    {
+        [$computedDigests, $compressedBytes, $decodedBytes] = [array_values($computedDigests), array_values($compressedBytes), array_values($decodedBytes)];
+        $out = [];
+        $readableCount = $matchedCount = $validCount = $malformed = $compressedTotal = $decodedTotal = $largest = 0;
+        foreach (array_values($storedDigests) as $i => $stored) {
+            $compressed = $compressedBytes[$i] ?? 0;
+            $decoded = $decodedBytes[$i] ?? 0;
+            $readable = $compressed >= 0 && $compressed <= $maxCompressed && $decoded <= $maxDecoded;
+            $matched = hash_equals($stored, $computedDigests[$i] ?? '');
+            $wellFormed = \strlen($stored) === 64 && strspn($stored, '0123456789abcdef') === 64;
+            $valid = $readable && $matched && $decoded >= 0;
+            $readableCount += (int) $readable;
+            $matchedCount += (int) $matched;
+            $validCount += (int) $valid;
+            $malformed += (int) ! $wellFormed;
+            if ($readable) {
+                $compressedTotal = $compressedTotal > PHP_INT_MAX - $compressed ? PHP_INT_MAX : $compressedTotal + $compressed;
+            }
+            if ($valid) {
+                $decodedTotal = $decodedTotal > PHP_INT_MAX - $decoded ? PHP_INT_MAX : $decodedTotal + $decoded;
+                $largest = max($largest, $decoded);
+            }
+            $out[] = ($readable ? 1 : 0) | ($matched ? 2 : 0) | ($wellFormed ? 4 : 0) | ($valid ? 8 : 0)
+                | ($compressed < 0 || $decoded < 0 ? 16 : 0) | ($stored === '' ? 32 : 0) | crc32($stored) << 32;
+        }
+        array_push($out, $readableCount, $matchedCount, $validCount, $malformed, $compressedTotal, $decodedTotal, $largest);
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a digest holds a NUL byte, or
+     * the columns differ in length or are not lists.
+     *
+     * @param  list<string>  $storedDigests
+     * @param  list<string>  $computedDigests
+     * @param  list<int>  $compressedBytes
+     * @param  list<int>  $decodedBytes
+     * @return list<int>
+     */
+    public static function planPayloadIntegrityBatchNative(array $storedDigests, array $computedDigests, array $compressedBytes, array $decodedBytes,
+        int $maxCompressed = self::MAX_COMPRESSED_BYTES, int $maxDecoded = self::MAX_DECODED_BYTES): array
+    {
+        $count = \count($storedDigests);
+        $words = $count + 8;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w55RustFfiState('out', $words);
+        if ($state === null || \count($computedDigests) !== $count || \count($compressedBytes) !== $count || \count($decodedBytes) !== $count
+            || ! array_is_list($storedDigests) || ! array_is_list($computedDigests) || ! array_is_list($compressedBytes) || ! array_is_list($decodedBytes)) {
+            return self::planPayloadIntegrityBatchPhp($storedDigests, $computedDigests, $compressedBytes, $decodedBytes, $maxCompressed, $maxDecoded);
+        }
+        $stored = implode("\0", $storedDigests);
+        $computed = implode("\0", $computedDigests);
+        $ints = pack('P*', ...$compressedBytes, ...$decodedBytes);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
+            $written = $ffi->nntmux_w552_nzb_store_integrity_plan_batch($stored, \strlen($stored), $computed, \strlen($computed), $ints, \strlen($ints), $count, $maxCompressed, $maxDecoded, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planPayloadIntegrityBatchPhp($storedDigests, $computedDigests, $compressedBytes, $decodedBytes, $maxCompressed, $maxDecoded);
     }
 }
