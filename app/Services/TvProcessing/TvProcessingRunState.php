@@ -6,7 +6,9 @@ namespace App\Services\TvProcessing;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
+use InvalidArgumentException;
 use Throwable;
 
 /**
@@ -359,5 +361,312 @@ final class TvProcessingRunState
         }
 
         return self::$w47RustFfiHandle === false ? null : self::$w47RustFfiHandle;
+    }
+
+    // ========================================================================
+    // WAVE 62.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three paired runs reached 2.58x common mean, 2.30x common p99, 2.23x uncommon mean and 2.07x uncommon p99; see RustTvMazeTvdbPipeOutcomeWriterPosterResolverRunStateW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    private const string W62_RUN_STATE_FFI_CDEF = 'ssize_t nntmux_w624_tv_run_state_plan_row_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per runStatePlanRowBatch() record. */
+    public const int W62_ROW_WORDS = 6;
+
+    /** int64 summary words after the runStatePlanRowBatch() records (none for an empty batch). */
+    public const int W62_TRAILER_WORDS = 11;
+
+    private const array W62_PROVIDERS = ['tvdb' => 1, 'tvmaze' => 2, 'tmdb' => 3, 'trakt' => 4, 'local db' => 5];
+
+    private const string W62_DIGITS = '0123456789';
+
+    /** Upper clamp for epoch-second timestamps. */
+    private const int W62_TIME_MAX = 1 << 40;
+
+    private const int W62_MAX_COUNTER = 1_000_000_000;
+
+    /**
+     * TV processing run-state plan rows for [provider, title, episode key, videos id, consecutive
+     * transients, refreshed at, now, hits, misses] items (times in epoch seconds; now clamps to
+     * 0..2^40, hits and misses to 0..10^9).
+     *
+     * Titles normalize to `[a-z0-9]` tokens; the attempted-title key is the trimmed, lowercased
+     * provider, 0x1F and that title. The refresh and episode lookup keys follow refreshKeyPhp()
+     * (ASCII lowercase) and episodeLookupKeyPhp(). Episode keys: 0 empty, 1 `NxM` (1-4 and 1-5
+     * digits), 2 a valid date, 3 otherwise. Refresh state: 0 never, 1 within EPISODE_REFRESH_TTL,
+     * 2 in the future, 3 stale. Decision: 1 circuit open, 2 nothing to search, 3 search, 4 title
+     * already attempted in this batch, 5 refresh the episode list, 6 episode lookup, 7 episode
+     * already looked up in this batch, 8 cached.
+     *
+     * Rows [decision | provider << 4 | refresh state << 8 | episode key class << 10 | flags << 12
+     * (1 repeated title, 2 repeated lookup, 4 circuit open, 8 non-ASCII title, 16 future refresh) |
+     * title bytes << 20, title hash (0), refresh key hash, lookup key hash, hit rate per mille (-1),
+     * refresh age (-1)], then the trailer [decisions 1-8, hits, misses, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function runStatePlanRowBatch(array $items): array
+    {
+        return self::usesW62RustFfi() ? self::runStatePlanRowBatchNative($items) : self::runStatePlanRowBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function runStatePlanRowBatchPhp(array $items): array
+    {
+        self::w62Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $summary = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        $titles = [];
+        $lookups = [];
+        foreach ($items as [$provider, $title, $episodeKey, $videoId, $transients, $refreshedAt, $now, $hits, $misses]) {
+            $name = strtolower(trim($provider));
+            $providerClass = $name === '' ? 0 : (self::W62_PROVIDERS[$name] ?? 6);
+            $normalized = trim((string) preg_replace('/[^a-z0-9]+/', ' ', strtolower($title)), ' ');
+            $length = \strlen($normalized);
+            $titleKey = $name."\x1f".$normalized;
+            $titleHash = $length === 0 ? 0 : self::w62Fnv($titleKey);
+            $refreshHash = self::w62Fnv('tv:eps-refreshed:'.strtolower($provider).':'.$videoId);
+            $lookupKey = $provider.':'.$videoId.':'.$episodeKey;
+            $lookupHash = self::w62Fnv($lookupKey);
+            $key = trim($episodeKey);
+            $x = strpos($key, 'x');
+            $rest = $x === false ? 0 : \strlen($key) - $x - 1;
+            $episodeClass = match (true) {
+                $key === '' => 0,
+                $x !== false && $x >= 1 && $x <= 4 && strspn($key, self::W62_DIGITS, 0, $x) === $x && $rest >= 1 && $rest <= 5
+                    && strspn($key, self::W62_DIGITS, $x + 1) === $rest => 1,
+                self::w62Ymd($key) > 0 => 2,
+                default => 3,
+            };
+            $now = max(0, min(self::W62_TIME_MAX, $now));
+            $refreshState = match (true) {
+                $refreshedAt <= 0 => 0,
+                $refreshedAt > $now => 2,
+                $now - $refreshedAt < self::EPISODE_REFRESH_TTL => 1,
+                default => 3,
+            };
+            $age = $refreshedAt > 0 && $refreshedAt <= $now ? $now - $refreshedAt : -1;
+            $circuit = $transients >= self::CIRCUIT_BREAKER_THRESHOLD;
+            $hits = max(0, min(self::W62_MAX_COUNTER, $hits));
+            $misses = max(0, min(self::W62_MAX_COUNTER, $misses));
+            $total = $hits + $misses;
+            $rate = $total > 0 ? intdiv($hits * 1000, $total) : -1;
+            $duplicateTitle = false;
+            if ($length > 0) {
+                $duplicateTitle = isset($titles[$titleKey]);
+                $titles[$titleKey] = true;
+            }
+            $duplicateLookup = false;
+            if (($episodeClass === 1 || $episodeClass === 2) && $videoId > 0) {
+                $duplicateLookup = isset($lookups[$lookupKey]);
+                $lookups[$lookupKey] = true;
+            }
+            $decision = match (true) {
+                $circuit => 1,
+                $videoId <= 0 && $length === 0 => 2,
+                $videoId <= 0 => $duplicateTitle ? 4 : 3,
+                $refreshState === 0 || $refreshState === 3 => 5,
+                $episodeClass === 1 || $episodeClass === 2 => $duplicateLookup ? 7 : 6,
+                default => 8,
+            };
+            $flags = ($duplicateTitle ? 1 : 0) | ($duplicateLookup ? 2 : 0) | ($circuit ? 4 : 0)
+                | (mb_check_encoding($title, 'ASCII') ? 0 : 8) | ($refreshState === 2 ? 16 : 0);
+            $word = $decision | $providerClass << 4 | $refreshState << 8 | $episodeClass << 10 | $flags << 12 | min(255, $length) << 20;
+            array_push($out, $word, $titleHash, $refreshHash, $lookupHash, $rate, $age);
+            $summary[$decision - 1]++;
+            $summary[8] += $hits;
+            $summary[9] += $misses;
+            $value = $word ^ $titleHash << 20 ^ $lookupHash;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $summary[10] = $digest;
+
+        return [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function runStatePlanRowBatchNative(array $items): array
+    {
+        self::w62Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w62Join([array_column($items, 0), array_column($items, 1), array_column($items, 2)], $count);
+        $ints = pack('P*', ...array_column($items, 3), ...array_column($items, 4), ...array_column($items, 5), ...array_column($items, 6), ...array_column($items, 7), ...array_column($items, 8));
+
+        return self::w62Call($blob, $twin, $ints, $count, $count * self::W62_ROW_WORDS + self::W62_TRAILER_WORDS)
+            ?? self::runStatePlanRowBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w62Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W62 TV processing run state plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 9 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_string($item[2]) || ! \is_int($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5]) || ! \is_int($item[6]) || ! \is_int($item[7]) || ! \is_int($item[8])) {
+                throw new InvalidArgumentException('W62 TV processing run state plan batch items must be [string provider, string title, string episode key, int videos id, int consecutive transients, int refreshed at, int now, int hits, int misses] lists.');
+            }
+        }
+    }
+
+    public static function usesW62RustFfi(): bool
+    {
+        $enabled = self::w62RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W62 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('enabled');
+        self::w62RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w62Join(array $columns, int $count): array
+    {
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\0", $column);
+        }
+        $joined = implode("\0", $parts);
+        if (substr_count($joined, "\0") === \count($columns) * $count - 1) {
+            return [$joined, ''];
+        }
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\x01", $column);
+        }
+
+        return [$joined, implode("\x01", $parts)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w62Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w62RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w62', self::W62_RUN_STATE_FFI_CDEF) ?? false;
+            self::w62RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w62RustFfiState('out', $out);
+                self::w62RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W62_RUN_STATE_FFI_CDEF.)
+            $written = $ffi->nntmux_w624_tv_run_state_plan_row_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w62RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W62 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static: no arguments returns the state, one argument reads a key ('reset'
+     * clears everything) and two arguments write a key.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** A trimmed `YYYY-MM-DD` (or '.'/'/' separated) valid date with a positive year as `YYYYMMDD`, else 0. */
+    private static function w62Ymd(string $day): int
+    {
+        if (\strlen($day) !== 10 || strspn($day, self::W62_DIGITS, 0, 4) !== 4 || strspn($day, self::W62_DIGITS, 5, 2) !== 2
+            || strspn($day, self::W62_DIGITS, 8, 2) !== 2) {
+            return 0;
+        }
+        $separator = $day[4];
+        if (($separator !== '-' && $separator !== '.' && $separator !== '/') || $day[7] !== $separator) {
+            return 0;
+        }
+        $year = (int) substr($day, 0, 4);
+        $month = (int) substr($day, 5, 2);
+        $date = (int) substr($day, 8, 2);
+
+        return $year > 0 && checkdate($month, $date, $year) ? $year * 10_000 + $month * 100 + $date : 0;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int. */
+    private static function w62Fnv(string $bytes): int
+    {
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
     }
 }
