@@ -647,4 +647,267 @@ class GroupNamePipe extends AbstractCategorizationPipe
             return null;
         }
     }
+
+    /** C signature of the Wave 66.5 {@see self::w66GroupNamePipePlanBatch()} helper. */
+    private const string W66_GROUP_NAME_PIPE_PLAN_FFI_CDEF = 'int64_t nntmux_w665_group_name_pipe_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 66.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 6.48/6.54/3.67/3.57x); see tests/Unit/RustCategorizationBookPassableConsoleGroupNameMiscPipeW66ParityTest.php.
+     */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 66.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w66_5', self::W66_GROUP_NAME_PIPE_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W66_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 66.5 plan batch to Rust until disabled or reset. */
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', true);
+    }
+
+    /** Route the Wave 66.5 plan batch to PHP until enabled or reset. */
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', false);
+    }
+
+    /** Restore W66_RUST_FFI_DEFAULT routing and drop the cached Wave 66.5 handle and buffer. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', null);
+        self::w66RustFfiState('reset', null);
+    }
+
+    public static function usesW66RustFfi(): bool
+    {
+        return self::w66RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w66GroupNamePipePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 66.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w66Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w66RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w665_group_name_pipe_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w66Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /** Wave 66.5 group rules in match order: category, permille confidence and lowercase keywords (rule = index + 1). */
+    private const array W66_GROUP_RULES = [
+        [Category::TV_ANIME, 800, ['anime']],
+        [Category::TV_OTHER, 600, ['tv']],
+        [Category::MOVIE_OTHER, 600, ['movie', 'dvd', 'bluray', 'x264']],
+        [Category::XXX_OTHER, 700, ['erotica', 'xxx']],
+        [Category::MUSIC_OTHER, 600, ['sound', 'mp3', 'music', 'lossless']],
+        [Category::GAME_OTHER, 600, ['game', 'console', 'psx', 'nintendo']],
+        [Category::PC_0DAY, 600, ['warez', '0day', 'app', 'software']],
+        [Category::BOOKS_EBOOK, 500, ['ebook', 'e-book', 'comic']],
+    ];
+
+    /** `CategorizationResult::isProtectedMiscResultPhp()` for a category id and matched-by label. */
+    private static function w66ProtectedMisc(int $category, string $label): bool
+    {
+        return $category === Category::OTHER_HASHED || ($category === Category::OTHER_MISC && (str_starts_with($label, 'hash_')
+            || str_starts_with($label, 'obfuscated_') || str_starts_with($label, 'gibberish_') || $label === 'group_only_low_signal'));
+    }
+
+    /**
+     * `CategorizationResult::shouldOverridePhp()` on permille confidences: 2 blocked by the protected-misc guard,
+     * 1 replaces the best result, 0 keeps it.
+     */
+    private static function w66OverrideDecision(int $category, int $confidence, int $bestCategory, int $bestConfidence, string $bestLabel): int
+    {
+        if ($category !== Category::OTHER_MISC && $category !== Category::OTHER_HASHED && $confidence < 600
+            && self::w66ProtectedMisc($bestCategory, $bestLabel)) {
+            return 2;
+        }
+
+        return $confidence > $bestConfidence || ($confidence === $bestConfidence && $category !== Category::OTHER_MISC && $bestCategory === Category::OTHER_MISC) ? 1 : 0;
+    }
+
+    /**
+     * Batch group-name override plan over `groupName\tcurrentCategory\tcurrentConfidence\tcurrentMatchedBy`,
+     * confidences in permille. Seven words per record: `[rule, category, confidence, decision, target, segments,
+     * errors]`. The trimmed name is lowercased (ASCII); the text after its first `alt.binaries.` (else after a leading
+     * `a.b.`, error 16) selects the first W66_GROUP_RULES rule with a keyword in it, like categorizePhp() without
+     * line-break handling. Decision/target: 0 no rule (keeps the current category, default OTHER_MISC), 4 the current
+     * result already stops (>= 950), 2 blocked by shouldOverridePhp()'s protected-misc guard, 1 the rule overrides the
+     * current result, 3 the current result wins. Segments counts the non-empty dot-separated parts of the trimmed name.
+     * Numbers are trimmed 1-15 ASCII digits; errors: 1 invalid number, 2 not exactly four fields, 4 no
+     * `alt.binaries.` prefix, 8 empty name, 16 abbreviated `a.b.` prefix.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66GroupNamePipePlanBatch(array $records): array
+    {
+        return self::usesW66RustFfi() ? self::w66GroupNamePipePlanBatchNative($records) : self::w66GroupNamePipePlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66GroupNamePipePlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w66Words($count, implode("\0", $records), 7 * $count) ?? self::w66GroupNamePipePlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66GroupNamePipePlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $errors = \count($fields) === 4 ? 0 : 2;
+            $current = self::w66Number($fields[1] ?? '', Category::OTHER_MISC, $errors);
+            $currentConfidence = self::w66Number($fields[2] ?? '', 0, $errors);
+            $currentLabel = $fields[3] ?? '';
+            $name = trim($fields[0]);
+            $segments = 0;
+            foreach (explode('.', $name) as $segment) {
+                $segments += $segment !== '' ? 1 : 0;
+            }
+            $lower = strtolower($name);
+            $rest = null;
+            if ($name === '') {
+                $errors |= 8;
+            } elseif (($at = strpos($lower, 'alt.binaries.')) !== false) {
+                $rest = substr($lower, $at + 13);
+            } elseif (str_starts_with($lower, 'a.b.')) {
+                $errors |= 16;
+                $rest = substr($lower, 4);
+            } else {
+                $errors |= 4;
+            }
+            $rule = $category = $confidence = 0;
+            if ($rest !== null) {
+                foreach (self::W66_GROUP_RULES as $index => [$ruleCategory, $ruleConfidence, $keywords]) {
+                    foreach ($keywords as $keyword) {
+                        if (str_contains($rest, $keyword)) {
+                            [$rule, $category, $confidence] = [$index + 1, $ruleCategory, $ruleConfidence];
+                            break 2;
+                        }
+                    }
+                }
+            }
+            [$decision, $target] = match (true) {
+                $rule === 0 => [0, $current],
+                $currentConfidence >= 950 => [4, $current],
+                default => match (self::w66OverrideDecision($category, $confidence, $current, $currentConfidence, $currentLabel)) {
+                    2 => [2, $current],
+                    1 => [1, $category],
+                    default => [3, $current],
+                },
+            };
+            array_push($out, $rule, $category, $confidence, $decision, $target, $segments, $errors);
+        }
+
+        return $out;
+    }
 }

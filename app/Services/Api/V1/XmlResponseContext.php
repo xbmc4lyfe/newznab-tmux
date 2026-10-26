@@ -6,6 +6,7 @@ namespace App\Services\Api\V1;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 final readonly class XmlResponseContext
@@ -358,5 +359,328 @@ final readonly class XmlResponseContext
         }
 
         return self::w53Words($count, implode("\0", $values), '', 3 * $count) ?? self::xmlEscapePlanBatchPhp($values);
+    }
+
+    // Rust is the default only while the paired W65.6 benchmark clears 1.5x on all four metrics.
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    private const string W65_XML_FFI_CDEF = <<<'C'
+        int32_t nntmux_w656_xml_context_batch(const char *strings, size_t strings_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W65_XML_HEADER = 21;
+
+    /** Integer columns in the order Rust reads them. */
+    public const array W65_XML_COLUMNS = ['offset', 'total', 'items'];
+
+    private const int W65_MAX_ITEMS = 1_048_576;
+
+    /** Offset (2^31 - 1), total (2^40) and item (2^20 - 1) clamps. */
+    private const int W65_XML_OFFSET_CAP = 2_147_483_647;
+
+    private const int W65_XML_TOTAL_CAP = 1_099_511_627_776;
+
+    private const int W65_XML_ITEMS_CAP = 1_048_575;
+
+    /** `strtolower(trim($type))` => 0 caps, 1 search, 2 tvsearch, 3 movie, 4 music, 5 book, 6 details, 7 register. */
+    private const array W65_XML_TYPES = [
+        'caps' => 0, 'c' => 0, 'search' => 1, 's' => 1, 'tvsearch' => 2, 'tv' => 2, 'movie' => 3, 'm' => 3,
+        'music' => 4, 'book' => 5, 'details' => 6, 'd' => 6, 'register' => 7, 'r' => 7,
+    ];
+
+    private const string W65_XML_HOST_BYTES = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:[]';
+
+    /**
+     * Plan Newznab/Torznab XML response envelopes: response types (unknown 8), server URLs and the `offset`,
+     * `total` and `items` columns. Mode 0 envelope only (caps, register), 1 paginated feed (search to book), 2
+     * single item (details), 3 error (unknown). Scheme 2 https, 1 http, 0 other (case-insensitive prefix); the
+     * host runs to the first `/` after it and allows `[A-Za-z0-9.:[]-]`. Offsets clamp to 0..2^31-1, totals to
+     * 0..2^40 and items to 0..2^20-1. A feed is consistent when offset + items fit the total, a single item holds
+     * at most one item and an envelope none. Flags: 1 valid host, 2 trailing slash, 4 non-ASCII URL, 8
+     * consistent, 16 offset past a non-zero total, 32 valid (scheme, host and consistent).
+     *
+     * Layout: `[0]` count, `[1..10]` per type, `[10..14]` per mode, `[14]` valid, `[15]` https, `[16]` total
+     * items, `[17]` largest total, `[18]` inconsistent, `[19]` first invalid index (-1), `[20]` FNV-1a digest;
+     * then per context `type | mode << 4 | scheme << 6 | flags << 8 | items << 14 | min(offset, 2^24-1) << 34 |
+     * min(URL bytes, 31) << 58`.
+     *
+     * @param  array<array-key, int|string>  $types
+     * @param  array<array-key, int|string>  $servers
+     * @param  array<string, array<array-key, int>>  $metrics
+     * @return list<int>
+     */
+    public static function w65XmlResponseContextPlanBatch(array $types, array $servers, array $metrics): array
+    {
+        return (self::usesW65RustFfi() ? self::w65XmlResponseContextPlanBatchNative($types, $servers, $metrics) : null)
+            ?? self::w65XmlResponseContextPlanBatchPhp($types, $servers, $metrics);
+    }
+
+    /**
+     * @param  array<array-key, int|string>  $types
+     * @param  array<array-key, int|string>  $servers
+     * @param  array<string, array<array-key, int>>  $metrics
+     * @return list<int>
+     */
+    public static function w65XmlResponseContextPlanBatchPhp(array $types, array $servers, array $metrics): array
+    {
+        $types = array_values($types);
+        $count = \count($types);
+        $servers = self::w65Column($servers, $count, '');
+        [$offsets, $totals, $items] = self::w65Metrics($metrics, $count);
+        $out = array_fill(0, self::W65_XML_HEADER, 0);
+        $out[0] = $count;
+        $out[19] = -1;
+        $digest = 2_166_136_261;
+        $rows = [];
+        foreach ($types as $at => $type) {
+            $kind = self::W65_XML_TYPES[strtolower(trim((string) $type))] ?? 8;
+            $mode = match ($kind) {
+                0, 7 => 0,
+                6 => 2,
+                8 => 3,
+                default => 1,
+            };
+            $url = (string) $servers[$at];
+            $scheme = strncasecmp($url, 'https://', 8) === 0 ? 2 : (strncasecmp($url, 'http://', 7) === 0 ? 1 : 0);
+            $host = '';
+            if ($scheme > 0) {
+                $rest = substr($url, 6 + $scheme);
+                $slash = strpos($rest, '/');
+                $host = $slash === false ? $rest : substr($rest, 0, $slash);
+            }
+            $hostValid = $host !== '' && strspn($host, self::W65_XML_HOST_BYTES) === \strlen($host);
+            $offset = max(0, min($offsets[$at], self::W65_XML_OFFSET_CAP));
+            $total = max(0, min($totals[$at], self::W65_XML_TOTAL_CAP));
+            $item = max(0, min($items[$at], self::W65_XML_ITEMS_CAP));
+            $consistent = match ($mode) {
+                0 => $item === 0,
+                1 => $offset <= $total && $item <= $total - $offset,
+                2 => $item <= 1,
+                default => false,
+            };
+            $valid = $scheme > 0 && $hostValid && $consistent;
+            $flags = ($hostValid ? 1 : 0) | ($url !== '' && $url[-1] === '/' ? 2 : 0) | (preg_match('/[\x80-\xff]/', $url) === 1 ? 4 : 0)
+                | ($consistent ? 8 : 0) | ($mode === 1 && $total > 0 && $offset >= $total ? 16 : 0) | ($valid ? 32 : 0);
+            $out[1 + $kind]++;
+            $out[10 + $mode]++;
+            $out[14] += (int) $valid;
+            $out[15] += (int) ($scheme === 2);
+            $out[16] += $item;
+            $out[17] = max($out[17], $total);
+            $out[18] += (int) ! $consistent;
+            if (! $valid && $out[19] < 0) {
+                $out[19] = $at;
+            }
+            $row = $kind | $mode << 4 | $scheme << 6 | $flags << 8 | $item << 14 | min($offset, 0xFFFFFF) << 34 | min(\strlen($url), 31) << 58;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[20] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust plan, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, int|string>  $types
+     * @param  array<array-key, int|string>  $servers
+     * @param  array<string, array<array-key, int>>  $metrics
+     * @return list<int>|null
+     */
+    public static function w65XmlResponseContextPlanBatchNative(array $types, array $servers, array $metrics): ?array
+    {
+        $count = \count($types);
+        if ($count > self::W65_MAX_ITEMS) {
+            return null;
+        }
+        [$joined, $twin] = self::w65Strings([...array_values($types), ...self::w65Column($servers, $count, '')]);
+        $ints = self::w65Pack($metrics, $count);
+        $words = self::W65_XML_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w65Call($words, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w656_xml_context_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $words));
+    }
+
+    /**
+     * Route the Wave 65.6 batch plan through Rust for the rest of the process.
+     */
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', true);
+    }
+
+    /**
+     * Route the Wave 65.6 batch plan through PHP for the rest of the process.
+     */
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', false);
+    }
+
+    /**
+     * Restore the default Wave 65.6 routing and drop the cached binding and scratch buffer.
+     */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('reset');
+    }
+
+    public static function usesW65RustFfi(): bool
+    {
+        $forced = self::w65RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W65_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run `$callback` with the Wave 65.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 65.6 routing and binding in function statics, so the class gains no properties. No `$op` returns
+     * the forced routing (null for the default); `'set'` replaces it with `$val` and returns the previous
+     * value; `'reset'` clears the routing, binding and buffer; `'binding'` returns the cached binding and an
+     * output buffer of at least `$val` values, or null.
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $enabled = $ffi = $buffer = null;
+            $capacity = 0;
+
+            return null;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('api_w656', self::W65_XML_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 65.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w65Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w65RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Values NUL-joined and, when one holds a NUL, the same values joined with 0x01 so Rust finds the
+     * separators where the two differ.
+     *
+     * @param  list<int|string|null>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w65Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
+    }
+
+    /**
+     * Values by position, cut or padded with `$pad` to `$count`.
+     *
+     * @template T of int|string|null
+     *
+     * @param  array<array-key, T>  $values
+     * @param  T  $pad
+     * @return list<T>
+     */
+    private static function w65Column(array $values, int $count, int|string|null $pad = 0): array
+    {
+        $values = array_values($values);
+
+        return \count($values) === $count ? $values : array_pad(\array_slice($values, 0, $count), $count, $pad);
+    }
+
+    /**
+     * The named integer columns of {@see W65_XML_COLUMNS}, each cut or padded with 0 to `$count`.
+     *
+     * @param  array<string, array<array-key, int>>  $metrics
+     * @return list<list<int>>
+     */
+    private static function w65Metrics(array $metrics, int $count): array
+    {
+        $columns = [];
+        foreach (self::W65_XML_COLUMNS as $key) {
+            $columns[] = self::w65Column($metrics[$key] ?? [], $count);
+        }
+
+        return $columns;
+    }
+
+    /**
+     * The named integer columns packed one after another as machine-order `int64_t`.
+     *
+     * @param  array<string, array<array-key, int>>  $metrics
+     */
+    private static function w65Pack(array $metrics, int $count): string
+    {
+        $packed = '';
+        foreach (self::w65Metrics($metrics, $count) as $column) {
+            $packed .= pack('q*', ...$column);
+        }
+
+        return $packed;
     }
 }
