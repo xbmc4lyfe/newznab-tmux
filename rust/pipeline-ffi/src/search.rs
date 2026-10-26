@@ -44218,3 +44218,776 @@ mod wave56_5_search_page_elastic_manticore_driver_client_helper {
         }
     }
 }
+
+/// Wave 57.5 batch helpers for `AuditReleaseDeletion`, `PreparationRunDiagnostics`,
+/// `PreparedManifest`, `Prerequisites` and `PublicationForwarderDiagnostics`. Each entry reads
+/// `count` NUL-joined records in place and writes a fixed number of words per record.
+mod wave57_5_verification_audit_prep_manifest_prereq_forwarder {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Plan callback: record bytes, its output words and a reusable slice scratch vector.
+    type Plan = for<'a> fn(&'a [u8], &mut [i64], &mut Vec<&'a [u8]>);
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// PHP `str_contains()`: an empty needle always matches.
+    fn contains(text: &[u8], needle: &[u8]) -> bool {
+        let Some(&first) = needle.first() else {
+            return true;
+        };
+        let mut from = 0;
+        while let Some(at) = memchr(first, &text[from..]) {
+            let at = from + at;
+            if text[at..].starts_with(needle) {
+                return true;
+            }
+            from = at + 1;
+        }
+        false
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// Longest decimal run the helpers parse into an `i64`.
+    const MAX_DIGITS: usize = 18;
+
+    /// 1-18 ASCII digits as an integer (PHP `ctype_digit()` plus `(int)`).
+    fn number(field: &[u8]) -> Option<i64> {
+        if field.is_empty() || field.len() > MAX_DIGITS {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records, writing
+    /// `width` words per record straight into `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        width: usize,
+        plan: Plan,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(fields) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = count * width;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            let mut scratch = Vec::new();
+            for (field, slot) in fields.iter().zip(words.chunks_exact_mut(width)) {
+                plan(field, slot, &mut scratch);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `AuditReleaseDeletion::auditRecordPlanBatch()` over `guid\tverdict\tcaller\tpath...`:
+    /// `[verdict, caller, paths, flags]`. Verdict: 0 empty, 1 `unrepairable`, 2 `repairable`, 3
+    /// `inconclusive`, 4 other. Caller: 0 empty, 1 `commit`, 2 `cleanup`, 3 `audit`, 4 other. Flags: 1
+    /// guid is not 40 lowercase hex bytes, 2 empty path, 4 relative path, 8 `..` segment, 16
+    /// duplicate paths, 32 first (NZB) path lacks the guid, 64 not exactly nine paths, 128 path
+    /// with a control byte.
+    fn audit_plan<'a>(record: &'a [u8], words: &mut [i64], paths: &mut Vec<&'a [u8]>) {
+        let mut fields = record.split(|&b| b == b'\t');
+        let guid = fields.next().unwrap_or_default();
+        let verdict = match fields.next().unwrap_or_default() {
+            b"" => 0,
+            b"unrepairable" => 1,
+            b"repairable" => 2,
+            b"inconclusive" => 3,
+            _ => 4,
+        };
+        let caller = match fields.next().unwrap_or_default() {
+            b"" => 0,
+            b"commit" => 1,
+            b"cleanup" => 2,
+            b"audit" => 3,
+            _ => 4,
+        };
+        paths.clear();
+        paths.extend(fields);
+        let hex = guid.len() == 40 && guid.iter().all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let mut flags = i64::from(!hex);
+        for path in paths.iter() {
+            if path.is_empty() {
+                flags |= 2;
+                continue;
+            }
+            if path[0] != b'/' {
+                flags |= 4;
+            }
+            if path.split(|&b| b == b'/').any(|segment| segment == b"..") {
+                flags |= 8;
+            }
+            if path.iter().any(|&b| b < 0x20 || b == 0x7f) {
+                flags |= 128;
+            }
+        }
+        if let Some(first) = paths.first()
+            && (guid.is_empty() || !contains(first, guid))
+        {
+            flags |= 32;
+        }
+        let total = paths.len();
+        if total != 9 {
+            flags |= 64;
+        }
+        if total > 1 {
+            paths.sort_unstable();
+            if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+                flags |= 16;
+            }
+        }
+        words.copy_from_slice(&[verdict, caller, total as i64, flags]);
+    }
+
+    /// `PreparationRunDiagnostics::runDiagnosticsPlanBatch()` over eleven comma-separated fields
+    /// (`limit, inspected, ready, waiting_upload, unknown, header_rejected, read_failures,
+    /// selection_us, read_assessment_us, update_us, stop_reason`, each PHP-trimmed): `[stop reason,
+    /// bottleneck, assessed, flags]`. Stop reason: 0 empty, 1 `error`, 2 `limit_and_deadline`, 3
+    /// `limit`, 4 `deadline`, 5 `exhausted`, 6 other. Bottleneck: the phase with the largest
+    /// strictly positive duration, first wins ties (0 none, 1 selection, 2 read_assessment, 3
+    /// update). Assessed sums the four assessment counters. Empty counters read 0. Flags: 1 counter
+    /// that is not 1-18 digits (read as 0), 2 fewer than eleven fields, 4 more, 8 inspected above
+    /// limit, 16 assessed above inspected, 32 read failures, 64 unknown stop reason, 128 a limit
+    /// stop below the limit.
+    fn run_diagnostics_plan(record: &[u8], words: &mut [i64], _: &mut Vec<&[u8]>) {
+        let mut fields: [&[u8]; 11] = [b""; 11];
+        let mut total = 0usize;
+        for field in record.split(|&b| b == b',') {
+            if total < 11 {
+                fields[total] = field;
+            }
+            total += 1;
+        }
+        let mut flags = if total < 11 {
+            2
+        } else if total > 11 {
+            4
+        } else {
+            0
+        };
+        let mut values = [0i64; 10];
+        for (value, field) in values.iter_mut().zip(fields) {
+            let field = trim(field);
+            if field.is_empty() {
+                continue;
+            }
+            match number(field) {
+                Some(parsed) => *value = parsed,
+                None => flags |= 1,
+            }
+        }
+        let stop = match trim(fields[10]) {
+            b"" => 0,
+            b"error" => 1,
+            b"limit_and_deadline" => 2,
+            b"limit" => 3,
+            b"deadline" => 4,
+            b"exhausted" => 5,
+            _ => {
+                flags |= 64;
+                6
+            }
+        };
+        let [
+            limit,
+            inspected,
+            ready,
+            waiting,
+            unknown,
+            rejected,
+            failures,
+            ..,
+        ] = values;
+        let assessed = ready + waiting + unknown + rejected;
+        if inspected > limit {
+            flags |= 8;
+        }
+        if assessed > inspected {
+            flags |= 16;
+        }
+        if failures > 0 {
+            flags |= 32;
+        }
+        if matches!(stop, 2 | 3) && inspected < limit {
+            flags |= 128;
+        }
+        let (mut bottleneck, mut best) = (0i64, 0i64);
+        for (code, &duration) in (1..).zip(&values[7..]) {
+            if duration > best {
+                best = duration;
+                bottleneck = code;
+            }
+        }
+        words.copy_from_slice(&[stop, bottleneck, assessed, flags]);
+    }
+
+    /// 32-bit FNV-1a (PHP `hash('fnv1a32')`).
+    fn fnv1a32(bytes: &[u8]) -> u32 {
+        bytes.iter().fold(0x811c_9dc5u32, |hash, &b| {
+            (hash ^ u32::from(b)).wrapping_mul(0x0100_0193)
+        })
+    }
+
+    /// `PreparedManifest::manifestEntryPlanBatch()` over newline-separated `name\tsegments\tbytes`
+    /// entries (empty lines skipped): `[valid, invalid, segments, bytes, digest]`. An entry is valid
+    /// with exactly three fields, a name that is not empty, `.` or `..` and holds no `/`, 1-18 digit
+    /// positive segments and 1-18 digit bytes. Segment and byte totals saturate at `i64::MAX`; the
+    /// digest is the FNV-1a 32 hash of the whole record.
+    fn manifest_entry_plan(record: &[u8], words: &mut [i64], _: &mut Vec<&[u8]>) {
+        let (mut valid, mut invalid, mut segments, mut bytes) = (0i64, 0i64, 0i64, 0i64);
+        for line in record.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split(|&b| b == b'\t');
+            let (Some(name), Some(seg), Some(size), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                invalid += 1;
+                continue;
+            };
+            let entry = match (number(seg), number(size)) {
+                (Some(seg), Some(size))
+                    if seg > 0
+                        && !matches!(name, b"" | b"." | b"..")
+                        && memchr(b'/', name).is_none() =>
+                {
+                    Some((seg, size))
+                }
+                _ => None,
+            };
+            match entry {
+                Some((seg, size)) => {
+                    valid += 1;
+                    segments = segments.saturating_add(seg);
+                    bytes = bytes.saturating_add(size);
+                }
+                None => invalid += 1,
+            }
+        }
+        words.copy_from_slice(&[valid, invalid, segments, bytes, i64::from(fnv1a32(record))]);
+    }
+
+    /// PHP `in_array(strtolower($value), ['1', 'true', 'yes', 'on'], true)`.
+    fn truthy(value: &[u8]) -> bool {
+        value == b"1"
+            || value.eq_ignore_ascii_case(b"true")
+            || value.eq_ignore_ascii_case(b"yes")
+            || value.eq_ignore_ascii_case(b"on")
+    }
+
+    /// `Prerequisites::readinessPlanBatch()` over comma-separated `key=value` pairs (items, keys and
+    /// values PHP-trimmed, keys ASCII case-insensitive, later pairs win): `[missing, satisfied,
+    /// flags, ready]`. Requirement bits: 1 `par2` (non-empty binary), 2 `nntp`, 4 `database`, 8
+    /// `storage`, 16 `queue`, 32 `scratch` (truthy `1`/`true`/`yes`/`on`); `required` (default
+    /// true) gates readiness. Missing masks unsatisfied requirements; ready is 1 when not required
+    /// or nothing is missing. Flags: 1 explicit PAR2 path (`/` or `\`), 2 unknown key, 4 duplicate
+    /// key, 8 item without `=`, 16 not required.
+    fn readiness_plan(record: &[u8], words: &mut [i64], _: &mut Vec<&[u8]>) {
+        let (mut have, mut seen, mut flags) = (0i64, 0i64, 0i64);
+        let (mut required, mut explicit) = (true, false);
+        for item in record.split(|&b| b == b',') {
+            let item = trim(item);
+            if item.is_empty() {
+                continue;
+            }
+            let Some(eq) = memchr(b'=', item) else {
+                flags |= 8;
+                continue;
+            };
+            let key = trim(&item[..eq]);
+            let value = trim(&item[eq + 1..]);
+            let bit = [
+                &b"par2"[..],
+                b"nntp",
+                b"database",
+                b"storage",
+                b"queue",
+                b"scratch",
+                b"required",
+            ]
+            .iter()
+            .position(|name| key.eq_ignore_ascii_case(name))
+            .map_or(0, |index| 1i64 << index);
+            if bit == 0 {
+                flags |= 2;
+                continue;
+            }
+            if seen & bit != 0 {
+                flags |= 4;
+            }
+            seen |= bit;
+            let on = match bit {
+                64 => {
+                    required = truthy(value);
+                    continue;
+                }
+                1 => {
+                    explicit = value.iter().any(|&b| b == b'/' || b == b'\\');
+                    !value.is_empty()
+                }
+                _ => truthy(value),
+            };
+            if on {
+                have |= bit;
+            } else {
+                have &= !bit;
+            }
+        }
+        if !required {
+            flags |= 16;
+        }
+        if explicit {
+            flags |= 1;
+        }
+        let missing = 63 & !have;
+        let ready = i64::from(!required || missing == 0);
+        words.copy_from_slice(&[missing, i64::from(have.count_ones() as u8), flags, ready]);
+    }
+
+    /// `PublicationForwarderDiagnostics::forwarderPlanBatch()` over comma-separated item results
+    /// (PHP-trimmed, empty skipped): `[items, success, retry, errors, health]`. Three-digit codes
+    /// classify as HTTP statuses: 2xx success; 408, 429, 503 and 504 retry; other 4xx and 5xx
+    /// errors. Labels: `published`, `filtered`, `metadata_review` success; `deferred`, `paused`,
+    /// `retry`, `stale` retry; `error`, `transport`, `invalid` errors; anything else only counts as
+    /// an item. Health: 0 no items, 1 no errors and at most a quarter retried, 2 at most a tenth
+    /// errors, 3 failing.
+    fn forwarder_plan(record: &[u8], words: &mut [i64], _: &mut Vec<&[u8]>) {
+        let (mut items, mut success, mut retry, mut errors) = (0i64, 0i64, 0i64, 0i64);
+        for token in record.split(|&b| b == b',') {
+            let token = trim(token);
+            if token.is_empty() {
+                continue;
+            }
+            items += 1;
+            if token.len() == 3 && token.iter().all(u8::is_ascii_digit) {
+                let code = token
+                    .iter()
+                    .fold(0u32, |acc, &b| acc * 10 + u32::from(b - b'0'));
+                match code {
+                    200..=299 => success += 1,
+                    408 | 429 | 503 | 504 => retry += 1,
+                    400..=599 => errors += 1,
+                    _ => {}
+                }
+                continue;
+            }
+            match token {
+                b"published" | b"filtered" | b"metadata_review" => success += 1,
+                b"deferred" | b"paused" | b"retry" | b"stale" => retry += 1,
+                b"error" | b"transport" | b"invalid" => errors += 1,
+                _ => {}
+            }
+        }
+        let health = if items == 0 {
+            0
+        } else if errors == 0 && retry * 4 <= items {
+            1
+        } else if errors * 10 <= items {
+            2
+        } else {
+            3
+        };
+        words.copy_from_slice(&[items, success, retry, errors, health]);
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes the
+            /// helper's fixed words per record and returns the words written, `-needed` when
+            /// `out_cap` is too small (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(
+                        count, flags, data, data_len, ints, ints_len, out, out_cap, $width, $plan,
+                    )
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `AuditReleaseDeletion::auditRecordPlanBatch()` (see [`audit_plan`]).
+        nntmux_w575_audit_record_plan, 4, audit_plan
+    );
+    entry!(
+        /// `PreparationRunDiagnostics::runDiagnosticsPlanBatch()` (see [`run_diagnostics_plan`]).
+        nntmux_w575_run_diagnostics_plan, 4, run_diagnostics_plan
+    );
+    entry!(
+        /// `PreparedManifest::manifestEntryPlanBatch()` (see [`manifest_entry_plan`]).
+        nntmux_w575_manifest_entry_plan, 5, manifest_entry_plan
+    );
+    entry!(
+        /// `Prerequisites::readinessPlanBatch()` (see [`readiness_plan`]).
+        nntmux_w575_readiness_plan, 4, readiness_plan
+    );
+    entry!(
+        /// `PublicationForwarderDiagnostics::forwarderPlanBatch()` (see [`forwarder_plan`]).
+        nntmux_w575_forwarder_plan, 5, forwarder_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [(Entry, usize); 5] = [
+            (nntmux_w575_audit_record_plan, 4),
+            (nntmux_w575_run_diagnostics_plan, 4),
+            (nntmux_w575_manifest_entry_plan, 5),
+            (nntmux_w575_readiness_plan, 4),
+            (nntmux_w575_forwarder_plan, 5),
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Vec<i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        const GUID: &[u8] = b"0123456789abcdef0123456789abcdef01234567";
+
+        #[test]
+        fn w575_audit_plans_classify_records() {
+            let nine = [
+                &b"0123456789abcdef0123456789abcdef01234567\tunrepairable\tcommit\t/n/0/0123456789abcdef0123456789abcdef01234567.nzb.gz"[..],
+                b"\t/c/1\t/c/2\t/c/3\t/c/4\t/c/5\t/c/6\t/c/7\t/c/8",
+            ]
+            .concat();
+            let words = call(
+                nntmux_w575_audit_record_plan,
+                &[
+                    &nine,
+                    b"",
+                    GUID,
+                    b"XYZ\trepairable\tcleanup\trel/../x\t\t/a\x01",
+                    b"0123456789abcdef0123456789abcdef01234567\tinconclusive\taudit\t/a\t/a",
+                    b"g\tother\twho\t/g",
+                ],
+            );
+            assert_eq!(
+                words,
+                [
+                    1, 1, 9, 0, //
+                    0, 0, 0, 65, //
+                    0, 0, 0, 64, //
+                    2, 2, 3, 239, //
+                    3, 3, 2, 112, //
+                    4, 4, 1, 65,
+                ]
+            );
+        }
+
+        #[test]
+        fn w575_run_diagnostics_plans_normalize_runs() {
+            let words = call(
+                nntmux_w575_run_diagnostics_plan,
+                &[
+                    b"100,100,60,20,10,5,0,30,900,40,limit",
+                    b"",
+                    b"10, 20 ,5,5,5,10,2,7,7,7, deadline ",
+                    b"5,1,x,,,,,,,0,limit,extra",
+                    b"50,40,1,1,1,1,0,0,0,0,bogus",
+                ],
+            );
+            assert_eq!(
+                words,
+                [
+                    3, 2, 95, 0, //
+                    0, 0, 0, 2, //
+                    4, 1, 25, 56, //
+                    3, 0, 0, 133, //
+                    6, 0, 4, 64,
+                ]
+            );
+        }
+
+        #[test]
+        fn w575_manifest_plans_roll_up_entries() {
+            let words = call(
+                nntmux_w575_manifest_entry_plan,
+                &[
+                    b"a.rar\t10\t1000\nb.par2\t1\t20\n",
+                    b"",
+                    b"..\t1\t1\nx/y\t1\t1\nz\t0\t1\nw\t1\nv\t1\t1\t1\nu\t1\t1",
+                    b"a\t999999999999999999\t999999999999999999\nb\t999999999999999999\t999999999999999999",
+                ],
+            );
+            let digests: Vec<i64> = [
+                &b"a.rar\t10\t1000\nb.par2\t1\t20\n"[..],
+                b"",
+                b"..\t1\t1\nx/y\t1\t1\nz\t0\t1\nw\t1\nv\t1\t1\t1\nu\t1\t1",
+                b"a\t999999999999999999\t999999999999999999\nb\t999999999999999999\t999999999999999999",
+            ]
+            .iter()
+            .map(|r| i64::from(fnv1a32(r)))
+            .collect();
+            assert_eq!(fnv1a32(b""), 0x811c_9dc5);
+            assert_eq!(fnv1a32(b"a"), 0xe40c_292c);
+            assert_eq!(
+                words,
+                [
+                    2,
+                    0,
+                    11,
+                    1020,
+                    digests[0], //
+                    0,
+                    0,
+                    0,
+                    0,
+                    digests[1], //
+                    1,
+                    5,
+                    1,
+                    1,
+                    digests[2], //
+                    2,
+                    0,
+                    1_999_999_999_999_999_998,
+                    1_999_999_999_999_999_998,
+                    digests[3],
+                ]
+            );
+        }
+
+        #[test]
+        fn w575_readiness_plans_encode_missing_requirements() {
+            let words = call(
+                nntmux_w575_readiness_plan,
+                &[
+                    b"par2=/usr/bin/par2,nntp=1,database=true,storage=YES,queue=on,scratch=1",
+                    b"",
+                    b" PAR2 = par2 , nntp=0, bogus=1, noeq ,required=no",
+                    b"par2=,par2=C:\\par2.exe,nntp=1,nntp=0",
+                ],
+            );
+            assert_eq!(
+                words,
+                [
+                    0, 6, 1, 1, //
+                    63, 0, 0, 0, //
+                    62, 1, 26, 1, //
+                    62, 1, 5, 0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w575_forwarder_plans_roll_up_health() {
+            let words = call(
+                nntmux_w575_forwarder_plan,
+                &[
+                    b"200,201,published,filtered",
+                    b"",
+                    b"200,429,retry,deferred",
+                    b"500, 404 ,transport,200,200,200,200,200,200,200,200,200,200,200,200,200,200,200,200,200,200",
+                    b"error,invalid,301,099,0200,other",
+                ],
+            );
+            assert_eq!(
+                words,
+                [
+                    4, 4, 0, 0, 1, //
+                    0, 0, 0, 0, 0, //
+                    4, 1, 3, 0, 2, //
+                    21, 18, 0, 3, 3, //
+                    6, 0, 0, 2, 3,
+                ]
+            );
+        }
+
+        #[test]
+        fn w575_entries_validate_the_abi() {
+            for (entry, width) in ENTRIES {
+                let data = b"a\0b";
+                let mut out = [7i64; 16];
+                let call = |count: usize, flags: i64, len: usize, cap: usize, out: *mut i64| unsafe {
+                    entry(
+                        count,
+                        flags,
+                        data.as_ptr(),
+                        len,
+                        std::ptr::null(),
+                        0,
+                        out,
+                        cap,
+                    )
+                };
+                let needed = (2 * width) as i64;
+                assert_eq!(call(2, 0, 3, 16, out.as_mut_ptr()), needed);
+                assert_eq!(call(2, 0, 3, 2 * width - 1, out.as_mut_ptr()), -needed);
+                assert_eq!(call(2, 1, 3, 16, out.as_mut_ptr()), -1);
+                assert_eq!(call(3, 0, 3, 16, out.as_mut_ptr()), -1);
+                assert_eq!(call(1, 0, 3, 16, out.as_mut_ptr()), -1);
+                assert_eq!(call(0, 0, 0, 0, std::ptr::null_mut()), 0);
+                assert_eq!(call(2, 0, 3, 4, std::ptr::null_mut()), -1);
+                let overlapping = unsafe {
+                    entry(
+                        1,
+                        0,
+                        out.as_ptr().cast(),
+                        8,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        16,
+                    )
+                };
+                assert_eq!(overlapping, -1);
+            }
+        }
+    }
+}
