@@ -7,6 +7,7 @@ namespace App\Services\Releases\Verification;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
+use InvalidArgumentException;
 use Throwable;
 
 /** Validate all article references without fetching any payload. */
@@ -668,5 +669,304 @@ final class CandidateHeaderInventory
         $words[] = $digest[1];
 
         return $words;
+    }
+
+    // ========================================================================
+    // WAVE 63.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 1000-round paired runs reached 2.26x common mean, 2.32x common p99, 1.52x uncommon mean and 1.85x uncommon p99; see RustVerificationAdmissionInventoryPrepRepoSampleBatchW63ParityTest. */
+    public const bool W63_RUST_FFI_DEFAULT = true;
+
+    private const string W63_FFI_CDEF = 'ssize_t nntmux_w634_candidate_header_inventory_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w63HeaderInventoryPlanBatch() record. */
+    public const int W63_ROW_WORDS = 4;
+
+    /** int64 summary words after the w63HeaderInventoryPlanBatch() records (none for an empty batch). */
+    public const int W63_TRAILER_WORDS = 9;
+
+    /** Bytes a trimmed message ID may not hold: \s, controls, DEL and angle brackets. */
+    private const string W63_INVALID_ID = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x7f<>";
+
+    private const int W63_BYTES_MAX = 1 << 36;
+
+    /**
+     * Header inventory plan rows for [file key, message ID, part number, bytes, declared parts]
+     * segment items in manifest order.
+     *
+     * Message IDs are trimmed of `<>` and checked with assessment()'s pattern. Files are keyed by
+     * their first appearance and keep that row's declared count. Flags: 1 invalid message ID, 2
+     * message ID repeats, 4 number outside 1..declared parts, 8 number repeats in its file, 16
+     * bytes < 1, 32 empty file key, 64 declared parts differ from the file's first row, 128 number
+     * below the file's highest (clamped to 0..2^31). The gap is the number of parts skipped since
+     * the file's highest number.
+     *
+     * Rows [flags | trimmed length << 8 (clamped to 2^24 - 1) | number << 32 (clamped to
+     * 0..2^24 - 1), fnv1a32(trimmed ID) (0 when empty), gap, file ordinal], then the trailer
+     * [articles, files, articles expected (per file max(segments, declared)), complete files,
+     * gaps, positive bytes (each clamped to 2^36), defective rows, duplicate IDs, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int}>  $items
+     * @return list<int>
+     */
+    public static function w63HeaderInventoryPlanBatch(array $items): array
+    {
+        return self::usesW63RustFfi() ? self::w63HeaderInventoryPlanBatchNative($items) : self::w63HeaderInventoryPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int}>  $items
+     * @return list<int>
+     */
+    public static function w63HeaderInventoryPlanBatchPhp(array $items): array
+    {
+        self::w63Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = $files = $stats = $ids = $numbers = [];
+        $gaps = $bytesTotal = $invalid = $duplicates = 0;
+        $digest = 2_166_136_261;
+        foreach ($items as [$key, $messageId, $number, $bytes, $total]) {
+            $id = trim($messageId, '<>');
+            $length = \strlen($id);
+            $flags = $length > 0 && strcspn($id, self::W63_INVALID_ID) === $length ? 0 : 1;
+            if (isset($ids[$id])) {
+                $flags |= 2;
+            } else {
+                $ids[$id] = true;
+            }
+            if ($number < 1 || $number > $total) {
+                $flags |= 4;
+            }
+            if (isset($files[$key])) {
+                $f = $files[$key];
+            } else {
+                $f = $files[$key] = \count($stats);
+                $stats[] = [0, $total, 0];
+            }
+            if (isset($numbers[$f][$number])) {
+                $flags |= 8;
+            } else {
+                $numbers[$f][$number] = true;
+            }
+            if ($bytes < 1) {
+                $flags |= 16;
+            } else {
+                $bytesTotal += min($bytes, self::W63_BYTES_MAX);
+            }
+            if ($key === '') {
+                $flags |= 32;
+            }
+            if ($total !== $stats[$f][1]) {
+                $flags |= 64;
+            }
+            $n = max(0, min(1 << 31, $number));
+            $last = $stats[$f][2];
+            $gap = 0;
+            if ($n > $last) {
+                $gap = $n - $last - 1;
+                $stats[$f][2] = $n;
+            } elseif ($n < $last) {
+                $flags |= 128;
+            }
+            $stats[$f][0]++;
+            $gaps += $gap;
+            if ($flags !== 0) {
+                $invalid++;
+                if (($flags & 2) !== 0) {
+                    $duplicates++;
+                }
+            }
+            $hash = $length === 0 ? 0 : self::w63Fnv($id);
+            $word = $flags | min($length, 0xFFFFFF) << 8 | max(0, min(0xFFFFFF, $number)) << 32;
+            array_push($out, $word, $hash, $gap, $f);
+            $value = $word ^ $hash << 16 ^ $gap;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $expected = $complete = 0;
+        foreach ($stats as [$segments, $total]) {
+            $expected += max($segments, max(0, min(1 << 31, $total)));
+            if ($total >= 1 && $segments >= $total) {
+                $complete++;
+            }
+        }
+
+        return [...$out, \count($items), \count($stats), $expected, $complete, $gaps, $bytesTotal, $invalid, $duplicates, $digest];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int}>  $items
+     * @return list<int>
+     */
+    public static function w63HeaderInventoryPlanBatchNative(array $items): array
+    {
+        self::w63Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w63Join([array_column($items, 0), array_column($items, 1)], $count);
+        $ints = pack('P*', ...array_column($items, 2), ...array_column($items, 3), ...array_column($items, 4));
+
+        return self::w63Call($blob, $twin, $ints, $count, $count * self::W63_ROW_WORDS + self::W63_TRAILER_WORDS)
+            ?? self::w63HeaderInventoryPlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w63Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W63 candidate header inventory plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 5 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_int($item[2]) || ! \is_int($item[3]) || ! \is_int($item[4])) {
+                throw new InvalidArgumentException('W63 candidate header inventory plan batch items must be [string file key, string message id, int number, int bytes, int declared parts] lists.');
+            }
+        }
+    }
+
+    public static function usesW63RustFfi(): bool
+    {
+        $enabled = self::w63RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W63_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW63RustFfi(): void
+    {
+        self::w63RustFfiState('enabled', true);
+    }
+
+    public static function disableW63RustFfi(): void
+    {
+        self::w63RustFfiState('enabled', false);
+    }
+
+    /** Drop the W63 override, binding, output buffer and declined-call count; routing returns to W63_RUST_FFI_DEFAULT. */
+    public static function resetW63RustFfi(): void
+    {
+        self::w63RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W63 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW63RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w63RustFfiState('enabled');
+        self::w63RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w63RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w63Join(array $columns, int $count): array
+    {
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\0", $column);
+        }
+        $joined = implode("\0", $parts);
+        if (substr_count($joined, "\0") === \count($columns) * $count - 1) {
+            return [$joined, ''];
+        }
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\x01", $column);
+        }
+
+        return [$joined, implode("\x01", $parts)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w63Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w63RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w63', self::W63_FFI_CDEF) ?? false;
+            self::w63RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w63RustFfiState('out', $out);
+                self::w63RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W63_FFI_CDEF.)
+            $written = $ffi->nntmux_w634_candidate_header_inventory_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w63RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W63 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w63RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int. */
+    private static function w63Fnv(string $bytes): int
+    {
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
     }
 }

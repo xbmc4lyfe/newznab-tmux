@@ -23,6 +23,7 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 use RuntimeException;
 use Throwable;
 
@@ -2123,5 +2124,298 @@ final class CandidateRepository
         $words[] = $digest[1];
 
         return $words;
+    }
+
+    // ========================================================================
+    // WAVE 63.4 BATCH HELPER
+    // ========================================================================
+
+    /** Disabled: the minimum of three 1000-round paired runs reached 1.55x common p99 but only 1.47x common mean, 1.27x uncommon mean and 1.05x uncommon p99, so PHP stays the default; see RustVerificationAdmissionInventoryPrepRepoSampleBatchW63ParityTest. */
+    public const bool W63_RUST_FFI_DEFAULT = false;
+
+    private const string W63_FFI_CDEF = 'ssize_t nntmux_w634_candidate_repository_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w63CandidateRepoPlanBatch() record. */
+    public const int W63_ROW_WORDS = 5;
+
+    /** int64 summary words after the w63CandidateRepoPlanBatch() records (none for an empty batch). */
+    public const int W63_TRAILER_WORDS = 9;
+
+    private const array W63_STATUS_CODES = ['ready' => 1, 'pending' => 2, 'unknown' => 3, 'verifying' => 4, 'waiting_upload' => 5, 'header_rejected' => 6,
+        'unrepairable' => 7, 'dirty' => 8, 'metadata_deferred' => 9, 'metadata_review' => 10, 'filtered' => 11, 'expired' => 12];
+
+    private const int W63_TIME_MAX = 1 << 40;
+
+    private const int W63_CLAIM_WINDOW = 100;
+
+    /**
+     * Claim, lease and retry plan rows for [status, lease token, reason, id, version, next attempt
+     * at, lease until, now, release id, lease seconds, retry seconds, deterministic retry seconds,
+     * deterministic] items (times in epoch seconds; a lease until <= 0 is no lease; now clamped
+     * to 0..2^40, lease seconds to 1..86400, retry seconds to 0..31536000).
+     *
+     * Status codes: claimable 1 ready, 2 pending, 3 unknown, 4 verifying; then 5 waiting_upload,
+     * 6 header_rejected, 7 unrepairable, 8 dirty, 9 metadata_deferred, 10 metadata_review, 11
+     * filtered, 12 expired; 0 other. Lease tokens are 0 empty, 1 UUID, 2 other. A row is claimable
+     * like claimableCandidates(): unpublished, claimable status, due and its lease free, and its id
+     * not seen earlier (claimQueueIds() keeps one slot per id). Action: 1 claim (lease until now +
+     * lease seconds), 2 renew a held verifying lease with a UUID token (same lease), 3 return a
+     * stale verifying lease (lease 0), 4 published, 5 wait until due, 6 ineligible (lease -1 for
+     * 4-6). Claimable rows are ranked by (next attempt at, id); the first 100 form the claim
+     * window. The finish() retry is now + (deterministic ? deterministic retry : retry) seconds.
+     *
+     * Rows [action | status << 4 | token class << 8 | flags << 12 (1 due, 2 lease free, 4
+     * published, 8 duplicate id, 16 in the claim window, 32 version < 1, 64 ready queue, 128
+     * partial publication deferred reason), lease until, retry at, rank (-1), seconds until due (0
+     * when due)], then the trailer [claim, renew, stale, published, wait and ineligible counts,
+     * claim window size, earliest next attempt of a waiting row (-1), FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int, 9: int, 10: int, 11: int, 12: int}>  $items
+     * @return list<int>
+     */
+    public static function w63CandidateRepoPlanBatch(array $items): array
+    {
+        return self::usesW63RustFfi() ? self::w63CandidateRepoPlanBatchNative($items) : self::w63CandidateRepoPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int, 9: int, 10: int, 11: int, 12: int}>  $items
+     * @return list<int>
+     */
+    public static function w63CandidateRepoPlanBatchPhp(array $items): array
+    {
+        self::w63Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = $ids = $nexts = $windowIds = $positions = [];
+        $summary = [0, 0, 0, 0, 0, 0, 0, -1, 0];
+        foreach ($items as $i => [$status, $leaseToken, $reason, $id, $version, $next, $lease, $now, $releaseId, $leaseSeconds, $retrySeconds, $deterministicSeconds, $deterministic]) {
+            $code = self::W63_STATUS_CODES[$status] ?? 0;
+            if ($leaseToken === '') {
+                $token = 0;
+            } else {
+                $token = \strlen($leaseToken) === 36 && $leaseToken[8] === '-' && $leaseToken[13] === '-' && $leaseToken[18] === '-' && $leaseToken[23] === '-'
+                    && strspn(str_replace('-', '', $leaseToken), '0123456789abcdefABCDEF') === 32 ? 1 : 2;
+            }
+            $now = max(0, min(self::W63_TIME_MAX, $now));
+            $released = $releaseId > 0;
+            $duplicate = isset($ids[$id]);
+            $ids[$id] = true;
+            $due = $next <= $now;
+            $free = $lease <= 0 || $lease < $now;
+            $claimable = ! $released && $code >= 1 && $code <= 4 && $due && $free && ! $duplicate;
+            $leaseFor = max(1, min(86_400, $leaseSeconds));
+            if ($claimable) {
+                [$action, $leaseOut] = [1, $now + $leaseFor];
+            } elseif ($released) {
+                [$action, $leaseOut] = [4, -1];
+            } elseif ($code === 4 && ! $free && $token === 1) {
+                [$action, $leaseOut] = [2, $now + $leaseFor];
+            } elseif ($code === 4 && $free) {
+                [$action, $leaseOut] = [3, 0];
+            } elseif (! $due) {
+                [$action, $leaseOut] = [5, -1];
+            } else {
+                [$action, $leaseOut] = [6, -1];
+            }
+            $retryAt = $now + max(0, min(31_536_000, $deterministic !== 0 ? $deterministicSeconds : $retrySeconds));
+            $flags = ($due ? 1 : 0) | ($free ? 2 : 0) | ($released ? 4 : 0) | ($duplicate ? 8 : 0) | ($version < 1 ? 32 : 0) | ($code === 1 ? 64 : 0)
+                | (str_starts_with($reason, self::PARTIAL_DEFERRED) ? 128 : 0);
+            array_push($out, $action | $code << 4 | $token << 8 | $flags << 12, $leaseOut, $retryAt, -1, $due ? 0 : min($next - $now, self::W63_TIME_MAX));
+            $summary[$action - 1]++;
+            if ($action === 5 && ($summary[7] < 0 || $next < $summary[7])) {
+                $summary[7] = $next;
+            }
+            if ($claimable) {
+                $nexts[] = $next;
+                $windowIds[] = $id;
+                $positions[] = $i;
+            }
+        }
+        if ($positions !== []) {
+            array_multisort($nexts, SORT_ASC, SORT_NUMERIC, $windowIds, SORT_ASC, SORT_NUMERIC, $positions);
+            foreach ($positions as $rank => $i) {
+                $out[5 * $i + 3] = $rank;
+                if ($rank < self::W63_CLAIM_WINDOW) {
+                    $out[5 * $i] |= 16 << 12;
+                }
+            }
+        }
+        $summary[6] = min(\count($positions), self::W63_CLAIM_WINDOW);
+        $digest = 2_166_136_261;
+        for ($k = 0, $words = \count($out); $k < $words; $k += 5) {
+            $value = $out[$k] ^ $out[$k + 1] << 8 ^ $out[$k + 3];
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $summary[8] = $digest;
+
+        return [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int, 9: int, 10: int, 11: int, 12: int}>  $items
+     * @return list<int>
+     */
+    public static function w63CandidateRepoPlanBatchNative(array $items): array
+    {
+        self::w63Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w63Join([array_column($items, 0), array_column($items, 1), array_column($items, 2)], $count);
+        $ints = pack('P*', ...array_column($items, 3), ...array_column($items, 4), ...array_column($items, 5), ...array_column($items, 6), ...array_column($items, 7),
+            ...array_column($items, 8), ...array_column($items, 9), ...array_column($items, 10), ...array_column($items, 11), ...array_column($items, 12));
+
+        return self::w63Call($blob, $twin, $ints, $count, $count * self::W63_ROW_WORDS + self::W63_TRAILER_WORDS)
+            ?? self::w63CandidateRepoPlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w63Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W63 candidate repository plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 13 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_string($item[2]) || ! \is_int($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5]) || ! \is_int($item[6]) || ! \is_int($item[7]) || ! \is_int($item[8]) || ! \is_int($item[9]) || ! \is_int($item[10]) || ! \is_int($item[11]) || ! \is_int($item[12])) {
+                throw new InvalidArgumentException('W63 candidate repository plan batch items must be [string status, string lease token, string reason, int id, int version, int next attempt at, int lease until, int now, int release id, int lease seconds, int retry seconds, int deterministic retry seconds, int deterministic] lists.');
+            }
+        }
+    }
+
+    public static function usesW63RustFfi(): bool
+    {
+        $enabled = self::w63RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W63_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW63RustFfi(): void
+    {
+        self::w63RustFfiState('enabled', true);
+    }
+
+    public static function disableW63RustFfi(): void
+    {
+        self::w63RustFfiState('enabled', false);
+    }
+
+    /** Drop the W63 override, binding, output buffer and declined-call count; routing returns to W63_RUST_FFI_DEFAULT. */
+    public static function resetW63RustFfi(): void
+    {
+        self::w63RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W63 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW63RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w63RustFfiState('enabled');
+        self::w63RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w63RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w63Join(array $columns, int $count): array
+    {
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\0", $column);
+        }
+        $joined = implode("\0", $parts);
+        if (substr_count($joined, "\0") === \count($columns) * $count - 1) {
+            return [$joined, ''];
+        }
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\x01", $column);
+        }
+
+        return [$joined, implode("\x01", $parts)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w63Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w63RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w63', self::W63_FFI_CDEF) ?? false;
+            self::w63RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w63RustFfiState('out', $out);
+                self::w63RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W63_FFI_CDEF.)
+            $written = $ffi->nntmux_w634_candidate_repository_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w63RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W63 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w63RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
     }
 }
