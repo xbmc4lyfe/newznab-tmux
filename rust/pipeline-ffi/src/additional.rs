@@ -47025,3 +47025,993 @@ mod w626_incident_lookup_queue_registration_tests {
         assert_eq!((status, out[25]), (1, -1));
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 63.6: secondary search index, service status, signup error, tmux mode
+// and TV lookup status plans (`nntmux_w636_*`) for SecondarySearchIndex,
+// ServiceStatusEnum, SignupError, TmuxMode and TvLookupStatus. Same contract
+// as Wave 62.6: strings are NUL-joined column after column (with a
+// 0x01-joined twin when one holds a NUL), integer columns are machine-order
+// `int64_t`, and the result is fixed-width `int64_t` words. Every export
+// returns 1, -1 for invalid input or an output range overlapping an input (PHP
+// then computes the batch) or -2 when `out` is null, misaligned or too small,
+// and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+pub mod w636_enum_plans {
+    use super::*;
+
+    /// Validates `out` (-2), then rejects an output range overlapping any
+    /// input (-1) before running `compute` under `w49_run`.
+    unsafe fn w636_run(
+        out: *mut i64,
+        out_cap: usize,
+        inputs: &[(*const u8, usize)],
+        compute: impl FnOnce() -> Option<Vec<i64>>,
+    ) -> i32 {
+        if out.is_null() || !w17_aligned(out.cast_const(), out_cap) {
+            return -2;
+        }
+        let start = out as usize;
+        // `w17_aligned` proved `out_cap * 8` fits without wrapping.
+        let end = start + out_cap * std::mem::size_of::<i64>();
+        let disjoint = inputs.iter().all(|&(ptr, len)| {
+            len == 0 || ptr.is_null() || {
+                let from = ptr as usize;
+                from.saturating_add(len) <= start || from >= end
+            }
+        });
+        if !disjoint {
+            return -1;
+        }
+        // SAFETY: forwarded output contract.
+        unsafe { w49_run(out, out_cap, compute) }
+    }
+
+    /// A token length saturated to 8 bits.
+    #[inline]
+    fn w636_len8(value: &[u8]) -> i64 {
+        value.len().min(255) as i64
+    }
+
+    // --- SecondarySearchIndex::w63SecondaryIndexPlanBatch --------------------
+
+    pub(crate) const W636_INDEX_HEADER: usize = 30;
+
+    /// Largest document id carried in a row (2^31 - 1).
+    const W636_DOC_CAP: i64 = (1 << 31) - 1;
+
+    /// Manticore column count per case (unknown 0).
+    const W636_INDEX_COLUMNS: [i64; 7] = [5, 4, 4, 5, 2, 8, 0];
+
+    /// Case 0 music, 1 books, 2 games, 3 console, 4 steam, 5 anime, 6 unknown;
+    /// source 0 backing value, 1 case name, 2 alias of the lowercased trimmed
+    /// token (including the `<value>_rt` table), 3 unknown.
+    #[inline]
+    fn w636_index_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+        match raw {
+            b"music" => (0, 0),
+            b"books" => (1, 0),
+            b"games" => (2, 0),
+            b"console" => (3, 0),
+            b"steam" => (4, 0),
+            b"anime" => (5, 0),
+            b"Music" => (0, 1),
+            b"Books" => (1, 1),
+            b"Games" => (2, 1),
+            b"Console" => (3, 1),
+            b"Steam" => (4, 1),
+            b"Anime" => (5, 1),
+            _ => {
+                w616_lower_trim_into(raw, lower);
+                match lower.as_slice() {
+                    b"music" | b"music_rt" | b"audio" | b"mp3" => (0, 2),
+                    b"books" | b"books_rt" | b"book" | b"ebook" | b"ebooks" => (1, 2),
+                    b"games" | b"games_rt" | b"game" | b"pc_games" => (2, 2),
+                    b"console" | b"console_rt" | b"consoles" => (3, 2),
+                    b"steam" | b"steam_rt" | b"steam_apps" => (4, 2),
+                    b"anime" | b"anime_rt" | b"anidb" | b"anime_titles" => (5, 2),
+                    _ => (6, 3),
+                }
+            }
+        }
+    }
+
+    /// `(kind, fulltext position)` of an exact column name: kind 0 absent, 1
+    /// text, 2 string, 3 integer, 4 bigint, 5 blank; position 7 when the
+    /// column is not a full-text field.
+    #[inline]
+    fn w636_index_field(case: i64, field: &[u8]) -> (i64, i64) {
+        if field.is_empty() {
+            return (5, 7);
+        }
+        match (case, field) {
+            (0, b"artist") | (1, b"author") => (1, 0),
+            (0 | 1, b"title") => (1, 1),
+            (2 | 3 | 5, b"title") | (4, b"name") => (1, 0),
+            (3, b"platform") => (2, 1),
+            (0, b"year") | (1, b"publishdate") => (2, 7),
+            (5, b"lang" | b"title_type" | b"media_type" | b"status") => (2, 7),
+            (0..=3, b"cover") | (0 | 2 | 3, b"genres_id") | (4, b"appid") => (3, 7),
+            (5, b"anidbid" | b"anilist_id" | b"mal_id") => (3, 7),
+            (2 | 3, b"releasedate_ts") => (4, 7),
+            _ => (0, 7),
+        }
+    }
+
+    /// Index tokens and requested field names (two string columns) with a
+    /// document id column. Route 0 full-text match, 1 attribute filter, 2
+    /// rejected (no such column), 3 no field requested, 4 unknown index. Doc
+    /// state 0 missing (<= 0), 1 valid, 2 overflow (> 2^31-1); the row carries
+    /// the id clamped to 0..2^31-1. `[0]` count, `[1..8]` per case, `[8..12]`
+    /// per source, `[12..18]` per field kind, `[18..23]` per route, `[23..26]`
+    /// per doc state, `[26]` mask of known cases, `[27]` first rejected or
+    /// unknown index (-1), `[28]` total columns of resolved indexes, `[29]`
+    /// FNV-1a digest; then per record `case | source << 3 | kind << 5 | route
+    /// << 8 | fulltext position << 11 | doc state << 14 | min(index bytes,
+    /// 255) << 16 | min(field bytes, 255) << 24 | doc << 32`.
+    pub(crate) fn w636_index_batch(fields: &[&[u8]], docs: &[i64], count: usize) -> Vec<i64> {
+        let mut out = vec![0i64; W636_INDEX_HEADER + count];
+        out[0] = count as i64;
+        out[27] = -1;
+        let mut lower = Vec::new();
+        for at in 0..count {
+            let raw = fields[at];
+            let field = fields[count + at];
+            let (case, source) = w636_index_case(raw, &mut lower);
+            let (kind, position) = if case == 6 {
+                (if field.is_empty() { 5 } else { 0 }, 7)
+            } else {
+                w636_index_field(case, field)
+            };
+            let route: i64 = if case == 6 {
+                4
+            } else if kind == 5 {
+                3
+            } else if kind == 0 {
+                2
+            } else if position != 7 {
+                0
+            } else {
+                1
+            };
+            let doc = docs[at];
+            let state: i64 = if doc <= 0 {
+                0
+            } else if doc <= W636_DOC_CAP {
+                1
+            } else {
+                2
+            };
+            out[1 + case as usize] += 1;
+            out[8 + source as usize] += 1;
+            out[12 + kind as usize] += 1;
+            out[18 + route as usize] += 1;
+            out[23 + state as usize] += 1;
+            if case < 6 {
+                out[26] |= 1 << case;
+            }
+            if route == 2 || route == 4 {
+                w586_first(&mut out[27], at);
+            }
+            out[28] += W636_INDEX_COLUMNS[case as usize];
+            out[W636_INDEX_HEADER + at] = case
+                | source << 3
+                | kind << 5
+                | route << 8
+                | position << 11
+                | state << 14
+                | w636_len8(raw) << 16
+                | w636_len8(field) << 24
+                | doc.clamp(0, W636_DOC_CAP) << 32;
+        }
+        out[29] = w526_digest(&out[W636_INDEX_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w636_secondary_index_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w636_run(out, out_cap, &inputs, || {
+                let fields = w566_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    2,
+                    count,
+                )?;
+                let docs = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+                Some(w636_index_batch(&fields, &docs, count))
+            })
+        }
+    }
+
+    // --- ServiceStatusEnum::w63ServiceStatusPlanBatch ------------------------
+
+    pub(crate) const W636_SERVICE_HEADER: usize = 19;
+
+    /// Duration and window clamp (2^24 - 1 seconds).
+    const W636_SERVICE_CAP: i64 = (1 << 24) - 1;
+
+    /// Uptime window used for a window at or below 0.
+    const W636_SERVICE_WINDOW: i64 = 86_400;
+
+    /// A degraded service opens an incident after this many seconds.
+    const W636_DEGRADED_INCIDENT: i64 = 1_800;
+
+    /// `severity()` per case; unknown carries 7.
+    const W636_SERVICE_SEVERITY: [i64; 6] = [0, 1, 3, 4, 2, 7];
+
+    /// Case 0 operational, 1 degraded, 2 partial outage, 3 major outage, 4
+    /// maintenance, 5 unknown; source 0 backing value, 1 case name or label, 2
+    /// alias of the lowercased trimmed token, 3 unknown.
+    #[inline]
+    fn w636_service_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+        match raw {
+            b"operational" => (0, 0),
+            b"degraded" => (1, 0),
+            b"partial_outage" => (2, 0),
+            b"major_outage" => (3, 0),
+            b"maintenance" => (4, 0),
+            b"Operational" => (0, 1),
+            b"Degraded" => (1, 1),
+            b"PartialOutage" | b"Partial outage" => (2, 1),
+            b"MajorOutage" | b"Major outage" => (3, 1),
+            b"Maintenance" => (4, 1),
+            _ => {
+                w616_lower_trim_into(raw, lower);
+                match lower.as_slice() {
+                    b"operational" | b"ok" | b"up" | b"healthy" | b"green" | b"normal"
+                    | b"online" => (0, 2),
+                    b"degraded" | b"slow" | b"yellow" | b"warning" | b"degraded_performance"
+                    | b"degraded-performance" => (1, 2),
+                    b"partial" | b"partial_outage" | b"partial-outage" | b"partial outage"
+                    | b"orange" => (2, 2),
+                    b"major" | b"major_outage" | b"major-outage" | b"major outage" | b"down"
+                    | b"outage" | b"red" | b"offline" => (3, 2),
+                    b"maintenance" | b"maint" | b"scheduled" | b"under_maintenance"
+                    | b"under maintenance" => (4, 2),
+                    _ => (5, 3),
+                }
+            }
+        }
+    }
+
+    /// Status tokens with a seconds-in-status column and an uptime window
+    /// (at or below 0 means 86,400). Durations and the window clamp to
+    /// 0..2^24-1. An incident is a partial or major outage, or degradation
+    /// longer than 1,800 seconds; stale is a known status held longer than
+    /// the window. Downtime is the window-capped duration of a major outage
+    /// and half of it for a partial one; uptime ppm is `(window - downtime) *
+    /// 10^6 / window` (0 for unknown). `[0]` count, `[1..7]` per case,
+    /// `[7..11]` per source, `[11]` worst known severity (-1), `[12]` its first
+    /// index (-1), `[13]` incidents, `[14]` stale, `[15]` total downtime,
+    /// `[16]` mean uptime ppm over known statuses (-1 when none), `[17]`
+    /// available (operational or maintenance), `[18]` FNV-1a digest; then per
+    /// status `case | source << 3 | severity << 5 | incident << 8 | stale << 9
+    /// | ppm << 10 | duration << 30 | min(token bytes, 255) << 54`.
+    pub(crate) fn w636_service_batch(statuses: &[&[u8]], durations: &[i64], window: i64) -> Vec<i64> {
+        let count = statuses.len();
+        let window = if window <= 0 {
+            W636_SERVICE_WINDOW
+        } else {
+            window.min(W636_SERVICE_CAP)
+        };
+        let mut out = vec![0i64; W636_SERVICE_HEADER + count];
+        out[0] = count as i64;
+        out[11] = -1;
+        out[12] = -1;
+        let (mut ppm_sum, mut known) = (0i64, 0i64);
+        let mut lower = Vec::new();
+        for (at, &raw) in statuses.iter().enumerate() {
+            let (case, source) = w636_service_case(raw, &mut lower);
+            let severity = W636_SERVICE_SEVERITY[case as usize];
+            let duration = durations[at].clamp(0, W636_SERVICE_CAP);
+            let incident = i64::from(
+                case == 2 || case == 3 || (case == 1 && duration > W636_DEGRADED_INCIDENT),
+            );
+            let stale = i64::from(case < 5 && duration > window);
+            let down = match case {
+                3 => duration.min(window),
+                2 => duration.min(window) / 2,
+                _ => 0,
+            };
+            let ppm = if case < 5 {
+                (window - down) * 1_000_000 / window
+            } else {
+                0
+            };
+            out[1 + case as usize] += 1;
+            out[7 + source as usize] += 1;
+            if case < 5 {
+                known += 1;
+                ppm_sum += ppm;
+                if severity > out[11] {
+                    out[11] = severity;
+                    out[12] = at as i64;
+                }
+            }
+            out[13] += incident;
+            out[14] += stale;
+            out[15] += down;
+            out[17] += i64::from(case == 0 || case == 4);
+            out[W636_SERVICE_HEADER + at] = case
+                | source << 3
+                | severity << 5
+                | incident << 8
+                | stale << 9
+                | ppm << 10
+                | duration << 30
+                | w636_len8(raw) << 54;
+        }
+        out[16] = if known > 0 { ppm_sum / known } else { -1 };
+        out[18] = w526_digest(&out[W636_SERVICE_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w636_service_status_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        window: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w636_run(out, out_cap, &inputs, || {
+                let statuses = w566_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    1,
+                    count,
+                )?;
+                let durations = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+                Some(w636_service_batch(&statuses, &durations, window))
+            })
+        }
+    }
+
+    // --- SignupError::w63SignupErrorPlanBatch --------------------------------
+
+    pub(crate) const W636_SIGNUP_HEADER: usize = 27;
+
+    /// Attempt and attempt-limit clamp (2^20 - 1).
+    const W636_ATTEMPT_CAP: i64 = (1 << 20) - 1;
+
+    /// Attempt limit used for a limit at or below 0.
+    const W636_SIGNUP_ATTEMPTS: i64 = 5;
+
+    /// HTTP status and offending field (0 none, 1 username, 2 password, 3
+    /// email, 4 invite) per case.
+    const W636_SIGNUP_HTTP: [i64; 8] = [422, 422, 422, 409, 409, 403, 201, 500];
+    const W636_SIGNUP_FIELD: [i64; 8] = [1, 2, 3, 1, 3, 4, 0, 0];
+
+    /// Case 0..5 BAD_USERNAME..BAD_INVITE_CODE, 6 SUCCESS, 7 unknown; source 0
+    /// backing value, 1 case name, 2 exact message, 3 alias of the lowercased
+    /// trimmed token, 4 unknown.
+    #[inline]
+    fn w636_signup_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+        match raw {
+            b"-1" => (0, 0),
+            b"-2" => (1, 0),
+            b"-3" => (2, 0),
+            b"-4" => (3, 0),
+            b"-5" => (4, 0),
+            b"-6" => (5, 0),
+            b"1" => (6, 0),
+            b"BAD_USERNAME" => (0, 1),
+            b"BAD_PASSWORD" => (1, 1),
+            b"BAD_EMAIL" => (2, 1),
+            b"USERNAME_IN_USE" => (3, 1),
+            b"EMAIL_IN_USE" => (4, 1),
+            b"BAD_INVITE_CODE" => (5, 1),
+            b"SUCCESS" => (6, 1),
+            b"Invalid username provided." => (0, 2),
+            b"Invalid password provided." => (1, 2),
+            b"Invalid email address provided." => (2, 2),
+            b"Username is already in use." => (3, 2),
+            b"Email address is already in use." => (4, 2),
+            b"Invalid or expired invite code." => (5, 2),
+            b"Registration successful." => (6, 2),
+            _ => {
+                w616_lower_trim_into(raw, lower);
+                match lower.as_slice() {
+                    b"bad_username" | b"invalid_username" | b"username" => (0, 3),
+                    b"bad_password" | b"invalid_password" | b"weak_password" | b"password" => {
+                        (1, 3)
+                    }
+                    b"bad_email" | b"invalid_email" | b"email" => (2, 3),
+                    b"username_in_use" | b"username_taken" | b"duplicate_username" => (3, 3),
+                    b"email_in_use" | b"email_taken" | b"duplicate_email" => (4, 3),
+                    b"bad_invite_code" | b"invalid_invite" | b"invite_expired" | b"invite" => {
+                        (5, 3)
+                    }
+                    b"success" | b"ok" | b"registered" | b"created" => (6, 3),
+                    _ => (7, 4),
+                }
+            }
+        }
+    }
+
+    /// Signup outcome tokens with an attempts-so-far column and an attempt
+    /// limit (at or below 0 means 5). Attempts and the limit clamp to
+    /// 0..2^20-1. Disposition 0 accept (success), 1 retry, 2 throttle (this
+    /// attempt reaches the limit), 3 reject (unknown); audit 0 none, 1 info
+    /// (success), 2 warning (throttle or invite failure), 3 error (unknown).
+    /// `[0]` count, `[1..9]` per case, `[9..14]` per source, `[14..18]` per
+    /// disposition, `[18..22]` per audit level, `[22]` errors, `[23]` first
+    /// throttle (-1), `[24]` first unknown (-1), `[25]` highest HTTP status (0
+    /// when empty), `[26]` FNV-1a digest; then per attempt `case | source << 3
+    /// | http << 6 | field << 16 | disposition << 19 | audit << 21 | attempts
+    /// << 23 | min(token bytes, 255) << 43`.
+    pub(crate) fn w636_signup_batch(codes: &[&[u8]], attempts: &[i64], limit: i64) -> Vec<i64> {
+        let count = codes.len();
+        let limit = if limit <= 0 {
+            W636_SIGNUP_ATTEMPTS
+        } else {
+            limit.min(W636_ATTEMPT_CAP)
+        };
+        let mut out = vec![0i64; W636_SIGNUP_HEADER + count];
+        out[0] = count as i64;
+        out[23] = -1;
+        out[24] = -1;
+        let mut lower = Vec::new();
+        for (at, &raw) in codes.iter().enumerate() {
+            let (case, source) = w636_signup_case(raw, &mut lower);
+            let tries = attempts[at].clamp(0, W636_ATTEMPT_CAP);
+            let http = W636_SIGNUP_HTTP[case as usize];
+            let disposition: i64 = match case {
+                6 => 0,
+                7 => 3,
+                _ if tries + 1 >= limit => 2,
+                _ => 1,
+            };
+            let audit: i64 = match case {
+                6 => 1,
+                7 => 3,
+                _ if disposition == 2 || case == 5 => 2,
+                _ => 0,
+            };
+            out[1 + case as usize] += 1;
+            out[9 + source as usize] += 1;
+            out[14 + disposition as usize] += 1;
+            out[18 + audit as usize] += 1;
+            out[22] += i64::from(case <= 5);
+            if disposition == 2 {
+                w586_first(&mut out[23], at);
+            }
+            if case == 7 {
+                w586_first(&mut out[24], at);
+            }
+            out[25] = out[25].max(http);
+            out[W636_SIGNUP_HEADER + at] = case
+                | source << 3
+                | http << 6
+                | W636_SIGNUP_FIELD[case as usize] << 16
+                | disposition << 19
+                | audit << 21
+                | tries << 23
+                | w636_len8(raw) << 43;
+        }
+        out[26] = w526_digest(&out[W636_SIGNUP_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w636_signup_error_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        limit: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w636_run(out, out_cap, &inputs, || {
+                let codes = w566_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    1,
+                    count,
+                )?;
+                let attempts = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+                Some(w636_signup_batch(&codes, &attempts, limit))
+            })
+        }
+    }
+
+    // --- TmuxMode::w63TmuxModePlanBatch --------------------------------------
+
+    pub(crate) const W636_TMUX_HEADER: usize = 21;
+
+    /// Active runner clamp (2^16 - 1) and capacity cap (2^40).
+    const W636_ACTIVE_CAP: i64 = (1 << 16) - 1;
+    const W636_CAPACITY_CAP: i64 = 1 << 40;
+
+    /// `count(tasks())`, default and maximum runners per case (unknown 0).
+    const W636_TMUX_PANES: [i64; 4] = [10, 8, 4, 0];
+    const W636_TMUX_DEFAULT: [i64; 4] = [4, 2, 1, 0];
+    const W636_TMUX_MAX: [i64; 4] = [16, 8, 1, 0];
+
+    /// Case 0 full, 1 basic, 2 stripped, 3 unknown; source 0 backing value, 1
+    /// case name, 2 alias of the lowercased trimmed token, 3 unknown.
+    #[inline]
+    fn w636_tmux_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+        match raw {
+            b"0" => (0, 0),
+            b"1" => (1, 0),
+            b"2" => (2, 0),
+            b"Full" => (0, 1),
+            b"Basic" => (1, 1),
+            b"Stripped" => (2, 1),
+            _ => {
+                w616_lower_trim_into(raw, lower);
+                match lower.as_slice() {
+                    b"full" | b"complete" | b"all" | b"everything" => (0, 2),
+                    b"basic" | b"standard" | b"default" | b"normal" => (1, 2),
+                    b"stripped" | b"minimal" | b"sequential" | b"lite" | b"simple" => (2, 2),
+                    _ => (3, 3),
+                }
+            }
+        }
+    }
+
+    /// Mode tokens with requested and active runner columns and a shared
+    /// runner capacity (at or below 0 is unlimited, else capped at 2^40). A
+    /// known mode targets its default runners for a request at or below 0,
+    /// else the request capped to its maximum (flags 1 capped, 2 defaulted).
+    /// Active runners clamp to 0..2^16-1. In order, each known mode starts
+    /// `max(target - active, 0)` runners while capacity remains. State 0
+    /// admitted, 1 partially admitted, 2 deferred, 3 rejected (unknown), 4
+    /// saturated (nothing to start). `[0]` count, `[1..5]` per case, `[5..9]`
+    /// per source, `[9..14]` per state, `[14]` total panes, `[15]` total
+    /// target runners, `[16]` runners started, `[17]` remaining capacity (-1
+    /// unlimited), `[18]` first partial or deferred (-1), `[19]` first
+    /// rejected (-1), `[20]` FNV-1a digest; then per mode `case | source << 2
+    /// | panes << 4 | target << 8 | flags << 13 | state << 15 | started << 18
+    /// | active << 23 | min(token bytes, 255) << 39`.
+    pub(crate) fn w636_tmux_batch(modes: &[&[u8]], ints: &[i64], capacity: i64) -> Vec<i64> {
+        let count = modes.len();
+        let mut remaining = if capacity <= 0 {
+            -1
+        } else {
+            capacity.min(W636_CAPACITY_CAP)
+        };
+        let mut out = vec![0i64; W636_TMUX_HEADER + count];
+        out[0] = count as i64;
+        out[18] = -1;
+        out[19] = -1;
+        let mut lower = Vec::new();
+        for (at, &raw) in modes.iter().enumerate() {
+            let (case, source) = w636_tmux_case(raw, &mut lower);
+            let slot = case as usize;
+            let requested = ints[at];
+            let active = ints[count + at].clamp(0, W636_ACTIVE_CAP);
+            let (target, flags) = if case == 3 {
+                (0, 0)
+            } else if requested <= 0 {
+                (W636_TMUX_DEFAULT[slot], 2)
+            } else {
+                (
+                    requested.min(W636_TMUX_MAX[slot]),
+                    i64::from(requested > W636_TMUX_MAX[slot]),
+                )
+            };
+            let available = (target - active).max(0);
+            let (state, started): (i64, i64) = if case == 3 {
+                (3, 0)
+            } else if available == 0 {
+                (4, 0)
+            } else {
+                let grant = if remaining < 0 {
+                    available
+                } else {
+                    available.min(remaining)
+                };
+                if remaining >= 0 {
+                    remaining -= grant;
+                }
+                (
+                    if grant == available {
+                        0
+                    } else if grant > 0 {
+                        1
+                    } else {
+                        2
+                    },
+                    grant,
+                )
+            };
+            out[1 + slot] += 1;
+            out[5 + source as usize] += 1;
+            out[9 + state as usize] += 1;
+            out[14] += W636_TMUX_PANES[slot];
+            out[15] += target;
+            out[16] += started;
+            if state == 1 || state == 2 {
+                w586_first(&mut out[18], at);
+            }
+            if state == 3 {
+                w586_first(&mut out[19], at);
+            }
+            out[W636_TMUX_HEADER + at] = case
+                | source << 2
+                | W636_TMUX_PANES[slot] << 4
+                | target << 8
+                | flags << 13
+                | state << 15
+                | started << 18
+                | active << 23
+                | w636_len8(raw) << 39;
+        }
+        out[17] = remaining;
+        out[20] = w526_digest(&out[W636_TMUX_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w636_tmux_mode_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        capacity: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w636_run(out, out_cap, &inputs, || {
+                let modes = w566_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    1,
+                    count,
+                )?;
+                let values = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+                Some(w636_tmux_batch(&modes, &values, capacity))
+            })
+        }
+    }
+
+    // --- TvLookupStatus::w63TvLookupStatusPlanBatch --------------------------
+
+    pub(crate) const W636_TV_HEADER: usize = 25;
+
+    /// Attempt clamp (2^16 - 1), elapsed clamp (2^40) and cooldown cap (7 days).
+    const W636_TV_ATTEMPT_CAP: i64 = (1 << 16) - 1;
+    const W636_TV_ELAPSED_CAP: i64 = 1 << 40;
+    const W636_TV_COOLDOWN_CAP: i64 = 604_800;
+
+    /// Attempt limit used for a limit at or below 0.
+    const W636_TV_ATTEMPTS: i64 = 10;
+
+    /// `classifyValue()` flags per case.
+    const W636_TV_FLAGS: [i64; 9] = [3, 5, 11, 13, 5, 16, 32, 64, 0];
+
+    /// The value of a canonical decimal `int64` token (PHP `(string) (int) $t
+    /// === $t`): an optional `-`, no leading zeros and no `-0`.
+    #[inline]
+    fn w636_canonical_int(raw: &[u8]) -> Option<i64> {
+        let (negative, digits) = match raw {
+            [b'-', rest @ ..] => (true, rest),
+            _ => (false, raw),
+        };
+        if digits.is_empty()
+            || digits.len() > 19
+            || (digits[0] == b'0' && (digits.len() > 1 || negative))
+            || !digits.iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        let mut value: i64 = 0;
+        for &digit in digits {
+            value = value.checked_mul(10)?.checked_sub(i64::from(digit - b'0'))?;
+        }
+        if negative {
+            Some(value)
+        } else {
+            value.checked_neg()
+        }
+    }
+
+    /// Case 0 pending, 1 show not found, 2 episode missing, 3 season pack, 4
+    /// parse failed, 5 matched episode, 6 legacy pending, 7 legacy exhausted, 8
+    /// unknown; source 0 numeric value, 1 case name, 2 alias of the lowercased
+    /// trimmed token, 3 unknown text.
+    #[inline]
+    fn w636_tv_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+        if let Some(value) = w636_canonical_int(raw) {
+            let case = match value {
+                1.. => 5,
+                0 => 0,
+                -10 => 1,
+                -11 => 2,
+                -12 => 3,
+                -100 => 4,
+                -3..=-1 => 6,
+                -4 | -6 => 7,
+                _ => 8,
+            };
+            return (case, 0);
+        }
+        match raw {
+            b"Pending" => (0, 1),
+            b"ShowNotFound" => (1, 1),
+            b"EpisodeMissing" => (2, 1),
+            b"SeasonPack" => (3, 1),
+            b"ParseFailed" => (4, 1),
+            _ => {
+                w616_lower_trim_into(raw, lower);
+                match lower.as_slice() {
+                    b"pending" | b"waiting" | b"queued" => (0, 2),
+                    b"show_not_found" | b"show-not-found" | b"not_found" | b"notfound" => (1, 2),
+                    b"episode_missing" | b"episode-missing" | b"no_episode" => (2, 2),
+                    b"season_pack" | b"season-pack" | b"pack" => (3, 2),
+                    b"parse_failed" | b"parse-failed" | b"unparseable" | b"unparsable" => (4, 2),
+                    _ => (8, 3),
+                }
+            }
+        }
+    }
+
+    /// Stored lookup statuses (values or names) with attempts and
+    /// seconds-since-last-attempt columns and an attempt limit (at or below 0
+    /// means 10). Attempts and the limit clamp to 0..2^16-1, elapsed to
+    /// 0..2^40. Legacy pending normalizes to pending and legacy exhausted to
+    /// show not found. Action 0 skip (matched episode), 1 dispatch, 2 cooldown,
+    /// 3 give up (pending becomes show not found, episode missing parks), 4
+    /// terminal, 5 invalid. A retryable status's cooldown is 0 before its first
+    /// attempt, else its base (pending 900, episode missing 21,600 seconds)
+    /// doubled per further attempt up to 6 times, capped at 7 days; it
+    /// dispatches once elapsed reaches it. Target 15 when none. `[0]` count,
+    /// `[1..10]` per case, `[10..14]` per source, `[14..20]` per action, `[20]`
+    /// normalized, `[21]` shortest wait (-1), `[22]` first invalid (-1), `[23]`
+    /// total attempts, `[24]` FNV-1a digest; then per status `case | source <<
+    /// 4 | flags << 6 | action << 13 | target << 16 | normalized << 20 | wait
+    /// << 21 | attempts << 41 | min(token bytes, 63) << 57`.
+    pub(crate) fn w636_tv_batch(statuses: &[&[u8]], ints: &[i64], limit: i64) -> Vec<i64> {
+        let count = statuses.len();
+        let limit = if limit <= 0 {
+            W636_TV_ATTEMPTS
+        } else {
+            limit.min(W636_TV_ATTEMPT_CAP)
+        };
+        let mut out = vec![0i64; W636_TV_HEADER + count];
+        out[0] = count as i64;
+        out[21] = -1;
+        out[22] = -1;
+        let mut lower = Vec::new();
+        for (at, &raw) in statuses.iter().enumerate() {
+            let (case, source) = w636_tv_case(raw, &mut lower);
+            let attempts = ints[at].clamp(0, W636_TV_ATTEMPT_CAP);
+            let elapsed = ints[count + at].clamp(0, W636_TV_ELAPSED_CAP);
+            let (base, normalized) = match case {
+                6 => (0, 1),
+                7 => (1, 1),
+                _ => (case, 0),
+            };
+            let (action, target, wait): (i64, i64, i64) = match base {
+                5 => (0, 15, 0),
+                8 => (5, 15, 0),
+                1 | 3 | 4 => (4, base, 0),
+                _ if attempts >= limit => (3, if base == 0 { 1 } else { 2 }, 0),
+                _ => {
+                    let cooldown = if attempts == 0 {
+                        0
+                    } else {
+                        let step = if base == 0 { 900 } else { 21_600 };
+                        (step << (attempts - 1).min(6)).min(W636_TV_COOLDOWN_CAP)
+                    };
+                    if elapsed >= cooldown {
+                        (1, base, 0)
+                    } else {
+                        (2, base, cooldown - elapsed)
+                    }
+                }
+            };
+            out[1 + case as usize] += 1;
+            out[10 + source as usize] += 1;
+            out[14 + action as usize] += 1;
+            out[20] += normalized;
+            if wait > 0 && (out[21] < 0 || wait < out[21]) {
+                out[21] = wait;
+            }
+            if action == 5 {
+                w586_first(&mut out[22], at);
+            }
+            out[23] += attempts;
+            out[W636_TV_HEADER + at] = case
+                | source << 4
+                | W636_TV_FLAGS[case as usize] << 6
+                | action << 13
+                | target << 16
+                | normalized << 20
+                | wait << 21
+                | attempts << 41
+                | (raw.len().min(63) as i64) << 57;
+        }
+        out[24] = w526_digest(&out[W636_TV_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w636_tv_lookup_status_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        limit: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w636_run(out, out_cap, &inputs, || {
+                let statuses = w566_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    1,
+                    count,
+                )?;
+                let values = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+                Some(w636_tv_batch(&statuses, &values, limit))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod w636_enum_plan_tests {
+        use super::*;
+        use std::ptr::null;
+
+        fn tokens(values: &[&'static str]) -> Vec<&'static [u8]> {
+            values.iter().map(|value| value.as_bytes()).collect()
+        }
+
+        #[test]
+        fn w636_index_batch_routes_fields() {
+            let fields = tokens(&["music", "Console", " ANIME_RT ", "nope", "steam", "artist", "platform", "anidbid", "", "bogus"]);
+            let out = w636_index_batch(&fields, &[7, 0, 1 << 33, 5, -1], 5);
+            assert_eq!(&out[1..8], &[1, 0, 0, 1, 1, 1, 1]);
+            assert_eq!(&out[18..23], &[2, 1, 1, 0, 1]);
+            assert_eq!(&out[23..29], &[2, 2, 1, 0b111001, 3, 20]);
+            assert_eq!(out[W636_INDEX_HEADER], 1 << 5 | 1 << 14 | 5 << 16 | 6 << 24 | 7 << 32);
+            assert_eq!(out[W636_INDEX_HEADER + 2] >> 32, W636_DOC_CAP);
+        }
+
+        #[test]
+        fn w636_service_batch_scores_uptime() {
+            let statuses = tokens(&["operational", "Major outage", " down ", "degraded", "??"]);
+            let out = w636_service_batch(&statuses, &[10, 100, 200, 1_801, 5], 1_000);
+            assert_eq!(&out[1..7], &[1, 1, 0, 2, 0, 1]);
+            assert_eq!(&out[11..18], &[4, 1, 3, 1, 300, 925_000, 1]);
+            assert_eq!(out[W636_SERVICE_HEADER + 4] & 0xff, 5 | 3 << 3 | 7 << 5);
+        }
+
+        #[test]
+        fn w636_signup_batch_throttles() {
+            let codes = tokens(&["1", "BAD_EMAIL", "Invalid or expired invite code.", " Email_Taken ", "nope"]);
+            let out = w636_signup_batch(&codes, &[0, 4, 0, 1, 0], 0);
+            assert_eq!(&out[14..18], &[1, 2, 1, 1]);
+            assert_eq!(&out[18..26], &[1, 1, 2, 1, 3, 1, 4, 500]);
+            assert_eq!(out[W636_SIGNUP_HEADER] & 0xffff, 6 | 201 << 6);
+        }
+
+        #[test]
+        fn w636_tmux_batch_admits_capacity() {
+            let modes = tokens(&["0", "Basic", "lite", "x", "0"]);
+            let out = w636_tmux_batch(&modes, &[0, 99, 0, 3, 20, 1, 0, 0, 0, 16], 7);
+            assert_eq!(&out[9..14], &[1, 1, 1, 1, 1]);
+            assert_eq!(&out[14..20], &[32, 29, 7, 0, 1, 3]);
+            let unlimited = w636_tmux_batch(&modes, &[0, 99, 0, 3, 20, 1, 0, 0, 0, 16], 0);
+            assert_eq!((unlimited[16], unlimited[17]), (12, -1));
+        }
+
+        #[test]
+        fn w636_tv_batch_schedules_retries() {
+            let statuses = tokens(&["0", "-11", "-2", "-6", "42", "ParseFailed", " queued ", "-0", "-9223372036854775808"]);
+            let ints = [0, 2, 9, 0, 0, 0, 3, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0];
+            let out = w636_tv_batch(&statuses, &ints, 9);
+            assert_eq!(&out[14..20], &[1, 1, 2, 1, 2, 2]);
+            assert_eq!(&out[20..24], &[2, 3_600, 7, 14]);
+            assert_eq!(w636_canonical_int(b"-9223372036854775808"), Some(i64::MIN));
+            assert_eq!(w636_canonical_int(b"9223372036854775808"), None);
+            assert_eq!(w636_canonical_int(b"007"), None);
+        }
+
+        #[test]
+        fn w636_exports_validate_buffers() {
+            let mut out = vec![0i64; 64];
+            let status = unsafe {
+                nntmux_w636_service_status_batch(null(), 0, null(), 0, null(), 0, 0, 0, out.as_mut_ptr(), 64)
+            };
+            assert_eq!((status, out[0], out[11], out[16]), (1, 0, -1, -1));
+            let status = unsafe {
+                nntmux_w636_tmux_mode_batch(null(), 0, null(), 0, null(), 0, 0, 0, std::ptr::null_mut(), 64)
+            };
+            assert_eq!(status, -2);
+            let status = unsafe {
+                nntmux_w636_signup_error_batch(null(), 0, null(), 0, null(), 0, 0, 0, out.as_mut_ptr(), 3)
+            };
+            assert_eq!(status, -2);
+            let misaligned = unsafe { (out.as_mut_ptr() as *mut u8).add(1) as *mut i64 };
+            let status = unsafe {
+                nntmux_w636_tv_lookup_status_batch(null(), 0, null(), 0, null(), 0, 0, 0, misaligned, 32)
+            };
+            assert_eq!(status, -2);
+            // Input bytes aliasing the output range are rejected.
+            let alias = out.as_ptr() as *const u8;
+            let status = unsafe {
+                nntmux_w636_secondary_index_batch(alias, 8, null(), 0, null(), 0, 1, out.as_mut_ptr(), 64)
+            };
+            assert_eq!(status, -1);
+            // A null input with a length, a short integer column and a bad twin are invalid.
+            let joined = b"music\0title";
+            let status = unsafe {
+                nntmux_w636_secondary_index_batch(null(), 4, null(), 0, null(), 0, 1, out.as_mut_ptr(), 64)
+            };
+            assert_eq!(status, -1);
+            let status = unsafe {
+                nntmux_w636_secondary_index_batch(joined.as_ptr(), joined.len(), null(), 0, joined.as_ptr(), 4, 1, out.as_mut_ptr(), 64)
+            };
+            assert_eq!(status, -1);
+            let twin = b"music\x02title";
+            let doc = 9i64.to_ne_bytes();
+            let status = unsafe {
+                nntmux_w636_secondary_index_batch(joined.as_ptr(), joined.len(), twin.as_ptr(), twin.len(), doc.as_ptr(), 8, 1, out.as_mut_ptr(), 64)
+            };
+            assert_eq!(status, -1);
+            let status = unsafe {
+                nntmux_w636_secondary_index_batch(joined.as_ptr(), joined.len(), null(), 0, doc.as_ptr(), 8, 1, out.as_mut_ptr(), 64)
+            };
+            assert_eq!((status, out[0], out[18], out[W636_INDEX_HEADER] >> 32), (1, 1, 1, 9));
+        }
+    }
+}
