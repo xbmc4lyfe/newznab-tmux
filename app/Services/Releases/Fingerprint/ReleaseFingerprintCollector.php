@@ -3416,4 +3416,295 @@ final class ReleaseFingerprintCollector
 
         return self::$w47CollectorRustFfiHandle === false ? null : self::$w47CollectorRustFfiHandle;
     }
+
+    // ---- Wave 63.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 9.39x/8.79x, uncommon 9.60x/8.77x); see RustFingerprintCollectorYencDecoderPartServiceLogFileW63ParityTest. */
+    public const bool W63_RUST_FFI_DEFAULT = true;
+
+    private const string W63_RELEASE_FINGERPRINT_COLLECTOR_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w632_collector_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W63_RELEASE_FINGERPRINT_COLLECTOR_TAIL = 28;
+
+    /**
+     * Wave 63 routing, binding and output buffer, kept in function-local statics (no static or
+     * instance properties). Operations: null reads the routing override, 'set' replaces it
+     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
+     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
+     * (null without the library).
+     */
+    private static function w63RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'reset':
+                $previous = $enabled;
+                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w63', self::W63_RELEASE_FINGERPRINT_COLLECTOR_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w63RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    /** Routes w63CollectorPlanBatch() to Rust until reset. */
+    public static function enableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', true);
+    }
+
+    /** Routes w63CollectorPlanBatch() to PHP until reset. */
+    public static function disableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', false);
+    }
+
+    /** Restores W63_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
+    public static function resetW63RustFfi(): void
+    {
+        self::w63RustFfiState('reset');
+    }
+
+    public static function usesW63RustFfi(): bool
+    {
+        $enabled = self::w63RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W63_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w63CollectorPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW63RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w63RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w63RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w63CollectorPlanBatch(array $rows): array
+    {
+        return self::usesW63RustFfi() ? self::w63CollectorPlanBatchNative($rows) : self::w63CollectorPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w63CollectorPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W63_RELEASE_FINGERPRINT_COLLECTOR_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w63RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w63CollectorPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W63_RELEASE_FINGERPRINT_COLLECTOR_FFI_CDEF.)
+            $written = $ffi->nntmux_w632_collector_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w63CollectorPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w63Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w63Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /** Rows with at least this many file bytes can serve as a PAR2 16 KiB source sample. */
+    private const int W63_SOURCE_SAMPLE_BYTES = 16_384;
+
+    /**
+     * Wave 63.2 collection plan. Per `filename\tbytes\tsegments\tarticle_bytes\toutcome` row
+     * `kind | outcome << 4 | flags << 7 | fragments << 13 | min(bytes >> 20, 2^20 - 1) << 19 |
+     * min(segments, 65535) << 39 | (crc32(lowercase trimmed filename) & 0xFF) << 55`. Kinds (by
+     * w63CollectorKind()): 0 empty, 1 PAR2 index, 2 PAR2 volume, 3 RAR or split archive, 4 7-Zip, 5
+     * zip, 6 text, 7 media, 8 other. A row is valid with a non-empty filename and w63Int() bytes (12
+     * digits), segments (9) and article bytes (9). Outcomes: 0 invalid, then by the trimmed outcome
+     * text (case-insensitive) 6 `skipped`, 4 `timeout`/`unavailable`, 3 `missing`/`430`, 5 any other
+     * text except `ok`, and otherwise 2 when the sampled article exceeds MAX_ARTICLE_BODY_BYTES, 1
+     * when it was sampled and 6 when it was not. Flags: 1 PAR2 bytes fit the MAX_PAR2_SET_BYTES
+     * budget (then charged to it), 2 PAR2 over budget, 4 archive segments above
+     * MAX_SEVEN_ZIP_FRAGMENTS_PER_RECORD, 8 a filename seen on an earlier valid row, 16 a sampled
+     * non-PAR2 row of at least W63_SOURCE_SAMPLE_BYTES, 32 outcome text present. Archive rows plan
+     * min(segments, MAX_SEVEN_ZIP_FRAGMENTS_PER_RECORD) fragments. Then nine kind, seven outcome and
+     * six flag counts, the distinct valid filenames, the PAR2 bytes charged, the planned fragments,
+     * the valid rows' bytes, the sampled article bytes and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w63CollectorPlanBatchPhp(array $rows): array
+    {
+        $out = $names = [];
+        $kinds = array_fill(0, 9, 0);
+        $outcomes = array_fill(0, 7, 0);
+        $flagCounts = array_fill(0, 6, 0);
+        $par2Used = $fragmentsTotal = $totalBytes = $sampledBytes = 0;
+        foreach ($rows as $row) {
+            [$name, $bytes, $segments, $article, $text] = explode("\t", (string) $row, 5) + array_fill(0, 5, '');
+            $lower = strtolower(trim($name));
+            $kind = self::w63CollectorKind($lower);
+            $bytes = self::w63Int($bytes, 12);
+            $segments = self::w63Int($segments, 9);
+            $article = self::w63Int($article, 9);
+            $text = self::w63CollectorText($text);
+            $valid = $kind !== 0 && $bytes !== false && $segments !== false && $article !== false;
+            $b = \is_int($bytes) ? $bytes : 0;
+            $s = \is_int($segments) ? $segments : 0;
+            $outcome = ! $valid ? 0 : match ($text) {
+                5 => 6,
+                3 => 4,
+                2 => 3,
+                4 => 5,
+                default => \is_int($article) ? ($article > self::MAX_ARTICLE_BODY_BYTES ? 2 : 1) : 6,
+            };
+            $crc = crc32($lower);
+            $par2 = $valid && ($kind === 1 || $kind === 2);
+            $included = $par2 && $par2Used + $b <= self::MAX_PAR2_SET_BYTES;
+            if ($included) {
+                $par2Used += $b;
+            }
+            $archive = $valid && ($kind === 3 || $kind === 4);
+            $fragments = $archive ? min($s, self::MAX_SEVEN_ZIP_FRAGMENTS_PER_RECORD) : 0;
+            $dup = false;
+            if ($valid) {
+                $dup = isset($names[$crc]);
+                $names[$crc] = true;
+            }
+            $flags = (int) $included | (int) ($par2 && ! $included) << 1 | (int) ($archive && $s > self::MAX_SEVEN_ZIP_FRAGMENTS_PER_RECORD) << 2 | (int) $dup << 3
+                | (int) ($outcome === 1 && ! $par2 && $b >= self::W63_SOURCE_SAMPLE_BYTES) << 4 | (int) ($text !== 0) << 5;
+            $kinds[$kind]++;
+            $outcomes[$outcome]++;
+            for ($k = 0; $k < 6; $k++) {
+                $flagCounts[$k] += $flags >> $k & 1;
+            }
+            $fragmentsTotal += $fragments;
+            if ($valid) {
+                $totalBytes += $b;
+            }
+            if ($outcome === 1) {
+                $sampledBytes += (int) $article;
+            }
+            $out[] = $kind | $outcome << 4 | $flags << 7 | $fragments << 13 | min($b >> 20, 0xFFFFF) << 19 | min($s, 0xFFFF) << 39 | ($crc & 0xFF) << 55;
+        }
+        array_push($out, ...$kinds, ...$outcomes, ...$flagCounts);
+        array_push($out, \count($names), $par2Used, $fragmentsTotal, $totalBytes, $sampledBytes);
+        $out[] = self::w63Digest($out);
+
+        return $out;
+    }
+
+    /** Kind of a lowercased filename for w63CollectorPlanBatchPhp(). */
+    private static function w63CollectorKind(string $lower): int
+    {
+        if ($lower === '') {
+            return 0;
+        }
+        $dot = strrpos($lower, '.');
+        if ($dot === false) {
+            return 8;
+        }
+        $base = substr($lower, 0, $dot);
+        $ext = substr($lower, $dot + 1);
+        $length = \strlen($ext);
+        if ($ext === 'par2') {
+            $vol = strrpos($base, '.vol');
+            $tail = $vol === false ? '' : substr($base, $vol + 4);
+
+            return $tail !== '' && strspn($tail, '0123456789+-') === \strlen($tail) && str_contains($tail, '+') ? 2 : 1;
+        }
+
+        return match (true) {
+            $ext === 'rar' => 3,
+            $ext === '7z' => 4,
+            $ext === 'zip' => 5,
+            \in_array($ext, ['nfo', 'sfv', 'nzb', 'txt'], true) => 6,
+            \in_array($ext, ['mkv', 'mp4', 'avi', 'iso', 'flac', 'mp3', 'epub', 'pdf'], true) => 7,
+            ($length === 3 || $length === 4) && $ext[0] === 'r' && strspn($ext, '0123456789', 1) === $length - 1 => 3,
+            $length === 3 && strspn($ext, '0123456789') === 3 => str_ends_with($base, '.7z') ? 4 : 3,
+            default => 8,
+        };
+    }
+
+    /** 0 none, 1 ok, 2 missing, 3 unavailable, 4 any other text, 5 skipped. */
+    private static function w63CollectorText(string $text): int
+    {
+        return match (strtolower(trim($text))) {
+            '' => 0,
+            'ok' => 1,
+            'missing', '430' => 2,
+            'timeout', 'unavailable' => 3,
+            'skipped' => 5,
+            default => 4,
+        };
+    }
 }
