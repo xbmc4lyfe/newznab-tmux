@@ -235,4 +235,222 @@ class BoundedMetricQuery
             return null;
         }
     }
+
+    /**
+     * Enabled: the paired benchmark in the W60 parity test measures 4.059x common mean, 4.517x
+     * common p99, 3.044x uncommon mean and 2.848x uncommon p99 (per-metric minimum of four runs),
+     * above the 1.5x rule.
+     */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    private const string W60_BOUNDED_METRIC_QUERY_FFI_CDEF = 'ssize_t nntmux_w601_bounded_metric_query_plan_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public const int W60_PLAN_WORDS = 7;
+
+    public const int W60_SQL_READ_ONLY = 16;
+
+    public const int W60_SQL_MULTI = 32;
+
+    public const int W60_SQL_HAS_LIMIT = 64;
+
+    public const int W60_SQL_HINTED = 128;
+
+    public const int W60_WINDOW_CLAMPED = 256;
+
+    public const int W60_TIMEOUT_DEFAULTED = 512;
+
+    public const int W60_TIMEOUT_CLAMPED = 1024;
+
+    public const int W60_LIMIT_DEFAULTED = 2048;
+
+    public const int W60_LIMIT_CLAMPED = 4096;
+
+    public const int W60_CACHE_DISABLED = 8192;
+
+    public const int W60_STALE = 16384;
+
+    public const int W60_FUTURE_AGE = 32768;
+
+    public const int W60_MALFORMED = 65536;
+
+    public const int W60_RUNNABLE = 131072;
+
+    private const array W60_SQL_KINDS = ['select' => 1, 'with' => 2, 'show' => 3, 'explain' => 4];
+
+    private const array W60_SQL_WRITES = ['insert' => 0, 'update' => 0, 'delete' => 0, 'drop' => 0, 'alter' => 0, 'truncate' => 0, 'replace' => 0, 'create' => 0, 'grant' => 0];
+
+    public static function usesW60RustFfi(): bool
+    {
+        $enabled = self::w60RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 60 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function boundedQueryPlanBatch(array $rows): array
+    {
+        return self::usesW60RustFfi() ? self::boundedQueryPlanBatchNative($rows) : self::boundedQueryPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or Rust declines the batch (a
+     * row holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function boundedQueryPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count * self::W60_PLAN_WORDS;
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w60RustFfiState('out', $words);
+        if ($buffer === null) {
+            return self::boundedQueryPlanBatchPhp($rows);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $rows);
+        try {
+            // @phpstan-ignore method.notFound (Declared by W60_BOUNDED_METRIC_QUERY_FFI_CDEF.)
+            $written = $ffi->nntmux_w601_bounded_metric_query_plan_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $result = $written === $count ? unpack('q*', FFI::string($out, $words * 8)) : false;
+        if (! \is_array($result)) {
+            return self::boundedQueryPlanBatchPhp($rows);
+        }
+
+        /** @var list<int> */
+        return array_values($result);
+    }
+
+    /**
+     * Seven words per `sql\twindow_seconds\ttimeout_ms\trow_limit\tage_seconds\tcache_ttl` row:
+     * the statement kind (0 empty, 1 select, 2 with, 3 show, 4 explain, 5 other; the leading
+     * letters after ltrim()) with the read-only (no insert/update/delete/drop/alter/truncate/
+     * replace/create/grant word), multi-statement (a `;` before the trailing `;`/whitespace),
+     * LIMIT word, existing time-limit hint, window/timeout/limit defaulted or clamped, cache
+     * disabled (ttl <= 0), stale (age < 0 or >= ttl), future age and runnable (read-only single
+     * statement) flags; then the window (60-86400 s), step (window / 240, at least 15 s),
+     * timeout (default 2000, at most 30000 ms), row limit (default 1000, at most 100000), fresh
+     * seconds left and the `[A-Za-z0-9_]+` word count. A malformed row yields
+     * `[W60_MALFORMED, 0, 0, 0, 0, 0, 0]`.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function boundedQueryPlanBatchPhp(array $rows): array
+    {
+        $words = [];
+        foreach ($rows as $row) {
+            $f = explode("\t", $row);
+            $ints = [];
+            if (\count($f) === 6) {
+                for ($i = 1; $i <= 5 && preg_match('/\A-?[0-9]{1,18}\z/', $f[$i]) === 1; $i++) {
+                    $ints[] = (int) $f[$i];
+                }
+            }
+            if (\count($ints) !== 5) {
+                array_push($words, self::W60_MALFORMED, 0, 0, 0, 0, 0, 0);
+
+                continue;
+            }
+            [$window, $timeout, $limit, $age, $ttl] = $ints;
+            $sql = $f[0];
+            $lead = ltrim($sql);
+            $kind = 0;
+            if ($lead !== '') {
+                preg_match('/\A[A-Za-z]*/', $lead, $m);
+                $kind = self::W60_SQL_KINDS[strtolower($m[0] ?? '')] ?? 5;
+            }
+            $lower = strtolower($sql);
+            $tokens = (int) preg_match_all('/[a-z0-9_]+/', $lower, $m);
+            $seen = array_flip($m[0]);
+            $readOnly = $kind >= 1 && $kind <= 4 && array_intersect_key(self::W60_SQL_WRITES, $seen) === [];
+            $multi = str_contains(rtrim($sql, " \t\n\r\0\x0B;"), ';');
+            $flags = $kind
+                | ($readOnly ? self::W60_SQL_READ_ONLY : 0)
+                | ($multi ? self::W60_SQL_MULTI : 0)
+                | (isset($seen['limit']) ? self::W60_SQL_HAS_LIMIT : 0)
+                | (str_contains($lower, 'max_execution_time') || str_contains($lower, 'max_statement_time') ? self::W60_SQL_HINTED : 0)
+                | ($readOnly && ! $multi ? self::W60_RUNNABLE : 0);
+            $clamped = max(60, min(86400, $window));
+            $flags |= $clamped !== $window ? self::W60_WINDOW_CLAMPED : 0;
+            if ($timeout <= 0) {
+                $timeout = 2000;
+                $flags |= self::W60_TIMEOUT_DEFAULTED;
+            } elseif ($timeout > 30000) {
+                $timeout = 30000;
+                $flags |= self::W60_TIMEOUT_CLAMPED;
+            }
+            if ($limit < 1) {
+                $limit = 1000;
+                $flags |= self::W60_LIMIT_DEFAULTED;
+            } elseif ($limit > 100000) {
+                $limit = 100000;
+                $flags |= self::W60_LIMIT_CLAMPED;
+            }
+            $flags |= $age < 0 ? self::W60_FUTURE_AGE : 0;
+            $fresh = 0;
+            if ($ttl <= 0) {
+                $flags |= self::W60_CACHE_DISABLED;
+            } elseif ($age < 0 || $age >= $ttl) {
+                $flags |= self::W60_STALE;
+            } else {
+                $fresh = $ttl - $age;
+            }
+            array_push($words, $flags, $clamped, max(15, intdiv($clamped, 240)), $timeout, $limit, $fresh, $tokens);
+        }
+
+        return $words;
+    }
+
+    /**
+     * Wave 60 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics so the
+     * class gains no Wave 60 static properties.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('bounded_metric_query_w60', self::W60_BOUNDED_METRIC_QUERY_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
+    }
 }
