@@ -6,6 +6,7 @@ namespace App\Services\Security;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Contracts\Cache\Repository as CacheRepository;
 use Throwable;
 
@@ -640,5 +641,282 @@ final class IndexerProxyDetector
         $packed = self::w47PackedIp($host);
 
         return $packed !== null && self::w47PrivateIp($packed);
+    }
+
+    // Rust is the default only while the paired W59.6 benchmark clears 1.5x on all four metrics.
+    public const bool W59_RUST_FFI_DEFAULT = true;
+
+    public const string W59_FFI_CDEF = <<<'C'
+        int32_t nntmux_w596_proxy_detect_batch(const char *strings, size_t strings_len, const char *twin, size_t twin_len, size_t count, int64_t threshold, int64_t *out, size_t out_cap);
+        C;
+
+    private const int W59_MAX_ITEMS = 1_048_576;
+
+    public const int W59_DETECT_HEADER = 22;
+
+    /** Lowercase indexer proxy and *arr fragments (bits 0-7), then download clients (bits 8-11). */
+    private const array W59_SIGNATURES = ['nzbhydra', 'prowlarr', 'jackett', 'sonarr', 'radarr', 'lidarr', 'readarr', 'mylar',
+        'sabnzbd', 'nzbget', 'nzbvortex', 'nzbunity'];
+
+    /**
+     * Header-signature scores for a request batch. Signatures match the lowercased User-Agent; hops are
+     * comma-separated Via or X-Forwarded-For entries that are not blank. Score: +40 indexer UA, -20
+     * downloader-only UA, +15 empty UA, +10 per Via hop (3 max), +5 per forwarded hop (4 max), +20 when
+     * Via names an indexer; clamped to 0..100 and blocked at `$threshold`.
+     *
+     * Layout: `[0]` count, `[1]` blocked, `[2]` indexer, `[3]` downloader, `[4]` empty UA, `[5]` Via
+     * hops, `[6]` forwarded hops (each capped at 255), `[7]` max score, `[8]` first blocked index (-1),
+     * `[9..20]` per-signature hits, `[21]` FNV-1a digest; then per request `score | blocked << 7 |
+     * first signature + 1 << 8 | signatures << 12 | min(via, 255) << 24 | min(xff, 255) << 32 |
+     * via indexer << 40 | empty UA << 41 | min(UA bytes, 65535) << 42`.
+     *
+     * @param  array<array-key, string>  $userAgents
+     * @param  array<array-key, string>  $vias  Parallel to $userAgents; '' when absent.
+     * @param  array<array-key, string>  $forwardedFor  Parallel to $userAgents; '' when absent.
+     * @return list<int>
+     */
+    public static function detectProxyBatch(array $userAgents, array $vias, array $forwardedFor, int $threshold = 50): array
+    {
+        return (self::usesW59RustFfi() ? self::detectProxyBatchNative($userAgents, $vias, $forwardedFor, $threshold) : null)
+            ?? self::detectProxyBatchPhp($userAgents, $vias, $forwardedFor, $threshold);
+    }
+
+    /**
+     * @param  array<array-key, string>  $userAgents
+     * @param  array<array-key, string>  $vias
+     * @param  array<array-key, string>  $forwardedFor
+     * @return list<int>
+     */
+    public static function detectProxyBatchPhp(array $userAgents, array $vias, array $forwardedFor, int $threshold = 50): array
+    {
+        $userAgents = array_values($userAgents);
+        $vias = array_values($vias);
+        $forwardedFor = array_values($forwardedFor);
+        $out = array_fill(0, self::W59_DETECT_HEADER, 0);
+        $out[0] = \count($userAgents);
+        $out[8] = -1;
+        $digest = 2_166_136_261;
+        $rows = [];
+        foreach ($userAgents as $at => $raw) {
+            $raw = (string) $raw;
+            $agent = strtolower($raw);
+            $via = strtolower((string) ($vias[$at] ?? ''));
+            $mask = $first = 0;
+            if ($agent !== '') {
+                foreach (self::W59_SIGNATURES as $bit => $signature) {
+                    if (str_contains($agent, $signature)) {
+                        $mask |= 1 << $bit;
+                        if ($first === 0) {
+                            $first = $bit + 1;
+                        }
+                        $out[9 + $bit]++;
+                    }
+                }
+            }
+            $indexer = ($mask & 0xFF) !== 0;
+            $downloader = ($mask & 0xF00) !== 0;
+            $empty = $agent === '';
+            $viaHops = self::w59Hops($via);
+            $xffHops = self::w59Hops((string) ($forwardedFor[$at] ?? ''));
+            $viaIndexer = false;
+            if ($via !== '') {
+                for ($bit = 0; $bit < 8; $bit++) {
+                    if (str_contains($via, self::W59_SIGNATURES[$bit])) {
+                        $viaIndexer = true;
+
+                        break;
+                    }
+                }
+            }
+            $score = $indexer ? 40 : ($downloader ? -20 : 0);
+            if ($empty) {
+                $score += 15;
+            }
+            $score += min($viaHops, 3) * 10 + min($xffHops, 4) * 5;
+            if ($viaIndexer) {
+                $score += 20;
+            }
+            $score = max(0, min(100, $score));
+            $blocked = $score >= $threshold;
+            $out[1] += (int) $blocked;
+            $out[2] += (int) $indexer;
+            $out[3] += (int) $downloader;
+            $out[4] += (int) $empty;
+            $out[5] += min($viaHops, 255);
+            $out[6] += min($xffHops, 255);
+            $out[7] = max($out[7], $score);
+            if ($blocked && $out[8] < 0) {
+                $out[8] = $at;
+            }
+            $row = $score | (int) $blocked << 7 | $first << 8 | $mask << 12 | min($viaHops, 255) << 24 | min($xffHops, 255) << 32
+                | (int) $viaIndexer << 40 | (int) $empty << 41 | min(\strlen($raw), 65_535) << 42;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[21] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust scores, or null when PHP must compute them (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $userAgents
+     * @param  array<array-key, string>  $vias
+     * @param  array<array-key, string>  $forwardedFor
+     * @return list<int>|null
+     */
+    public static function detectProxyBatchNative(array $userAgents, array $vias, array $forwardedFor, int $threshold = 50): ?array
+    {
+        $count = \count($userAgents);
+        if ($count > self::W59_MAX_ITEMS || \count($vias) !== $count || \count($forwardedFor) !== $count) {
+            return null;
+        }
+        [$joined, $twin] = self::w59Strings(array_values($userAgents), array_values($vias), array_values($forwardedFor));
+        $fields = self::W59_DETECT_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w59Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w596_proxy_detect_batch($joined, \strlen($joined), $twin, \strlen($twin), $count, $threshold, $out, $fields));
+    }
+
+    /**
+     * Comma-separated entries that are not blank after `trim(" \t")`.
+     */
+    private static function w59Hops(string $header): int
+    {
+        if ($header === '') {
+            return 0;
+        }
+        $hops = 0;
+        foreach (explode(',', $header) as $entry) {
+            if (trim($entry, " \t") !== '') {
+                $hops++;
+            }
+        }
+
+        return $hops;
+    }
+
+    /**
+     * Run `$callback` with the Wave 59.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW59RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w59RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w59RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW59RustFfi(): bool
+    {
+        $forced = self::w59RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W59_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 59.6 routing and binding in function statics (no static properties, so readonly classes can share it).
+     * No `$op` returns the forced routing (null for the default); `'set'` replaces it with `$val`
+     * and returns the previous value; `'binding'` returns the cached `additional_w59` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w59RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w59', self::W59_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 59.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w59Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w59RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Columns NUL-joined one after another and, when a value holds a NUL, the same columns joined
+     * with 0x01 so Rust finds the separators where the two differ.
+     *
+     * @param  list<string>  ...$columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w59Strings(array ...$columns): array
+    {
+        $joined = '';
+        $items = 0;
+        foreach ($columns as $column) {
+            if ($column !== []) {
+                $joined .= ($items > 0 ? "\0" : '').implode("\0", $column);
+                $items += \count($column);
+            }
+        }
+        if ($items === 0 || substr_count($joined, "\0") === $items - 1) {
+            return [$joined, ''];
+        }
+        $twin = '';
+        $items = 0;
+        foreach ($columns as $column) {
+            if ($column !== []) {
+                $twin .= ($items > 0 ? "\x01" : '').implode("\x01", $column);
+                $items += \count($column);
+            }
+        }
+
+        return [$joined, $twin];
     }
 }
