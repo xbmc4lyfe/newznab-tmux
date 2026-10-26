@@ -60698,3 +60698,1098 @@ mod w614_tests {
         assert_eq!(empty, 0);
     }
 }
+// =============================================================================
+// Wave 62.4: TvMazePipe, TvdbPipe, TvLookupOutcomeWriter, TvPosterResolver and
+// TvProcessingRunState batch plan rows.
+// =============================================================================
+
+pub mod w624_batch {
+    use super::w574_batch::MAX_RECORDS;
+    use super::w594_batch::{fnv, split};
+    use super::w614_batch::trim;
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// Record body: blob values (field-major), the int64 columns, the record count, output.
+    type Body = fn(&[&[u8]], &[i64], usize, &mut [i64]);
+
+    /// Upper clamp for epoch-second timestamps.
+    pub(crate) const TIME_MAX: i64 = 1 << 40;
+
+    const FNV_BASIS: i64 = 2_166_136_261;
+
+    /// Column `k` of the packed int64 words for record `i`.
+    #[inline(always)]
+    fn col(ints: &[i64], count: usize, k: usize, i: usize) -> i64 {
+        ints[k * count + i]
+    }
+
+    #[inline(always)]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point to `len` readable bytes unless `len` is zero.
+    unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Validate the frame, split the blob and run `body`. Returns the words written, -1 for a
+    /// malformed frame or panic and `-needed` when `out_cap` is too small.
+    ///
+    /// # Safety
+    ///
+    /// See the exported functions.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        fields: usize,
+        columns: usize,
+        words: usize,
+        trailer: usize,
+        body: Body,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(blob as usize, blob_len, out as usize, out_bytes)
+                || overlaps(twin as usize, twin_len, out as usize, out_bytes)
+                || overlaps(ints as usize, ints_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(blob), Some(twin), Some(ints)) = (
+                unsafe { bytes(blob, blob_len) },
+                unsafe { bytes(twin, twin_len) },
+                unsafe { bytes(ints, ints_len) },
+            ) else {
+                return -1;
+            };
+            if ints.len() != count * columns * 8 {
+                return -1;
+            }
+            if count == 0 {
+                return if blob.is_empty() && twin.is_empty() {
+                    0
+                } else {
+                    -1
+                };
+            }
+            let all: Vec<i64> = ints
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|w| i64::from_le_bytes(*w))
+                .collect();
+            let mut values: Vec<&[u8]> = Vec::with_capacity(count * fields);
+            if !split(blob, twin, count * fields, &mut values) {
+                return -1;
+            }
+            let need = count * words + trailer;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from every input.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            body(&values, &all, count, out);
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Multiplicative byte hasher for the per-batch duplicate sets.
+    #[derive(Default)]
+    struct Fx(u64);
+
+    impl Hasher for Fx {
+        #[inline(always)]
+        fn write(&mut self, bytes: &[u8]) {
+            for b in bytes {
+                self.0 =
+                    (self.0.rotate_left(5) ^ u64::from(*b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+            }
+        }
+
+        #[inline(always)]
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+
+    type Seen = HashSet<Vec<u8>, BuildHasherDefault<Fx>>;
+
+    #[inline(always)]
+    fn digits(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |a, d| a * 10 + i64::from(d - b'0'))
+    }
+
+    #[inline(always)]
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    /// PHP `unpack('N', hash('fnv1a32', $s, true))[1]`.
+    #[inline(always)]
+    pub(crate) fn fnv32(s: &[u8]) -> i64 {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in s {
+            h ^= u32::from(*b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        i64::from(h)
+    }
+
+    /// PHP `trim(preg_replace('/[^a-z0-9]+/', ' ', strtolower($s)), ' ')` into `out`.
+    pub(crate) fn norm(s: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        let mut gap = false;
+        for b in s {
+            let c = b.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                if gap && !out.is_empty() {
+                    out.push(b' ');
+                }
+                gap = false;
+                out.push(c);
+            } else {
+                gap = true;
+            }
+        }
+    }
+
+    /// (query length, year): a trailing ` 1900`-` 2099` token is cut from a normalized query
+    /// that keeps at least one byte.
+    pub(crate) fn strip_year(q: &[u8]) -> (usize, i64) {
+        let n = q.len();
+        if n >= 6 && q[n - 5] == b' ' && all_digits(&q[n - 4..]) {
+            let year = digits(&q[n - 4..]);
+            if (1900..=2099).contains(&year) {
+                return (n - 5, year);
+            }
+        }
+        (n, 0)
+    }
+
+    /// A trimmed `YYYY-MM-DD` (or '.'/'/' separated) valid date with a positive year as
+    /// `YYYYMMDD`, else 0.
+    pub(crate) fn ymd(t: &[u8]) -> i64 {
+        if t.len() != 10 || !all_digits(&t[..4]) || !all_digits(&t[5..7]) || !all_digits(&t[8..]) {
+            return 0;
+        }
+        let sep = t[4];
+        if !matches!(sep, b'-' | b'.' | b'/') || t[7] != sep {
+            return 0;
+        }
+        let (y, m, d) = (digits(&t[..4]), digits(&t[5..7]), digits(&t[8..]));
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let days = match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => 0,
+        };
+        if y > 0 && d >= 1 && d <= days {
+            y * 10_000 + m * 100 + d
+        } else {
+            0
+        }
+    }
+
+    /// 0 empty, 1 tvdb, 2 tvmaze, 3 tmdb, 4 trakt, 5 local db, 6 other (trimmed, ASCII
+    /// case-insensitive).
+    pub(crate) fn provider_class(p: &[u8]) -> i64 {
+        if p.is_empty() {
+            return 0;
+        }
+        for (name, class) in [
+            (&b"tvdb"[..], 1),
+            (b"tvmaze", 2),
+            (b"tmdb", 3),
+            (b"trakt", 4),
+            (b"local db", 5),
+        ] {
+            if p.eq_ignore_ascii_case(name) {
+                return class;
+            }
+        }
+        6
+    }
+
+    #[inline(always)]
+    fn ends_ci(s: &[u8], suffix: &[u8]) -> bool {
+        s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+
+    // -- TvMazePipe / TvdbPipe -------------------------------------------------------------------
+
+    /// Normalized query, flags (1 year stripped, 2 non-ASCII title), length and year.
+    #[inline(always)]
+    fn query(title: &[u8], q: &mut Vec<u8>) -> (usize, i64, i64) {
+        norm(title, q);
+        let (len, year) = strip_year(q);
+        q.truncate(len);
+        let flags = i64::from(year > 0) | if title.is_ascii() { 0 } else { 2 };
+        (len, year, flags)
+    }
+
+    fn tvmaze_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut summary = [0i64; 8];
+        let mut digest = FNV_BASIS;
+        let mut q = Vec::with_capacity(128);
+        for (i, row) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let (len, year, mut flags) = query(v[i], &mut q);
+            let day = trim(v[count + i]);
+            let air = ymd(day);
+            if !day.is_empty() && air == 0 {
+                flags |= 4;
+            }
+            let title_class = match len {
+                0 => 0,
+                1..=120 => 1,
+                _ => 2,
+            };
+            let code = trim(v[2 * count + i]);
+            let (country_class, packed) = if code.is_empty() {
+                (0, 0)
+            } else if code.len() == 2 && code.iter().all(u8::is_ascii_alphabetic) {
+                (
+                    1,
+                    i64::from(code[0].to_ascii_uppercase()) << 8
+                        | i64::from(code[1].to_ascii_uppercase()),
+                )
+            } else {
+                (2, 0)
+            };
+            let video = col(ints, count, 0, i);
+            let site = col(ints, count, 1, i);
+            let season = col(ints, count, 2, i).clamp(0, 9999);
+            let episode = col(ints, count, 3, i).clamp(0, 99_999);
+            let site_ok = (1..=99_999_999).contains(&site);
+            let status: i64 = if len == 0 {
+                1
+            } else if col(ints, count, 5, i) >= 3 {
+                2
+            } else if video <= 0 {
+                3
+            } else if col(ints, count, 4, i) != 0 {
+                4
+            } else if !site_ok {
+                5
+            } else if episode > 0 {
+                6
+            } else if air > 0 {
+                7
+            } else {
+                8
+            };
+            let key = match status {
+                6 => season * 100_000 + episode,
+                7 => air,
+                _ => -1,
+            };
+            let hash = if len == 0 { 0 } else { fnv32(&q) };
+            let word = status
+                | title_class << 4
+                | country_class << 6
+                | flags << 8
+                | (len.min(255) as i64) << 16
+                | year << 24;
+            *row = [
+                word,
+                hash,
+                air,
+                key,
+                if site_ok { site } else { -1 },
+                packed,
+            ];
+            summary[if status <= 2 { 0 } else { status as usize - 2 }] += 1;
+            digest = fnv(digest, word ^ hash << 20 ^ key);
+        }
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    /// (class, id): 0 empty, 1 1-10 digits, 2 `series-` plus 1-10 digits, 3 otherwise (or a
+    /// zero id).
+    pub(crate) fn tvdb_id(raw: &[u8]) -> (i64, i64) {
+        if raw.is_empty() {
+            return (0, 0);
+        }
+        let (prefixed, s) = match raw.strip_prefix(b"series-") {
+            Some(rest) => (true, rest),
+            None => (false, raw),
+        };
+        if (1..=10).contains(&s.len()) && all_digits(s) {
+            let id = digits(s);
+            if id > 0 {
+                return (if prefixed { 2 } else { 1 }, id);
+            }
+        }
+        (3, 0)
+    }
+
+    fn tvdb_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut summary = [0i64; 8];
+        let mut digest = FNV_BASIS;
+        let mut q = Vec::with_capacity(128);
+        for (i, row) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let (len, title_year, mut flags) = query(v[i], &mut q);
+            let (id_class, id) = tvdb_id(trim(v[count + i]));
+            let day = trim(v[2 * count + i]);
+            let air = ymd(day);
+            if !day.is_empty() && air == 0 {
+                flags |= 4;
+            }
+            let first = trim(v[3 * count + i]);
+            let first_year = if first.len() >= 4 && all_digits(&first[..4]) {
+                digits(&first[..4])
+            } else {
+                0
+            };
+            let year = col(ints, count, 5, i);
+            let effective = if (1900..=2099).contains(&year) {
+                year
+            } else {
+                if title_year > 0 {
+                    flags |= 8;
+                }
+                title_year
+            };
+            let (delta, bonus) = if effective > 0 && first_year > 0 {
+                let d = (first_year - effective).abs();
+                (
+                    d,
+                    match d {
+                        0 => 20,
+                        1 => 5,
+                        _ => -10,
+                    },
+                )
+            } else {
+                (-1, 0)
+            };
+            let video = col(ints, count, 0, i);
+            let season = col(ints, count, 1, i).clamp(0, 9999);
+            let episode = col(ints, count, 2, i).clamp(0, 99_999);
+            let status: i64 = if len == 0 {
+                1
+            } else if col(ints, count, 4, i) >= 3 {
+                2
+            } else if video <= 0 {
+                3
+            } else if col(ints, count, 3, i) != 0 {
+                4
+            } else if id == 0 {
+                5
+            } else if episode > 0 {
+                6
+            } else if air > 0 {
+                7
+            } else {
+                8
+            };
+            let key = match status {
+                6 => season * 100_000 + episode,
+                7 => air,
+                _ => -1,
+            };
+            let hash = if len == 0 { 0 } else { fnv32(&q) };
+            let word =
+                status | id_class << 4 | flags << 8 | (len.min(255) as i64) << 16 | effective << 24;
+            *row = [word, hash, air, key, if id > 0 { id } else { -1 }, delta];
+            match status {
+                1 | 2 => summary[0] += 1,
+                3..=7 => summary[status as usize - 2] += 1,
+                _ => {}
+            }
+            summary[6] += bonus;
+            digest = fnv(digest, word ^ hash << 20 ^ key);
+        }
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- TvLookupOutcomeWriter -----------------------------------------------------------------
+
+    /// TvProcessingResult status codes (trimmed, ASCII case-insensitive), -1 when unknown.
+    pub(crate) fn status_code(s: &[u8]) -> i64 {
+        for (name, code) in [
+            (&b"matched"[..], 0),
+            (b"season_pack", 1),
+            (b"episode_missing", 2),
+            (b"not_found", 3),
+            (b"parse_failed", 4),
+            (b"transient", 5),
+            (b"skipped", 6),
+            (b"pending", 7),
+        ] {
+            if s.eq_ignore_ascii_case(name) {
+                return code;
+            }
+        }
+        -1
+    }
+
+    #[inline(always)]
+    fn episode_delay(attempts: i64) -> i64 {
+        match attempts {
+            1 => 3600,
+            2 => 21_600,
+            3 => 86_400,
+            4 => 259_200,
+            _ => 604_800,
+        }
+    }
+
+    #[inline(always)]
+    fn transient_delay(attempts: i64, retry_after: i64) -> i64 {
+        retry_after.max(match attempts {
+            1 => 300,
+            2 => 900,
+            3 => 3600,
+            _ => 21_600,
+        })
+    }
+
+    fn outcome_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut summary = [0i64; 8];
+        summary[6] = -1;
+        let mut digest = FNV_BASIS;
+        for (i, row) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let code = status_code(trim(v[i]));
+            let provider = trim(v[count + i]);
+            let provider_class = provider_class(provider);
+            let mut provider_hash: u32 = 0x811c_9dc5;
+            for b in provider {
+                provider_hash ^= u32::from(b.to_ascii_lowercase());
+                provider_hash = provider_hash.wrapping_mul(0x0100_0193);
+            }
+            let provider_hash = if provider.is_empty() {
+                0
+            } else {
+                i64::from(provider_hash)
+            };
+            let prev_video = col(ints, count, 0, i);
+            let prev_status = col(ints, count, 1, i);
+            let prev_attempts = col(ints, count, 2, i).clamp(0, 1_000_000);
+            let video = col(ints, count, 3, i);
+            let episode = col(ints, count, 4, i);
+            let transient = col(ints, count, 5, i) != 0;
+            let retry = col(ints, count, 6, i).clamp(0, 604_800);
+            let linked = video.max(0);
+            let (vid, status, attempts, delay, mut flags) = match code {
+                0 => (linked, episode, 0, -1, 0),
+                1 => (linked, -12, 0, -1, 0),
+                2 => {
+                    let attempts = if prev_status == -11 {
+                        prev_attempts + 1
+                    } else {
+                        1
+                    };
+                    let delay = if transient {
+                        retry.max(900)
+                    } else if attempts < 6 {
+                        episode_delay(attempts)
+                    } else {
+                        -1
+                    };
+                    let exhausted = if !transient && attempts >= 6 { 16 } else { 0 };
+                    (linked, -11, attempts, delay, exhausted)
+                }
+                5 => {
+                    let attempts = if prev_status == 0 {
+                        prev_attempts + 1
+                    } else {
+                        1
+                    };
+                    if attempts >= 8 {
+                        (0, -10, 0, -1, 16)
+                    } else {
+                        (0, 0, attempts, transient_delay(attempts, retry), 0)
+                    }
+                }
+                4 => (0, -100, 0, -1, 0),
+                _ => (0, -10, 0, -1, 0),
+            };
+            let link = vid != prev_video || (status != prev_status && status.max(prev_status) > 0);
+            let bump = link && (code == 0 || code == 1);
+            let invalid = video < 0
+                || code < 0
+                || (code == 0 && episode <= 0)
+                || ((0..=2).contains(&code) && video == 0);
+            flags |= i64::from(link)
+                | i64::from(bump) << 1
+                | i64::from(invalid) << 2
+                | i64::from(transient) << 3;
+            let transition: i64 = if delay >= 0 {
+                1
+            } else if status > 0 {
+                3
+            } else if status == -11 {
+                4
+            } else {
+                2
+            };
+            let word = (code + 1) | provider_class << 4 | transition << 8 | flags << 12;
+            *row = [word, vid, status, attempts, delay];
+            match transition {
+                1 => summary[0] += 1,
+                3 => summary[2] += 1,
+                _ => summary[1] += 1,
+            }
+            summary[3] += i64::from(invalid);
+            summary[4] += i64::from(link);
+            summary[5] += i64::from(bump);
+            summary[6] = summary[6].max(delay);
+            digest = fnv(digest, word ^ status << 16 ^ delay ^ provider_hash << 40);
+        }
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- TvPosterResolver ----------------------------------------------------------------------
+
+    /// (class, extension) of a trimmed poster candidate: class 0 empty, 1 https URL, 2 http URL,
+    /// 3 root-relative path, 4 invalid (control bytes or spaces, another scheme, or a host
+    /// without an inner dot); extension 1 jpg/jpeg, 2 png, 3 webp, 4 gif, 0 other.
+    pub(crate) fn poster_class(s: &[u8]) -> (i64, i64) {
+        if s.is_empty() {
+            return (0, 0);
+        }
+        if s.iter().any(|b| *b <= 0x20 || *b == 0x7f) {
+            return (4, 0);
+        }
+        let (class, rest) = if s.len() >= 8 && s[..8].eq_ignore_ascii_case(b"https://") {
+            (1, &s[8..])
+        } else if s.len() >= 7 && s[..7].eq_ignore_ascii_case(b"http://") {
+            (2, &s[7..])
+        } else if s[0] == b'/' && (s.len() == 1 || s[1] != b'/') {
+            (3, s)
+        } else {
+            return (4, 0);
+        };
+        let path = if class == 3 {
+            rest
+        } else {
+            let h = rest
+                .iter()
+                .position(|b| matches!(b, b'/' | b'?' | b'#'))
+                .unwrap_or(rest.len());
+            let host = &rest[..h];
+            if host.is_empty() || !host.contains(&b'.') || host[0] == b'.' || host[h - 1] == b'.' {
+                return (4, 0);
+            }
+            &rest[h..]
+        };
+        let path = &path[..path
+            .iter()
+            .position(|b| matches!(b, b'?' | b'#'))
+            .unwrap_or(path.len())];
+        let ext = if ends_ci(path, b".jpg") || ends_ci(path, b".jpeg") {
+            1
+        } else if ends_ci(path, b".png") {
+            2
+        } else if ends_ci(path, b".webp") {
+            3
+        } else if ends_ci(path, b".gif") {
+            4
+        } else {
+            0
+        };
+        (class, ext)
+    }
+
+    /// 0 empty, 1 jpeg, 2 png, 3 webp, 4 gif, 5 another image/*, 6 otherwise (parameters after
+    /// ';' ignored).
+    pub(crate) fn content_type(s: &[u8]) -> i64 {
+        let t = trim(s);
+        let base = trim(&t[..t.iter().position(|b| *b == b';').unwrap_or(t.len())]);
+        if base.is_empty() {
+            0
+        } else if base.eq_ignore_ascii_case(b"image/jpeg")
+            || base.eq_ignore_ascii_case(b"image/jpg")
+        {
+            1
+        } else if base.eq_ignore_ascii_case(b"image/png") {
+            2
+        } else if base.eq_ignore_ascii_case(b"image/webp") {
+            3
+        } else if base.eq_ignore_ascii_case(b"image/gif") {
+            4
+        } else if base.len() > 6 && base[..6].eq_ignore_ascii_case(b"image/") {
+            5
+        } else {
+            6
+        }
+    }
+
+    const POSTER_MAX_BYTES: i64 = 20_971_520;
+
+    fn poster_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut summary = [0i64; 7];
+        let mut digest = FNV_BASIS;
+        for (i, row) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let provider = trim(v[i]);
+            let tmdb = trim(v[count + i]);
+            let fanart = trim(v[2 * count + i]);
+            let (pc, pe) = poster_class(provider);
+            let (tc, te) = poster_class(tmdb);
+            let (fc, fe) = poster_class(fanart);
+            let width = col(ints, count, 0, i);
+            let height = col(ints, count, 1, i);
+            let size = col(ints, count, 4, i);
+            let (source, selected, class, ext): (i64, &[u8], i64, i64) = if pc == 1 || pc == 2 {
+                (1, provider, pc, pe)
+            } else if (tc == 1 || tc == 3) && col(ints, count, 2, i) > 0 {
+                (2, tmdb, tc, te)
+            } else if (fc == 1 || fc == 2) && col(ints, count, 3, i) > 0 {
+                (3, fanart, fc, fe)
+            } else {
+                (0, &[], 0, 0)
+            };
+            let ctype = content_type(v[3 * count + i]);
+            let (dim, aspect) = if width == 0 && height == 0 {
+                (0, -1)
+            } else if (1..=20_000).contains(&width) && (1..=20_000).contains(&height) {
+                let aspect = width * 1000 / height;
+                (if (600..=750).contains(&aspect) { 1 } else { 2 }, aspect)
+            } else {
+                (3, -1)
+            };
+            let mismatch = ext > 0 && ctype > 0 && ext != ctype;
+            let flags = i64::from(class == 2)
+                | i64::from(mismatch) << 1
+                | i64::from(size > POSTER_MAX_BYTES) << 2
+                | i64::from(size < 0 || dim == 3) << 3
+                | i64::from(pc >= 3) << 4;
+            let score = [0, 300, 200, 100][source as usize]
+                + if dim == 1 { 50 } else { 0 }
+                + if class == 1 { 20 } else { 0 }
+                - if mismatch { 30 } else { 0 };
+            let hash = if selected.is_empty() {
+                0
+            } else {
+                fnv32(selected)
+            };
+            let word = source
+                | pc << 4
+                | tc << 8
+                | fc << 12
+                | ext << 16
+                | ctype << 20
+                | dim << 24
+                | flags << 28;
+            *row = [word, hash, selected.len() as i64, aspect, score];
+            summary[if source == 0 { 3 } else { source as usize - 1 }] += 1;
+            summary[4] += i64::from(dim == 1);
+            if (0..=POSTER_MAX_BYTES).contains(&size) {
+                summary[5] = summary[5].max(size);
+            }
+            digest = fnv(digest, word ^ hash << 24 ^ score);
+        }
+        summary[6] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- TvProcessingRunState ------------------------------------------------------------------
+
+    /// PHP's decimal rendering of `v`.
+    #[inline(always)]
+    fn push_i64(out: &mut Vec<u8>, v: i64) {
+        let mut buf = [0u8; 20];
+        let mut n = v.unsigned_abs();
+        let mut at = buf.len();
+        loop {
+            at -= 1;
+            buf[at] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if v < 0 {
+            out.push(b'-');
+        }
+        out.extend_from_slice(&buf[at..]);
+    }
+
+    /// `NxM` with a 1-4 digit season and a 1-5 digit episode.
+    pub(crate) fn season_episode(k: &[u8]) -> bool {
+        let Some(x) = k.iter().position(|b| *b == b'x') else {
+            return false;
+        };
+        let rest = &k[x + 1..];
+        (1..=4).contains(&x)
+            && all_digits(&k[..x])
+            && (1..=5).contains(&rest.len())
+            && all_digits(rest)
+    }
+
+    pub(crate) const REFRESH_TTL: i64 = 3600;
+
+    fn run_state_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut summary = [0i64; 11];
+        let mut digest = FNV_BASIS;
+        let mut q = Vec::with_capacity(128);
+        let mut title_key = Vec::with_capacity(160);
+        let mut key = Vec::with_capacity(160);
+        let mut titles = Seen::default();
+        let mut lookups = Seen::default();
+        for (i, row) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let raw = v[i];
+            let provider = trim(raw);
+            let provider_class = provider_class(provider);
+            let title = v[count + i];
+            norm(title, &mut q);
+            let len = q.len();
+            title_key.clear();
+            title_key.extend(provider.iter().map(u8::to_ascii_lowercase));
+            title_key.push(0x1f);
+            title_key.extend_from_slice(&q);
+            let title_hash = if len == 0 { 0 } else { fnv32(&title_key) };
+            let video = col(ints, count, 0, i);
+            key.clear();
+            key.extend_from_slice(b"tv:eps-refreshed:");
+            key.extend(raw.iter().map(u8::to_ascii_lowercase));
+            key.push(b':');
+            push_i64(&mut key, video);
+            let refresh_hash = fnv32(&key);
+            let episode_key = v[2 * count + i];
+            key.clear();
+            key.extend_from_slice(raw);
+            key.push(b':');
+            push_i64(&mut key, video);
+            key.push(b':');
+            key.extend_from_slice(episode_key);
+            let lookup_hash = fnv32(&key);
+            let k = trim(episode_key);
+            let episode_class: i64 = if k.is_empty() {
+                0
+            } else if season_episode(k) {
+                1
+            } else if ymd(k) > 0 {
+                2
+            } else {
+                3
+            };
+            let now = col(ints, count, 3, i).clamp(0, TIME_MAX);
+            let refreshed = col(ints, count, 2, i);
+            let refresh_state: i64 = if refreshed <= 0 {
+                0
+            } else if refreshed > now {
+                2
+            } else if now - refreshed < REFRESH_TTL {
+                1
+            } else {
+                3
+            };
+            let age = if refreshed > 0 && refreshed <= now {
+                now - refreshed
+            } else {
+                -1
+            };
+            let circuit = col(ints, count, 1, i) >= 3;
+            let hits = col(ints, count, 4, i).clamp(0, 1_000_000_000);
+            let misses = col(ints, count, 5, i).clamp(0, 1_000_000_000);
+            let total = hits + misses;
+            let rate = if total > 0 { hits * 1000 / total } else { -1 };
+            let duplicate_title = len > 0 && {
+                let seen = titles.contains(title_key.as_slice());
+                if !seen {
+                    titles.insert(title_key.clone());
+                }
+                seen
+            };
+            let duplicate_lookup = (episode_class == 1 || episode_class == 2) && video > 0 && {
+                let seen = lookups.contains(key.as_slice());
+                if !seen {
+                    lookups.insert(key.clone());
+                }
+                seen
+            };
+            let decision: i64 = if circuit {
+                1
+            } else if video <= 0 && len == 0 {
+                2
+            } else if video <= 0 {
+                if duplicate_title { 4 } else { 3 }
+            } else if refresh_state == 0 || refresh_state == 3 {
+                5
+            } else if episode_class == 1 || episode_class == 2 {
+                if duplicate_lookup { 7 } else { 6 }
+            } else {
+                8
+            };
+            let flags = i64::from(duplicate_title)
+                | i64::from(duplicate_lookup) << 1
+                | i64::from(circuit) << 2
+                | i64::from(!title.is_ascii()) << 3
+                | i64::from(refresh_state == 2) << 4;
+            let word = decision
+                | provider_class << 4
+                | refresh_state << 8
+                | episode_class << 10
+                | flags << 12
+                | (len.min(255) as i64) << 20;
+            *row = [word, title_hash, refresh_hash, lookup_hash, rate, age];
+            summary[decision as usize - 1] += 1;
+            summary[8] += hits;
+            summary[9] += misses;
+            digest = fnv(digest, word ^ title_hash << 20 ^ lookup_hash);
+        }
+        summary[10] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    macro_rules! export624 {
+        ($name:ident, $fields:literal, $columns:literal, $words:literal, $trailer:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `blob` must point to `blob_len` readable bytes (`count * fields` NUL-joined
+            /// values, field-major), `twin` to `twin_len` readable bytes (empty, or the same
+            /// values joined by 0x01), `ints` to `ints_len` readable bytes (`columns` columns
+            /// of `count` packed little-endian int64 words) and `out` to `out_cap` writable,
+            /// aligned int64 words that overlap no input; null pointers are accepted only with
+            /// zero lengths. Bad shapes return -1 before writing, a short output returns
+            /// `-needed` without writing and panics map to -1.
+            #[unsafe(no_mangle)]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                twin: *const u8,
+                twin_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                const BODY: Body = $body;
+                unsafe {
+                    run(
+                        blob, blob_len, twin, twin_len, ints, ints_len, count, out, out_cap,
+                        $fields, $columns, $words, $trailer, BODY,
+                    )
+                }
+            }
+        };
+    }
+
+    export624!(
+        nntmux_w624_tvmaze_lookup_plan_row_batch,
+        3,
+        6,
+        6,
+        8,
+        tvmaze_row
+    );
+    export624!(nntmux_w624_tvdb_lookup_plan_row_batch, 4, 6, 6, 8, tvdb_row);
+    export624!(
+        nntmux_w624_tv_lookup_outcome_plan_row_batch,
+        2,
+        7,
+        5,
+        8,
+        outcome_row
+    );
+    export624!(
+        nntmux_w624_tv_poster_resolution_plan_row_batch,
+        4,
+        5,
+        5,
+        7,
+        poster_row
+    );
+    export624!(
+        nntmux_w624_tv_run_state_plan_row_batch,
+        3,
+        6,
+        6,
+        11,
+        run_state_row
+    );
+}
+
+#[cfg(test)]
+mod w624_tests {
+    use super::w624_batch::*;
+
+    type Export = unsafe extern "C" fn(
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        usize,
+        *mut i64,
+        usize,
+    ) -> isize;
+
+    /// Field-major frame without NULs, then the int columns.
+    fn call(export: Export, fields: &[&[&[u8]]], columns: &[&[i64]], out: &mut [i64]) -> isize {
+        let count = fields[0].len();
+        let blob = fields
+            .iter()
+            .flat_map(|f| f.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(&0u8);
+        let ints: Vec<u8> = columns
+            .iter()
+            .flat_map(|c| c.iter())
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        unsafe {
+            export(
+                blob.as_ptr(),
+                blob.len(),
+                std::ptr::null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn w624_classifiers() {
+        let mut q = Vec::new();
+        norm(b"  The.Office.US--2005 ", &mut q);
+        assert_eq!(q, b"the office us 2005");
+        assert_eq!(strip_year(&q), (13, 2005));
+        assert_eq!(strip_year(b"x 1899"), (6, 0));
+        assert_eq!(strip_year(b" 2005"), (5, 0));
+        assert_eq!(ymd(b"2024-02-29"), 20_240_229);
+        assert_eq!(ymd(b"2023-02-29"), 0);
+        assert_eq!(ymd(b"1900.02.29"), 0);
+        assert_eq!(ymd(b"2000/02/29"), 20_000_229);
+        assert_eq!(ymd(b"2000-02/29"), 0);
+        assert_eq!(ymd(b"0000-01-01"), 0);
+        assert_eq!(provider_class(b"TVMaze"), 2);
+        assert_eq!(provider_class(b"Local DB"), 5);
+        assert_eq!(provider_class(b"x"), 6);
+        assert_eq!(tvdb_id(b"series-81189"), (2, 81_189));
+        assert_eq!(tvdb_id(b"0000"), (3, 0));
+        assert_eq!(tvdb_id(b"12345678901"), (3, 0));
+        assert_eq!(status_code(b"Season_Pack"), 1);
+        assert_eq!(status_code(b"bogus"), -1);
+        assert_eq!(
+            poster_class(b"https://static.tvmaze.com/a/b.JPG?x=1"),
+            (1, 1)
+        );
+        assert_eq!(poster_class(b"http://img.example/p.webp"), (2, 3));
+        assert_eq!(poster_class(b"/abc.png"), (3, 2));
+        assert_eq!(poster_class(b"//cdn.example/a.png"), (4, 0));
+        assert_eq!(poster_class(b"https://localhost/a.png"), (4, 0));
+        assert_eq!(poster_class(b"ftp://a.b/c.png"), (4, 0));
+        assert_eq!(content_type(b" Image/JPEG; charset=binary"), 1);
+        assert_eq!(content_type(b"image/avif"), 5);
+        assert_eq!(content_type(b"text/html"), 6);
+        assert_eq!(content_type(b" ; x"), 0);
+        assert!(season_episode(b"1x5"));
+        assert!(!season_episode(b"x5"));
+        assert!(!season_episode(b"12345x1"));
+        assert_eq!(fnv32(b""), 0x811c_9dc5);
+    }
+
+    #[test]
+    fn w624_rows_and_frames() {
+        let mut out = vec![0i64; 6 + 8];
+        let written = call(
+            nntmux_w624_tvmaze_lookup_plan_row_batch,
+            &[&[b"Doctor Who (2005)"], &[b"2024-01-06"], &[b" gb "]],
+            &[&[7], &[210], &[1], &[2], &[0], &[0]],
+            &mut out,
+        );
+        assert_eq!(written, 14);
+        assert_eq!(out[0] & 0xF, 6);
+        assert_eq!(out[0] >> 24, 2005);
+        assert_eq!(out[1], fnv32(b"doctor who"));
+        assert_eq!(out[2], 20_240_106);
+        assert_eq!(out[3], 100_002);
+        assert_eq!(out[5], i64::from(b'G') << 8 | i64::from(b'B'));
+        assert_eq!(out[6 + 4], 1);
+
+        let mut out = vec![0i64; 5 + 8];
+        let written = call(
+            nntmux_w624_tv_lookup_outcome_plan_row_batch,
+            &[&[b"transient"], &[b"TVDB"]],
+            &[&[0], &[0], &[2], &[0], &[0], &[1], &[50]],
+            &mut out,
+        );
+        assert_eq!(written, 13);
+        assert_eq!(&out[1..5], &[0, 0, 3, 3600]);
+
+        let mut short = vec![0i64; 3];
+        let need = call(
+            nntmux_w624_tv_run_state_plan_row_batch,
+            &[&[b"TVDB"], &[b"Show"], &[b"1x2"]],
+            &[&[1], &[0], &[0], &[0], &[0], &[0]],
+            &mut short,
+        );
+        assert_eq!(need, -17);
+        let mut out = vec![0i64; 17];
+        let empty = unsafe {
+            nntmux_w624_tv_poster_resolution_plan_row_batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(empty, 0);
+        let bad = unsafe {
+            nntmux_w624_tvdb_lookup_plan_row_batch(
+                b"a".as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(bad, -1);
+    }
+}
