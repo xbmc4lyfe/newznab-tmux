@@ -466,4 +466,283 @@ final class ProcessingRuntimeStateRepository
                 return $enabled;
         }
     }
+
+    // ---- Wave 67.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 12.616x/10.147x, uncommon 11.494x/8.919x); see RustRuntimeStateConsolesEpisodeHydrationFanartForkingW67ParityTest. */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    private const string W67_RUNTIME_STATE_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w672_runtime_state_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W67_RUNTIME_STATE_TAIL = 25;
+
+    /**
+     * Wave 67 routing, binding and output buffer, kept in function-local statics (no static or
+     * instance properties). Operations: null reads the routing override, 'set' replaces it
+     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
+     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
+     * (null without the library).
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'reset':
+                $previous = $enabled;
+                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w67', self::W67_RUNTIME_STATE_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w67RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    /** Routes w67RuntimeStatePlanBatch() to Rust until reset. */
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', true);
+    }
+
+    /** Routes w67RuntimeStatePlanBatch() to PHP until reset. */
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', false);
+    }
+
+    /** Restores W67_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('reset');
+    }
+
+    public static function usesW67RustFfi(): bool
+    {
+        $enabled = self::w67RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W67_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w67RuntimeStatePlanBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w67RuntimeStatePlanBatch(array $rows): array
+    {
+        return self::usesW67RustFfi() ? self::w67RuntimeStatePlanBatchNative($rows) : self::w67RuntimeStatePlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w67RuntimeStatePlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W67_RUNTIME_STATE_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w67RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w67RuntimeStatePlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W67_RUNTIME_STATE_FFI_CDEF.)
+            $written = $ffi->nntmux_w672_runtime_state_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w67RuntimeStatePlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w67Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w67Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /** 0 empty or 0/false/off/no, 1 for 1/true/on/yes, 2 any other value (trimmed, any case). */
+    private static function w67Flag(string $value): int
+    {
+        return match (strtolower(trim($value))) {
+            '', '0', 'false', 'off', 'no' => 0,
+            '1', 'true', 'on', 'yes' => 1,
+            default => 2,
+        };
+    }
+
+    /** Wave 57 state positions + 1. */
+    private const array W67_RUNTIME_STATES = ['running' => 1, 'paused' => 2, 'draining' => 3, 'drained' => 4, 'stopped' => 5];
+
+    /** The W57_TRANSITIONS table by state position. */
+    private const array W67_RUNTIME_ALLOWED = [1 => [2 => true, 3 => true], 2 => [1 => true, 3 => true], 3 => [1 => true, 4 => true], 4 => [1 => true, 5 => true], 5 => [1 => true]];
+
+    /** 0 empty, a W67_RUNTIME_STATES position (trimmed, any case), otherwise false. */
+    private static function w67RuntimeState(string $value): int|false
+    {
+        $value = trim($value);
+
+        return $value === '' ? 0 : (self::W67_RUNTIME_STATES[strtolower($value)] ?? false);
+    }
+
+    /**
+     * Wave 67.2 runtime state plan. Per `state\trequested\ttmux_running\tstop_requested\tpending\t
+     * active\tprevious` row `transition | state << 2 | requested << 5 | effective << 8 | gate << 11
+     * | forced << 14 | promoted << 15 | conflict << 16 | changed << 17 | first << 18 | malformed
+     * << 19 | running << 20 | stop << 21 | min(load, 2^20 - 1) << 22 | min(pending, 2^20 - 1) <<
+     * 42`. States are w67RuntimeState() positions, flags w67Flag() values and counters w67Int()
+     * fields of 9 digits; load is pending + active. An empty or unknown state, an unknown
+     * requested or previous state, an unparsable flag or counter is malformed. The transition is
+     * 0 none, 3 no-op, 1 allowed by W57_TRANSITIONS or 2 rejected. A well-formed row takes the
+     * requested state when allowed; a stop request forces running or paused to draining
+     * (forced), and draining without load is promoted to drained. The gate is 1 admit
+     * (running), 2 hold (paused), 3 wait (draining), 4 idle (drained) or 5 stop (stopped, or
+     * drained with a stop request). A conflict is a running tmux in drained/stopped or a stopped
+     * tmux in running/draining; changed compares with a non-empty previous state and first marks
+     * an empty one. Then four transition, six gate and six effective-state counts, malformed
+     * rows, conflicts, changed, forced and promoted rows, total pending, total active, the
+     * highest load (well-formed rows) and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w67RuntimeStatePlanBatchPhp(array $rows): array
+    {
+        $out = [];
+        $transitions = array_fill(0, 4, 0);
+        $gates = array_fill(0, 6, 0);
+        $effs = array_fill(0, 6, 0);
+        $malformedRows = $conflicts = $changedRows = $forcedRows = $promotedRows = $totalPending = $totalActive = $maxLoad = 0;
+        foreach ($rows as $row) {
+            [$state, $requested, $running, $stop, $pending, $active, $previous] = explode("\t", (string) $row, 7) + ['', '', '', '', '', '', ''];
+            $state = self::w67RuntimeState($state);
+            $requested = self::w67RuntimeState($requested);
+            $previous = self::w67RuntimeState($previous);
+            $running = self::w67Flag($running);
+            $stop = self::w67Flag($stop);
+            $pending = self::w67Int($pending, 9);
+            $active = self::w67Int($active, 9);
+            $s = \is_int($state) ? $state : 0;
+            $r = \is_int($requested) ? $requested : 0;
+            $p = \is_int($previous) ? $previous : 0;
+            $malformed = $s === 0 || $requested === false || $previous === false || $running === 2 || $stop === 2 || $pending === false || $active === false;
+            $pend = \is_int($pending) ? $pending : 0;
+            $act = \is_int($active) ? $active : 0;
+            $load = $pend + $act;
+            $transition = match (true) {
+                $r === 0 => 0,
+                $r === $s => 3,
+                isset(self::W67_RUNTIME_ALLOWED[$s][$r]) => 1,
+                default => 2,
+            };
+            $eff = $gate = 0;
+            $forced = $promoted = $conflict = $changed = $first = false;
+            if (! $malformed) {
+                $eff = $transition === 1 ? $r : $s;
+                if ($stop === 1 && ($eff === 1 || $eff === 2)) {
+                    [$eff, $forced] = [3, true];
+                }
+                if ($eff === 3 && $load === 0) {
+                    [$eff, $promoted] = [4, true];
+                }
+                $gate = match ($eff) {
+                    1 => 1,
+                    2 => 2,
+                    3 => 3,
+                    4 => $stop === 1 ? 5 : 4,
+                    default => 5,
+                };
+                $conflict = $running === 1 ? ($eff === 4 || $eff === 5) : ($eff === 1 || $eff === 3);
+                $first = $p === 0;
+                $changed = $p !== 0 && $p !== $eff;
+                $totalPending += $pend;
+                $totalActive += $act;
+                $maxLoad = max($maxLoad, $load);
+            }
+            $transitions[$transition]++;
+            $gates[$gate]++;
+            $effs[$eff]++;
+            $malformedRows += (int) $malformed;
+            $conflicts += (int) $conflict;
+            $changedRows += (int) $changed;
+            $forcedRows += (int) $forced;
+            $promotedRows += (int) $promoted;
+            $out[] = $transition | $s << 2 | $r << 5 | $eff << 8 | $gate << 11 | (int) $forced << 14 | (int) $promoted << 15 | (int) $conflict << 16
+                | (int) $changed << 17 | (int) $first << 18 | (int) $malformed << 19 | (int) ($running === 1) << 20 | (int) ($stop === 1) << 21
+                | min($load, 0xFFFFF) << 22 | min($pend, 0xFFFFF) << 42;
+        }
+        array_push($out, ...$transitions, ...$gates, ...$effs);
+        array_push($out, $malformedRows, $conflicts, $changedRows, $forcedRows, $promotedRows, $totalPending, $totalActive, $maxLoad);
+        $out[] = self::w67Digest($out);
+
+        return $out;
+    }
 }

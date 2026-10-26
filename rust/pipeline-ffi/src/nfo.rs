@@ -53886,3 +53886,1218 @@ pub mod wave66_2_binaries_collection_header_parser_storage_tx_missed_part {
         }
     }
 }
+
+pub mod wave67_2_runtime_state_consoles_episode_hydration_fanart_forking {
+    //! Wave 67.2 batch kernels for ProcessingRuntimeStateRepository, ConsolesProcessor,
+    //! EpisodeHydrationService, FanartTvService and ForkingService in the Wave 49.2 framing: one
+    //! `i64` word per tab-separated row, a few summary words and one XXH64 digest of the
+    //! preceding words out. Every export takes one NUL-joined string column (exactly `count`
+    //! rows) and returns the word count, `-needed` when `out_cap` (in words) is short, or -1 for
+    //! a null output, a malformed batch, an output overlapping the input or a panic. Outputs are
+    //! written byte-wise, so any alignment is accepted. Every rule is byte-level ASCII, so the
+    //! PHP twins agree under any `setlocale()`.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, span,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::io::Write;
+
+    type Set<T> = HashSet<T, FoldState>;
+    type Map<K, V> = HashMap<K, V, FoldState>;
+
+    fn set<T>(n: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    fn map<K, V>(n: usize) -> Map<K, V> {
+        HashMap::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// PHP `explode("\t", $row, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(row: &[u8]) -> [&[u8]; N] {
+        let mut out = [&row[..0]; N];
+        let mut rest = row;
+        for (k, slot) in out.iter_mut().enumerate() {
+            if k + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'\t') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// PHP `trim()` with its default character set.
+    fn trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    #[inline]
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    #[inline]
+    fn num(d: &[u8]) -> i64 {
+        d.iter()
+            .fold(0i64, |acc, &c| acc * 10 + i64::from(c - b'0'))
+    }
+
+    /// A trimmed field: `Ok(None)` when empty, `Ok(Some(n))` for 1 to `max` ASCII digits,
+    /// otherwise `Err(())` (PHP `w67Int()`: null, int or false).
+    #[inline]
+    fn int(v: &[u8], max: usize) -> Result<Option<i64>, ()> {
+        let v = trim(v);
+        if v.is_empty() {
+            return Ok(None);
+        }
+        if v.len() > max || !all_digits(v) {
+            return Err(());
+        }
+        Ok(Some(num(v)))
+    }
+
+    #[inline]
+    fn val(v: Result<Option<i64>, ()>) -> i64 {
+        v.ok().flatten().unwrap_or(0)
+    }
+
+    fn lower(s: &[u8]) -> Vec<u8> {
+        s.iter().map(u8::to_ascii_lowercase).collect()
+    }
+
+    /// 0 empty or 0/false/off/no; 1 1/true/on/yes; 2 other (case-insensitive, trimmed).
+    fn flag(v: &[u8]) -> i64 {
+        let v = trim(v);
+        if v.is_empty()
+            || [b"0".as_slice(), b"false", b"off", b"no"]
+                .iter()
+                .any(|t| v.eq_ignore_ascii_case(t))
+        {
+            0
+        } else if [b"1".as_slice(), b"true", b"on", b"yes"]
+            .iter()
+            .any(|t| v.eq_ignore_ascii_case(t))
+        {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Days since 1970-01-01 of a proleptic Gregorian date (year >= 1).
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y / 400;
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    // ---- ProcessingRuntimeStateRepository ----------------------------------------------------
+
+    const RUNTIME_STATES: [&[u8]; 5] = [b"running", b"paused", b"draining", b"drained", b"stopped"];
+
+    /// `Ok(0)` empty, `Ok(1..=5)` a RUNTIME_STATES position + 1, `Err(())` another value.
+    fn runtime_state(v: &[u8]) -> Result<i64, ()> {
+        let v = trim(v);
+        if v.is_empty() {
+            return Ok(0);
+        }
+        RUNTIME_STATES
+            .iter()
+            .position(|s| v.eq_ignore_ascii_case(s))
+            .map(|p| p as i64 + 1)
+            .ok_or(())
+    }
+
+    /// The Wave 57 transition table.
+    fn runtime_allowed(from: i64, to: i64) -> bool {
+        matches!(
+            (from, to),
+            (1, 2) | (1, 3) | (2, 1) | (2, 3) | (3, 1) | (3, 4) | (4, 1) | (4, 5) | (5, 1)
+        )
+    }
+
+    pub fn runtime_state_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 25);
+        let (mut transitions, mut gates, mut effs) = ([0i64; 4], [0i64; 6], [0i64; 6]);
+        let (mut malformed_rows, mut conflicts, mut changed_rows, mut forced_rows) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut promoted_rows, mut total_pending, mut total_active, mut max_load) =
+            (0i64, 0i64, 0i64, 0i64);
+        for row in rows {
+            let [state, requested, running, stop, pending, active, previous] = fields::<7>(row);
+            let (state, req, prev) = (
+                runtime_state(state),
+                runtime_state(requested),
+                runtime_state(previous),
+            );
+            let (running, stop) = (flag(running), flag(stop));
+            let (pending, active) = (int(pending, 9), int(active, 9));
+            let (s, r, p) = (state.unwrap_or(0), req.unwrap_or(0), prev.unwrap_or(0));
+            let malformed = s == 0
+                || req.is_err()
+                || prev.is_err()
+                || running == 2
+                || stop == 2
+                || pending.is_err()
+                || active.is_err();
+            let (pend, act) = (val(pending), val(active));
+            let load = pend + act;
+            let transition = if r == 0 {
+                0
+            } else if r == s {
+                3
+            } else if runtime_allowed(s, r) {
+                1
+            } else {
+                2
+            };
+            let (mut eff, mut gate, mut forced, mut promoted) = (0i64, 0i64, false, false);
+            let (mut conflict, mut changed, mut first) = (false, false, false);
+            if !malformed {
+                eff = if transition == 1 { r } else { s };
+                if stop == 1 && (eff == 1 || eff == 2) {
+                    (eff, forced) = (3, true);
+                }
+                if eff == 3 && load == 0 {
+                    (eff, promoted) = (4, true);
+                }
+                gate = match eff {
+                    1 => 1,
+                    2 => 2,
+                    3 => 3,
+                    4 if stop != 1 => 4,
+                    _ => 5,
+                };
+                conflict = if running == 1 {
+                    eff == 4 || eff == 5
+                } else {
+                    eff == 1 || eff == 3
+                };
+                first = p == 0;
+                changed = p != 0 && p != eff;
+                total_pending += pend;
+                total_active += act;
+                max_load = max_load.max(load);
+            }
+            transitions[transition as usize] += 1;
+            gates[gate as usize] += 1;
+            effs[eff as usize] += 1;
+            malformed_rows += i64::from(malformed);
+            conflicts += i64::from(conflict);
+            changed_rows += i64::from(changed);
+            forced_rows += i64::from(forced);
+            promoted_rows += i64::from(promoted);
+            out.push(
+                transition
+                    | s << 2
+                    | r << 5
+                    | eff << 8
+                    | gate << 11
+                    | i64::from(forced) << 14
+                    | i64::from(promoted) << 15
+                    | i64::from(conflict) << 16
+                    | i64::from(changed) << 17
+                    | i64::from(first) << 18
+                    | i64::from(malformed) << 19
+                    | i64::from(running == 1) << 20
+                    | i64::from(stop == 1) << 21
+                    | load.min(0xF_FFFF) << 22
+                    | pend.min(0xF_FFFF) << 42,
+            );
+        }
+        out.extend(transitions);
+        out.extend(gates);
+        out.extend(effs);
+        out.extend([
+            malformed_rows,
+            conflicts,
+            changed_rows,
+            forced_rows,
+            promoted_rows,
+            total_pending,
+            total_active,
+            max_load,
+        ]);
+        out
+    }
+
+    // ---- ConsolesProcessor -------------------------------------------------------------------
+
+    /// Platform code of an upper-cased token (0 none).
+    fn console_platform(t: &[u8]) -> i64 {
+        match t {
+            b"NDS" => 1,
+            b"3DS" => 2,
+            b"WII" => 3,
+            b"WIIU" => 4,
+            b"SWITCH" | b"NSW" => 5,
+            b"PSP" => 6,
+            b"PSV" | b"VITA" => 7,
+            b"PSX" | b"PS1" => 8,
+            b"PS2" => 9,
+            b"PS3" => 10,
+            b"PS4" => 11,
+            b"PS5" => 12,
+            b"XBOX" => 13,
+            b"X360" | b"XBOX360" => 14,
+            b"XBOXONE" | b"XONE" => 15,
+            b"XSX" => 16,
+            b"GBA" => 17,
+            b"NGC" | b"GAMECUBE" => 18,
+            b"N64" => 19,
+            b"SNES" => 20,
+            b"NES" => 21,
+            b"DREAMCAST" => 22,
+            _ => 0,
+        }
+    }
+
+    /// Region code of an upper-cased token (0 none).
+    fn console_region(t: &[u8]) -> i64 {
+        match t {
+            b"USA" | b"NTSC" | b"NTSCU" => 1,
+            b"EUR" | b"EUROPE" | b"PAL" => 2,
+            b"JPN" | b"JAP" | b"JAPAN" | b"NTSCJ" => 3,
+            b"ASIA" | b"KOR" => 4,
+            b"REGIONFREE" => 5,
+            _ => 0,
+        }
+    }
+
+    /// 0 none, 1 Nintendo, 2 Sony, 3 Microsoft, 4 Sega.
+    fn console_family(p: i64) -> usize {
+        match p {
+            0 => 0,
+            1..=5 | 17..=21 => 1,
+            6..=12 => 2,
+            13..=16 => 3,
+            _ => 4,
+        }
+    }
+
+    const CONSOLE_MAX_ATTEMPTS: i64 = 3;
+    const CONSOLE_BACKOFF_HOURS: [i64; 3] = [1, 4, 12];
+
+    pub fn consoles_processor_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 26);
+        let (mut actions, mut families, mut regions) = ([0i64; 10], [0i64; 5], [0i64; 6]);
+        let (mut dup_rows, mut total_attempts, mut max_attempts) = (0i64, 0i64, 0i64);
+        let mut keys: Map<Vec<u8>, i64> = map(rows.len());
+        let mut key: Vec<u8> = Vec::with_capacity(128);
+        for (index, row) in rows.iter().enumerate() {
+            let [name, category, status, attempts, mode, renamed] = fields::<6>(row);
+            let (mut platform, mut region, mut titled, mut title_tokens) = (0i64, 0i64, true, 0i64);
+            key.clear();
+            key.push(0);
+            key.push(b':');
+            let mut upper = [0u8; 16];
+            for token in name
+                .split(|b| !b.is_ascii_alphanumeric())
+                .filter(|t| !t.is_empty())
+            {
+                let (p, g) = if token.len() <= 16 {
+                    for (u, &b) in upper.iter_mut().zip(token) {
+                        *u = b.to_ascii_uppercase();
+                    }
+                    let t = &upper[..token.len()];
+                    (console_platform(t), console_region(t))
+                } else {
+                    (0, 0)
+                };
+                if p != 0 || g != 0 {
+                    titled = false;
+                    if platform == 0 {
+                        platform = p;
+                    }
+                    if region == 0 {
+                        region = g;
+                    }
+                } else if titled {
+                    if title_tokens > 0 {
+                        key.push(b' ');
+                    }
+                    key.extend(token.iter().map(u8::to_ascii_lowercase));
+                    title_tokens += 1;
+                }
+            }
+            let (category, status, attempts, mode) = (
+                int(category, 6),
+                int(status, 9),
+                int(attempts, 3),
+                int(mode, 1),
+            );
+            let renamed = flag(renamed);
+            let (cat, st, a, m) = (val(category), val(status), val(attempts), val(mode));
+            let malformed = trim(name).is_empty()
+                || !matches!(category, Ok(Some(_)))
+                || status.is_err()
+                || attempts.is_err()
+                || mode.is_err()
+                || m > 2
+                || renamed == 2;
+            let (mut next, mut backoff, mut dup, mut leader, mut hash) =
+                (0i64, 0i64, false, 0i64, 0i64);
+            let action = if malformed {
+                0
+            } else if !(1000..=1999).contains(&cat) {
+                1
+            } else if st > 0 {
+                2
+            } else if m == 0 {
+                3
+            } else if m == 2 && renamed != 1 {
+                4
+            } else if a >= CONSOLE_MAX_ATTEMPTS {
+                5
+            } else if platform == 0 && title_tokens < 2 {
+                next = CONSOLE_MAX_ATTEMPTS;
+                8
+            } else {
+                key[0] = platform as u8;
+                hash = i64::from(crc32(&key)) & 0x7_FFFF;
+                match keys.get(key.as_slice()) {
+                    Some(&l) => {
+                        (dup, leader) = (true, l);
+                        9
+                    }
+                    None => {
+                        keys.insert(key.clone(), index as i64);
+                        leader = index as i64;
+                        next = a + 1;
+                        backoff = CONSOLE_BACKOFF_HOURS[a as usize];
+                        if platform != 0 { 6 } else { 7 }
+                    }
+                }
+            };
+            if !malformed {
+                total_attempts += a;
+                max_attempts = max_attempts.max(a);
+            }
+            actions[action as usize] += 1;
+            families[console_family(platform)] += 1;
+            regions[region as usize] += 1;
+            dup_rows += i64::from(dup);
+            out.push(
+                action
+                    | platform << 4
+                    | region << 9
+                    | title_tokens.min(15) << 12
+                    | next.min(7) << 16
+                    | backoff << 19
+                    | i64::from(dup) << 23
+                    | leader.min(0xF_FFFF) << 24
+                    | hash << 44,
+            );
+        }
+        out.extend(actions);
+        out.extend(families);
+        out.extend(regions);
+        out.extend([keys.len() as i64, dup_rows, total_attempts, max_attempts]);
+        out
+    }
+
+    // ---- EpisodeHydrationService -------------------------------------------------------------
+
+    /// 0 empty, 1 valid `YYYY-MM-DD[( |T)HH:MM:SS]` (1900-2099), 2 invalid, 3 zero date; with the
+    /// year, month and day of a valid date.
+    fn airdate(v: &[u8]) -> (i64, i64, i64, i64) {
+        let v = trim(v);
+        if v.is_empty() {
+            return (0, 0, 0, 0);
+        }
+        let digits = |a: &[u8]| all_digits(a).then(|| num(a));
+        if !(v.len() == 10 || v.len() == 19) || v[4] != b'-' || v[7] != b'-' {
+            return (2, 0, 0, 0);
+        }
+        let (Some(y), Some(m), Some(d)) = (digits(&v[0..4]), digits(&v[5..7]), digits(&v[8..10]))
+        else {
+            return (2, 0, 0, 0);
+        };
+        let (mut h, mut mi, mut s) = (0, 0, 0);
+        if v.len() == 19 {
+            if !(v[10] == b' ' || v[10] == b'T') || v[13] != b':' || v[16] != b':' {
+                return (2, 0, 0, 0);
+            }
+            match (digits(&v[11..13]), digits(&v[14..16]), digits(&v[17..19])) {
+                (Some(a), Some(b), Some(c)) => (h, mi, s) = (a, b, c),
+                _ => return (2, 0, 0, 0),
+            }
+        }
+        if y == 0 && m == 0 && d == 0 {
+            return (3, 0, 0, 0);
+        }
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let dim = match m {
+            2 if leap => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if !(1900..=2099).contains(&y)
+            || !(1..=12).contains(&m)
+            || !(1..=dim).contains(&d)
+            || h > 23
+            || mi > 59
+            || s > 59
+        {
+            return (2, 0, 0, 0);
+        }
+        (1, y, m, d)
+    }
+
+    pub fn episode_hydration_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 19);
+        let (mut actions, mut sources, mut dates) = ([0i64; 6], [0i64; 3], [0i64; 4]);
+        let (mut daily_rows, mut min_day, mut max_day, mut dated) = (0i64, 0i64, 0i64, false);
+        let mut videos: Set<i64> = set(rows.len());
+        let mut keys: Map<(i64, i64, i64), i64> = map(rows.len());
+        let mut buf: Vec<u8> = Vec::with_capacity(32);
+        for (index, row) in rows.iter().enumerate() {
+            let [video, series, episode, firstaired, tv_episode] = fields::<5>(row);
+            let (video, series, episode, tv_episode) = (
+                int(video, 9),
+                int(series, 4),
+                int(episode, 4),
+                int(tv_episode, 9),
+            );
+            let (date_state, y, m, d) = airdate(firstaired);
+            let vid = val(video);
+            let malformed = vid == 0
+                || video.is_err()
+                || series.is_err()
+                || episode.is_err()
+                || tv_episode.is_err()
+                || date_state == 2;
+            let (mut s, mut e) = (val(series), val(episode));
+            let source = if s > 0 && e > 0 {
+                1
+            } else if date_state == 1 {
+                if s == 0 {
+                    s = y;
+                }
+                if e == 0 {
+                    e = m * 100 + d;
+                }
+                2
+            } else {
+                0
+            };
+            let daily = s >= 1900;
+            let in_range = if daily {
+                s <= 2099 && (101..=1231).contains(&e)
+            } else {
+                (1..=99).contains(&s) && (1..=999).contains(&e)
+            };
+            let (mut leader, mut hash) = (0i64, 0i64);
+            let action = if malformed {
+                0
+            } else if source == 0 {
+                1
+            } else if !in_range {
+                5
+            } else {
+                buf.clear();
+                let _ = write!(buf, "{vid}:{s}:{e}");
+                hash = i64::from(crc32(&buf)) & 0x7FF;
+                match keys.get(&(vid, s, e)) {
+                    Some(&l) => {
+                        leader = l;
+                        4
+                    }
+                    None => {
+                        keys.insert((vid, s, e), index as i64);
+                        leader = index as i64;
+                        if val(tv_episode) > 0 { 3 } else { 2 }
+                    }
+                }
+            };
+            if !malformed {
+                videos.insert(vid);
+                daily_rows += i64::from(daily && source != 0);
+                if date_state == 1 {
+                    let day = days_from_civil(y, m, d);
+                    if dated {
+                        min_day = min_day.min(day);
+                        max_day = max_day.max(day);
+                    } else {
+                        (min_day, max_day, dated) = (day, day, true);
+                    }
+                }
+            }
+            actions[action as usize] += 1;
+            sources[source as usize] += 1;
+            dates[date_state as usize] += 1;
+            out.push(
+                action
+                    | source << 3
+                    | date_state << 5
+                    | i64::from(daily) << 7
+                    | s.min(4095) << 8
+                    | e.min(4095) << 20
+                    | leader.min(0xF_FFFF) << 32
+                    | hash << 52,
+            );
+        }
+        out.extend(actions);
+        out.extend(sources);
+        out.extend(dates);
+        out.extend([
+            videos.len() as i64,
+            keys.len() as i64,
+            daily_rows,
+            min_day,
+            max_day,
+        ]);
+        out
+    }
+
+    // ---- FanartTvService ---------------------------------------------------------------------
+
+    /// 0 other, 1 poster, 2 backdrop, 3 banner.
+    fn fanart_class(kind: &[u8]) -> i64 {
+        let k = trim(kind);
+        let is = |names: &[&[u8]]| names.iter().any(|n| k.eq_ignore_ascii_case(n));
+        if is(&[b"movieposter", b"tvposter", b"seasonposter", b"poster"]) {
+            1
+        } else if is(&[
+            b"moviebackground",
+            b"showbackground",
+            b"artistbackground",
+            b"background",
+        ]) {
+            2
+        } else if is(&[b"moviebanner", b"tvbanner", b"seasonbanner", b"banner"]) {
+            3
+        } else {
+            0
+        }
+    }
+
+    /// 3 English, 2 language-neutral (empty or `00`), 1 another two-letter code, 0 other.
+    fn fanart_lang(lang: &[u8]) -> i64 {
+        let l = trim(lang);
+        if l.eq_ignore_ascii_case(b"en") {
+            3
+        } else if l.is_empty() || l == b"00" {
+            2
+        } else if l.len() == 2 && l.iter().all(u8::is_ascii_alphabetic) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Minimum HD width and height per class.
+    const FANART_HD: [(i64, i64); 4] = [(0, 0), (1000, 1426), (1920, 1080), (1000, 185)];
+
+    /// `Some((https, fanart_host, preview, ext))` for an absolute http(s) URL without blanks or
+    /// control bytes (ext 0 other, 1 jpg/jpeg, 2 png, on the path before `?`).
+    fn fanart_url(url: &[u8]) -> Option<(bool, bool, bool, i64)> {
+        let starts = |p: &[u8]| url.len() > p.len() && url[..p.len()].eq_ignore_ascii_case(p);
+        let https = starts(b"https://");
+        if !https && !starts(b"http://") {
+            return None;
+        }
+        if url.iter().any(|&b| b <= 0x20 || b == 0x7F) {
+            return None;
+        }
+        let rest = &url[if https { 8 } else { 7 }..];
+        let host = &rest[..rest.iter().position(|&b| b == b'/').unwrap_or(rest.len())];
+        let fanart = host.eq_ignore_ascii_case(b"fanart.tv")
+            || (host.len() > 10 && host[host.len() - 10..].eq_ignore_ascii_case(b".fanart.tv"));
+        let lowered = lower(rest);
+        let preview = lowered.windows(9).any(|w| w == b"/preview/");
+        let path = &lowered[..lowered
+            .iter()
+            .position(|&b| b == b'?')
+            .unwrap_or(lowered.len())];
+        let ext = if path.ends_with(b".jpg") || path.ends_with(b".jpeg") {
+            1
+        } else if path.ends_with(b".png") {
+            2
+        } else {
+            0
+        };
+        Some((https, fanart, preview, ext))
+    }
+
+    pub fn fanart_tv_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 20);
+        let (mut actions, mut classes, mut langs) = ([0i64; 4], [0i64; 4], [0i64; 4]);
+        let (mut total_likes, mut max_likes, mut https_rows, mut preview_rows, mut hd_rows) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let mut groups: Set<Vec<u8>> = set(rows.len());
+        // (group, class) => (ordinal, best row, best score)
+        let mut slots: Map<(Vec<u8>, i64), (i64, usize, i64)> = map(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            let [group, kind, lang, likes, url, width, height] = fields::<7>(row);
+            let group = lower(trim(group));
+            let (class, lang) = (fanart_class(kind), fanart_lang(lang));
+            let (likes, width, height) = (int(likes, 9), int(width, 5), int(height, 5));
+            let url = trim(url);
+            let parsed = fanart_url(url);
+            let malformed = group.is_empty()
+                || likes.is_err()
+                || width.is_err()
+                || height.is_err()
+                || parsed.is_none();
+            let (https, fanart, preview, ext) = parsed.unwrap_or((false, false, false, 0));
+            let (l, w, h) = (val(likes), val(width), val(height));
+            let (hw, hh) = FANART_HD[class as usize];
+            let hd = class != 0 && w >= hw && h >= hh;
+            let (mut slot, mut hash) = (0i64, 0i64);
+            let action = if malformed {
+                0
+            } else {
+                hash = i64::from(crc32(url)) & 0x7FF;
+                https_rows += i64::from(https);
+                preview_rows += i64::from(preview);
+                hd_rows += i64::from(hd);
+                if !groups.contains(group.as_slice()) {
+                    groups.insert(group.clone());
+                }
+                if class == 0 {
+                    1
+                } else {
+                    let score = lang << 51
+                        | i64::from(!preview) << 50
+                        | l.min(0xF_FFFF) << 30
+                        | (w.min(9999) * h.min(9999)) >> 10;
+                    let next = slots.len() as i64;
+                    let entry = slots
+                        .entry((group, class))
+                        .or_insert((next, index, i64::MIN));
+                    if score > entry.2 {
+                        (entry.1, entry.2) = (index, score);
+                    }
+                    slot = entry.0;
+                    total_likes += l;
+                    max_likes = max_likes.max(l);
+                    2
+                }
+            };
+            actions[action as usize] += 1;
+            classes[class as usize] += 1;
+            langs[lang as usize] += 1;
+            out.push(
+                action
+                    | class << 2
+                    | lang << 4
+                    | i64::from(https) << 6
+                    | i64::from(fanart) << 7
+                    | i64::from(preview) << 8
+                    | ext << 9
+                    | i64::from(hd) << 11
+                    | l.min(0xF_FFFF) << 12
+                    | slot.min(0xF_FFFF) << 32
+                    | hash << 52,
+            );
+        }
+        for &(_, best, _) in slots.values() {
+            out[best] |= 3;
+        }
+        actions[2] -= slots.len() as i64;
+        actions[3] = slots.len() as i64;
+        out.extend(actions);
+        out.extend(classes);
+        out.extend(langs);
+        out.extend([
+            groups.len() as i64,
+            slots.len() as i64,
+            total_likes,
+            max_likes,
+            https_rows,
+            preview_rows,
+            hd_rows,
+        ]);
+        out
+    }
+
+    // ---- ForkingService ----------------------------------------------------------------------
+
+    const WORK_TYPES: [&[u8]; 18] = [
+        b"backfill",
+        b"binaries",
+        b"fixRelNames_standard",
+        b"fixRelNames_predbft",
+        b"releases",
+        b"postProcess_add",
+        b"postProcess_ani",
+        b"postProcess_ama",
+        b"postProcess_boo",
+        b"postProcess_con",
+        b"postProcess_gam",
+        b"postProcess_mov",
+        b"postProcess_mus",
+        b"postProcess_nfo",
+        b"postProcess_tv",
+        b"safe_backfill",
+        b"safe_binaries",
+        b"update_per_group",
+    ];
+
+    const FORK_DEFAULT_WORKERS: i64 = 16;
+    const FORK_EST_CAP_MS: i64 = 1 << 40;
+
+    /// Ceil-divided chunk duration in ms, capped at FORK_EST_CAP_MS.
+    fn fork_estimate(items: i64, workers: i64, per: i64) -> i64 {
+        ((items + workers - 1) / workers * per).min(FORK_EST_CAP_MS)
+    }
+
+    pub fn forking_service_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 14);
+        let mut actions = [0i64; 5];
+        let (mut total_workers, mut total_items, mut max_workers, mut clamped_rows) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut serial_rows, mut total_est, mut max_est) = (0i64, 0i64, 0i64);
+        let mut types: Set<i64> = set(32);
+        for row in rows {
+            let [kind, items, requested, max, timeout, per] = fields::<6>(row);
+            let kind = trim(kind);
+            let ty = WORK_TYPES
+                .iter()
+                .position(|t| kind == *t)
+                .map_or(0, |p| p as i64 + 1);
+            let (items, requested, max, timeout, per) = (
+                int(items, 9),
+                int(requested, 4),
+                int(max, 4),
+                int(timeout, 6),
+                int(per, 7),
+            );
+            let malformed = ty == 0
+                || items.is_err()
+                || requested.is_err()
+                || max.is_err()
+                || timeout.is_err()
+                || per.is_err();
+            let (n, req, mx, t, p) = (val(items), val(requested), val(max), val(timeout), val(per));
+            let serial = ty == 5 || ty == 18;
+            let (mut workers, mut base, mut extra, mut est) = (0i64, 0i64, 0i64, 0i64);
+            let (mut clamped, mut over) = (false, false);
+            let action = if malformed {
+                0
+            } else {
+                let cap = if serial {
+                    1
+                } else if mx > 0 {
+                    mx
+                } else {
+                    FORK_DEFAULT_WORKERS
+                };
+                let want = if req > 0 { req } else { cap };
+                let action = if n == 0 {
+                    1
+                } else {
+                    workers = want.clamp(1, cap).min(n);
+                    est = fork_estimate(n, workers, p);
+                    let budget = t * 1000;
+                    over = t > 0 && est > budget;
+                    let mut scaled = false;
+                    if over && !serial {
+                        let needed = ((n * p + budget - 1) / budget).min(cap).min(n);
+                        if needed > workers {
+                            (workers, scaled) = (needed, true);
+                            est = fork_estimate(n, workers, p);
+                            over = est > budget;
+                        }
+                    }
+                    base = n / workers;
+                    extra = n % workers;
+                    if over {
+                        4
+                    } else if scaled {
+                        3
+                    } else {
+                        2
+                    }
+                };
+                clamped = req > 0 && workers != req;
+                total_workers += workers;
+                total_items += n;
+                max_workers = max_workers.max(workers);
+                clamped_rows += i64::from(clamped);
+                serial_rows += i64::from(serial);
+                total_est += est;
+                max_est = max_est.max(est);
+                types.insert(ty);
+                action
+            };
+            actions[action as usize] += 1;
+            out.push(
+                action
+                    | ty << 3
+                    | workers.min(1023) << 8
+                    | i64::from(clamped) << 18
+                    | i64::from(serial) << 19
+                    | base.min(0xF_FFFF) << 20
+                    | extra.min(1023) << 40
+                    | i64::from(over) << 50
+                    | ((est + 999) / 1000).min(0xFFF) << 51,
+            );
+        }
+        out.extend(actions);
+        out.extend([
+            total_workers,
+            total_items,
+            max_workers,
+            clamped_rows,
+            serial_rows,
+            total_est,
+            max_est,
+            types.len() as i64,
+        ]);
+        out
+    }
+
+    // ---- Exports -----------------------------------------------------------------------------
+
+    macro_rules! export {
+        ($name:ident, $plan:ident) => {
+            /// # Safety
+            /// `items` must be readable for `items_len` bytes and `out` writable for `out_cap`
+            /// words.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                items: *const u8,
+                items_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let inputs = [(items, items_len)];
+                unsafe {
+                    emit(out, out_cap, count, &inputs, || {
+                        Some($plan(&column(span(items, items_len)?, count)?))
+                    })
+                }
+            }
+        };
+    }
+
+    export!(nntmux_w672_runtime_state_plan_batch, runtime_state_plan);
+    export!(
+        nntmux_w672_consoles_processor_plan_batch,
+        consoles_processor_plan
+    );
+    export!(
+        nntmux_w672_episode_hydration_plan_batch,
+        episode_hydration_plan
+    );
+    export!(nntmux_w672_fanart_tv_plan_batch, fanart_tv_plan);
+    export!(nntmux_w672_forking_service_plan_batch, forking_service_plan);
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn refs<'a>(v: &[&'a str]) -> Vec<&'a [u8]> {
+            v.iter().map(|s| s.as_bytes()).collect()
+        }
+
+        #[test]
+        fn w672_helpers_follow_php() {
+            assert_eq!(fields::<3>(b"a\tb\tc\td"), [b"a".as_slice(), b"b", b"c\td"]);
+            assert_eq!(int(b" 42 ", 3), Ok(Some(42)));
+            assert_eq!(int(b"1234", 3), Err(()));
+            assert_eq!(flag(b" ON "), 1);
+            assert_eq!(flag(b"Off"), 0);
+            assert_eq!(flag(b"maybe"), 2);
+            assert_eq!(runtime_state(b" Draining "), Ok(3));
+            assert_eq!(runtime_state(b"halted"), Err(()));
+            assert_eq!(airdate(b"2024-02-29"), (1, 2024, 2, 29));
+            assert_eq!(airdate(b"2023-02-29"), (2, 0, 0, 0));
+            assert_eq!(airdate(b"0000-00-00 00:00:00"), (3, 0, 0, 0));
+            assert_eq!(airdate(b"2024-01-15T10:20:30"), (1, 2024, 1, 15));
+            assert_eq!(airdate(b"1899-12-31"), (2, 0, 0, 0));
+            assert_eq!(days_from_civil(1900, 1, 1), -25_567);
+            assert_eq!(fanart_lang(b"EN"), 3);
+            assert_eq!(fanart_lang(b"00"), 2);
+            assert_eq!(fanart_lang(b"de"), 1);
+            assert_eq!(fanart_lang(b"deu"), 0);
+            assert_eq!(
+                fanart_url(b"https://assets.fanart.tv/preview/a.JPG?x=1"),
+                Some((true, true, true, 1))
+            );
+            assert_eq!(fanart_url(b"http://x.org/a b.png"), None);
+            assert_eq!(fanart_url(b"ftp://x/a.png"), None);
+            assert_eq!(console_platform(b"XBOX360"), 14);
+            assert_eq!(console_region(b"PAL"), 2);
+            assert_eq!(console_family(22), 4);
+        }
+
+        #[test]
+        fn w672_runtime_rows_gate_and_diff() {
+            let words = runtime_state_plan(&refs(&[
+                "running\tpaused\t1\t0\t3\t2\trunning",
+                "running\t\t1\tyes\t0\t0\t",
+                "draining\t\t0\t0\t5\t0\tdraining",
+                "stopped\trunning\tno\t\t\t\tdrained",
+                "paused\tdrained\t0\t0\t1\t1\t",
+                "bogus\t\t1\t0\t0\t0\t",
+            ]));
+            assert_eq!(
+                words[0],
+                1 | 1 << 2 | 2 << 5 | 2 << 8 | 2 << 11 | 1 << 17 | 1 << 20 | 5 << 22 | 3 << 42
+            );
+            assert_eq!(
+                words[1],
+                1 << 2
+                    | 4 << 8
+                    | 5 << 11
+                    | 1 << 14
+                    | 1 << 15
+                    | 1 << 16
+                    | 1 << 18
+                    | 1 << 20
+                    | 1 << 21
+            );
+            assert_eq!(
+                words[2],
+                3 << 2 | 3 << 8 | 3 << 11 | 1 << 16 | 5 << 22 | 5 << 42
+            );
+            assert_eq!(
+                words[3],
+                1 | 5 << 2 | 1 << 5 | 1 << 8 | 1 << 11 | 1 << 16 | 1 << 17
+            );
+            assert_eq!(
+                words[4],
+                2 | 2 << 2 | 4 << 5 | 2 << 8 | 2 << 11 | 1 << 18 | 2 << 22 | 1 << 42
+            );
+            assert_eq!(words[5], 1 << 19 | 1 << 20);
+            assert_eq!(
+                words[6..30],
+                [
+                    3, 2, 1, 0, 1, 1, 2, 1, 0, 1, 1, 1, 2, 1, 1, 0, 1, 3, 2, 1, 1, 9, 3, 5
+                ]
+            );
+        }
+
+        #[test]
+        fn w672_console_rows_detect_and_coalesce() {
+            let words = consoles_processor_plan(&refs(&[
+                "Super.Mario.Odyssey.NSW-BigBlueBox\t1050\t\t0\t1\t",
+                "super mario odyssey SWITCH EUR\t1050\t0\t1\t1\t",
+                "Some.Game.PAL.PS2-GRP\t1080\t\t2\t1\t",
+                "Halo.Infinite\t1040\t\t0\t2\tyes",
+                "Halo\t1040\t\t0\t1\t",
+                "Movie.2024\t2040\t\t0\t1\t",
+                "x\t1050\t12\t0\t1\t",
+                "x\t1050\t\t0\t0\t",
+                "Halo.Infinite\t1040\t\t0\t2\tno",
+                "x\t1050\t\t3\t1\t",
+                "\t1050\t\t0\t1\t",
+            ]));
+            let low = |w: i64| w & ((1 << 44) - 1);
+            assert_eq!(low(words[0]), 6 | 5 << 4 | 3 << 12 | 1 << 16 | 1 << 19);
+            assert_eq!(low(words[1]), 9 | 5 << 4 | 2 << 9 | 3 << 12 | 1 << 23);
+            assert_eq!(
+                low(words[2]),
+                6 | 9 << 4 | 2 << 9 | 2 << 12 | 3 << 16 | 12 << 19 | 2 << 24
+            );
+            assert_eq!(low(words[3]), 7 | 2 << 12 | 1 << 16 | 1 << 19 | 3 << 24);
+            assert_eq!(low(words[4]), 8 | 1 << 12 | 3 << 16);
+            assert_eq!(
+                words[5..11].iter().map(|w| w & 15).collect::<Vec<_>>(),
+                [1, 2, 3, 4, 5, 0]
+            );
+            assert_eq!(
+                words[0] >> 44,
+                i64::from(crc32(b"\x05:super mario odyssey")) & 0x7_FFFF
+            );
+            assert_eq!(
+                words[11..36],
+                [
+                    1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 8, 2, 1, 0, 0, 9, 0, 2, 0, 0, 0, 3, 1, 6, 3
+                ]
+            );
+        }
+
+        #[test]
+        fn w672_episode_rows_normalize_and_upsert() {
+            let words = episode_hydration_plan(&refs(&[
+                "10\t1\t2\t2020-01-05\t",
+                "10\t\t\t2024-01-15 00:00:00\t7",
+                "10\t01\t02\t\t",
+                "11\t\t\t\t",
+                "12\t100\t5\t\t",
+                "0\t1\t1\t\t",
+                "12\t1\t1\t2023-02-29\t",
+                "13\t\t3\t0000-00-00\t",
+            ]));
+            let low = |w: i64| w & ((1 << 52) - 1);
+            assert_eq!(low(words[0]), 2 | 1 << 3 | 1 << 5 | 1 << 8 | 2 << 20);
+            assert_eq!(
+                low(words[1]),
+                3 | 2 << 3 | 1 << 5 | 1 << 7 | 2024 << 8 | 115 << 20 | 1 << 32
+            );
+            assert_eq!(low(words[2]), 4 | 1 << 3 | 1 << 8 | 2 << 20);
+            assert_eq!(low(words[3]), 1);
+            assert_eq!(low(words[4]), 5 | 1 << 3 | 100 << 8 | 5 << 20);
+            assert_eq!(low(words[5]), 1 << 3 | 1 << 8 | 1 << 20);
+            assert_eq!(low(words[6]), 1 << 3 | 2 << 5 | 1 << 8 | 1 << 20);
+            assert_eq!(low(words[7]), 1 | 3 << 5 | 3 << 20);
+            assert_eq!(words[0] >> 52, i64::from(crc32(b"10:1:2")) & 0x7FF);
+            assert_eq!(
+                words[8..26],
+                [
+                    2, 2, 1, 1, 1, 1, 2, 5, 1, 4, 2, 1, 1, 4, 2, 1, 18_266, 19_737
+                ]
+            );
+        }
+
+        #[test]
+        fn w672_fanart_rows_rank_slots() {
+            let words = fanart_tv_plan(&refs(&[
+                "tt1\tmovieposter\ten\t5\thttps://assets.fanart.tv/fanart/a.jpg\t1000\t1426",
+                "TT1\tmovieposter\tde\t50\thttps://assets.fanart.tv/fanart/b.jpg\t1000\t1426",
+                "tt1\tmovieposter\t00\t9\thttp://x.org/c.png\t\t",
+                "tt1\tmoviebackground\ten\t1\thttps://assets.fanart.tv/preview/d.jpg\t1920\t1080",
+                "tt1\thdmovielogo\ten\t1\thttps://assets.fanart.tv/e.png\t\t",
+                "tt2\ttvbanner\t\tx\thttps://a/b\t\t",
+                "\tmovieposter\ten\t1\thttps://a/b\t\t",
+            ]));
+            let low = |w: i64| w & ((1 << 52) - 1);
+            assert_eq!(
+                low(words[0]),
+                3 | 1 << 2 | 3 << 4 | 1 << 6 | 1 << 7 | 1 << 9 | 1 << 11 | 5 << 12
+            );
+            assert_eq!(
+                low(words[1]),
+                2 | 1 << 2 | 1 << 4 | 1 << 6 | 1 << 7 | 1 << 9 | 1 << 11 | 50 << 12
+            );
+            assert_eq!(low(words[2]), 2 | 1 << 2 | 2 << 4 | 2 << 9 | 9 << 12);
+            assert_eq!(
+                low(words[3]),
+                3 | 2 << 2
+                    | 3 << 4
+                    | 1 << 6
+                    | 1 << 7
+                    | 1 << 8
+                    | 1 << 9
+                    | 1 << 11
+                    | 1 << 12
+                    | 1 << 32
+            );
+            assert_eq!(
+                low(words[4]),
+                1 | 3 << 4 | 1 << 6 | 1 << 7 | 2 << 9 | 1 << 12
+            );
+            assert_eq!(words[5], 3 << 2 | 2 << 4 | 1 << 6);
+            assert_eq!(words[6] & 3, 0);
+            assert_eq!(
+                words[0] >> 52,
+                i64::from(crc32(b"https://assets.fanart.tv/fanart/a.jpg")) & 0x7FF
+            );
+            assert_eq!(
+                words[7..26],
+                [2, 1, 2, 2, 1, 4, 1, 1, 0, 1, 2, 4, 1, 2, 65, 50, 4, 1, 3]
+            );
+        }
+
+        #[test]
+        fn w672_fork_rows_clamp_chunk_and_budget() {
+            let words = forking_service_plan(&refs(&[
+                "postProcess_add\t100\t8\t4\t\t",
+                "releases\t10\t4\t\t\t",
+                "binaries\t0\t2\t\t\t",
+                "backfill\t1000\t2\t\t10\t100",
+                "postProcess_tv\t1000\t2\t4\t1\t100",
+                "unknown\t1\t1\t\t\t",
+                "binaries\t7\t\t\t\t500",
+            ]));
+            assert_eq!(words[0], 2 | 6 << 3 | 4 << 8 | 1 << 18 | 25 << 20);
+            assert_eq!(words[1], 2 | 5 << 3 | 1 << 8 | 1 << 18 | 1 << 19 | 10 << 20);
+            assert_eq!(words[2], 1 | 2 << 3 | 1 << 18);
+            assert_eq!(
+                words[3],
+                3 | 1 << 3 | 10 << 8 | 1 << 18 | 100 << 20 | 10 << 51
+            );
+            assert_eq!(
+                words[4],
+                4 | 15 << 3 | 4 << 8 | 1 << 18 | 250 << 20 | 1 << 50 | 25 << 51
+            );
+            assert_eq!(words[5], 0);
+            assert_eq!(words[6], 2 | 2 << 3 | 7 << 8 | 1 << 20 | 1 << 51);
+            assert_eq!(
+                words[7..20],
+                [1, 1, 3, 1, 1, 26, 2117, 10, 5, 1, 35_500, 25_000, 5]
+            );
+        }
+
+        #[test]
+        fn w672_exports_guard_null_short_and_malformed_batches() {
+            let mut out = [0i64; 64];
+            let o = out.as_mut_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w672_runtime_state_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    26
+                );
+                assert_eq!(
+                    nntmux_w672_runtime_state_plan_batch(b"a".as_ptr(), 1, 1, o, 25),
+                    -26
+                );
+                assert_eq!(
+                    nntmux_w672_consoles_processor_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w672_consoles_processor_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    27
+                );
+                assert_eq!(
+                    nntmux_w672_episode_hydration_plan_batch(std::ptr::null(), 0, 0, o, 64),
+                    19
+                );
+                assert_eq!(
+                    nntmux_w672_fanart_tv_plan_batch(b"a".as_ptr(), 1, 1, std::ptr::null_mut(), 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w672_fanart_tv_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    21
+                );
+                assert_eq!(
+                    nntmux_w672_forking_service_plan_batch(std::ptr::null(), 1, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w672_forking_service_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    15
+                );
+                // An output buffer overlapping the input is refused.
+                let mut shared = [0u8; 512];
+                let p = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w672_forking_service_plan_batch(p, 1, 1, p as *mut i64, 64),
+                    -1
+                );
+                // Unaligned outputs are written byte-wise.
+                let mut raw = [0u8; 8 * 30];
+                let unaligned = raw.as_mut_ptr().add(1) as *mut i64;
+                assert_eq!(
+                    nntmux_w672_episode_hydration_plan_batch(b"a".as_ptr(), 1, 1, unaligned, 20),
+                    20
+                );
+            }
+        }
+    }
+}
