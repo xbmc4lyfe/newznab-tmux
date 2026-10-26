@@ -42489,3 +42489,915 @@ mod w576_outbox_entry_outcome_timing_metadata_tests {
         assert_eq!(status, -1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 58.6: verification spot-check, ledger, lock, result and run diagnostics
+// batches (`nntmux_w586_*`) for SpotCheckVerifier, VerificationLedger,
+// VerificationLockStore, VerificationResult and VerificationRunDiagnostics.
+// Same contract as Wave 57.6: strings are NUL-joined column after column (with
+// a 0x01-joined twin when one holds a NUL), integer columns are machine-order
+// `int64_t`, and the result is fixed-width `int64_t` words. Every export
+// returns 1, -1 for invalid input (PHP then computes the batch) or -2 when
+// `out` is null, misaligned or too small, and leaves `out` untouched unless it
+// returns 1.
+// ---------------------------------------------------------------------------
+
+/// Largest phase or loop duration a diagnostics batch carries (2^50-1 ns).
+const W586_NS_CAP: i64 = (1 << 50) - 1;
+/// Largest ledger timestamp (seconds) or delta magnitude (bytes) a batch carries.
+const W586_TIME_CAP: i64 = 1 << 40;
+const W586_DELTA_CAP: i64 = 1 << 50;
+const W586_PENDING_CAP: i64 = 1 << 62;
+/// Largest lock lease timestamp (ms).
+const W586_LEASE_CAP: i64 = 1 << 42;
+
+#[inline]
+fn w586_first(slot: &mut i64, index: usize) {
+    if *slot < 0 {
+        *slot = index as i64;
+    }
+}
+
+// --- SpotCheckVerifier::classifyResponseBatch --------------------------------
+
+/// libc `memchr()` (PHP `strpos()` with a one-byte needle).
+#[inline]
+fn w586_find(hay: &[u8], byte: u8) -> Option<usize> {
+    if hay.is_empty() {
+        return None;
+    }
+    // SAFETY: `hay` is readable for its length.
+    let found = unsafe { memchr(hay.as_ptr(), i32::from(byte), hay.len()) };
+    (!found.is_null()).then(|| found as usize - hay.as_ptr() as usize)
+}
+
+pub(crate) const W586_SPOT_HEADER: usize = 14;
+
+/// The three-digit NNTP status code, or -1 when the line does not start with
+/// one followed by its end, a space, a tab, CR or LF.
+#[inline]
+fn w586_spot_code(response: &[u8]) -> i64 {
+    if response.len() < 3 || !response[..3].iter().all(u8::is_ascii_digit) {
+        return -1;
+    }
+    if response.len() > 3 && !matches!(response[3], b' ' | b'\t' | b'\r' | b'\n') {
+        return -1;
+    }
+    response[..3]
+        .iter()
+        .fold(0, |value, &b| value * 10 + i64::from(b - b'0'))
+}
+
+/// Spot-check responses to ARTICLE (0, expects 220), HEAD (1, 221), BODY (2,
+/// 222) or STAT (3, 223); any other command is 4. Class 0 present, 1 another
+/// 22x success, 2 missing (423/430), 3 transient (other 4xx), 4 error (5xx), 5
+/// malformed or unexpected. `[0]` count, `[1..=6]` per class, `[7]` found
+/// (class 0-1), `[8]` missing, `[9]` first missing and `[10]` first transient
+/// or error index (-1 when none), `[11]` missing ppm, `[12]` verdict (0 pass,
+/// 1 missing above `threshold` ppm, 2 inconclusive, 3 empty), `[13]` FNV-1a
+/// digest; then per response `class | command << 3 | has_message_id << 6 |
+/// crlf << 7 | (code + 1) << 8 | min(bytes, 65535) << 18`.
+pub(crate) fn w586_spot_batch(responses: &[&[u8]], commands: &[i64], threshold: i64) -> Vec<i64> {
+    let count = responses.len();
+    let mut out = vec![0i64; W586_SPOT_HEADER + count];
+    out[0] = count as i64;
+    out[9] = -1;
+    out[10] = -1;
+    for (at, response) in responses.iter().enumerate() {
+        let command = if (0..=3).contains(&commands[at]) {
+            commands[at]
+        } else {
+            4
+        };
+        let code = w586_spot_code(response);
+        let class: i64 = if command < 4 && code == 220 + command {
+            0
+        } else {
+            match code {
+                220..=223 => 1,
+                423 | 430 => 2,
+                400..=499 => 3,
+                500..=599 => 4,
+                _ => 5,
+            }
+        };
+        let has_id = w586_find(response, b'<').is_some_and(|lt| w586_find(&response[lt..], b'>').is_some());
+        let crlf = response.ends_with(b"\r\n");
+        out[1 + class as usize] += 1;
+        out[7] += i64::from(class <= 1);
+        if class == 2 {
+            out[8] += 1;
+            w586_first(&mut out[9], at);
+        }
+        if class == 3 || class == 4 {
+            w586_first(&mut out[10], at);
+        }
+        out[W586_SPOT_HEADER + at] = class
+            | command << 3
+            | i64::from(has_id) << 6
+            | i64::from(crlf) << 7
+            | (code + 1) << 8
+            | (response.len().min(65_535) as i64) << 18;
+    }
+    if count > 0 {
+        out[11] = out[8] * 1_000_000 / count as i64;
+    }
+    out[12] = if count == 0 {
+        3
+    } else if out[11] > threshold {
+        1
+    } else if out[2] + out[4] + out[5] + out[6] > 0 {
+        2
+    } else {
+        0
+    };
+    out[13] = w526_digest(&out[W586_SPOT_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w586_spot_response_batch(
+    responses: *const u8,
+    responses_len: usize,
+    response_twin: *const u8,
+    response_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    threshold: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let responses = w566_columns(
+                w15_input(responses, responses_len)?,
+                w15_input(response_twin, response_twin_len)?,
+                1,
+                count,
+            )?;
+            let commands = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+            Some(w586_spot_batch(&responses, &commands, threshold))
+        })
+    }
+}
+
+// --- VerificationLedger::summarizeLedgerBatch --------------------------------
+
+pub(crate) const W586_LEDGER_HEADER: usize = 26;
+
+/// Ledger state index; 8 when it names none (exact bytes).
+#[inline]
+fn w586_ledger_state(state: &[u8]) -> usize {
+    match state {
+        b"waiting_upload" => 0,
+        b"ready" => 1,
+        b"verifying" => 2,
+        b"verified" => 3,
+        b"published" => 4,
+        b"dirty" => 5,
+        b"expired" => 6,
+        b"stale" => 7,
+        _ => 8,
+    }
+}
+
+/// Allowed target-state bits per source state.
+const W586_LEDGER_ALLOWED: [u8; 8] = [0x62, 0xE4, 0xEA, 0xB0, 0x00, 0x43, 0x00, 0x42];
+
+/// Ledger entries applied in order. `states` holds the from and to columns,
+/// `ints` the attempts, failures, updated-at (unix seconds) and pending-byte
+/// delta columns. Class 0 valid, 1 no-op, 2 forbidden, 3 unknown state.
+/// Attempts clamp to 0..2^31-1, failures to 0..attempts, timestamps and `now`
+/// to 0..2^40, deltas to ±2^50, `capacity` and `pending` to 0..2^62 and
+/// `max_attempts` to 1..2^31-1. A valid transition applies its delta as
+/// `adjust()` does: growth beyond capacity is refused, a shrink floors at 0.
+/// `[0]` count, `[1..=4]` per class, `[5..=13]` per target state, `[14]`
+/// refused, `[15]` final pending bytes, `[16]` first forbidden or unknown and
+/// `[17]` first refused index (-1 when none), `[18]` exhausted, `[19]`
+/// attempts, `[20]` failures, `[21]` oldest age and `[22]` its index (-1 when
+/// none), `[23]` missing and `[24]` future timestamps, `[25]` FNV-1a digest;
+/// then per entry `class | from << 2 | to << 6 | refused << 10 | missing << 11
+/// | future << 12 | exhausted << 13 | min(failures, 1023) << 14 |
+/// min(attempts, 1023) << 24 | min(age, 2^28-1) << 34`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn w586_ledger_batch(
+    states: &[&[u8]],
+    ints: &[i64],
+    count: usize,
+    now: i64,
+    capacity: i64,
+    pending: i64,
+    max_attempts: i64,
+) -> Vec<i64> {
+    let now = now.clamp(0, W586_TIME_CAP);
+    let capacity = capacity.clamp(0, W586_PENDING_CAP);
+    let mut pending = pending.clamp(0, W586_PENDING_CAP);
+    let max_attempts = max_attempts.clamp(1, W576_COUNT_CAP);
+    let mut out = vec![0i64; W586_LEDGER_HEADER + count];
+    out[0] = count as i64;
+    out[16] = -1;
+    out[17] = -1;
+    out[22] = -1;
+    for at in 0..count {
+        let from = w586_ledger_state(states[at]);
+        let to = w586_ledger_state(states[count + at]);
+        let class: i64 = if from == 8 || to == 8 {
+            3
+        } else if from == to {
+            1
+        } else if W586_LEDGER_ALLOWED[from] >> to & 1 == 1 {
+            0
+        } else {
+            2
+        };
+        let attempts = ints[at].clamp(0, W576_COUNT_CAP);
+        let failures = ints[count + at].clamp(0, attempts);
+        let stamp = ints[2 * count + at].clamp(0, W586_TIME_CAP);
+        let delta = ints[3 * count + at].clamp(-W586_DELTA_CAP, W586_DELTA_CAP);
+        let missing = stamp == 0;
+        let future = stamp > now;
+        let age = if missing || future { 0 } else { now - stamp };
+        let exhausted = attempts >= max_attempts;
+        let mut refused = false;
+        if class == 0 {
+            if delta > 0 {
+                if pending + delta > capacity {
+                    refused = true;
+                } else {
+                    pending += delta;
+                }
+            } else if delta < 0 {
+                pending = (pending + delta).max(0);
+            }
+        }
+        out[1 + class as usize] += 1;
+        out[5 + to] += 1;
+        if refused {
+            out[14] += 1;
+            w586_first(&mut out[17], at);
+        }
+        if class >= 2 {
+            w586_first(&mut out[16], at);
+        }
+        out[18] += i64::from(exhausted);
+        out[19] += attempts;
+        out[20] += failures;
+        if !missing && !future && (out[22] < 0 || age > out[21]) {
+            out[21] = age;
+            out[22] = at as i64;
+        }
+        out[23] += i64::from(missing);
+        out[24] += i64::from(future);
+        out[W586_LEDGER_HEADER + at] = class
+            | (from as i64) << 2
+            | (to as i64) << 6
+            | i64::from(refused) << 10
+            | i64::from(missing) << 11
+            | i64::from(future) << 12
+            | i64::from(exhausted) << 13
+            | failures.min(1023) << 14
+            | attempts.min(1023) << 24
+            | age.min((1 << 28) - 1) << 34;
+    }
+    out[15] = pending;
+    out[25] = w526_digest(&out[W586_LEDGER_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w586_ledger_summary_batch(
+    states: *const u8,
+    states_len: usize,
+    state_twin: *const u8,
+    state_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    now: i64,
+    capacity: i64,
+    pending: i64,
+    max_attempts: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let states = w566_columns(
+                w15_input(states, states_len)?,
+                w15_input(state_twin, state_twin_len)?,
+                2,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 4, count)?;
+            Some(w586_ledger_batch(&states, &ints, count, now, capacity, pending, max_attempts))
+        })
+    }
+}
+
+// --- VerificationLockStore::classifyLockBatch --------------------------------
+
+pub(crate) const W586_LOCK_HEADER: usize = 19;
+
+/// Lock key class: 0 valid (1-191 bytes of `[A-Za-z0-9:._-]`), 1 empty, 2 too
+/// long, 3 invalid bytes.
+#[inline]
+fn w586_lock_key(name: &[u8]) -> i64 {
+    if name.is_empty() {
+        1
+    } else if name.len() > 191 {
+        2
+    } else if name
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'-'))
+    {
+        0
+    } else {
+        3
+    }
+}
+
+/// Holder token class: 0 32 lowercase hex digits, 1 lowercase UUID, 2 empty, 3 other.
+#[inline]
+fn w586_lock_token(token: &[u8]) -> i64 {
+    match token.len() {
+        0 => 2,
+        32 if w576_lower_hex(token) => 0,
+        36 if token.iter().enumerate().all(|(at, &b)| {
+            if matches!(at, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+            }
+        }) =>
+        {
+            1
+        }
+        _ => 3,
+    }
+}
+
+/// Lock requests against their current lease. `strings` holds the name and
+/// token columns, `ints` the mode (0 exclusive, 1 shared, 2 exclusive group, 3
+/// drain; other 4), exclusive lease expiry (ms, 0 none; clamped to 0..2^42)
+/// and shared holder (0..2^20-1) columns. `now` clamps to 0..2^42 and `ttl` to
+/// 0..2^40; a TTL is valid from 1 s to 1 day. Lease 0 free, 1 held, 2 expired,
+/// 3 held but expiring (remaining below a quarter TTL). Outcome 0 granted, 1
+/// contended, 2 reclaim an expired lease, 3 invalid request, 4 draining
+/// (shared holders remain). `[0]` count, `[1..=5]` per outcome, `[6..=9]` per
+/// lease, `[10]` invalid keys, `[11]` invalid tokens, `[12]` TTL valid, `[13]`
+/// shared holders, `[14]` first contended and `[15]` first reclaim index,
+/// `[16]` soonest expiring held index (-1 when none) and `[17]` its remaining
+/// ms, `[18]` FNV-1a digest; then per request `outcome | key << 3 | token << 5
+/// | lease << 7 | mode << 9 | min(holders, 1023) << 12 | min(name bytes, 255)
+/// << 22 | min(remaining, 2^32-1) << 30`.
+pub(crate) fn w586_lock_batch(
+    strings: &[&[u8]],
+    ints: &[i64],
+    count: usize,
+    now: i64,
+    ttl: i64,
+) -> Vec<i64> {
+    let now = now.clamp(0, W586_LEASE_CAP);
+    let ttl = ttl.clamp(0, W586_TIME_CAP);
+    let ttl_valid = (1_000..=86_400_000).contains(&ttl);
+    let mut out = vec![0i64; W586_LOCK_HEADER + count];
+    out[0] = count as i64;
+    out[12] = i64::from(ttl_valid);
+    out[14] = -1;
+    out[15] = -1;
+    out[16] = -1;
+    for at in 0..count {
+        let name = strings[at];
+        let key = w586_lock_key(name);
+        let token = w586_lock_token(strings[count + at]);
+        let mode = if (0..=3).contains(&ints[at]) { ints[at] } else { 4 };
+        let expires = ints[count + at].clamp(0, W586_LEASE_CAP);
+        let holders = ints[2 * count + at].clamp(0, (1 << 20) - 1);
+        let lease: i64 = if expires == 0 {
+            0
+        } else if expires <= now {
+            2
+        } else if (expires - now) * 4 < ttl {
+            3
+        } else {
+            1
+        };
+        let held = lease == 1 || lease == 3;
+        let remaining = if held { expires - now } else { 0 };
+        let outcome: i64 = if key != 0 || token >= 2 || mode == 4 || !ttl_valid {
+            3
+        } else {
+            match mode {
+                0 | 1 => {
+                    if held {
+                        1
+                    } else if lease == 2 {
+                        2
+                    } else {
+                        0
+                    }
+                }
+                2 => {
+                    if held || holders > 0 {
+                        1
+                    } else if lease == 2 {
+                        2
+                    } else {
+                        0
+                    }
+                }
+                _ => {
+                    if held {
+                        1
+                    } else if holders > 0 {
+                        4
+                    } else if lease == 2 {
+                        2
+                    } else {
+                        0
+                    }
+                }
+            }
+        };
+        out[1 + outcome as usize] += 1;
+        out[6 + lease as usize] += 1;
+        out[10] += i64::from(key != 0);
+        out[11] += i64::from(token >= 2);
+        out[13] += holders;
+        if outcome == 1 {
+            w586_first(&mut out[14], at);
+        }
+        if outcome == 2 {
+            w586_first(&mut out[15], at);
+        }
+        if held && (out[16] < 0 || remaining < out[17]) {
+            out[16] = at as i64;
+            out[17] = remaining;
+        }
+        out[W586_LOCK_HEADER + at] = outcome
+            | key << 3
+            | token << 5
+            | lease << 7
+            | mode << 9
+            | holders.min(1023) << 12
+            | (name.len().min(255) as i64) << 22
+            | remaining.min((1 << 32) - 1) << 30;
+    }
+    out[18] = w526_digest(&out[W586_LOCK_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w586_lock_status_batch(
+    strings: *const u8,
+    strings_len: usize,
+    string_twin: *const u8,
+    string_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    now: i64,
+    ttl: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let strings = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(string_twin, string_twin_len)?,
+                2,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 3, count)?;
+            Some(w586_lock_batch(&strings, &ints, count, now, ttl))
+        })
+    }
+}
+
+// --- VerificationResult::summarizeResultBatch --------------------------------
+
+pub(crate) const W586_RESULT_HEADER: usize = 25;
+
+/// Verdict index: complete 0, repaired 1, sampled 2, unknown 3, unrepairable 4, other 5.
+#[inline]
+fn w586_result_verdict(verdict: &[u8]) -> i64 {
+    match verdict {
+        b"complete" => 0,
+        b"repaired" => 1,
+        b"sampled" => 2,
+        b"unknown" => 3,
+        b"unrepairable" => 4,
+        _ => 5,
+    }
+}
+
+/// Bitset of the reason needles' first two bytes (`bu`, `by`, `id`, `co`, `ov`,
+/// `re`, `he`), indexed by `first << 8 | second`.
+const W586_REASON_BIGRAMS: [u64; 1024] = {
+    let pairs: [[u8; 2]; 7] = [*b"bu", *b"by", *b"id", *b"co", *b"ov", *b"re", *b"he"];
+    let mut table = [0u64; 1024];
+    let mut at = 0;
+    while at < pairs.len() {
+        let key = (pairs[at][0] as usize) << 8 | pairs[at][1] as usize;
+        table[key >> 6] |= 1 << (key & 63);
+        at += 1;
+    }
+    table
+};
+
+/// Reason class (case-sensitive, first match): 0 empty, 1 budget, 2 identity
+/// or collision, 3 byte range or overlap, 4 retry, 5 header, 6 other. One pass
+/// filters start positions by the needles' first two bytes and records which
+/// needles occur; the lowest class found wins, as PHP's ordered
+/// `str_contains()` checks do. No needle is shorter than five bytes.
+#[inline]
+fn w586_result_reason(reason: &[u8]) -> i64 {
+    if reason.is_empty() {
+        return 0;
+    }
+    let mut found = 0u32;
+    for at in 0..reason.len().saturating_sub(4) {
+        let key = (reason[at] as usize) << 8 | reason[at + 1] as usize;
+        if W586_REASON_BIGRAMS[key >> 6] >> (key & 63) & 1 == 0 {
+            continue;
+        }
+        let rest = &reason[at..];
+        found |= match &rest[..2] {
+            b"bu" if rest.starts_with(b"budget") => return 1,
+            b"by" if rest.starts_with(b"byte range") => 4,
+            b"id" if rest.starts_with(b"identity") => 2,
+            b"co" if rest.starts_with(b"collide") => 2,
+            b"ov" if rest.starts_with(b"overlapping") => 4,
+            b"re" if rest.starts_with(b"retry") => 8,
+            b"he" if rest.starts_with(b"header") => 16,
+            _ => 0,
+        };
+    }
+    match found.trailing_zeros() {
+        1 => 2,
+        2 => 3,
+        3 => 4,
+        4 => 5,
+        _ => 6,
+    }
+}
+
+/// Verification results. `strings` holds the verdict and reason columns, `ints`
+/// the sampled article count (clamped to 0..2^31-1) and flag (waiting for
+/// headers 1, header rejected 2, deterministic 4) columns. Passed verdicts are
+/// 0-2. Retry class 0 passed, 1 deterministic, 2 waiting, 3 rejected, 4
+/// retryable (rejected, then waiting, then deterministic win). Article bucket
+/// 0 none, 1 one, 2 up to 4, 3 up to 16, 4 more. `[0]` count, `[1..=6]` per
+/// verdict, `[7]` passed, `[8..=14]` per reason class, `[15..=19]` per retry
+/// class, `[20]` articles, `[21]` most articles, `[22]` first failing index
+/// (-1 when none), `[23]` pass ppm, `[24]` FNV-1a digest; then per result
+/// `verdict | passed << 3 | reason << 4 | retry << 7 | flags << 10 | bucket <<
+/// 13 | min(reason bytes, 65535) << 16 | articles << 32`.
+pub(crate) fn w586_result_batch(strings: &[&[u8]], ints: &[i64], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W586_RESULT_HEADER + count];
+    out[0] = count as i64;
+    out[22] = -1;
+    for at in 0..count {
+        let verdict = w586_result_verdict(strings[at]);
+        let reason_bytes = strings[count + at];
+        let reason = w586_result_reason(reason_bytes);
+        let articles = ints[at].clamp(0, W576_COUNT_CAP);
+        let flags = ints[count + at] & 7;
+        let passed = verdict <= 2;
+        let retry: i64 = if passed {
+            0
+        } else if flags & 2 != 0 {
+            3
+        } else if flags & 1 != 0 {
+            2
+        } else if flags & 4 != 0 {
+            1
+        } else {
+            4
+        };
+        let bucket: i64 = match articles {
+            0 => 0,
+            1 => 1,
+            2..=4 => 2,
+            5..=16 => 3,
+            _ => 4,
+        };
+        out[1 + verdict as usize] += 1;
+        out[7] += i64::from(passed);
+        out[8 + reason as usize] += 1;
+        out[15 + retry as usize] += 1;
+        out[20] += articles;
+        out[21] = out[21].max(articles);
+        if !passed {
+            w586_first(&mut out[22], at);
+        }
+        out[W586_RESULT_HEADER + at] = verdict
+            | i64::from(passed) << 3
+            | reason << 4
+            | retry << 7
+            | flags << 10
+            | bucket << 13
+            | (reason_bytes.len().min(65_535) as i64) << 16
+            | articles << 32;
+    }
+    if count > 0 {
+        out[23] = out[7] * 1_000_000 / count as i64;
+    }
+    out[24] = w526_digest(&out[W586_RESULT_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w586_result_summary_batch(
+    strings: *const u8,
+    strings_len: usize,
+    string_twin: *const u8,
+    string_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let strings = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(string_twin, string_twin_len)?,
+                2,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w586_result_batch(&strings, &ints, count))
+        })
+    }
+}
+
+// --- VerificationRunDiagnostics::summarizeRunBatch ---------------------------
+
+pub(crate) const W586_RUN_HEADER: usize = 43;
+const W586_PHASES: usize = 9;
+
+/// `STOP_REASONS` index; `None` when it names none (`stopPhp()` records it as error, 8).
+#[inline]
+fn w586_stop_reason(reason: &[u8]) -> Option<i64> {
+    Some(match reason {
+        b"limit" => 0,
+        b"deadline" => 1,
+        b"no_claim" => 2,
+        b"draining" => 3,
+        b"worker_unavailable" => 4,
+        b"initialization_unavailable" => 5,
+        b"initialization_error" => 6,
+        b"unsafe_scratch_root" => 7,
+        b"error" => 8,
+        _ => return None,
+    })
+}
+
+/// Command runs. `ints` holds the claims admitted, limit, claim calls, claim
+/// loop ns (negative when the loop never started), max seconds columns (counts
+/// clamped to 0..2^31-1, durations to 0..2^50-1) and then nine phase ns per
+/// run (`PHASES` order). Limit and deadline follow `stopPhp()`; the bottleneck
+/// is the first strictly longest non-zero phase (9 none); idle is loop time
+/// not charged to a phase; a run is stalled when it claimed nothing despite
+/// calls. `[0]` count, `[1..=9]` per stop reason, `[10]` unrecognized reasons,
+/// `[11]` limit and `[12]` deadline reached, `[13]` loops started, `[14]`
+/// stalled, `[15..=24]` per bottleneck, `[25]` claims, `[26]` calls, `[27]`
+/// loop ns, `[28..=36]` per phase ns and `[37]` idle ns (totals capped at
+/// 2^62), `[38]` slowest loop index (-1 when none) and `[39]` its ns, `[40]`
+/// the batch bottleneck (9 none), `[41]` mean claim efficiency ppm (each run
+/// capped at 1e6), `[42]` FNV-1a digest; then per run `reason | unrecognized
+/// << 4 | limit << 5 | deadline << 6 | started << 7 | stalled << 8 |
+/// bottleneck << 9 | min(claims, 2^20-1) << 13 | min(loop ms, 2^30-1) << 33`.
+pub(crate) fn w586_run_batch(reasons: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+    let count = reasons.len();
+    let phases = &ints[5 * count..];
+    let mut out = vec![0i64; W586_RUN_HEADER + count];
+    out[0] = count as i64;
+    out[38] = -1;
+    let (mut efficiency, mut measured) = (0i64, 0i64);
+    for (at, reason) in reasons.iter().enumerate() {
+        let known = w586_stop_reason(reason);
+        let case = known.unwrap_or(8);
+        let claims = ints[at].clamp(0, W576_COUNT_CAP);
+        let limit = ints[count + at].clamp(0, W576_COUNT_CAP);
+        let calls = ints[2 * count + at].clamp(0, W576_COUNT_CAP);
+        let raw_loop = ints[3 * count + at];
+        let max_seconds = ints[4 * count + at].clamp(0, W576_COUNT_CAP);
+        let started = raw_loop >= 0;
+        let loop_ns = if started { raw_loop.min(W586_NS_CAP) } else { 0 };
+        let limit_reached = claims >= limit;
+        let deadline = started && max_seconds > 0 && loop_ns >= max_seconds * 1_000_000_000;
+        let stalled = calls > 0 && claims == 0;
+        let (mut bottleneck, mut longest, mut charged) = (9i64, 0i64, 0i64);
+        for (phase, &raw) in phases[at * W586_PHASES..(at + 1) * W586_PHASES].iter().enumerate() {
+            let ns = raw.clamp(0, W586_NS_CAP);
+            charged += ns;
+            if ns > longest {
+                longest = ns;
+                bottleneck = phase as i64;
+            }
+            out[28 + phase] = w47_add(out[28 + phase], ns);
+        }
+        let idle = if started { (loop_ns - charged).max(0) } else { 0 };
+        if calls > 0 {
+            efficiency += (claims * 1_000_000 / calls).min(1_000_000);
+            measured += 1;
+        }
+        out[1 + case as usize] += 1;
+        out[10] += i64::from(known.is_none());
+        out[11] += i64::from(limit_reached);
+        out[12] += i64::from(deadline);
+        out[13] += i64::from(started);
+        out[14] += i64::from(stalled);
+        out[15 + bottleneck as usize] += 1;
+        out[25] += claims;
+        out[26] += calls;
+        out[27] = w47_add(out[27], loop_ns);
+        out[37] = w47_add(out[37], idle);
+        if started && (out[38] < 0 || loop_ns > out[39]) {
+            out[38] = at as i64;
+            out[39] = loop_ns;
+        }
+        out[W586_RUN_HEADER + at] = case
+            | i64::from(known.is_none()) << 4
+            | i64::from(limit_reached) << 5
+            | i64::from(deadline) << 6
+            | i64::from(started) << 7
+            | i64::from(stalled) << 8
+            | bottleneck << 9
+            | claims.min((1 << 20) - 1) << 13
+            | (loop_ns / 1_000_000).min((1 << 30) - 1) << 33;
+    }
+    out[40] = 9;
+    let mut longest = 0;
+    for phase in 0..W586_PHASES {
+        if out[28 + phase] > longest {
+            longest = out[28 + phase];
+            out[40] = phase as i64;
+        }
+    }
+    if measured > 0 {
+        out[41] = efficiency / measured;
+    }
+    out[42] = w526_digest(&out[W586_RUN_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w586_run_diagnostics_batch(
+    reasons: *const u8,
+    reasons_len: usize,
+    reason_twin: *const u8,
+    reason_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let reasons = w566_columns(
+                w15_input(reasons, reasons_len)?,
+                w15_input(reason_twin, reason_twin_len)?,
+                1,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 5 + W586_PHASES, count)?;
+            Some(w586_run_batch(&reasons, &ints))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w586_spot_ledger_lock_result_diagnostics_tests {
+    use super::*;
+    use std::ptr::null;
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_ne_bytes()).collect()
+    }
+
+    #[test]
+    fn w586_spot_batch_classifies_responses() {
+        let responses: [&[u8]; 6] = [
+            b"223 0 <a@b>\r\n",
+            b"220 1 <x@y>",
+            b"430 no such article",
+            b"480 auth",
+            b"502",
+            b"22x",
+        ];
+        let out = w586_spot_batch(&responses, &[3, 1, 0, 3, 2, 9], 200_000);
+        assert_eq!(&out[..13], &[6, 1, 1, 1, 1, 1, 1, 2, 1, 2, 3, 166_666, 2]);
+        assert_eq!(out[W586_SPOT_HEADER], 3 << 3 | 1 << 6 | 1 << 7 | 224 << 8 | 13 << 18);
+        assert_eq!(out[W586_SPOT_HEADER + 5] & 0x3_FF00, 0);
+        assert_eq!(w586_spot_code(b"223\tx"), 223);
+        assert_eq!(w586_spot_code(b"2234"), -1);
+        assert_eq!(w586_spot_batch(&[], &[], 0)[12], 3);
+        assert_eq!(w586_spot_batch(&[b"430"], &[3], 0)[12], 1);
+    }
+
+    #[test]
+    fn w586_ledger_batch_applies_deltas_in_order() {
+        let states: [&[u8]; 8] = [b"ready", b"ready", b"verified", b"bogus", b"verifying", b"ready", b"published", b"verifying"];
+        let ints = [3, 0, 9, 1, 5, 0, 1, 0, 100, 0, 50, 7, 40, 30, 20, 0];
+        let out = w586_ledger_batch(&states, &ints, 4, 100, 50, 10, 3);
+        assert_eq!(&out[..5], &[4, 2, 1, 0, 1]);
+        assert_eq!((out[14], out[15], out[16], out[17], out[18]), (1, 50, 3, 2, 2));
+        assert_eq!((out[19], out[20], out[21], out[22], out[23], out[24]), (13, 4, 93, 3, 1, 0));
+    }
+
+    #[test]
+    fn w586_lock_and_token_classes() {
+        assert_eq!(w586_lock_key(b"publication:12"), 0);
+        assert_eq!(w586_lock_key(b""), 1);
+        assert_eq!(w586_lock_key(&[b'a'; 192]), 2);
+        assert_eq!(w586_lock_key(b"a b"), 3);
+        assert_eq!(w586_lock_token(&[b'a'; 32]), 0);
+        assert_eq!(w586_lock_token(b"123e4567-e89b-12d3-a456-426614174000"), 1);
+        assert_eq!(w586_lock_token(b"123E4567-e89b-12d3-a456-426614174000"), 3);
+        let token = [b'f'; 32];
+        let strings: [&[u8]; 4] = [b"a", b"g", &token, &token];
+        let out = w586_lock_batch(&strings, &[0, 3, 5_000, 0, 0, 2], 2, 1_000, 60_000);
+        assert_eq!(&out[..6], &[2, 0, 1, 0, 0, 1]);
+        assert_eq!((out[14], out[16], out[17]), (0, 0, 4_000));
+    }
+
+    #[test]
+    fn w586_result_and_run_batches() {
+        let strings: [&[u8]; 4] = [b"sampled", b"unknown", b"", b"Spot-check article identity differs from its header."];
+        let out = w586_result_batch(&strings, &[3, 0, 0, 4], 2);
+        assert_eq!(&out[..8], &[2, 0, 0, 1, 1, 0, 0, 1]);
+        assert_eq!((out[8], out[10], out[16], out[22], out[23]), (1, 1, 1, 1, 500_000));
+        assert_eq!(w586_result_reason(b"header then retry"), 4);
+        assert_eq!(w586_result_reason(b"overlapping identity"), 2);
+        assert_eq!(w586_result_reason(b"x budget identity"), 1);
+        assert_eq!(w586_result_reason(b"byte rang"), 6);
+        assert_eq!(w586_result_reason(b"byte range"), 3);
+        assert_eq!(w586_result_reason(b"overlappin"), 6);
+        assert_eq!(w586_result_reason(b"xoverlapping"), 3);
+        assert_eq!(w586_result_reason(b"retr\0retry"), 4);
+        assert_eq!(w586_result_reason(b"heade"), 6);
+        assert_eq!((w586_result_reason(b"retry"), w586_result_reason(b"x"), w586_result_reason(b"")), (4, 6, 0));
+        let mut ints = vec![5, 0, 10, 0, 20, 4, 2_000_000_000, -1, 1, 0];
+        ints.extend([0, 7, 0, 0, 0, 0, 0, 0, 0]);
+        ints.extend([0; 9]);
+        let out = w586_run_batch(&[b"limit", b"bogus"], &ints);
+        assert_eq!((out[1], out[9], out[10], out[11], out[12], out[13], out[14]), (1, 1, 1, 1, 1, 1, 1));
+        assert_eq!((out[16], out[24], out[38], out[39], out[40], out[41]), (1, 1, 0, 2_000_000_000, 1, 125_000));
+    }
+
+    #[test]
+    fn w586_exports_validate_buffers() {
+        let mut out = vec![0i64; 64];
+        for status in unsafe {
+            [
+                nntmux_w586_spot_response_batch(null(), 0, null(), 0, null(), 0, 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w586_ledger_summary_batch(null(), 0, null(), 0, null(), 0, 0, 0, 0, 0, 1, out.as_mut_ptr(), 64),
+                nntmux_w586_lock_status_batch(null(), 0, null(), 0, null(), 0, 0, 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w586_result_summary_batch(null(), 0, null(), 0, null(), 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w586_run_diagnostics_batch(null(), 0, null(), 0, null(), 0, 0, out.as_mut_ptr(), 64),
+            ]
+        } {
+            assert_eq!(status, 1);
+        }
+        let ints = packed(&[1]);
+        let status = unsafe {
+            nntmux_w586_spot_response_batch(b"223".as_ptr(), 3, null(), 0, ints.as_ptr(), ints.len(), 1, 0, out.as_mut_ptr(), 4)
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w586_spot_response_batch(b"223".as_ptr(), 3, null(), 0, ints.as_ptr(), ints.len() - 1, 1, 0, out.as_mut_ptr(), 64)
+        };
+        assert_eq!(status, -1);
+        let status = unsafe {
+            nntmux_w586_result_summary_batch(null(), 0, null(), 0, null(), 0, 0, null::<i64>().cast_mut(), 64)
+        };
+        assert_eq!(status, -2);
+    }
+}
