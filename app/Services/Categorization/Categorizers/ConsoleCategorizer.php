@@ -9,6 +9,7 @@ use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 class ConsoleCategorizer extends AbstractCategorizer
@@ -494,5 +495,286 @@ CDEF;
         }
 
         return self::$w423RustFfiHandle === false ? null : self::$w423RustFfiHandle;
+    }
+
+    // ========================================================================
+    // WAVE 60.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 7.36x, p99 6.78x; uncommon mean 7.73x, p99 5.21x); see RustCategorizersAbstractBookConsoleGroupNameReleaseContextW60ParityTest. */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    public const string W60_CONSOLE_CATEGORIZER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w603_console_platform_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w60ConsolePlatformBatch(). */
+    public const int W60_CONSOLE_CATEGORIZER_TRAILER = 36;
+
+    /**
+     * Platform tokens: 1 PS5, 2 PS4, 3 PS3, 4 PS Vita, 5 PSP, 6 Xbox One/Series, 7 Xbox 360, 8 Xbox, 9 Switch, 10 Wii U,
+     * 11 Wii, 12 3DS, 13 NDS and 14 retro (`xbox` and `wii` depend on the next token; PPSA/CUSA ids by shape).
+     *
+     * @var array<string, int>
+     */
+    public const array W60_CONSOLE_PLATFORM_TOKENS = ['ps5' => 1, 'ps4' => 2, 'ps3' => 3, 'psvita' => 4, 'vita' => 4, 'psv' => 4, 'psp' => 5,
+        'xboxone' => 6, 'xbone' => 6, 'xb1' => 6, 'xsx' => 6, 'xss' => 6, 'xbsx' => 6, 'xbox360' => 7, 'x360' => 7, 'switch' => 9, 'nsw' => 9,
+        'nsp' => 9, 'xci' => 9, 'wiiu' => 10, 'wbfs' => 11, '3ds' => 12, 'cia' => 12, 'nds' => 13, 'snes' => 14, 'nes' => 14, 'n64' => 14,
+        'gba' => 14, 'gbc' => 14, 'gb' => 14, 'dreamcast' => 14, 'saturn' => 14, 'atari' => 14, 'sega' => 14, 'ps2' => 14, 'ps1' => 14,
+        'psx' => 14, 'mame' => 14, 'genesis' => 14, 'megadrive' => 14];
+
+    /**
+     * Region tokens: 1 PAL, 2 NTSC, 3 USA, 4 EUR, 5 JPN, 6 Asia, 7 Korea, 8 region free and 9 multi-language
+     * (`region free` and `multiN` are detected in code).
+     *
+     * @var array<string, int>
+     */
+    public const array W60_CONSOLE_REGION_TOKENS = ['pal' => 1, 'ntsc' => 2, 'usa' => 3, 'us' => 3, 'eur' => 4, 'europe' => 4, 'eu' => 4,
+        'jpn' => 5, 'japan' => 5, 'jp' => 5, 'asia' => 6, 'kor' => 7, 'korea' => 7, 'regionfree' => 8, 'multi' => 9];
+
+    /**
+     * Format flags: 1 DLC, 2 update, 4 PKG, 8 ISO, 16 NSP/XCI, 32 CIA, 64 WBFS and 128 ROM.
+     *
+     * @var array<string, int>
+     */
+    public const array W60_CONSOLE_FORMAT_TOKENS = ['dlc' => 1, 'update' => 2, 'patch' => 2, 'pkg' => 4, 'iso' => 8, 'nsp' => 16, 'xci' => 16,
+        'cia' => 32, 'wbfs' => 64, 'rom' => 128, 'roms' => 128];
+
+    /** Category ids by platform (PS5 shares the PS4 category; Switch and retro use GAME_OTHER). */
+    public const array W60_CONSOLE_CATEGORIES = [0, Category::GAME_PS4, Category::GAME_PS4, Category::GAME_PS3, Category::GAME_PSVITA,
+        Category::GAME_PSP, Category::GAME_XBOXONE, Category::GAME_XBOX360, Category::GAME_XBOX, Category::GAME_OTHER, Category::GAME_WIIU,
+        Category::GAME_WII, Category::GAME_3DS, Category::GAME_NDS, Category::GAME_OTHER];
+
+    /** Confidence in thousandths by platform. */
+    public const array W60_CONSOLE_CONFIDENCE = [0, 800, 900, 900, 900, 900, 900, 900, 850, 850, 900, 850, 900, 900, 800];
+
+    /** @var list<string> */
+    public const array W60_CONSOLE_GROUP_HINTS = ['console', 'games', 'nintendo', 'wii', 'xbox', 'ps3', 'ps4', 'psp', 'sony'];
+
+    public static function usesW60RustFfi(): bool
+    {
+        $override = self::w60RustFfiState();
+
+        return \is_bool($override) ? $override : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the ConsoleCategorizer Wave 60 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 60.3 console platform and region plans. Each item is `releaseName|groupName` (fields trimmed). Per item
+     * `platform | region << 4 | formats << 8 | altBinaries << 16 | groupHint << 17 | categoryId << 18 | confidenceMilli
+     * << 29 | min(tokens, 63) << 39 | min(nameLength, 255) << 45` over the `[^a-z0-9]+`-separated lowercase tokens:
+     * platform is the smallest W60_CONSOLE_PLATFORM_TOKENS index of any token (`xbox` is 6 before `one`/`series`, 7
+     * before `360`, else 8; `wii` is 10 before `u`, else 11; `ppsa` plus 4-6 digits is 1 and `cusa` plus 5 digits is
+     * 2), region the smallest W60_CONSOLE_REGION_TOKENS index (`region` before `free` is 8, `multi` plus 1-2 digits
+     * is 9), formats OR W60_CONSOLE_FORMAT_TOKENS, alt.binaries marks a case-insensitive `alt.binaries.` group
+     * prefix and the hint any W60_CONSOLE_GROUP_HINTS substring; category and confidence come from
+     * W60_CONSOLE_CATEGORIES and W60_CONSOLE_CONFIDENCE. Then fifteen platform, ten region and eight format counts,
+     * the alt.binaries and hint counts and the distinct (platform, region) pairs of items with a platform.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60ConsolePlatformBatch(array $items): array
+    {
+        return self::usesW60RustFfi() ? self::w60ConsolePlatformBatchNative($items) : self::w60ConsolePlatformBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60ConsolePlatformBatchNative(array $items): array
+    {
+        return self::w60Invoke($items, \count($items) + self::W60_CONSOLE_CATEGORIZER_TRAILER) ?? self::w60ConsolePlatformBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60ConsolePlatformBatchPhp(array $items): array
+    {
+        $out = [];
+        $platforms = array_fill(0, 15, 0);
+        $regions = array_fill(0, 10, 0);
+        $formats = array_fill(0, 8, 0);
+        $alt = $hints = 0;
+        $pairs = [];
+        foreach ($items as $item) {
+            $f = explode('|', (string) $item, 2) + ['', ''];
+            $name = trim($f[0]);
+            $group = strtolower(trim($f[1]));
+            $tokens = $name === '' ? [] : (preg_split('/[^a-z0-9]+/', strtolower($name), -1, PREG_SPLIT_NO_EMPTY) ?: []);
+            $platform = $region = $format = 0;
+            foreach ($tokens as $i => $token) {
+                $token = (string) $token;
+                $next = (string) ($tokens[$i + 1] ?? '');
+                $length = \strlen($token);
+                $p = match (true) {
+                    $token === 'xbox' => $next === 'one' || $next === 'series' ? 6 : ($next === '360' ? 7 : 8),
+                    $token === 'wii' => $next === 'u' ? 10 : 11,
+                    $length >= 8 && $length <= 10 && str_starts_with($token, 'ppsa') && strspn($token, '0123456789', 4) === $length - 4 => 1,
+                    $length === 9 && str_starts_with($token, 'cusa') && strspn($token, '0123456789', 4) === 5 => 2,
+                    default => self::W60_CONSOLE_PLATFORM_TOKENS[$token] ?? 0,
+                };
+                if ($p !== 0 && ($platform === 0 || $p < $platform)) {
+                    $platform = $p;
+                }
+                $r = match (true) {
+                    $token === 'region' => $next === 'free' ? 8 : 0,
+                    ($length === 6 || $length === 7) && str_starts_with($token, 'multi') && strspn($token, '0123456789', 5) === $length - 5 => 9,
+                    default => self::W60_CONSOLE_REGION_TOKENS[$token] ?? 0,
+                };
+                if ($r !== 0 && ($region === 0 || $r < $region)) {
+                    $region = $r;
+                }
+                $format |= self::W60_CONSOLE_FORMAT_TOKENS[$token] ?? 0;
+            }
+            $isAlt = str_starts_with($group, 'alt.binaries.') ? 1 : 0;
+            $hint = 0;
+            foreach (self::W60_CONSOLE_GROUP_HINTS as $needle) {
+                if (str_contains($group, $needle)) {
+                    $hint = 1;
+
+                    break;
+                }
+            }
+            $platforms[$platform]++;
+            $regions[$region]++;
+            for ($b = 0; $b < 8; $b++) {
+                $formats[$b] += $format >> $b & 1;
+            }
+            $alt += $isAlt;
+            $hints += $hint;
+            if ($platform !== 0) {
+                $pairs[$platform * 10 + $region] = true;
+            }
+            $out[] = $platform | $region << 4 | $format << 8 | $isAlt << 16 | $hint << 17 | self::W60_CONSOLE_CATEGORIES[$platform] << 18
+                | self::W60_CONSOLE_CONFIDENCE[$platform] << 29 | min(\count($tokens), 63) << 39 | min(\strlen($name), 255) << 45;
+        }
+        array_push($out, ...$platforms, ...$regions, ...$formats);
+        array_push($out, $alt, $hints, \count($pairs));
+
+        return $out;
+    }
+
+    /**
+     * Wave 60 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w603', self::W60_CONSOLE_CATEGORIZER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w60RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w60RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 60.3 ConsoleCategorizer export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w60Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w60RustFfiState('ffi');
+            $out = self::w60RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w60RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W60_CONSOLE_CATEGORIZER_FFI_CDEF.)
+            $written = $ffi->nntmux_w603_console_platform_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

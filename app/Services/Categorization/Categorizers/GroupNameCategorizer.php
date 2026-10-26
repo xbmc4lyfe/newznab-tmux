@@ -9,6 +9,7 @@ use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 class GroupNameCategorizer extends AbstractCategorizer
@@ -332,5 +333,244 @@ CDEF;
         }
 
         return self::$w423RustFfiHandle === false ? null : self::$w423RustFfiHandle;
+    }
+
+    // ========================================================================
+    // WAVE 60.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 5.60x, p99 4.51x; uncommon mean 3.02x, p99 2.64x); see RustCategorizersAbstractBookConsoleGroupNameReleaseContextW60ParityTest. */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    public const string W60_GROUP_NAME_CATEGORIZER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w603_group_name_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w60GroupNameBatch(). */
+    public const int W60_GROUP_NAME_CATEGORIZER_TRAILER = 19;
+
+    /**
+     * Topic rules in categorizePhp() order: needles, category id and confidence in thousandths.
+     *
+     * @var list<array{list<string>, int, int}>
+     */
+    public const array W60_GROUP_RULES = [
+        [['anime'], Category::TV_ANIME, 800],
+        [['tv'], Category::TV_OTHER, 600],
+        [['movie', 'dvd', 'bluray', 'x264'], Category::MOVIE_OTHER, 600],
+        [['erotica', 'xxx'], Category::XXX_OTHER, 700],
+        [['sound', 'mp3', 'music', 'lossless'], Category::MUSIC_OTHER, 600],
+        [['game', 'console', 'psx', 'nintendo'], Category::GAME_OTHER, 600],
+        [['warez', '0day', 'app', 'software'], Category::PC_0DAY, 600],
+        [['ebook', 'e-book', 'comic'], Category::BOOKS_EBOOK, 500],
+    ];
+
+    public static function usesW60RustFfi(): bool
+    {
+        $override = self::w60RustFfiState();
+
+        return \is_bool($override) ? $override : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the GroupNameCategorizer Wave 60 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 60.3 newsgroup hierarchy plans. Each item is one group name (trimmed, compared lowercase). Per item
+     * `hierarchy | min(depth, 15) << 3 | rule << 7 | categoryId << 11 | confidenceMilli << 24 | abbreviated << 34 |
+     * min(length, 255) << 35`: hierarchy is 0 empty, 5 invalid (a byte outside `[a-z0-9.+_-]`, a leading or trailing
+     * `.` or `..`), 1 `alt.binaries.` prefix, 2 other `alt.`, 3 another dotted hierarchy and 4 a single segment;
+     * depth counts the segments of valid names (0 otherwise); the rule is the first W60_GROUP_RULES entry (1-8)
+     * with a needle after the first `alt.binaries.`, else 0 with category 0; abbreviated marks an `a.b.` prefix.
+     * Then six hierarchy and nine rule counts, the depth sum, the largest depth, the distinct non-empty names and
+     * the abbreviated count.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60GroupNameBatch(array $items): array
+    {
+        return self::usesW60RustFfi() ? self::w60GroupNameBatchNative($items) : self::w60GroupNameBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60GroupNameBatchNative(array $items): array
+    {
+        return self::w60Invoke($items, \count($items) + self::W60_GROUP_NAME_CATEGORIZER_TRAILER) ?? self::w60GroupNameBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60GroupNameBatchPhp(array $items): array
+    {
+        $out = [];
+        $hierarchies = [0, 0, 0, 0, 0, 0];
+        $rules = array_fill(0, 9, 0);
+        $depthSum = $maxDepth = $abbreviated = 0;
+        $groups = [];
+        foreach ($items as $item) {
+            $g = strtolower(trim((string) $item));
+            $length = \strlen($g);
+            $hierarchy = match (true) {
+                $g === '' => 0,
+                strspn($g, 'abcdefghijklmnopqrstuvwxyz0123456789.+-_') !== $length || $g[0] === '.' || $g[-1] === '.' || str_contains($g, '..') => 5,
+                str_starts_with($g, 'alt.binaries.') => 1,
+                str_starts_with($g, 'alt.') => 2,
+                str_contains($g, '.') => 3,
+                default => 4,
+            };
+            $depth = $hierarchy === 0 || $hierarchy === 5 ? 0 : substr_count($g, '.') + 1;
+            $rule = $category = $confidence = 0;
+            $at = strpos($g, 'alt.binaries.');
+            if ($at !== false) {
+                $rest = substr($g, $at + 13);
+                foreach (self::W60_GROUP_RULES as $index => [$needles, $ruleCategory, $ruleConfidence]) {
+                    foreach ($needles as $needle) {
+                        if (str_contains($rest, $needle)) {
+                            [$rule, $category, $confidence] = [$index + 1, $ruleCategory, $ruleConfidence];
+
+                            break 2;
+                        }
+                    }
+                }
+            }
+            $abbrev = str_starts_with($g, 'a.b.') ? 1 : 0;
+            $hierarchies[$hierarchy]++;
+            $rules[$rule]++;
+            $depthSum += $depth;
+            $maxDepth = max($maxDepth, $depth);
+            $abbreviated += $abbrev;
+            if ($g !== '') {
+                $groups[$g] = true;
+            }
+            $out[] = $hierarchy | min($depth, 15) << 3 | $rule << 7 | $category << 11 | $confidence << 24 | $abbrev << 34 | min($length, 255) << 35;
+        }
+        array_push($out, ...$hierarchies, ...$rules);
+        array_push($out, $depthSum, $maxDepth, \count($groups), $abbreviated);
+
+        return $out;
+    }
+
+    /**
+     * Wave 60 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w603', self::W60_GROUP_NAME_CATEGORIZER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w60RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w60RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 60.3 GroupNameCategorizer export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w60Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w60RustFfiState('ffi');
+            $out = self::w60RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w60RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W60_GROUP_NAME_CATEGORIZER_FFI_CDEF.)
+            $written = $ffi->nntmux_w603_group_name_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
