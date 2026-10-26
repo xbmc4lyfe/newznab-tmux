@@ -6,6 +6,7 @@ namespace App\Services\Releases\Verification;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use PDO;
@@ -357,5 +358,196 @@ final class PublicationTiming
             $this->attempts[array_key_last($this->attempts)]['transaction_finalization_ns'] = self::accumulateDuration(0, $now, $this->callbackEndedAt);
             $this->callbackEndedAt = null;
         }
+    }
+
+    // Rust is the default only while the paired W57.6 benchmark clears 1.5x on all four metrics.
+    private const bool W57_RUST_FFI_DEFAULT = true;
+
+    public const string W57_FFI_CDEF = <<<'C'
+        int32_t nntmux_w576_timing_summary_batch(const char *ints, size_t ints_len, size_t count, int64_t sla, int64_t *out, size_t out_cap);
+        C;
+
+    private const int W57_MAX_ITEMS = 1_048_576;
+
+    public const int W57_TIMING_HEADER = 21;
+
+    /** Largest phase duration a batch carries (2^50-1 ns, about 13 days). */
+    private const int W57_NS_CAP = 1_125_899_906_842_623;
+
+    private const int W57_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /**
+     * Summarize phase durations in ns (clamped to 0..2^50-1) against an SLA. Buckets: below 1 us, 10 us,
+     * 100 us, 1 ms, 10 ms, 100 ms, 1 s, else 7.
+     *
+     * Layout: `[0]` count, `[1]` over the SLA, `[2]` clamped, `[3]` total (capped at 2^62), `[4]` mean,
+     * `[5]` min and `[6]` max (0 when empty), `[7]` p50, `[8]` p90 and `[9]` p99 (nearest rank), `[10]`
+     * within-SLA ppm, `[11]` first over-SLA index (-1 when none), `[12..19]` per bucket, `[20]` FNV-1a
+     * digest; then per duration `ns | bucket << 51 | over << 54 | clamped << 55`.
+     *
+     * @param  array<array-key, int>  $durations
+     * @return list<int>
+     */
+    public static function summarizeTimingBatch(array $durations, int $slaNs): array
+    {
+        return (self::usesW57RustFfi() ? self::summarizeTimingBatchNative($durations, $slaNs) : null) ?? self::summarizeTimingBatchPhp($durations, $slaNs);
+    }
+
+    /**
+     * @param  array<array-key, int>  $durations
+     * @return list<int>
+     */
+    public static function summarizeTimingBatchPhp(array $durations, int $slaNs): array
+    {
+        $count = \count($durations);
+        $out = array_fill(0, self::W57_TIMING_HEADER, 0);
+        $out[0] = $count;
+        $out[11] = -1;
+        $digest = 2_166_136_261;
+        $rows = $sorted = [];
+        $at = 0;
+        foreach ($durations as $raw) {
+            $raw = (int) $raw;
+            $ns = $raw < 0 ? 0 : ($raw > self::W57_NS_CAP ? self::W57_NS_CAP : $raw);
+            $clamped = $ns !== $raw;
+            $over = $ns > $slaNs;
+            $bucket = $ns < 1_000 ? 0 : ($ns < 10_000 ? 1 : ($ns < 100_000 ? 2 : ($ns < 1_000_000 ? 3
+                : ($ns < 10_000_000 ? 4 : ($ns < 100_000_000 ? 5 : ($ns < 1_000_000_000 ? 6 : 7))))));
+            $out[1] += (int) $over;
+            $out[2] += (int) $clamped;
+            $out[3] = min($out[3] + $ns, self::W57_TOTAL_CAP);
+            $out[12 + $bucket]++;
+            if ($over && $out[11] < 0) {
+                $out[11] = $at;
+            }
+            $sorted[] = $ns;
+            $row = $ns | $bucket << 51 | (int) $over << 54 | (int) $clamped << 55;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+            $at++;
+        }
+        if ($count > 0) {
+            sort($sorted);
+            $out[4] = intdiv($out[3], $count);
+            $out[5] = $sorted[0];
+            $out[6] = $sorted[$count - 1];
+            $out[7] = $sorted[intdiv($count * 50 + 99, 100) - 1];
+            $out[8] = $sorted[intdiv($count * 90 + 99, 100) - 1];
+            $out[9] = $sorted[intdiv($count * 99 + 99, 100) - 1];
+            $out[10] = intdiv(($count - $out[1]) * 1_000_000, $count);
+        }
+        $out[20] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust summary, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, int>  $durations
+     * @return list<int>|null
+     */
+    public static function summarizeTimingBatchNative(array $durations, int $slaNs): ?array
+    {
+        $count = \count($durations);
+        if ($count > self::W57_MAX_ITEMS) {
+            return null;
+        }
+        $ints = pack('q*', ...array_values($durations));
+        $fields = self::W57_TIMING_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w57Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w576_timing_summary_batch($ints, \strlen($ints), $count, $slaNs, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 57.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW57RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w57RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w57RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW57RustFfi(): bool
+    {
+        $forced = self::w57RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W57_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 57.6 routing and binding in function statics (shared by every Wave 57.6 target, including readonly classes and enums).
+     * No `$op` returns the forced routing (null for the default); `'set'` replaces it with `$val`
+     * and returns the previous value; `'binding'` returns the cached `additional_w57` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w57RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w57', self::W57_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 57.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w57Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w57RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
     }
 }
