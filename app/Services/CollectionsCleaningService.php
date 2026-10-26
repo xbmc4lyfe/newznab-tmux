@@ -917,4 +917,371 @@ class CollectionsCleaningService
                 return $enabled;
         }
     }
+
+    // ========================================================================
+    // WAVE 67.1 BATCH HELPER
+    // ========================================================================
+
+    /** Benchmark-gated default; see RustXxxPipeCollectionCleanupCleaningConfigProviderRepoW67ParityTest. */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    public const string W67_COLLECTIONS_CLEANING_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w671_collections_cleaning_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w67CollectionsCleaningPlanBatch(). */
+    public const int W67_COLLECTIONS_CLEANING_TRAILER = 34;
+
+    public static function usesW67RustFfi(): bool
+    {
+        $override = self::w67RustFfiState();
+
+        return \is_bool($override) ? $override : self::W67_RUST_FFI_DEFAULT;
+    }
+
+    /** Forces the CollectionsCleaningService Wave 67 Rust path on until reset. */
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', true);
+    }
+
+    /** Forces the CollectionsCleaningService Wave 67 PHP path until reset. */
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', false);
+    }
+
+    /** Restores the benchmark default and drops the cached library handle and scratch buffers; earlier toggles are untouched. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('reset');
+    }
+
+    /**
+     * Runs $callback with the CollectionsCleaningService Wave 67 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 67.1 collection subject plans, one per `subject|group` row (the group trimmed and lowercased). The subject loses a
+     * trailing yEnc tag with up to three `-`, `_` or whitespace bytes before it, and a trailing `(part/total)` counter of
+     * 1-10 digit numbers with the spaces, tabs, `-` and `_` before it; the rest is lowercased, whitespace runs collapse to one
+     * space and it is trimmed. Flags: 1 yEnc, 2 counter, 4 `.par2`, 8 `.vol` with `+`, 16 quoted file name, 32 `.partN`
+     * file, 64 music group (sounds/mp3/music), 128 `N kB/MB/GB` size, 256 non-ASCII, 512 control byte. The quoted name's
+     * extension code: 0 none, 1-13 rar, par2, nfo, sfv, nzb, mkv, mp4, avi, 7z, zip, jpg, mp3, flac, 14 other. Decision:
+     * 0 empty subject, 1 nothing left after cleaning, 2 music, 3 generic with a quoted name, 4 generic. Collection keys are
+     * `music:`/`generic:` + cleaned subject + NUL + group. Per item `decision | flags << 3 | ext << 13 | min(part, 4095) << 17
+     * | min(total, 4095) << 29 | (fnv1a32(key) & 0xFFFFF) << 41` (no hash below decision 2); then 5 decision, 10 flag and
+     * 15 extension counts, the part sum, the largest total and the distinct keys and groups.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67CollectionsCleaningPlanBatch(array $items): array
+    {
+        return self::usesW67RustFfi() ? self::w67CollectionsCleaningPlanBatchNative($items) : self::w67CollectionsCleaningPlanBatchPhp($items);
+    }
+
+    /**
+     * Rust plan; falls back to the PHP reference when the library is missing or the call declines.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67CollectionsCleaningPlanBatchNative(array $items): array
+    {
+        return self::w67Invoke($items, \count($items) + self::W67_COLLECTIONS_CLEANING_TRAILER) ?? self::w67CollectionsCleaningPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67CollectionsCleaningPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W67_COLLECTIONS_CLEANING_TRAILER, 0);
+        $keys = [];
+        $groups = [];
+        foreach ($items as $item) {
+            $item = (string) $item;
+            [$subject, $rawGroup] = explode('|', $item, 2) + ['', ''];
+            $group = strtolower(trim($rawGroup));
+            [$stripped, $part, $total, $flags] = self::w67StripSubject($subject);
+            $lower = strtolower($subject);
+            $flags |= (str_contains($lower, '.par2') ? 4 : 0) | (str_contains($lower, '.vol') && str_contains($lower, '+') ? 8 : 0);
+            $ext = 0;
+            $open = strpos($subject, '"');
+            $close = $open === false ? false : strpos($subject, '"', $open + 1);
+            if ($open !== false && $close !== false) {
+                $flags |= 16;
+                $file = substr($lower, $open + 1, $close - $open - 1);
+                $dot = strrpos($file, '.');
+                $ext = $dot === false ? 14 : (self::W67_EXTENSIONS[substr($file, $dot + 1)] ?? 14);
+                $flags |= preg_match('/\.part[0-9]/', $file) === 1 ? 32 : 0;
+            }
+            $music = self::w67ContainsAny($group, self::W67_MUSIC_GROUPS);
+            $flags |= ($music ? 64 : 0) | (preg_match('/[0-9] [kmgKMG][bB]/', $subject) === 1 ? 128 : 0) | (preg_match('/[\x80-\xff]/', $item) === 1 ? 256 : 0)
+                | (strcspn($item, self::W67_CONTROL_BYTES) !== \strlen($item) ? 512 : 0);
+            $cleaned = trim((string) preg_replace('/[ \t\n\r\x0B\x0C]+/', ' ', strtolower($stripped)), ' ');
+            $decision = match (true) {
+                trim($subject) === '' => 0,
+                $cleaned === '' => 1,
+                $music => 2,
+                ($flags & 16) !== 0 => 3,
+                default => 4,
+            };
+            $hash = 0;
+            if ($decision >= 2) {
+                $key = ($music ? 'music:' : 'generic:').$cleaned."\0".$group;
+                $hash = (int) hexdec(hash('fnv1a32', $key)) & 0xFFFFF;
+                $keys[$key] = true;
+            }
+            if ($group !== '') {
+                $groups[$group] = true;
+            }
+            $tail[$decision]++;
+            for ($b = 0; $b < 10; $b++) {
+                $tail[5 + $b] += $flags >> $b & 1;
+            }
+            $tail[15 + $ext]++;
+            $tail[30] += min($part, self::W67_SUM_CAP);
+            $tail[31] = max($tail[31], $total);
+            $out[] = $decision | $flags << 3 | $ext << 13 | min($part, 4095) << 17 | min($total, 4095) << 29 | $hash << 41;
+        }
+        $tail[32] = \count($keys);
+        $tail[33] = \count($groups);
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    private const string W67_CONTROL_BYTES = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F";
+
+    private const string W67_DIGITS = '0123456789';
+
+    private const int W67_SUM_CAP = 1 << 40;
+
+    /** @var list<string> */
+    private const array W67_MUSIC_GROUPS = ['sounds', 'mp3', 'music'];
+
+    /** Quoted file extension => code; any other quoted name is 14. */
+    private const array W67_EXTENSIONS = ['rar' => 1, 'par2' => 2, 'nfo' => 3, 'sfv' => 4, 'nzb' => 5, 'mkv' => 6, 'mp4' => 7, 'avi' => 8, '7z' => 9,
+        'zip' => 10, 'jpg' => 11, 'mp3' => 12, 'flac' => 13];
+
+    /** $s without a trailing yEnc tag and up to three separators before it, or null without one. */
+    private static function w67StripYenc(string $s): ?string
+    {
+        $t = rtrim($s);
+        if (\strlen($t) < 4 || strcasecmp(substr($t, -4), 'yenc') !== 0) {
+            return null;
+        }
+        $s = substr($t, 0, -4);
+        for ($k = 0; $k < 3 && $s !== '' && str_contains("-_ \t\n\r\x0B\x0C", $s[-1]); $k++) {
+            $s = substr($s, 0, -1);
+        }
+
+        return $s;
+    }
+
+    /**
+     * `[subject before, part, total]` of a trailing `(part/total)` counter of 1-10 digit numbers, or null.
+     *
+     * @return array{0: string, 1: int, 2: int}|null
+     */
+    private static function w67StripCounter(string $s): ?array
+    {
+        $t = rtrim($s, " \t");
+        if ($t === '' || $t[-1] !== ')') {
+            return null;
+        }
+        $open = strrpos(substr($t, 0, -1), '(');
+        if ($open === false) {
+            return null;
+        }
+        $inner = substr($t, $open + 1, -1);
+        $slash = strpos($inner, '/');
+        if ($slash === false) {
+            return null;
+        }
+        $a = substr($inner, 0, $slash);
+        $b = substr($inner, $slash + 1);
+        $la = \strlen($a);
+        $lb = \strlen($b);
+        if ($la < 1 || $la > 10 || $lb < 1 || $lb > 10 || strspn($a, self::W67_DIGITS) !== $la || strspn($b, self::W67_DIGITS) !== $lb) {
+            return null;
+        }
+
+        return [rtrim(substr($t, 0, $open), " \t-_"), (int) $a, (int) $b];
+    }
+
+    /**
+     * `[subject without the yEnc tag and part counter, part, total, flags]`: the yEnc tag (flag 1) is stripped before and,
+     * when it was not, after the counter (flag 2).
+     *
+     * @return array{0: string, 1: int, 2: int, 3: int}
+     */
+    private static function w67StripSubject(string $subject): array
+    {
+        $flags = 0;
+        $part = $total = 0;
+        $rest = self::w67StripYenc($subject);
+        if ($rest !== null) {
+            $subject = $rest;
+            $flags |= 1;
+        }
+        $counter = self::w67StripCounter($subject);
+        if ($counter !== null) {
+            [$subject, $part, $total] = $counter;
+            $flags |= 2;
+        }
+        if (($flags & 1) === 0) {
+            $rest = self::w67StripYenc($subject);
+            if ($rest !== null) {
+                $subject = $rest;
+                $flags |= 1;
+            }
+        }
+
+        return [$subject, $part, $total, $flags];
+    }
+
+    /**
+     * Whether $haystack holds any of $needles.
+     *
+     * @param  list<string>  $needles
+     */
+    private static function w67ContainsAny(string $haystack, array $needles): bool
+    {
+        foreach ($needles as $needle) {
+            if (str_contains($haystack, $needle)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Wave 67 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'reset' clears the override, library handle and buffers, 'ffi'
+     * resolves the library (null when unavailable) and 'out' and 'lens' return `int64_t` output and
+     * length-column buffers of at least $val words.
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var FFI\CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var FFI\CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('collections_cleaning_w671', self::W67_COLLECTIONS_CLEANING_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w67RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w67RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 67.1 CollectionsCleaningService export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w67Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w67RustFfiState('ffi');
+            $out = self::w67RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof FFI\CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w67RustFfiState('lens', $count);
+                if (! $column instanceof FFI\CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W67_COLLECTIONS_CLEANING_FFI_CDEF.)
+            $written = $ffi->nntmux_w671_collections_cleaning_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
