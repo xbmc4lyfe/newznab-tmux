@@ -47371,3 +47371,1537 @@ pub mod categorizers_abstract_book_console_group_name_release_context_w603 {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 61.3: PredbFeedEntry, PredbFeedImporter, PredbFeedSourceFactory,
+// IrcNetworks and PreAnnounceParser batch rows
+// ---------------------------------------------------------------------------
+
+/// Batch helpers for PreDB feed entry validation, feed import upsert plans, feed source policy
+/// resolution, IRC network routing and IRC pre-announce parsing. Each export reads items as
+/// zero-copy slices of one blob (NUL-joined, or tiled by a length column) and writes one int64 word
+/// per item plus a trailer, so a batch costs one FFI crossing. The PHP `w61*BatchPhp()` methods
+/// are the reference implementation.
+pub mod predb_feed_entry_importer_source_factory_irc_networks_parser_w613 {
+    use super::release_image_browse_duplicate_group_management_w553::run_items;
+    use std::borrow::Cow;
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hash, Hasher};
+
+    /// Byte-wise FNV-1a hasher for the per-call distinct-key sets; keys never outlive one call.
+    #[derive(Default)]
+    struct KeyHasher(u64);
+
+    impl Hasher for KeyHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            let mut hash = self.0 ^ 0xCBF2_9CE4_8422_2325;
+            for &b in bytes {
+                hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            self.0 = hash;
+        }
+
+        fn write_u8(&mut self, value: u8) {
+            self.0 = (self.0 ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+
+        fn write_u64(&mut self, value: u64) {
+            self.0 = (self.0 ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.0 = (self.0 ^ value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0 ^ (self.0 >> 31)
+        }
+    }
+
+    type KeySet<T> = HashSet<T, BuildHasherDefault<KeyHasher>>;
+
+    /// A key compared and hashed as PHP `strtolower()` would leave it.
+    #[derive(Clone, Copy)]
+    struct Caseless<'a>(&'a [u8]);
+
+    impl Hash for Caseless<'_> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            for &b in self.0 {
+                state.write_u8(b.to_ascii_lowercase());
+            }
+            state.write_usize(self.0.len());
+        }
+    }
+
+    impl PartialEq for Caseless<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.eq_ignore_ascii_case(other.0)
+        }
+    }
+
+    impl Eq for Caseless<'_> {}
+
+    /// A [`Caseless`] key that owns its bytes when they came from a stripped copy of the item.
+    struct CaselessCow<'a>(Cow<'a, [u8]>);
+
+    impl Hash for CaselessCow<'_> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            Caseless(&self.0).hash(state);
+        }
+    }
+
+    impl PartialEq for CaselessCow<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.eq_ignore_ascii_case(&other.0)
+        }
+    }
+
+    impl Eq for CaselessCow<'_> {}
+
+    /// The `strtolower(strtr($title, ' _', '..'))` form of one byte.
+    fn dotted(b: u8) -> u8 {
+        if b == b' ' || b == b'_' {
+            b'.'
+        } else {
+            b.to_ascii_lowercase()
+        }
+    }
+
+    /// A title key compared and hashed as `strtolower(strtr($title, ' _', '..'))`.
+    #[derive(Clone, Copy)]
+    struct DotKey<'a>(&'a [u8]);
+
+    impl Hash for DotKey<'_> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            for &b in self.0 {
+                state.write_u8(dotted(b));
+            }
+            state.write_usize(self.0.len());
+        }
+    }
+
+    impl PartialEq for DotKey<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.len() == other.0.len()
+                && self
+                    .0
+                    .iter()
+                    .zip(other.0)
+                    .all(|(&a, &b)| dotted(a) == dotted(b))
+        }
+    }
+
+    impl Eq for DotKey<'_> {}
+
+    /// PHP `trim()` with its default characters.
+    fn ptrim(s: &[u8]) -> &[u8] {
+        let keep = |b: &u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let Some(start) = s.iter().position(keep) else {
+            return &[];
+        };
+        let end = s.iter().rposition(keep).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// PHP `trim($s, " \t")`.
+    fn trim_blank(s: &[u8]) -> &[u8] {
+        let keep = |b: &u8| *b != b' ' && *b != b'\t';
+        let Some(start) = s.iter().position(keep) else {
+            return &[];
+        };
+        let end = s.iter().rposition(keep).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// PHP `explode('|', $item, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(item: &[u8]) -> [&[u8]; N] {
+        let mut out: [&[u8]; N] = [&[]; N];
+        let mut rest = item;
+        for (i, slot) in out.iter_mut().enumerate() {
+            if i + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'|') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// 1 to `max` ASCII digits as their value, else `None`.
+    fn digits(s: &[u8], max: usize) -> Option<i64> {
+        if s.is_empty() || s.len() > max || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            s.iter()
+                .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0')),
+        )
+    }
+
+    /// A byte in `W61_CONTROL_CHARS` (C0 controls and DEL).
+    fn control(b: u8) -> bool {
+        b < 0x20 || b == 0x7f
+    }
+
+    /// `PredbFeedEntry::W61_SCENE_CHARS`.
+    fn scene_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'_' | b'.' | b'(' | b')' | b'&' | b'\'' | b'+' | b',' | b'-'
+            )
+    }
+
+    /// `w61IsReleaseName()`: up to 255 scene bytes ending in `-` and a run of word bytes, with at
+    /// least one byte before that last `-`.
+    fn release_name(t: &[u8]) -> bool {
+        let n = t.len();
+        if n > 255 || !t.iter().all(|&b| scene_byte(b)) {
+            return false;
+        }
+        match t.iter().rposition(|&b| b == b'-') {
+            Some(d) => {
+                d >= 1
+                    && d + 1 < n
+                    && t[d + 1..]
+                        .iter()
+                        .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+            }
+            None => false,
+        }
+    }
+
+    /// `w61Flag()`: 0 empty, 1 a boolean token (then its value) and 2 malformed.
+    fn flag(raw: &[u8]) -> (i64, i64) {
+        let v = ptrim(raw);
+        if v.is_empty() {
+            return (0, 0);
+        }
+        for t in [b"1" as &[u8], b"true", b"yes", b"on"] {
+            if v.eq_ignore_ascii_case(t) {
+                return (1, 1);
+            }
+        }
+        for t in [b"0" as &[u8], b"false", b"no", b"off"] {
+            if v.eq_ignore_ascii_case(t) {
+                return (1, 0);
+            }
+        }
+        (2, 0)
+    }
+
+    /// `PredbFeedEntry::W48_CATEGORY_PREFIXES` class of a trimmed category.
+    fn category_class(cat: &[u8]) -> usize {
+        if cat.is_empty() {
+            return 0;
+        }
+        let end = cat
+            .iter()
+            .position(|b| matches!(b, b'-' | b'/' | b' ' | b'.' | b'_' | b':'))
+            .unwrap_or(cat.len());
+        let prefix = &cat[..end];
+        if prefix.len() > 6 {
+            return 8;
+        }
+        let mut buf = [0u8; 6];
+        for (d, s) in buf.iter_mut().zip(prefix) {
+            *d = s.to_ascii_uppercase();
+        }
+        match &buf[..prefix.len()] {
+            b"TV" => 1,
+            b"MOVIE" | b"MOVIES" | b"X264" | b"X265" | b"BLURAY" | b"DVDR" | b"XVID" | b"UHD"
+            | b"BD" => 2,
+            b"MP3" | b"FLAC" | b"MUSIC" | b"MVID" | b"AUDIO" => 3,
+            b"GAMES" | b"GAME" | b"PS4" | b"PS5" | b"NSW" | b"XBOX" | b"PC" | b"WII" => 4,
+            b"APPS" | b"APP" | b"0DAY" | b"ISO" => 5,
+            b"XXX" => 6,
+            b"EBOOK" | b"EBOOKS" | b"BOOK" | b"BOOKS" | b"ABOOK" => 7,
+            _ => 8,
+        }
+    }
+
+    /// `/^([0-9]{1,6})(?:\.([0-9]{1,2}))?([KMG])B$/iD` as whole KB.
+    fn size_kb(s: &[u8]) -> Option<i64> {
+        let n = s.len();
+        if n < 3 || !s[n - 1].eq_ignore_ascii_case(&b'b') {
+            return None;
+        }
+        let unit = match s[n - 2].to_ascii_uppercase() {
+            b'K' => 1,
+            b'M' => 1024,
+            b'G' => 1_048_576,
+            _ => return None,
+        };
+        let num = &s[..n - 2];
+        let (int, frac) = match num.iter().position(|&b| b == b'.') {
+            Some(p) => (&num[..p], Some(&num[p + 1..])),
+            None => (num, None),
+        };
+        let mut hundredths = digits(int, 6)? * 100;
+        if let Some(frac) = frac {
+            let f = digits(frac, 2)?;
+            hundredths += if frac.len() == 1 { f * 10 } else { f };
+        }
+        Some(hundredths * unit / 100)
+    }
+
+    /// `PredbFeedEntry::w61TitleShape()` of a valid title.
+    fn title_shape(t: &[u8]) -> i64 {
+        if release_name(t) {
+            1
+        } else if t[0] == b'[' || t[0] == b'(' {
+            4
+        } else if t.contains(&b' ') {
+            2
+        } else if t.contains(&b'_') {
+            3
+        } else {
+            0
+        }
+    }
+
+    /// `PredbFeedEntry::w61FeedEntryBatchPhp()`.
+    fn feed_entry(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 44);
+        let mut title_states = [0i64; 4];
+        let mut shapes = [0i64; 5];
+        let mut source_states = [0i64; 3];
+        let mut classes = [0i64; 9];
+        let mut size_states = [0i64; 3];
+        let mut files_states = [0i64; 4];
+        let mut nukes = [0i64; 5];
+        let mut time_states = [0i64; 4];
+        let (mut duplicates, mut kb_sum, mut max_kb, mut files_sum) = (0i64, 0i64, 0i64, 0i64);
+        let (mut min_time, mut max_time) = (0i64, 0i64);
+        let mut titles: KeySet<DotKey> = KeySet::default();
+        let mut sources: KeySet<Caseless> = KeySet::default();
+        for &item in items {
+            let [title, source, category, size, files, nuked, predate] = fields::<7>(item);
+            let title = ptrim(title);
+            let length = title.len();
+            let title_state = if length == 0 {
+                0
+            } else if length > 255 {
+                1
+            } else if title.iter().any(|&b| control(b)) {
+                2
+            } else {
+                3
+            };
+            let (mut shape, mut duplicate) = (0, 0);
+            if title_state == 3 {
+                shape = title_shape(title);
+                if !titles.insert(DotKey(title)) {
+                    duplicate = 1;
+                }
+            }
+            let source = ptrim(source);
+            let source_state = if source.is_empty() {
+                0
+            } else if source.len() <= 64
+                && source
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            {
+                1
+            } else {
+                2
+            };
+            if !source.is_empty() {
+                sources.insert(Caseless(source));
+            }
+            let class = category_class(ptrim(category));
+            let size = ptrim(size);
+            let (size_state, kb) = if size.is_empty() {
+                (0, 0)
+            } else {
+                match size_kb(size) {
+                    Some(kb) => (1, kb),
+                    None => (2, 0),
+                }
+            };
+            let files = ptrim(files);
+            let (files_state, count) = if files.is_empty() {
+                (0, 0)
+            } else {
+                match digits(files, 9) {
+                    Some(0) => (2, 0),
+                    Some(c) => (1, c),
+                    None => (3, 0),
+                }
+            };
+            let nuked = ptrim(nuked);
+            let nuke = if nuked.is_empty() {
+                0
+            } else {
+                match digits(nuked, 2) {
+                    Some(0) => 0,
+                    Some(2 | 4 | 5) => 1,
+                    Some(1 | 3) => 2,
+                    Some(_) => 3,
+                    None => 4,
+                }
+            };
+            let predate = ptrim(predate);
+            let time_state = if predate.is_empty() {
+                0
+            } else {
+                match digits(predate, 12) {
+                    Some(t) if (946_684_800..4_102_444_800).contains(&t) => {
+                        min_time = if min_time == 0 { t } else { min_time.min(t) };
+                        max_time = max_time.max(t);
+                        1
+                    }
+                    Some(_) => 2,
+                    None => 3,
+                }
+            };
+            title_states[title_state as usize] += 1;
+            shapes[shape as usize] += 1;
+            source_states[source_state as usize] += 1;
+            classes[class] += 1;
+            size_states[size_state as usize] += 1;
+            files_states[files_state as usize] += 1;
+            nukes[nuke as usize] += 1;
+            time_states[time_state as usize] += 1;
+            duplicates += duplicate;
+            kb_sum += kb;
+            max_kb = max_kb.max(kb);
+            files_sum += count;
+            out.push(
+                title_state
+                    | shape << 2
+                    | source_state << 5
+                    | (class as i64) << 7
+                    | size_state << 11
+                    | files_state << 13
+                    | nuke << 15
+                    | time_state << 18
+                    | duplicate << 20
+                    | (length.min(1023) as i64) << 21
+                    | count.min(0xF_FFFF) << 31,
+            );
+        }
+        out.extend(title_states);
+        out.extend(shapes);
+        out.extend(source_states);
+        out.extend(classes);
+        out.extend(size_states);
+        out.extend(files_states);
+        out.extend(nukes);
+        out.extend(time_states);
+        out.extend([
+            duplicates,
+            sources.len() as i64,
+            kb_sum,
+            max_kb,
+            files_sum,
+            min_time,
+            max_time,
+        ]);
+        out
+    }
+
+    /// `w61Small()`: 0 empty, 1 up to `max` digits (then the value) and 2 malformed.
+    fn small(raw: &[u8], max: usize) -> (i64, i64) {
+        let v = ptrim(raw);
+        if v.is_empty() {
+            return (0, 0);
+        }
+        match digits(v, max) {
+            Some(n) => (1, n),
+            None => (2, 0),
+        }
+    }
+
+    /// `PredbFeedImporter::w61ImportPlanBatchPhp()`.
+    fn import_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 22);
+        let mut decisions = [0i64; 6];
+        let mut reasons = [0i64; 4];
+        let mut existing_states = [0i64; 3];
+        let mut fills = [0i64; 3];
+        let (mut nuke_changes, mut padded, mut malformed, mut accepted_bytes, mut inserts) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let mut seen: KeySet<Caseless> = KeySet::default();
+        for &item in items {
+            let [raw_title, existing, nuked, prior, details, known] = fields::<6>(item);
+            let title = ptrim(raw_title);
+            let length = title.len();
+            let reason = if length == 0 {
+                1
+            } else if length > 255 {
+                2
+            } else if title.iter().any(|&b| control(b)) {
+                3
+            } else {
+                0
+            };
+            let pad = i64::from(length > 0 && length != raw_title.len());
+            let (existing_state, existing) = flag(existing);
+            let (nuked_state, nuked) = small(nuked, 2);
+            let (prior_state, prior) = small(prior, 2);
+            let (detail_state, details) = small(details, 1);
+            let (known_state, known) = small(known, 1);
+            let bad = i64::from(
+                existing_state == 2
+                    || nuked_state == 2
+                    || prior_state == 2
+                    || detail_state == 2
+                    || known_state == 2,
+            );
+            let (mut nuke_change, mut fill, mut chunk) = (0i64, 0i64, 0i64);
+            let decision = if reason != 0 {
+                0
+            } else if !seen.insert(Caseless(title)) {
+                1
+            } else if existing == 0 {
+                chunk = inserts / 100;
+                inserts += 1;
+                2
+            } else {
+                nuke_change = i64::from(nuked != 0 && nuked != prior);
+                fill = details & !known & 7;
+                if nuke_change == 1 {
+                    3
+                } else if fill != 0 {
+                    4
+                } else {
+                    5
+                }
+            };
+            decisions[decision] += 1;
+            reasons[reason] += 1;
+            existing_states[existing_state as usize] += 1;
+            nuke_changes += nuke_change;
+            for (bit, slot) in fills.iter_mut().enumerate() {
+                *slot += fill >> bit & 1;
+            }
+            padded += pad;
+            malformed += bad;
+            if (2..=4).contains(&decision) {
+                accepted_bytes += length as i64;
+            }
+            out.push(
+                decision as i64
+                    | (reason as i64) << 3
+                    | existing_state << 5
+                    | nuke_change << 7
+                    | fill << 8
+                    | pad << 11
+                    | bad << 12
+                    | (length.min(255) as i64) << 13
+                    | chunk << 21,
+            );
+        }
+        out.extend(decisions);
+        out.extend(reasons);
+        out.extend(existing_states);
+        out.push(nuke_changes);
+        out.extend(fills);
+        out.extend([
+            padded,
+            malformed,
+            accepted_bytes,
+            (inserts + 99) / 100,
+            seen.len() as i64,
+        ]);
+        out
+    }
+
+    /// `PredbFeedSourceFactory::W48_SOURCES`: index, kind, option flags and rate tier.
+    fn source(key: &[u8]) -> Option<[i64; 4]> {
+        Some(match key {
+            b"predb_club" => [0, 0, 0, 2],
+            b"predb_net" => [1, 0, 0, 2],
+            b"predb_me" => [2, 1, 16, 1],
+            b"predb_org" => [3, 0, 0, 2],
+            b"predatabase" => [4, 0, 32, 3],
+            b"srrdb" => [5, 0, 32, 3],
+            b"xrel" => [6, 0, 0, 3],
+            b"xrel_p2p" => [7, 0, 64, 3],
+            b"scnsrc_me" => [8, 1, 21, 1],
+            b"eztv" => [9, 1, 20, 1],
+            b"predb_ovh" => [10, 0, 0, 2],
+            b"apibay" => [11, 0, 0, 2],
+            b"nfodb" => [12, 1, 19, 1],
+            b"one_techno" => [13, 1, 19, 1],
+            b"one_gabba" => [14, 1, 19, 1],
+            b"ddlvalley" => [15, 1, 18, 1],
+            b"hdencode" => [16, 1, 26, 1],
+            b"hdencode_tv" => [17, 1, 26, 1],
+            b"mp3scene" => [18, 1, 18, 1],
+            b"nima4k" => [19, 0, 0, 2],
+            b"gload" => [20, 1, 18, 1],
+            b"hdworld" => [21, 1, 18, 1],
+            b"g4u" => [22, 0, 0, 2],
+            b"nswdb" => [23, 0, 0, 2],
+            b"3dsdb" => [24, 0, 0, 2],
+            b"gabber" => [25, 0, 0, 2],
+            b"movieblog" => [26, 1, 18, 1],
+            b"scnlog" => [27, 1, 19, 1],
+            b"knaben" => [28, 0, 0, 2],
+            b"crowdnfo" => [29, 0, 0, 2],
+            b"seriousaboutsound" => [30, 0, 0, 2],
+            b"dats_pciso_1998" => [31, 0, 0, 2],
+            b"nzedb_archive" => [32, 0, 0, 2],
+            b"scene_archive_sql" => [33, 2, 32, 0],
+            _ => return None,
+        })
+    }
+
+    /// `PredbFeedSourceFactory::W61_SOURCE_ALIASES`.
+    fn alias(key: &[u8]) -> Option<&'static [u8]> {
+        Some(match key {
+            b"predb" | b"predb.club" => b"predb_club",
+            b"predb.net" => b"predb_net",
+            b"predb.me" => b"predb_me",
+            b"predb.org" => b"predb_org",
+            b"predb.ovh" => b"predb_ovh",
+            b"srrdb.com" => b"srrdb",
+            b"xrel.to" => b"xrel",
+            b"xrel.to_p2p" => b"xrel_p2p",
+            b"eztv.re" => b"eztv",
+            b"apibay.org" => b"apibay",
+            b"knaben.eu" => b"knaben",
+            b"crowdnfo.net" => b"crowdnfo",
+            b"nima4k.org" => b"nima4k",
+            b"1techno" => b"one_techno",
+            b"1gabba" => b"one_gabba",
+            b"threedsdb" => b"3dsdb",
+            b"scnsrc" => b"scnsrc_me",
+            b"hd_encode" => b"hdencode",
+            _ => return None,
+        })
+    }
+
+    /// `w61Bounded()`: 0 empty (default), 1 in range, 2 clamped and 3 malformed (default).
+    fn bounded(raw: &[u8], default: i64, min: i64, max: i64) -> (i64, i64) {
+        let v = ptrim(raw);
+        if v.is_empty() {
+            return (0, default);
+        }
+        match digits(v, 9) {
+            Some(n) if (min..=max).contains(&n) => (1, n),
+            Some(n) => (2, n.clamp(min, max)),
+            None => (3, default),
+        }
+    }
+
+    /// `PredbFeedSourceFactory::w61SourcePlanBatchPhp()`.
+    fn source_plan(items: &[&[u8]]) -> Vec<i64> {
+        const INTERVAL_MS: [i64; 4] = [0, 2000, 1000, 3000];
+        let mut out = Vec::with_capacity(items.len() + 31);
+        let mut statuses = [0i64; 6];
+        let mut kinds = [0i64; 3];
+        let mut tiers = [0i64; 4];
+        let mut page_states = [0i64; 4];
+        let mut timeout_states = [0i64; 4];
+        let mut body_states = [0i64; 4];
+        let (mut duplicates, mut mask, mut page_sum, mut max_timeout, mut body_sum, mut intervals) =
+            (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
+        for &item in items {
+            let [raw_key, raw_page, raw_timeout, raw_body] = fields::<4>(item);
+            let key = ptrim(raw_key);
+            let length = key.len();
+            let (status, entry) = if length == 0 {
+                (0, None)
+            } else if let Some(entry) = source(key) {
+                (1, Some(entry))
+            } else if length > 32 {
+                (5, None)
+            } else {
+                let mut buf = [0u8; 32];
+                for (d, &s) in buf.iter_mut().zip(key) {
+                    *d = match s {
+                        b'-' | b' ' => b'_',
+                        _ => s.to_ascii_lowercase(),
+                    };
+                }
+                let normal = &buf[..length];
+                if let Some(entry) = source(normal) {
+                    (2, Some(entry))
+                } else if let Some(canonical) = alias(normal) {
+                    (3, source(canonical))
+                } else {
+                    (4, None)
+                }
+            };
+            let (page_state, mut page) = bounded(raw_page, 100, 1, 1000);
+            let (timeout_state, timeout) = bounded(raw_timeout, 15, 1, 120);
+            let (body_state, body) = bounded(raw_body, 1_048_576, 1024, 67_108_864);
+            let (mut index, mut kind, mut flags, mut tier, mut duplicate) = (-1i64, 0, 0, 0, 0);
+            if let Some([i, k, f, t]) = entry {
+                (index, kind, flags, tier) = (i, k, f, t);
+                if kind == 1 {
+                    page = page.min(50);
+                }
+                if mask >> index & 1 == 1 {
+                    duplicate = 1;
+                } else {
+                    mask |= 1 << index;
+                    intervals += INTERVAL_MS[tier as usize];
+                }
+                kinds[kind as usize] += 1;
+                tiers[tier as usize] += 1;
+                page_sum += page;
+                max_timeout = max_timeout.max(timeout);
+                body_sum += body;
+            }
+            statuses[status] += 1;
+            page_states[page_state as usize] += 1;
+            timeout_states[timeout_state as usize] += 1;
+            body_states[body_state as usize] += 1;
+            duplicates += duplicate;
+            out.push(
+                status as i64
+                    | (index + 1) << 3
+                    | kind << 9
+                    | flags << 11
+                    | tier << 18
+                    | page_state << 20
+                    | timeout_state << 22
+                    | body_state << 24
+                    | page << 26
+                    | timeout << 36
+                    | duplicate << 43
+                    | (length.min(63) as i64) << 44,
+            );
+        }
+        out.extend(statuses);
+        out.extend(kinds);
+        out.extend(tiers);
+        out.extend(page_states);
+        out.extend(timeout_states);
+        out.extend(body_states);
+        out.extend([duplicates, mask, page_sum, max_timeout, body_sum, intervals]);
+        out
+    }
+
+    /// `IrcNetworks::w61HostKind()`: 0 empty, 1 hostname, 2 IPv4 and 3 invalid.
+    fn host_kind(host: &[u8]) -> i64 {
+        if host.is_empty() {
+            return 0;
+        }
+        if host.iter().all(|&b| b.is_ascii_digit() || b == b'.') {
+            let mut parts = 0;
+            for part in host.split(|&b| b == b'.') {
+                parts += 1;
+                let ok = match digits(part, 3) {
+                    Some(v) => v <= 255 && (part.len() == 1 || part[0] != b'0'),
+                    None => false,
+                };
+                if !ok || parts > 4 {
+                    return 3;
+                }
+            }
+            return if parts == 4 { 2 } else { 3 };
+        }
+        if host.len() > 253 {
+            return 3;
+        }
+        for label in host.split(|&b| b == b'.') {
+            if label.is_empty()
+                || label.len() > 63
+                || label[0] == b'-'
+                || label[label.len() - 1] == b'-'
+                || !label
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return 3;
+            }
+        }
+        1
+    }
+
+    /// `IrcNetworks::W61_FORMATS` position plus one, 0 empty and 8 unknown.
+    fn network_format(raw: &[u8]) -> i64 {
+        const FORMATS: [&[u8]; 7] = [
+            b"corruptnet",
+            b"zenet",
+            b"predatabase",
+            b"ngp",
+            b"rizon",
+            b"opentrackers",
+            b"nntmux",
+        ];
+        let f = ptrim(raw);
+        if f.is_empty() {
+            return 0;
+        }
+        FORMATS
+            .iter()
+            .position(|name| f.eq_ignore_ascii_case(name))
+            .map_or(8, |i| i as i64 + 1)
+    }
+
+    /// `IrcNetworks::w61NetworkPlanBatchPhp()`.
+    fn network_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 34);
+        let mut name_states = [0i64; 3];
+        let mut host_kinds = [0i64; 4];
+        let mut port_states = [0i64; 3];
+        let mut tls_states = [0i64; 3];
+        let mut formats = [0i64; 9];
+        let mut routes = [0i64; 6];
+        let (mut tls_on, mut valid_sum, mut invalid_sum, mut duplicates, mut legacy_sum) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let mut names: KeySet<Caseless> = KeySet::default();
+        let mut hosts: KeySet<Caseless> = KeySet::default();
+        for &item in items {
+            let [
+                raw_name,
+                raw_host,
+                raw_port,
+                raw_tls,
+                raw_channels,
+                raw_format,
+            ] = fields::<6>(item);
+            let name = ptrim(raw_name);
+            let name_state = if name.is_empty() {
+                0
+            } else if name.len() <= 32
+                && name
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            {
+                1
+            } else {
+                2
+            };
+            let legacy = i64::from(name.eq_ignore_ascii_case(b"synirc"));
+            let mut duplicate = 0;
+            if name_state == 1 && !names.insert(Caseless(name)) {
+                duplicate = 1;
+            }
+            let host = ptrim(raw_host);
+            let kind = host_kind(host);
+            let (tls_state, mut tls) = flag(raw_tls);
+            let mut port_text = ptrim(raw_port);
+            let plus = port_text.first() == Some(&b'+');
+            if plus {
+                tls = 1;
+                port_text = &port_text[1..];
+            }
+            let (port_state, port) = if port_text.is_empty() && !plus {
+                (0, if tls == 1 { 6697 } else { 6667 })
+            } else {
+                match digits(port_text, 5) {
+                    Some(p) if (1..=65535).contains(&p) => (1, p),
+                    _ => (2, 0),
+                }
+            };
+            let (mut valid, mut invalid) = (0i64, 0i64);
+            let channels = ptrim(raw_channels);
+            if !channels.is_empty() {
+                for channel in channels.split(|&b| b == b',') {
+                    let channel = ptrim(channel);
+                    let n = channel.len();
+                    if n == 0 {
+                        continue;
+                    }
+                    if (channel[0] == b'#' || channel[0] == b'&')
+                        && (2..=50).contains(&n)
+                        && !channel
+                            .iter()
+                            .any(|&b| matches!(b, b' ' | 0x07 | b'\r' | b'\n' | b'\t'))
+                    {
+                        valid += 1;
+                    } else {
+                        invalid += 1;
+                    }
+                }
+            }
+            let format = network_format(raw_format);
+            let route = if name_state != 1 || (kind != 1 && kind != 2) || port_state == 2 {
+                0
+            } else if valid == 0 {
+                1
+            } else if legacy == 1 || format == 7 {
+                2
+            } else if format == 6 {
+                3
+            } else if (1..=5).contains(&format) {
+                4
+            } else {
+                5
+            };
+            if kind == 1 || kind == 2 {
+                hosts.insert(Caseless(host));
+            }
+            name_states[name_state] += 1;
+            host_kinds[kind as usize] += 1;
+            port_states[port_state as usize] += 1;
+            tls_states[tls_state as usize] += 1;
+            formats[format as usize] += 1;
+            routes[route] += 1;
+            tls_on += tls;
+            valid_sum += valid;
+            invalid_sum += invalid;
+            duplicates += duplicate;
+            legacy_sum += legacy;
+            out.push(
+                name_state as i64
+                    | legacy << 2
+                    | duplicate << 3
+                    | kind << 4
+                    | port_state << 6
+                    | port << 8
+                    | tls_state << 24
+                    | tls << 26
+                    | format << 27
+                    | (route as i64) << 31
+                    | valid.min(255) << 34
+                    | invalid.min(255) << 42
+                    | (host.len().min(255) as i64) << 50,
+            );
+        }
+        out.extend(name_states);
+        out.extend(host_kinds);
+        out.extend(port_states);
+        out.extend(tls_states);
+        out.extend(formats);
+        out.extend(routes);
+        out.extend([
+            tls_on,
+            valid_sum,
+            invalid_sum,
+            duplicates,
+            hosts.len() as i64,
+            legacy_sum,
+        ]);
+        out
+    }
+
+    /// A byte removed on its own by `PreAnnounceParser::W61_CODES`.
+    fn format_code(b: u8) -> bool {
+        matches!(b, 0x02 | 0x03 | 0x0f | 0x11 | 0x16 | 0x1d | 0x1e | 0x1f)
+    }
+
+    /// `preg_replace(W61_CODES, '', $raw)` into `out`: formatting bytes, and a colour byte with
+    /// up to two foreground digits and, after them, a comma and up to two background digits.
+    fn strip_codes(raw: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        let n = raw.len();
+        let run = |from: usize| {
+            raw[from..]
+                .iter()
+                .take(2)
+                .take_while(|b| b.is_ascii_digit())
+                .count()
+        };
+        let mut i = 0;
+        while i < n {
+            let b = raw[i];
+            if b == 0x03 {
+                i += 1;
+                let fg = run(i);
+                i += fg;
+                if fg > 0 && i + 1 < n && raw[i] == b',' && raw[i + 1].is_ascii_digit() {
+                    i += 1;
+                    i += run(i);
+                }
+            } else {
+                if !format_code(b) {
+                    out.push(b);
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// `PreAnnounceParser::W61_TYPES`, 0 for another keyword.
+    fn announce_type(keyword: &[u8]) -> i64 {
+        const TYPES: [&[u8]; 8] = [
+            b"PRE", b"P2P", b"INFO", b"NUKE", b"UNNUKE", b"MODNUKE", b"RENUKE", b"OLDNUKE",
+        ];
+        TYPES
+            .iter()
+            .position(|t| keyword.eq_ignore_ascii_case(t))
+            .map_or(0, |i| i as i64 + 1)
+    }
+
+    /// The first of `needle` in `hay` at or after `from`.
+    fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+        hay.get(from..)?
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|p| p + from)
+    }
+
+    /// Whether lowercase `word` starts at `s` in `x`, ASCII case-insensitively, followed by the
+    /// end or a non-alphanumeric byte.
+    fn suffix(x: &[u8], s: usize, word: &[u8]) -> bool {
+        let end = s + word.len();
+        end <= x.len()
+            && x[s..end].eq_ignore_ascii_case(word)
+            && (end == x.len() || !x[end].is_ascii_alphanumeric())
+    }
+
+    /// `PreAnnounceParser::w61InfoCounts()`: the first file count and the first size in
+    /// hundredths of a MB, -1 when absent.
+    fn info_counts(x: &[u8]) -> (i64, i64) {
+        let m = x.len();
+        let (mut files, mut size) = (-1i64, -1i64);
+        let run = |from: usize| x[from..].iter().take_while(|b| b.is_ascii_digit()).count();
+        let mut i = 0;
+        while i < m {
+            if !x[i].is_ascii_digit()
+                || (i > 0 && (x[i - 1].is_ascii_alphanumeric() || x[i - 1] == b'.'))
+            {
+                i += 1;
+                continue;
+            }
+            let mut j = i + run(i);
+            let int = &x[i..j];
+            let mut frac: &[u8] = &[];
+            if j + 1 < m && x[j] == b'.' && x[j + 1].is_ascii_digit() {
+                let k = j + 1 + run(j + 1);
+                frac = &x[j + 1..k];
+                j = k;
+            }
+            if int.len() <= 9 {
+                let value = digits(int, 9).unwrap_or(0);
+                let s = j + x[j..].iter().take_while(|&&b| b == b' ').count();
+                if files < 0
+                    && frac.is_empty()
+                    && [b"files" as &[u8], b"file", b"f"]
+                        .iter()
+                        .any(|w| suffix(x, s, w))
+                {
+                    files = value;
+                } else if size < 0 && suffix(x, s, b"mb") {
+                    let cents = match frac.len() {
+                        0 => 0,
+                        1 => i64::from(frac[0] - b'0') * 10,
+                        _ => i64::from(frac[0] - b'0') * 10 + i64::from(frac[1] - b'0'),
+                    };
+                    size = value * 100 + cents;
+                }
+            }
+            i = j;
+        }
+        (files, size)
+    }
+
+    /// One parsed announce line (`PreAnnounceParser::w61ParseLine()`).
+    struct Announce<'a> {
+        format: i64,
+        kind: i64,
+        title: &'a [u8],
+        section: usize,
+        files: i64,
+        size: i64,
+        reason: usize,
+        unterminated: i64,
+    }
+
+    /// `PreAnnounceParser::w61ParseLine()` of a stripped, blank-trimmed line.
+    fn parse_line(s: &[u8]) -> Announce<'_> {
+        let mut a = Announce {
+            format: 0,
+            kind: 0,
+            title: &[],
+            section: 0,
+            files: -1,
+            size: -1,
+            reason: 0,
+            unterminated: 0,
+        };
+        let n = s.len();
+        if n == 0 || s.iter().any(|&b| b == b'\r' || b == b'\n') {
+            return a;
+        }
+        if s.starts_with(b".:::") {
+            let body = &s[4..];
+            let mut parts: [&[u8]; 3] = [&[]; 3];
+            let mut at = 0;
+            for slot in parts.iter_mut() {
+                match find(body, b":::", at) {
+                    Some(p) => {
+                        *slot = &body[at..p];
+                        at = p + 3;
+                    }
+                    None => {
+                        *slot = &body[at..];
+                        break;
+                    }
+                }
+            }
+            a.format = 4;
+            a.kind = announce_type(trim_blank(parts[0]));
+            let title = trim_blank(parts[2]);
+            if release_name(title) {
+                a.title = title;
+            }
+            a.section = trim_blank(parts[1]).len();
+            return a;
+        }
+        let alnum = |from: usize| {
+            s[from..]
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric())
+                .count()
+        };
+        let (keyword, offset);
+        if s[0] == b'(' || s[0] == b'[' {
+            let k = alnum(1);
+            let close = if s[0] == b'(' { b')' } else { b']' };
+            if k == 0 || k + 1 >= n || s[k + 1] != close {
+                return a;
+            }
+            a.format = if s[0] == b'(' { 2 } else { 5 };
+            keyword = &s[1..=k];
+            offset = k + 2;
+        } else {
+            let k = alnum(0);
+            if k == 0 || k >= n {
+                return a;
+            }
+            if s[k] == b':' {
+                a.format = 1;
+                offset = k + 1;
+            } else {
+                let j = k + s[k..]
+                    .iter()
+                    .take_while(|&&b| b == b' ' || b == b'\t')
+                    .count();
+                if j >= n || s[j] != b'|' {
+                    return a;
+                }
+                a.format = 3;
+                offset = j + 1;
+            }
+            keyword = &s[..k];
+        }
+        a.kind = announce_type(keyword);
+        let mut segs: [&[u8]; 16] = [&[]; 16];
+        let mut ends = [0usize; 16];
+        let mut count = 0;
+        let mut i = offset;
+        while count < 16 {
+            while i < n && matches!(s[i], b' ' | b'\t' | b'|') {
+                i += 1;
+            }
+            if i >= n {
+                break;
+            }
+            let c = s[i];
+            let seg = if c == b'[' || c == b'(' {
+                let close = if c == b'[' { b']' } else { b')' };
+                match s[i + 1..].iter().position(|&b| b == close) {
+                    Some(p) => {
+                        let seg = trim_blank(&s[i + 1..i + 1 + p]);
+                        i += p + 2;
+                        seg
+                    }
+                    None => {
+                        a.unterminated = 1;
+                        let seg = trim_blank(&s[i + 1..]);
+                        i = n;
+                        seg
+                    }
+                }
+            } else {
+                let j = s[i..]
+                    .iter()
+                    .position(|&b| matches!(b, b' ' | b'\t' | b'|'))
+                    .map_or(n, |p| i + p);
+                let mut seg = &s[i..j];
+                while let [rest @ .., b',' | b'!'] = seg {
+                    seg = rest;
+                }
+                i = j;
+                seg
+            };
+            segs[count] = seg;
+            ends[count] = i;
+            count += 1;
+        }
+        let pre = a.kind == 1;
+        if pre {
+            a.section = if count > 0 { segs[0].len() } else { 0 };
+        }
+        let start = usize::from(pre);
+        let title_index = (start..count).find(|&t| release_name(segs[t]));
+        if let Some(t) = title_index {
+            a.title = segs[t];
+            if a.kind == 3 {
+                (a.files, a.size) = info_counts(&s[ends[t]..]);
+            }
+            if a.kind >= 4 && t + 1 < count {
+                a.reason = segs[t + 1].len();
+            }
+        }
+        a
+    }
+
+    /// `PreAnnounceParser::w61AnnounceParseBatchPhp()`.
+    fn announce_parse(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 29);
+        let mut formats = [0i64; 6];
+        let mut types = [0i64; 9];
+        let (mut entries, mut stripped_sum, mut coded, mut titled, mut sectioned) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let (mut files_sum, mut size_sum, mut reasons, mut nukes, mut infos, mut pres) =
+            (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
+        let (mut max_length, mut unterminated) = (0i64, 0i64);
+        let mut titles: KeySet<CaselessCow> = KeySet::default();
+        let mut buf = Vec::new();
+        for &raw in items {
+            let coded_line = raw.iter().any(|&b| format_code(b));
+            let line: &[u8] = if coded_line {
+                strip_codes(raw, &mut buf);
+                &buf
+            } else {
+                raw
+            };
+            let stripped = (raw.len() - line.len()) as i64;
+            let line = trim_blank(line);
+            let a = parse_line(line);
+            let title_ok = i64::from(!a.title.is_empty());
+            let entry = i64::from(
+                a.kind != 0
+                    && title_ok == 1
+                    && (a.kind != 1 || a.section > 0)
+                    && (a.kind != 3 || (a.files >= 0 && a.size >= 0)),
+            );
+            formats[a.format as usize] += 1;
+            types[a.kind as usize] += 1;
+            entries += entry;
+            stripped_sum += stripped;
+            coded += i64::from(stripped > 0);
+            titled += title_ok;
+            sectioned += i64::from(a.section > 0);
+            if a.files >= 0 {
+                files_sum += a.files;
+            }
+            if a.size >= 0 {
+                size_sum += a.size;
+            }
+            reasons += i64::from(a.reason > 0);
+            if entry == 1 {
+                match a.kind {
+                    1 | 2 => pres += 1,
+                    3 => infos += 1,
+                    _ => nukes += 1,
+                }
+                titles.insert(CaselessCow(if coded_line {
+                    Cow::Owned(a.title.to_vec())
+                } else {
+                    let at = a.title.as_ptr() as usize - raw.as_ptr() as usize;
+                    Cow::Borrowed(&raw[at..at + a.title.len()])
+                }));
+            }
+            max_length = max_length.max(line.len() as i64);
+            unterminated += a.unterminated;
+            out.push(
+                a.format
+                    | a.kind << 3
+                    | i64::from(stripped > 0) << 7
+                    | stripped.min(255) << 8
+                    | title_ok << 16
+                    | (a.section.min(63) as i64) << 17
+                    | i64::from(a.files >= 0) << 23
+                    | a.files.clamp(0, 65535) << 24
+                    | i64::from(a.size >= 0) << 40
+                    | (a.size.max(0) / 100).min(0xFFFF) << 41
+                    | i64::from(a.reason > 0) << 57
+                    | entry << 58
+                    | a.unterminated << 59,
+            );
+        }
+        out.extend(formats);
+        out.extend(types);
+        out.extend([
+            entries,
+            stripped_sum,
+            coded,
+            titled,
+            sectioned,
+            files_sum,
+            size_sum,
+            reasons,
+            nukes,
+            infos,
+            pres,
+            titles.len() as i64,
+            max_length,
+            unterminated,
+        ]);
+        out
+    }
+
+    macro_rules! w613_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// Items are NUL-joined in `blob`, or concatenated with their byte lengths in `lens`
+            /// when it is non-null. Returns the word count, `-needed` when `out_cap` is too small,
+            /// or `-1` when it declines (null `out`, null `blob` with a length, `count` other than
+            /// the number of NUL-separated items, or `lens` that do not tile `blob`).
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+            /// `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run_items(blob, blob_len, lens, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w613_export!(
+        /// `PredbFeedEntry::w61FeedEntryBatch()`.
+        nntmux_w613_predb_feed_entry_batch => feed_entry
+    );
+    w613_export!(
+        /// `PredbFeedImporter::w61ImportPlanBatch()`.
+        nntmux_w613_predb_feed_importer_batch => import_plan
+    );
+    w613_export!(
+        /// `PredbFeedSourceFactory::w61SourcePlanBatch()`.
+        nntmux_w613_predb_feed_source_factory_batch => source_plan
+    );
+    w613_export!(
+        /// `IrcNetworks::w61NetworkPlanBatch()`.
+        nntmux_w613_irc_networks_batch => network_plan
+    );
+    w613_export!(
+        /// `PreAnnounceParser::w61AnnounceParseBatch()`.
+        nntmux_w613_pre_announce_parser_batch => announce_parse
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        /// Each export with the words an empty batch writes.
+        const EXPORTS: [(Export, isize); 5] = [
+            (nntmux_w613_predb_feed_entry_batch, 44),
+            (nntmux_w613_predb_feed_importer_batch, 22),
+            (nntmux_w613_predb_feed_source_factory_batch, 31),
+            (nntmux_w613_irc_networks_batch, 34),
+            (nntmux_w613_pre_announce_parser_batch, 29),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            if items.iter().all(|i| !i.contains(&0)) {
+                let joined = items.join(&0u8);
+                let mut nul = vec![0i64; 4096];
+                let w = unsafe {
+                    f(
+                        joined.as_ptr(),
+                        joined.len(),
+                        ptr::null(),
+                        items.len(),
+                        nul.as_mut_ptr(),
+                        nul.len(),
+                    )
+                };
+                assert_eq!(w, written);
+                assert_eq!(&nul[..w as usize], &out[..]);
+            }
+            out
+        }
+
+        #[test]
+        fn w613_helpers() {
+            assert!(release_name(b"Name-GRP") && release_name(b"Some.Show.S01E02.720p-GRP_x"));
+            assert!(!release_name(b"-GRP") && !release_name(b"Name-") && !release_name(b"Na me-G"));
+            assert_eq!(size_kb(b"1.5MB"), Some(1536));
+            assert_eq!(size_kb(b"2gb"), Some(2_097_152));
+            assert_eq!(size_kb(b"1.234MB"), None);
+            assert_eq!(category_class(b"TV-X264"), 1);
+            assert_eq!(category_class(b"MP3"), 3);
+            assert_eq!(category_class(b"LONGPREFIX"), 8);
+            assert_eq!(host_kind(b"irc.example.net"), 1);
+            assert_eq!(host_kind(b"10.0.0.1"), 2);
+            assert_eq!(host_kind(b"10.0.0.01"), 3);
+            assert_eq!(host_kind(b"-bad.host"), 3);
+            let mut buf = Vec::new();
+            strip_codes(b"\x0304,12PRE\x03:\x02 x\x0f", &mut buf);
+            assert_eq!(buf, b"PRE: x");
+            strip_codes(b"\x03,5a", &mut buf);
+            assert_eq!(buf, b",5a");
+            assert_eq!(info_counts(b" [14F 67.5MB]"), (14, 6750));
+            assert_eq!(info_counts(b" - 14 F & 67 MB"), (14, 6700));
+            assert_eq!(info_counts(b" (2 Files) (38 MB)"), (2, 3800));
+        }
+
+        #[test]
+        fn w613_entry_and_importer_items() {
+            let entry = call(
+                nntmux_w613_predb_feed_entry_batch,
+                &[
+                    b"Some.Show.S01E02-GRP|predb.net|TV-X264|1.5MB|12|2|1700000000",
+                    b"Some show s01e02-grp|x|||0|9|1",
+                ],
+            );
+            assert_eq!(
+                entry[0],
+                3 | 1 << 2
+                    | 1 << 5
+                    | 1 << 7
+                    | 1 << 11
+                    | 1 << 13
+                    | 1 << 15
+                    | 1 << 18
+                    | 20 << 21
+                    | 12 << 31
+            );
+            assert_eq!(
+                entry[1],
+                3 | 2 << 2 | 1 << 5 | 2 << 13 | 3 << 15 | 2 << 18 | 1 << 20 | 20 << 21
+            );
+            assert_eq!(&entry[2..6], &[0, 0, 0, 2]);
+            let plan = call(
+                nntmux_w613_predb_feed_importer_batch,
+                &[
+                    b"Name-GRP|0",
+                    b" name-grp |1",
+                    b"Other-GRP|yes|2|0",
+                    b"Third-GRP|1|0|0|5|1",
+                    b"|x",
+                ],
+            );
+            assert_eq!(plan[0], 2 | 1 << 5 | 8 << 13);
+            assert_eq!(plan[1], 1 | 1 << 5 | 1 << 11 | 8 << 13);
+            assert_eq!(plan[2], 3 | 1 << 5 | 1 << 7 | 9 << 13);
+            assert_eq!(plan[3], 4 | 1 << 5 | 4 << 8 | 9 << 13);
+            assert_eq!(plan[4], 1 << 3 | 2 << 5 | 1 << 12);
+        }
+
+        #[test]
+        fn w613_source_network_announce_items() {
+            let source = call(
+                nntmux_w613_predb_feed_source_factory_batch,
+                &[
+                    b"predb_me|200|30|",
+                    b"Predb-Club",
+                    b"srrdb.com|0|x|5",
+                    b"nope",
+                ],
+            );
+            assert_eq!(
+                source[0],
+                1 | 3 << 3
+                    | 1 << 9
+                    | 16 << 11
+                    | 1 << 18
+                    | 1 << 20
+                    | 1 << 22
+                    | 50 << 26
+                    | 30 << 36
+                    | 8 << 44
+            );
+            assert_eq!(
+                source[1],
+                2 | 1 << 3 | 2 << 18 | 100 << 26 | 15 << 36 | 10 << 44
+            );
+            assert_eq!(
+                source[2],
+                3 | 6 << 3
+                    | 32 << 11
+                    | 3 << 18
+                    | 2 << 20
+                    | 3 << 22
+                    | 2 << 24
+                    | 1 << 26
+                    | 15 << 36
+                    | 9 << 44
+            );
+            assert_eq!(source[3], 4 | 100 << 26 | 15 << 36 | 4 << 44);
+            let network = call(
+                nntmux_w613_irc_networks_batch,
+                &[
+                    b"corrupt|irc.corrupt-net.org|+6697||#pre,#pre-info|corruptnet",
+                    b"synirc|irc.synirc.net||yes|#pre|",
+                ],
+            );
+            assert_eq!(
+                network[0],
+                1 | 1 << 4 | 1 << 6 | 6697 << 8 | 1 << 26 | 1 << 27 | 4 << 31 | 2 << 34 | 19 << 50
+            );
+            assert_eq!(
+                network[1],
+                1 | 1 << 2 | 1 << 4 | 6697 << 8 | 1 << 24 | 1 << 26 | 2 << 31 | 1 << 34 | 14 << 50
+            );
+            let announce = call(
+                nntmux_w613_pre_announce_parser_batch,
+                &[
+                    b"\x02PRE:\x02 [FLAC] Name-GRP",
+                    b"(INFO) (Name-GRP) (2 Files) (38 MB)",
+                    b"nonsense",
+                ],
+            );
+            assert_eq!(
+                announce[0],
+                1 | 1 << 3 | 1 << 7 | 2 << 8 | 1 << 16 | 4 << 17 | 1 << 58
+            );
+            assert_eq!(
+                announce[1],
+                2 | 3 << 3 | 1 << 16 | 1 << 23 | 2 << 24 | 1 << 40 | 38 << 41 | 1 << 58
+            );
+            assert_eq!(announce[2], 0);
+        }
+
+        #[test]
+        fn w613_exports_guard_their_buffers() {
+            let mut buf = [0i64; 128];
+            let o = buf.as_mut_ptr();
+            let n = ptr::null::<i64>();
+            for (f, trailer) in EXPORTS {
+                unsafe {
+                    assert_eq!(f(b"x".as_ptr(), 1, n, 1, ptr::null_mut(), 128), -1);
+                    assert_eq!(f(ptr::null(), 1, n, 1, o, 128), -1);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 1, o, 128), -1);
+                    assert_eq!(f(ptr::null(), 0, n, 0, o, 128), trailer);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 2, o, 1), -(trailer + 2));
+                    let lens = [1i64, 2];
+                    assert_eq!(
+                        f(b"a\0b".as_ptr(), 3, lens.as_ptr(), 2, o, 128),
+                        trailer + 2
+                    );
+                    assert_eq!(f(b"a\0bc".as_ptr(), 4, lens.as_ptr(), 2, o, 128), -1);
+                }
+            }
+        }
+    }
+}
