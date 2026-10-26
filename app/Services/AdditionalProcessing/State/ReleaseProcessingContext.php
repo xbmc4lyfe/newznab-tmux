@@ -1055,4 +1055,310 @@ class ReleaseProcessingContext
     {
         return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, 0);
     }
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 9.30x, p99 5.94x; uncommon mean 9.10x, p99 5.61x); see RustAdditional7zParserBudgetPersistenceMetricsContextW65ParityTest. */
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    public const string W65_RELEASE_CONTEXT_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w653_release_context_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 65.3 batch. */
+    public const int W65_RELEASE_CONTEXT_TRAILER = 27;
+
+    /** Cap for the Wave 65.3 running totals. */
+    private const int W65_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', true);
+    }
+
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', false);
+    }
+
+    /** Restores W65_RUST_FFI_DEFAULT and drops the cached library handle and scratch buffers. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('reset');
+    }
+
+    public static function usesW65RustFfi(): bool
+    {
+        $override = self::w65RustFfiState();
+
+        return \is_bool($override) ? $override : self::W65_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the ReleaseProcessingContext Wave 65 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 65.3 release processing state, password, completion and outcome plan with needsMediaProcessing(),
+     * needsSample() and isTimedOut()'s rules. Each item is `state|passwordStatus|found|added|total|elapsed|timeout`.
+     * The trimmed state is 0 empty, 1 `pending`, 2 `downloading`, 3 `extracting`, 4 `media`, 5 `finalizing`, 6 `done`,
+     * 7 `failed` (any case) or 8 other. The password status is 0 empty, 1 up to 2 trimmed ASCII digits, 2 other, and
+     * classed 0 unset, 1 none (0), 2 passworded (1) or 3 other. Found is a comma list of markFound() types (video,
+     * mediaInfo, audioInfo, audioSample, jpgSample, sample, par2Info) plus nfo, trimmed and case-sensitive, as mask
+     * bits 0-7; other non-empty entries count as unknown. Added and total file info are 0 empty, 1 up to 6 digits, 2
+     * other; elapsed and timeout seconds the same with up to 9 digits. Timed out means a positive timeout below the
+     * elapsed seconds; completion is the per-mille added / total (capped at 1000, 0 without a total). The outcome is 5
+     * invalid (any state 2 or state 8), 4 passworded, 3 failed (state 7 or timed out), 2 complete (state 6, or nothing
+     * left to find), 1 in progress (states 1-5) or 0 idle; the next state is 0 when invalid, 7 when passworded or
+     * failed, 6 when complete, 1 when idle and otherwise the following state, skipping `media` when no media is
+     * needed. Per item `state | next << 4 | passwordState << 8 | passwordClass << 10 | mask << 13 | min(unknown, 15) <<
+     * 21 | addedState << 25 | totalState << 27 | elapsedState << 29 | timeoutState << 31 | needsMedia << 33 |
+     * needsSample << 34 | timedOut << 35 | outcome << 36 | completion << 39 | remaining << 49` (timeout - elapsed
+     * seconds clamped to 0..16383, 0 without a timeout). Then the six outcome counts, the nine state counts, the eight
+     * found type counts, the added and total file info totals (capped at 2^62), the timed-out count and the 1-based
+     * index of the first strictly longest positive elapsed time (0 when none).
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65ReleaseContextPlanBatch(array $items): array
+    {
+        return self::usesW65RustFfi() ? self::w65ReleaseContextPlanBatchNative($items) : self::w65ReleaseContextPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65ReleaseContextPlanBatchNative(array $items): array
+    {
+        return self::w65Invoke($items, \count($items) + self::W65_RELEASE_CONTEXT_TRAILER) ?? self::w65ReleaseContextPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65ReleaseContextPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $outcomes = [0, 0, 0, 0, 0, 0];
+        $states = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $found = [0, 0, 0, 0, 0, 0, 0, 0];
+        $addedSum = $totalSum = $timedOutCount = $slowest = $slowestElapsed = $index = 0;
+        foreach ($items as $item) {
+            $index++;
+            [$rawState, $rawPassword, $rawFound, $rawAdded, $rawTotal, $rawElapsed, $rawTimeout] = explode('|', (string) $item, 7) + ['', '', '', '', '', '', ''];
+            $stateText = strtolower(trim($rawState));
+            $state = $stateText === '' ? 0 : (self::W65_CONTEXT_STATES[$stateText] ?? 8);
+            [$passwordState, $password] = self::w65Count($rawPassword, 2);
+            $passwordClass = $passwordState !== 1 ? 0 : ($password === 0 ? 1 : ($password === 1 ? 2 : 3));
+            $mask = $unknown = 0;
+            foreach (explode(',', $rawFound) as $piece) {
+                $piece = trim($piece);
+                if ($piece === '') {
+                    continue;
+                }
+                $bit = self::W65_FOUND_BITS[$piece] ?? null;
+                if ($bit === null) {
+                    $unknown++;
+                } else {
+                    $mask |= 1 << $bit;
+                }
+            }
+            [$addedState, $added] = self::w65Count($rawAdded, 6);
+            [$totalState, $totalFiles] = self::w65Count($rawTotal, 6);
+            [$elapsedState, $elapsed] = self::w65Count($rawElapsed, 9);
+            [$timeoutState, $timeout] = self::w65Count($rawTimeout, 9);
+            $needsMedia = ($mask & 0b1111) !== 0b1111;
+            $needsSample = ($mask & 0b110000) !== 0b110000;
+            $timedOut = $timeout > 0 && $elapsed > $timeout;
+            $completion = $totalFiles > 0 ? min(intdiv($added * 1000, $totalFiles), 1000) : 0;
+            if ($addedState === 2 || $totalState === 2 || $elapsedState === 2 || $timeoutState === 2 || $passwordState === 2 || $state === 8) {
+                $outcome = 5;
+            } elseif ($passwordClass === 2) {
+                $outcome = 4;
+            } elseif ($state === 7 || $timedOut) {
+                $outcome = 3;
+            } elseif ($state === 6 || (! $needsMedia && ! $needsSample)) {
+                $outcome = 2;
+            } elseif ($state >= 1) {
+                $outcome = 1;
+            } else {
+                $outcome = 0;
+            }
+            $next = match ($outcome) {
+                5 => 0,
+                4, 3 => 7,
+                2 => 6,
+                1 => $state + 1 === 4 && ! $needsMedia ? 5 : $state + 1,
+                default => 1,
+            };
+            $remaining = $timeout > 0 ? min(max(0, $timeout - $elapsed), 16_383) : 0;
+            $outcomes[$outcome]++;
+            $states[$state]++;
+            for ($bit = 0; $bit < 8; $bit++) {
+                $found[$bit] += ($mask >> $bit) & 1;
+            }
+            $addedSum = min($addedSum + $added, self::W65_TOTAL_CAP);
+            $totalSum = min($totalSum + $totalFiles, self::W65_TOTAL_CAP);
+            $timedOutCount += $timedOut ? 1 : 0;
+            if ($elapsed > $slowestElapsed) {
+                $slowest = $index;
+                $slowestElapsed = $elapsed;
+            }
+            $out[] = $state | $next << 4 | $passwordState << 8 | $passwordClass << 10 | $mask << 13 | min($unknown, 15) << 21 | $addedState << 25
+                | $totalState << 27 | $elapsedState << 29 | $timeoutState << 31 | ($needsMedia ? 1 : 0) << 33 | ($needsSample ? 1 : 0) << 34
+                | ($timedOut ? 1 : 0) << 35 | $outcome << 36 | $completion << 39 | $remaining << 49;
+        }
+        array_push($out, ...$outcomes, ...$states, ...$found);
+        array_push($out, $addedSum, $totalSum, $timedOutCount, $slowest);
+
+        return $out;
+    }
+
+    /**
+     * (0 empty, 1 one to $max ASCII digits, 2 other; the value) for the trimmed field.
+     *
+     * @return array{int, int}
+     */
+    private static function w65Count(string $text, int $max): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $length = \strlen($text);
+
+        return $length <= $max && strspn($text, '0123456789') === $length ? [1, (int) $text] : [2, 0];
+    }
+
+    /** Lower-cased processing state => code (empty 0, anything else 8). */
+    private const array W65_CONTEXT_STATES = ['pending' => 1, 'downloading' => 2, 'extracting' => 3, 'media' => 4, 'finalizing' => 5, 'done' => 6, 'failed' => 7];
+
+    /** markFound() type (plus nfo), case-sensitive => mask bit. */
+    private const array W65_FOUND_BITS = ['video' => 0, 'mediaInfo' => 1, 'audioInfo' => 2, 'audioSample' => 3, 'jpgSample' => 4, 'sample' => 5,
+        'par2Info' => 6, 'nfo' => 7];
+
+    /**
+     * Wave 65 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and returns the
+     * previous override, 'reset' clears the override, library handle and buffers, 'ffi' resolves the library
+     * (null when unavailable) and 'out' and 'lens' return `int64_t` output and length-column buffers of at least
+     * $val words. Function statics keep the class's property set unchanged.
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w653', self::W65_RELEASE_CONTEXT_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w65RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w65RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 65.3 ReleaseProcessingContext export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call declines
+     * or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w65Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w65RustFfiState('ffi');
+            $out = self::w65RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w65RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W65_RELEASE_CONTEXT_FFI_CDEF.)
+            $written = $ffi->nntmux_w653_release_context_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

@@ -623,4 +623,249 @@ class FfmpegFrameGrabber implements VideoFrameGrabber
     {
         return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, $pad);
     }
+
+    /** C signature of the Wave 64.5 {@see self::w64FfmpegGrabberPlanBatch()} helper. */
+    private const string W64_FFMPEG_GRABBER_PLAN_FFI_CDEF = 'int64_t nntmux_w645_ffmpeg_grabber_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 64.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 6.75/6.69/6.60/5.54x); see tests/Unit/RustAdditionalFfmpegFrameScorerRankerInspectorFetcherW64ParityTest.php.
+     */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 64.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w64_5', self::W64_FFMPEG_GRABBER_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W64_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 64.5 plan batch to Rust until disabled or reset. */
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    /** Route the Wave 64.5 plan batch to PHP until enabled or reset. */
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restore W64_RUST_FFI_DEFAULT routing and drop the cached Wave 64.5 handle and buffer. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', null);
+        self::w64RustFfiState('reset', null);
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        return self::w64RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w64FfmpegGrabberPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 64.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w64Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w64RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w645_ffmpeg_grabber_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w64Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /**
+     * Batch grab() plan over `duration\twidth\theight\tcount\tfrom_ms\tspacing_ms\tcontainer`. Ten words per record:
+     * `[duration_ms, from_ms, spacing_ms, frames, last_ms, scaled_width, scaled_height, container, options, flags]`.
+     * The duration is a trimmed Matroska `H:MM:SS[.fraction]` tag (1-7 hour digits, fraction truncated to
+     * milliseconds) or 1-15 digit milliseconds; other numbers are trimmed 1-15 ASCII digits (empty takes the
+     * default: count 1, the rest 0). Frames are the count clamped to 1..64. With a known duration the seek start
+     * is capped at 90% of it and, for several frames, the spacing at the remaining time per gap (an unset spacing
+     * spreads the frames evenly). The scaled size follows `scale='min(1280,iw)':-2` (even height); the container
+     * is its 1-based `VideoContainer` case for an exact demuxer name, 0 empty or -1 unknown, and options counts
+     * grab()'s ffmpeg arguments. Flags: 1 invalid number, 2 not exactly seven fields, 4 count clamped, 8 unknown
+     * container, 16 seek start capped, 32 missing resolution, 64 duration read from a clock tag.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w64FfmpegGrabberPlanBatch(array $records): array
+    {
+        return self::usesW64RustFfi() ? self::w64FfmpegGrabberPlanBatchNative($records) : self::w64FfmpegGrabberPlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w64FfmpegGrabberPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w64Words($count, implode("\0", $records), 10 * $count) ?? self::w64FfmpegGrabberPlanBatchPhp($records);
+    }
+
+    private const array W64_CONTAINERS = ['matroska', 'avi', 'mpeg', 'mpegts', 'mov', 'asf', 'ogg'];
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w64FfmpegGrabberPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 7 ? 0 : 2;
+            $text = trim($fields[0]);
+            if ($text === '') {
+                $duration = 0;
+            } elseif (preg_match('/^(\d{1,7}):(\d{2}):(\d{2})(?:\.(\d+))?$/D', $text, $match) === 1) {
+                $flags |= 64;
+                $duration = (int) $match[1] * 3_600_000 + (int) $match[2] * 60_000 + (int) $match[3] * 1000
+                    + (int) substr(str_pad($match[4] ?? '', 3, '0'), 0, 3);
+            } elseif (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+                $duration = (int) $text;
+            } else {
+                $flags |= 1;
+                $duration = 0;
+            }
+            $width = self::w64Number($fields[1] ?? '', 0, $flags);
+            $height = self::w64Number($fields[2] ?? '', 0, $flags);
+            $requested = self::w64Number($fields[3] ?? '', 1, $flags);
+            $frames = min(max($requested, 1), 64);
+            if ($frames !== $requested) {
+                $flags |= 4;
+            }
+            $from = self::w64Number($fields[4] ?? '', 0, $flags);
+            $spacing = self::w64Number($fields[5] ?? '', 0, $flags);
+            if ($duration > 0) {
+                $limit = intdiv($duration * 9, 10);
+                if ($from > $limit) {
+                    $from = $limit;
+                    $flags |= 16;
+                }
+                if ($frames > 1) {
+                    $available = $duration - $from;
+                    $spacing = $spacing > 0 ? min($spacing, intdiv($available, $frames - 1)) : intdiv($available, $frames);
+                }
+            }
+            if ($width === 0 || $height === 0) {
+                $flags |= 32;
+                $scaledWidth = $scaledHeight = 0;
+            } else {
+                $scaled = $width > 1280 ? intdiv($height * 1280, $width) : $height;
+                $scaledWidth = min($width, 1280);
+                $scaledHeight = $scaled - $scaled % 2;
+            }
+            $name = trim($fields[6] ?? '');
+            $container = 0;
+            if ($name !== '') {
+                $at = array_search($name, self::W64_CONTAINERS, true);
+                if ($at === false) {
+                    $flags |= 8;
+                    $container = -1;
+                } else {
+                    $container = $at + 1;
+                }
+            }
+            array_push($out, $duration, $from, $spacing, $frames, $from + ($frames - 1) * $spacing, $scaledWidth, $scaledHeight, $container, $container > 0 ? 21 : 19, $flags);
+        }
+
+        return $out;
+    }
 }

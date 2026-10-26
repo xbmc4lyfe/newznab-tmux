@@ -51291,3 +51291,2488 @@ mod wave63_5_verification_policy_par2_proof_payload_update_reset {
         }
     }
 }
+
+mod wave64_5_ffmpeg_frame_scorer_ranker_inspector_fetcher {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Plan callback: record bytes and its output words.
+    type Plan = fn(&[u8], &mut [i64]);
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// 1-`max` ASCII digits as an integer; `max` is at most 18.
+    fn digits(field: &[u8], max: usize) -> Option<i64> {
+        if field.is_empty() || field.len() > max {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// Trimmed 1-15 digits; empty is `None`, anything else sets bit 1 and is also `None`.
+    fn number(field: &[u8], flags: &mut i64) -> Option<i64> {
+        match trim(field) {
+            b"" => None,
+            text => digits(text, 15).or_else(|| {
+                *flags |= 1;
+                None
+            }),
+        }
+    }
+
+    /// `data` split on `separator` like `<[u8]>::split()`, searching a word at a time.
+    fn split_on(data: &[u8], separator: u8) -> impl Iterator<Item = &[u8]> {
+        let mut rest = Some(data);
+        std::iter::from_fn(move || {
+            let current = rest?;
+            match memchr(separator, current) {
+                Some(at) => {
+                    rest = Some(&current[at + 1..]);
+                    Some(&current[..at])
+                }
+                None => {
+                    rest = None;
+                    Some(current)
+                }
+            }
+        })
+    }
+
+    /// Up to `N` fields split on `separator` (missing fields empty) and the total field count.
+    fn fields<const N: usize>(record: &[u8], separator: u8) -> ([&[u8]; N], usize) {
+        let mut fields: [&[u8]; N] = [b""; N];
+        let mut total = 0usize;
+        for field in split_on(record, separator) {
+            if total < N {
+                fields[total] = field;
+            }
+            total += 1;
+        }
+        (fields, total)
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records, writing
+    /// `width` words per record straight into `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        width: usize,
+        plan: Plan,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(records) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = records.len() * width;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            for (record, slot) in records.iter().zip(words.chunks_exact_mut(width)) {
+                plan(record, slot);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Hex digit values; uppercase `A-F` also set 0x10 and other bytes are 0x80.
+    const HEX: [u8; 256] = {
+        let mut table = [0x80u8; 256];
+        let mut at = 0;
+        while at < 10 {
+            table[b'0' as usize + at] = at as u8;
+            at += 1;
+        }
+        at = 0;
+        while at < 6 {
+            table[b'a' as usize + at] = 10 + at as u8;
+            table[b'A' as usize + at] = 0x10 | (10 + at as u8);
+            at += 1;
+        }
+        table
+    };
+
+    /// Decodes an even-length run of ASCII hex digits (empty decodes to nothing) and whether any
+    /// digit is uppercase; `None` for odd lengths or other bytes.
+    fn unhex(text: &[u8]) -> Option<(Vec<u8>, bool)> {
+        let (pairs, rest) = text.as_chunks::<2>();
+        if !rest.is_empty() {
+            return None;
+        }
+        let mut seen = 0u8;
+        let mut bytes = Vec::with_capacity(pairs.len());
+        for &[high, low] in pairs {
+            let (high, low) = (HEX[usize::from(high)], HEX[usize::from(low)]);
+            seen |= high | low;
+            bytes.push((high & 0x0f) << 4 | (low & 0x0f));
+        }
+        (seen & 0x80 == 0).then_some((bytes, seen & 0x10 != 0))
+    }
+
+    /// `VideoContainer` demuxer names in case order.
+    const CONTAINERS: [&[u8]; 7] = [
+        b"matroska",
+        b"avi",
+        b"mpeg",
+        b"mpegts",
+        b"mov",
+        b"asf",
+        b"ogg",
+    ];
+
+    /// `^(\d{1,7}):(\d{2}):(\d{2})(?:\.(\d+))?$` as milliseconds (fraction truncated to three digits).
+    fn clock_ms(text: &[u8]) -> Option<i64> {
+        let colon = memchr(b':', text)?;
+        let hours = digits(&text[..colon], 7)?;
+        let rest = &text[colon + 1..];
+        if rest.len() < 5 || rest[2] != b':' {
+            return None;
+        }
+        let minutes = digits(&rest[..2], 2)?;
+        let seconds = digits(&rest[3..5], 2)?;
+        let millis = match &rest[5..] {
+            [] => 0,
+            [b'.', fraction @ ..]
+                if !fraction.is_empty() && fraction.iter().all(u8::is_ascii_digit) =>
+            {
+                (0..3).fold(0i64, |acc, at| {
+                    acc * 10 + fraction.get(at).map_or(0, |&b| i64::from(b - b'0'))
+                })
+            }
+            _ => return None,
+        };
+        Some(hours * 3_600_000 + minutes * 60_000 + seconds * 1000 + millis)
+    }
+
+    /// `FfmpegFrameGrabber::w64FfmpegGrabberPlanBatch()`: ten words per record.
+    fn ffmpeg_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<7>(record, b'\t');
+        let mut flags = if total_fields == 7 { 0 } else { 2 };
+        let text = trim(f[0]);
+        let duration = if text.is_empty() {
+            0
+        } else if let Some(ms) = clock_ms(text) {
+            flags |= 64;
+            ms
+        } else if let Some(ms) = digits(text, 15) {
+            ms
+        } else {
+            flags |= 1;
+            0
+        };
+        let width = number(f[1], &mut flags).unwrap_or(0);
+        let height = number(f[2], &mut flags).unwrap_or(0);
+        let requested = number(f[3], &mut flags).unwrap_or(1);
+        let frames = requested.clamp(1, 64);
+        if frames != requested {
+            flags |= 4;
+        }
+        let mut from = number(f[4], &mut flags).unwrap_or(0);
+        let mut spacing = number(f[5], &mut flags).unwrap_or(0);
+        if duration > 0 {
+            let limit = duration * 9 / 10;
+            if from > limit {
+                from = limit;
+                flags |= 16;
+            }
+            if frames > 1 {
+                let available = duration - from;
+                spacing = if spacing > 0 {
+                    spacing.min(available / (frames - 1))
+                } else {
+                    available / frames
+                };
+            }
+        }
+        let last = from + (frames - 1) * spacing;
+        let (scaled_width, scaled_height) = if width == 0 || height == 0 {
+            flags |= 32;
+            (0, 0)
+        } else {
+            let scaled = if width > 1280 {
+                height * 1280 / width
+            } else {
+                height
+            };
+            (width.min(1280), scaled - scaled % 2)
+        };
+        let name = trim(f[6]);
+        let container = if name.is_empty() {
+            0
+        } else {
+            match CONTAINERS.iter().position(|known| *known == name) {
+                Some(at) => at as i64 + 1,
+                None => {
+                    flags |= 8;
+                    -1
+                }
+            }
+        };
+        out.copy_from_slice(&[
+            duration,
+            from,
+            spacing,
+            frames,
+            last,
+            scaled_width,
+            scaled_height,
+            container,
+            if container > 0 { 21 } else { 19 },
+            flags,
+        ]);
+    }
+
+    const FRAME_PIXEL_CAP: i64 = 1 << 20;
+
+    /// Luma values at or below this count as black border.
+    const DARK: u8 = 16;
+
+    /// `FrameQualityScorer::w64FrameQualityPlanBatch()`: ten words per record.
+    fn frame_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<3>(record, b'\t');
+        let mut flags = if total_fields == 3 { 0 } else { 2 };
+        let width = number(f[0], &mut flags).unwrap_or(0);
+        let height = number(f[1], &mut flags).unwrap_or(0);
+        let decoded = if f[2].is_empty() { None } else { unhex(f[2]) };
+        if let Some((_, true)) = decoded {
+            flags |= 4;
+        }
+        let status = if width < 1 || height < 1 {
+            1
+        } else if width > FRAME_PIXEL_CAP
+            || height > FRAME_PIXEL_CAP
+            || width * height > FRAME_PIXEL_CAP
+        {
+            flags |= 8;
+            1
+        } else if decoded.is_none() {
+            2
+        } else if f[2].len() as i64 != 2 * width * height {
+            3
+        } else {
+            0
+        };
+        let pixels = match (status, decoded) {
+            (0, Some((pixels, _))) => pixels,
+            _ => {
+                out.copy_from_slice(&[status, 0, 0, 0, 0, 0, 0, 0, 0, flags]);
+                return;
+            }
+        };
+        let (w, h) = (width as usize, height as usize);
+        let mut histogram = [0u64; 256];
+        for &luma in &pixels {
+            histogram[usize::from(luma)] += 1;
+        }
+        let (mut sum, mut squares, mut levels) = (0u64, 0u64, 0i64);
+        let (mut low, mut high) = (255i64, 0i64);
+        for (luma, &seen) in histogram.iter().enumerate() {
+            if seen > 0 {
+                let value = luma as u64;
+                sum += value * seen;
+                squares += value * value * seen;
+                levels += 1;
+                low = low.min(luma as i64);
+                high = high.max(luma as i64);
+            }
+        }
+        let n = pixels.len() as u64;
+        let mean = (sum * 1000 / n) as i64;
+        let stddev = ((n * squares - sum * sum).isqrt() * 1000 / n) as i64;
+        let contrast = high - low;
+        let dark_row = |y: usize| pixels[y * w..(y + 1) * w].iter().all(|&b| b <= DARK);
+        let dark_column = |x: usize| (0..h).all(|y| pixels[y * w + x] <= DARK);
+        let top = (0..h).take_while(|&y| dark_row(y)).count();
+        let (rows, columns) = if top == h {
+            (h, w)
+        } else {
+            let bottom = (0..h).rev().take_while(|&y| dark_row(y)).count();
+            let left = (0..w).take_while(|&x| dark_column(x)).count();
+            let right = (0..w).rev().take_while(|&x| dark_column(x)).count();
+            (top + bottom, left + right)
+        };
+        let class = if stddev < 10_000 || contrast < 24 {
+            1
+        } else if mean < 40_000 {
+            2
+        } else if mean > 220_000 {
+            3
+        } else if (rows > 0 && rows * 4 >= h) || (columns > 0 && columns * 4 >= w) {
+            4
+        } else {
+            5
+        };
+        out.copy_from_slice(&[
+            0,
+            mean,
+            stddev,
+            contrast,
+            levels,
+            rows as i64,
+            columns as i64,
+            class,
+            class << 32 | stddev,
+            flags,
+        ]);
+    }
+
+    /// Letter runs that `ImageCandidateRanker::CONTENT` matches on their own.
+    const CONTENT: [&[u8]; 18] = [
+        b"screen",
+        b"screens",
+        b"screenshot",
+        b"screenshots",
+        b"screencap",
+        b"screencaps",
+        b"caps",
+        b"contactsheet",
+        b"contactsheets",
+        b"sheet",
+        b"thumb",
+        b"thumbs",
+        b"thumbnail",
+        b"thumbnails",
+        b"preview",
+        b"previews",
+        b"sample",
+        b"samples",
+    ];
+
+    /// Letter runs `ImageCandidateRanker::COVER` matches.
+    const COVER: [&[u8]; 6] = [b"cover", b"front", b"poster", b"folder", b"box", b"keyart"];
+
+    /// Letter runs `ImageCandidateRanker::LEAST` matches (`cd\d*` and friends are the bare run).
+    const LEAST: [&[u8]; 16] = [
+        b"back",
+        b"rear",
+        b"cd",
+        b"dvd",
+        b"disc",
+        b"disk",
+        b"label",
+        b"inlay",
+        b"insert",
+        b"proof",
+        b"logo",
+        b"banner",
+        b"avatar",
+        b"sig",
+        b"signature",
+        b"spine",
+    ];
+
+    const IMAGE_EXTENSIONS: [&[u8]; 6] = [b"jpg", b"jpeg", b"png", b"gif", b"webp", b"bmp"];
+
+    const ROLES: [&[u8]; 4] = [b"content", b"cover", b"other", b"least"];
+
+    fn listed(words: &[&[u8]], run: &[u8]) -> bool {
+        words.iter().any(|word| run.eq_ignore_ascii_case(word))
+    }
+
+    /// `rankPhp()`'s keyword rank of a file name: the three patterns only match whole ASCII letter runs,
+    /// except `contact[ ._-]?sheets?`, which also spans one separator.
+    fn keyword_rank(name: &[u8]) -> i64 {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut at = 0;
+        while at < name.len() {
+            if name[at].is_ascii_alphabetic() {
+                let start = at;
+                while at < name.len() && name[at].is_ascii_alphabetic() {
+                    at += 1;
+                }
+                runs.push((start, at));
+            } else {
+                at += 1;
+            }
+        }
+        let content = runs.iter().enumerate().any(|(index, &(start, end))| {
+            listed(&CONTENT, &name[start..end])
+                || (name[start..end].eq_ignore_ascii_case(b"contact")
+                    && matches!(name.get(end), Some(b' ' | b'.' | b'_' | b'-'))
+                    && runs.get(index + 1).is_some_and(|&(next, stop)| {
+                        next == end + 1 && listed(&[b"sheet", b"sheets"], &name[next..stop])
+                    }))
+        });
+        let any = |words: &[&[u8]]| {
+            runs.iter()
+                .any(|&(start, end)| listed(words, &name[start..end]))
+        };
+        if content {
+            0
+        } else if any(&LEAST) {
+            3
+        } else if any(&COVER) {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// The first `"..."` pair with content, as `/"([^"]+)"/` finds it.
+    fn quoted(name: &[u8]) -> Option<&[u8]> {
+        let mut at = memchr(b'"', name)?;
+        loop {
+            let rest = &name[at + 1..];
+            let close = memchr(b'"', rest)?;
+            if close > 0 {
+                return Some(&rest[..close]);
+            }
+            at += 1 + close;
+        }
+    }
+
+    fn is_slash(byte: u8) -> bool {
+        byte == b'/' || byte == b'\\'
+    }
+
+    /// `ImageCandidateRanker::w64ImageRankerPlanBatch()`: ten words per record.
+    fn ranker_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<5>(record, b'\t');
+        let mut flags = if total_fields == 5 { 0 } else { 2 };
+        let name = match quoted(f[0]) {
+            Some(inner) => {
+                flags |= 32;
+                inner
+            }
+            None => f[0],
+        };
+        let name = trim(name);
+        let name = &name[..name
+            .iter()
+            .rposition(|&b| !is_slash(b))
+            .map_or(0, |at| at + 1)];
+        let base = &name[name
+            .iter()
+            .rposition(|&b| is_slash(b))
+            .map_or(0, |at| at + 1)..];
+        if base.is_empty() {
+            flags |= 16;
+        }
+        let role = trim(f[4]);
+        let (rank, explicit) = match ROLES
+            .iter()
+            .position(|known| role.eq_ignore_ascii_case(known))
+        {
+            Some(at) => (at as i64, 1),
+            None => {
+                if !role.is_empty() {
+                    flags |= 8;
+                }
+                (keyword_rank(base), 0)
+            }
+        };
+        let extension = match base.iter().rposition(|&b| b == b'.') {
+            Some(dot) => IMAGE_EXTENSIONS
+                .iter()
+                .position(|known| base[dot + 1..].eq_ignore_ascii_case(known))
+                .map_or(0, |at| at as i64 + 1),
+            None => 0,
+        };
+        let mut width = number(f[1], &mut flags).unwrap_or(0);
+        let mut height = number(f[2], &mut flags).unwrap_or(0);
+        let bytes = number(f[3], &mut flags).unwrap_or(0);
+        if width > 65_535 {
+            width = 65_535;
+            flags |= 4;
+        }
+        if height > 65_535 {
+            height = 65_535;
+            flags |= 4;
+        }
+        let pixels = width * height;
+        let size_class = if width == 0 || height == 0 {
+            0
+        } else if width.min(height) < 150 {
+            1
+        } else if pixels < 640 * 480 {
+            2
+        } else {
+            3
+        };
+        let density = if pixels > 0 && bytes > 0 {
+            bytes * 1000 / pixels
+        } else {
+            0
+        };
+        let score = (3 - rank) << 50 | size_class << 48 | pixels << 16 | (bytes >> 10).min(65_535);
+        out.copy_from_slice(&[
+            rank, explicit, extension, width, height, size_class, bytes, density, score, flags,
+        ]);
+    }
+
+    fn be16(bytes: &[u8], at: usize) -> i64 {
+        i64::from(u16::from_be_bytes([bytes[at], bytes[at + 1]]))
+    }
+
+    fn le16(bytes: &[u8], at: usize) -> i64 {
+        i64::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
+    }
+
+    fn le32(bytes: &[u8], at: usize) -> i64 {
+        i64::from(u32::from_le_bytes([
+            bytes[at],
+            bytes[at + 1],
+            bytes[at + 2],
+            bytes[at + 3],
+        ]))
+    }
+
+    const GIF: i64 = 1;
+    const JPEG: i64 = 2;
+    const PNG: i64 = 3;
+    const WEBP: i64 = 18;
+
+    /// `ImageInspector::w52ProbeHeader()`.
+    fn probe(head: &[u8]) -> (i64, i64, i64) {
+        let length = head.len();
+        if length >= 24 && head.starts_with(b"\x89PNG\r\n\x1a\n") && &head[12..16] == b"IHDR" {
+            let size = |at: usize| {
+                i64::from(u32::from_be_bytes([
+                    head[at],
+                    head[at + 1],
+                    head[at + 2],
+                    head[at + 3],
+                ]))
+            };
+            return (PNG, size(16), size(20));
+        }
+        if length >= 30 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
+            return match &head[12..16] {
+                b"VP8 " if &head[23..26] == b"\x9d\x01\x2a" => {
+                    (WEBP, le16(head, 26) & 0x3FFF, le16(head, 28) & 0x3FFF)
+                }
+                b"VP8L" if head[20] == 0x2f => {
+                    let bits = le32(head, 21);
+                    (WEBP, (bits & 0x3FFF) + 1, (bits >> 14 & 0x3FFF) + 1)
+                }
+                b"VP8X" => {
+                    let size = |at: usize| {
+                        i64::from(u32::from_le_bytes([
+                            head[at],
+                            head[at + 1],
+                            head[at + 2],
+                            0,
+                        ]))
+                    };
+                    (WEBP, size(24) + 1, size(27) + 1)
+                }
+                _ => (WEBP, 0, 0),
+            };
+        }
+        if length >= 3 && head.starts_with(b"\xFF\xD8\xFF") {
+            let mut offset = 2;
+            while offset + 4 <= length && head[offset] == 0xFF {
+                let marker = head[offset + 1];
+                if marker == 0xFF {
+                    offset += 1;
+                    continue;
+                }
+                if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+                    offset += 2;
+                    continue;
+                }
+                if marker == 0xD9 || marker == 0xDA {
+                    break;
+                }
+                let segment = be16(head, offset + 2) as usize;
+                if segment < 2 {
+                    break;
+                }
+                if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                    if offset + 9 > length {
+                        break;
+                    }
+                    return (JPEG, be16(head, offset + 7), be16(head, offset + 5));
+                }
+                offset += 2 + segment;
+            }
+            return (JPEG, 0, 0);
+        }
+        (0, 0, 0)
+    }
+
+    /// Whether `needle` occurs in `haystack`.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// `ImageInspector::w64ImageInspectorPlanBatch()`: nine words per record.
+    fn inspector_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<3>(record, b'\t');
+        let mut flags = if total_fields == 3 { 0 } else { 2 };
+        let size = number(f[0], &mut flags).unwrap_or(0);
+        let mut decode = |field: &[u8], invalid: i64| match unhex(field) {
+            Some((bytes, upper)) => {
+                if upper {
+                    flags |= 16;
+                }
+                bytes
+            }
+            None => {
+                flags |= invalid;
+                Vec::new()
+            }
+        };
+        let head = decode(f[1], 4);
+        let tail = decode(f[2], 8);
+        let kind = if head.starts_with(b"\xFF\xD8\xFF") {
+            JPEG
+        } else if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+            PNG
+        } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+            GIF
+        } else if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
+            WEBP
+        } else {
+            0
+        };
+        let (width, height) = if kind == GIF {
+            if head.len() >= 10 {
+                (le16(&head, 6), le16(&head, 8))
+            } else {
+                (0, 0)
+            }
+        } else {
+            match probe(&head) {
+                (probed, width, height) if probed == kind && kind != 0 => (width, height),
+                _ => (0, 0),
+            }
+        };
+        let complete = if kind == 0 || size < 16 {
+            false
+        } else if kind == WEBP {
+            head.len() >= 8 && size >= le32(&head, 4) + 8
+        } else {
+            let slice = &tail[tail.len().saturating_sub(4096)..];
+            let slice = &slice[..slice
+                .iter()
+                .rposition(|&b| !matches!(b, 0 | b'\r' | b'\n' | b' '))
+                .map_or(0, |at| at + 1)];
+            match kind {
+                PNG => contains(&slice[slice.len().saturating_sub(64)..], b"IEND"),
+                JPEG => contains(&slice[slice.len().saturating_sub(1024)..], b"\xFF\xD9"),
+                _ => slice.last() == Some(&0x3B),
+            }
+        };
+        let edge = width >= 150 && height >= 150;
+        let pixels = width.min(1 << 31) * height.min(1 << 31);
+        if pixels > 12_000_000 {
+            flags |= 32;
+        }
+        let reason = if kind == 0 {
+            1
+        } else if size < 16 {
+            6
+        } else if kind == GIF {
+            2
+        } else if width == 0 || height == 0 {
+            3
+        } else if !edge {
+            4
+        } else if !complete {
+            5
+        } else {
+            0
+        };
+        out.copy_from_slice(&[
+            kind,
+            width,
+            height,
+            i64::from(complete),
+            i64::from(edge),
+            pixels,
+            i64::from(reason == 0),
+            reason,
+            flags,
+        ]);
+    }
+
+    const SPENT_CAP: i64 = 1 << 62;
+
+    /// `MediaArticleFetcher::w64ArticleFetcherPlanBatch()`: ten words per record.
+    fn fetcher_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<5>(record, b'\t');
+        let mut flags = if total_fields == 5 { 0 } else { 2 };
+        let from = number(f[0], &mut flags).unwrap_or(0);
+        let max_bytes = number(f[1], &mut flags).unwrap_or(0);
+        let budget = number(f[2], &mut flags).unwrap_or(0);
+        let estimate = number(f[3], &mut flags).unwrap_or(0);
+        let mut segments: Vec<(i64, u8)> = Vec::new();
+        if !f[4].is_empty() {
+            for item in split_on(f[4], b'|') {
+                let (size, state) = match memchr(b':', item) {
+                    Some(colon) => (&item[..colon], &item[colon + 1..]),
+                    None => (item, &b""[..]),
+                };
+                let size = digits(size, 15).unwrap_or_else(|| {
+                    flags |= 1;
+                    0
+                });
+                let state = match state {
+                    b"" | b"ok" => 0,
+                    b"retry" => 1,
+                    b"alt" => 2,
+                    b"missing" => 3,
+                    _ => {
+                        flags |= 8;
+                        3
+                    }
+                };
+                segments.push((size, state));
+            }
+        }
+        let count = segments.len() as i64;
+        let start = if max_bytes > 0 { from } else { count };
+        if start > count {
+            flags |= 4;
+        }
+        let (mut index, mut written, mut spent) = (start, 0i64, 0i64);
+        let (mut attempts, mut retries, mut alternates) = (0i64, 0i64, 0i64);
+        let reason = loop {
+            if index >= count {
+                break 0;
+            }
+            if written >= max_bytes {
+                break 1;
+            }
+            if budget > 0 && spent + estimate > budget {
+                break 2;
+            }
+            let (size, state) = segments[index as usize];
+            attempts += i64::from(state.min(2)) + 1;
+            if state > 0 {
+                retries += 1;
+            }
+            if state == 3 {
+                break 3;
+            }
+            alternates += i64::from(state == 2);
+            spent = (spent + size).min(SPENT_CAP);
+            written += size.min(max_bytes - written);
+            index += 1;
+        };
+        out.copy_from_slice(&[
+            count, start, index, written, spent, attempts, retries, alternates, reason, flags,
+        ]);
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes the
+            /// helper's fixed words per record and returns the words written, `-needed` when
+            /// `out_cap` is too small (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(
+                        count, flags, data, data_len, ints, ints_len, out, out_cap, $width, $plan,
+                    )
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `FfmpegFrameGrabber::w64FfmpegGrabberPlanBatch()` (see [`ffmpeg_plan`]).
+        nntmux_w645_ffmpeg_grabber_plan, 10, ffmpeg_plan
+    );
+    entry!(
+        /// `FrameQualityScorer::w64FrameQualityPlanBatch()` (see [`frame_plan`]).
+        nntmux_w645_frame_quality_plan, 10, frame_plan
+    );
+    entry!(
+        /// `ImageCandidateRanker::w64ImageRankerPlanBatch()` (see [`ranker_plan`]).
+        nntmux_w645_image_ranker_plan, 10, ranker_plan
+    );
+    entry!(
+        /// `ImageInspector::w64ImageInspectorPlanBatch()` (see [`inspector_plan`]).
+        nntmux_w645_image_inspector_plan, 9, inspector_plan
+    );
+    entry!(
+        /// `MediaArticleFetcher::w64ArticleFetcherPlanBatch()` (see [`fetcher_plan`]).
+        nntmux_w645_article_fetcher_plan, 10, fetcher_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [(Entry, usize); 5] = [
+            (nntmux_w645_ffmpeg_grabber_plan, 10),
+            (nntmux_w645_frame_quality_plan, 10),
+            (nntmux_w645_image_ranker_plan, 10),
+            (nntmux_w645_image_inspector_plan, 9),
+            (nntmux_w645_article_fetcher_plan, 10),
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Vec<i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        #[test]
+        fn w645_ffmpeg_plans_seek_and_scale() {
+            assert_eq!(
+                call(
+                    nntmux_w645_ffmpeg_grabber_plan,
+                    &[
+                        b"5400000\t1920\t1080\t6\t60000\t300000\tmatroska",
+                        b"",
+                        b"01:30:00.5\t1280\t721\t4\t\t\tmov",
+                        b"100000\t640\t480\t0\t99000\t50\tmp4\textra",
+                        b"x\t\t7\t65\t5\t2\t MOV ",
+                    ]
+                ),
+                vec![
+                    5400000, 60000, 300000, 6, 1560000, 1280, 720, 1, 21, 0, //
+                    0, 0, 0, 1, 0, 0, 0, 0, 19, 34, //
+                    5400500, 0, 1350125, 4, 4050375, 1280, 720, 5, 21, 64, //
+                    100000, 90000, 50, 1, 90000, 640, 480, -1, 19, 30, //
+                    0, 5, 2, 64, 131, 0, 0, -1, 19, 45,
+                ]
+            );
+            assert_eq!(clock_ms(b"1:30:00.5"), Some(5_400_500));
+            assert_eq!(clock_ms(b"0:00:10.123456"), Some(10_123));
+            assert_eq!(clock_ms(b"12345678:00:00"), None);
+            assert_eq!(clock_ms(b"1:30:00."), None);
+            assert_eq!(clock_ms(b"1:2:03"), None);
+        }
+
+        #[test]
+        fn w645_frame_plans_measure_and_rank() {
+            let letterbox = format!("4\t4\t{0}4080602060208040{0}", "00".repeat(4));
+            assert_eq!(
+                call(
+                    nntmux_w645_frame_quality_plan,
+                    &[
+                        b"2\t2\t1040c0f0",
+                        b"",
+                        letterbox.as_bytes(),
+                        b"2\t2\t000000",
+                        b"1\t2\t8080",
+                        b"2\t1\t0G00",
+                        b"3\t1\t000000",
+                        b"2\t2\tFFFFF0F0",
+                    ]
+                ),
+                vec![
+                    0,
+                    128000,
+                    91000,
+                    224,
+                    4,
+                    0,
+                    0,
+                    5,
+                    5 << 32 | 91000,
+                    0, //
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    2, //
+                    0,
+                    40000,
+                    47312,
+                    128,
+                    5,
+                    2,
+                    0,
+                    4,
+                    4 << 32 | 47312,
+                    0, //
+                    3,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0, //
+                    0,
+                    128000,
+                    0,
+                    0,
+                    1,
+                    0,
+                    0,
+                    1,
+                    1 << 32,
+                    0, //
+                    2,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0, //
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                    1,
+                    3,
+                    1,
+                    1 << 32,
+                    0, //
+                    0,
+                    247500,
+                    7500,
+                    15,
+                    2,
+                    0,
+                    0,
+                    1,
+                    1 << 32 | 7500,
+                    4,
+                ]
+            );
+            assert_eq!(
+                call(
+                    nntmux_w645_frame_quality_plan,
+                    &[b"1048576\t1\t", b"1024\t1025\tab", b"1048577\t1\tab"]
+                ),
+                vec![
+                    2, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+                    1, 0, 0, 0, 0, 0, 0, 0, 0, 8, //
+                    1, 0, 0, 0, 0, 0, 0, 0, 0, 8,
+                ]
+            );
+        }
+
+        #[test]
+        fn w645_ranker_plans_order_candidates() {
+            assert_eq!(
+                call(
+                    nntmux_w645_image_ranker_plan,
+                    &[
+                        b"Movie.2024.screens.jpg\t1920\t1080\t512000\t",
+                        b"",
+                        b"[1/5] - \"CD1.Cover.JPEG\" yEnc\t100\t900\t0\t",
+                        b"C:\\rel\\contact-sheets.png\t70000\t\t2048\tcover",
+                        b"dir/sheets.webp/\t640\t480\tx\tbogus\textra",
+                    ]
+                ),
+                vec![
+                    0,
+                    0,
+                    1,
+                    1920,
+                    1080,
+                    3,
+                    512000,
+                    246,
+                    3 << 50 | 3 << 48 | (1920 * 1080) << 16 | 500,
+                    0, //
+                    2,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1 << 50,
+                    18, //
+                    3,
+                    0,
+                    2,
+                    100,
+                    900,
+                    1,
+                    0,
+                    0,
+                    1 << 48 | 90000 << 16,
+                    32, //
+                    1,
+                    1,
+                    3,
+                    65535,
+                    0,
+                    0,
+                    2048,
+                    0,
+                    2 << 50 | 2,
+                    4, //
+                    2,
+                    0,
+                    5,
+                    640,
+                    480,
+                    3,
+                    0,
+                    0,
+                    1 << 50 | 3 << 48 | 307200 << 16,
+                    11,
+                ]
+            );
+            assert_eq!(keyword_rank(b"contact sheets.jpg"), 0);
+            assert_eq!(keyword_rank(b"contact__sheets.jpg"), 2);
+            assert_eq!(keyword_rank(b"sheets.jpg"), 2);
+            assert_eq!(keyword_rank(b"cd12abc.jpg"), 3);
+            assert_eq!(keyword_rank(b"cover.back.jpg"), 3);
+            assert_eq!(keyword_rank(b"xcover.jpg"), 2);
+            assert_eq!(quoted(b"\"\"abc\""), Some(&b"abc"[..]));
+            assert_eq!(quoted(b"\"\"\""), None);
+        }
+
+        #[test]
+        fn w645_inspector_plans_check_headers_and_tails() {
+            let png = hex(b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\x03\x20\0\0\x02\x58\x08\x02\0\0\0");
+            let jpeg = hex(
+                b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xFF\xC0\x00\x11\x08\x00\x78\x00\xa0\x03",
+            );
+            let gif = hex(b"GIF89a\x40\x01\xf0\x00");
+            let webp = hex(b"RIFF\x88\x13\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0\x8f\x01\0\x2b\x01\0");
+            let records = [
+                format!(
+                    "4096\t{png}\t{}",
+                    hex(b"data\0\0\0\0IEND\xae\x42\x60\x82\r\n")
+                ),
+                String::new(),
+                format!("2048\t{jpeg}\t{}", hex(b"....\xFF\xD9")),
+                format!("999\t{gif}\t3b0a"),
+                format!("5008\t{}\t", webp.to_uppercase()),
+                format!("5007\t{webp}\t"),
+                format!("10\t{png}\tzz"),
+                format!("9000\t{}\t49454e44", &png[..32]),
+            ];
+            let records: Vec<&[u8]> = records.iter().map(String::as_bytes).collect();
+            assert_eq!(
+                call(nntmux_w645_image_inspector_plan, &records),
+                vec![
+                    3, 800, 600, 1, 1, 480000, 1, 0, 0, //
+                    0, 0, 0, 0, 0, 0, 0, 1, 2, //
+                    2, 160, 120, 1, 0, 19200, 0, 4, 0, //
+                    1, 320, 240, 1, 1, 76800, 0, 2, 0, //
+                    18, 400, 300, 1, 1, 120000, 1, 0, 16, //
+                    18, 400, 300, 0, 1, 120000, 0, 5, 0, //
+                    3, 800, 600, 0, 1, 480000, 0, 6, 8, //
+                    3, 0, 0, 1, 0, 0, 0, 3, 0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w645_fetcher_plans_walk_segments() {
+            assert_eq!(
+                call(
+                    nntmux_w645_article_fetcher_plan,
+                    &[
+                        b"0\t2500\t0\t0\t1000|1000:retry|1000:alt|1000",
+                        b"",
+                        b"1\t10000\t2500\t1000\t700|800:ok|900|1000",
+                        b"0\t5000\t\t\t500|x:missing|500",
+                        b"7\t100\t\t\t1|2",
+                        b"0\t\t\t\t1|2|3",
+                        b"0\t9\t\t\t5:bogus\textra",
+                    ]
+                ),
+                vec![
+                    4, 0, 3, 2500, 3000, 6, 2, 1, 1, 0, //
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 2, //
+                    4, 1, 3, 1700, 1700, 2, 0, 0, 2, 0, //
+                    3, 0, 1, 500, 500, 4, 1, 0, 3, 1, //
+                    2, 7, 7, 0, 0, 0, 0, 0, 0, 4, //
+                    3, 3, 3, 0, 0, 0, 0, 0, 0, 0, //
+                    1, 0, 0, 0, 0, 3, 1, 0, 3, 10,
+                ]
+            );
+        }
+
+        #[test]
+        fn w645_entries_validate_the_abi() {
+            for (entry, width) in ENTRIES {
+                let data = b"a\0b\0c";
+                let mut out = [7i64; 64];
+                let call = |count: usize, flags: i64, len: usize, cap: usize, out: *mut i64| unsafe {
+                    entry(
+                        count,
+                        flags,
+                        data.as_ptr(),
+                        len,
+                        std::ptr::null(),
+                        0,
+                        out,
+                        cap,
+                    )
+                };
+                let needed = (3 * width) as i64;
+                assert_eq!(call(3, 0, 5, 64, out.as_mut_ptr()), needed);
+                assert_eq!(call(3, 0, 5, 3 * width - 1, out.as_mut_ptr()), -needed);
+                assert_eq!(call(3, 1, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(4, 0, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(2, 0, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(0, 0, 0, 0, std::ptr::null_mut()), 0);
+                assert_eq!(call(3, 0, 5, 4, std::ptr::null_mut()), -1);
+                let ints = 1u64.to_le_bytes();
+                let with_ints = unsafe {
+                    entry(
+                        3,
+                        0,
+                        data.as_ptr(),
+                        5,
+                        ints.as_ptr(),
+                        8,
+                        out.as_mut_ptr(),
+                        64,
+                    )
+                };
+                assert_eq!(with_ints, -1);
+                let overlapping = unsafe {
+                    entry(
+                        1,
+                        0,
+                        out.as_ptr().cast(),
+                        8,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        64,
+                    )
+                };
+                assert_eq!(overlapping, -1);
+                let misaligned = unsafe {
+                    entry(
+                        3,
+                        0,
+                        data.as_ptr(),
+                        5,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr().cast::<u8>().add(1).cast(),
+                        8,
+                    )
+                };
+                assert_eq!(misaligned, -1);
+            }
+        }
+    }
+}
+
+/// Wave 65.5: batch API capabilities, release row cache, usage quota, user resolver and v1 presenter plans
+/// over NUL-joined tab-separated records (see the PHP `w65*PlanBatchPhp()` twins).
+mod wave65_5_api_capabilities_cache_usage_user_resolver_v1_presenter {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Plan callback: record bytes and its output words.
+    type Plan = fn(&[u8], &mut [i64]);
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// 1-15 ASCII digits as an integer.
+    fn digits(field: &[u8]) -> Option<i64> {
+        if field.is_empty() || field.len() > 15 {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// Trimmed 1-15 digits; empty yields `default`, anything else sets bit 1 and yields `default`.
+    fn number(field: &[u8], default: i64, flags: &mut i64) -> i64 {
+        match trim(field) {
+            b"" => default,
+            text => digits(text).unwrap_or_else(|| {
+                *flags |= 1;
+                default
+            }),
+        }
+    }
+
+    /// `data` split on `separator` like `<[u8]>::split()`, searching a word at a time.
+    fn split_on(data: &[u8], separator: u8) -> impl Iterator<Item = &[u8]> {
+        let mut rest = Some(data);
+        std::iter::from_fn(move || {
+            let current = rest?;
+            match memchr(separator, current) {
+                Some(at) => {
+                    rest = Some(&current[at + 1..]);
+                    Some(&current[..at])
+                }
+                None => {
+                    rest = None;
+                    Some(current)
+                }
+            }
+        })
+    }
+
+    /// Up to `N` fields split on `separator` (missing fields empty) and the total field count.
+    fn fields<const N: usize>(record: &[u8], separator: u8) -> ([&[u8]; N], usize) {
+        let mut fields: [&[u8]; N] = [b""; N];
+        let mut total = 0usize;
+        for field in split_on(record, separator) {
+            if total < N {
+                fields[total] = field;
+            }
+            total += 1;
+        }
+        (fields, total)
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records, writing
+    /// `width` words per record straight into `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        width: usize,
+        plan: Plan,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(records) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = records.len() * width;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            for (record, slot) in records.iter().zip(words.chunks_exact_mut(width)) {
+                plan(record, slot);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ApiCapabilitiesService::SEARCHING_V1`/`SEARCHING_V2` keys in declaration order.
+    const FUNCTIONS: [&[u8]; 6] = [
+        b"search",
+        b"tv-search",
+        b"movie-search",
+        b"audio-search",
+        b"book-search",
+        b"anime-search",
+    ];
+
+    /// `ApiCapabilitiesService::SEARCHING_V1` values.
+    const SEARCHING_V1: [&[u8]; 6] = [
+        b"q,group,minsize,maxsize,maxage,cat,limit,offset,attrs,extended,del,sort",
+        b"q,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+        b"q,imdbid,tmdbid,traktid,genre,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+        b"q,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort",
+        b"q,title,author,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort",
+        b"q,anidbid,anilistid,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+    ];
+
+    /// `ApiCapabilitiesService::SEARCHING_V2` values.
+    const SEARCHING_V2: [&[u8]; 6] = [
+        b"id,group,minsize,maxage,cat,limit,offset,cursor,sort",
+        b"id,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxage,limit,offset,cursor,sort",
+        b"id,imdbid,tmdbid,traktid,cat,minsize,maxage,limit,offset,cursor,sort",
+        b"id,cat,minsize,maxage,group,limit,offset,cursor,sort",
+        b"id,cat,minsize,maxage,group,limit,offset,cursor,sort",
+        b"id,anidbid,anilistid,cat,minsize,maxage,limit,offset,cursor,sort",
+    ];
+
+    /// `ApiCapabilitiesService::w65ApiCapabilitiesPlanBatch()`: eleven words per record.
+    fn capabilities_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<6>(record, b'\t');
+        let mut flags = if total_fields == 6 { 0 } else { 2 };
+        let version = number(f[0], 1, &mut flags);
+        let table = match version {
+            1 => Some(&SEARCHING_V1),
+            2 => Some(&SEARCHING_V2),
+            _ => {
+                flags |= 4;
+                None
+            }
+        };
+        let requested_max = number(f[1], 100, &mut flags);
+        let max = if requested_max < 1 {
+            flags |= 8;
+            1
+        } else {
+            requested_max
+        };
+        let requested_default = number(f[2], 0, &mut flags);
+        let default = if requested_default == 0 {
+            max
+        } else if requested_default > max {
+            flags |= 8;
+            max
+        } else {
+            requested_default
+        };
+        let name = trim(f[3]);
+        let (function, params) = if name.is_empty() {
+            (0, None)
+        } else {
+            match FUNCTIONS.iter().position(|known| *known == name) {
+                Some(at) => (at as i64 + 1, table.map(|table| table[at])),
+                None => {
+                    flags |= 16;
+                    (-1, None)
+                }
+            }
+        };
+        let (mut requested, mut supported, mut mask) = (0i64, 0i64, 0i64);
+        if !f[4].is_empty() {
+            for item in split_on(f[4], b',') {
+                let item = trim(item);
+                if item.is_empty() {
+                    continue;
+                }
+                requested += 1;
+                if let Some(at) =
+                    params.and_then(|list| split_on(list, b',').position(|p| p == item))
+                {
+                    supported += 1;
+                    mask |= 1 << at;
+                }
+            }
+        }
+        let (mut roots, mut parents) = (Vec::new(), Vec::new());
+        if !f[5].is_empty() {
+            for item in split_on(f[5], b'|') {
+                match memchr(b':', item) {
+                    None => match digits(item) {
+                        Some(id) => roots.push(id),
+                        None => flags |= 1,
+                    },
+                    Some(colon) => match (digits(&item[..colon]), digits(&item[colon + 1..])) {
+                        (Some(_), Some(parent)) => parents.push(parent),
+                        _ => flags |= 1,
+                    },
+                }
+            }
+        }
+        roots.sort_unstable();
+        let orphans = parents
+            .iter()
+            .filter(|parent| roots.binary_search(parent).is_err())
+            .count() as i64;
+        out.copy_from_slice(&[
+            version,
+            max,
+            default,
+            function,
+            requested,
+            supported,
+            mask,
+            roots.len() as i64,
+            parents.len() as i64,
+            orphans,
+            flags,
+        ]);
+    }
+
+    /// Slicing-by-8 tables for the zlib CRC-32 PHP's `crc32()` computes.
+    const CRC_TABLES: [[u32; 256]; 8] = {
+        let mut tables = [[0u32; 256]; 8];
+        let mut n = 0;
+        while n < 256 {
+            let mut crc = n as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                crc = if crc & 1 != 0 {
+                    0xEDB8_8320 ^ (crc >> 1)
+                } else {
+                    crc >> 1
+                };
+                bit += 1;
+            }
+            tables[0][n] = crc;
+            n += 1;
+        }
+        let mut t = 1;
+        while t < 8 {
+            n = 0;
+            while n < 256 {
+                let previous = tables[t - 1][n];
+                tables[t][n] = (previous >> 8) ^ tables[0][(previous & 0xff) as usize];
+                n += 1;
+            }
+            t += 1;
+        }
+        tables
+    };
+
+    /// Feeds `bytes` into a running (pre-inverted) CRC-32.
+    fn crc_update(mut crc: u32, bytes: &[u8]) -> u32 {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            let low = crc ^ u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            crc = CRC_TABLES[7][(low & 0xff) as usize]
+                ^ CRC_TABLES[6][((low >> 8) & 0xff) as usize]
+                ^ CRC_TABLES[5][((low >> 16) & 0xff) as usize]
+                ^ CRC_TABLES[4][(low >> 24) as usize]
+                ^ CRC_TABLES[3][usize::from(chunk[4])]
+                ^ CRC_TABLES[2][usize::from(chunk[5])]
+                ^ CRC_TABLES[1][usize::from(chunk[6])]
+                ^ CRC_TABLES[0][usize::from(chunk[7])];
+        }
+        for &byte in rest {
+            crc = (crc >> 8) ^ CRC_TABLES[0][((crc ^ u32::from(byte)) & 0xff) as usize];
+        }
+        crc
+    }
+
+    /// `ApiReleaseRowCache::w65ApiReleaseCachePlanBatch()`: ten words per record.
+    fn cache_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<10>(record, b'\t');
+        let mut flags = if total_fields == 10 { 0 } else { 2 };
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        let mut dropped = 0i64;
+        if !f[2].is_empty() {
+            for item in split_on(f[2], b'&') {
+                let item = trim(item);
+                if item.is_empty() {
+                    dropped += 1;
+                    continue;
+                }
+                let Some(eq) = memchr(b'=', item) else {
+                    dropped += 1;
+                    flags |= 4;
+                    continue;
+                };
+                let (key, value) = (trim(&item[..eq]), trim(&item[eq + 1..]));
+                if key.is_empty() {
+                    dropped += 1;
+                    flags |= 4;
+                    continue;
+                }
+                if value.is_empty() {
+                    dropped += 1;
+                    continue;
+                }
+                let start = buffer.len();
+                buffer.extend_from_slice(key);
+                buffer.push(b'=');
+                buffer.extend_from_slice(value);
+                pairs.push((start, buffer.len()));
+            }
+        }
+        pairs.sort_unstable_by(|a, b| buffer[a.0..a.1].cmp(&buffer[b.0..b.1]));
+        let mut crc = crc_update(!0, b"api_release_rows:");
+        crc = crc_update(crc, trim(f[0]));
+        crc = crc_update(crc, b":");
+        crc = crc_update(crc, trim(f[1]));
+        crc = crc_update(crc, b":");
+        let mut normalized = 0i64;
+        for (at, &(start, end)) in pairs.iter().enumerate() {
+            if at > 0 {
+                crc = crc_update(crc, b"&");
+                normalized += 1;
+            }
+            crc = crc_update(crc, &buffer[start..end]);
+            normalized += (end - start) as i64;
+        }
+        let hash = i64::from(!crc);
+        let ttl = number(f[3], 600, &mut flags).max(1);
+        let jitter = number(f[4], 60, &mut flags);
+        let effective = ttl + if jitter > 0 { hash % (jitter + 1) } else { 0 };
+        let stale = number(f[5], 900, &mut flags).max(effective);
+        let age = number(f[6], -1, &mut flags);
+        let bytes = number(f[7], 0, &mut flags);
+        let budget = number(f[8], 0, &mut flags);
+        let contended = number(f[9], 0, &mut flags) != 0;
+        let status = if age >= 0 && age < effective {
+            1
+        } else if !contended {
+            3
+        } else if age >= 0 && age < stale {
+            2
+        } else {
+            4
+        };
+        out.copy_from_slice(&[
+            hash,
+            pairs.len() as i64,
+            dropped,
+            normalized,
+            effective,
+            stale,
+            status,
+            i64::from(budget == 0 || bytes <= budget),
+            (bytes + 65535) / 65536,
+            flags,
+        ]);
+    }
+
+    /// `UserRole` from a trimmed backing value (1-4) or case-insensitive name; empty is `USER`, else 0.
+    fn role(field: &[u8]) -> i64 {
+        let text = trim(field);
+        if text.is_empty() {
+            return 1;
+        }
+        if let Some(value) = digits(text) {
+            return if (1..=4).contains(&value) { value } else { 0 };
+        }
+        [&b"user"[..], b"admin", b"disabled", b"moderator"]
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(text))
+            .map_or(0, |at| at as i64 + 1)
+    }
+
+    /// Default request and download limits per role (unknown, user, admin, disabled, moderator).
+    const ROLE_LIMITS: [(i64, i64); 5] = [(0, 0), (100, 25), (10_000, 1000), (0, 0), (1000, 100)];
+
+    const WINDOW: i64 = 86_400;
+
+    /// `ApiUsageService::w65ApiUsagePlanBatch()`: eleven words per record.
+    fn usage_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<8>(record, b'\t');
+        let mut flags = if total_fields == 8 { 0 } else { 2 };
+        let role = role(f[0]);
+        if role == 0 {
+            flags |= 4;
+        }
+        let kind = match trim(f[1]) {
+            b"" | b"api" => 0,
+            b"get" | b"nzb" => 1,
+            _ => {
+                flags |= 8;
+                0
+            }
+        };
+        let (role_requests, role_downloads) = ROLE_LIMITS[role as usize];
+        let mut used = number(f[2], 0, &mut flags);
+        let mut downloads = number(f[3], 0, &mut flags);
+        let max_requests = number(f[4], role_requests, &mut flags);
+        let max_downloads = number(f[5], role_downloads, &mut flags);
+        let elapsed = number(f[6], 0, &mut flags);
+        let reset_in = if elapsed >= WINDOW {
+            used = 0;
+            downloads = 0;
+            flags |= 16;
+            WINDOW
+        } else {
+            WINDOW - elapsed
+        };
+        let burst = number(f[7], 0, &mut flags);
+        let per_minute = ((max_requests + 59) / 60).max(1);
+        let status = if role == 3 {
+            4
+        } else if role == 0 {
+            5
+        } else if used >= max_requests {
+            1
+        } else if kind == 1 && downloads >= max_downloads {
+            2
+        } else if burst >= per_minute {
+            3
+        } else {
+            0
+        };
+        let allowed = status == 0;
+        out.copy_from_slice(&[
+            role,
+            kind,
+            max_requests,
+            max_downloads,
+            if allowed { used + 1 } else { 0 },
+            if allowed {
+                max_requests - used - 1
+            } else {
+                (max_requests - used).max(0)
+            },
+            if allowed && kind == 1 {
+                max_downloads - downloads - 1
+            } else {
+                (max_downloads - downloads).max(0)
+            },
+            reset_in,
+            per_minute,
+            status,
+            flags,
+        ]);
+    }
+
+    /// Token format: 0 empty, 1/2/3 lowercase hex of 32/40/64 bytes, 4 other printable ASCII, 5 anything else.
+    fn token_format(token: &[u8]) -> i64 {
+        if token.is_empty() {
+            return 0;
+        }
+        if matches!(token.len(), 32 | 40 | 64)
+            && token
+                .iter()
+                .all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return match token.len() {
+                32 => 1,
+                40 => 2,
+                _ => 3,
+            };
+        }
+        if token.iter().all(|&b| (0x21..=0x7e).contains(&b)) {
+            4
+        } else {
+            5
+        }
+    }
+
+    /// Permission bits per role: 1 API, 2 download, 4 preview, 8 admin, 16 moderate.
+    const ROLE_MASKS: [i64; 5] = [0, 3, 31, 0, 23];
+
+    /// `ApiUserResolver::w65ApiUserResolverPlanBatch()`: eight words per record.
+    fn resolver_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<7>(record, b'\t');
+        let mut flags = if total_fields == 7 { 0 } else { 2 };
+        let (token, source) = if !f[0].is_empty() {
+            (f[0], 0)
+        } else if !f[1].is_empty() {
+            (f[1], 1)
+        } else {
+            (&b""[..], -1)
+        };
+        let version = if token.is_empty() {
+            0
+        } else if trim(f[0]).is_empty() {
+            1
+        } else {
+            2
+        };
+        let format = token_format(token);
+        let status = number(f[2], 0, &mut flags);
+        let verified = number(f[3], 0, &mut flags) != 0;
+        let expires = number(f[4], 0, &mut flags);
+        let now = number(f[5], 0, &mut flags);
+        let role = role(f[6]);
+        if role == 0 {
+            flags |= 8;
+        }
+        let decision = if version == 0 {
+            1
+        } else if format == 5 {
+            2
+        } else if role == 0 {
+            6
+        } else if role == 3 || status != 0 {
+            3
+        } else if version == 1 && !verified {
+            4
+        } else if expires > 0 && now >= expires {
+            5
+        } else {
+            0
+        };
+        let mask = if decision != 0 {
+            0
+        } else {
+            ROLE_MASKS[role as usize] | if version == 2 { 32 } else { 0 }
+        };
+        out.copy_from_slice(&[
+            version,
+            source,
+            token.len() as i64,
+            format,
+            role,
+            decision,
+            mask,
+            flags,
+        ]);
+    }
+
+    /// Extra bytes per input byte when XML-escaped (`htmlspecialchars` with quotes).
+    const XML_EXTRA: [u8; 256] = {
+        let mut table = [0u8; 256];
+        table[b'&' as usize] = 4;
+        table[b'<' as usize] = 3;
+        table[b'>' as usize] = 3;
+        table[b'"' as usize] = 5;
+        table[b'\'' as usize] = 5;
+        table
+    };
+
+    /// Extra bytes per input byte when JSON-escaped with unescaped slashes and Unicode.
+    const JSON_EXTRA: [u8; 256] = {
+        let mut table = [0u8; 256];
+        let mut at = 0;
+        while at < 0x20 {
+            table[at] = 5;
+            at += 1;
+        }
+        table[0x08] = 1;
+        table[0x09] = 1;
+        table[0x0a] = 1;
+        table[0x0c] = 1;
+        table[0x0d] = 1;
+        table[b'"' as usize] = 1;
+        table[b'\\' as usize] = 1;
+        table
+    };
+
+    /// XML and JSON escaped lengths of `text`.
+    fn escaped(text: &[u8]) -> (i64, i64) {
+        let (mut xml, mut json) = (0usize, 0usize);
+        for &byte in text {
+            xml += usize::from(XML_EXTRA[usize::from(byte)]);
+            json += usize::from(JSON_EXTRA[usize::from(byte)]);
+        }
+        ((text.len() + xml) as i64, (text.len() + json) as i64)
+    }
+
+    fn decimal_len(value: i64) -> i64 {
+        value
+            .checked_ilog10()
+            .map_or(1, |digits| i64::from(digits) + 1)
+    }
+
+    const PRESENTER_TYPES: [&[u8]; 7] = [
+        b"caps",
+        b"search",
+        b"tvsearch",
+        b"movie",
+        b"music",
+        b"book",
+        b"details",
+    ];
+
+    const KNOWN_ATTRS: [&[u8]; 14] = [
+        b"size",
+        b"category",
+        b"guid",
+        b"files",
+        b"poster",
+        b"group",
+        b"grabs",
+        b"comments",
+        b"password",
+        b"usenetdate",
+        b"tvdbid",
+        b"imdb",
+        b"season",
+        b"episode",
+    ];
+
+    /// `ApiV1Presenter::w65ApiV1PresenterPlanBatch()`: ten words per record.
+    fn presenter_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<7>(record, b'\t');
+        let mut flags = if total_fields == 7 { 0 } else { 2 };
+        let format = trim(f[0]);
+        let format = if format.is_empty() || format.eq_ignore_ascii_case(b"xml") {
+            0
+        } else if format.eq_ignore_ascii_case(b"json") {
+            1
+        } else {
+            flags |= 4;
+            0
+        };
+        let kind = match trim(f[1]) {
+            b"" => 2,
+            text => match PRESENTER_TYPES.iter().position(|known| *known == text) {
+                Some(at) => at as i64 + 1,
+                None => {
+                    flags |= 8;
+                    0
+                }
+            },
+        };
+        let guid = f[2];
+        let guid_valid = matches!(guid.len(), 32 | 40)
+            && guid.iter().all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !guid_valid && !guid.is_empty() {
+            flags |= 16;
+        }
+        let (title_xml, mut title_json) = escaped(f[3]);
+        if std::str::from_utf8(f[3]).is_err() {
+            flags |= 32;
+            title_json = -1;
+        }
+        let size = number(f[4], 0, &mut flags);
+        let category = number(f[5], 0, &mut flags);
+        let (mut attrs, mut known) = (0i64, 0i64);
+        let (mut attrs_xml, mut attrs_json) = (0i64, 0i64);
+        if !f[6].is_empty() {
+            for item in split_on(f[6], b'|') {
+                let eq = match memchr(b'=', item) {
+                    Some(eq) if eq > 0 => eq,
+                    _ => {
+                        flags |= 1;
+                        continue;
+                    }
+                };
+                let (name, value) = (&item[..eq], &item[eq + 1..]);
+                attrs += 1;
+                if KNOWN_ATTRS.contains(&name) {
+                    known += 1;
+                }
+                let (name_xml, name_json) = escaped(name);
+                let (value_xml, value_json) = escaped(value);
+                attrs_xml += 32 + name_xml + value_xml;
+                attrs_json += 38 + name_json + value_json;
+            }
+        }
+        let shared = 2 * guid.len() as i64 + decimal_len(size) + decimal_len(category);
+        let (xml_bytes, json_bytes) = if kind == 1 {
+            (0, 0)
+        } else {
+            (
+                256 + title_xml + shared + attrs_xml,
+                if title_json < 0 {
+                    -1
+                } else {
+                    192 + title_json + shared + attrs_json + (attrs - 1).max(0)
+                },
+            )
+        };
+        out.copy_from_slice(&[
+            format,
+            kind,
+            i64::from(guid_valid),
+            title_xml,
+            title_json,
+            attrs,
+            known,
+            xml_bytes,
+            json_bytes,
+            flags,
+        ]);
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes the
+            /// helper's fixed words per record and returns the words written, `-needed` when
+            /// `out_cap` is too small (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(
+                        count, flags, data, data_len, ints, ints_len, out, out_cap, $width, $plan,
+                    )
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `ApiCapabilitiesService::w65ApiCapabilitiesPlanBatch()` (see [`capabilities_plan`]).
+        nntmux_w655_api_capabilities_plan, 11, capabilities_plan
+    );
+    entry!(
+        /// `ApiReleaseRowCache::w65ApiReleaseCachePlanBatch()` (see [`cache_plan`]).
+        nntmux_w655_api_release_cache_plan, 10, cache_plan
+    );
+    entry!(
+        /// `ApiUsageService::w65ApiUsagePlanBatch()` (see [`usage_plan`]).
+        nntmux_w655_api_usage_plan, 11, usage_plan
+    );
+    entry!(
+        /// `ApiUserResolver::w65ApiUserResolverPlanBatch()` (see [`resolver_plan`]).
+        nntmux_w655_api_user_resolver_plan, 8, resolver_plan
+    );
+    entry!(
+        /// `ApiV1Presenter::w65ApiV1PresenterPlanBatch()` (see [`presenter_plan`]).
+        nntmux_w655_api_v1_presenter_plan, 10, presenter_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [(Entry, usize); 5] = [
+            (nntmux_w655_api_capabilities_plan, 11),
+            (nntmux_w655_api_release_cache_plan, 10),
+            (nntmux_w655_api_usage_plan, 11),
+            (nntmux_w655_api_user_resolver_plan, 8),
+            (nntmux_w655_api_v1_presenter_plan, 10),
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Vec<i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        fn crc32(bytes: &[u8]) -> i64 {
+            i64::from(!crc_update(!0, bytes))
+        }
+
+        #[test]
+        fn w655_crc_matches_zlib() {
+            assert_eq!(crc32(b""), 0);
+            assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+            assert_eq!(
+                crc32(b"The quick brown fox jumps over the lazy dog"),
+                0x414F_A339
+            );
+            let long: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+            let bytewise = long.iter().fold(!0u32, |crc, &b| {
+                (crc >> 8) ^ CRC_TABLES[0][((crc ^ u32::from(b)) & 0xff) as usize]
+            });
+            assert_eq!(crc32(&long), i64::from(!bytewise));
+        }
+
+        #[test]
+        fn w655_capabilities_plans_limits_params_and_categories() {
+            assert_eq!(
+                call(
+                    nntmux_w655_api_capabilities_plan,
+                    &[
+                        b"1\t100\t50\ttv-search\tq, season ,ep,bogus,,\t5000|5030:5000|5040:7000",
+                        b"",
+                        b"2\t0\t500\tmovie-search\tid,q,cursor,imdbid\t1000|1000|1010:1000|x|1:|:2",
+                        b" 3 \t250\t\tbook-search\tq,author",
+                        b"1\t\t\tSearch\tq\t\textra",
+                    ]
+                ),
+                vec![
+                    1, 100, 50, 2, 4, 3, 769, 1, 2, 1, 0, //
+                    1, 100, 100, 0, 0, 0, 0, 0, 0, 0, 2, //
+                    2, 1, 1, 3, 4, 3, 515, 2, 1, 0, 9, //
+                    3, 250, 250, 5, 2, 0, 0, 0, 0, 0, 6, //
+                    1, 100, 100, -1, 1, 0, 0, 0, 0, 0, 18,
+                ]
+            );
+        }
+
+        #[test]
+        fn w655_cache_plans_keys_ttls_and_status() {
+            let hash = crc32(b"api_release_rows:v2:movies:a=1&b=2");
+            assert_eq!(
+                call(
+                    nntmux_w655_api_release_cache_plan,
+                    &[
+                        b"v1\tsearch\tt=search&q=abc&cat=2000\t600\t60\t900\t30\t4096\t1048576\t0",
+                        b"",
+                        b"v2\tmovies\t b = 2 & a=1 &&noeq&=x&c=\t100\t0\t50\t100\t65537\t65536\t1",
+                        b"v2\tmovies\ta=1&b=2\t100\t0\t150\t120\t\t\t1",
+                        b"v2\tmovies\ta=1&b=2\t100\t0\t150\t\t\t\tx",
+                    ]
+                ),
+                vec![
+                    3_217_350_003,
+                    3,
+                    0,
+                    23,
+                    641,
+                    900,
+                    1,
+                    1,
+                    1,
+                    0, //
+                    crc32(b"api_release_rows:::"),
+                    0,
+                    0,
+                    0,
+                    605,
+                    900,
+                    3,
+                    1,
+                    0,
+                    2, //
+                    hash,
+                    2,
+                    4,
+                    7,
+                    100,
+                    100,
+                    4,
+                    0,
+                    2,
+                    4, //
+                    hash,
+                    2,
+                    0,
+                    7,
+                    100,
+                    150,
+                    2,
+                    1,
+                    0,
+                    0, //
+                    hash,
+                    2,
+                    0,
+                    7,
+                    100,
+                    150,
+                    3,
+                    1,
+                    0,
+                    1,
+                ]
+            );
+            // Pairs sort by their joined bytes, so `a!` (0x21) precedes `a=`.
+            let sorted = call(
+                nntmux_w655_api_release_cache_plan,
+                &[b"v\ts\ta=y&a!=x\t\t\t\t\t\t\t"],
+            );
+            assert_eq!(sorted[0], crc32(b"api_release_rows:v:s:a!=x&a=y"));
+        }
+
+        #[test]
+        fn w655_usage_plans_quota_and_throttle() {
+            assert_eq!(
+                call(
+                    nntmux_w655_api_usage_plan,
+                    &[
+                        b"user\tapi\t10\t2\t\t\t3600\t0",
+                        b"",
+                        b" Admin \tget\t5\t1000\t\t\t100\t1",
+                        b"user\tnzb\t3\t25\t\t\t0\t0",
+                        b"4\tapi\t1000\t0\t\t\t0\t0",
+                        b"disabled\t\t0\t0\t\t\t90000\t0",
+                        b"bogus\tpost\tx",
+                        b"user\tapi\t0\t0\t100\t\t\t2",
+                    ]
+                ),
+                vec![
+                    1, 0, 100, 25, 11, 89, 23, 82800, 2, 0, 0, //
+                    1, 0, 100, 25, 1, 99, 25, 86400, 2, 0, 2, //
+                    2, 1, 10000, 1000, 0, 9995, 0, 86300, 167, 2, 0, //
+                    1, 1, 100, 25, 0, 97, 0, 86400, 2, 2, 0, //
+                    4, 0, 1000, 100, 0, 0, 100, 86400, 17, 1, 0, //
+                    3, 0, 0, 0, 0, 0, 0, 86400, 1, 4, 16, //
+                    0, 0, 0, 0, 0, 0, 0, 86400, 1, 5, 15, //
+                    1, 0, 100, 25, 0, 100, 25, 86400, 2, 3, 0,
+                ]
+            );
+            assert_eq!(role(b" MODERATOR "), 4);
+            assert_eq!(role(b"01"), 1);
+            assert_eq!(role(b"5"), 0);
+            assert_eq!(role(b"adm\xc4\xb1n"), 0);
+        }
+
+        #[test]
+        fn w655_resolver_plans_token_gates() {
+            let sha1 = [b'\t'; 1]
+                .iter()
+                .copied()
+                .chain(b"ab".repeat(20))
+                .chain(*b"\t0\t0\t0\t0\tadmin")
+                .collect::<Vec<u8>>();
+            let sha256 = b"f"
+                .repeat(64)
+                .into_iter()
+                .chain(*b"\t\t1\t0\t\t\tmoderator")
+                .collect::<Vec<u8>>();
+            assert_eq!(
+                call(
+                    nntmux_w655_api_user_resolver_plan,
+                    &[
+                        b"0123456789abcdef0123456789abcdef\t\t0\t1\t0\t0\tuser",
+                        b"",
+                        &sha1,
+                        b" \tkey\t0\t1\t0\t0\t",
+                        b"\tkey with space\t0\t1\t0\t0\t",
+                        &sha256,
+                        b"tok\t\t0\t0\t100\t100\t4",
+                        b"tok\t\t0\t0\t100\t99\t9",
+                        b"\t\t0",
+                    ]
+                ),
+                vec![
+                    2, 0, 32, 1, 1, 0, 35, 0, //
+                    0, -1, 0, 0, 1, 1, 0, 2, //
+                    1, 1, 40, 2, 2, 4, 0, 0, //
+                    1, 0, 1, 5, 1, 2, 0, 0, //
+                    1, 1, 14, 5, 1, 2, 0, 0, //
+                    2, 0, 64, 3, 4, 3, 0, 0, //
+                    2, 0, 3, 4, 4, 5, 0, 0, //
+                    2, 0, 3, 4, 0, 6, 0, 8, //
+                    0, -1, 0, 0, 1, 1, 0, 2,
+                ]
+            );
+        }
+
+        #[test]
+        fn w655_presenter_plans_escapes_and_sizes() {
+            assert_eq!(
+                call(
+                    nntmux_w655_api_v1_presenter_plan,
+                    &[
+                        b"xml\tsearch\t0123456789abcdef0123456789abcdef\tA & B\t1024\t2000\tsize=1024|grabs=3",
+                        b"",
+                        b" JSON \tcaps\t\t\"x\"\n\t\t\t",
+                        b"yaml\tnope\tZZ\t\xff\t5\t\tnoeq|=v|custom=<a>",
+                        b"json\t\t\tA\\B\x01\t\t\tguid=\"x\"",
+                    ]
+                ),
+                vec![
+                    0, 2, 1, 9, 5, 2, 2, 415, 360, 0, //
+                    0, 2, 0, 0, 0, 0, 0, 258, 194, 2, //
+                    1, 1, 0, 14, 7, 0, 0, 0, 0, 0, //
+                    0, 0, 0, 1, -1, 1, 0, 310, -1, 61, //
+                    1, 2, 0, 4, 10, 1, 1, 311, 251, 0,
+                ]
+            );
+            assert_eq!(escaped(b"<\"it's\">"), (29, 10));
+            assert_eq!(decimal_len(0), 1);
+            assert_eq!(decimal_len(999_999_999_999_999), 15);
+        }
+
+        #[test]
+        fn w655_entries_validate_the_abi() {
+            for (entry, width) in ENTRIES {
+                let data = b"a\0b\0c";
+                let mut out = [7i64; 64];
+                let call = |count: usize, flags: i64, len: usize, cap: usize, out: *mut i64| unsafe {
+                    entry(
+                        count,
+                        flags,
+                        data.as_ptr(),
+                        len,
+                        std::ptr::null(),
+                        0,
+                        out,
+                        cap,
+                    )
+                };
+                let needed = (3 * width) as i64;
+                assert_eq!(call(3, 0, 5, 64, out.as_mut_ptr()), needed);
+                assert_eq!(call(3, 0, 5, 3 * width - 1, out.as_mut_ptr()), -needed);
+                assert_eq!(call(3, 1, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(4, 0, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(2, 0, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(0, 0, 0, 0, std::ptr::null_mut()), 0);
+                assert_eq!(call(3, 0, 5, 4, std::ptr::null_mut()), -1);
+                let ints = 1u64.to_le_bytes();
+                let with_ints = unsafe {
+                    entry(
+                        3,
+                        0,
+                        data.as_ptr(),
+                        5,
+                        ints.as_ptr(),
+                        8,
+                        out.as_mut_ptr(),
+                        64,
+                    )
+                };
+                assert_eq!(with_ints, -1);
+                let overlapping = unsafe {
+                    entry(
+                        1,
+                        0,
+                        out.as_ptr().cast(),
+                        8,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        64,
+                    )
+                };
+                assert_eq!(overlapping, -1);
+                let misaligned = unsafe {
+                    entry(
+                        3,
+                        0,
+                        data.as_ptr(),
+                        5,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr().cast::<u8>().add(1).cast(),
+                        8,
+                    )
+                };
+                assert_eq!(misaligned, -1);
+            }
+        }
+    }
+}

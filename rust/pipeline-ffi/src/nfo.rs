@@ -50423,3 +50423,2352 @@ pub mod wave63_2_fingerprint_collector_yenc_decoder_part_service_log_file {
         }
     }
 }
+
+pub mod wave64_2_additional_config_console_batch_result_work_plan_archive_candidate {
+    //! Wave 64.2 batch kernels for ProcessingConfiguration, ConsoleOutputService,
+    //! AdditionalBatchResult, AdditionalWorkPlan and ArchiveCandidate in the Wave 49.2 framing:
+    //! one `i64` word per tab-separated row, a few summary words and one XXH64 digest of the
+    //! preceding words out. Every export takes one NUL-joined string column (exactly `count`
+    //! rows) and returns the word count, `-needed` when `out_cap` (in words) is short, or -1 for
+    //! a null output, a malformed batch, an output overlapping the input or a panic. Rows are
+    //! borrowed from the input and every rule is byte-level ASCII, so the PHP twins agree under
+    //! any `setlocale()`.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, span,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    type Set<T> = HashSet<T, FoldState>;
+    type Map<K, V> = HashMap<K, V, FoldState>;
+
+    fn set<T>(n: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    fn map<K, V>(n: usize) -> Map<K, V> {
+        HashMap::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// PHP `explode("\t", $row, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(row: &[u8]) -> [&[u8]; N] {
+        let mut out = [&row[..0]; N];
+        let mut rest = row;
+        for (k, slot) in out.iter_mut().enumerate() {
+            if k + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'\t') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// PHP `trim()` with its default character set.
+    fn trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    #[inline]
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    #[inline]
+    fn num(d: &[u8]) -> i64 {
+        d.iter()
+            .fold(0i64, |acc, &c| acc * 10 + i64::from(c - b'0'))
+    }
+
+    /// A trimmed field: `Ok(None)` when empty, `Ok(Some(n))` for 1 to `max` ASCII digits,
+    /// otherwise `Err(())` (PHP `w64Int()`: null, int or false).
+    #[inline]
+    fn int(v: &[u8], max: usize) -> Result<Option<i64>, ()> {
+        let v = trim(v);
+        if v.is_empty() {
+            return Ok(None);
+        }
+        if v.len() > max || !all_digits(v) {
+            return Err(());
+        }
+        Ok(Some(num(v)))
+    }
+
+    fn lower(s: &[u8]) -> Vec<u8> {
+        s.iter().map(u8::to_ascii_lowercase).collect()
+    }
+
+    /// PHP `str_contains($hay, $needle)` for a non-empty needle.
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// PHP `strlen((string) $n)` for `$n >= 0`.
+    fn digits(mut n: i64) -> i64 {
+        let mut d = 1;
+        while n >= 10 {
+            n /= 10;
+            d += 1;
+        }
+        d
+    }
+
+    fn push_int(buf: &mut Vec<u8>, mut v: i64) {
+        let mut tmp = [0u8; 20];
+        let mut i = tmp.len();
+        loop {
+            i -= 1;
+            tmp[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        buf.extend_from_slice(&tmp[i..]);
+    }
+
+    /// Message-id shape: 0 empty, 1 valid (no byte <= 0x20, 0x7F, `<` or `>`), 2 invalid.
+    fn id_state(id: &[u8]) -> i64 {
+        if id.is_empty() {
+            0
+        } else if id
+            .iter()
+            .all(|&b| b > 0x20 && b != 0x7F && b != b'<' && b != b'>')
+        {
+            1
+        } else {
+            2
+        }
+    }
+
+    // ---- ProcessingConfiguration -------------------------------------------------------------
+
+    const CONFIG_DEFAULTS: [i64; 6] = [25, 2, 3, 1, 0, 120];
+    const CONFIG_MIN: [i64; 6] = [1, 1, 1, 1, 0, 1];
+    const CONFIG_MAX: [i64; 6] = [1000, 50, 100, 10, 86_400, 86_400];
+    const CONFIG_FEATURES: [&[u8]; 8] = [
+        b"video",
+        b"thumbnails",
+        b"audio",
+        b"jpg",
+        b"mediainfo",
+        b"passwords",
+        b"par2",
+        b"debug",
+    ];
+    /// `"` + path + `" --foreground --signal=KILL ` + seconds + ` "` without path and seconds.
+    const CONFIG_KILL_FIXED: i64 = 32;
+
+    /// 0 empty, 1 absolute, 2 relative, 3 invalid (control byte, DEL or `"`).
+    fn path_kind(p: &[u8]) -> i64 {
+        if p.is_empty() {
+            0
+        } else if p.iter().any(|&b| b < 0x20 || b == 0x7F || b == b'"') {
+            3
+        } else if p[0] == b'/' {
+            1
+        } else {
+            2
+        }
+    }
+
+    pub fn config_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 44);
+        let (mut defaulted_counts, mut clamped_counts, mut invalid_counts) =
+            ([0i64; 6], [0i64; 6], [0i64; 6]);
+        let (mut timeout_kinds, mut ffmpeg_kinds) = ([0i64; 4], [0i64; 4]);
+        let mut features = [0i64; 8];
+        let (mut disabled, mut kill_rows, mut kill_bytes, mut query_total) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut max_segments, mut timeout_total, mut max_release, mut unknown_total) =
+            (0i64, 0i64, 0i64, 0i64);
+        let mut ffmpeg_paths: Set<u32> = set(16);
+        for row in rows {
+            let [q, s, r, p, t, rt, tpath, fpath, feats] = fields::<9>(row);
+            let mut values = [0i64; 6];
+            let (mut defaulted, mut clamped, mut invalid) = (0i64, 0i64, 0i64);
+            for (k, raw) in [q, s, r, p, t, rt].into_iter().enumerate() {
+                let v = match int(raw, 9) {
+                    Err(()) => {
+                        invalid |= 1 << k;
+                        CONFIG_DEFAULTS[k]
+                    }
+                    Ok(None) => {
+                        defaulted |= 1 << k;
+                        CONFIG_DEFAULTS[k]
+                    }
+                    Ok(Some(0)) if k != 4 => {
+                        defaulted |= 1 << k;
+                        CONFIG_DEFAULTS[k]
+                    }
+                    Ok(Some(v)) => v,
+                };
+                let c = v.clamp(CONFIG_MIN[k], CONFIG_MAX[k]);
+                if c != v {
+                    clamped |= 1 << k;
+                }
+                values[k] = c;
+            }
+            let tpath = trim(tpath);
+            let fpath = trim(fpath);
+            let (tkind, fkind) = (path_kind(tpath), path_kind(fpath));
+            let (mut requested, mut unknown) = (0i64, 0i64);
+            for token in feats.split(|&b| b == b',') {
+                let token = trim(token);
+                if token.is_empty() {
+                    continue;
+                }
+                match CONFIG_FEATURES
+                    .iter()
+                    .position(|f| token.eq_ignore_ascii_case(f))
+                {
+                    Some(i) => requested |= 1 << i,
+                    None => unknown += 1,
+                }
+            }
+            let ffmpeg = fkind == 1 || fkind == 2;
+            let effective = if ffmpeg { requested } else { requested & !7 };
+            let active = (tkind == 1 || tkind == 2) && values[4] > 0;
+            let kill_len = if active {
+                CONFIG_KILL_FIXED + tpath.len() as i64 + digits(values[4])
+            } else {
+                1
+            };
+            for k in 0..6 {
+                defaulted_counts[k] += defaulted >> k & 1;
+                clamped_counts[k] += clamped >> k & 1;
+                invalid_counts[k] += invalid >> k & 1;
+            }
+            timeout_kinds[tkind as usize] += 1;
+            ffmpeg_kinds[fkind as usize] += 1;
+            for (k, slot) in features.iter_mut().enumerate() {
+                *slot += effective >> k & 1;
+            }
+            disabled += i64::from(requested & 7 != 0 && !ffmpeg);
+            kill_rows += i64::from(active);
+            kill_bytes += kill_len;
+            query_total += values[0];
+            max_segments = max_segments.max(values[1]);
+            timeout_total += values[4];
+            max_release = max_release.max(values[5]);
+            unknown_total += unknown;
+            if ffmpeg {
+                ffmpeg_paths.insert(crc32(fpath));
+            }
+            out.push(
+                values[0]
+                    | values[1] << 11
+                    | values[2] << 17
+                    | values[3] << 24
+                    | defaulted << 28
+                    | clamped << 34
+                    | invalid << 40
+                    | tkind << 46
+                    | fkind << 48
+                    | effective << 50
+                    | i64::from(active) << 58
+                    | unknown.min(15) << 59,
+            );
+        }
+        out.extend(defaulted_counts);
+        out.extend(clamped_counts);
+        out.extend(invalid_counts);
+        out.extend(timeout_kinds);
+        out.extend(ffmpeg_kinds);
+        out.extend(features);
+        out.extend([
+            disabled,
+            kill_rows,
+            kill_bytes,
+            query_total,
+            max_segments,
+            timeout_total,
+            max_release,
+            unknown_total,
+            ffmpeg_paths.len() as i64,
+        ]);
+        out
+    }
+
+    // ---- ConsoleOutputService ----------------------------------------------------------------
+
+    const CONSOLE_UNITS: [&[u8]; 5] = [b"B", b"KB", b"MB", b"GB", b"TB"];
+    const CONSOLE_SEVERITY: [i64; 8] = [0, 1, 2, 2, 3, 4, 4, 5];
+
+    /// `floor(b * 10 / 1024^unit) / 10` with one decimal and its unit; returns the unit.
+    fn human_size(buf: &mut Vec<u8>, b: i64) -> i64 {
+        let mut unit = 0usize;
+        while unit < 4 && b >= 1i64 << (10 * (unit + 1)) {
+            unit += 1;
+        }
+        let tenths = (b * 10) >> (10 * unit);
+        push_int(buf, tenths / 10);
+        buf.push(b'.');
+        buf.push(b'0' + (tenths % 10) as u8);
+        buf.push(b' ');
+        buf.extend_from_slice(CONSOLE_UNITS[unit]);
+        unit as i64
+    }
+
+    pub fn console_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 27);
+        let (mut kinds, mut severities, mut units) = ([0i64; 8], [0i64; 6], [0i64; 5]);
+        let (mut label_bytes, mut max_label, mut fail_total, mut timeout_seconds, mut start_bytes) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let mut releases: Set<i64> = set(rows.len());
+        let mut sources: Set<u32> = set(16);
+        let mut label = Vec::with_capacity(256);
+        for row in rows {
+            let [kind, a, b, text] = fields::<4>(row);
+            let (kind, a, b) = (int(kind, 2), int(a, 12), int(b, 12));
+            let code = match (kind, a, b) {
+                (Ok(Some(k)), Ok(_), Ok(_)) if k <= 6 => k,
+                _ => 7,
+            };
+            let a = a.ok().flatten().unwrap_or(0);
+            let b = b.ok().flatten().unwrap_or(0);
+            label.clear();
+            let mut unit = 0i64;
+            match code {
+                0 => {
+                    label.extend_from_slice(b"\n[");
+                    push_int(&mut label, a);
+                    label.extend_from_slice(b"][");
+                    unit = human_size(&mut label, b);
+                    label.push(b']');
+                }
+                1 => {
+                    label.extend_from_slice(b"fC");
+                    push_int(&mut label, a);
+                }
+                2 => {
+                    label.extend_from_slice(b"(p2n:");
+                    push_int(&mut label, a);
+                    label.push(b')');
+                }
+                3 => {
+                    label.extend_from_slice(b"(src:");
+                    label.extend_from_slice(text);
+                    label.push(b')');
+                }
+                4 => {
+                    label.extend_from_slice(b" Release ");
+                    push_int(&mut label, a);
+                    label.extend_from_slice(b" timed out after ");
+                    push_int(&mut label, b);
+                    label.push(b's');
+                }
+                5 => {
+                    label.extend_from_slice(b" Release ");
+                    push_int(&mut label, a);
+                    label.extend_from_slice(b" deleted after ");
+                    push_int(&mut label, b);
+                    label.extend_from_slice(b" timeout(s)");
+                }
+                6 => {
+                    label.extend_from_slice(b"Deleted broken release ID ");
+                    push_int(&mut label, a);
+                }
+                _ => {}
+            }
+            let severity = CONSOLE_SEVERITY[code as usize];
+            let len = label.len() as i64;
+            kinds[code as usize] += 1;
+            severities[severity as usize] += 1;
+            label_bytes += len;
+            max_label = max_label.max(len);
+            match code {
+                0 => {
+                    units[unit as usize] += 1;
+                    start_bytes += b;
+                    releases.insert(a);
+                }
+                1 => fail_total += a,
+                3 => {
+                    sources.insert(crc32(text));
+                }
+                4 => {
+                    timeout_seconds += b;
+                    releases.insert(a);
+                }
+                5 | 6 => {
+                    releases.insert(a);
+                }
+                _ => {}
+            }
+            out.push(
+                code | len.min(4095) << 3
+                    | severity << 15
+                    | unit << 18
+                    | i64::from(crc32(&label)) << 22
+                    | digits(a) << 54
+                    | digits(b) << 58,
+            );
+        }
+        out.extend(kinds);
+        out.extend(severities);
+        out.extend(units);
+        out.extend([
+            label_bytes,
+            max_label,
+            fail_total,
+            timeout_seconds,
+            releases.len() as i64,
+            sources.len() as i64,
+            start_bytes,
+        ]);
+        out
+    }
+
+    // ---- AdditionalBatchResult ---------------------------------------------------------------
+
+    /// ProcessingOutcome values in case order (codes 1-12).
+    const RESULT_OUTCOMES: [&[u8]; 12] = [
+        b"completed",
+        b"no-useful-artifacts",
+        b"passworded",
+        b"group-unavailable",
+        b"temporary-workspace-unavailable",
+        b"timed-out",
+        b"deleted-after-timeout",
+        b"deleted-broken-nzb",
+        b"deleted-par2-only",
+        b"not-found",
+        b"awaiting-late-articles",
+        b"failed",
+    ];
+    const RESULT_MEDIA: [&[u8]; 7] = [
+        b"sample",
+        b"jpg",
+        b"video",
+        b"audio",
+        b"mediainfo",
+        b"nfo",
+        b"filelist",
+    ];
+    const RESULT_MAX_ATTEMPTS: i64 = 3;
+
+    /// 0 none, 1 timeout, 2 connection, 3 missing article, 4 password, 5 corrupt, 6 other.
+    fn result_error(e: &[u8]) -> i64 {
+        let e = trim(e);
+        if e.is_empty() {
+            return 0;
+        }
+        let l = lower(e);
+        if contains(&l, b"timeout") || contains(&l, b"timed out") {
+            1
+        } else if contains(&l, b"connection") || contains(&l, b"socket") {
+            2
+        } else if contains(&l, b"no such article") || contains(&l, b"430") {
+            3
+        } else if contains(&l, b"password") {
+            4
+        } else if contains(&l, b"crc") || contains(&l, b"corrupt") {
+            5
+        } else {
+            6
+        }
+    }
+
+    /// 0 empty, 1 passworded, 2 clear, 3 other.
+    fn result_password(p: &[u8]) -> i64 {
+        let p = trim(p);
+        if p.is_empty() {
+            0
+        } else if [b"yes".as_slice(), b"1", b"true"]
+            .iter()
+            .any(|v| p.eq_ignore_ascii_case(v))
+        {
+            1
+        } else if [b"no".as_slice(), b"0", b"false"]
+            .iter()
+            .any(|v| p.eq_ignore_ascii_case(v))
+        {
+            2
+        } else {
+            3
+        }
+    }
+
+    pub fn batch_result_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 48);
+        let (mut outcomes, mut errors, mut passwords) = ([0i64; 13], [0i64; 7], [0i64; 4]);
+        let (mut media_counts, mut flag_counts, mut buckets) = ([0i64; 7], [0i64; 6], [0i64; 5]);
+        let (mut total_elapsed, mut max_elapsed, mut total_attempts, mut artifacts) =
+            (0i64, 0i64, 0i64, 0i64);
+        let mut ids: Set<i64> = set(rows.len());
+        for row in rows {
+            let [id, outcome, elapsed, attempts, password, media, error] = fields::<7>(row);
+            let (id, elapsed, attempts) = (int(id, 12), int(elapsed, 9), int(attempts, 3));
+            let outcome = trim(outcome);
+            let outcome = RESULT_OUTCOMES
+                .iter()
+                .position(|o| outcome.eq_ignore_ascii_case(o))
+                .map_or(0, |p| p as i64 + 1);
+            let eclass = result_error(error);
+            let pw = result_password(password);
+            let (mut mask, mut unknown) = (0i64, 0i64);
+            for token in media.split(|&b| b == b',') {
+                let token = trim(token);
+                if token.is_empty() {
+                    continue;
+                }
+                match RESULT_MEDIA
+                    .iter()
+                    .position(|m| token.eq_ignore_ascii_case(m))
+                {
+                    Some(i) => mask |= 1 << i,
+                    None => unknown += 1,
+                }
+            }
+            let ms = elapsed.ok().flatten().unwrap_or(0);
+            let tries = attempts.ok().flatten().unwrap_or(0);
+            let successful = (1..=3).contains(&outcome);
+            let deleted = (7..=9).contains(&outcome);
+            let retryable = outcome != 0
+                && !successful
+                && !deleted
+                && outcome != 10
+                && (eclass == 1 || eclass == 2 || matches!(outcome, 4 | 5 | 6 | 11))
+                && tries < RESULT_MAX_ATTEMPTS;
+            let conflict = (outcome == 3 && pw == 2) || (outcome == 1 && pw == 1);
+            let duplicate = matches!(id, Ok(Some(v)) if v > 0 && !ids.insert(v));
+            let malformed = id.is_err() || elapsed.is_err() || attempts.is_err() || outcome == 0;
+            let flags = i64::from(successful)
+                | i64::from(deleted) << 1
+                | i64::from(retryable) << 2
+                | i64::from(conflict) << 3
+                | i64::from(duplicate) << 4
+                | i64::from(malformed) << 5;
+            let bucket = [1_000, 10_000, 60_000, 300_000]
+                .iter()
+                .filter(|&&limit| ms >= limit)
+                .count() as i64;
+            outcomes[outcome as usize] += 1;
+            errors[eclass as usize] += 1;
+            passwords[pw as usize] += 1;
+            for (k, slot) in media_counts.iter_mut().enumerate() {
+                *slot += mask >> k & 1;
+            }
+            for (k, slot) in flag_counts.iter_mut().enumerate() {
+                *slot += flags >> k & 1;
+            }
+            buckets[bucket as usize] += 1;
+            total_elapsed += ms;
+            max_elapsed = max_elapsed.max(ms);
+            total_attempts += tries;
+            artifacts += i64::from(mask.count_ones());
+            out.push(
+                outcome
+                    | eclass << 4
+                    | pw << 7
+                    | mask << 9
+                    | flags << 16
+                    | bucket << 22
+                    | tries.min(255) << 25
+                    | (ms / 1000).min(0xF_FFFF) << 33
+                    | unknown.min(7) << 53,
+            );
+        }
+        out.extend(outcomes);
+        out.extend(errors);
+        out.extend(passwords);
+        out.extend(media_counts);
+        out.extend(flag_counts);
+        out.extend(buckets);
+        out.extend([
+            total_elapsed,
+            max_elapsed,
+            total_attempts,
+            ids.len() as i64,
+            artifacts,
+        ]);
+        out
+    }
+
+    // ---- AdditionalWorkPlan ------------------------------------------------------------------
+
+    const WORKPLAN_AUDIO: [&[u8]; 9] = [
+        b"mp3", b"flac", b"ogg", b"wav", b"aac", b"m4a", b"wma", b"ape", b"opus",
+    ];
+    /// Flag letters (case-insensitive): book flood, probe is the only file, mapped names, video
+    /// disabled, audio disabled.
+    const WORKPLAN_FLAGS: &[u8; 5] = b"bpmva";
+    const WORKPLAN_SEGMENT_LIMIT: i64 = 1000;
+
+    pub fn work_plan_eval(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 22);
+        let (mut stage_counts, mut flag_counts) = ([0i64; 8], [0i64; 5]);
+        let (mut supported_rows, mut malformed_rows, mut over_rows) = (0i64, 0i64, 0i64);
+        let (mut total_needed, mut total_deferred, mut max_needed, mut total_archives) =
+            (0i64, 0i64, 0i64, 0i64);
+        let mut media_ids: Set<u32> = set(rows.len());
+        for row in rows {
+            let [
+                samples,
+                jpgs,
+                media,
+                audio,
+                ext,
+                archives,
+                probes,
+                par2,
+                books,
+                budget,
+                flags,
+            ] = fields::<11>(row);
+            let mut malformed = false;
+            let mut count = |v: &[u8]| match int(v, 6) {
+                Ok(n) => n.unwrap_or(0),
+                Err(()) => {
+                    malformed = true;
+                    0
+                }
+            };
+            let [samples, jpgs, archives, probes, par2, books] =
+                [samples, jpgs, archives, probes, par2, books].map(&mut count);
+            let budget = match int(budget, 9) {
+                Ok(Some(b)) if b > 0 => b.min(100),
+                Ok(_) => 2,
+                Err(()) => {
+                    malformed = true;
+                    2
+                }
+            };
+            let media = trim(media);
+            let (media_state, audio_state) = (id_state(media), id_state(trim(audio)));
+            let ext = trim(ext);
+            let ext = ext.strip_prefix(b".").unwrap_or(ext);
+            let known = WORKPLAN_AUDIO.iter().any(|e| ext.eq_ignore_ascii_case(e));
+            let (mut letters, mut unknown) = (0i64, 0i64);
+            for &c in flags {
+                if c == b' ' || c == b',' {
+                    continue;
+                }
+                match WORKPLAN_FLAGS
+                    .iter()
+                    .position(|&f| f == c.to_ascii_lowercase())
+                {
+                    Some(i) => letters |= 1 << i,
+                    None => unknown += 1,
+                }
+            }
+            let (flood, mapped, no_video, no_audio) = (
+                letters & 1 != 0,
+                letters & 4 != 0,
+                letters & 8 != 0,
+                letters & 16 != 0,
+            );
+            let stages = i64::from(samples > 0 && !no_video)
+                | i64::from(jpgs > 0) << 1
+                | i64::from(media_state == 1 && !no_video) << 2
+                | i64::from(audio_state == 1 && known && !no_audio) << 3
+                | i64::from(archives > 0 && !(flood && books > 0)) << 4
+                | i64::from(probes > 0 && archives == 0) << 5
+                | i64::from(par2 > 0 && !mapped) << 6
+                | i64::from(archives > 0 || probes > 0) << 7;
+            let on = |k: u32| stages >> k & 1 != 0;
+            let needed = if on(0) { samples } else { 0 }
+                + if on(1) { jpgs } else { 0 }
+                + (stages >> 2 & 1)
+                + (stages >> 3 & 1)
+                + if on(4) { archives * budget } else { 0 }
+                + if on(5) { probes } else { 0 }
+                + if on(6) { par2 } else { 0 };
+            let over = needed > WORKPLAN_SEGMENT_LIMIT;
+            let supported = stages != 0;
+            for (k, slot) in stage_counts.iter_mut().enumerate() {
+                *slot += stages >> k & 1;
+            }
+            for (k, slot) in flag_counts.iter_mut().enumerate() {
+                *slot += letters >> k & 1;
+            }
+            supported_rows += i64::from(supported);
+            malformed_rows += i64::from(malformed);
+            over_rows += i64::from(over);
+            total_needed += needed;
+            total_deferred += (needed - WORKPLAN_SEGMENT_LIMIT).max(0);
+            max_needed = max_needed.max(needed);
+            total_archives += archives;
+            if media_state == 1 {
+                media_ids.insert(crc32(media));
+            }
+            out.push(
+                stages
+                    | needed.min(0xF_FFFF) << 8
+                    | budget << 28
+                    | letters << 35
+                    | i64::from(malformed) << 40
+                    | i64::from(over) << 41
+                    | i64::from(supported) << 42
+                    | unknown.min(15) << 43
+                    | i64::from(known) << 47
+                    | media_state << 48
+                    | audio_state << 50,
+            );
+        }
+        out.extend(stage_counts);
+        out.extend(flag_counts);
+        out.extend([
+            supported_rows,
+            malformed_rows,
+            over_rows,
+            total_needed,
+            total_deferred,
+            max_needed,
+            total_archives,
+            media_ids.len() as i64,
+        ]);
+        out
+    }
+
+    // ---- ArchiveCandidate --------------------------------------------------------------------
+
+    /// Bytes of first volumes a batch may sample.
+    const ARCHIVE_BUDGET: i64 = 64 << 20;
+
+    /// Family (0 rar, 1 7z, 2 zip, 3 split, 4 file), part order and set stem of a lowercased
+    /// name.
+    fn archive_volume(name: &[u8]) -> (i64, i64, &[u8]) {
+        let file = (4, 1, name);
+        let Some(dot) = name.iter().rposition(|&b| b == b'.') else {
+            return file;
+        };
+        let (base, ext) = (&name[..dot], &name[dot + 1..]);
+        let numbered = |lead: u8| {
+            (ext.len() == 3 || ext.len() == 4) && ext[0] == lead && all_digits(&ext[1..])
+        };
+        let (family, order, base) = if ext == b"rar" {
+            match base.iter().rposition(|&b| b == b'.') {
+                Some(p)
+                    if (5..=8).contains(&(base.len() - p - 1))
+                        && &base[p + 1..p + 5] == b"part"
+                        && all_digits(&base[p + 5..]) =>
+                {
+                    (0, num(&base[p + 5..]), &base[..p])
+                }
+                _ => (0, 1, base),
+            }
+        } else if numbered(b'r') {
+            (0, num(&ext[1..]) + 2, base)
+        } else if ext == b"7z" {
+            (1, 1, base)
+        } else if ext.len() == 3 && all_digits(ext) {
+            match base.strip_suffix(b".7z") {
+                Some(stem) => (1, num(ext), stem),
+                None => (3, num(ext), base),
+            }
+        } else if ext == b"zip" || ext == b"zipx" {
+            (2, 1, base)
+        } else if numbered(b'z') {
+            (2, num(&ext[1..]) + 1, base)
+        } else {
+            return file;
+        };
+        if base.is_empty() {
+            file
+        } else {
+            (family, order, base)
+        }
+    }
+
+    /// 0 unknown, 1 under 1 MiB, 2 up to 16 MiB, 3 up to 4 GiB, 4 larger.
+    fn archive_class(bytes: Option<i64>) -> i64 {
+        match bytes {
+            None => 0,
+            Some(b) if b < 1 << 20 => 1,
+            Some(b) if b <= 16 << 20 => 2,
+            Some(b) if b <= 4 << 30 => 3,
+            Some(_) => 4,
+        }
+    }
+
+    pub fn archive_candidate_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 19);
+        let (mut families, mut classes) = ([0i64; 5], [0i64; 5]);
+        let (mut first_rows, mut included_bytes, mut total_bytes) = (0i64, 0i64, 0i64);
+        let (mut malformed_rows, mut dup_rows, mut max_order) = (0i64, 0i64, 0i64);
+        let mut keys: Map<Vec<u8>, usize> = map(rows.len());
+        let mut sets: Vec<(usize, bool)> = Vec::with_capacity(rows.len());
+        let mut sources: Set<i64> = set(rows.len());
+        let mut key = Vec::with_capacity(128);
+        for (index, row) in rows.iter().enumerate() {
+            let [name, segments, bytes, source] = fields::<4>(row);
+            let name = lower(trim(name));
+            let (family, order, base) = archive_volume(&name);
+            let (segments, bytes, source) = (int(segments, 6), int(bytes, 12), int(source, 9));
+            let malformed = segments.is_err() || bytes.is_err() || source.is_err();
+            let bytes = bytes.ok().flatten();
+            let first = order <= 1;
+            key.clear();
+            key.push(b'0' + family as u8);
+            key.extend_from_slice(base);
+            let set_index = match keys.get(key.as_slice()) {
+                Some(&s) => s,
+                None => {
+                    keys.insert(key.clone(), sets.len());
+                    sets.push((index, false));
+                    sets.len() - 1
+                }
+            };
+            sets[set_index].1 |= first;
+            let leader = sets[set_index].0 as i64;
+            let class = archive_class(bytes);
+            let included = match bytes {
+                Some(b) if first && family != 4 && included_bytes + b <= ARCHIVE_BUDGET => {
+                    included_bytes += b;
+                    true
+                }
+                _ => false,
+            };
+            let dup = matches!(source, Ok(Some(v)) if !sources.insert(v));
+            families[family as usize] += 1;
+            classes[class as usize] += 1;
+            first_rows += i64::from(first);
+            total_bytes += bytes.unwrap_or(0);
+            malformed_rows += i64::from(malformed);
+            dup_rows += i64::from(dup);
+            max_order = max_order.max(order);
+            out.push(
+                family
+                    | i64::from(first) << 3
+                    | order.min(0xFFFF) << 4
+                    | class << 20
+                    | i64::from(included) << 23
+                    | i64::from(dup) << 24
+                    | i64::from(malformed) << 25
+                    | leader.min(0xF_FFFF) << 26
+                    | (i64::from(crc32(base)) & 0xFFFF) << 46,
+            );
+        }
+        out.extend(families);
+        out.extend(classes);
+        out.extend([
+            first_rows,
+            sets.len() as i64,
+            sets.iter().filter(|s| !s.1).count() as i64,
+            included_bytes,
+            total_bytes,
+            malformed_rows,
+            dup_rows,
+            max_order,
+        ]);
+        out
+    }
+
+    // ---- Exports -----------------------------------------------------------------------------
+
+    macro_rules! export {
+        ($name:ident, $plan:ident) => {
+            /// # Safety
+            /// `items` must be readable for `items_len` bytes and `out` writable for `out_cap`
+            /// words.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                items: *const u8,
+                items_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let inputs = [(items, items_len)];
+                unsafe {
+                    emit(out, out_cap, count, &inputs, || {
+                        Some($plan(&column(span(items, items_len)?, count)?))
+                    })
+                }
+            }
+        };
+    }
+
+    export!(nntmux_w642_processing_config_plan_batch, config_plan);
+    export!(nntmux_w642_console_output_plan_batch, console_plan);
+    export!(nntmux_w642_batch_result_plan_batch, batch_result_plan);
+    export!(nntmux_w642_work_plan_eval_batch, work_plan_eval);
+    export!(
+        nntmux_w642_archive_candidate_plan_batch,
+        archive_candidate_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn refs<'a>(v: &[&'a str]) -> Vec<&'a [u8]> {
+            v.iter().map(|s| s.as_bytes()).collect()
+        }
+
+        #[test]
+        fn w642_helpers_follow_php() {
+            assert_eq!(fields::<3>(b"a\tb\tc\td"), [b"a".as_slice(), b"b", b"c\td"]);
+            assert_eq!(int(b" 42 ", 3), Ok(Some(42)));
+            assert_eq!(int(b"", 3), Ok(None));
+            assert_eq!(int(b"1234", 3), Err(()));
+            assert_eq!(
+                (digits(0), digits(9), digits(10), digits(999_999)),
+                (1, 1, 2, 6)
+            );
+            assert!(contains(b"read timed out", b"timed out") && !contains(b"x", b"xy"));
+            assert_eq!(id_state(b"a@b"), 1);
+            assert_eq!(id_state(b"<a@b>"), 2);
+            assert_eq!(path_kind(b"/usr/bin/timeout"), 1);
+            assert_eq!(path_kind(b"timeout"), 2);
+            assert_eq!(path_kind(b"a\"b"), 3);
+            let mut buf = Vec::new();
+            assert_eq!(human_size(&mut buf, 1_572_864), 2);
+            assert_eq!(buf, b"1.5 MB");
+            assert_eq!(archive_volume(b"x.part01.rar"), (0, 1, b"x".as_slice()));
+            assert_eq!(
+                archive_volume(b"x.part12345.rar"),
+                (0, 1, b"x.part12345".as_slice())
+            );
+            assert_eq!(archive_volume(b"x.r00"), (0, 2, b"x".as_slice()));
+            assert_eq!(archive_volume(b"x.7z.002"), (1, 2, b"x".as_slice()));
+            assert_eq!(archive_volume(b"x.mkv.001"), (3, 1, b"x.mkv".as_slice()));
+            assert_eq!(archive_volume(b"x.z01"), (2, 2, b"x".as_slice()));
+            assert_eq!(archive_volume(b".7z.001"), (4, 1, b".7z.001".as_slice()));
+            assert_eq!(archive_volume(b"x"), (4, 1, b"x".as_slice()));
+        }
+
+        #[test]
+        fn w642_config_rows_default_clamp_and_gate_features() {
+            let words = config_plan(&refs(&[
+                "\t0\t500\t20\t30\t\t/usr/bin/timeout\t/usr/bin/ffmpeg\tvideo, AUDIO,jpg,bogus",
+                "x\t2\t3\t1\t0\t90\ttimeout\t\tvideo,mediainfo",
+            ]));
+            assert_eq!(
+                words[0],
+                25 | 2 << 11
+                    | 100 << 17
+                    | 10 << 24
+                    | 0b100011 << 28
+                    | 0b1100 << 34
+                    | 1 << 46
+                    | 1 << 48
+                    | 0b1101 << 50
+                    | 1 << 58
+                    | 1 << 59
+            );
+            assert_eq!(
+                words[1],
+                25 | 2 << 11 | 3 << 17 | 1 << 24 | 1 << 40 | 2 << 46 | 0b10000 << 50
+            );
+            assert_eq!(words[2..8], [1, 1, 0, 0, 0, 1]);
+            assert_eq!(words[36..45], [1, 1, 32 + 16 + 2 + 1, 50, 2, 30, 120, 1, 1]);
+        }
+
+        #[test]
+        fn w642_console_rows_format_labels() {
+            let words = console_plan(&refs(&[
+                "0\t7\t1572864\t",
+                "3\t\t\tpar2 index",
+                "4\t9\t120\t",
+                "9\t1\t1\t",
+            ]));
+            assert_eq!(words[0] & 0x7FFF, 12 << 3);
+            assert_eq!(
+                words[0] >> 22 & 0xFFFF_FFFF,
+                i64::from(crc32(b"\n[7][1.5 MB]"))
+            );
+            assert_eq!(words[0] >> 18 & 7, 2);
+            assert_eq!(words[1] & 0x7FFF, 3 | 16 << 3);
+            assert_eq!(words[2] & 0x3FFFF, 4 | 31 << 3 | 3 << 15);
+            assert_eq!(words[3] & 0x3FFFF, 7 | 5 << 15);
+            assert_eq!(words[4..12], [1, 0, 0, 1, 1, 0, 0, 1]);
+            assert_eq!(words[23..30], [59, 31, 0, 120, 2, 1, 1572864]);
+        }
+
+        #[test]
+        fn w642_batch_result_rows_roll_up() {
+            let words = batch_result_plan(&refs(&[
+                "1\tcompleted\t1500\t1\tno\tsample,jpg,x\t",
+                "2\tTIMED-OUT\t400000\t1\t\t\tRead timed out",
+                "2\tpassworded\t\t\tno\t\t",
+                "x\tbogus\t\t\t\t\t",
+            ]));
+            assert_eq!(
+                words[0],
+                1 | 2 << 7 | 3 << 9 | 1 << 16 | 1 << 22 | 1 << 25 | 1 << 33 | 1 << 53
+            );
+            assert_eq!(
+                words[1],
+                6 | 1 << 4 | 4 << 16 | 4 << 22 | 1 << 25 | 400 << 33
+            );
+            assert_eq!(words[2], 3 | 2 << 7 | (1 | 8 | 16) << 16);
+            assert_eq!(words[3], 32 << 16);
+            let tail = &words[4..];
+            assert_eq!(tail[..13], [1, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(tail[13 + 7 + 4 + 7..13 + 7 + 4 + 7 + 6], [2, 0, 1, 1, 1, 1]);
+            assert_eq!(tail[42..47], [401500, 400000, 2, 2, 2]);
+        }
+
+        #[test]
+        fn w642_work_plan_rows_evaluate_stages() {
+            let words = work_plan_eval(&refs(&[
+                "2\t1\t<bad>\tid@x\t.FLAC\t3\t0\t1\t0\t\tm",
+                "0\t0\t\t\t\t0\t2\t0\t0\t5\tV q",
+                "x\t\t\t\t\t2\t\t\t4\t0\tB",
+            ]));
+            assert_eq!(
+                words[0],
+                (1 | 2 | 8 | 16 | 128)
+                    | (2 + 1 + 1 + 6) << 8
+                    | 2 << 28
+                    | 4 << 35
+                    | 1 << 42
+                    | 1 << 47
+                    | 2 << 48
+                    | 1 << 50
+            );
+            assert_eq!(
+                words[1],
+                (32 | 128) | 2 << 8 | 5 << 28 | 8 << 35 | 1 << 42 | 1 << 43
+            );
+            assert_eq!(words[2], 128 | 2 << 28 | 1 << 35 | 1 << 40 | 1 << 42);
+            assert_eq!(words[3..11], [1, 1, 0, 1, 1, 1, 0, 3]);
+            assert_eq!(words[16..24], [3, 1, 0, 12, 0, 10, 5, 0]);
+        }
+
+        #[test]
+        fn w642_archive_rows_group_volumes() {
+            let words = archive_candidate_plan(&refs(&[
+                "Movie.part01.rar\t10\t1000\t0",
+                "movie.part02.rar\t10\t1000\t1",
+                "Movie.r00\t1\t70000000\t1",
+                "x.7z.002\tx\t\t2",
+            ]));
+            assert_eq!(
+                words[0] & ((1 << 46) - 1),
+                1 << 3 | 1 << 4 | 1 << 20 | 1 << 23
+            );
+            assert_eq!(words[1] & ((1 << 46) - 1), 2 << 4 | 1 << 20);
+            assert_eq!(words[2] & ((1 << 46) - 1), 2 << 4 | 3 << 20 | 1 << 24);
+            assert_eq!(words[3] & ((1 << 46) - 1), 1 | 2 << 4 | 1 << 25 | 3 << 26);
+            assert_eq!(words[0] >> 46, i64::from(crc32(b"movie")) & 0xFFFF);
+            assert_eq!(words[4..14], [3, 1, 0, 0, 0, 1, 2, 0, 1, 0]);
+            assert_eq!(words[14..22], [1, 2, 1, 1000, 70002000, 1, 1, 2]);
+        }
+
+        #[test]
+        fn w642_exports_guard_null_short_and_malformed_batches() {
+            let mut out = [0i64; 64];
+            let o = out.as_mut_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w642_processing_config_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    45
+                );
+                assert_eq!(
+                    nntmux_w642_processing_config_plan_batch(b"a".as_ptr(), 1, 1, o, 44),
+                    -45
+                );
+                assert_eq!(
+                    nntmux_w642_console_output_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w642_batch_result_plan_batch(std::ptr::null(), 0, 0, o, 64),
+                    48
+                );
+                assert_eq!(
+                    nntmux_w642_work_plan_eval_batch(b"a".as_ptr(), 1, 1, std::ptr::null_mut(), 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w642_archive_candidate_plan_batch(std::ptr::null(), 1, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w642_archive_candidate_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    20
+                );
+                // An output buffer overlapping the input is refused.
+                let mut shared = [0u8; 512];
+                let p = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w642_archive_candidate_plan_batch(p, 1, 1, p as *mut i64, 64),
+                    -1
+                );
+                // Unaligned outputs are written byte-wise.
+                let mut raw = [0u8; 8 * 30];
+                let unaligned = raw.as_mut_ptr().add(1) as *mut i64;
+                assert_eq!(
+                    nntmux_w642_console_output_plan_batch(b"a".as_ptr(), 1, 1, unaligned, 28),
+                    28
+                );
+            }
+        }
+    }
+}
+
+pub mod wave65_2_additional_nzb_parser_file_manager_archive_fallback_processor_sync {
+    //! Wave 65.2 batch kernels for NzbContentParser, ReleaseFileManager,
+    //! ReleaseFilesArchiveFallback, ReleaseProcessor and ReleaseSearchSyncCoordinator in the
+    //! Wave 49.2 framing: one `i64` word per tab-separated row, a few summary words and one XXH64
+    //! digest of the preceding words out. Every export takes one NUL-joined string column
+    //! (exactly `count` rows) and returns the word count, `-needed` when `out_cap` (in words) is
+    //! short, or -1 for a null output, a malformed batch, an output overlapping the input or a
+    //! panic. Every rule is byte-level ASCII, so the PHP twins agree under any `setlocale()`.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, span,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    type Set<T> = HashSet<T, FoldState>;
+    type Map<K, V> = HashMap<K, V, FoldState>;
+
+    fn set<T>(n: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    fn map<K, V>(n: usize) -> Map<K, V> {
+        HashMap::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// PHP `explode("\t", $row, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(row: &[u8]) -> [&[u8]; N] {
+        let mut out = [&row[..0]; N];
+        let mut rest = row;
+        for (k, slot) in out.iter_mut().enumerate() {
+            if k + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'\t') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// PHP `trim()` with its default character set.
+    fn trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    #[inline]
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    #[inline]
+    fn num(d: &[u8]) -> i64 {
+        d.iter()
+            .fold(0i64, |acc, &c| acc * 10 + i64::from(c - b'0'))
+    }
+
+    /// A trimmed field: `Ok(None)` when empty, `Ok(Some(n))` for 1 to `max` ASCII digits,
+    /// otherwise `Err(())` (PHP `w65Int()`: null, int or false).
+    #[inline]
+    fn int(v: &[u8], max: usize) -> Result<Option<i64>, ()> {
+        let v = trim(v);
+        if v.is_empty() {
+            return Ok(None);
+        }
+        if v.len() > max || !all_digits(v) {
+            return Err(());
+        }
+        Ok(Some(num(v)))
+    }
+
+    fn lower(s: &[u8]) -> Vec<u8> {
+        s.iter().map(u8::to_ascii_lowercase).collect()
+    }
+
+    /// PHP `str_contains($hay, $needle)` for a non-empty needle.
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn one_of(v: &[u8], list: &[&[u8]]) -> bool {
+        list.contains(&v)
+    }
+
+    /// 0 empty, 1 passworded, 2 clear, 3 other.
+    fn password_state(p: &[u8]) -> i64 {
+        let p = trim(p);
+        if p.is_empty() {
+            0
+        } else if [b"yes".as_slice(), b"1", b"true"]
+            .iter()
+            .any(|v| p.eq_ignore_ascii_case(v))
+        {
+            1
+        } else if [b"no".as_slice(), b"0", b"false"]
+            .iter()
+            .any(|v| p.eq_ignore_ascii_case(v))
+        {
+            2
+        } else {
+            3
+        }
+    }
+
+    /// 0 none, 1 timeout, 2 connection, 3 missing article, 4 password, 5 corrupt, 6 other.
+    fn error_class(e: &[u8]) -> i64 {
+        let e = trim(e);
+        if e.is_empty() {
+            return 0;
+        }
+        let l = lower(e);
+        if contains(&l, b"timeout") || contains(&l, b"timed out") {
+            1
+        } else if contains(&l, b"connection") || contains(&l, b"socket") {
+            2
+        } else if contains(&l, b"no such article") || contains(&l, b"430") {
+            3
+        } else if contains(&l, b"password") {
+            4
+        } else if contains(&l, b"crc") || contains(&l, b"corrupt") {
+            5
+        } else {
+            6
+        }
+    }
+
+    /// Splits a comma list into trimmed, non-empty tokens and maps each case-insensitively onto
+    /// `names`: the bit mask of known tokens and the count of unknown ones.
+    fn token_mask(list: &[u8], names: &[&[u8]]) -> (i64, i64) {
+        let (mut mask, mut unknown) = (0i64, 0i64);
+        for token in list.split(|&b| b == b',') {
+            let token = trim(token);
+            if token.is_empty() {
+                continue;
+            }
+            match names.iter().position(|n| token.eq_ignore_ascii_case(n)) {
+                Some(i) => mask |= 1 << i,
+                None => unknown += 1,
+            }
+        }
+        (mask, unknown)
+    }
+
+    /// `(base, extension)` split at the last dot (no dot: the whole name and an empty extension).
+    fn split_ext(name: &[u8]) -> (&[u8], &[u8]) {
+        match name.iter().rposition(|&b| b == b'.') {
+            Some(d) => (&name[..d], &name[d + 1..]),
+            None => (name, &name[..0]),
+        }
+    }
+
+    /// The text after the last dot of `base` and the stem before it.
+    fn last_tail(base: &[u8]) -> Option<(&[u8], &[u8])> {
+        base.iter()
+            .rposition(|&b| b == b'.')
+            .map(|p| (&base[..p], &base[p + 1..]))
+    }
+
+    // ---- NzbContentParser --------------------------------------------------------------------
+
+    const NZB_VIDEO: [&[u8]; 13] = [
+        b"avi", b"mkv", b"mp4", b"m4v", b"mov", b"wmv", b"mpg", b"mpeg", b"ts", b"vob", b"ogv",
+        b"rmvb", b"webm",
+    ];
+    const NZB_AUDIO: [&[u8]; 12] = [
+        b"mp3", b"flac", b"ogg", b"wav", b"aac", b"m4a", b"wma", b"ape", b"opus", b"ac3", b"dts",
+        b"mka",
+    ];
+    const NZB_IMAGE: [&[u8]; 5] = [b"jpg", b"jpeg", b"png", b"gif", b"webp"];
+    const NZB_SUPPORT: [&[u8]; 5] = [b"sfv", b"srr", b"srs", b"nzb", b"txt"];
+
+    /// The trimmed quoted file name of a subject (when the quotes hold at least one byte),
+    /// otherwise the trimmed subject; and whether it was quoted.
+    fn nzb_name(subject: &[u8]) -> (&[u8], bool) {
+        if let Some(q) = subject.iter().position(|&b| b == b'"')
+            && let Some(e) = subject[q + 1..].iter().position(|&b| b == b'"')
+            && e > 0
+        {
+            return (trim(&subject[q + 1..q + 1 + e]), true);
+        }
+        (trim(subject), false)
+    }
+
+    /// The last `(part/total)` of a subject, 1 to 6 digits each.
+    fn yenc_part(s: &[u8]) -> Option<(i64, i64)> {
+        let open = s.iter().rposition(|&b| b == b'(')?;
+        let rest = &s[open + 1..];
+        let slash = rest.iter().position(|&b| b == b'/')?;
+        let close = rest.iter().position(|&b| b == b')')?;
+        if !(1..=6).contains(&slash) || close <= slash + 1 || close - slash - 1 > 6 {
+            return None;
+        }
+        let (a, b) = (&rest[..slash], &rest[slash + 1..close]);
+        (all_digits(a) && all_digits(b)).then(|| (num(a), num(b)))
+    }
+
+    fn is_archive_ext(ext: &[u8]) -> bool {
+        ext == b"rar"
+            || ext == b"7z"
+            || ext == b"zip"
+            || (ext.len() == 3 && ext[0] == b'r' && all_digits(&ext[1..]))
+            || (ext.len() == 3 && all_digits(ext))
+    }
+
+    /// Class (0 other, 1 video, 2 audio, 3 archive, 4 par2, 5 nfo, 6 image, 7 support), group
+    /// stem and PAR2 volume flag of a lowercased file name.
+    fn nzb_class(name: &[u8]) -> (i64, &[u8], bool) {
+        let (base, ext) = split_ext(name);
+        if ext.is_empty() {
+            return (0, base, false);
+        }
+        if is_archive_ext(ext) {
+            let stem = match last_tail(base) {
+                Some((stem, tail))
+                    if (5..=8).contains(&tail.len())
+                        && tail.starts_with(b"part")
+                        && all_digits(&tail[4..]) =>
+                {
+                    stem
+                }
+                _ => base,
+            };
+            return (3, stem, false);
+        }
+        if ext == b"par2" {
+            return match last_tail(base) {
+                Some((stem, tail)) if tail.starts_with(b"vol") => (4, stem, true),
+                _ => (4, base, false),
+            };
+        }
+        let class = if one_of(ext, &NZB_VIDEO) {
+            1
+        } else if one_of(ext, &NZB_AUDIO) {
+            2
+        } else if ext == b"nfo" {
+            5
+        } else if one_of(ext, &NZB_IMAGE) {
+            6
+        } else if one_of(ext, &NZB_SUPPORT) {
+            7
+        } else {
+            0
+        };
+        (class, base, false)
+    }
+
+    pub fn nzb_content_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 30);
+        let (mut class_counts, mut class_bytes) = ([0i64; 8], [0i64; 8]);
+        let (mut sample_rows, mut vol_rows, mut complete_rows, mut malformed_rows) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut dup_rows, mut total_segments, mut total_bytes, mut max_total) =
+            (0i64, 0i64, 0i64, 0i64);
+        let mut groups: Map<Vec<u8>, usize> = map(rows.len());
+        let mut info: Vec<(i64, i64)> = Vec::with_capacity(rows.len());
+        let mut names: Set<Vec<u8>> = set(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            let [subject, segments, bytes] = fields::<3>(row);
+            let (raw, quoted) = nzb_name(subject);
+            let name = lower(raw);
+            let (class, stem, vol) = nzb_class(&name);
+            let (p, t) = yenc_part(subject).unwrap_or((0, 0));
+            let (segments, bytes) = (int(segments, 6), int(bytes, 12));
+            let malformed = name.is_empty() || segments.is_err() || bytes.is_err();
+            let seg = segments.ok().flatten().unwrap_or(0);
+            let b = bytes.ok().flatten().unwrap_or(0);
+            let complete = t > 0 && matches!(segments, Ok(Some(s)) if s >= t);
+            let sample = contains(&name, b"sample");
+            let group = match groups.get(stem) {
+                Some(&g) => g,
+                None => {
+                    groups.insert(stem.to_vec(), info.len());
+                    info.push((index as i64, 0));
+                    info.len() - 1
+                }
+            };
+            info[group].1 |= 1 << class;
+            let leader = info[group].0;
+            let stem_crc = i64::from(crc32(stem)) & 0x3FF;
+            let dup = !name.is_empty() && !names.insert(name);
+            class_counts[class as usize] += 1;
+            class_bytes[class as usize] += b;
+            sample_rows += i64::from(sample);
+            vol_rows += i64::from(vol);
+            complete_rows += i64::from(complete);
+            malformed_rows += i64::from(malformed);
+            dup_rows += i64::from(dup);
+            total_segments += seg;
+            total_bytes += b;
+            max_total = max_total.max(t);
+            out.push(
+                class
+                    | i64::from(sample) << 3
+                    | i64::from(vol) << 4
+                    | i64::from(quoted) << 5
+                    | i64::from(complete) << 6
+                    | i64::from(malformed) << 7
+                    | i64::from(dup) << 8
+                    | p.min(4095) << 9
+                    | t.min(4095) << 21
+                    | leader.min(0xF_FFFF) << 33
+                    | stem_crc << 53,
+            );
+        }
+        out.extend(class_counts);
+        out.extend(class_bytes);
+        let with = |m: i64| info.iter().filter(|g| g.1 & m != 0).count() as i64;
+        out.extend([
+            info.len() as i64,
+            with(8),
+            with(16),
+            with(32),
+            with(6),
+            sample_rows,
+            vol_rows,
+            complete_rows,
+            malformed_rows,
+            dup_rows,
+            total_segments,
+            total_bytes,
+            max_total,
+        ]);
+        out
+    }
+
+    // ---- ReleaseFileManager ------------------------------------------------------------------
+
+    /// Inserts one release may take in a batch (ReleaseFileManager::DEFAULT_RELEASE_FILE_LIMIT).
+    const FILE_LIMIT: i64 = 11;
+
+    /// 0 empty, 1 valid (an optional `0x` and 1 to 8 hex digits) with its value, 2 invalid.
+    fn crc_state(v: &[u8]) -> (i64, i64) {
+        let v = trim(v);
+        if v.is_empty() {
+            return (0, 0);
+        }
+        let hex = if v.len() >= 2 && v[0] == b'0' && (v[1] | 0x20) == b'x' {
+            &v[2..]
+        } else {
+            v
+        };
+        if hex.is_empty() || hex.len() > 8 || !hex.iter().all(u8::is_ascii_hexdigit) {
+            return (2, 0);
+        }
+        let value = hex.iter().fold(0i64, |acc, &c| {
+            acc << 4 | i64::from((c as char).to_digit(16).unwrap_or(0))
+        });
+        (1, value)
+    }
+
+    /// Days since 1970-01-01 of a proleptic Gregorian date (year >= 1970).
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y / 400;
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    /// 0 empty, 1 Unix seconds (1 to 10 digits), 2 `YYYY-MM-DD[ T]HH:MM:SS` (1970-2099, UTC),
+    /// 3 invalid; with the epoch seconds.
+    fn timestamp(v: &[u8]) -> (i64, i64) {
+        let v = trim(v);
+        if v.is_empty() {
+            return (0, 0);
+        }
+        if v.len() <= 10 && all_digits(v) {
+            return (1, num(v));
+        }
+        if v.len() != 19
+            || v[4] != b'-'
+            || v[7] != b'-'
+            || (v[10] != b' ' && v[10] != b'T')
+            || v[13] != b':'
+            || v[16] != b':'
+        {
+            return (3, 0);
+        }
+        let part = |a: usize, b: usize| all_digits(&v[a..b]).then(|| num(&v[a..b]));
+        let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) = (
+            part(0, 4),
+            part(5, 7),
+            part(8, 10),
+            part(11, 13),
+            part(14, 16),
+            part(17, 19),
+        ) else {
+            return (3, 0);
+        };
+        if !(1970..=2099).contains(&y)
+            || !(1..=12).contains(&mo)
+            || !(1..=31).contains(&d)
+            || h > 23
+            || mi > 59
+            || s > 59
+        {
+            return (3, 0);
+        }
+        (
+            2,
+            days_from_civil(y, mo, d) * 86_400 + h * 3_600 + mi * 60 + s,
+        )
+    }
+
+    pub fn release_file_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 26);
+        let (mut actions, mut crcs, mut stamps, mut passwords) =
+            ([0i64; 6], [0i64; 3], [0i64; 4], [0i64; 4]);
+        let (mut insert_bytes, mut update_bytes, mut delta_bytes, mut name_bytes) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut min_ts, mut max_ts, mut missing_rows) = (0i64, 0i64, 0i64);
+        let mut releases: Set<i64> = set(rows.len());
+        let mut inserts: Map<i64, i64> = map(rows.len());
+        let mut seen: Set<(i64, Vec<u8>)> = set(rows.len());
+        for row in rows {
+            let [rid, name, size, crc, ts, pw, existing] = fields::<7>(row);
+            let (rid, size, existing) = (int(rid, 12), int(size, 12), int(existing, 12));
+            let name = trim(name);
+            let (crc, crc_value) = crc_state(crc);
+            let (ts, ts_value) = timestamp(ts);
+            let pw = password_state(pw);
+            let id = match rid {
+                Ok(Some(v)) if v > 0 => v,
+                _ => 0,
+            };
+            let malformed = id == 0 || name.is_empty() || size.is_err() || existing.is_err();
+            let missing = size == Ok(None);
+            let bytes = size.ok().flatten().unwrap_or(0);
+            let mut ordinal = 0i64;
+            let action = if malformed {
+                4
+            } else if !seen.insert((id, lower(name))) {
+                3
+            } else {
+                match existing {
+                    Ok(None) => {
+                        let n = inserts.entry(id).or_insert(0);
+                        *n += 1;
+                        ordinal = *n;
+                        if ordinal > FILE_LIMIT { 5 } else { 0 }
+                    }
+                    Ok(Some(e)) if e == bytes => 2,
+                    Ok(Some(e)) => {
+                        delta_bytes += (bytes - e).abs();
+                        1
+                    }
+                    Err(()) => 4,
+                }
+            };
+            if !malformed {
+                releases.insert(id);
+            }
+            match action {
+                0 => insert_bytes += bytes,
+                1 => update_bytes += bytes,
+                _ => {}
+            }
+            if ts == 1 || ts == 2 {
+                if stamps[1] + stamps[2] == 0 {
+                    (min_ts, max_ts) = (ts_value, ts_value);
+                } else {
+                    min_ts = min_ts.min(ts_value);
+                    max_ts = max_ts.max(ts_value);
+                }
+            }
+            actions[action as usize] += 1;
+            crcs[crc as usize] += 1;
+            stamps[ts as usize] += 1;
+            passwords[pw as usize] += 1;
+            name_bytes += name.len() as i64;
+            missing_rows += i64::from(missing);
+            out.push(
+                action
+                    | crc << 3
+                    | ts << 5
+                    | pw << 7
+                    | i64::from(missing) << 9
+                    | crc_value << 10
+                    | (name.len() as i64).min(4095) << 42
+                    | ordinal.min(511) << 54,
+            );
+        }
+        out.extend(actions);
+        out.extend(crcs);
+        out.extend(stamps);
+        out.extend(passwords);
+        out.extend([
+            releases.len() as i64,
+            insert_bytes,
+            update_bytes,
+            delta_bytes,
+            min_ts,
+            max_ts,
+            name_bytes,
+            missing_rows,
+        ]);
+        out
+    }
+
+    // ---- ReleaseFilesArchiveFallback ---------------------------------------------------------
+
+    const FALLBACK_IMAGE: [&[u8]; 6] = [b"jpg", b"jpeg", b"png", b"gif", b"webp", b"bmp"];
+    const FALLBACK_NFO: [&[u8]; 2] = [b"nfo", b"diz"];
+    const FALLBACK_VIDEO: [&[u8]; 11] = [
+        b"mkv", b"avi", b"mp4", b"m4v", b"mov", b"wmv", b"ts", b"mpg", b"mpeg", b"vob", b"webm",
+    ];
+    const FALLBACK_AUDIO: [&[u8]; 9] = [
+        b"mp3", b"flac", b"ogg", b"wav", b"aac", b"m4a", b"wma", b"ape", b"opus",
+    ];
+    const FALLBACK_JUNK: [&[u8]; 10] = [
+        b"sfv", b"srr", b"srs", b"url", b"exe", b"lnk", b"db", b"par2", b"nzb", b"ini",
+    ];
+
+    /// 0 other, 1 image, 2 nfo, 3 video, 4 audio, 5 nested archive, 6 junk.
+    fn fallback_kind(ext: &[u8]) -> i64 {
+        if one_of(ext, &FALLBACK_IMAGE) {
+            1
+        } else if one_of(ext, &FALLBACK_NFO) {
+            2
+        } else if one_of(ext, &FALLBACK_VIDEO) {
+            3
+        } else if one_of(ext, &FALLBACK_AUDIO) {
+            4
+        } else if ext == b"rar"
+            || ext == b"7z"
+            || ext == b"zip"
+            || (ext.len() == 3 && ext[0] == b'r' && all_digits(&ext[1..]))
+        {
+            5
+        } else if one_of(ext, &FALLBACK_JUNK) {
+            6
+        } else {
+            0
+        }
+    }
+
+    /// 0 unknown, 1 under 64 KiB, 2 under 1 MiB, 3 under 16 MiB, 4 under 1 GiB, 5 larger.
+    fn fallback_class(bytes: Option<i64>) -> i64 {
+        match bytes {
+            None => 0,
+            Some(b) if b < 1 << 16 => 1,
+            Some(b) if b < 1 << 20 => 2,
+            Some(b) if b < 1 << 24 => 3,
+            Some(b) if b < 1 << 30 => 4,
+            Some(_) => 5,
+        }
+    }
+
+    pub fn archive_fallback_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 27);
+        let (mut kinds, mut eligible_kinds) = ([0i64; 7], [0i64; 7]);
+        let (mut junk_rows, mut sample_rows, mut pw_rows, mut dup_rows, mut malformed_rows) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let (mut eligible_bytes, mut max_depth) = (0i64, 0i64);
+        let (mut best, mut best_score) = ([-1i64; 3], [-1i64; 3]);
+        let mut seen: Set<Vec<u8>> = set(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            let [name, size, pw] = fields::<3>(row);
+            let path: Vec<u8> = trim(name)
+                .iter()
+                .map(|&b| {
+                    if b == b'\\' {
+                        b'/'
+                    } else {
+                        b.to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            let (base, depth) = match path.iter().rposition(|&b| b == b'/') {
+                Some(s) => (
+                    &path[s + 1..],
+                    path.iter().filter(|&&b| b == b'/').count() as i64,
+                ),
+                None => (path.as_slice(), 0),
+            };
+            let (_, ext) = split_ext(base);
+            let kind = fallback_kind(ext);
+            let junk = kind == 6 || base.first() == Some(&b'.') || contains(&path, b"__macosx");
+            let sample = contains(base, b"sample");
+            let passworded = password_state(pw) == 1;
+            let size = int(size, 12);
+            let malformed = base.is_empty() || size.is_err();
+            let bytes = size.ok().flatten();
+            let dup = !base.is_empty() && !seen.insert(base.to_vec());
+            let fits = match (kind, bytes) {
+                (1, Some(v)) => (1024..=16 << 20).contains(&v),
+                (2, Some(v)) => (1..=65_536).contains(&v),
+                (3, Some(v)) => (1..=4 << 30).contains(&v),
+                (4, Some(v)) => (1..=512 << 20).contains(&v),
+                _ => false,
+            };
+            let eligible = fits && !junk && !passworded && !dup && !malformed;
+            let b = bytes.unwrap_or(0);
+            let score = match kind {
+                1 => {
+                    100 + if contains(base, b"cover")
+                        || contains(base, b"poster")
+                        || contains(base, b"folder")
+                    {
+                        50
+                    } else {
+                        0
+                    } + if contains(base, b"proof") { 30 } else { 0 }
+                        - if sample { 40 } else { 0 }
+                        + (b >> 16).min(50)
+                        - depth * 5
+                }
+                2 => 300 - depth * 10,
+                3 => 200 - if sample { 150 } else { 0 } + (b >> 24).min(200) - depth * 5,
+                _ => 0,
+            }
+            .clamp(0, 1023);
+            if eligible && (1..=3).contains(&kind) {
+                let k = (kind - 1) as usize;
+                if score > best_score[k] {
+                    (best[k], best_score[k]) = (index as i64, score);
+                }
+            }
+            kinds[kind as usize] += 1;
+            eligible_kinds[kind as usize] += i64::from(eligible);
+            junk_rows += i64::from(junk);
+            sample_rows += i64::from(sample);
+            pw_rows += i64::from(passworded);
+            dup_rows += i64::from(dup);
+            malformed_rows += i64::from(malformed);
+            if eligible {
+                eligible_bytes += b;
+            }
+            max_depth = max_depth.max(depth);
+            out.push(
+                kind | i64::from(junk) << 3
+                    | i64::from(sample) << 4
+                    | i64::from(passworded) << 5
+                    | i64::from(eligible) << 6
+                    | i64::from(dup) << 7
+                    | i64::from(malformed) << 8
+                    | depth.min(15) << 9
+                    | score << 13
+                    | fallback_class(bytes) << 23
+                    | (i64::from(crc32(base)) & 0xFFFF) << 26
+                    | (ext.len() as i64).min(15) << 42,
+            );
+        }
+        out.extend(kinds);
+        out.extend(eligible_kinds);
+        out.extend([
+            junk_rows,
+            sample_rows,
+            pw_rows,
+            dup_rows,
+            malformed_rows,
+            eligible_bytes,
+            best[0],
+            best[1],
+            best[2],
+            best_score[0],
+            best_score[2],
+            max_depth,
+        ]);
+        out
+    }
+
+    // ---- ReleaseProcessor --------------------------------------------------------------------
+
+    /// ProcessingStage backing values in pipeline order (bits 0-12).
+    const PROCESSOR_STAGES: [&[u8]; 13] = [
+        b"workspace-preparation",
+        b"nzb-parsing",
+        b"release-initialization",
+        b"message-id-selection",
+        b"media-source-planning",
+        b"direct-downloads",
+        b"archive-downloads",
+        b"extracted-files",
+        b"media-sources",
+        b"archive-fallbacks",
+        b"timeout-handling",
+        b"finalization",
+        b"workspace-cleanup",
+    ];
+    /// Flag letters (case-insensitive): group unavailable, workspace unavailable, PAR2 only,
+    /// broken NZB, late articles, not found.
+    const PROCESSOR_FLAGS: &[u8; 6] = b"gwpbln";
+    const PROCESSOR_MAX_ATTEMPTS: i64 = 3;
+    const PROCESSOR_TIMEOUT_MS: i64 = 120_000;
+
+    pub fn release_processor_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 51);
+        let (mut outcomes, mut actions, mut stage_counts) = ([0i64; 13], [0i64; 5], [0i64; 13]);
+        let (mut errors, mut passwords) = ([0i64; 7], [0i64; 4]);
+        let (mut timed_rows, mut malformed_rows, mut dup_rows, mut gap_rows) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut total_elapsed, mut max_elapsed, mut total_delay) = (0i64, 0i64, 0i64);
+        let mut ids: Set<i64> = set(rows.len());
+        for row in rows {
+            let [rid, stages, pw, elapsed, timeout, attempts, error, flags] = fields::<8>(row);
+            let (rid, elapsed, timeout, attempts) = (
+                int(rid, 12),
+                int(elapsed, 9),
+                int(timeout, 9),
+                int(attempts, 3),
+            );
+            let (mask, mut unknown) = token_mask(stages, &PROCESSOR_STAGES);
+            let mut letters = 0i64;
+            for &c in flags {
+                if c == b' ' || c == b',' {
+                    continue;
+                }
+                match PROCESSOR_FLAGS
+                    .iter()
+                    .position(|&f| f == c.to_ascii_lowercase())
+                {
+                    Some(i) => letters |= 1 << i,
+                    None => unknown += 1,
+                }
+            }
+            let hi = if mask == 0 {
+                15
+            } else {
+                63 - i64::from(mask.leading_zeros())
+            };
+            let gap = mask != 0 && mask != (1 << (hi + 1)) - 1;
+            let eclass = error_class(error);
+            let pwst = password_state(pw);
+            let ms = elapsed.ok().flatten().unwrap_or(0);
+            let limit = match timeout {
+                Ok(Some(t)) if t > 0 => t,
+                _ => PROCESSOR_TIMEOUT_MS,
+            };
+            let tries = attempts.ok().flatten().unwrap_or(0);
+            let timed_out = ms > limit;
+            let flag = |k: u32| letters >> k & 1 != 0;
+            let outcome = if flag(5) {
+                10
+            } else if flag(3) {
+                8
+            } else if flag(2) {
+                9
+            } else if flag(1) {
+                5
+            } else if flag(0) {
+                4
+            } else if timed_out {
+                if tries + 1 >= PROCESSOR_MAX_ATTEMPTS {
+                    7
+                } else {
+                    6
+                }
+            } else if flag(4) {
+                11
+            } else if pwst == 1 || eclass == 4 {
+                3
+            } else if eclass != 0 {
+                12
+            } else if mask >> 11 & 1 != 0 {
+                if mask & 0b11111 << 5 != 0 { 1 } else { 2 }
+            } else {
+                12
+            };
+            let retryable = matches!(outcome, 4 | 5 | 6 | 11)
+                || (outcome == 12 && (eclass == 1 || eclass == 2));
+            let action = match outcome {
+                1..=3 => 0,
+                7..=9 => 2,
+                10 => 3,
+                _ if retryable && tries < PROCESSOR_MAX_ATTEMPTS => 1,
+                _ => 4,
+            };
+            let delay = if action == 1 {
+                (match outcome {
+                    4 => 300,
+                    5 => 60,
+                    6 => 120,
+                    11 => 900,
+                    _ => 60,
+                }) << tries.min(4)
+            } else {
+                0
+            };
+            let malformed =
+                rid.is_err() || elapsed.is_err() || timeout.is_err() || attempts.is_err();
+            let dup = matches!(rid, Ok(Some(v)) if v > 0 && !ids.insert(v));
+            outcomes[outcome as usize] += 1;
+            actions[action as usize] += 1;
+            for (k, slot) in stage_counts.iter_mut().enumerate() {
+                *slot += mask >> k & 1;
+            }
+            errors[eclass as usize] += 1;
+            passwords[pwst as usize] += 1;
+            timed_rows += i64::from(timed_out);
+            malformed_rows += i64::from(malformed);
+            dup_rows += i64::from(dup);
+            gap_rows += i64::from(gap);
+            total_elapsed += ms;
+            max_elapsed = max_elapsed.max(ms);
+            total_delay += delay;
+            out.push(
+                outcome
+                    | action << 4
+                    | mask << 7
+                    | hi << 20
+                    | i64::from(gap) << 24
+                    | pwst << 25
+                    | eclass << 27
+                    | i64::from(timed_out) << 30
+                    | i64::from(malformed) << 31
+                    | i64::from(dup) << 32
+                    | tries.min(255) << 33
+                    | (delay / 60).min(0xFFF) << 41
+                    | unknown.min(15) << 53
+                    | letters << 57,
+            );
+        }
+        out.extend(outcomes);
+        out.extend(actions);
+        out.extend(stage_counts);
+        out.extend(errors);
+        out.extend(passwords);
+        out.extend([
+            timed_rows,
+            malformed_rows,
+            dup_rows,
+            gap_rows,
+            total_elapsed,
+            max_elapsed,
+            total_delay,
+            ids.len() as i64,
+        ]);
+        out
+    }
+
+    // ---- ReleaseSearchSyncCoordinator --------------------------------------------------------
+
+    const SYNC_OPS: [&[u8]; 4] = [b"update", b"insert", b"delete", b"flush"];
+    /// Search document fields (bits 0-12).
+    const SYNC_FIELDS: [&[u8]; 13] = [
+        b"name",
+        b"searchname",
+        b"fromname",
+        b"categories_id",
+        b"filename",
+        b"size",
+        b"postdate",
+        b"adddate",
+        b"nfo",
+        b"imdbid",
+        b"tvdb",
+        b"haspreview",
+        b"passwordstatus",
+    ];
+    const SYNC_ALL: i64 = (1 << 13) - 1;
+    const SYNC_FLUSH_RELEASES: usize = 100;
+    const SYNC_FLUSH_BYTES: i64 = 1 << 20;
+
+    pub fn search_sync_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 35);
+        let (mut actions, mut ops, mut field_counts) = ([0i64; 8], [0i64; 5], [0i64; 13]);
+        let (mut batches, mut flushed_releases, mut pending_bytes, mut max_batch) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut malformed_rows, mut total_bytes) = (0i64, 0i64);
+        let mut pending: Map<i64, (i64, i64)> = map(SYNC_FLUSH_RELEASES * 2);
+        let mut ids: Set<i64> = set(rows.len());
+        for row in rows {
+            let [rid, op, list, bytes] = fields::<4>(row);
+            let (rid, bytes) = (int(rid, 12), int(bytes, 9));
+            let op_t = trim(op);
+            let op = SYNC_OPS
+                .iter()
+                .position(|o| op_t.eq_ignore_ascii_case(o))
+                .map_or(4, |p| p as i64);
+            let (mut mask, unknown) = token_mask(list, &SYNC_FIELDS);
+            if op == 1 {
+                mask = SYNC_ALL;
+            }
+            let id = match rid {
+                Ok(Some(v)) if v > 0 => v,
+                _ => 0,
+            };
+            let malformed = op == 4 || bytes.is_err() || (op != 3 && id == 0);
+            let b = bytes.ok().flatten().unwrap_or(0);
+            let mut merged = 0i64;
+            let action = if malformed {
+                0
+            } else if op == 3 {
+                6
+            } else if op == 2 {
+                match pending.remove(&id) {
+                    Some((_, held)) => {
+                        pending_bytes -= held;
+                        2
+                    }
+                    None => 3,
+                }
+            } else if let Some(entry) = pending.get_mut(&id) {
+                let next = entry.0 | mask;
+                let a = if next == entry.0 { 5 } else { 4 };
+                entry.0 = next;
+                entry.1 += b;
+                pending_bytes += b;
+                merged = next;
+                a
+            } else if mask == 0 {
+                7
+            } else {
+                pending.insert(id, (mask, b));
+                pending_bytes += b;
+                merged = mask;
+                1
+            };
+            if !malformed {
+                total_bytes += b;
+                if op != 3 {
+                    ids.insert(id);
+                }
+                if op <= 1 {
+                    for (k, slot) in field_counts.iter_mut().enumerate() {
+                        *slot += mask >> k & 1;
+                    }
+                }
+            }
+            let trigger = !malformed
+                && (op == 3
+                    || pending.len() >= SYNC_FLUSH_RELEASES
+                    || pending_bytes >= SYNC_FLUSH_BYTES);
+            let flushed = trigger && !pending.is_empty();
+            if flushed {
+                batches += 1;
+                flushed_releases += pending.len() as i64;
+                max_batch = max_batch.max(pending.len() as i64);
+                pending.clear();
+                pending_bytes = 0;
+            }
+            actions[action as usize] += 1;
+            ops[op as usize] += 1;
+            malformed_rows += i64::from(malformed);
+            out.push(
+                action
+                    | op << 3
+                    | mask << 6
+                    | merged << 19
+                    | i64::from(flushed) << 32
+                    | batches.min(0xFFFF) << 33
+                    | (pending.len() as i64).min(0x3FF) << 49
+                    | unknown.min(15) << 59,
+            );
+        }
+        out.extend(actions);
+        out.extend(ops);
+        out.extend(field_counts);
+        out.extend([
+            batches,
+            flushed_releases,
+            pending.len() as i64,
+            pending_bytes,
+            max_batch,
+            malformed_rows,
+            ids.len() as i64,
+            total_bytes,
+        ]);
+        out
+    }
+
+    // ---- Exports -----------------------------------------------------------------------------
+
+    macro_rules! export {
+        ($name:ident, $plan:ident) => {
+            /// # Safety
+            /// `items` must be readable for `items_len` bytes and `out` writable for `out_cap`
+            /// words.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                items: *const u8,
+                items_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let inputs = [(items, items_len)];
+                unsafe {
+                    emit(out, out_cap, count, &inputs, || {
+                        Some($plan(&column(span(items, items_len)?, count)?))
+                    })
+                }
+            }
+        };
+    }
+
+    export!(nntmux_w652_nzb_content_plan_batch, nzb_content_plan);
+    export!(nntmux_w652_release_file_plan_batch, release_file_plan);
+    export!(
+        nntmux_w652_archive_fallback_plan_batch,
+        archive_fallback_plan
+    );
+    export!(
+        nntmux_w652_release_processor_plan_batch,
+        release_processor_plan
+    );
+    export!(nntmux_w652_search_sync_plan_batch, search_sync_plan);
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn refs<'a>(v: &[&'a str]) -> Vec<&'a [u8]> {
+            v.iter().map(|s| s.as_bytes()).collect()
+        }
+
+        #[test]
+        fn w652_helpers_follow_php() {
+            assert_eq!(fields::<3>(b"a\tb\tc\td"), [b"a".as_slice(), b"b", b"c\td"]);
+            assert_eq!(int(b" 42 ", 3), Ok(Some(42)));
+            assert_eq!(int(b"1234", 3), Err(()));
+            assert_eq!(
+                nzb_name(b"[1/9] - \" Movie.mkv \" yEnc (1/5)"),
+                (b"Movie.mkv".as_slice(), true)
+            );
+            assert_eq!(nzb_name(b"x \"\" y"), (b"x \"\" y".as_slice(), false));
+            assert_eq!(yenc_part(b"a (3/40)"), Some((3, 40)));
+            assert_eq!(yenc_part(b"a (/40)"), None);
+            assert_eq!(yenc_part(b"a (1/1234567)"), None);
+            assert_eq!(nzb_class(b"x.part01.rar"), (3, b"x".as_slice(), false));
+            assert_eq!(nzb_class(b"x.vol03+04.par2"), (4, b"x".as_slice(), true));
+            assert_eq!(nzb_class(b"x.r12"), (3, b"x".as_slice(), false));
+            assert_eq!(nzb_class(b"x.mkv"), (1, b"x".as_slice(), false));
+            assert_eq!(crc_state(b"0xDEADBEEF"), (1, 0xDEAD_BEEF));
+            assert_eq!(crc_state(b"0x"), (2, 0));
+            assert_eq!(crc_state(b"123456789"), (2, 0));
+            assert_eq!(timestamp(b"1700000000"), (1, 1_700_000_000));
+            assert_eq!(timestamp(b"2023-11-14 22:13:20"), (2, 1_700_000_000));
+            assert_eq!(timestamp(b"2000-02-29T00:00:00"), (2, 951_782_400));
+            assert_eq!(timestamp(b"1969-12-31 23:59:59"), (3, 0));
+            assert_eq!(timestamp(b"2023-13-01 00:00:00"), (3, 0));
+            assert_eq!(fallback_kind(b"r05"), 5);
+            assert_eq!(fallback_kind(b"diz"), 2);
+            assert_eq!(error_class(b"Read timed out"), 1);
+            assert_eq!(password_state(b" TRUE "), 1);
+        }
+
+        #[test]
+        fn w652_nzb_rows_classify_and_group() {
+            let words = nzb_content_plan(&refs(&[
+                "\"Movie.part01.rar\" yEnc (1/50)\t50\t1000",
+                "\"movie.vol00+01.par2\" (1/3)\t2\t10",
+                "Movie.Sample.mkv\tx\t",
+                "\"Movie.part01.rar\"\t1\t1",
+            ]));
+            let low = |w: i64| w & ((1 << 53) - 1);
+            assert_eq!(low(words[0]), 3 | 1 << 5 | 1 << 6 | 1 << 9 | 50 << 21);
+            assert_eq!(low(words[1]), 4 | 1 << 4 | 1 << 5 | 1 << 9 | 3 << 21);
+            assert_eq!(low(words[2]), 1 | 1 << 3 | 1 << 7 | 2 << 33);
+            assert_eq!(low(words[3]), 3 | 1 << 5 | 1 << 8);
+            assert_eq!(words[0] >> 53, i64::from(crc32(b"movie")) & 0x3FF);
+            assert_eq!(words[4..12], [0, 1, 0, 2, 1, 0, 0, 0]);
+            assert_eq!(words[12..20], [0, 0, 0, 1001, 10, 0, 0, 0]);
+            assert_eq!(words[20..33], [2, 1, 1, 0, 1, 1, 1, 1, 1, 1, 53, 1011, 50]);
+        }
+
+        #[test]
+        fn w652_file_rows_plan_actions() {
+            let mut rows = vec![
+                "1\tA.mkv\t100\t0xDEADBEEF\t2023-11-14 22:13:20\tno\t".to_string(),
+                "1\ta.MKV\t100\t\t\t\t".to_string(),
+                "1\tb.nfo\t50\tzz\t1700000100\tyes\t50".to_string(),
+                "1\tc.nfo\t70\t1\tbad\t\t50".to_string(),
+                "0\tx\t1\t\t\t\t".to_string(),
+            ];
+            for i in 0..12 {
+                rows.push(format!("2\tf{i}\t\t\t\t\t"));
+            }
+            let words = release_file_plan(&rows.iter().map(|r| r.as_bytes()).collect::<Vec<_>>());
+            assert_eq!(
+                words[0],
+                1 << 3 | 2 << 5 | 2 << 7 | 0xDEAD_BEEF << 10 | 5 << 42 | 1 << 54
+            );
+            assert_eq!(words[1], 3 | 5 << 42);
+            assert_eq!(words[2], 2 | 2 << 3 | 1 << 5 | 1 << 7 | 5 << 42);
+            assert_eq!(words[3], 1 | 1 << 3 | 3 << 5 | 1 << 10 | 5 << 42);
+            assert_eq!(words[4], 4 | 1 << 42);
+            assert_eq!(words[15], 1 << 9 | 3 << 42 | 11 << 54);
+            assert_eq!(words[16], 5 | 1 << 9 | 3 << 42 | 12 << 54);
+            let tail = &words[17..];
+            assert_eq!(
+                tail[..17],
+                [12, 1, 1, 1, 1, 1, 14, 2, 1, 14, 1, 1, 1, 15, 1, 1, 0]
+            );
+            assert_eq!(
+                tail[17..25],
+                [2, 100, 70, 20, 1_700_000_000, 1_700_000_100, 47, 12]
+            );
+        }
+
+        #[test]
+        fn w652_fallback_rows_rank_candidates() {
+            let words = archive_fallback_plan(&refs(&[
+                "Movie/Cover.JPG\t200000",
+                "movie\\movie.nfo\t900",
+                "Movie.Sample.mkv\t50000000",
+                "movie.mkv\t900000000",
+                "__MACOSX/._cover.jpg\t5000",
+                "cover.jpg\t200000\tyes",
+                "x.sfv\tx",
+            ]));
+            assert_eq!(words[0] & ((1 << 23) - 1), 1 | 1 << 6 | 1 << 9 | 148 << 13);
+            assert_eq!(words[1] & ((1 << 23) - 1), 2 | 1 << 6 | 1 << 9 | 290 << 13);
+            assert_eq!(words[2] & ((1 << 23) - 1), 3 | 1 << 4 | 1 << 6 | 52 << 13);
+            assert_eq!(words[3] & ((1 << 23) - 1), 3 | 1 << 6 | 253 << 13);
+            assert_eq!(words[4] & ((1 << 23) - 1), 1 | 1 << 3 | 1 << 9 | 145 << 13);
+            assert_eq!(words[5] & ((1 << 23) - 1), 1 | 1 << 5 | 1 << 7 | 153 << 13);
+            assert_eq!(words[6] & ((1 << 23) - 1), 6 | 1 << 3 | 1 << 8);
+            assert_eq!(words[7..14], [0, 3, 1, 2, 0, 0, 1]);
+            assert_eq!(words[14..21], [0, 1, 1, 2, 0, 0, 0]);
+            assert_eq!(
+                words[21..33],
+                [
+                    2,
+                    1,
+                    1,
+                    1,
+                    1,
+                    200000 + 900 + 50000000 + 900000000,
+                    0,
+                    1,
+                    3,
+                    148,
+                    253,
+                    1
+                ]
+            );
+        }
+
+        #[test]
+        fn w652_processor_rows_transition_outcomes() {
+            let words = release_processor_plan(&refs(&[
+                "1\tnzb-parsing,DIRECT-DOWNLOADS,finalization,bogus\tno\t1000\t\t0\t\t",
+                "2\t\t\t200000\t\t2\t\t",
+                "3\t\t\t10\t\t1\tConnection reset\t",
+                "3\t\t\t10\t0\tx\t\tL q",
+            ]));
+            assert_eq!(
+                words[0],
+                1 | (2 | 32 | 2048) << 7 | 11 << 20 | 1 << 24 | 2 << 25 | 1 << 53
+            );
+            assert_eq!(words[1], 7 | 2 << 4 | 15 << 20 | 1 << 30 | 2 << 33);
+            assert_eq!(
+                words[2],
+                12 | 1 << 4 | 15 << 20 | 2 << 27 | 1 << 33 | 2 << 41
+            );
+            assert_eq!(
+                words[3],
+                11 | 1 << 4 | 15 << 20 | 1 << 31 | 1 << 32 | 15 << 41 | 1 << 53 | 16 << 57
+            );
+            assert_eq!(words[4..17], [0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1]);
+            assert_eq!(words[17..22], [1, 2, 1, 0, 0]);
+            assert_eq!(words[46..54], [1, 1, 1, 1, 201020, 200000, 1020, 3]);
+        }
+
+        #[test]
+        fn w652_sync_rows_coalesce_and_flush() {
+            let words = search_sync_plan(&refs(&[
+                "1\tupdate\tname,SIZE,bogus\t10",
+                "1\tupdate\tsize\t5",
+                "1\tupdate\tnfo\t5",
+                "2\tinsert\t\t7",
+                "2\tdelete\t\t",
+                "3\tupdate\t\t",
+                "\tflush\t\t",
+                "\tupdate\tname\t",
+                "4\tdelete\t\t",
+            ]));
+            assert_eq!(words[0], 1 | 33 << 6 | 33 << 19 | 1 << 49 | 1 << 59);
+            assert_eq!(words[1], 5 | 32 << 6 | 33 << 19 | 1 << 49);
+            assert_eq!(words[2], 4 | 256 << 6 | 289 << 19 | 1 << 49);
+            assert_eq!(
+                words[3],
+                1 | 1 << 3 | SYNC_ALL << 6 | SYNC_ALL << 19 | 2 << 49
+            );
+            assert_eq!(words[4], 2 | 2 << 3 | 1 << 49);
+            assert_eq!(words[5], 7 | 1 << 49);
+            assert_eq!(words[6], 6 | 3 << 3 | 1 << 32 | 1 << 33);
+            assert_eq!(words[7], 64 | 1 << 33);
+            assert_eq!(words[8], 3 | 2 << 3 | 1 << 33);
+            assert_eq!(words[9..17], [1, 2, 1, 1, 1, 1, 1, 1]);
+            assert_eq!(words[22..35], [2, 1, 1, 1, 1, 3, 1, 1, 2, 1, 1, 1, 1]);
+            assert_eq!(words[17..22], [5, 1, 2, 1, 0]);
+            assert_eq!(words[35..43], [1, 1, 0, 0, 1, 1, 4, 27]);
+        }
+
+        #[test]
+        fn w652_exports_guard_null_short_and_malformed_batches() {
+            let mut out = [0i64; 64];
+            let o = out.as_mut_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w652_nzb_content_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    31
+                );
+                assert_eq!(
+                    nntmux_w652_nzb_content_plan_batch(b"a".as_ptr(), 1, 1, o, 30),
+                    -31
+                );
+                assert_eq!(
+                    nntmux_w652_release_file_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w652_archive_fallback_plan_batch(std::ptr::null(), 0, 0, o, 64),
+                    27
+                );
+                assert_eq!(
+                    nntmux_w652_release_processor_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        64
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w652_search_sync_plan_batch(std::ptr::null(), 1, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w652_release_processor_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    52
+                );
+                assert_eq!(
+                    nntmux_w652_search_sync_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    36
+                );
+                // An output buffer overlapping the input is refused.
+                let mut shared = [0u8; 512];
+                let p = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w652_search_sync_plan_batch(p, 1, 1, p as *mut i64, 64),
+                    -1
+                );
+                // Unaligned outputs are written byte-wise.
+                let mut raw = [0u8; 8 * 30];
+                let unaligned = raw.as_mut_ptr().add(1) as *mut i64;
+                assert_eq!(
+                    nntmux_w652_release_file_plan_batch(b"a".as_ptr(), 1, 1, unaligned, 27),
+                    27
+                );
+            }
+        }
+    }
+}
