@@ -565,4 +565,269 @@ final class ApiUsageService
 
         return self::w53Words($count, implode("\0", $values), '', 3 * $count) ?? self::auditValuePlanBatchPhp($values);
     }
+
+    /** C signature of the Wave 65.5 {@see self::w65ApiUsagePlanBatch()} helper. */
+    private const string W65_API_USAGE_PLAN_FFI_CDEF = 'int64_t nntmux_w655_api_usage_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 65.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 6.57/3.78/6.10/6.17x); see tests/Unit/RustApiCapabilitiesCacheUsageUserResolverV1PresenterW65ParityTest.php.
+     */
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 65.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w65_5', self::W65_API_USAGE_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W65_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 65.5 plan batch to Rust until disabled or reset. */
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', true);
+    }
+
+    /** Route the Wave 65.5 plan batch to PHP until enabled or reset. */
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', false);
+    }
+
+    /** Restore W65_RUST_FFI_DEFAULT routing and drop the cached Wave 65.5 handle and buffer. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', null);
+        self::w65RustFfiState('reset', null);
+    }
+
+    public static function usesW65RustFfi(): bool
+    {
+        return self::w65RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w65ApiUsagePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 65.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w65Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w65RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w655_api_usage_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w65Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /**
+     * Batch API quota plan over `role\tkind\tused\tdownloads\tmax_requests\tmax_downloads\telapsed\tburst`. Eleven
+     * words per record: `[role, kind, max_requests, max_downloads, reserved, remaining_requests, remaining_downloads,
+     * reset_in, per_minute, status, flags]`. Role is a trimmed `UserRole` value 1-4 or case-insensitive name (empty is
+     * user, else 0) whose defaults fill empty limits (user 100/25, admin 10000/1000, moderator 1000/100, disabled and
+     * unknown 0/0). Kind: empty or `api` 0, `get` or `nzb` 1 (download). Once elapsed reaches the 86400 second window
+     * the counters restart and reset_in is a full window. per_minute is ceil(max_requests / 60), at least 1. Status: 4
+     * disabled, 5 unknown role, 1 requests exhausted (like reservedCountPhp()), 2 downloads exhausted for a download,
+     * 3 burst at per_minute, else 0 with reserved = used + 1. Numbers are trimmed 1-15 ASCII digits. Flags: 1 invalid
+     * number, 2 not exactly eight fields, 4 unknown role, 8 unknown kind, 16 window rolled over.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w65ApiUsagePlanBatch(array $records): array
+    {
+        return self::usesW65RustFfi() ? self::w65ApiUsagePlanBatchNative($records) : self::w65ApiUsagePlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w65ApiUsagePlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w65Words($count, implode("\0", $records), 11 * $count) ?? self::w65ApiUsagePlanBatchPhp($records);
+    }
+
+    /** Default `[requests, downloads]` limits per resolved role (unknown, user, admin, disabled, moderator). */
+    private const array W65_ROLE_LIMITS = [[0, 0], [100, 25], [10000, 1000], [0, 0], [1000, 100]];
+
+    /** `UserRole` from a trimmed backing value (1-4) or case-insensitive name; empty is user, anything else 0. */
+    private static function w65Role(string $field): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return 1;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            $value = (int) $text;
+
+            return $value >= 1 && $value <= 4 ? $value : 0;
+        }
+
+        return match (strtolower($text)) {
+            'user' => 1,
+            'admin' => 2,
+            'disabled' => 3,
+            'moderator' => 4,
+            default => 0,
+        };
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w65ApiUsagePlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 8 ? 0 : 2;
+            $role = self::w65Role($fields[0]);
+            if ($role === 0) {
+                $flags |= 4;
+            }
+            $kind = match (trim($fields[1] ?? '')) {
+                '', 'api' => 0,
+                'get', 'nzb' => 1,
+                default => -1,
+            };
+            if ($kind < 0) {
+                $flags |= 8;
+                $kind = 0;
+            }
+            [$roleRequests, $roleDownloads] = self::W65_ROLE_LIMITS[$role];
+            $used = self::w65Number($fields[2] ?? '', 0, $flags);
+            $downloads = self::w65Number($fields[3] ?? '', 0, $flags);
+            $maxRequests = self::w65Number($fields[4] ?? '', $roleRequests, $flags);
+            $maxDownloads = self::w65Number($fields[5] ?? '', $roleDownloads, $flags);
+            $elapsed = self::w65Number($fields[6] ?? '', 0, $flags);
+            if ($elapsed >= 86400) {
+                $used = $downloads = 0;
+                $flags |= 16;
+                $resetIn = 86400;
+            } else {
+                $resetIn = 86400 - $elapsed;
+            }
+            $burst = self::w65Number($fields[7] ?? '', 0, $flags);
+            $perMinute = max(1, intdiv($maxRequests + 59, 60));
+            $status = match (true) {
+                $role === 3 => 4,
+                $role === 0 => 5,
+                $used >= $maxRequests => 1,
+                $kind === 1 && $downloads >= $maxDownloads => 2,
+                $burst >= $perMinute => 3,
+                default => 0,
+            };
+            $allowed = $status === 0;
+            array_push(
+                $out,
+                $role,
+                $kind,
+                $maxRequests,
+                $maxDownloads,
+                $allowed ? $used + 1 : 0,
+                $allowed ? $maxRequests - $used - 1 : max(0, $maxRequests - $used),
+                $allowed && $kind === 1 ? $maxDownloads - $downloads - 1 : max(0, $maxDownloads - $downloads),
+                $resetIn,
+                $perMinute,
+                $status,
+                $flags,
+            );
+        }
+
+        return $out;
+    }
 }
