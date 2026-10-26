@@ -23,8 +23,9 @@ use RuntimeException;
 
 /**
  * Paired randomized benchmark (`test_paired_randomized_benchmark_gates_rust_default`, run with
- * `RUN_RUST_FFI_BENCHMARKS=1`): per helper, 100 interleaved samples per workload after 20 warmup rounds,
- * per-sample random PHP/Rust order, each side the fastest of three back-to-back calls, release dylib.
+ * `RUN_RUST_FFI_BENCHMARKS=1`): per helper, 400 interleaved samples per workload after 20 warmup rounds,
+ * per-sample random PHP/Rust order, three back-to-back calls per side, every call timed individually
+ * (1,200 observations per side, so p99 is a per-call tail), release dylib.
  * Common workloads hold 320 records and uncommon ones 384 records with edge cases. Timings include
  * PHP-side packing, the FFI call and output decoding; each run prints its ratios to STDERR.
  *
@@ -93,11 +94,11 @@ class RustLogViewerIndexCoordinatorManticoreEntryParserW67ParityTest extends Tes
      * @var array<class-string, array{float, float, float, float}>
      */
     private const QUALIFICATION = [
-        LogIndex::class => [7.35, 5.97, 6.81, 5.68],
-        LogSearchCoordinator::class => [6.85, 5.98, 7.33, 5.35],
-        ManticoreLogSearcher::class => [5.85, 4.41, 5.36, 3.64],
-        LogEntry::class => [8.48, 5.25, 3.86, 3.20],
-        LogEntryParser::class => [5.99, 4.53, 5.97, 4.10],
+        LogIndex::class => [7.54, 6.29, 7.10, 6.10],
+        LogSearchCoordinator::class => [6.68, 5.64, 7.13, 6.66],
+        ManticoreLogSearcher::class => [5.95, 5.32, 5.62, 6.27],
+        LogEntry::class => [8.42, 7.19, 3.91, 3.99],
+        LogEntryParser::class => [5.94, 5.02, 6.07, 5.01],
     ];
 
     /**
@@ -113,12 +114,12 @@ class RustLogViewerIndexCoordinatorManticoreEntryParserW67ParityTest extends Tes
         LogEntryParser::class => ['ffi', 'useW445RustFfi', 'buf', 'cap', 'metaBuf', 'metaCap', 'useNative'],
     ];
 
-    /** Back-to-back calls per side of a sample; the fastest is kept (drops preemption spikes). */
+    /** Back-to-back calls per side of a sample; each call is recorded so p99 is an individual-call latency. */
     private const REPEATS = 3;
 
     private const RANDOM_ROUNDS = 400;
 
-    private const BENCH_SAMPLES = 100;
+    private const BENCH_SAMPLES = 400;
 
     private const BYTES = ['a', 'Z', 'x', 'E', '0', '1', '7', '9', ' ', "\t", "\n", "\r", "\x0b", "\x0c", "\x01", "\x7f", '-', '_', '.', ',', ':', '|', '/', '[', ']', '{', '}', '#', '+', "\xc3\xa9", "\xc3", "\xff", "\xa0", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\xe2\x80\xa8", "\0"];
 
@@ -722,13 +723,11 @@ class RustLogViewerIndexCoordinatorManticoreEntryParserW67ParityTest extends Tes
                 $times = ['php' => [], 'rust' => []];
                 for ($s = 0; $s < self::BENCH_SAMPLES; $s++) {
                     foreach (mt_rand(0, 1) === 1 ? [true, false] : [false, true] as $rust) {
-                        $best = PHP_INT_MAX;
                         for ($r = 0; $r < self::REPEATS; $r++) {
                             $t0 = hrtime(true);
                             $workload($rust);
-                            $best = min($best, hrtime(true) - $t0);
+                            $times[$rust ? 'rust' : 'php'][] = (hrtime(true) - $t0) / 1000;
                         }
-                        $times[$rust ? 'rust' : 'php'][] = $best / 1000;
                     }
                 }
 
