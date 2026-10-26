@@ -44169,7 +44169,7 @@ pub mod w591_enums_backfill_days_group_scan_nzb_import_par2_rename_tmux_backfill
     /// Writes `per_row` words from `row(entry, dst, tail)` for each of exactly `count` rows,
     /// then the `tail` rollup words (zeroed first).
     #[allow(clippy::too_many_arguments)]
-    unsafe fn run(
+    pub(crate) unsafe fn run(
         input: *const u8,
         len: usize,
         count: usize,
@@ -44222,7 +44222,7 @@ pub mod w591_enums_backfill_days_group_scan_nzb_import_par2_rename_tmux_backfill
     }
 
     /// Exactly `N` tab-separated fields, as PHP `explode("\t", $row)` with `count() === N`.
-    fn fields<const N: usize>(row: &[u8]) -> Option<[&[u8]; N]> {
+    pub(crate) fn fields<const N: usize>(row: &[u8]) -> Option<[&[u8]; N]> {
         let mut out = [&row[..0]; N];
         let mut it = row.split(|&b| b == b'\t');
         for slot in &mut out {
@@ -44232,7 +44232,7 @@ pub mod w591_enums_backfill_days_group_scan_nzb_import_par2_rename_tmux_backfill
     }
 
     /// PHP `preg_match('/\A-?[0-9]{1,18}\z/')` then `(int)`.
-    fn strict_int(s: &[u8]) -> Option<i64> {
+    pub(crate) fn strict_int(s: &[u8]) -> Option<i64> {
         let digits = s.strip_prefix(b"-").unwrap_or(s);
         if digits.is_empty() || digits.len() > 18 || !digits.iter().all(u8::is_ascii_digit) {
             return None;
@@ -44242,7 +44242,7 @@ pub mod w591_enums_backfill_days_group_scan_nzb_import_par2_rename_tmux_backfill
     }
 
     /// PHP `trim()` without a character list.
-    fn php_trim(s: &[u8]) -> &[u8] {
+    pub(crate) fn php_trim(s: &[u8]) -> &[u8] {
         let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
         let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
         let end = s.iter().rposition(|b| !ws(b)).map_or(start, |e| e + 1);
@@ -44254,7 +44254,7 @@ pub mod w591_enums_backfill_days_group_scan_nzb_import_par2_rename_tmux_backfill
         hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
     }
 
-    fn flag(on: bool, bit: i64) -> i64 {
+    pub(crate) fn flag(on: bool, bit: i64) -> i64 {
         if on { bit } else { 0 }
     }
 
@@ -44638,6 +44638,768 @@ pub mod w591_enums_backfill_days_group_scan_nzb_import_par2_rename_tmux_backfill
                     assert!(out[..tail].iter().all(|&w| w == 0));
                     assert_eq!(export(std::ptr::null(), 0, 1, out.as_mut_ptr(), out.len()), 1);
                     assert_eq!(export(std::ptr::null(), 2, 1, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, std::ptr::null_mut(), 8), -1);
+                }
+            }
+        }
+    }
+}
+
+pub mod w601_monitoring_bounded_query_grafana_jwt_metric_family_exporter_cloudflare {
+    //! Wave 60.1 per-row batch kernels for BoundedMetricQuery, GrafanaJwtIssuer, MetricFamily,
+    //! PrometheusMetricsExporter and CloudflareIpRangeService. Every export shares the Wave 59.1
+    //! contract: NUL-joined rows in, a fixed number of `i64` words per row followed by a fixed
+    //! rollup tail out; returns the row count, `SHORT_CAPACITY` when `out_cap` (in words) is too
+    //! small, or -1 for a malformed batch (a row holding a NUL byte splits into extra rows, so
+    //! PHP falls back).
+
+    use super::w47_irc_stream_cloudflare_proxy::{php_ipv4, php_ipv6};
+    use super::w591_enums_backfill_days_group_scan_nzb_import_par2_rename_tmux_backfill::{
+        fields, flag, php_trim, run, strict_int,
+    };
+
+    /// PHP `trim()`'s default character list.
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    /// Decimal length of `v` as PHP prints an int.
+    fn dec_len(v: i64) -> i64 {
+        let mut n = 1 + i64::from(v < 0);
+        let mut u = v.unsigned_abs();
+        while u >= 10 {
+            u /= 10;
+            n += 1;
+        }
+        n
+    }
+
+    /// PCRE `$` without `/D`: the subject, minus one trailing newline.
+    fn dollar(s: &[u8]) -> &[u8] {
+        s.strip_suffix(b"\n").unwrap_or(s)
+    }
+
+    /// Lowercased lookup of the trimmed token; `exact` is whether the raw token equals the key.
+    fn lookup_ci(raw: &[u8], table: &[(&[u8], i64)]) -> Option<(i64, bool)> {
+        let t = php_trim(raw);
+        table.iter().find(|(k, _)| t.eq_ignore_ascii_case(k)).map(|&(k, v)| (v, raw == k))
+    }
+
+    // ---- BoundedMetricQuery: `sql\twindow\ttimeout_ms\trow_limit\tage\tcache_ttl` ----
+
+    pub const BMQ_WORDS: usize = 7;
+    pub const BMQ_READ_ONLY: i64 = 1 << 4;
+    pub const BMQ_MULTI: i64 = 1 << 5;
+    pub const BMQ_HAS_LIMIT: i64 = 1 << 6;
+    pub const BMQ_HINTED: i64 = 1 << 7;
+    pub const BMQ_WINDOW_CLAMPED: i64 = 1 << 8;
+    pub const BMQ_TIMEOUT_DEFAULTED: i64 = 1 << 9;
+    pub const BMQ_TIMEOUT_CLAMPED: i64 = 1 << 10;
+    pub const BMQ_LIMIT_DEFAULTED: i64 = 1 << 11;
+    pub const BMQ_LIMIT_CLAMPED: i64 = 1 << 12;
+    pub const BMQ_CACHE_DISABLED: i64 = 1 << 13;
+    pub const BMQ_STALE: i64 = 1 << 14;
+    pub const BMQ_FUTURE_AGE: i64 = 1 << 15;
+    pub const BMQ_MALFORMED: i64 = 1 << 16;
+    pub const BMQ_RUNNABLE: i64 = 1 << 17;
+    const BMQ_KINDS: &[(&[u8], i64)] = &[(b"select", 1), (b"with", 2), (b"show", 3), (b"explain", 4)];
+
+    fn is_word(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    /// Whether `token` is a data-changing keyword (case-insensitive), dispatched on length.
+    fn is_write(token: &[u8]) -> bool {
+        let eq = |w: &[u8]| token.eq_ignore_ascii_case(w);
+        match token.len() {
+            4 => eq(b"drop"),
+            5 => eq(b"alter") || eq(b"grant"),
+            6 => eq(b"insert") || eq(b"update") || eq(b"delete") || eq(b"create"),
+            7 => eq(b"replace"),
+            8 => eq(b"truncate"),
+            _ => false,
+        }
+    }
+
+    /// `stripos()` for `max_execution_time` or `max_statement_time`.
+    fn has_time_hint(sql: &[u8]) -> bool {
+        sql.len() >= 18
+            && (0..=sql.len() - 18).any(|i| {
+                let w = &sql[i..i + 18];
+                w[..4].eq_ignore_ascii_case(b"max_")
+                    && (w[4..].eq_ignore_ascii_case(b"execution_time") || w[4..].eq_ignore_ascii_case(b"statement_time"))
+            })
+    }
+
+    pub fn bounded_query_words(row: &[u8], dst: &mut [i64], _tail: &mut [i64]) {
+        let parsed = fields::<6>(row).and_then(|[sql, w, t, l, a, c]| {
+            Some((sql, strict_int(w)?, strict_int(t)?, strict_int(l)?, strict_int(a)?, strict_int(c)?))
+        });
+        let Some((sql, window, timeout, limit, age, ttl)) = parsed else {
+            dst.copy_from_slice(&[BMQ_MALFORMED, 0, 0, 0, 0, 0, 0]);
+            return;
+        };
+        let lead = &sql[sql.iter().position(|&b| !is_ws(b)).unwrap_or(sql.len())..];
+        let kind = if lead.is_empty() {
+            0
+        } else {
+            let word = &lead[..lead.iter().take_while(|b| b.is_ascii_alphabetic()).count()];
+            BMQ_KINDS.iter().find(|(k, _)| word.eq_ignore_ascii_case(k)).map_or(5, |&(_, v)| v)
+        };
+        let (mut tokens, mut write, mut has_limit, mut i) = (0i64, false, false, 0);
+        while i < sql.len() {
+            if !is_word(sql[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < sql.len() && is_word(sql[i]) {
+                i += 1;
+            }
+            let token = &sql[start..i];
+            tokens += 1;
+            write = write || is_write(token);
+            has_limit = has_limit || (token.len() == 5 && token.eq_ignore_ascii_case(b"limit"));
+        }
+        let body_end = sql.iter().rposition(|&b| !is_ws(b) && b != b';').map_or(0, |e| e + 1);
+        let multi = sql[..body_end].contains(&b';');
+        let read_only = (1..=4).contains(&kind) && !write;
+        let mut flags = kind
+            | flag(read_only, BMQ_READ_ONLY)
+            | flag(multi, BMQ_MULTI)
+            | flag(has_limit, BMQ_HAS_LIMIT)
+            | flag(has_time_hint(sql), BMQ_HINTED)
+            | flag(read_only && !multi, BMQ_RUNNABLE);
+        let clamped = window.clamp(60, 86_400);
+        flags |= flag(clamped != window, BMQ_WINDOW_CLAMPED);
+        let timeout = if timeout <= 0 {
+            flags |= BMQ_TIMEOUT_DEFAULTED;
+            2000
+        } else if timeout > 30_000 {
+            flags |= BMQ_TIMEOUT_CLAMPED;
+            30_000
+        } else {
+            timeout
+        };
+        let limit = if limit < 1 {
+            flags |= BMQ_LIMIT_DEFAULTED;
+            1000
+        } else if limit > 100_000 {
+            flags |= BMQ_LIMIT_CLAMPED;
+            100_000
+        } else {
+            limit
+        };
+        flags |= flag(age < 0, BMQ_FUTURE_AGE);
+        let fresh = if ttl <= 0 {
+            flags |= BMQ_CACHE_DISABLED;
+            0
+        } else if age < 0 || age >= ttl {
+            flags |= BMQ_STALE;
+            0
+        } else {
+            ttl - age
+        };
+        dst.copy_from_slice(&[flags, clamped, (clamped / 240).max(15), timeout, limit, fresh, tokens]);
+    }
+
+    // ---- GrafanaJwtIssuer: `sub\temail\trole\torg\tttl\tnow\tleeway\tprior_iat` ----
+
+    pub const JWT_WORDS: usize = 7;
+    pub const JWT_ROLE_EXACT: i64 = 1 << 3;
+    pub const JWT_SUB_VALID: i64 = 1 << 4;
+    pub const JWT_EMAIL_EMPTY: i64 = 1 << 5;
+    pub const JWT_EMAIL_VALID: i64 = 1 << 6;
+    pub const JWT_ORG_DEFAULTED: i64 = 1 << 7;
+    pub const JWT_ORG_INVALID: i64 = 1 << 8;
+    pub const JWT_TTL_DEFAULTED: i64 = 1 << 9;
+    pub const JWT_TTL_CLAMPED: i64 = 1 << 10;
+    pub const JWT_SKEW_CLAMPED: i64 = 1 << 11;
+    pub const JWT_PRIOR_NONE: i64 = 1 << 12;
+    pub const JWT_PRIOR_ACTIVE: i64 = 1 << 13;
+    pub const JWT_PRIOR_EXPIRED: i64 = 1 << 14;
+    pub const JWT_PRIOR_NOT_YET: i64 = 1 << 15;
+    pub const JWT_REFRESH: i64 = 1 << 16;
+    pub const JWT_CLAIM_SAFE: i64 = 1 << 17;
+    pub const JWT_ISSUABLE: i64 = 1 << 18;
+    pub const JWT_MALFORMED: i64 = 1 << 19;
+    const JWT_ROLES: &[(&[u8], i64)] = &[(b"None", 1), (b"Viewer", 2), (b"Editor", 3), (b"Admin", 4)];
+
+    /// `/\A[^@ \t\n\r\x0b\x0c]+@[^@ \t\n\r\x0b\x0c]+\.[^@ \t\n\r\x0b\x0c]+\z/`.
+    fn email_valid(e: &[u8]) -> bool {
+        let bad = |b: &u8| matches!(*b, b'@' | b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+        let Some(at) = e.iter().position(|&b| b == b'@') else {
+            return false;
+        };
+        let (local, domain) = (&e[..at], &e[at + 1..]);
+        !local.is_empty()
+            && !local.iter().any(bad)
+            && domain.len() >= 3
+            && !domain.iter().any(bad)
+            && domain[1..domain.len() - 1].contains(&b'.')
+    }
+
+    /// Printable ASCII that `json_encode(..., JSON_UNESCAPED_SLASHES)` copies unchanged.
+    fn json_plain(s: &[u8]) -> bool {
+        s.iter().all(|&b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+    }
+
+    pub fn jwt_claim_words(row: &[u8], dst: &mut [i64], _tail: &mut [i64]) {
+        let parsed = fields::<8>(row).and_then(|[sub, email, role, org, ttl, now, leeway, iat]| {
+            Some((sub, email, role, org, strict_int(ttl)?, strict_int(now)?, strict_int(leeway)?, strict_int(iat)?))
+        });
+        let Some((sub, email, role, org, ttl, now, leeway, iat)) = parsed else {
+            dst.copy_from_slice(&[JWT_MALFORMED, 0, 0, 0, 0, 0, 0]);
+            return;
+        };
+        let (code, exact) = lookup_ci(role, JWT_ROLES).unwrap_or((0, false));
+        let sub_valid =
+            (1..=255).contains(&sub.len()) && sub.iter().all(|&b| b.is_ascii_alphanumeric() || b"._@+-".contains(&b));
+        let email_ok = !email.is_empty() && email_valid(email);
+        let mut flags = code
+            | flag(exact, JWT_ROLE_EXACT)
+            | flag(sub_valid, JWT_SUB_VALID)
+            | flag(email.is_empty(), JWT_EMAIL_EMPTY)
+            | flag(email_ok, JWT_EMAIL_VALID);
+        let org = if org.is_empty() {
+            flags |= JWT_ORG_DEFAULTED;
+            1
+        } else {
+            match strict_int(org) {
+                Some(v) if v >= 1 => v,
+                _ => {
+                    flags |= JWT_ORG_INVALID;
+                    0
+                }
+            }
+        };
+        let ttl = if ttl <= 0 {
+            flags |= JWT_TTL_DEFAULTED;
+            900
+        } else {
+            let c = ttl.clamp(60, 86_400);
+            flags |= flag(c != ttl, JWT_TTL_CLAMPED);
+            c
+        };
+        let skew = leeway.clamp(0, 300);
+        flags |= flag(skew != leeway, JWT_SKEW_CLAMPED);
+        let (nbf, exp) = (now - skew, now + ttl);
+        let remaining = if iat == 0 {
+            flags |= JWT_PRIOR_NONE;
+            0
+        } else if now < iat - skew {
+            flags |= JWT_PRIOR_NOT_YET;
+            0
+        } else if now >= iat + ttl + skew {
+            flags |= JWT_PRIOR_EXPIRED;
+            0
+        } else {
+            flags |= JWT_PRIOR_ACTIVE;
+            iat + ttl + skew - now
+        };
+        flags |= flag(flags & JWT_PRIOR_ACTIVE == 0 || remaining < ttl / 5, JWT_REFRESH);
+        let safe = json_plain(sub) && json_plain(email) && json_plain(role);
+        flags |= flag(safe, JWT_CLAIM_SAFE);
+        flags |= flag(
+            sub_valid && code != 0 && flags & JWT_ORG_INVALID == 0 && (email.is_empty() || email_ok) && safe,
+            JWT_ISSUABLE,
+        );
+        let claims_len = if safe {
+            let (s, e, r) = (sub.len() as i64, email.len() as i64, role.len() as i64);
+            8 + s + 11 + e + 10 + s + 10 + r + 8 + dec_len(org) + 7 + dec_len(now) + 7 + dec_len(nbf) + 7 + dec_len(exp) + 1
+        } else {
+            -1
+        };
+        dst.copy_from_slice(&[flags, org, ttl, nbf, exp, remaining, claims_len]);
+    }
+
+    // ---- MetricFamily: `name\ttype\thelp\tlabels\tseries\tmax_series` ----
+
+    pub const FAM_WORDS: usize = 6;
+    pub const FAM_TAIL: usize = 9;
+    pub const FAM_TYPE_EXACT: i64 = 1 << 3;
+    pub const FAM_TYPE_SUPPORTED: i64 = 1 << 4;
+    pub const FAM_NAME_VALID: i64 = 1 << 5;
+    pub const FAM_NAME_RESERVED: i64 = 1 << 6;
+    pub const FAM_NAME_TOTAL: i64 = 1 << 7;
+    pub const FAM_COUNTER_NO_TOTAL: i64 = 1 << 8;
+    pub const FAM_GAUGE_TOTAL: i64 = 1 << 9;
+    pub const FAM_HELP_EMPTY: i64 = 1 << 10;
+    pub const FAM_HELP_ESCAPED: i64 = 1 << 11;
+    pub const FAM_LABEL_INVALID: i64 = 1 << 12;
+    pub const FAM_LABEL_DUPLICATE: i64 = 1 << 13;
+    pub const FAM_LABEL_RESERVED: i64 = 1 << 14;
+    pub const FAM_SERIES_CLAMPED: i64 = 1 << 15;
+    pub const FAM_CARDINALITY_EXCEEDED: i64 = 1 << 16;
+    pub const FAM_DEFINITION_VALID: i64 = 1 << 17;
+    pub const FAM_MALFORMED: i64 = 1 << 18;
+    const FAM_TYPES: &[(&[u8], i64)] =
+        &[(b"gauge", 1), (b"counter", 2), (b"histogram", 3), (b"summary", 4), (b"untyped", 5)];
+
+    /// `/^[a-zA-Z_:][a-zA-Z0-9_:]*$/` (`colon`) or `/^[a-zA-Z_][a-zA-Z0-9_]*$/`.
+    fn prom_ident(s: &[u8], colon: bool) -> bool {
+        let s = dollar(s);
+        let ok = |b: u8| b.is_ascii_alphabetic() || b == b'_' || (colon && b == b':');
+        !s.is_empty() && ok(s[0]) && s[1..].iter().all(|&b| ok(b) || b.is_ascii_digit())
+    }
+
+    pub fn family_words(row: &[u8], dst: &mut [i64], tail: &mut [i64]) {
+        tail[0] += 1;
+        let parsed = fields::<6>(row).and_then(|[name, kind, help, labels, series, max]| {
+            Some((name, kind, help, labels, strict_int(series)?, strict_int(max)?))
+        });
+        let Some((name, kind, help, labels, series, max)) = parsed else {
+            dst.copy_from_slice(&[FAM_MALFORMED, 0, 0, 0, 0, 0]);
+            tail[8] += 1;
+            return;
+        };
+        let (code, exact) = lookup_ci(kind, FAM_TYPES).unwrap_or((0, false));
+        let name_valid = prom_ident(name, true);
+        let total = name.ends_with(b"_total");
+        let supported = kind == b"gauge" || kind == b"counter";
+        let escapes = help.iter().filter(|&&b| b == b'\\' || b == b'\n').count() as i64;
+        let mut flags = code
+            | flag(exact, FAM_TYPE_EXACT)
+            | flag(supported, FAM_TYPE_SUPPORTED)
+            | flag(name_valid, FAM_NAME_VALID)
+            | flag(name.starts_with(b"__"), FAM_NAME_RESERVED)
+            | flag(total, FAM_NAME_TOTAL)
+            | flag(code == 2 && !total, FAM_COUNTER_NO_TOTAL)
+            | flag(code == 1 && total, FAM_GAUGE_TOTAL)
+            | flag(php_trim(help).is_empty(), FAM_HELP_EMPTY)
+            | flag(escapes != 0, FAM_HELP_ESCAPED);
+        let (mut count, mut bad, mut dup, mut reserved) = (0i64, -1i64, false, false);
+        if !labels.is_empty() {
+            for (i, label) in labels.split(|&b| b == b',').enumerate() {
+                if bad < 0 && !prom_ident(label, false) {
+                    bad = i as i64;
+                }
+                reserved = reserved || label.starts_with(b"__");
+                dup = dup || labels.split(|&b| b == b',').take(i).any(|prior| prior == label);
+                count += 1;
+            }
+        }
+        flags |= flag(bad >= 0, FAM_LABEL_INVALID) | flag(dup, FAM_LABEL_DUPLICATE) | flag(reserved, FAM_LABEL_RESERVED);
+        let clamped = series.clamp(0, 1_000_000_000);
+        flags |= flag(clamped != series, FAM_SERIES_CLAMPED);
+        flags |= flag(max > 0 && clamped > max, FAM_CARDINALITY_EXCEEDED);
+        let valid = name_valid && supported && bad < 0;
+        flags |= flag(valid, FAM_DEFINITION_VALID);
+        dst.copy_from_slice(&[flags, count, bad, help.len() as i64 + escapes, clamped, if max > 0 { max - clamped } else { -1 }]);
+        tail[1] += i64::from(valid);
+        tail[2] += count;
+        tail[3] += clamped;
+        tail[4] += i64::from(flags & FAM_CARDINALITY_EXCEEDED != 0);
+        tail[5] = tail[5].max(clamped);
+        tail[6] += i64::from(code == 1);
+        tail[7] += i64::from(code == 2);
+    }
+
+    // ---- PrometheusMetricsExporter: `collector\tstatus\tfamilies\tsamples\tduration_us\tbudget_us\tbytes` ----
+
+    pub const SCRAPE_WORDS: usize = 7;
+    pub const SCRAPE_TAIL: usize = 14;
+    pub const SCRAPE_CLASS_SHIFT: u32 = 4;
+    pub const SCRAPE_NAME_CONVENTIONAL: i64 = 1 << 7;
+    pub const SCRAPE_NAMESPACED: i64 = 1 << 8;
+    pub const SCRAPE_BUDGET_DEFAULTED: i64 = 1 << 9;
+    pub const SCRAPE_CLAMPED: i64 = 1 << 10;
+    pub const SCRAPE_EMPTY_OUTPUT: i64 = 1 << 11;
+    pub const SCRAPE_OVER_BUDGET: i64 = 1 << 12;
+    pub const SCRAPE_SAMPLE_HEAVY: i64 = 1 << 13;
+    pub const SCRAPE_RETRY: i64 = 1 << 14;
+    pub const SCRAPE_MALFORMED: i64 = 1 << 15;
+    const SCRAPE_STATUSES: &[(&[u8], i64)] = &[
+        (b"ok", 1),
+        (b"success", 1),
+        (b"0", 1),
+        (b"error", 2),
+        (b"failed", 2),
+        (b"fail", 2),
+        (b"exception", 2),
+        (b"1", 2),
+        (b"timeout", 3),
+        (b"timed_out", 3),
+        (b"skipped", 4),
+        (b"skip", 4),
+        (b"disabled", 4),
+    ];
+    const HOUR_US: i64 = 3_600_000_000;
+
+    pub fn scrape_words(row: &[u8], dst: &mut [i64], tail: &mut [i64]) {
+        tail[0] += 1;
+        let parsed = fields::<7>(row).and_then(|[name, status, fam, samples, duration, budget, bytes]| {
+            Some((name, status, strict_int(fam)?, strict_int(samples)?, strict_int(duration)?, strict_int(budget)?, strict_int(bytes)?))
+        });
+        let Some((name, status, families, samples, duration, budget, bytes)) = parsed else {
+            dst.copy_from_slice(&[SCRAPE_MALFORMED, 0, 0, 0, 0, 0, 0]);
+            tail[6] += 1;
+            return;
+        };
+        let base = name.iter().rposition(|&b| b == b'\\').map_or(name, |p| &name[p + 1..]);
+        let conventional = base.len() >= 10
+            && base[0].is_ascii_uppercase()
+            && base.ends_with(b"Collector")
+            && base.iter().all(u8::is_ascii_alphanumeric);
+        let code = lookup_ci(status, SCRAPE_STATUSES).map_or(0, |(v, _)| v);
+        let mut clamped = false;
+        let mut clamp = |v: i64, hi: i64| {
+            let c = v.clamp(0, hi);
+            clamped |= c != v;
+            c
+        };
+        let families = clamp(families, 1_000_000_000);
+        let samples = clamp(samples, 1_000_000_000_000);
+        let duration = clamp(duration, HOUR_US);
+        let bytes = clamp(bytes, 1_000_000_000_000);
+        let (budget, defaulted) = if budget <= 0 { (5_000_000, true) } else { (clamp(budget, HOUR_US), false) };
+        let pct = duration * 100 / budget;
+        let class = match pct {
+            0..25 => 1,
+            25..75 => 2,
+            75..=100 => 3,
+            _ => 4,
+        };
+        let per_family = if families > 0 { samples / families } else { 0 };
+        let flags = code
+            | class << SCRAPE_CLASS_SHIFT
+            | flag(conventional, SCRAPE_NAME_CONVENTIONAL)
+            | flag(name.contains(&b'\\'), SCRAPE_NAMESPACED)
+            | flag(defaulted, SCRAPE_BUDGET_DEFAULTED)
+            | flag(clamped, SCRAPE_CLAMPED)
+            | flag(code == 1 && families == 0, SCRAPE_EMPTY_OUTPUT)
+            | flag(class == 4, SCRAPE_OVER_BUDGET)
+            | flag(per_family > 10_000, SCRAPE_SAMPLE_HEAVY)
+            | flag(code == 2 || code == 3, SCRAPE_RETRY);
+        dst.copy_from_slice(&[flags, base.len() as i64, families, samples, per_family, pct, bytes]);
+        tail[1 + if code == 0 { 4 } else { code as usize - 1 }] += 1;
+        tail[7] += families;
+        tail[8] += samples;
+        tail[9] += bytes;
+        tail[10] += duration;
+        tail[11] += i64::from(class == 4);
+        tail[12] = tail[12].max(pct);
+        tail[13] += i64::from(conventional);
+    }
+
+    // ---- CloudflareIpRangeService: one trusted-proxy entry per row ----
+
+    pub const CIDR_WORDS: usize = 6;
+    pub const CIDR_TAIL: usize = 8;
+    pub const CIDR_CLASS_SHIFT: u32 = 4;
+    pub const CIDR_TRIMMED: i64 = 1 << 8;
+    pub const CIDR_SKIPPED: i64 = 1 << 9;
+    pub const CIDR_INVALID_ADDRESS: i64 = 1 << 10;
+    pub const CIDR_PREFIX_IMPLIED: i64 = 1 << 11;
+    pub const CIDR_PREFIX_INVALID: i64 = 1 << 12;
+    pub const CIDR_HOST_BITS: i64 = 1 << 13;
+    pub const CIDR_VALID: i64 = 1 << 14;
+    pub const CIDR_CF_MEMBER: i64 = 1 << 15;
+    pub const CIDR_PROXY_TOKEN: i64 = 1 << 16;
+    const PROXY_TOKENS: &[&[u8]] = &[b"REMOTE_ADDR", b"PRIVATE_SUBNETS", b"private_ranges"];
+    /// Cloudflare's published ranges (IPv4 first), as leading bytes and prefix length.
+    const CF_RANGES: &[(bool, [u8; 4], u32)] = &[
+        (false, [173, 245, 48, 0], 20),
+        (false, [103, 21, 244, 0], 22),
+        (false, [103, 22, 200, 0], 22),
+        (false, [103, 31, 4, 0], 22),
+        (false, [141, 101, 64, 0], 18),
+        (false, [108, 162, 192, 0], 18),
+        (false, [190, 93, 240, 0], 20),
+        (false, [188, 114, 96, 0], 20),
+        (false, [197, 234, 240, 0], 22),
+        (false, [198, 41, 128, 0], 17),
+        (false, [162, 158, 0, 0], 15),
+        (false, [104, 16, 0, 0], 13),
+        (false, [104, 24, 0, 0], 14),
+        (false, [172, 64, 0, 0], 13),
+        (false, [131, 0, 72, 0], 22),
+        (true, [0x24, 0x00, 0xcb, 0x00], 32),
+        (true, [0x26, 0x06, 0x47, 0x00], 32),
+        (true, [0x28, 0x03, 0xf8, 0x00], 32),
+        (true, [0x24, 0x05, 0xb5, 0x00], 32),
+        (true, [0x24, 0x05, 0x81, 0x00], 32),
+        (true, [0x2a, 0x06, 0x98, 0xc0], 29),
+        (true, [0x2c, 0x0f, 0xf2, 0x48], 32),
+    ];
+
+    /// Private 1, loopback 2, link-local 3, CGNAT 4, multicast 5, reserved 6, documentation 7,
+    /// unspecified 8, IPv4-mapped 9, else public 0; first match wins.
+    fn address_class(p: &[u8]) -> i64 {
+        let (a, b) = (p[0], p[1]);
+        if p.len() == 4 {
+            let c = p[2];
+            return if a == 10 || (a == 172 && b & 0xf0 == 16) || (a == 192 && b == 168) {
+                1
+            } else if a == 127 {
+                2
+            } else if a == 169 && b == 254 {
+                3
+            } else if a == 100 && b & 0xc0 == 64 {
+                4
+            } else if a & 0xf0 == 224 {
+                5
+            } else if a & 0xf0 == 240 || a == 0 {
+                6
+            } else if (a == 192 && b == 0 && c == 2) || (a == 198 && b == 51 && c == 100) || (a == 203 && b == 0 && c == 113) {
+                7
+            } else {
+                0
+            };
+        }
+        let v = u128::from_be_bytes(p.try_into().unwrap_or([0; 16]));
+        if v == 1 {
+            2
+        } else if v == 0 {
+            8
+        } else if a & 0xfe == 0xfc {
+            1
+        } else if a == 0xfe && b & 0xc0 == 0x80 {
+            3
+        } else if a == 0xff {
+            5
+        } else if p[..10].iter().all(|&x| x == 0) && p[10] == 0xff && p[11] == 0xff {
+            9
+        } else if p[..4] == [0x20, 0x01, 0x0d, 0xb8] {
+            7
+        } else {
+            0
+        }
+    }
+
+    pub fn cidr_words(row: &[u8], dst: &mut [i64], tail: &mut [i64]) {
+        tail[0] += 1;
+        let entry = php_trim(row);
+        let mut flags = flag(entry.len() != row.len(), CIDR_TRIMMED);
+        if PROXY_TOKENS.contains(&entry) || entry.is_empty() || entry[0] == b'#' {
+            flags |= if entry.is_empty() || entry[0] == b'#' { CIDR_SKIPPED } else { CIDR_PROXY_TOKEN };
+            dst.copy_from_slice(&[flags, 0, 0, 0, 0, -1]);
+            tail[4] += 1;
+            return;
+        }
+        let (address, prefix_text) = match entry.iter().position(|&b| b == b'/') {
+            Some(p) => (&entry[..p], Some(&entry[p + 1..])),
+            None => (entry, None),
+        };
+        let packed: Option<([u8; 16], usize)> = if address.contains(&b':') {
+            php_ipv6(address).map(|v| (v, 16))
+        } else if address.contains(&b'.') {
+            php_ipv4(address).map(|v| {
+                let mut b = [0u8; 16];
+                b[..4].copy_from_slice(&v);
+                (b, 4)
+            })
+        } else {
+            None
+        };
+        let Some((bytes, width_bytes)) = packed else {
+            dst.copy_from_slice(&[flags | CIDR_INVALID_ADDRESS, 0, 0, 0, 0, -1]);
+            tail[3] += 1;
+            return;
+        };
+        let p = &bytes[..width_bytes];
+        let v6 = width_bytes == 16;
+        let width = width_bytes as i64 * 8;
+        flags |= if v6 { 2 } else { 1 } | address_class(p) << CIDR_CLASS_SHIFT;
+        tail[if v6 { 2 } else { 1 }] += 1;
+        let value = if v6 { u128::from_be_bytes(bytes) } else { u128::from(u32::from_be_bytes([p[0], p[1], p[2], p[3]])) };
+        let prefix = match prefix_text {
+            None => {
+                flags |= CIDR_PREFIX_IMPLIED;
+                width
+            }
+            Some(t) if (1..=3).contains(&t.len()) && t.iter().all(u8::is_ascii_digit) => {
+                let n = t.iter().fold(0i64, |a, &d| a * 10 + i64::from(d - b'0'));
+                if n <= width {
+                    flags |= CIDR_VALID;
+                    n
+                } else {
+                    -1
+                }
+            }
+            Some(_) => -1,
+        };
+        let split = |v: u128| if v6 { ((v >> 64) as u64 as i64, v as u64 as i64) } else { (v as i64, 0) };
+        if prefix < 0 {
+            let (hi, lo) = split(value);
+            dst.copy_from_slice(&[flags | CIDR_PREFIX_INVALID, -1, 0, hi, lo, -1]);
+            tail[3] += 1;
+            return;
+        }
+        let host = (width - prefix) as u32;
+        let network = if host >= 128 { 0 } else { value >> host << host };
+        flags |= flag(network != value, CIDR_HOST_BITS);
+        let cf = CF_RANGES.iter().position(|&(rv6, head, rp)| {
+            let shift = width as u32 - rp;
+            let mut net = [0u8; 16];
+            net[..4].copy_from_slice(&head);
+            let rnet = if rv6 { u128::from_be_bytes(net) } else { u128::from(u32::from_be_bytes(head)) };
+            rv6 == v6 && prefix >= i64::from(rp) && value >> shift == rnet >> shift
+        });
+        flags |= flag(cf.is_some(), CIDR_CF_MEMBER);
+        let (hi, lo) = split(network);
+        dst.copy_from_slice(&[flags, prefix, i64::from(host), hi, lo, cf.map_or(-1, |i| i as i64)]);
+        tail[5] += i64::from(cf.is_some());
+        tail[6] += i64::from(network != value);
+        tail[7] += i64::from(flags & CIDR_VALID != 0);
+    }
+
+    /// Writes [`BMQ_WORDS`] words per NUL-joined BoundedMetricQuery row.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w601_bounded_metric_query_plan_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, BMQ_WORDS, 0, out, out_cap, bounded_query_words) }
+    }
+
+    /// Writes [`JWT_WORDS`] words per NUL-joined GrafanaJwtIssuer row.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w601_grafana_jwt_claim_plan_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, JWT_WORDS, 0, out, out_cap, jwt_claim_words) }
+    }
+
+    /// Writes [`FAM_WORDS`] words per NUL-joined MetricFamily row, then [`FAM_TAIL`] rollup words.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w601_metric_family_summary_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, FAM_WORDS, FAM_TAIL, out, out_cap, family_words) }
+    }
+
+    /// Writes [`SCRAPE_WORDS`] words per NUL-joined exporter scrape row, then [`SCRAPE_TAIL`]
+    /// aggregate words.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w601_prometheus_exporter_scrape_plan_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, SCRAPE_WORDS, SCRAPE_TAIL, out, out_cap, scrape_words) }
+    }
+
+    /// Writes [`CIDR_WORDS`] words per NUL-joined trusted-proxy entry, then [`CIDR_TAIL`] rollup
+    /// words.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w601_cloudflare_ip_range_classify_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, CIDR_WORDS, CIDR_TAIL, out, out_cap, cidr_words) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::w591_enums_backfill_days_group_scan_nzb_import_par2_rename_tmux_backfill::SHORT_CAPACITY;
+        use super::*;
+
+        #[test]
+        fn w601_bounded_query_words_plan() {
+            let mut d = [0i64; BMQ_WORDS];
+            bounded_query_words(b"  SELECT a FROM t LIMIT 5\t300\t0\t0\t10\t60", &mut d, &mut []);
+            let f = 1 | BMQ_READ_ONLY | BMQ_HAS_LIMIT | BMQ_RUNNABLE | BMQ_TIMEOUT_DEFAULTED | BMQ_LIMIT_DEFAULTED;
+            assert_eq!(d, [f, 300, 15, 2000, 1000, 50, 6]);
+            bounded_query_words(b"delete from t; select 1;;\t1\t99999\t200000\t-1\t0", &mut d, &mut []);
+            let f = 5 | BMQ_MULTI | BMQ_WINDOW_CLAMPED | BMQ_TIMEOUT_CLAMPED | BMQ_LIMIT_CLAMPED | BMQ_CACHE_DISABLED | BMQ_FUTURE_AGE;
+            assert_eq!(d, [f, 60, 15, 30_000, 100_000, 0, 5]);
+            bounded_query_words(b"\t1", &mut d, &mut []);
+            assert_eq!(d[0], BMQ_MALFORMED);
+        }
+
+        #[test]
+        fn w601_jwt_and_family_words_plan() {
+            let mut d = [0i64; JWT_WORDS];
+            jwt_claim_words(b"alice\ta@b.co\tViewer\t\t900\t1000\t30\t0", &mut d, &mut []);
+            let f = 2 | JWT_ROLE_EXACT | JWT_SUB_VALID | JWT_EMAIL_VALID | JWT_ORG_DEFAULTED | JWT_PRIOR_NONE | JWT_REFRESH | JWT_CLAIM_SAFE | JWT_ISSUABLE;
+            let len = br#"{"sub":"alice","email":"a@b.co","name":"alice","role":"Viewer","org":1,"iat":1000,"nbf":970,"exp":1900}"#.len() as i64;
+            assert_eq!(d, [f, 1, 900, 970, 1900, 0, len]);
+            assert!(!email_valid(b"a@.b") && email_valid(b"a@x.b") && !email_valid(b"a@b@c.d"));
+
+            let mut d = [0i64; FAM_WORDS];
+            let mut tail = [0i64; FAM_TAIL];
+            family_words(b"jobs\tcounter\ta\\b\tqueue,state,queue\t7\t5", &mut d, &mut tail);
+            let f = 2 | FAM_TYPE_EXACT | FAM_TYPE_SUPPORTED | FAM_NAME_VALID | FAM_COUNTER_NO_TOTAL | FAM_HELP_ESCAPED | FAM_LABEL_DUPLICATE
+                | FAM_CARDINALITY_EXCEEDED | FAM_DEFINITION_VALID;
+            assert_eq!(d, [f, 3, -1, 4, 7, -2]);
+            assert!(prom_ident(b"a\n", true) && !prom_ident(b"a\n\n", true) && !prom_ident(b"1a", false));
+            assert_eq!(tail, [1, 1, 3, 7, 1, 7, 0, 1, 0]);
+        }
+
+        #[test]
+        fn w601_scrape_and_cidr_words_plan() {
+            let mut d = [0i64; SCRAPE_WORDS];
+            let mut tail = [0i64; SCRAPE_TAIL];
+            scrape_words(b"App\\QueueCollector\t OK \t2\t50\t1000000\t0\t10", &mut d, &mut tail);
+            let f = 1 | 1 << SCRAPE_CLASS_SHIFT | SCRAPE_NAME_CONVENTIONAL | SCRAPE_NAMESPACED | SCRAPE_BUDGET_DEFAULTED;
+            assert_eq!(d, [f, 14, 2, 50, 25, 20, 10]);
+
+            let mut d = [0i64; CIDR_WORDS];
+            let mut tail = [0i64; CIDR_TAIL];
+            cidr_words(b" 104.16.1.2/13", &mut d, &mut tail);
+            let f = 1 | CIDR_TRIMMED | CIDR_VALID | CIDR_HOST_BITS | CIDR_CF_MEMBER;
+            assert_eq!(d, [f, 13, 19, i64::from(u32::from_be_bytes([104, 16, 0, 0])), 0, 11]);
+            cidr_words(b"2a06:98c0::/29", &mut d, &mut tail);
+            assert_eq!(d, [2 | CIDR_VALID | CIDR_CF_MEMBER, 29, 99, 0x2a06_98c0_0000_0000, 0, 20]);
+            cidr_words(b"::1/129", &mut d, &mut tail);
+            assert_eq!(d, [2 | 2 << CIDR_CLASS_SHIFT | CIDR_PREFIX_INVALID, -1, 0, 0, 1, -1]);
+            cidr_words(b"REMOTE_ADDR", &mut d, &mut tail);
+            assert_eq!(d, [CIDR_PROXY_TOKEN, 0, 0, 0, 0, -1]);
+            assert_eq!(tail, [4, 1, 2, 1, 1, 2, 1, 2]);
+        }
+
+        #[test]
+        fn w601_exports_guard_counts_capacity_and_tail() {
+            type Export = unsafe extern "C" fn(*const u8, usize, usize, *mut i64, usize) -> isize;
+            let rows = b"a\tb\0c";
+            let exports: [(Export, usize, usize); 5] = [
+                (nntmux_w601_bounded_metric_query_plan_batch, BMQ_WORDS, 0),
+                (nntmux_w601_grafana_jwt_claim_plan_batch, JWT_WORDS, 0),
+                (nntmux_w601_metric_family_summary_batch, FAM_WORDS, FAM_TAIL),
+                (nntmux_w601_prometheus_exporter_scrape_plan_batch, SCRAPE_WORDS, SCRAPE_TAIL),
+                (nntmux_w601_cloudflare_ip_range_classify_batch, CIDR_WORDS, CIDR_TAIL),
+            ];
+            for (export, per_row, tail) in exports {
+                let mut out = vec![7i64; 8 * per_row + tail];
+                unsafe {
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, out.as_mut_ptr(), out.len()), 2);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, out.as_mut_ptr(), 2 * per_row + tail - 1), SHORT_CAPACITY);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 3, out.as_mut_ptr(), out.len()), -1);
+                    out.fill(7);
+                    assert_eq!(export(std::ptr::null(), 0, 0, out.as_mut_ptr(), out.len()), 0);
+                    assert!(out[..tail].iter().all(|&w| w == 0));
                     assert_eq!(export(rows.as_ptr(), rows.len(), 2, std::ptr::null_mut(), 8), -1);
                 }
             }

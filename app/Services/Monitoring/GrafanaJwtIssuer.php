@@ -490,4 +490,235 @@ class GrafanaJwtIssuer
             return null;
         }
     }
+
+    /**
+     * Enabled: the paired benchmark in the W60 parity test measures 5.76x common mean, 4.829x
+     * common p99, 4.484x uncommon mean and 2.386x uncommon p99 (per-metric minimum of four runs),
+     * above the 1.5x rule.
+     */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    private const string W60_GRAFANA_JWT_FFI_CDEF = 'ssize_t nntmux_w601_grafana_jwt_claim_plan_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public const int W60_CLAIM_WORDS = 7;
+
+    public const int W60_ROLE_EXACT = 8;
+
+    public const int W60_SUB_VALID = 16;
+
+    public const int W60_EMAIL_EMPTY = 32;
+
+    public const int W60_EMAIL_VALID = 64;
+
+    public const int W60_ORG_DEFAULTED = 128;
+
+    public const int W60_ORG_INVALID = 256;
+
+    public const int W60_TTL_DEFAULTED = 512;
+
+    public const int W60_TTL_CLAMPED = 1024;
+
+    public const int W60_SKEW_CLAMPED = 2048;
+
+    public const int W60_PRIOR_NONE = 4096;
+
+    public const int W60_PRIOR_ACTIVE = 8192;
+
+    public const int W60_PRIOR_EXPIRED = 16384;
+
+    public const int W60_PRIOR_NOT_YET = 32768;
+
+    public const int W60_REFRESH = 65536;
+
+    public const int W60_CLAIM_SAFE = 131072;
+
+    public const int W60_ISSUABLE = 262144;
+
+    public const int W60_MALFORMED = 524288;
+
+    private const array W60_ROLES = ['none' => 1, 'viewer' => 2, 'editor' => 3, 'admin' => 4];
+
+    private const array W60_ROLE_NAMES = ['None', 'Viewer', 'Editor', 'Admin'];
+
+    public static function usesW60RustFfi(): bool
+    {
+        $enabled = self::w60RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 60 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function jwtClaimPlanBatch(array $rows): array
+    {
+        return self::usesW60RustFfi() ? self::jwtClaimPlanBatchNative($rows) : self::jwtClaimPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or Rust declines the batch (a
+     * row holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function jwtClaimPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count * self::W60_CLAIM_WORDS;
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w60RustFfiState('out', $words);
+        if ($buffer === null) {
+            return self::jwtClaimPlanBatchPhp($rows);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $rows);
+        try {
+            // @phpstan-ignore method.notFound (Declared by W60_GRAFANA_JWT_FFI_CDEF.)
+            $written = $ffi->nntmux_w601_grafana_jwt_claim_plan_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $result = $written === $count ? unpack('q*', FFI::string($out, $words * 8)) : false;
+        if (! \is_array($result)) {
+            return self::jwtClaimPlanBatchPhp($rows);
+        }
+
+        /** @var list<int> */
+        return array_values($result);
+    }
+
+    /**
+     * Seven words per `sub\temail\trole\torg\tttl\tnow\tleeway\tprior_iat` row: the role code
+     * (0 unknown, 1 None, 2 Viewer, 3 Editor, 4 Admin; trimmed, case-insensitive) with the
+     * exact-role, subject (`[A-Za-z0-9._@+-]{1,255}`), empty/valid email, org defaulted (empty
+     * is 1) or invalid (not a positive strict integer, 0), ttl defaulted (900) or clamped
+     * (60-86400), skew clamped (0-300), prior token none (iat 0), active, expired or not yet
+     * valid, refresh (no active prior token or less than a fifth of the ttl left), claim-safe
+     * (sub, email and role are printable ASCII without `"` or `\`) and issuable flags; then the
+     * org, ttl, nbf (now - skew), exp (now + ttl), prior seconds left and the claims JSON length
+     * (-1 unless claim-safe). A malformed row yields `[W60_MALFORMED, 0, 0, 0, 0, 0, 0]`.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function jwtClaimPlanBatchPhp(array $rows): array
+    {
+        $words = [];
+        foreach ($rows as $row) {
+            $f = explode("\t", $row);
+            $ints = [];
+            if (\count($f) === 8) {
+                for ($i = 4; $i <= 7 && preg_match('/\A-?[0-9]{1,18}\z/', $f[$i]) === 1; $i++) {
+                    $ints[] = (int) $f[$i];
+                }
+            }
+            if (\count($ints) !== 4) {
+                array_push($words, self::W60_MALFORMED, 0, 0, 0, 0, 0, 0);
+
+                continue;
+            }
+            [$sub, $email, $role, $org] = $f;
+            [$ttl, $now, $leeway, $iat] = $ints;
+            $code = self::W60_ROLES[strtolower(trim($role))] ?? 0;
+            $subValid = preg_match('/\A[A-Za-z0-9._@+\-]{1,255}\z/', $sub) === 1;
+            $emailValid = $email !== '' && preg_match('/\A[^@ \t\n\r\x0b\x0c]+@[^@ \t\n\r\x0b\x0c]+\.[^@ \t\n\r\x0b\x0c]+\z/', $email) === 1;
+            $flags = $code
+                | (\in_array($role, self::W60_ROLE_NAMES, true) ? self::W60_ROLE_EXACT : 0)
+                | ($subValid ? self::W60_SUB_VALID : 0)
+                | ($email === '' ? self::W60_EMAIL_EMPTY : 0)
+                | ($emailValid ? self::W60_EMAIL_VALID : 0);
+            if ($org === '') {
+                $org = 1;
+                $flags |= self::W60_ORG_DEFAULTED;
+            } elseif (preg_match('/\A-?[0-9]{1,18}\z/', $org) === 1 && (int) $org >= 1) {
+                $org = (int) $org;
+            } else {
+                $org = 0;
+                $flags |= self::W60_ORG_INVALID;
+            }
+            if ($ttl <= 0) {
+                $ttl = 900;
+                $flags |= self::W60_TTL_DEFAULTED;
+            } elseif ($ttl < 60 || $ttl > 86400) {
+                $ttl = max(60, min(86400, $ttl));
+                $flags |= self::W60_TTL_CLAMPED;
+            }
+            $skew = max(0, min(300, $leeway));
+            $flags |= $skew !== $leeway ? self::W60_SKEW_CLAMPED : 0;
+            $nbf = $now - $skew;
+            $exp = $now + $ttl;
+            $remaining = 0;
+            if ($iat === 0) {
+                $flags |= self::W60_PRIOR_NONE;
+            } elseif ($now < $iat - $skew) {
+                $flags |= self::W60_PRIOR_NOT_YET;
+            } elseif ($now >= $iat + $ttl + $skew) {
+                $flags |= self::W60_PRIOR_EXPIRED;
+            } else {
+                $flags |= self::W60_PRIOR_ACTIVE;
+                $remaining = $iat + $ttl + $skew - $now;
+            }
+            $flags |= ($flags & self::W60_PRIOR_ACTIVE) === 0 || $remaining < intdiv($ttl, 5) ? self::W60_REFRESH : 0;
+            $safe = preg_match('/\A[\x20\x21\x23-\x5b\x5d-\x7e]*\z/', $sub.$email.$role) === 1;
+            if ($safe) {
+                $flags |= self::W60_CLAIM_SAFE;
+                if ($subValid && $code !== 0 && $org !== 0 && ($email === '' || $emailValid)) {
+                    $flags |= self::W60_ISSUABLE;
+                }
+            }
+            $claimsLen = $safe
+                ? \strlen((string) json_encode(['sub' => $sub, 'email' => $email, 'name' => $sub, 'role' => $role, 'org' => $org, 'iat' => $now, 'nbf' => $nbf, 'exp' => $exp], JSON_UNESCAPED_SLASHES))
+                : -1;
+            array_push($words, $flags, $org, $ttl, $nbf, $exp, $remaining, $claimsLen);
+        }
+
+        return $words;
+    }
+
+    /**
+     * Wave 60 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics so the
+     * class gains no Wave 60 static properties.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('grafana_jwt_issuer_w60', self::W60_GRAFANA_JWT_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
+    }
 }
