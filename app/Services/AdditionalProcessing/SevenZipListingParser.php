@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\AdditionalProcessing;
 
 use App\Support\RustPipelineLibrary;
+use FFI\CData;
 
 /**
  * Incremental parser for `7z l -slt -ba` output, fed in arbitrary chunks.
@@ -545,5 +546,355 @@ final class SevenZipListingParser
 
         return (substr_count($data, "\0") === $count - 1 ? self::w52Words($count, $data, '', 4 * $count) : null)
             ?? self::linePlanBatchPhp($lines);
+    }
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 5.08x, p99 3.76x; uncommon mean 6.18x, p99 4.39x); see RustAdditional7zParserBudgetPersistenceMetricsContextW65ParityTest. */
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    public const string W65_SEVEN_ZIP_LISTING_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w653_seven_zip_listing_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 65.3 batch. */
+    public const int W65_SEVEN_ZIP_LISTING_TRAILER = 17;
+
+    /** Cap for the Wave 65.3 running totals. */
+    private const int W65_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', true);
+    }
+
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', false);
+    }
+
+    /** Restores W65_RUST_FFI_DEFAULT and drops the cached library handle and scratch buffers. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('reset');
+    }
+
+    public static function usesW65RustFfi(): bool
+    {
+        $override = self::w65RustFfiState();
+
+        return \is_bool($override) ? $override : self::W65_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the SevenZipListingParser Wave 65 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 65.3 `7z l -slt` record plan. Each item is one record block: lines end at LF (one trailing CR dropped),
+     * blank lines (spaces and tabs only) are skipped, and every other line must be `Key = value` (or end in ` =`) with
+     * a key matching `^[A-Za-z][A-Za-z0-9 ()._-]*$` that is not repeated, else the block is malformed (the line is
+     * dropped). Path is 0 missing or empty, 1 clean, 2 with C0, DEL or UTF-8 C1 controls; Size, Packed Size and Offset
+     * are 0 empty, 1 up to 15 trimmed ASCII digits, 2 other; Encrypted is 0 empty, 1 `+`, 2 `-`, 3 other. The codec is
+     * the Method's last space-separated token before any `:`, 0 without a Method, 1-10 for copy, lzma, lzma2, ppmd,
+     * bzip2, deflate, deflate64, zstd, lz4, brotli (any case) or 11 other; AES is a caseless `aes` anywhere in the
+     * Method and compressed a Method other than empty or `Copy`. The kind is 0 empty block, 1 rejected (malformed, Path
+     * state other than 1, or no Size key), 2 directory (`Folder = +` or Attributes starting with `D`), then by the
+     * basename's extension: 3 video, 4 audio, 5 NFO, 6 archive or volume (rar, zip, 7z, tar, gz, tgz, bz2, xz, iso,
+     * `rNN`, `zNN`, `NNN`), 7 image, 8 other. Sample is a caseless `sample` in the basename. Per item `kind |
+     * pathState << 4 | sizeState << 6 | packedState << 8 | offsetState << 10 | encrypted << 12 | codec << 14 | aes << 18
+     * | compressed << 19 | sample << 20 | malformed << 21 | min(properties, 255) << 22 | ratio << 30 | sizeMiB << 40`,
+     * with the ratio packed * 1000 / size (capped at 1023, 0 unless both are valid and size is positive) and the size
+     * in MiB capped at 2^23 - 1. Then the nine kind counts and, over files (kind 3+), the encrypted, compressed and AES
+     * counts, the size and packed totals (capped at 2^62), the 1-based index of the first non-sample video, of the
+     * first strictly largest non-sample video, and the distinct paths (case-insensitive).
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65SevenZipListingPlanBatch(array $items): array
+    {
+        return self::usesW65RustFfi() ? self::w65SevenZipListingPlanBatchNative($items) : self::w65SevenZipListingPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65SevenZipListingPlanBatchNative(array $items): array
+    {
+        return self::w65Invoke($items, \count($items) + self::W65_SEVEN_ZIP_LISTING_TRAILER) ?? self::w65SevenZipListingPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65SevenZipListingPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $kinds = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $encrypted = $compressed = $aesCount = $sizeSum = $packedSum = $firstMedia = $largest = $index = 0;
+        $largestSize = -1;
+        $paths = [];
+        foreach ($items as $item) {
+            $index++;
+            $record = [];
+            $malformed = false;
+            foreach (explode("\n", (string) $item) as $line) {
+                if (str_ends_with($line, "\r")) {
+                    $line = substr($line, 0, -1);
+                }
+                if (strspn($line, " \t") === \strlen($line)) {
+                    continue;
+                }
+                $separator = strpos($line, ' = ');
+                if ($separator !== false) {
+                    $key = substr($line, 0, $separator);
+                    $value = substr($line, $separator + 3);
+                } elseif (str_ends_with($line, ' =')) {
+                    $key = substr($line, 0, -2);
+                    $value = '';
+                } else {
+                    $malformed = true;
+
+                    continue;
+                }
+                if ($key === '' || strspn($key, self::W65_KEY_FIRST, 0, 1) !== 1 || strspn($key, self::W65_KEY_CHARS) !== \strlen($key) || isset($record[$key])) {
+                    $malformed = true;
+
+                    continue;
+                }
+                $record[$key] = $value;
+            }
+            $path = $record['Path'] ?? '';
+            $pathState = $path === '' ? 0 : (preg_match('/[\x00-\x1F\x7F]|\xC2[\x80-\x9F]/', $path) === 1 ? 2 : 1);
+            [$sizeState, $size] = self::w65Count($record['Size'] ?? '', 15);
+            [$packedState, $packed] = self::w65Count($record['Packed Size'] ?? '', 15);
+            [$offsetState] = self::w65Count($record['Offset'] ?? '', 15);
+            $encryption = match ($record['Encrypted'] ?? '') {
+                '' => 0,
+                '+' => 1,
+                '-' => 2,
+                default => 3,
+            };
+            $method = $record['Method'] ?? '';
+            $isCompressed = $method !== '' && $method !== 'Copy';
+            $codec = 0;
+            if ($method !== '') {
+                $space = strrpos($method, ' ');
+                $token = $space === false ? $method : substr($method, $space + 1);
+                $colon = strpos($token, ':');
+                $codec = self::W65_CODECS[strtolower($colon === false ? $token : substr($token, 0, $colon))] ?? 11;
+            }
+            $aes = stripos($method, 'aes') !== false;
+            $directory = ($record['Folder'] ?? '') === '+' || str_starts_with($record['Attributes'] ?? '', 'D');
+            $slash = strrpos($path, '/');
+            $backslash = strrpos($path, '\\');
+            $base = substr($path, max($slash === false ? -1 : $slash, $backslash === false ? -1 : $backslash) + 1);
+            $dot = strrpos($base, '.');
+            $sample = stripos($base, 'sample') !== false;
+            if ($record === [] && ! $malformed) {
+                $kind = 0;
+            } elseif ($malformed || $pathState !== 1 || ! isset($record['Size'])) {
+                $kind = 1;
+            } elseif ($directory) {
+                $kind = 2;
+            } else {
+                $kind = self::w65ExtensionKind($dot === false ? '' : substr($base, $dot + 1));
+            }
+            $ratio = $sizeState === 1 && $size > 0 && $packedState === 1 ? min(intdiv($packed * 1000, $size), 1023) : 0;
+            $mib = $sizeState === 1 ? min($size >> 20, 8_388_607) : 0;
+            $kinds[$kind]++;
+            if ($kind >= 3) {
+                $encrypted += $encryption === 1 ? 1 : 0;
+                $compressed += $isCompressed ? 1 : 0;
+                $aesCount += $aes ? 1 : 0;
+                $sizeSum = min($sizeSum + $size, self::W65_TOTAL_CAP);
+                $packedSum = min($packedSum + $packed, self::W65_TOTAL_CAP);
+                if ($kind === 3 && ! $sample) {
+                    if ($firstMedia === 0) {
+                        $firstMedia = $index;
+                    }
+                    if ($size > $largestSize) {
+                        $largest = $index;
+                        $largestSize = $size;
+                    }
+                }
+                $paths[strtolower($path)] = true;
+            }
+            $out[] = $kind | $pathState << 4 | $sizeState << 6 | $packedState << 8 | $offsetState << 10 | $encryption << 12 | $codec << 14
+                | ($aes ? 1 : 0) << 18 | ($isCompressed ? 1 : 0) << 19 | ($sample ? 1 : 0) << 20 | ($malformed ? 1 : 0) << 21
+                | min(\count($record), 255) << 22 | $ratio << 30 | $mib << 40;
+        }
+        array_push($out, ...$kinds);
+        array_push($out, $encrypted, $compressed, $aesCount, $sizeSum, $packedSum, $firstMedia, $largest, \count($paths));
+
+        return $out;
+    }
+
+    /**
+     * (0 empty, 1 one to $max ASCII digits, 2 other; the value) for the trimmed field.
+     *
+     * @return array{int, int}
+     */
+    private static function w65Count(string $text, int $max): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $length = \strlen($text);
+
+        return $length <= $max && strspn($text, '0123456789') === $length ? [1, (int) $text] : [2, 0];
+    }
+
+    /** First byte of an accepted listing key. */
+    private const string W65_KEY_FIRST = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+    /** Bytes of an accepted listing key. */
+    private const string W65_KEY_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ()._-';
+
+    /** Lower-cased codec token => code (any other token 11). */
+    private const array W65_CODECS = ['copy' => 1, 'lzma' => 2, 'lzma2' => 3, 'ppmd' => 4, 'bzip2' => 5, 'deflate' => 6, 'deflate64' => 7,
+        'zstd' => 8, 'lz4' => 9, 'brotli' => 10];
+
+    /** Lower-cased extension => entry kind (3 video, 4 audio, 5 NFO, 6 archive, 7 image). */
+    private const array W65_EXTENSION_KINDS = ['mkv' => 3, 'mp4' => 3, 'avi' => 3, 'm4v' => 3, 'ts' => 3, 'm2ts' => 3, 'wmv' => 3, 'mov' => 3,
+        'mpg' => 3, 'mpeg' => 3, 'webm' => 3, 'vob' => 3, 'mp3' => 4, 'flac' => 4, 'm4a' => 4, 'aac' => 4, 'ogg' => 4, 'wav' => 4, 'ape' => 4,
+        'wma' => 4, 'nfo' => 5, 'rar' => 6, 'zip' => 6, '7z' => 6, 'tar' => 6, 'gz' => 6, 'tgz' => 6, 'bz2' => 6, 'xz' => 6, 'iso' => 6,
+        'jpg' => 7, 'jpeg' => 7, 'png' => 7, 'gif' => 7, 'bmp' => 7, 'webp' => 7];
+
+    /** Entry kind of a basename extension: the W65_EXTENSION_KINDS entry, 6 for `rNN`, `zNN` and `NNN` volumes, else 8. */
+    private static function w65ExtensionKind(string $extension): int
+    {
+        $kind = self::W65_EXTENSION_KINDS[strtolower($extension)] ?? 0;
+        if ($kind !== 0) {
+            return $kind;
+        }
+
+        return \strlen($extension) === 3 && strspn($extension, '0123456789', 1) === 2 && strspn($extension, '0123456789rRzZ', 0, 1) === 1 ? 6 : 8;
+    }
+
+    /**
+     * Wave 65 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and returns the
+     * previous override, 'reset' clears the override, library handle and buffers, 'ffi' resolves the library
+     * (null when unavailable) and 'out' and 'lens' return `int64_t` output and length-column buffers of at least
+     * $val words. Function statics keep the class's property set unchanged.
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var \FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w653', self::W65_SEVEN_ZIP_LISTING_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w65RustFfiState('ffi');
+                if (! $handle instanceof \FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w65RustFfiState('ffi');
+                if (! $handle instanceof \FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 65.3 SevenZipListingParser export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call declines
+     * or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w65Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w65RustFfiState('ffi');
+            $out = self::w65RustFfiState('out', $words);
+            if (! $ffi instanceof \FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w65RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                \FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = \FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W65_SEVEN_ZIP_LISTING_FFI_CDEF.)
+            $written = $ffi->nntmux_w653_seven_zip_listing_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', \FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (\Throwable) {
+            return null;
+        }
     }
 }
