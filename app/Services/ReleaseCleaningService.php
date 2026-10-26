@@ -9,6 +9,7 @@ use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\NzbSplitUnwrapper;
 use App\Support\PredbSearchDocument;
 use App\Support\RustPipelineLibrary;
+use FFI\CData;
 
 /**
  * Cleans names for releases/imports/namefixer.
@@ -739,5 +740,161 @@ class ReleaseCleaningService
     {
         self::$w401UseRustFfi = null;
         self::$w401Ffi = null;
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W55 parity test measures 6.547x common mean, 5.694x common
+     * p99, 7.237x uncommon mean and 5.248x uncommon p99 (per-metric minimum of four runs), above
+     * the 1.5x rule.
+     */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    private const string W55_FFI_CDEF = 'ssize_t nntmux_w551_release_cleaning_mask_batch(const char *subjects, size_t subjects_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 55 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    public const int W55_CLEAN_COUNTER_FILE = 1;
+
+    public const int W55_CLEAN_SCRAMBLED = 2;
+
+    public const int W55_CLEAN_YENC_TAIL = 4;
+
+    public const int W55_CLEAN_MULTI_SPACE = 8;
+
+    public const int W55_CLEAN_NON_PRINTABLE = 16;
+
+    public const int W55_CLEAN_NAME_PREFIX = 32;
+
+    public const int W55_CLEAN_MARKER_SUFFIX = 64;
+
+    /**
+     * One `W55_CLEAN_*` mask per subject, flagging the cleaning paths that apply to it: a
+     * COUNTER_FILE_SUBJECT match (and a ROT13 `lRap` marker after it, as counterFileSubjectNamePhp()
+     * checks), releaseCleanerHelperPhp()'s `yEnc` tail and whitespace runs, and fixerCleanerPhp()'s
+     * non-printable bytes, `Release Name`/`sample-` prefix and sample/proof/thumbs suffix.
+     *
+     * @param  array<array-key, string>  $subjects
+     * @return list<int>
+     */
+    public static function subjectCleaningMasks(array $subjects): array
+    {
+        return self::usesW55RustFfi() ? self::subjectCleaningMasksNative($subjects) : self::subjectCleaningMasksPhp($subjects);
+    }
+
+    /**
+     * @param  array<array-key, string>  $subjects
+     * @return list<int>
+     */
+    public static function subjectCleaningMasksPhp(array $subjects): array
+    {
+        $masks = [];
+        foreach ($subjects as $subject) {
+            $mask = 0;
+            if (preg_match(self::COUNTER_FILE_SUBJECT, $subject, $hit) === 1) {
+                $mask |= self::W55_CLEAN_COUNTER_FILE;
+                if (preg_match('/\blRap\b/i', substr($subject, \strlen($hit[0]))) === 1) {
+                    $mask |= self::W55_CLEAN_SCRAMBLED;
+                }
+            }
+            if (preg_match('/(\- )?yEnc$/', $subject) === 1) {
+                $mask |= self::W55_CLEAN_YENC_TAIL;
+            }
+            if (preg_match('/\s\s+/', $subject) === 1) {
+                $mask |= self::W55_CLEAN_MULTI_SPACE;
+            }
+            if (preg_match('/[^(\x20-\x7F)]/', $subject) === 1) {
+                $mask |= self::W55_CLEAN_NON_PRINTABLE;
+            }
+            if (preg_match('/^(Release Name|sample[-_])/i', $subject) === 1) {
+                $mask |= self::W55_CLEAN_NAME_PREFIX;
+            }
+            if (preg_match('/[.\-_](sample|proof|thumbs?)$/i', $subject) === 1) {
+                $mask |= self::W55_CLEAN_MARKER_SUFFIX;
+            }
+            $masks[] = $mask;
+        }
+
+        return $masks;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $subjects
+     * @return list<int>
+     */
+    public static function subjectCleaningMasksNative(array $subjects): array
+    {
+        $count = \count($subjects);
+        /** @var array{0: \FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w55RustFfiState('out', $count);
+        if ($buffer === null) {
+            return self::subjectCleaningMasksPhp($subjects);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $subjects);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w551_release_cleaning_mask_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', \FFI::string($out, $count * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::subjectCleaningMasksPhp($subjects);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 55 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('release_cleaning_w55', self::W55_FFI_CDEF) ?? false;
+                if (! $ffi instanceof \FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }

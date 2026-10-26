@@ -15,6 +15,7 @@ use App\Support\RustPipelineLibrary;
 use DariusIII\NetNntp\Client as NntpClient;
 use DariusIII\NetNntp\Error as NntpError;
 use DariusIII\NetNntp\Protocol\ResponseCode;
+use FFI\CData;
 use Illuminate\Container\Container;
 
 /**
@@ -2722,5 +2723,145 @@ class NNTPService extends NntpClient
     public function isCompressionSupported(): bool
     {
         return $this->_compressionSupported;
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W55 parity test measures 3.397x common mean, 3.313x common
+     * p99, 2.947x uncommon mean and 2.277x uncommon p99 (per-metric minimum of four runs), above
+     * the 1.5x rule.
+     */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    private const string W55_FFI_CDEF = 'ssize_t nntmux_w551_message_id_code_batch(const char *ids, size_t ids_len, size_t count, int64_t maximum_bytes, int64_t *out, size_t out_cap);';
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 55 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    public const int W55_MESSAGE_ID_REASON_MASK = 3;
+
+    public const int W55_MESSAGE_ID_WITHIN = 4;
+
+    public const int W55_MESSAGE_ID_NEEDS_FORMAT = 8;
+
+    public const int W55_MESSAGE_ID_INVALID_SHIFT = 4;
+
+    /**
+     * One verification word per message-id under one byte budget: planVerificationMessageIdPhp()'s
+     * reason index (W382_ID_REASONS, under W55_MESSAGE_ID_REASON_MASK), W55_MESSAGE_ID_WITHIN when
+     * the bracketed id fits, W55_MESSAGE_ID_NEEDS_FORMAT when _formatMessageID() would still bracket
+     * it, and `first_invalid + 1` shifted by W55_MESSAGE_ID_INVALID_SHIFT.
+     *
+     * @param  array<array-key, string>  $messageIds
+     * @return list<int>
+     */
+    public static function verificationMessageIdCodes(array $messageIds, int $maximumBytes): array
+    {
+        return self::usesW55RustFfi() ? self::verificationMessageIdCodesNative($messageIds, $maximumBytes) : self::verificationMessageIdCodesPhp($messageIds, $maximumBytes);
+    }
+
+    /**
+     * @param  array<array-key, string>  $messageIds
+     * @return list<int>
+     */
+    public static function verificationMessageIdCodesPhp(array $messageIds, int $maximumBytes): array
+    {
+        $codes = [];
+        foreach ($messageIds as $messageId) {
+            $id = trim($messageId, '<>');
+            $length = \strlen($id);
+            $span = strcspn($id, self::W382_INVALID_ID_BYTES);
+            $firstInvalid = $span < $length ? $span : -1;
+            $reason = match (true) {
+                $maximumBytes < 1 => 1,
+                $length === 0 => 2,
+                $firstInvalid >= 0 => 3,
+                default => 0,
+            };
+            $codes[] = $reason | ($reason === 0 && $length + 2 <= $maximumBytes ? self::W55_MESSAGE_ID_WITHIN : 0)
+                | ($messageId !== '' && ($messageId[0] !== '<' || $messageId[-1] !== '>') ? self::W55_MESSAGE_ID_NEEDS_FORMAT : 0)
+                | (($firstInvalid + 1) << self::W55_MESSAGE_ID_INVALID_SHIFT);
+        }
+
+        return $codes;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $messageIds
+     * @return list<int>
+     */
+    public static function verificationMessageIdCodesNative(array $messageIds, int $maximumBytes): array
+    {
+        $count = \count($messageIds);
+        /** @var array{0: \FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w55RustFfiState('out', $count);
+        if ($buffer === null) {
+            return self::verificationMessageIdCodesPhp($messageIds, $maximumBytes);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $messageIds);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w551_message_id_code_batch($joined, \strlen($joined), $count, $maximumBytes, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', \FFI::string($out, $count * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::verificationMessageIdCodesPhp($messageIds, $maximumBytes);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 55 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nntp_w55', self::W55_FFI_CDEF) ?? false;
+                if (! $ffi instanceof \FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }
