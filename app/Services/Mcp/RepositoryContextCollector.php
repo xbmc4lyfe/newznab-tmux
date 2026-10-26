@@ -6,6 +6,7 @@ namespace App\Services\Mcp;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -638,5 +639,188 @@ class RepositoryContextCollector
         }
 
         return array_values(array_unique($interfaces));
+    }
+
+    // ---- Wave 57.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 5.80x/4.74x, uncommon 5.52x/4.56x); see RustMcpPathGuardRepoContextRedactorStatusTmuxCollectorW57ParityTest. */
+    private const bool W57_RUST_FFI_DEFAULT = true;
+
+    private const string W57_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w57_repo_history_plan_batch(const char *outputs, size_t outputs_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 57 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w57RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w57', self::W57_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w57RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW57RustFfi(): bool
+    {
+        $enabled = self::w57RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W57_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planHistoryBatch() routed to Rust ($enabled) or PHP, then restores
+     * the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW57RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w57RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w57RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w57Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w57Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /**
+     * Batch plan over `git log --format=%h%x09%s` outputs, parsed as recentHistory() does
+     * (trim, split on `\R`, commit before the first tab, empty commits skipped). Per output:
+     * `flags | min(commits, 0xFFFFFF) << 8 | crc32(entries) << 32`, the entries joined as
+     * `commit\tsubject` by newlines. Flags: 1 a line was skipped, 2 a commit line had no tab, 4
+     * every commit (at least one) is 4-40 lowercase hex digits. The total commits, outputs
+     * without commits, outputs with skipped lines, outputs with untabbed lines, the distinct
+     * commit hashes and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $outputs
+     * @return list<int>
+     */
+    public static function planHistoryBatch(array $outputs): array
+    {
+        return self::usesW57RustFfi() ? self::planHistoryBatchNative($outputs) : self::planHistoryBatchPhp($outputs);
+    }
+
+    /**
+     * @param  list<string>  $outputs
+     * @return list<int>
+     */
+    public static function planHistoryBatchPhp(array $outputs): array
+    {
+        $out = $seen = [];
+        $total = $empty = $skipped = $untabbed = 0;
+        foreach ($outputs as $output) {
+            $entries = [];
+            $flags = 0;
+            $hex = true;
+            foreach (preg_split('/\R/', trim((string) $output)) ?: [] as $line) {
+                [$commit, $subject] = array_pad(explode("\t", $line, 2), 2, '');
+                if ($commit === '') {
+                    $flags |= 1;
+
+                    continue;
+                }
+                if (! str_contains($line, "\t")) {
+                    $flags |= 2;
+                }
+                $length = \strlen($commit);
+                $hex = $hex && $length >= 4 && $length <= 40 && strspn($commit, '0123456789abcdef') === $length;
+                $entries[] = $commit."\t".$subject;
+                $seen[$commit] = true;
+            }
+            $commits = \count($entries);
+            $flags |= $hex && $commits > 0 ? 4 : 0;
+            $total += $commits;
+            $empty += $commits === 0 ? 1 : 0;
+            $skipped += $flags & 1;
+            $untabbed += $flags >> 1 & 1;
+            $out[] = $flags | min($commits, 0xFFFFFF) << 8 | crc32(implode("\n", $entries)) << 32;
+        }
+        array_push($out, $total, $empty, $skipped, $untabbed, \count($seen));
+        $out[] = self::w57Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, an output holds a NUL byte or
+     * the column is not a list.
+     *
+     * @param  list<string>  $outputs
+     * @return list<int>
+     */
+    public static function planHistoryBatchNative(array $outputs): array
+    {
+        $count = \count($outputs);
+        $words = $count + 6;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w57RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($outputs)) {
+            return self::planHistoryBatchPhp($outputs);
+        }
+        $blob = implode("\0", $outputs);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W57_FFI_CDEF.)
+            $written = $ffi->nntmux_w57_repo_history_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w57Words($written, $out, $words) ?? self::planHistoryBatchPhp($outputs);
     }
 }

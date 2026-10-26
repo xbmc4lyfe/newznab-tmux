@@ -8,6 +8,8 @@ use App\Services\Monitoring\Prometheus\MetricFamily;
 use App\Services\Monitoring\TmuxMetricsSnapshot;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
+use Throwable;
 
 /**
  * Exposes the tmux monitor's processing statistics from its published snapshot.
@@ -436,5 +438,187 @@ class TmuxSnapshotCollector implements MetricsCollector
         $families[] = $timers;
 
         return $families;
+    }
+
+    // ---- Wave 57.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 5.92x/4.86x, uncommon 5.83x/4.65x); see RustMcpPathGuardRepoContextRedactorStatusTmuxCollectorW57ParityTest. */
+    private const bool W57_RUST_FFI_DEFAULT = true;
+
+    private const string W57_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w57_tmux_count_key_plan_batch(const char *keys, size_t keys_len, size_t count, int64_t collected_at, int64_t now, int64_t stale_after, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 57 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w57RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w57', self::W57_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w57RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW57RustFfi(): bool
+    {
+        $enabled = self::w57RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W57_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planCountKeyBatch() routed to Rust ($enabled) or PHP, then restores
+     * the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW57RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w57RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w57RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w57Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w57Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /**
+     * Batch plan over snapshot count keys, filed as extractCountSeriesPhp() files them, plus
+     * the snapshot's freshness. Per key: `class | index << 3 | duplicate << 7 | min(length,
+     * 0xFFFFFF) << 8 | crc32(label) << 32`. Class: 1 backlog (`process*`, labelled by the
+     * suffix), 2 table (labelled without `_table`), 3 category, 4 scalar (labelled by the key),
+     * 0 other (empty label); index is the position in its list. The five class counts, the
+     * duplicate keys, the snapshot age (`max(0, $now - $collectedAt)`, saturating), whether it
+     * exceeds `max(0, $staleAfter)` and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $keys
+     * @return list<int>
+     */
+    public static function planCountKeyBatch(array $keys, int $collectedAt, int $now, int $staleAfter): array
+    {
+        return self::usesW57RustFfi() ? self::planCountKeyBatchNative($keys, $collectedAt, $now, $staleAfter)
+            : self::planCountKeyBatchPhp($keys, $collectedAt, $now, $staleAfter);
+    }
+
+    /**
+     * @param  list<string>  $keys
+     * @return list<int>
+     */
+    public static function planCountKeyBatchPhp(array $keys, int $collectedAt, int $now, int $staleAfter): array
+    {
+        $out = $seen = [];
+        $classes = array_fill(0, 5, 0);
+        $duplicates = 0;
+        foreach ($keys as $key) {
+            $key = (string) $key;
+            [$class, $index, $label] = [0, 0, ''];
+            if (str_starts_with($key, 'process')) {
+                [$class, $label] = [1, substr($key, \strlen('process'))];
+            } elseif (($found = array_search($key, self::TABLES, true)) !== false) {
+                [$class, $index, $label] = [2, $found, self::TABLE_LABELS[$found]];
+            } elseif (($found = array_search($key, self::CATEGORIES, true)) !== false) {
+                [$class, $index, $label] = [3, $found, $key];
+            } elseif (($found = array_search($key, self::SCALAR_KEYS, true)) !== false) {
+                [$class, $index, $label] = [4, $found, $key];
+            }
+            $duplicate = isset($seen[$key]);
+            $seen[$key] = true;
+            $classes[$class]++;
+            $duplicates += $duplicate ? 1 : 0;
+            $out[] = $class | $index << 3 | ($duplicate ? 128 : 0) | min(\strlen($label), 0xFFFFFF) << 8 | crc32($label) << 32;
+        }
+        $age = match (true) {
+            $collectedAt >= $now => 0,
+            $collectedAt < 0 && $now > PHP_INT_MAX + $collectedAt => PHP_INT_MAX,
+            default => $now - $collectedAt,
+        };
+        array_push($out, ...$classes);
+        array_push($out, $duplicates, $age, $age > max(0, $staleAfter) ? 1 : 0);
+        $out[] = self::w57Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a key holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  list<string>  $keys
+     * @return list<int>
+     */
+    public static function planCountKeyBatchNative(array $keys, int $collectedAt, int $now, int $staleAfter): array
+    {
+        $count = \count($keys);
+        $words = $count + 9;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w57RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($keys)) {
+            return self::planCountKeyBatchPhp($keys, $collectedAt, $now, $staleAfter);
+        }
+        $blob = implode("\0", $keys);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W57_FFI_CDEF.)
+            $written = $ffi->nntmux_w57_tmux_count_key_plan_batch($blob, \strlen($blob), $count, $collectedAt, $now, $staleAfter, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w57Words($written, $out, $words) ?? self::planCountKeyBatchPhp($keys, $collectedAt, $now, $staleAfter);
     }
 }
