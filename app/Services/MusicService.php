@@ -16,6 +16,7 @@ use App\Services\Releases\ReleaseBrowseService;
 use App\Support\MetadataSearchLookup;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Throwable;
@@ -912,5 +913,202 @@ class MusicService
         return Release::query()->where('id', $releaseId)
             ->when($searchname !== null, static fn ($q) => $q->where('searchname', $searchname))
             ->update(['musicinfo_id' => $albumId]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 55.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 4.91x, p99 3.02x; uncommon mean 5.97x, p99 4.81x); see RustMoviesMusicProcessorMusicPostProcessTvMazeW55ParityTest. */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    public const string W55_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w554_music_lookup_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** summarizeMusicReleaseLookupBatchPhp() MP3/bitrate tokens. */
+    private const array W55_MP3_TOKENS = ['MP3' => true, '128' => true, '192' => true, '256' => true, '320' => true];
+
+    /**
+     * summarizeMusicReleaseLookupBatchPhp() per trimmed title and year instead of as totals.
+     * Each row yields four words: flags (FLAC 1, MP3/bitrate 2, year 4, artist-album
+     * splittable 8, valid year field 16), the ASCII alphanumeric token count, the year field
+     * when it is 1000-2999 else the first such title token (-1) and the first hyphen's offset
+     * in the trimmed title (-1).
+     *
+     * @param  list<string>  $titles
+     * @param  list<string>  $years
+     * @return list<int>
+     */
+    public static function musicLookupRowBatch(array $titles, array $years): array
+    {
+        return self::usesW55RustFfi()
+            ? self::musicLookupRowBatchNative($titles, $years)
+            : self::musicLookupRowBatchPhp($titles, $years);
+    }
+
+    /**
+     * @param  list<string>  $titles
+     * @param  list<string>  $years
+     * @return list<int>
+     */
+    public static function musicLookupRowBatchNative(array $titles, array $years): array
+    {
+        self::w55AssertColumns($titles, $years);
+        $count = \count($titles);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w55Call(implode("\0", $titles)."\0".implode("\0", $years), '', $count, 4)
+            ?? self::musicLookupRowBatchPhp($titles, $years);
+    }
+
+    /**
+     * @param  list<string>  $titles
+     * @param  list<string>  $years
+     * @return list<int>
+     */
+    public static function musicLookupRowBatchPhp(array $titles, array $years): array
+    {
+        self::w55AssertColumns($titles, $years);
+        $out = [];
+        foreach ($titles as $i => $rawTitle) {
+            $title = trim($rawTitle);
+            $yearField = trim($years[$i]);
+            $flags = 0;
+            $year = -1;
+            if (preg_match('/\A[12][0-9]{3}\z/', $yearField) === 1) {
+                $flags = 20;
+                $year = (int) $yearField;
+            }
+            $tokens = preg_split('/[^A-Z0-9]+/', strtoupper($title), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            foreach ($tokens as $token) {
+                if ($token === 'FLAC') {
+                    $flags |= 1;
+                } elseif (isset(self::W55_MP3_TOKENS[$token])) {
+                    $flags |= 2;
+                }
+                if (preg_match('/\A[12][0-9]{3}\z/', $token) === 1) {
+                    $flags |= 4;
+                    if ($year < 0) {
+                        $year = (int) $token;
+                    }
+                }
+            }
+            $hyphen = strpos($title, '-');
+            if ($hyphen !== false && trim(substr($title, 0, $hyphen)) !== '' && trim(substr($title, $hyphen + 1)) !== '') {
+                $flags |= 8;
+            }
+            array_push($out, $flags, \count($tokens), $year, $hyphen === false ? -1 : $hyphen);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Equal-length list columns, or InvalidArgumentException.
+     *
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w55AssertColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (! array_is_list($column) || \count($column) !== $count) {
+                throw new \InvalidArgumentException('W55 batch columns must be lists of equal length.');
+            }
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W55 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('enabled');
+        self::w55RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text columns and packed int64 header in,
+     * `$words` int64 words back per record. Null when the library is missing or declines
+     * (a value holding a NUL byte adds a field, which the export rejects).
+     *
+     * @return list<int>|null
+     */
+    private static function w55Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            $state = self::w55RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w55', self::W55_FFI_CDEF) ?? false;
+                self::w55RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w55RustFfiState('out', $out);
+                self::w55RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
+            $written = $ffi->nntmux_w554_music_lookup_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W55 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }
