@@ -7,6 +7,7 @@ namespace App\Services\Yenc;
 use App\Services\RegexService;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 
 /**
  * The file an article belongs to, as its yEnc header describes it.
@@ -313,5 +314,256 @@ final readonly class YencPart
         }
 
         return $summary;
+    }
+
+    // ---- Wave 63.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 8.66x/9.59x, uncommon 8.97x/8.99x); see RustFingerprintCollectorYencDecoderPartServiceLogFileW63ParityTest. */
+    public const bool W63_RUST_FFI_DEFAULT = true;
+
+    private const string W63_YENC_PART_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w632_yenc_part_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W63_YENC_PART_TAIL = 20;
+
+    /**
+     * Wave 63 routing, binding and output buffer, kept in function-local statics (no static or
+     * instance properties). Operations: null reads the routing override, 'set' replaces it
+     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
+     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
+     * (null without the library).
+     */
+    private static function w63RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'reset':
+                $previous = $enabled;
+                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w63', self::W63_YENC_PART_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w63RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    /** Routes w63YencPartPlanBatch() to Rust until reset. */
+    public static function enableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', true);
+    }
+
+    /** Routes w63YencPartPlanBatch() to PHP until reset. */
+    public static function disableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', false);
+    }
+
+    /** Restores W63_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
+    public static function resetW63RustFfi(): void
+    {
+        self::w63RustFfiState('reset');
+    }
+
+    public static function usesW63RustFfi(): bool
+    {
+        $enabled = self::w63RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W63_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w63YencPartPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW63RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w63RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w63RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w63YencPartPlanBatch(array $rows): array
+    {
+        return self::usesW63RustFfi() ? self::w63YencPartPlanBatchNative($rows) : self::w63YencPartPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w63YencPartPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W63_YENC_PART_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w63RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w63YencPartPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W63_YENC_PART_FFI_CDEF.)
+            $written = $ffi->nntmux_w632_yenc_part_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w63YencPartPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w63Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w63Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /**
+     * Wave 63.2 part plan. Per `name\tsize\tpart\tbegin\tend\tcrc32\tbody_bytes` row `status |
+     * continuity << 3 | crc_class << 5 | min(part, 65535) << 7 | min(length, 2^32 - 1) << 23 |
+     * (crc32(lowercase trimmed name) & 0xFF) << 55`. Numbers are w63Int() fields of up to 12 digits;
+     * a malformed one, a missing size or an empty trimmed name makes the row invalid (status 0, only
+     * the CRC class kept). Statuses: 1 single-part body of exactly `size` bytes, 2 single-part body
+     * of another length, 3 validSpanPhp() range with a body of exactly lengthPhp() bytes, 4 such a
+     * range with another body length, 5 an invalid range, 6 a part number without a range or half a
+     * range. CRC classes (normalizeCrc32Php() of the trimmed field): 0 absent, 1 valid, 2 malformed,
+     * 3 zero. Per file (lowercase trimmed name) a valid range continues the previous one (1), leaves
+     * a gap (2) or overlaps it (3), 0 for the first range and other statuses. Then seven status,
+     * four continuity and four CRC class counts, the distinct files, the bytes of complete rows
+     * (statuses 1 and 3), the largest range end, the ranges whose part number does not follow the
+     * file's previous range and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w63YencPartPlanBatchPhp(array $rows): array
+    {
+        $out = $files = [];
+        $statuses = array_fill(0, 7, 0);
+        $continuity = $crcs = [0, 0, 0, 0];
+        $totalLength = $maxEnd = $partGaps = 0;
+        foreach ($rows as $row) {
+            [$name, $size, $part, $begin, $end, $crc, $body] = explode("\t", (string) $row, 7) + array_fill(0, 7, '');
+            $name = trim($name);
+            $size = self::w63Int($size, 12);
+            $part = self::w63Int($part, 12);
+            $begin = self::w63Int($begin, 12);
+            $end = self::w63Int($end, 12);
+            $body = self::w63Int($body, 12);
+            $crcCode = self::w63CrcClass($crc);
+            if (! \is_int($size) || $part === false || $begin === false || $end === false || $body === false || $name === '') {
+                $statuses[0]++;
+                $crcs[$crcCode]++;
+                $out[] = $crcCode << 5;
+
+                continue;
+            }
+            $body ??= 0;
+            [$status, $length] = match (true) {
+                $begin === null && $end === null => $part !== null ? [6, 0] : [$body === $size ? 1 : 2, $size],
+                $begin !== null && $end !== null => self::validSpanPhp($begin, $end, $size) ? [$body === $end - $begin + 1 ? 3 : 4, $end - $begin + 1] : [5, 0],
+                default => [6, 0],
+            };
+            $key = strtolower($name);
+            $files[$key] ??= [null, null];
+            $cont = 0;
+            if (($status === 3 || $status === 4) && $begin !== null && $end !== null) {
+                [$lastEnd, $lastPart] = $files[$key];
+                if ($lastEnd !== null) {
+                    $cont = $begin === $lastEnd + 1 ? 1 : ($begin > $lastEnd + 1 ? 2 : 3);
+                }
+                if ($part !== null && $lastPart !== null && $part !== $lastPart + 1) {
+                    $partGaps++;
+                }
+                $files[$key] = [$end, $part];
+                $maxEnd = max($maxEnd, $end);
+            }
+            if ($status === 1 || $status === 3) {
+                $totalLength += $length;
+            }
+            $statuses[$status]++;
+            $continuity[$cont]++;
+            $crcs[$crcCode]++;
+            $out[] = $status | $cont << 3 | $crcCode << 5 | min($part ?? 0, 0xFFFF) << 7 | min($length, 0xFFFFFFFF) << 23 | (crc32($key) & 0xFF) << 55;
+        }
+        array_push($out, ...$statuses, ...$continuity, ...$crcs);
+        array_push($out, \count($files), $totalLength, $maxEnd, $partGaps);
+        $out[] = self::w63Digest($out);
+
+        return $out;
+    }
+
+    /** 0 absent, 1 valid, 2 malformed, 3 zero: normalizeCrc32Php() of the trimmed field. */
+    private static function w63CrcClass(string $crc): int
+    {
+        $crc = trim($crc);
+        $length = \strlen($crc);
+
+        return match (true) {
+            $length === 0 => 0,
+            $length > 8 || strspn($crc, '0123456789abcdefABCDEF') !== $length => 2,
+            strspn($crc, '0') === $length => 3,
+            default => 1,
+        };
     }
 }

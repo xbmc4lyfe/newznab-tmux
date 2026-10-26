@@ -6,7 +6,9 @@ namespace App\Services\Yenc;
 
 use App\Services\RegexService;
 use App\Services\Releases\Verification\LeaseHeartbeat;
+use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Psr\Log\LoggerInterface;
 use RuntimeException;
 use Throwable;
@@ -215,5 +217,239 @@ final class DecoderFactory
         }
 
         return $summary;
+    }
+
+    // ---- Wave 63.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 11.78x/11.54x, uncommon 10.49x/7.53x); see RustFingerprintCollectorYencDecoderPartServiceLogFileW63ParityTest. */
+    public const bool W63_RUST_FFI_DEFAULT = true;
+
+    private const string W63_DECODER_FACTORY_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w632_decoder_factory_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W63_DECODER_FACTORY_TAIL = 20;
+
+    /**
+     * Wave 63 routing, binding and output buffer, kept in function-local statics (no static or
+     * instance properties). Operations: null reads the routing override, 'set' replaces it
+     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
+     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
+     * (null without the library).
+     */
+    private static function w63RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'reset':
+                $previous = $enabled;
+                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w63', self::W63_DECODER_FACTORY_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w63RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    /** Routes w63DecoderFactoryPlanBatch() to Rust until reset. */
+    public static function enableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', true);
+    }
+
+    /** Routes w63DecoderFactoryPlanBatch() to PHP until reset. */
+    public static function disableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', false);
+    }
+
+    /** Restores W63_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
+    public static function resetW63RustFfi(): void
+    {
+        self::w63RustFfiState('reset');
+    }
+
+    public static function usesW63RustFfi(): bool
+    {
+        $enabled = self::w63RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W63_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w63DecoderFactoryPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW63RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w63RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w63RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w63DecoderFactoryPlanBatch(array $rows): array
+    {
+        return self::usesW63RustFfi() ? self::w63DecoderFactoryPlanBatchNative($rows) : self::w63DecoderFactoryPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w63DecoderFactoryPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W63_DECODER_FACTORY_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w63RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w63DecoderFactoryPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W63_DECODER_FACTORY_FFI_CDEF.)
+            $written = $ffi->nntmux_w632_decoder_factory_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w63DecoderFactoryPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w63Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w63Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /** Largest decode buffer w63DecoderFactoryPlanBatch() sizes. */
+    public const int W63_DECODER_MAX_BUFFER = 67_108_864;
+
+    /**
+     * Wave 63.2 decoder plan. Per `mode\tlibrary\tsapi\tos\tpayload_bytes\tline_length` row `mode |
+     * decision << 2 | flags << 4 | buffer_exponent << 11 | line << 16 | min(lines, 2^24 - 1) << 24
+     * | (crc32(mode:library) & 0x7FFF) << 48`. Modes are matched exactly (validModePhp()): 0
+     * invalid, 1 auto, 2 php, 3 native. Decisions: 0 invalid, 1 PHP decoder (selectsPhpPhp()), 2
+     * native with PHP fallback (auto), 3 native required. Flags: 1 library set, 2 SAPI `cli`, 4 OS
+     * family `Linux`, 8 absolute library path, 16 payload above W63_DECODER_MAX_BUFFER, 32 line length
+     * defaulted (128) or clamped (254), 64 malformed payload size. The payload (w63Int(), 12 digits,
+     * else 0) sizes a power-of-two buffer of 4096 to W63_DECODER_MAX_BUFFER bytes; lines is
+     * ceil(payload / line). Then four mode, four decision and seven flag counts, the distinct cache
+     * keys of valid rows (by crc32), the total payload, the largest buffer exponent, the total
+     * lines and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w63DecoderFactoryPlanBatchPhp(array $rows): array
+    {
+        $out = $keys = [];
+        $modes = $decisions = [0, 0, 0, 0];
+        $flagCounts = array_fill(0, 7, 0);
+        $totalPayload = $maxExponent = $totalLines = 0;
+        foreach ($rows as $row) {
+            [$mode, $library, $sapi, $os, $payload, $line] = explode("\t", (string) $row, 6) + array_fill(0, 6, '');
+            $code = match ($mode) {
+                'auto' => 1,
+                'php' => 2,
+                'native' => 3,
+                default => 0,
+            };
+            $decision = match (true) {
+                $code === 0 => 0,
+                self::selectsPhpPhp($mode, $library, $sapi, $os) => 1,
+                $code === 1 => 2,
+                default => 3,
+            };
+            $payload = self::w63Int($payload, 12);
+            $bytes = \is_int($payload) ? $payload : 0;
+            $length = self::w63Int($line, 3);
+            [$line, $adjusted] = match (true) {
+                \is_int($length) && $length >= 1 && $length <= 254 => [$length, false],
+                \is_int($length) && $length > 254 => [254, true],
+                default => [128, true],
+            };
+            $exponent = \strlen(decbin(max(4096, min($bytes, self::W63_DECODER_MAX_BUFFER)) - 1));
+            $lines = $bytes === 0 ? 0 : intdiv($bytes + $line - 1, $line);
+            $crc = crc32($mode.':'.$library);
+            if ($code !== 0) {
+                $keys[$crc] = true;
+            }
+            $flags = (int) ($library !== '') | (int) ($sapi === 'cli') << 1 | (int) ($os === 'Linux') << 2 | (int) str_starts_with($library, '/') << 3
+                | (int) ($bytes > self::W63_DECODER_MAX_BUFFER) << 4 | (int) $adjusted << 5 | (int) ($payload === false) << 6;
+            $modes[$code]++;
+            $decisions[$decision]++;
+            for ($k = 0; $k < 7; $k++) {
+                $flagCounts[$k] += $flags >> $k & 1;
+            }
+            $totalPayload += $bytes;
+            $maxExponent = max($maxExponent, $exponent);
+            $totalLines += $lines;
+            $out[] = $code | $decision << 2 | $flags << 4 | $exponent << 11 | $line << 16 | min($lines, 0xFFFFFF) << 24 | ($crc & 0x7FFF) << 48;
+        }
+        array_push($out, ...$modes, ...$decisions, ...$flagCounts);
+        array_push($out, \count($keys), $totalPayload, $maxExponent, $totalLines);
+        $out[] = self::w63Digest($out);
+
+        return $out;
     }
 }
