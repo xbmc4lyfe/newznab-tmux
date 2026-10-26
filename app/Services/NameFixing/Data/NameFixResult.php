@@ -6,6 +6,7 @@ namespace App\Services\NameFixing\Data;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Spatie\LaravelData\Data;
 use Spatie\TypeScriptTransformer\Attributes\TypeScript;
 use Throwable;
@@ -351,5 +352,255 @@ final class NameFixResult extends Data
     public function getFormattedMethod(): string
     {
         return "{$this->checkerName}: {$this->method}";
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 57.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Retained PHP: the minimum of three paired runs missed the 1.5x gates, since packing the result properties costs about as much as the PHP checks (common mean 1.41x, p99 1.35x; uncommon mean 1.00x, p99 0.96x); see RustNameFixingPatternsAppGameMovieTvNameFixResultW57ParityTest. */
+    public const bool W57_RUST_FFI_DEFAULT = false;
+
+    public const string W57_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w57_name_fix_result_row_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** int64 words per nameFixResultRowBatch() record, and the trailing summary words. */
+    public const int W57_ROW_WORDS = 6;
+
+    public const int W57_SUMMARY_WORDS = 8;
+
+    /** Method keywords (lowercase) classified 2 + index by the first one the method contains. */
+    private const array W57_METHOD_KEYWORDS = ['nfo', 'par2', 'sfv', 'srr', 'file', 'crc', 'hash', 'md5', 'uid', 'xxx', 'tv',
+        'movie', 'game', 'app', 'music', 'title'];
+
+    private const string W57_CONTROL = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+        ."\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f";
+
+    private const string W57_LETTERS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+    /**
+     * Result rows plus a batch summary. Each record yields six words: flags (successful 1,
+     * preDbId > 0 2, "PreDB: " method 4, untrimmed new name 8, control byte 16, non-ASCII byte
+     * 32, valid cleaned name 64, empty method 128, empty checker 256), the method class (0 empty,
+     * 1 PreDB, 2 + the first W57_METHOD_KEYWORDS entry the lowercased method contains, else -1),
+     * the PreDB source span (offset << 32 | length, or -1), the confidence tier (-1 outside
+     * [0, 1] or NaN, else 3/2/1/0 at the 0.95/0.75/0.5 thresholds), the trim() span of the new
+     * name and strlen(getSummary()). A valid cleaned name is the trimmed new name with 5-255
+     * bytes, no control byte, an ASCII letter and a [._ -] separator, not led by '.' or '-'.
+     * Non-empty batches end with eight summary words: successful, PreDB id, valid name and
+     * invalid confidence counts, then the tier 0-3 counts.
+     *
+     * @param  list<self>  $results
+     * @return list<int>
+     */
+    public static function nameFixResultRowBatch(array $results): array
+    {
+        return self::usesW57RustFfi() ? self::nameFixResultRowBatchNative($results) : self::nameFixResultRowBatchPhp($results);
+    }
+
+    /**
+     * @param  list<self>  $results
+     * @return list<int>
+     */
+    public static function nameFixResultRowBatchPhp(array $results): array
+    {
+        self::w57Results($results);
+        if ($results === []) {
+            return [];
+        }
+        $out = [];
+        $summary = [0, 0, 0, 0, 0, 0, 0, 0];
+        foreach ($results as $result) {
+            $name = $result->newName;
+            $method = $result->method;
+            $checker = $result->checkerName;
+            $confidence = $result->confidence;
+            $length = \strlen($name);
+            $trimmed = trim($name);
+            $trimmedLength = \strlen($trimmed);
+            $preDb = str_starts_with($method, 'PreDB: ');
+            $valid = $trimmedLength >= 5 && $trimmedLength <= 255
+                && strcspn($trimmed, self::W57_CONTROL) === $trimmedLength
+                && strpbrk($trimmed, self::W57_LETTERS) !== false
+                && strpbrk($trimmed, '._ -') !== false
+                && $trimmed[0] !== '.' && $trimmed[0] !== '-';
+            if ($method === '') {
+                $class = 0;
+            } elseif ($preDb) {
+                $class = 1;
+            } else {
+                $class = -1;
+                $lowerMethod = strtolower($method);
+                foreach (self::W57_METHOD_KEYWORDS as $i => $keyword) {
+                    if (str_contains($lowerMethod, $keyword)) {
+                        $class = $i + 2;
+                        break;
+                    }
+                }
+            }
+            $tier = ! ($confidence >= 0.0 && $confidence <= 1.0) ? -1
+                : ($confidence >= 0.95 ? 3 : ($confidence >= 0.75 ? 2 : ($confidence >= 0.5 ? 1 : 0)));
+            $successful = $name !== '';
+            array_push(
+                $out,
+                ($successful ? 1 : 0)
+                    | ($result->preDbId > 0 ? 2 : 0)
+                    | ($preDb ? 4 : 0)
+                    | ($trimmedLength !== $length ? 8 : 0)
+                    | (strcspn($name, self::W57_CONTROL) !== $length ? 16 : 0)
+                    | (preg_match('/[\x80-\xff]/', $name) === 1 ? 32 : 0)
+                    | ($valid ? 64 : 0)
+                    | ($method === '' ? 128 : 0)
+                    | ($checker === '' ? 256 : 0),
+                $class,
+                $preDb ? (7 << 32) | (\strlen($method) - 7) : -1,
+                $tier,
+                (strspn($name, " \t\n\r\0\x0B") << 32) | $trimmedLength,
+                $successful ? \strlen($checker) + \strlen($method) + $length + 6 : \strlen($checker) + 10,
+            );
+            $summary[0] += $successful ? 1 : 0;
+            $summary[1] += $result->preDbId > 0 ? 1 : 0;
+            $summary[2] += $valid ? 1 : 0;
+            $summary[$tier + 4]++;
+        }
+        array_push($out, ...$summary);
+
+        return $out;
+    }
+
+    /**
+     * @param  list<self>  $results
+     * @return list<int>
+     */
+    public static function nameFixResultRowBatchNative(array $results): array
+    {
+        self::w57Results($results);
+        $count = \count($results);
+        if ($count === 0) {
+            return [];
+        }
+        // Blob lengths in record order, then the preDbId and confidence columns.
+        $parts = [];
+        $lens = [];
+        $ids = [];
+        $confidences = [];
+        foreach ($results as $result) {
+            $parts[] = $result->newName;
+            $parts[] = $result->method;
+            $parts[] = $result->checkerName;
+            $lens[] = \strlen($result->newName);
+            $lens[] = \strlen($result->method);
+            $lens[] = \strlen($result->checkerName);
+            $ids[] = $result->preDbId;
+            $confidences[] = $result->confidence;
+        }
+        $ints = pack('P*', ...$lens, ...$ids).pack('e*', ...$confidences);
+
+        return self::w57Call(implode('', $parts), $ints, $count, $count * self::W57_ROW_WORDS + self::W57_SUMMARY_WORDS)
+            ?? self::nameFixResultRowBatchPhp($results);
+    }
+
+    /** @param array<array-key, mixed> $results */
+    private static function w57Results(array $results): void
+    {
+        if (! array_is_list($results)) {
+            throw new \InvalidArgumentException('W57 batch results must be a list.');
+        }
+        foreach ($results as $result) {
+            if (! $result instanceof self) {
+                throw new \InvalidArgumentException('W57 batch results must be NameFixResult instances.');
+            }
+        }
+    }
+
+    public static function usesW57RustFfi(): bool
+    {
+        $enabled = self::w57RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W57_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W57 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW57RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w57RustFfiState('enabled');
+        self::w57RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w57RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w57Call(string $blob, string $ints, int $count, int $need): ?array
+    {
+        try {
+            /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+            $state = self::w57RustFfiState();
+            $ffi = $state['ffi'];
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w57', self::W57_FFI_CDEF) ?? false;
+                self::w57RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w57RustFfiState('out', $out);
+                self::w57RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W57_FFI_CDEF.)
+            $written = $ffi->nntmux_w57_name_fix_result_row_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W57 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w57RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }

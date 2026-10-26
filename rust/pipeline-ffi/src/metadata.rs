@@ -54981,3 +54981,1362 @@ mod w564_tests {
         assert_eq!(out, vec![0, -1, -1, -1]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 57.4: NameFixing pattern rows (App, Game, Movie, TV) and NameFixResult rows
+// ---------------------------------------------------------------------------
+
+/// Batch row helpers for `AppPatterns`, `GamePatterns`, `MoviePatterns`, `TvPatterns` and
+/// `NameFixResult`. Every export takes a concatenated blob plus packed little-endian int64
+/// words (`stride` per record, the first `fields` of which are blob lengths) and writes
+/// fixed-width int64 rows, so a batch costs one FFI crossing and no per-value allocation.
+///
+/// Pattern rows pre-screen each `ALL_PATTERNS` entry with lowercase needle groups (a pattern
+/// can match only when every group has a needle somewhere in the ASCII-lowercased name),
+/// collect delimited tokens (an ASCII case-insensitive occurrence whose neighbours are not
+/// ASCII alphanumeric) as bit masks, extract scalar tokens and score the candidates. The
+/// PHP `*RowBatchPhp()` methods are the reference implementation.
+pub mod w574_batch {
+    use std::collections::HashMap;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::OnceLock;
+
+    pub const MAX_RECORDS: usize = 1 << 24;
+
+    /// Record body: blob values (`fields` per record), every int64 word, output rows. The int64
+    /// frame holds `count * fields` blob lengths in record order, then `stride - fields` more
+    /// columns of `count` words each.
+    type Body = fn(&[&[u8]], &[i64], &mut [i64]);
+
+    #[inline(always)]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point to `len` readable bytes unless `len` is zero.
+    unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Validate the frame, slice the blob and run `body`. Returns the words written, -1 for a
+    /// malformed frame or panic and `-needed` when `out_cap` is too small.
+    ///
+    /// # Safety
+    ///
+    /// See the exported functions.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        fields: usize,
+        stride: usize,
+        words: usize,
+        trailer: usize,
+        body: Body,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(blob as usize, blob_len, out as usize, out_bytes)
+                || overlaps(ints as usize, ints_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(blob), Some(ints)) = (unsafe { bytes(blob, blob_len) }, unsafe {
+                bytes(ints, ints_len)
+            }) else {
+                return -1;
+            };
+            if ints.len() != count * stride * 8 {
+                return -1;
+            }
+            let all: Vec<i64> = ints
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|w| i64::from_le_bytes(*w))
+                .collect();
+            let mut values: Vec<&[u8]> = Vec::with_capacity(count * fields);
+            let mut rest = blob;
+            for len in &all[..count * fields] {
+                let Ok(len) = usize::try_from(*len) else {
+                    return -1;
+                };
+                if len > rest.len() {
+                    return -1;
+                }
+                let (value, tail) = rest.split_at(len);
+                values.push(value);
+                rest = tail;
+            }
+            if !rest.is_empty() {
+                return -1;
+            }
+            if count == 0 {
+                return 0;
+            }
+            let need = count * words + trailer;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from both inputs.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            body(&values, &all, out);
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    #[inline(always)]
+    pub(crate) fn span(offset: usize, len: usize) -> i64 {
+        ((offset as i64) << 32) | len as i64
+    }
+
+    #[inline(always)]
+    fn bits(mask: i64) -> i64 {
+        i64::from(mask.count_ones())
+    }
+
+    /// The lowest set bit's index (the first candidate in priority order) or -1.
+    #[inline(always)]
+    fn candidate(mask: i64) -> i64 {
+        if mask == 0 {
+            -1
+        } else {
+            i64::from(mask.trailing_zeros())
+        }
+    }
+
+    #[inline(always)]
+    fn lower_into(value: &[u8], buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.extend(value.iter().map(u8::to_ascii_lowercase));
+    }
+
+    /// Maximal ASCII alphanumeric runs, as preg_split('/[^a-z0-9]+/', $lower, -1, NO_EMPTY).
+    fn runs_into(lower: &[u8], runs: &mut Vec<(usize, usize)>) {
+        runs.clear();
+        let mut i = 0;
+        while i < lower.len() {
+            if lower[i].is_ascii_alphanumeric() {
+                let start = i;
+                while i < lower.len() && lower[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+                runs.push((start, i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Some occurrence of `token` whose neighbours are not ASCII alphanumeric: the reference
+    /// definition `Lexicon::scan` implements through runs.
+    #[cfg(test)]
+    pub(crate) fn delimited(lower: &[u8], token: &[u8]) -> bool {
+        let Some(&first) = token.first() else {
+            return false;
+        };
+        if token.len() > lower.len() {
+            return false;
+        }
+        let last = lower.len() - token.len();
+        let mut p = 0;
+        while p <= last {
+            match lower[p..=last].iter().position(|c| *c == first) {
+                Some(i) => p += i,
+                None => return false,
+            }
+            if &lower[p..p + token.len()] == token
+                && (p == 0 || !lower[p - 1].is_ascii_alphanumeric())
+                && lower
+                    .get(p + token.len())
+                    .is_none_or(|c| !c.is_ascii_alphanumeric())
+            {
+                return true;
+            }
+            p += 1;
+        }
+        false
+    }
+
+    /// FNV-1a for the short run keys.
+    struct Fnv(u64);
+
+    impl Default for Fnv {
+        fn default() -> Self {
+            Self(0xcbf2_9ce4_8422_2325)
+        }
+    }
+
+    impl Hasher for Fnv {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            for b in bytes {
+                self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+
+    /// What a run key reports.
+    #[derive(Clone, Copy)]
+    enum Hit {
+        /// Bit `.1` of list `.0`.
+        Bit(usize, u32),
+        /// A resolution height.
+        Res(i64),
+        /// Bit `.2` of list `.1` when the whole compound token `.0` starts at the run.
+        Compound(&'static [u8], usize, u32),
+    }
+
+    /// One class's delimited token lists, keyed by the alphanumeric run a delimited occurrence
+    /// must start with. Tokens start and end with an ASCII alphanumeric byte, so a delimited
+    /// occurrence of a compound token (one with separators) begins exactly at a maximal run
+    /// equal to its first alphanumeric piece; only its tail and right boundary need checking.
+    struct Lexicon {
+        runs: HashMap<&'static [u8], Vec<Hit>, BuildHasherDefault<Fnv>>,
+        /// Bit L of `lens[b]`: some run key starts with byte b and has length L (< 64).
+        lens: [u64; 256],
+    }
+
+    impl Lexicon {
+        fn new(lists: &[&'static [&'static str]], resolutions: bool) -> Self {
+            let mut runs: HashMap<&'static [u8], Vec<Hit>, BuildHasherDefault<Fnv>> =
+                HashMap::default();
+            for (list, tokens) in lists.iter().enumerate() {
+                for (bit, token) in tokens.iter().enumerate() {
+                    let t = token.as_bytes();
+                    assert!(
+                        t.first().is_some_and(u8::is_ascii_alphanumeric)
+                            && t.last().is_some_and(u8::is_ascii_alphanumeric)
+                    );
+                    let piece = t
+                        .iter()
+                        .position(|c| !c.is_ascii_alphanumeric())
+                        .unwrap_or(t.len());
+                    let hit = if piece == t.len() {
+                        Hit::Bit(list, bit as u32)
+                    } else {
+                        Hit::Compound(t, list, bit as u32)
+                    };
+                    runs.entry(&t[..piece]).or_default().push(hit);
+                }
+            }
+            if resolutions {
+                for (t, height) in RESOLUTIONS {
+                    runs.entry(t.as_bytes())
+                        .or_default()
+                        .push(Hit::Res(*height));
+                }
+            }
+            let mut lens = [0u64; 256];
+            for key in runs.keys() {
+                assert!(key.len() < 64);
+                lens[key[0] as usize] |= 1 << key.len();
+            }
+            Self { runs, lens }
+        }
+
+        /// Bit j of mask i for each delimited occurrence of `lists[i][j]`, plus the first
+        /// resolution run's height (or -1).
+        fn scan<const N: usize>(&self, lower: &[u8], runs: &[(usize, usize)]) -> ([i64; N], i64) {
+            let mut masks = [0i64; N];
+            let mut res = -1;
+            for &(s, e) in runs {
+                if e - s >= 64 || self.lens[lower[s] as usize] & (1 << (e - s)) == 0 {
+                    continue;
+                }
+                let Some(hits) = self.runs.get(&lower[s..e]) else {
+                    continue;
+                };
+                for hit in hits {
+                    match *hit {
+                        Hit::Bit(list, bit) => masks[list] |= 1 << bit,
+                        Hit::Res(height) => {
+                            if res < 0 {
+                                res = height;
+                            }
+                        }
+                        Hit::Compound(token, list, bit) => {
+                            let end = s + token.len();
+                            if end <= lower.len()
+                                && &lower[s..end] == token
+                                && lower.get(end).is_none_or(|c| !c.is_ascii_alphanumeric())
+                            {
+                                masks[list] |= 1 << bit;
+                            }
+                        }
+                    }
+                }
+            }
+            (masks, res)
+        }
+    }
+
+    /// Lowercase needle groups per pattern, deduplicated into one needle table. One-byte needles
+    /// are set straight from `single`; longer ones are candidates only where both their first
+    /// and second bytes match (`first` & `second`), so most positions cost two table loads.
+    struct Screen {
+        needles: Vec<&'static [u8]>,
+        single: [u128; 256],
+        first: [u128; 256],
+        second: [u128; 256],
+        all: u128,
+        patterns: Vec<Vec<u128>>,
+    }
+
+    type Table = &'static [&'static [&'static [&'static str]]];
+
+    impl Screen {
+        fn new(table: Table) -> Self {
+            let mut needles: Vec<&'static [u8]> = Vec::new();
+            let mut patterns = Vec::with_capacity(table.len());
+            for groups in table {
+                let mut masks = Vec::with_capacity(groups.len());
+                for group in groups.iter() {
+                    let mut mask = 0u128;
+                    for needle in group.iter() {
+                        let n = needle.as_bytes();
+                        let i = match needles.iter().position(|x| *x == n) {
+                            Some(i) => i,
+                            None => {
+                                needles.push(n);
+                                needles.len() - 1
+                            }
+                        };
+                        assert!(i < 128 && !n.is_empty());
+                        mask |= 1u128 << i;
+                    }
+                    masks.push(mask);
+                }
+                patterns.push(masks);
+            }
+            let (mut single, mut first, mut second) = ([0u128; 256], [0u128; 256], [0u128; 256]);
+            let mut all = 0u128;
+            for (i, n) in needles.iter().enumerate() {
+                let bit = 1u128 << i;
+                all |= bit;
+                if n.len() == 1 {
+                    single[n[0] as usize] |= bit;
+                } else {
+                    first[n[0] as usize] |= bit;
+                    second[n[1] as usize] |= bit;
+                }
+            }
+            Self {
+                needles,
+                single,
+                first,
+                second,
+                all,
+                patterns,
+            }
+        }
+
+        fn mask(&self, lower: &[u8]) -> i64 {
+            let mut present = 0u128;
+            let n = lower.len();
+            for pos in 0..n {
+                let b = lower[pos] as usize;
+                present |= self.single[b];
+                if pos + 1 < n {
+                    let mut cand = self.first[b] & self.second[lower[pos + 1] as usize] & !present;
+                    while cand != 0 {
+                        let i = cand.trailing_zeros();
+                        cand &= cand - 1;
+                        let needle = self.needles[i as usize];
+                        if needle.len() <= n - pos
+                            && lower[pos + 2..pos + needle.len()]
+                                .iter()
+                                .zip(&needle[2..])
+                                .all(|(a, b)| a == b)
+                        {
+                            present |= 1u128 << i;
+                        }
+                    }
+                }
+                if present == self.all {
+                    break;
+                }
+            }
+            let mut mask = 0i64;
+            for (bit, groups) in self.patterns.iter().enumerate() {
+                if groups.iter().all(|g| g & present != 0) {
+                    mask |= 1 << bit;
+                }
+            }
+            mask
+        }
+    }
+
+    // -- Shared needle groups ------------------------------------------------------------------
+
+    const YEAR: &[&str] = &["19", "20"];
+    const RES: &[&str] = &["480", "720", "1080", "2160"];
+    const SRC: &[&str] = &[
+        "bd", "blu", "cam", "dtv", "dvd", "h", "p", "s", "r5", "vcd", "vod", "web", "remux",
+    ];
+    const VCODEC: &[&str] = &["divx", "264", "265", "hevc", "mpeg2", "xvid", "wmv", "av1"];
+    const ACODEC: &[&str] = &[
+        "aac", "ac3", "ac-3", "dd5", "dts", "dolby", "mp3", "truehd", "atmos", "eac3", "flac",
+    ];
+    const ACODEC_TV: &[&str] = &[
+        "aac", "ac3", "ac-3", "dd5", "dts", "dolby", "mp3", "truehd", "atmos", "eac3",
+    ];
+    const SERVICES: &[&str] = &[
+        "amzn", "atvp", "dsnp", "hmax", "hulu", "it", "nf", "pmtp", "pcok", "roku", "stan", "vudu",
+    ];
+    const WEB: &[&str] = &["web"];
+    const UHD: &[&str] = &["2160p", "4k", "uhd"];
+    const UHD_RES: &[&str] = &["2160p", "4k"];
+    const HD_RES: &[&str] = &["1080p", "720p"];
+    const H265: &[&str] = &["hevc", "265"];
+    const LANGUAGES: &[&str] = &[
+        "brazilian",
+        "chinese",
+        "croatian",
+        "danish",
+        "deutsch",
+        "dutch",
+        "estonian",
+        "english",
+        "finnish",
+        "flemish",
+        "francais",
+        "french",
+        "german",
+        "greek",
+        "hebrew",
+        "icelandic",
+        "italian",
+        "japenese",
+        "japan",
+        "korean",
+        "latin",
+        "nordic",
+        "norwegian",
+        "polish",
+        "portuguese",
+        "russian",
+        "serbian",
+        "slovenian",
+        "swedish",
+        "spanisch",
+        "spanish",
+        "thai",
+        "turkish",
+        "multi",
+    ];
+
+    // -- AppPatterns ---------------------------------------------------------------------------
+
+    const APP_SCREEN: Table = &[
+        &[&["keygen", "patch", "crack", "serial", "license"]],
+        &[&["winall", "win32", "win64", "x64", "x86"]],
+        &[&["mac", "osx"]],
+        &[&["linux", "ubuntu", "debian", "centos", "rhel", "fedora"]],
+        &[&[
+            "adobe",
+            "photoshop",
+            "illustrator",
+            "premiere",
+            "effects",
+            "indesign",
+            "lightroom",
+        ]],
+        &[&["microsoft", "office", "windows", "visual"]],
+        &[&["multi", "portable", "repack", "cracked"]],
+    ];
+    const APP_ARCH: &[&str] = &[
+        "x64",
+        "x86",
+        "win64",
+        "win32",
+        "amd64",
+        "arm64",
+        "arm",
+        "i386",
+        "i686",
+        "universal",
+    ];
+    const APP_QUALIFIERS: &[&str] = &[
+        "portable",
+        "repack",
+        "multilingual",
+        "multi",
+        "cracked",
+        "registered",
+        "activated",
+        "pre-activated",
+        "patched",
+        "fixed",
+        "retail",
+        "pro",
+        "enterprise",
+        "ultimate",
+        "professional",
+    ];
+
+    /// /(?<![A-Za-z0-9])[vV]?([0-9]+(?:\.[0-9]+)+)/: the captured version span or -1.
+    pub(crate) fn version_span(s: &[u8]) -> i64 {
+        let dotted = |start: usize| -> Option<usize> {
+            let mut i = start;
+            while i < s.len() && s[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            let mut groups = 0;
+            while i + 1 < s.len() && s[i] == b'.' && s[i + 1].is_ascii_digit() {
+                i += 1;
+                while i < s.len() && s[i].is_ascii_digit() {
+                    i += 1;
+                }
+                groups += 1;
+            }
+            (groups > 0).then_some(i)
+        };
+        for p in 0..s.len() {
+            if p > 0 && s[p - 1].is_ascii_alphanumeric() {
+                continue;
+            }
+            let start = if s[p] == b'v' || s[p] == b'V' {
+                p + 1
+            } else {
+                p
+            };
+            if let Some(end) = dotted(start) {
+                return span(start, end - start);
+            }
+        }
+        -1
+    }
+
+    fn app_screen() -> &'static (Screen, Lexicon) {
+        static SCREEN: OnceLock<(Screen, Lexicon)> = OnceLock::new();
+        SCREEN.get_or_init(|| {
+            (
+                Screen::new(APP_SCREEN),
+                Lexicon::new(&[APP_ARCH, APP_QUALIFIERS], false),
+            )
+        })
+    }
+
+    /// [prescreen, architecture mask, qualifier mask, version span, candidate, score].
+    fn app_row(values: &[&[u8]], _: &[i64], out: &mut [i64]) {
+        let (screen, lexicon) = app_screen();
+        let (mut lower, mut runs) = (Vec::new(), Vec::new());
+        for (name, slot) in values.iter().zip(out.as_chunks_mut::<6>().0.iter_mut()) {
+            lower_into(name, &mut lower);
+            runs_into(&lower, &mut runs);
+            let pre = screen.mask(&lower);
+            let ([arch, qual], _) = lexicon.scan::<2>(&lower, &runs);
+            let version = version_span(&lower);
+            let score = 8 * bits(pre) + bits(arch) + bits(qual) + if version >= 0 { 4 } else { 0 };
+            *slot = [pre, arch, qual, version, candidate(pre), score];
+        }
+    }
+
+    // -- GamePatterns --------------------------------------------------------------------------
+
+    const GAME_SCREEN: Table = &[
+        &[
+            &[
+                "nsw", "ps3", "ps4", "ps5", "psp", "psv", "xbsx", "xsx", "xbox", "wii", "switch",
+            ],
+            &["-"],
+        ],
+        &[
+            &[
+                "asia", "dlc", "eur", "goty", "jpn", "kor", "multi", "ntsc", "pal", "rf", "region",
+                "usa", "xbla",
+            ],
+            &[
+                "gc", "nds", "ps3", "ps4", "ps5", "psp", "psv", "switch", "nsw", "wii", "xbox",
+                "xbsx",
+            ],
+        ],
+        &[
+            &[
+                "gc", "nds", "ps3", "ps4", "ps5", "psp", "switch", "nsw", "wii", "xbox", "xbsx",
+            ],
+            &[
+                "codex",
+                "duplex",
+                "plaza",
+                "skidrow",
+                "reloaded",
+                "cpy",
+                "empress",
+                "razor1911",
+                "hoodlum",
+                "darksiders",
+                "flt",
+                "tinyiso",
+                "anomaly",
+                "insomni",
+                "oneup",
+                "strange",
+                "swag",
+                "sky",
+                "suxxors",
+            ],
+        ],
+        &[
+            &["pc", "win", "mac", "linux"],
+            &[
+                "codex",
+                "skidrow",
+                "reloaded",
+                "cpy",
+                "empress",
+                "razor1911",
+                "hoodlum",
+                "darksiders",
+                "flt",
+                "gog",
+                "prophet",
+                "tinyiso",
+                "plaza",
+                "p2p",
+                "simplex",
+                "rg",
+            ],
+        ],
+        &[
+            &["dlc", "update", "patch", "hotfix"],
+            &[
+                "codex", "skidrow", "reloaded", "plaza", "empress", "flt", "gog", "p2p", "tinyiso",
+            ],
+        ],
+        &[&["-outlaws"]],
+        &[&["-alias"]],
+        &[&["gog"]],
+        &[
+            &["repack", "rip"],
+            &["fitgirl", "dodi", "xatab", "r.g.", "mechanics"],
+        ],
+    ];
+    const GAME_PLATFORMS: &[&str] = &[
+        "nsw", "ps5", "ps4", "ps3", "psp", "psv", "xbsx", "xsx", "xbox one", "xbox360", "switch",
+        "wiiu", "wii", "nds", "3ds", "pc", "mac", "linux",
+    ];
+    const GAME_REGIONS: &[&str] = &[
+        "asia", "eur", "jpn", "kor", "ntsc", "ntscu", "pal", "usa", "rf", "xbla",
+    ];
+    const GAME_GROUPS: &[&str] = &[
+        "codex",
+        "skidrow",
+        "reloaded",
+        "cpy",
+        "empress",
+        "razor1911",
+        "hoodlum",
+        "darksiders",
+        "flt",
+        "gog",
+        "prophet",
+        "tinyiso",
+        "plaza",
+        "p2p",
+        "simplex",
+        "rg",
+        "anomaly",
+        "insomni",
+        "oneup",
+        "strange",
+        "swag",
+        "sky",
+        "suxxors",
+        "doge",
+        "tenoke",
+        "rune",
+    ];
+
+    fn game_screen() -> &'static (Screen, Lexicon) {
+        static SCREEN: OnceLock<(Screen, Lexicon)> = OnceLock::new();
+        SCREEN.get_or_init(|| {
+            (
+                Screen::new(GAME_SCREEN),
+                Lexicon::new(&[GAME_PLATFORMS, GAME_REGIONS, GAME_GROUPS], false),
+            )
+        })
+    }
+
+    /// [prescreen, platform mask, region mask, scene group mask, trailing group, candidate,
+    /// score]; the trailing group is the SCENE_GROUPS index of the text after the last '-'.
+    fn game_row(values: &[&[u8]], _: &[i64], out: &mut [i64]) {
+        let (screen, lexicon) = game_screen();
+        let (mut lower, mut runs) = (Vec::new(), Vec::new());
+        for (name, slot) in values.iter().zip(out.as_chunks_mut::<7>().0.iter_mut()) {
+            lower_into(name, &mut lower);
+            runs_into(&lower, &mut runs);
+            let pre = screen.mask(&lower);
+            let ([platforms, regions, groups], _) = lexicon.scan::<3>(&lower, &runs);
+            let trailing = lower.iter().rposition(|c| *c == b'-').map_or(-1, |p| {
+                let tail = &lower[p + 1..];
+                GAME_GROUPS
+                    .iter()
+                    .position(|g| g.as_bytes() == tail)
+                    .map_or(-1, |i| i as i64)
+            });
+            let score = 8 * bits(pre)
+                + bits(platforms)
+                + bits(regions)
+                + bits(groups)
+                + if trailing >= 0 { 4 } else { 0 };
+            *slot = [
+                pre,
+                platforms,
+                regions,
+                groups,
+                trailing,
+                candidate(pre),
+                score,
+            ];
+        }
+    }
+
+    // -- Shared movie/TV tokens ----------------------------------------------------------------
+
+    const SOURCES: &[&str] = &[
+        "bluray", "blu-ray", "bdrip", "brrip", "remux", "web-dl", "webdl", "webrip", "web-rip",
+        "web", "hdtv", "pdtv", "sdtv", "hdrip", "dvdrip", "dvd", "dvdscr", "cam", "ts", "vhs",
+        "vod", "hdcam",
+    ];
+    const VIDEO_CODECS: &[&str] = &[
+        "x264", "x265", "h264", "h.264", "h265", "h.265", "hevc", "avc", "xvid", "divx", "av1",
+        "mpeg2", "wmv", "vp9",
+    ];
+    const AUDIO_CODECS: &[&str] = &[
+        "aac", "ac3", "dd5.1", "ddp5.1", "dts", "dts-hd", "truehd", "atmos", "eac3", "flac", "mp3",
+        "opus",
+    ];
+    const RESOLUTIONS: &[(&str, i64)] = &[
+        ("480p", 480),
+        ("480i", 480),
+        ("480", 480),
+        ("576p", 576),
+        ("576i", 576),
+        ("576", 576),
+        ("720p", 720),
+        ("720", 720),
+        ("1080p", 1080),
+        ("1080i", 1080),
+        ("1080", 1080),
+        ("2160p", 2160),
+        ("2160", 2160),
+        ("4k", 2160),
+        ("uhd", 2160),
+    ];
+
+    #[inline(always)]
+    fn digit_at(s: &[u8], i: usize) -> bool {
+        s.get(i).is_some_and(u8::is_ascii_digit)
+    }
+
+    /// /(?<![0-9])(?:19|20)[0-9]{2}(?![0-9])/: the first year or -1.
+    pub(crate) fn year(s: &[u8]) -> i64 {
+        for p in 0..s.len().saturating_sub(3) {
+            if (p == 0 || !s[p - 1].is_ascii_digit())
+                && matches!((s[p], s[p + 1]), (b'1', b'9') | (b'2', b'0'))
+                && digit_at(s, p + 2)
+                && digit_at(s, p + 3)
+                && !digit_at(s, p + 4)
+            {
+                return digits(&s[p..p + 4]);
+            }
+        }
+        -1
+    }
+
+    #[inline(always)]
+    fn digits(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |acc, d| acc * 10 + i64::from(d - b'0'))
+    }
+
+    // -- MoviePatterns -------------------------------------------------------------------------
+
+    const MOVIE_SCREEN: Table = &[
+        &[
+            YEAR,
+            UHD,
+            &["remux", "bluray", "web"],
+            &["hevc", "265", "av1"],
+        ],
+        &[YEAR, UHD_RES, &["remux", "complete"], H265],
+        &[YEAR, UHD_RES, SERVICES, WEB, H265],
+        &[YEAR, HD_RES, SERVICES, WEB, &["264", "265", "hevc"]],
+        &[YEAR, RES, VCODEC],
+        &[YEAR, SRC, VCODEC, RES],
+        &[YEAR, SRC, VCODEC, ACODEC],
+        &[RES, SRC, ACODEC, VCODEC],
+        &[RES, ACODEC, SRC, YEAR],
+        &[LANGUAGES, YEAR, ACODEC, SRC],
+        &[YEAR, RES, &["bluray", "bdrip", "dvdrip", "hdtv", "web"]],
+    ];
+
+    fn movie_screen() -> &'static (Screen, Lexicon) {
+        static SCREEN: OnceLock<(Screen, Lexicon)> = OnceLock::new();
+        SCREEN.get_or_init(|| {
+            (
+                Screen::new(MOVIE_SCREEN),
+                Lexicon::new(&[SOURCES, VIDEO_CODECS, AUDIO_CODECS], true),
+            )
+        })
+    }
+
+    /// [prescreen, year, resolution, source mask, codec mask, candidate, score].
+    fn movie_row(values: &[&[u8]], _: &[i64], out: &mut [i64]) {
+        let (screen, lexicon) = movie_screen();
+        let (mut lower, mut runs) = (Vec::new(), Vec::new());
+        for (name, slot) in values.iter().zip(out.as_chunks_mut::<7>().0.iter_mut()) {
+            lower_into(name, &mut lower);
+            runs_into(&lower, &mut runs);
+            let pre = screen.mask(&lower);
+            let year = year(&lower);
+            let ([sources, video, audio], res) = lexicon.scan::<3>(&lower, &runs);
+            // Video codec bits 0-15 and audio codec bits 16-31.
+            let codecs = video | (audio << 16);
+            let score = 8 * bits(pre)
+                + bits(sources)
+                + bits(codecs)
+                + if year >= 0 { 4 } else { 0 }
+                + if res >= 0 { 4 } else { 0 };
+            *slot = [pre, year, res, sources, codecs, candidate(pre), score];
+        }
+    }
+
+    // -- TvPatterns ----------------------------------------------------------------------------
+
+    const EP_PIPE: &[&str] = &["s", "|", "ep"];
+    const EP_X: &[&str] = &["s", "x", "ep"];
+    const TV_SCREEN: Table = &[
+        &[EP_PIPE, UHD, SERVICES, WEB, H265],
+        &[EP_PIPE, HD_RES, SERVICES, WEB],
+        &[EP_X, RES, SRC, VCODEC],
+        &[EP_X, ACODEC_TV, SRC, RES, VCODEC],
+        &[EP_X, SRC, VCODEC],
+        &[EP_PIPE, SRC],
+        &[YEAR, EP_X, SRC],
+        &[EP_X, YEAR],
+        &[YEAR, &["720p", "1080p", "2160p", "hdtv", "web"]],
+        &[
+            YEAR,
+            &[
+                "indycar", "f1", "formula", "motogp", "nba", "ncw", "nns", "nsc", "nfl", "nhl",
+                "mlb", "ufc", "wwe", "boxing",
+            ],
+        ],
+        &[
+            &["s"],
+            &["complete", "full"],
+            &["720p", "1080p", "2160p", "hdtv", "web", "bluray"],
+        ],
+        &[&["480p", "720p", "1080p", "2160p"], &["hevc", "265", "264"]],
+    ];
+
+    fn tv_screen() -> &'static (Screen, Lexicon) {
+        static SCREEN: OnceLock<(Screen, Lexicon)> = OnceLock::new();
+        SCREEN.get_or_init(|| {
+            (
+                Screen::new(TV_SCREEN),
+                Lexicon::new(&[SOURCES, VIDEO_CODECS, AUDIO_CODECS], true),
+            )
+        })
+    }
+
+    #[inline(always)]
+    fn digit_run(s: &[u8], start: usize) -> usize {
+        s[start.min(s.len())..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count()
+    }
+
+    /// /(?<![a-z0-9])s([0-9]{1,2})[._ -]?e([0-9]{1,3})/, then
+    /// /(?<![0-9])([0-9]{1,2})x([0-9]{2,3})(?![0-9])/, on the lowercased name.
+    pub(crate) fn season_episode(s: &[u8]) -> (i64, i64) {
+        for p in 0..s.len() {
+            if s[p] != b's' || (p > 0 && s[p - 1].is_ascii_alphanumeric()) {
+                continue;
+            }
+            let d = digit_run(s, p + 1);
+            if !(1..=2).contains(&d) {
+                continue;
+            }
+            let q = p + 1 + d;
+            let e = match s.get(q) {
+                Some(b'.' | b'_' | b' ' | b'-') if s.get(q + 1) == Some(&b'e') => q + 1,
+                Some(b'e') => q,
+                _ => continue,
+            };
+            let ep = digit_run(s, e + 1).min(3);
+            if ep == 0 {
+                continue;
+            }
+            return (digits(&s[p + 1..q]), digits(&s[e + 1..e + 1 + ep]));
+        }
+        for p in 0..s.len() {
+            if !s[p].is_ascii_digit() || (p > 0 && s[p - 1].is_ascii_digit()) {
+                continue;
+            }
+            let d = digit_run(s, p);
+            if !(1..=2).contains(&d) || s.get(p + d) != Some(&b'x') {
+                continue;
+            }
+            let ep = digit_run(s, p + d + 1);
+            if !(2..=3).contains(&ep) {
+                continue;
+            }
+            return (digits(&s[p..p + d]), digits(&s[p + d + 1..p + d + 1 + ep]));
+        }
+        (-1, -1)
+    }
+
+    /// /(?<![0-9])((?:19|20)[0-9]{2})[._ -]([0-9]{2})[._ -]([0-9]{2})(?![0-9])/ as YYYYMMDD.
+    pub(crate) fn airdate(s: &[u8]) -> i64 {
+        let sep = |i: usize| matches!(s.get(i), Some(b'.' | b'_' | b' ' | b'-'));
+        for p in 0..s.len().saturating_sub(9) {
+            if (p == 0 || !s[p - 1].is_ascii_digit())
+                && matches!((s[p], s[p + 1]), (b'1', b'9') | (b'2', b'0'))
+                && digit_at(s, p + 2)
+                && digit_at(s, p + 3)
+                && sep(p + 4)
+                && digit_at(s, p + 5)
+                && digit_at(s, p + 6)
+                && sep(p + 7)
+                && digit_at(s, p + 8)
+                && digit_at(s, p + 9)
+                && !digit_at(s, p + 10)
+            {
+                return digits(&s[p..p + 4]) * 10000
+                    + digits(&s[p + 5..p + 7]) * 100
+                    + digits(&s[p + 8..p + 10]);
+            }
+        }
+        -1
+    }
+
+    /// [prescreen, season, episode, airdate, resolution, source mask, codec mask, candidate,
+    /// score].
+    fn tv_row(values: &[&[u8]], _: &[i64], out: &mut [i64]) {
+        let (screen, lexicon) = tv_screen();
+        let (mut lower, mut runs) = (Vec::new(), Vec::new());
+        for (name, slot) in values.iter().zip(out.as_chunks_mut::<9>().0.iter_mut()) {
+            lower_into(name, &mut lower);
+            runs_into(&lower, &mut runs);
+            let pre = screen.mask(&lower);
+            let (season, episode) = season_episode(&lower);
+            let date = airdate(&lower);
+            let ([sources, video, audio], res) = lexicon.scan::<3>(&lower, &runs);
+            let codecs = video | (audio << 16);
+            let score = 8 * bits(pre)
+                + bits(sources)
+                + bits(codecs)
+                + if season >= 0 { 4 } else { 0 }
+                + if date >= 0 { 4 } else { 0 }
+                + if res >= 0 { 4 } else { 0 };
+            *slot = [
+                pre,
+                season,
+                episode,
+                date,
+                res,
+                sources,
+                codecs,
+                candidate(pre),
+                score,
+            ];
+        }
+    }
+
+    // -- NameFixResult -------------------------------------------------------------------------
+
+    const METHOD_KEYWORDS: &[&str] = &[
+        "nfo", "par2", "sfv", "srr", "file", "crc", "hash", "md5", "uid", "xxx", "tv", "movie",
+        "game", "app", "music", "title",
+    ];
+
+    #[inline(always)]
+    fn is_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    /// PHP trim(): (strspn() of the trim set, trimmed slice).
+    pub(crate) fn trim(value: &[u8]) -> (usize, &[u8]) {
+        let start = value
+            .iter()
+            .position(|b| !is_trim(*b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(*b))
+            .map_or(start, |i| i + 1);
+        (start, &value[start..end])
+    }
+
+    #[inline(always)]
+    fn is_control(b: u8) -> bool {
+        b < 0x20 || b == 0x7f
+    }
+
+    /// 5-255 bytes, no control byte, an ASCII letter and a [._ -] separator, not led by '.'/'-'.
+    pub(crate) fn valid_name(t: &[u8]) -> bool {
+        (5..=255).contains(&t.len())
+            && !t.iter().any(|b| is_control(*b))
+            && t.iter().any(u8::is_ascii_alphabetic)
+            && t.iter().any(|b| matches!(b, b'.' | b'_' | b' ' | b'-'))
+            && t[0] != b'.'
+            && t[0] != b'-'
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// 0 empty, 1 "PreDB: " prefix, 2 + the first METHOD_KEYWORDS entry found, else -1.
+    fn method_class(method: &[u8], predb: bool, buf: &mut Vec<u8>) -> i64 {
+        if method.is_empty() {
+            return 0;
+        }
+        if predb {
+            return 1;
+        }
+        lower_into(method, buf);
+        METHOD_KEYWORDS
+            .iter()
+            .position(|k| contains(buf, k.as_bytes()))
+            .map_or(-1, |i| i as i64 + 2)
+    }
+
+    /// -1 outside [0, 1] (including NaN), then 3/2/1/0 at the 0.95/0.75/0.5 thresholds.
+    pub(crate) fn tier(c: f64) -> i64 {
+        if !(0.0..=1.0).contains(&c) {
+            -1
+        } else if c >= 0.95 {
+            3
+        } else if c >= 0.75 {
+            2
+        } else if c >= 0.5 {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// The int64 frame holds the new name, method and checker lengths per record, then the
+    /// preDbId column and the confidence column (IEEE-754 bits).
+    ///
+    /// Rows [flags, method class, PreDB source span, confidence tier, trimmed name span,
+    /// summary length] and the trailer [successful, PreDB id, valid name, invalid confidence,
+    /// tier 0, tier 1, tier 2, tier 3] counts.
+    fn result_row(values: &[&[u8]], ints: &[i64], out: &mut [i64]) {
+        let count = values.len() / 3;
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut summary = [0i64; 8];
+        let mut buf = Vec::new();
+        for (i, slot) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let (name, method, checker) = (values[3 * i], values[3 * i + 1], values[3 * i + 2]);
+            let pre_db = ints[3 * count + i];
+            let confidence = f64::from_bits(ints[4 * count + i] as u64);
+            let (offset, trimmed) = trim(name);
+            let predb = method.starts_with(b"PreDB: ");
+            let valid = valid_name(trimmed);
+            let successful = !name.is_empty();
+            let flags = i64::from(successful)
+                | (i64::from(pre_db > 0) << 1)
+                | (i64::from(predb) << 2)
+                | (i64::from(trimmed.len() != name.len()) << 3)
+                | (i64::from(name.iter().any(|b| is_control(*b))) << 4)
+                | (i64::from(name.iter().any(|b| *b >= 0x80)) << 5)
+                | (i64::from(valid) << 6)
+                | (i64::from(method.is_empty()) << 7)
+                | (i64::from(checker.is_empty()) << 8);
+            let tier = tier(confidence);
+            let summary_len = if successful {
+                checker.len() + 2 + method.len() + 4 + name.len()
+            } else {
+                checker.len() + 10
+            };
+            *slot = [
+                flags,
+                method_class(method, predb, &mut buf),
+                if predb { span(7, method.len() - 7) } else { -1 },
+                tier,
+                span(offset, trimmed.len()),
+                summary_len as i64,
+            ];
+            summary[0] += i64::from(successful);
+            summary[1] += i64::from(pre_db > 0);
+            summary[2] += i64::from(valid);
+            summary[(tier + 4) as usize] += 1;
+        }
+        trailer.copy_from_slice(&summary);
+    }
+
+    macro_rules! export {
+        ($name:ident, $fields:literal, $stride:literal, $words:literal, $trailer:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `blob` must point to `blob_len` readable bytes, `ints` to `ints_len` readable
+            /// bytes (`count` records of packed little-endian int64 words) and `out` to
+            /// `out_cap` writable, aligned int64 words that overlap neither input; null
+            /// pointers are accepted only with zero lengths. Bad shapes return -1 before
+            /// slicing, a short output returns `-needed` without writing and panics map to -1.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe {
+                    run(
+                        blob, blob_len, ints, ints_len, count, out, out_cap, $fields, $stride,
+                        $words, $trailer, $body,
+                    )
+                }
+            }
+        };
+    }
+
+    export!(nntmux_w57_app_pattern_row_batch, 1, 1, 6, 0, app_row);
+    export!(nntmux_w57_game_pattern_row_batch, 1, 1, 7, 0, game_row);
+    export!(nntmux_w57_movie_pattern_row_batch, 1, 1, 7, 0, movie_row);
+    export!(nntmux_w57_tv_pattern_row_batch, 1, 1, 9, 0, tv_row);
+    export!(nntmux_w57_name_fix_result_row_batch, 3, 5, 6, 8, result_row);
+}
+
+#[cfg(test)]
+mod w574_tests {
+    use super::w574_batch::*;
+
+    type Export =
+        unsafe extern "C" fn(*const u8, usize, *const u8, usize, usize, *mut i64, usize) -> isize;
+
+    fn pack(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn call(export: Export, blob: &[u8], ints: &[u8], count: usize, out: &mut [i64]) -> isize {
+        unsafe {
+            export(
+                blob.as_ptr(),
+                blob.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    fn names(export: Export, values: &[&[u8]], words: usize) -> Vec<i64> {
+        let lens: Vec<i64> = values.iter().map(|v| v.len() as i64).collect();
+        let mut out = vec![i64::MIN; values.len() * words];
+        assert_eq!(
+            call(
+                export,
+                &values.concat(),
+                &pack(&lens),
+                values.len(),
+                &mut out
+            ),
+            (values.len() * words) as isize
+        );
+        out
+    }
+
+    #[test]
+    fn w574_scalar_tokens() {
+        assert_eq!(version_span(b"app.v1.2.3-grp"), span(5, 5));
+        assert_eq!(version_span(b"xv1.2 1.0"), span(6, 3));
+        assert_eq!(version_span(b"v1..2.3"), span(4, 3));
+        assert_eq!(version_span(b"1"), -1);
+        assert_eq!(year(b"movie.2023.1080p"), 2023);
+        assert_eq!(year(b"12023 1999"), 1999);
+        assert_eq!(year(b"2100"), -1);
+        assert_eq!(season_episode(b"show.s01e02"), (1, 2));
+        assert_eq!(season_episode(b"show.s1.e1234"), (1, 123));
+        assert_eq!(season_episode(b"shows01e02 s123e4 1x02"), (1, 2));
+        assert_eq!(season_episode(b"s123e4 01x002"), (1, 2));
+        assert_eq!(season_episode(b"101x02 1x0234"), (-1, -1));
+        assert_eq!(airdate(b"daily.2023.12-15.hdtv"), 20231215);
+        assert_eq!(airdate(b"12023.12.15 2023.12.155"), -1);
+        assert!(delimited(b"pre-activated.x", b"pre-activated"));
+        assert!(!delimited(b"xpre-activated", b"pre-activated"));
+        assert_eq!(trim(b" \0a b\x0b"), (2, &b"a b"[..]));
+        assert!(valid_name(b"Some.Name"));
+        assert!(!valid_name(b".Some.Name"));
+        assert!(!valid_name(b"Some\tName"));
+        assert_eq!(tier(f64::NAN), -1);
+        assert_eq!(tier(-0.0), 0);
+        assert_eq!(tier(0.95), 3);
+        assert_eq!(tier(1.0000001), -1);
+    }
+
+    #[test]
+    fn w574_pattern_rows() {
+        let out = names(
+            nntmux_w57_app_pattern_row_batch,
+            &[
+                b"Adobe.Photoshop.2024.v25.0.x64.Multilingual.Pre-Activated-GRP",
+                b"",
+            ],
+            6,
+        );
+        assert_eq!(out[0], (1 << 1) | (1 << 4) | (1 << 6));
+        assert_eq!(out[1], 1);
+        assert_eq!(out[2], (1 << 2) | (1 << 6) | (1 << 7));
+        assert_eq!(out[3], span(22, 4));
+        assert_eq!(out[4], 1);
+        assert_eq!(out[5], 8 * 3 + 1 + 3 + 4);
+        assert_eq!(&out[6..], &[0, 0, 0, -1, -1, 0]);
+
+        let out = names(
+            nntmux_w57_game_pattern_row_batch,
+            &[b"Game.Name.PS5-CODEX"],
+            7,
+        );
+        assert_eq!(out[1], 1 << 1);
+        assert_eq!(out[3], 1);
+        assert_eq!(out[4], 0);
+        assert_eq!(out[5], 0);
+
+        let out = names(
+            nntmux_w57_movie_pattern_row_batch,
+            &[b"Movie.2023.2160p.UHD.BluRay.x265.DTS-HD-GRP"],
+            7,
+        );
+        assert_eq!(out[0] & 1, 1);
+        assert_eq!(&out[1..3], &[2023, 2160]);
+        assert_eq!(out[3], 1);
+        assert_eq!(out[4], (1 << 1) | (1 << 20) | (1 << 21));
+
+        let out = names(
+            nntmux_w57_tv_pattern_row_batch,
+            &[b"Show.S01E02.720p.HDTV.x264-GRP"],
+            9,
+        );
+        assert_eq!(&out[1..5], &[1, 2, -1, 720]);
+        assert_eq!(out[5], 1 << 10);
+        assert_eq!(out[6], 1);
+    }
+
+    #[test]
+    fn w574_result_rows_and_frames() {
+        let blob = b"A.Good.NamePreDB: srcPreDBTitle".to_vec();
+        let ints = pack(&[
+            11,
+            10,
+            5,
+            0,
+            5,
+            0,
+            7,
+            0,
+            0.9f64.to_bits() as i64,
+            f64::NAN.to_bits() as i64,
+        ]);
+        let mut out = vec![0i64; 20];
+        assert_eq!(
+            call(
+                nntmux_w57_name_fix_result_row_batch,
+                &blob,
+                &ints,
+                2,
+                &mut out
+            ),
+            20
+        );
+        assert_eq!(
+            &out[..6],
+            &[
+                1 | 2 | 4 | 64,
+                1,
+                span(7, 3),
+                2,
+                span(0, 11),
+                5 + 2 + 10 + 4 + 11
+            ]
+        );
+        assert_eq!(&out[6..12], &[256, 17, -1, -1, 0, 10]);
+        assert_eq!(&out[12..], &[1, 1, 1, 1, 0, 0, 1, 0]);
+        // Short output, overrunning and negative lengths, misaligned frames.
+        let mut short = [0i64; 3];
+        assert_eq!(
+            call(
+                nntmux_w57_name_fix_result_row_batch,
+                &blob,
+                &ints,
+                2,
+                &mut short
+            ),
+            -20
+        );
+        let mut out = [0i64; 8];
+        assert_eq!(
+            call(
+                nntmux_w57_app_pattern_row_batch,
+                b"ab",
+                &pack(&[3]),
+                1,
+                &mut out
+            ),
+            -1
+        );
+        assert_eq!(
+            call(
+                nntmux_w57_tv_pattern_row_batch,
+                b"ab",
+                &pack(&[-1]),
+                1,
+                &mut out
+            ),
+            -1
+        );
+        assert_eq!(
+            call(
+                nntmux_w57_game_pattern_row_batch,
+                b"ab",
+                &pack(&[1]),
+                1,
+                &mut out
+            ),
+            -1
+        );
+        assert_eq!(
+            call(nntmux_w57_movie_pattern_row_batch, b"", b"", 0, &mut out),
+            0
+        );
+    }
+}
