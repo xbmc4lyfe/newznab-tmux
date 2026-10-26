@@ -1130,4 +1130,239 @@ class TmuxMonitorService
     {
         return $this->runVar;
     }
+
+    // ========================================================================
+    // WAVE 58.4 BATCH HELPER
+    // ========================================================================
+
+    /** Disabled: common p99 fell to 1.48x in the minimum of three paired runs (common mean 1.64x; uncommon mean 1.59x, p99 1.59x), since packing six int columns costs about as much as the PHP arithmetic; see RustTmuxLayoutMonitorOutputPaneSessionManagerW58ParityTest. */
+    public const bool W58_RUST_FFI_DEFAULT = false;
+
+    public const string W58_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w58_monitor_cycle_row_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** int64 words per monitorCycleRowBatch() record. */
+    public const int W58_ROW_WORDS = 9;
+
+    /** int64 summary words after the monitorCycleRowBatch() records (none for an empty batch). */
+    public const int W58_TRAILER_WORDS = 4;
+
+    /**
+     * Monitor cycle rows. Each item is [now count, start count, elapsed seconds, backlog,
+     * previous backlog, iterations] and yields [delta (saturating now - start), rate per minute
+     * (floor(delta * 60 / elapsed), 0 without elapsed time), backlog delta (saturating), ETA
+     * seconds (ceil(backlog * 60 / rate), -1 without a positive rate and backlog), percent done
+     * (floor(max(0, delta) * 100 / (max(0, delta) + max(0, backlog)))), trend (-1/0/1 backlog
+     * delta sign), flags (1 stalled, 2 backlog growing, 4 draining, 8 clock skew, 16 idle, 32
+     * first cycle), health penalty score (0-100) and the next iteration (saturating)], followed
+     * by the trailer [saturating delta sum, stalled cycles, max ETA, max score]. Float results
+     * are clamped to +/-4e18 before the integer cast.
+     *
+     * @param  list<array{0: int, 1: int, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function monitorCycleRowBatch(array $items): array
+    {
+        return self::usesW58RustFfi() ? self::monitorCycleRowBatchNative($items) : self::monitorCycleRowBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: int, 1: int, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function monitorCycleRowBatchPhp(array $items): array
+    {
+        self::w58Items($items);
+        $out = [];
+        $summary = [0, 0, -1, 0];
+        foreach ($items as [$now, $start, $elapsed, $backlog, $previous, $iterations]) {
+            $delta = self::w58Sub($now, $start);
+            $rate = $elapsed > 0 ? self::w58Floor((float) $delta * 60.0 / (float) $elapsed) : 0;
+            $backlogDelta = self::w58Sub($backlog, $previous);
+            $eta = $rate > 0 && $backlog > 0 ? self::w58Ceil((float) $backlog * 60.0 / (float) $rate) : -1;
+            $completed = max(0, $delta);
+            $denominator = self::w58Add($completed, max(0, $backlog));
+            $percent = $denominator > 0 ? self::w58Floor((float) $completed * 100.0 / (float) $denominator) : 0;
+            $stalled = $iterations > 0 && $delta <= 0 && $backlog > 0;
+            $growing = $backlogDelta > 0;
+            $skew = $elapsed < 0;
+            $score = ($stalled ? 50 : 0) + ($growing ? 20 : 0) + ($eta > 3600 ? 20 : ($eta > 600 ? 10 : 0)) + ($skew ? 10 : 0);
+            array_push(
+                $out,
+                $delta,
+                $rate,
+                $backlogDelta,
+                $eta,
+                $percent,
+                $backlogDelta <=> 0,
+                ($stalled ? 1 : 0) | ($growing ? 2 : 0) | ($backlogDelta < 0 ? 4 : 0) | ($skew ? 8 : 0)
+                    | ($backlog <= 0 && $delta <= 0 ? 16 : 0) | ($iterations <= 0 ? 32 : 0),
+                $score,
+                $iterations === PHP_INT_MAX ? PHP_INT_MAX : $iterations + 1,
+            );
+            $summary[0] = self::w58Add($summary[0], $delta);
+            $summary[1] += $stalled ? 1 : 0;
+            $summary[2] = max($summary[2], $eta);
+            $summary[3] = max($summary[3], $score);
+        }
+
+        return $items === [] ? [] : [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: int, 1: int, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function monitorCycleRowBatchNative(array $items): array
+    {
+        self::w58Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        $columns = [[], [], [], [], [], []];
+        foreach ($items as $item) {
+            foreach ($item as $k => $value) {
+                $columns[$k][] = $value;
+            }
+        }
+
+        return self::w58Call('', pack('P*', ...array_merge(...$columns)), $count, $count * self::W58_ROW_WORDS + self::W58_TRAILER_WORDS)
+            ?? self::monitorCycleRowBatchPhp($items);
+    }
+
+    /** Saturating $a - $b. */
+    private static function w58Sub(int $a, int $b): int
+    {
+        if ($b < 0 ? $a > PHP_INT_MAX + $b : $a < PHP_INT_MIN + $b) {
+            return $b < 0 ? PHP_INT_MAX : PHP_INT_MIN;
+        }
+
+        return $a - $b;
+    }
+
+    /** Saturating $a + $b. */
+    private static function w58Add(int $a, int $b): int
+    {
+        if ($b > 0 ? $a > PHP_INT_MAX - $b : $a < PHP_INT_MIN - $b) {
+            return $b > 0 ? PHP_INT_MAX : PHP_INT_MIN;
+        }
+
+        return $a + $b;
+    }
+
+    private static function w58Floor(float $value): int
+    {
+        return (int) max(-4.0e18, min(4.0e18, floor($value)));
+    }
+
+    private static function w58Ceil(float $value): int
+    {
+        return (int) max(-4.0e18, min(4.0e18, ceil($value)));
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        $enabled = self::w58RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W58 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('enabled');
+        self::w58RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('enabled', $previous);
+        }
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w58Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new \InvalidArgumentException('W58 monitor batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || ! array_is_list($item) || \count($item) !== 6 || \count(array_filter($item, is_int(...))) !== 6) {
+                throw new \InvalidArgumentException('W58 monitor batch items must be lists of six ints.');
+            }
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w58Call(string $blob, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w58RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w58', self::W58_FFI_CDEF) ?? false;
+            self::w58RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w58RustFfiState('out', $out);
+                self::w58RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W58_FFI_CDEF.)
+            $written = $ffi->nntmux_w58_monitor_cycle_row_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w58RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W58 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static: no arguments returns the state, one argument reads a key ('reset'
+     * clears everything) and two arguments write a key.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
+    }
 }
