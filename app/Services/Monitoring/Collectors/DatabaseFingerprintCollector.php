@@ -8,6 +8,7 @@ use App\Services\Monitoring\BoundedMetricQuery;
 use App\Services\Monitoring\Prometheus\MetricFamily;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Throwable;
 
@@ -218,5 +219,162 @@ final class DatabaseFingerprintCollector implements MetricsCollector
         self::$ffi = $ffi ?? false;
 
         return $ffi;
+    }
+
+    /** Wave 54.2 paired benchmarks decide this default; see RustMcpProcessProbeVerificationPlannerRunnerDbFpCollectorW54ParityTest. */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    private const string W54_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w542_db_fingerprint_status_plan_batch(const char *statuses, size_t statuses_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 54 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w54', self::W54_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w54RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW54RustFfi(): bool
+    {
+        $enabled = self::w54RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planJobStatusBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch job status plan, as collect() fills `array_fill_keys(fingerprintJobStatuses(), 0)`
+     * from the grouped rows. Two words per row: `flags | slot << 8 | crc32(status) << 32` and
+     * the slot's final count. Flags: 1 known status, 2 status repeated by an earlier row, 4
+     * empty status, 8 negative total. The final pending, processing, complete and failed counts,
+     * the slots, the nonzero slots, the largest final count and the XXH64 digest of all earlier
+     * words follow.
+     *
+     * @param  list<string>  $statuses
+     * @param  list<int>  $totals
+     * @return list<int>
+     */
+    public static function planJobStatusBatch(array $statuses, array $totals): array
+    {
+        return self::usesW54RustFfi()
+            ? self::planJobStatusBatchNative($statuses, $totals)
+            : self::planJobStatusBatchPhp($statuses, $totals);
+    }
+
+    /**
+     * @param  list<string>  $statuses
+     * @param  list<int>  $totals
+     * @return list<int>
+     */
+    public static function planJobStatusBatchPhp(array $statuses, array $totals): array
+    {
+        $totals = array_values($totals);
+        $counts = array_fill_keys(self::fingerprintJobStatusesPhp(), 0);
+        $slots = array_flip(array_keys($counts));
+        $seen = $rows = [];
+        foreach (array_values($statuses) as $i => $status) {
+            $total = $totals[$i] ?? 0;
+            $slots[$status] ??= \count($slots);
+            $counts[$status] = $total;
+            $rows[] = [($slots[$status] < 4 ? 1 : 0) | (isset($seen[$status]) ? 2 : 0) | ($status === '' ? 4 : 0) | ($total < 0 ? 8 : 0)
+                | $slots[$status] << 8 | crc32($status) << 32, $status];
+            $seen[$status] = true;
+        }
+        $out = [];
+        foreach ($rows as [$word, $status]) {
+            $out[] = $word;
+            $out[] = $counts[$status];
+        }
+        $values = array_values($counts);
+        array_push($out, $values[0], $values[1], $values[2], $values[3], \count($values), \count(array_filter($values)), max($values));
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * are not lists, or a status holds a NUL byte.
+     *
+     * @param  list<string>  $statuses
+     * @param  list<int>  $totals
+     * @return list<int>
+     */
+    public static function planJobStatusBatchNative(array $statuses, array $totals): array
+    {
+        $count = \count($statuses);
+        $words = 2 * $count + 8;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w54RustFfiState('out', $words);
+        if ($state === null || \count($totals) !== $count || ! array_is_list($statuses) || ! array_is_list($totals)) {
+            return self::planJobStatusBatchPhp($statuses, $totals);
+        }
+        $joined = implode("\0", $statuses);
+        $ints = pack('P*', ...$totals);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W54_FFI_CDEF.)
+            $written = $ffi->nntmux_w542_db_fingerprint_status_plan_batch($joined, \strlen($joined), $ints, \strlen($ints), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planJobStatusBatchPhp($statuses, $totals);
     }
 }

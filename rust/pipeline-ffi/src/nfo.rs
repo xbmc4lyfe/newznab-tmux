@@ -40721,3 +40721,837 @@ pub mod wave53_2_categorization_pipes_abstract_book_passable_misc_movie {
         }
     }
 }
+
+pub mod wave54_2_mcp_process_probe_verification_planner_runner_db_fp_collector {
+    //! Wave 54.2 batch kernels for ProcessRunner, RuntimeProbeRunner, VerificationPlanner,
+    //! VerificationRunner and DatabaseFingerprintCollector, in the Wave 49.2 framing: NUL-joined
+    //! label columns (exactly `count` entries) or a length-framed blob, little-endian `i64`
+    //! tables (whole columns back to back), fixed `i64` words per item, a few summary words and
+    //! one XXH64 digest of the preceding words. Each export returns the word count, `-needed`
+    //! when `out_cap` (in words) is short, or -1 for a null output, a malformed batch, an output
+    //! overlapping an input or a panic.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, ints, span,
+    };
+    use std::borrow::Cow;
+    use std::collections::hash_map::Entry;
+    use std::collections::{HashMap, HashSet};
+
+    /// ProcessRunner::limitOutputPhp()'s single-quoted suffix: a literal backslash and `n`.
+    pub const OUTPUT_SUFFIX: &[u8] = b"\\n[output truncated]";
+
+    /// RuntimeProbeRunner::PROBES identifiers.
+    pub const PROBES: &[&[u8]] = &[b"database", b"disk", b"nntp", b"queue", b"redis", b"search"];
+
+    /// The default `nntmux-mcp.check_profiles.targeted` checks.
+    pub const TARGETED: &[&[u8]] = &[
+        b"phpunit",
+        b"pint",
+        b"phpstan",
+        b"php-lint",
+        b"frontend",
+        b"composer",
+        b"diff",
+    ];
+
+    /// DatabaseFingerprintCollector::fingerprintJobStatusesPhp().
+    pub const JOB_STATUSES: &[&[u8]] = &[b"pending", b"processing", b"complete", b"failed"];
+
+    /// Saturation limit of the 24-bit length fields.
+    const FIELD: usize = 0xFF_FFFF;
+
+    /// `k` whole little-endian `i64` columns of `count` values each.
+    fn columns(bytes: &[u8], count: usize, k: usize) -> Option<Vec<i64>> {
+        ints(bytes, count.checked_mul(k)?)
+    }
+
+    fn map<K, V>(n: usize) -> HashMap<K, V, FoldState> {
+        HashMap::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    fn set<T>(n: usize) -> HashSet<T, FoldState> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// Byte length of `mb_strcut($s, 0, $maximum)` under UTF-8 for `$maximum < strlen($s)`: the
+    /// cut backs off over continuation bytes (0x80-0xBF) whatever the validity.
+    pub fn cut_len(bytes: &[u8], maximum: usize) -> usize {
+        if maximum >= bytes.len() {
+            return bytes.len();
+        }
+        let mut end = maximum;
+        while end > 0 && (bytes[end] as i8) < -64 {
+            end -= 1;
+        }
+        end
+    }
+
+    /// Two words per output: the kept byte length and
+    /// `flags | crc32(limitOutputPhp(output, maximum)[0]) << 32`. Flags: 1 truncated, 2 empty,
+    /// 4 cut backed off a multibyte sequence, 8 maximum below 1, 16 holds a NUL byte, 32 invalid
+    /// UTF-8. Truncated outputs, input bytes, kept bytes, invalid outputs and the longest input
+    /// follow.
+    pub fn output_limit_plan(blob: &[u8], lengths: &[i64], maximums: &[i64]) -> Option<Vec<i64>> {
+        let mut out = Vec::with_capacity(lengths.len() * 2 + 6);
+        let mut scratch = Vec::new();
+        let mut offset = 0usize;
+        let (mut truncated_n, mut input, mut kept_total, mut invalid, mut longest) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for (&length, &requested) in lengths.iter().zip(maximums) {
+            let end = offset.checked_add(usize::try_from(length).ok()?)?;
+            let s = blob.get(offset..end)?;
+            offset = end;
+            let maximum = requested.max(1);
+            let truncated = s.len() as u64 > maximum as u64;
+            let (kept, crc) = if truncated {
+                let kept = cut_len(s, maximum as usize);
+                scratch.clear();
+                scratch.extend_from_slice(&s[..kept]);
+                scratch.extend_from_slice(OUTPUT_SUFFIX);
+                (kept, crc32(&scratch))
+            } else {
+                (s.len(), crc32(s))
+            };
+            let bad = std::str::from_utf8(s).is_err();
+            let flags = i64::from(truncated)
+                | i64::from(s.is_empty()) << 1
+                | i64::from(truncated && (kept as u64) < maximum as u64) << 2
+                | i64::from(requested < 1) << 3
+                | i64::from(s.contains(&0)) << 4
+                | i64::from(bad) << 5;
+            truncated_n += i64::from(truncated);
+            input += s.len() as i64;
+            kept_total += kept as i64;
+            invalid += i64::from(bad);
+            longest = longest.max(s.len() as i64);
+            out.push(kept as i64);
+            out.push(flags | i64::from(crc) << 32);
+        }
+        if offset != blob.len() {
+            return None;
+        }
+        out.extend([truncated_n, input, kept_total, invalid, longest]);
+        Some(out)
+    }
+
+    /// One word per probe result: `flags | first index << 8 | crc32(identifier) << 32`. Flags:
+    /// 1 duplicate (array_unique drops it), 2 ok, 4 known probe, 8 empty identifier, 16 latency
+    /// of at least 1000 ms. Unique results, ok unique results, unknown unique identifiers, the
+    /// batch status (1 passed, 0 failed), and the highest and lowest unique latency (0 without
+    /// results) follow.
+    pub fn probe_plan(ids: &[&[u8]], oks: &[i64], latencies: &[i64]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(ids.len() + 7);
+        // Batches name a handful of probes: scan the first SMALL distinct identifiers, then hash.
+        const SMALL: usize = 16;
+        let mut small: Vec<(&[u8], usize)> = Vec::with_capacity(SMALL);
+        let mut first: Option<HashMap<&[u8], usize, FoldState>> = None;
+        let (mut unique, mut ok_unique, mut unknown, mut all_ok) = (0i64, 0i64, 0i64, true);
+        let (mut high, mut low): (Option<i64>, Option<i64>) = (None, None);
+        for (i, &id) in ids.iter().enumerate() {
+            let (dup, index) = if let Some(first) = first.as_mut() {
+                match first.entry(id) {
+                    Entry::Occupied(e) => (true, *e.get()),
+                    Entry::Vacant(v) => (false, *v.insert(i)),
+                }
+            } else if let Some(&(_, index)) = small.iter().find(|&&(seen, _)| seen == id) {
+                (true, index)
+            } else if small.len() < SMALL {
+                small.push((id, i));
+                (false, i)
+            } else {
+                let mut hashed = map::<&[u8], usize>(ids.len());
+                hashed.extend(small.drain(..));
+                hashed.insert(id, i);
+                first = Some(hashed);
+                (false, i)
+            };
+            let ok = oks[i] != 0;
+            let latency = latencies[i];
+            let known = PROBES.contains(&id);
+            if !dup {
+                unique += 1;
+                ok_unique += i64::from(ok);
+                unknown += i64::from(!known);
+                all_ok &= ok;
+                high = Some(high.map_or(latency, |h| h.max(latency)));
+                low = Some(low.map_or(latency, |l| l.min(latency)));
+            }
+            let flags = i64::from(dup)
+                | i64::from(ok) << 1
+                | i64::from(known) << 2
+                | i64::from(id.is_empty()) << 3
+                | i64::from(latency >= 1000) << 4;
+            out.push(flags | (index as i64) << 8 | i64::from(crc32(id)) << 32);
+        }
+        out.extend([
+            unique,
+            ok_unique,
+            unknown,
+            i64::from(all_ok),
+            high.unwrap_or(0),
+            low.unwrap_or(0),
+        ]);
+        out
+    }
+
+    /// PHP basename() in an ASCII-compatible locale.
+    pub fn basename(path: &[u8]) -> &[u8] {
+        let mut end = path.len();
+        while end > 0 && path[end - 1] == b'/' {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && path[start - 1] != b'/' {
+            start -= 1;
+        }
+        &path[start..end]
+    }
+
+    /// `preg_replace('/(?:Test)?\.php$/', '', $name)`: `$` also matches before a final newline.
+    pub fn stem(name: &[u8]) -> Cow<'_, [u8]> {
+        let (core, newline) = if name.ends_with(b".php") {
+            (name, false)
+        } else if name.ends_with(b".php\n") {
+            (&name[..name.len() - 1], true)
+        } else {
+            return Cow::Borrowed(name);
+        };
+        let head = &core[..core.len() - if core.ends_with(b"Test.php") { 8 } else { 4 }];
+        if newline {
+            let mut owned = head.to_vec();
+            owned.push(b'\n');
+            Cow::Owned(owned)
+        } else {
+            Cow::Borrowed(head)
+        }
+    }
+
+    fn is_frontend(path: &[u8]) -> bool {
+        path.starts_with(b"resources/views/")
+            || path.starts_with(b"resources/js/")
+            || path.starts_with(b"resources/css/")
+            || path == b"package.json"
+            || path == b"vite.config.js"
+    }
+
+    fn is_mcp(path: &[u8]) -> bool {
+        path.starts_with(b"app/Mcp/")
+            || path.starts_with(b"app/Services/Mcp/")
+            || path == b"config/nntmux-mcp.php"
+            || path == b"routes/ai.php"
+    }
+
+    /// One word per path: `flags | min(stem length, 0xFFFFFF) << 8 | crc32(stem) << 32`. Flags:
+    /// 1 PHP (not Blade), 2 frontend, 4 MCP, 8 test file, 16 `composer.json`, 32 stem kept by
+    /// relatedTestStemsPhp(), 64 repeated stem, 128 falsy stem. PHP, frontend, MCP and test
+    /// counts, whether `composer.json` appears, the kept stems and the path-independent check
+    /// count (pint, phpstan, php-lint, frontend, composer, diff) follow.
+    pub fn path_plan(paths: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(paths.len() + 8);
+        let mut stems = set::<Cow<'_, [u8]>>(paths.len());
+        let (mut php, mut frontend, mut mcp, mut tests, mut composer) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for &path in paths {
+            let is_php = path.ends_with(b".php") && !path.ends_with(b".blade.php");
+            let front = is_frontend(path);
+            let in_mcp = is_mcp(path);
+            let test = path.starts_with(b"tests/") && path.ends_with(b"Test.php");
+            let comp = path == b"composer.json";
+            let s = stem(basename(path));
+            let len = s.len().min(FIELD) as i64;
+            let crc = crc32(&s);
+            let falsy = s.is_empty() || *s == *b"0";
+            let (kept, dup) = if falsy {
+                (false, false)
+            } else if stems.insert(s) {
+                (true, false)
+            } else {
+                (false, true)
+            };
+            php += i64::from(is_php);
+            frontend += i64::from(front);
+            mcp += i64::from(in_mcp);
+            tests += i64::from(test);
+            composer |= i64::from(comp);
+            let flags = i64::from(is_php)
+                | i64::from(front) << 1
+                | i64::from(in_mcp) << 2
+                | i64::from(test) << 3
+                | i64::from(comp) << 4
+                | i64::from(kept) << 5
+                | i64::from(dup) << 6
+                | i64::from(falsy) << 7;
+            out.push(flags | len << 8 | i64::from(crc) << 32);
+        }
+        let checks = if php > 0 { 3 } else { 0 } + i64::from(frontend > 0) + composer + 1;
+        out.extend([
+            php,
+            frontend,
+            mcp,
+            tests,
+            composer,
+            stems.len() as i64,
+            checks,
+        ]);
+        out
+    }
+
+    /// `preg_match('/^[A-Za-z0-9_.:\-\\\\]+$/', $filter) === 1`.
+    pub fn valid_filter(filter: &[u8]) -> bool {
+        let body = filter.strip_suffix(b"\n").unwrap_or(filter);
+        !body.is_empty()
+            && body.iter().all(|&b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-' | b'\\')
+            })
+    }
+
+    /// One word per check result: `flags | status code << 8 | crc32(name) << 32`. Status codes:
+    /// 1 passed, 2 skipped, 3 failed, 4 timed_out, else 0. Flags: 1 failing (neither passed nor
+    /// skipped), 2 truncated, 4 the name is a valid filter, 8 a default targeted check, 16 a
+    /// `diff-` name. The run status (1 failed), whether any result is truncated, failing,
+    /// skipped and passed counts and the distinct names follow.
+    pub fn result_plan(names: &[&[u8]], statuses: &[&[u8]], truncated: &[i64]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(names.len() + 7);
+        let mut distinct = set::<&[u8]>(names.len());
+        let (mut failing_n, mut skipped_n, mut passed_n, mut any_truncated) =
+            (0i64, 0i64, 0i64, 0i64);
+        for (i, &name) in names.iter().enumerate() {
+            let code: i64 = match statuses[i] {
+                b"passed" => 1,
+                b"skipped" => 2,
+                b"failed" => 3,
+                b"timed_out" => 4,
+                _ => 0,
+            };
+            let failing = code != 1 && code != 2;
+            let cut = truncated[i] != 0;
+            distinct.insert(name);
+            failing_n += i64::from(failing);
+            skipped_n += i64::from(code == 2);
+            passed_n += i64::from(code == 1);
+            any_truncated |= i64::from(cut);
+            let flags = i64::from(failing)
+                | i64::from(cut) << 1
+                | i64::from(valid_filter(name)) << 2
+                | i64::from(TARGETED.contains(&name)) << 3
+                | i64::from(name.starts_with(b"diff-")) << 4;
+            out.push(flags | code << 8 | i64::from(crc32(name)) << 32);
+        }
+        out.extend([
+            i64::from(failing_n > 0),
+            any_truncated,
+            failing_n,
+            skipped_n,
+            passed_n,
+            distinct.len() as i64,
+        ]);
+        out
+    }
+
+    /// Two words per grouped row, as collect() fills `array_fill_keys(statuses, 0)`:
+    /// `flags | slot << 8 | crc32(status) << 32` and the slot's final count. Flags: 1 known
+    /// status, 2 status repeated by an earlier row, 4 empty status, 8 negative total. The final
+    /// pending, processing, complete and failed counts, the slots, the nonzero slots and the
+    /// largest final count follow.
+    pub fn status_plan(statuses: &[&[u8]], totals: &[i64]) -> Vec<i64> {
+        let mut slots = map::<&[u8], usize>(statuses.len() + JOB_STATUSES.len());
+        for (slot, &status) in JOB_STATUSES.iter().enumerate() {
+            slots.insert(status, slot);
+        }
+        let mut values = vec![0i64; JOB_STATUSES.len()];
+        let mut seen = set::<&[u8]>(statuses.len());
+        let mut rows = Vec::with_capacity(statuses.len());
+        for (i, &status) in statuses.iter().enumerate() {
+            let next = values.len();
+            let slot = *slots.entry(status).or_insert(next);
+            if slot == next {
+                values.push(0);
+            }
+            values[slot] = totals[i];
+            let flags = i64::from(slot < JOB_STATUSES.len())
+                | i64::from(!seen.insert(status)) << 1
+                | i64::from(status.is_empty()) << 2
+                | i64::from(totals[i] < 0) << 3;
+            rows.push((
+                flags | (slot as i64) << 8 | i64::from(crc32(status)) << 32,
+                slot,
+            ));
+        }
+        let mut out = Vec::with_capacity(statuses.len() * 2 + 8);
+        for (word, slot) in rows {
+            out.push(word);
+            out.push(values[slot]);
+        }
+        out.extend_from_slice(&values[..JOB_STATUSES.len()]);
+        out.extend([
+            values.len() as i64,
+            values.iter().filter(|&&v| v != 0).count() as i64,
+            values.iter().copied().max().unwrap_or(0),
+        ]);
+        out
+    }
+
+    // ---- exports -----------------------------------------------------------------------------
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `outputs` holds the outputs back to back; `ints` the byte lengths and maximums as two
+    /// whole columns.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w542_process_output_limit_batch(
+        outputs: *const u8,
+        outputs_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(outputs, outputs_len), (ints, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let blob = span(outputs, outputs_len)?;
+                let table = columns(span(ints, ints_len)?, count, 2)?;
+                let (lengths, maximums) = table.split_at(count);
+                output_limit_plan(blob, lengths, maximums)
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the ok flags and latencies as two whole columns.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w542_runtime_probe_plan_batch(
+        ids: *const u8,
+        ids_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(ids, ids_len), (ints, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let ids = column(span(ids, ids_len)?, count)?;
+                let table = columns(span(ints, ints_len)?, count, 2)?;
+                let (oks, latencies) = table.split_at(count);
+                Some(probe_plan(&ids, oks, latencies))
+            })
+        }
+    }
+
+    /// # Safety
+    /// `paths` must be readable for `paths_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w542_verification_path_plan_batch(
+        paths: *const u8,
+        paths_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(paths, paths_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                Some(path_plan(&column(span(paths, paths_len)?, count)?))
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the truncated flags.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w542_verification_result_plan_batch(
+        names: *const u8,
+        names_len: usize,
+        statuses: *const u8,
+        statuses_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (names, names_len),
+            (statuses, statuses_len),
+            (ints, ints_len),
+        ];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let names = column(span(names, names_len)?, count)?;
+                let statuses = column(span(statuses, statuses_len)?, count)?;
+                let truncated = columns(span(ints, ints_len)?, count, 1)?;
+                Some(result_plan(&names, &statuses, &truncated))
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the row totals.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w542_db_fingerprint_status_plan_batch(
+        statuses: *const u8,
+        statuses_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(statuses, statuses_len), (ints, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let statuses = column(span(statuses, statuses_len)?, count)?;
+                let totals = columns(span(ints, ints_len)?, count, 1)?;
+                Some(status_plan(&statuses, &totals))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod w542_tests {
+        use super::super::wave49_verification_admission_inventory_prep_repo_sample::digest;
+        use super::*;
+
+        fn p(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn run(call: impl Fn(*mut i64, usize) -> isize) -> Vec<i64> {
+            let mut out = vec![0i64; 256];
+            let n = call(out.as_mut_ptr(), out.len());
+            assert!(n > 0, "export returned {n}");
+            out.truncate(n as usize);
+            let (body, last) = out.split_at(out.len() - 1);
+            assert_eq!(last[0], digest(body));
+            out.pop();
+            out
+        }
+
+        #[test]
+        fn w542_cut_len_matches_mb_strcut() {
+            assert_eq!(cut_len(b"ab\xC3\xA9\xC3\xA9", 3), 2);
+            assert_eq!(cut_len(b"\x80\x80\x80\x80", 2), 0);
+            assert_eq!(cut_len(b"a\xff\x80\x80", 3), 1);
+            assert_eq!(cut_len(b"\xe9\x80\x80\x41", 2), 0);
+            assert_eq!(cut_len(b"abc", 5), 3);
+            assert_eq!(cut_len(b"abcd", 2), 2);
+        }
+
+        #[test]
+        fn w542_output_limit_plan_follows_documented_words() {
+            let w = output_limit_plan(b"abcdefab\xC3\xA9x\0", &[3, 3, 5, 0, 1], &[10, 2, 3, 0, -4])
+                .unwrap();
+            assert_eq!(w[0], 3);
+            assert_eq!(w[1], i64::from(crc32(b"abc")) << 32);
+            assert_eq!(w[2], 2);
+            assert_eq!(w[3], 1 | i64::from(crc32(b"de\\n[output truncated]")) << 32);
+            // "ab\xC3\xA9x" cut at 3 backs off to 2.
+            assert_eq!(w[4], 2);
+            assert_eq!(
+                w[5],
+                1 | 4 | i64::from(crc32(b"ab\\n[output truncated]")) << 32
+            );
+            assert_eq!(w[6], 0);
+            assert_eq!(w[7], 2 | 8);
+            assert_eq!(w[8], 1);
+            assert_eq!(w[9], 8 | 16 | i64::from(crc32(b"\0")) << 32);
+            assert_eq!(&w[10..], &[2, 12, 8, 0, 5]);
+            assert_eq!(output_limit_plan(b"ab", &[1], &[5]), None);
+            assert_eq!(output_limit_plan(b"ab", &[3], &[5]), None);
+            assert_eq!(output_limit_plan(b"ab", &[-1], &[5]), None);
+            let w = output_limit_plan(b"\xff", &[1], &[5]).unwrap();
+            assert_eq!(w[1] & 0xFF, 32);
+        }
+
+        #[test]
+        fn w542_probe_plan_dedupes_like_array_unique() {
+            let w = probe_plan(
+                &[b"redis", b"custom", b"redis", b""],
+                &[1, 0, 0, 1],
+                &[5, 1200, 7, -3],
+            );
+            assert_eq!(w[0], 2 | 4 | i64::from(crc32(b"redis")) << 32);
+            assert_eq!(w[1], 16 | 1 << 8 | i64::from(crc32(b"custom")) << 32);
+            assert_eq!(w[2], 1 | 4 | i64::from(crc32(b"redis")) << 32);
+            assert_eq!(w[3], 2 | 8 | 3 << 8);
+            assert_eq!(&w[4..], &[3, 2, 2, 0, 1200, -3]);
+            assert_eq!(probe_plan(&[], &[], &[]), vec![0, 0, 0, 1, 0, 0]);
+        }
+
+        #[test]
+        fn w542_probe_plan_switches_to_hashing_past_small_batches() {
+            let names: Vec<Vec<u8>> = (0..40)
+                .map(|i| format!("p{}", i % 20).into_bytes())
+                .collect();
+            let ids: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+            let w = probe_plan(&ids, &[1; 40], &[1; 40]);
+            for (i, word) in w[..40].iter().enumerate() {
+                assert_eq!(word & 1, i64::from(i >= 20), "item {i}");
+                assert_eq!(word >> 8 & 0xFF_FFFF, (i % 20) as i64, "item {i}");
+            }
+            assert_eq!(w[40], 20);
+        }
+
+        #[test]
+        fn w542_basename_and_stem_follow_php() {
+            assert_eq!(basename(b"app/Foo.php"), b"Foo.php");
+            assert_eq!(basename(b"app/dir//"), b"dir");
+            assert_eq!(basename(b"///"), b"");
+            assert_eq!(basename(b""), b"");
+            assert_eq!(&*stem(b"FooTest.php"), b"Foo");
+            assert_eq!(&*stem(b"TestTest.php"), b"Test");
+            assert_eq!(&*stem(b"Test.php"), b"");
+            assert_eq!(&*stem(b"Foo.php\n"), b"Foo\n");
+            assert_eq!(&*stem(b"Foo.php\n\n"), b"Foo.php\n\n");
+            assert_eq!(&*stem(b"Foo.PHP"), b"Foo.PHP");
+            assert_eq!(&*stem(b"view.blade.php"), b"view.blade");
+        }
+
+        #[test]
+        fn w542_path_plan_follows_documented_words() {
+            let w = path_plan(&[
+                b"app/Services/Mcp/ProcessRunner.php",
+                b"tests/Unit/ProcessRunnerTest.php",
+                b"resources/views/a.blade.php",
+                b"composer.json",
+                b"0.php",
+            ]);
+            assert_eq!(
+                w[0],
+                1 | 4 | 32 | 13 << 8 | i64::from(crc32(b"ProcessRunner")) << 32
+            );
+            assert_eq!(
+                w[1],
+                1 | 8 | 64 | 13 << 8 | i64::from(crc32(b"ProcessRunner")) << 32
+            );
+            assert_eq!(w[2], 2 | 32 | 7 << 8 | i64::from(crc32(b"a.blade")) << 32);
+            assert_eq!(
+                w[3],
+                16 | 32 | 13 << 8 | i64::from(crc32(b"composer.json")) << 32
+            );
+            assert_eq!(w[4], 1 | 128 | 1 << 8 | i64::from(crc32(b"0")) << 32);
+            assert_eq!(&w[5..], &[3, 1, 1, 1, 1, 3, 6]);
+            assert_eq!(path_plan(&[]), vec![0, 0, 0, 0, 0, 0, 1]);
+            // A stem ending in a newline differs from a newline-free stem of other paths.
+            let w = path_plan(&[b"a.php\n", b"a\n"]);
+            assert_eq!(w[1] & 0xFF, 64);
+        }
+
+        #[test]
+        fn w542_valid_filter_and_result_plan() {
+            assert!(valid_filter(b"Tests\\Unit\\FooTest::test_bar"));
+            assert!(valid_filter(b"a-b.c\n"));
+            assert!(!valid_filter(b"a\n\n"));
+            assert!(!valid_filter(b"\n"));
+            assert!(!valid_filter(b""));
+            assert!(!valid_filter(b"a b"));
+            let w = result_plan(
+                &[b"pint", b"diff-staged", b"pint", b"x y"],
+                &[b"passed", b"skipped", b"timed_out", b""],
+                &[0, 1, 0, 0],
+            );
+            assert_eq!(w[0], 4 | 8 | 1 << 8 | i64::from(crc32(b"pint")) << 32);
+            assert_eq!(
+                w[1],
+                2 | 4 | 16 | 2 << 8 | i64::from(crc32(b"diff-staged")) << 32
+            );
+            assert_eq!(w[2], 1 | 4 | 8 | 4 << 8 | i64::from(crc32(b"pint")) << 32);
+            assert_eq!(w[3], 1 | i64::from(crc32(b"x y")) << 32);
+            assert_eq!(&w[4..], &[1, 1, 2, 1, 1, 3]);
+            assert_eq!(result_plan(&[], &[], &[]), vec![0, 0, 0, 0, 0, 0]);
+        }
+
+        #[test]
+        fn w542_status_plan_matches_array_fill_keys() {
+            let w = status_plan(&[b"complete", b"orphan", b"complete", b""], &[5, -2, 9, 0]);
+            assert_eq!(w[0], 1 | 2 << 8 | i64::from(crc32(b"complete")) << 32);
+            assert_eq!(w[1], 9);
+            assert_eq!(w[2], 8 | 4 << 8 | i64::from(crc32(b"orphan")) << 32);
+            assert_eq!(w[3], -2);
+            assert_eq!(w[4], 1 | 2 | 2 << 8 | i64::from(crc32(b"complete")) << 32);
+            assert_eq!(w[5], 9);
+            assert_eq!(w[6], 4 | 5 << 8);
+            assert_eq!(w[7], 0);
+            assert_eq!(&w[8..], &[0, 0, 9, 0, 6, 2, 9]);
+            assert_eq!(status_plan(&[], &[]), vec![0, 0, 0, 0, 4, 0, 0]);
+        }
+
+        #[test]
+        fn w542_exports_frame_and_guard_batches() {
+            let ints = p(&[3, 5]);
+            let w = run(|o, c| unsafe {
+                nntmux_w542_process_output_limit_batch(
+                    b"abcd".as_ptr(),
+                    3,
+                    ints.as_ptr(),
+                    ints.len(),
+                    1,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, output_limit_plan(b"abc", &[3], &[5]).unwrap());
+            let ints = p(&[1, 5]);
+            let w = run(|o, c| unsafe {
+                nntmux_w542_runtime_probe_plan_batch(
+                    b"disk".as_ptr(),
+                    4,
+                    ints.as_ptr(),
+                    ints.len(),
+                    1,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, probe_plan(&[b"disk"], &[1], &[5]));
+            let paths = b"a.php\0b.js";
+            let w = run(|o, c| unsafe {
+                nntmux_w542_verification_path_plan_batch(paths.as_ptr(), paths.len(), 2, o, c)
+            });
+            assert_eq!(w, path_plan(&[b"a.php", b"b.js"]));
+            let one = p(&[1]);
+            let w = run(|o, c| unsafe {
+                nntmux_w542_verification_result_plan_batch(
+                    b"pint".as_ptr(),
+                    4,
+                    b"failed".as_ptr(),
+                    6,
+                    one.as_ptr(),
+                    8,
+                    1,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, result_plan(&[b"pint"], &[b"failed"], &[1]));
+            let w = run(|o, c| unsafe {
+                nntmux_w542_db_fingerprint_status_plan_batch(
+                    b"failed".as_ptr(),
+                    6,
+                    one.as_ptr(),
+                    8,
+                    1,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, status_plan(&[b"failed"], &[1]));
+
+            let null = std::ptr::null::<u8>();
+            let mut out = [7i64; 32];
+            let o = out.as_mut_ptr();
+            unsafe {
+                // Empty batches accept null inputs.
+                assert_eq!(
+                    nntmux_w542_process_output_limit_batch(null, 0, null, 0, 0, o, 32),
+                    6
+                );
+                assert_eq!(
+                    nntmux_w542_runtime_probe_plan_batch(null, 0, null, 0, 0, o, 32),
+                    7
+                );
+                assert_eq!(
+                    nntmux_w542_verification_path_plan_batch(null, 0, 0, o, 32),
+                    8
+                );
+                assert_eq!(
+                    nntmux_w542_verification_result_plan_batch(null, 0, null, 0, null, 0, 0, o, 32),
+                    7
+                );
+                assert_eq!(
+                    nntmux_w542_db_fingerprint_status_plan_batch(null, 0, null, 0, 0, o, 32),
+                    8
+                );
+                out = [7; 32];
+                let o = out.as_mut_ptr();
+                // Null outputs, null non-empty inputs, short outputs and ragged batches.
+                let null_out = std::ptr::null_mut::<i64>();
+                assert_eq!(
+                    nntmux_w542_verification_path_plan_batch(
+                        paths.as_ptr(),
+                        paths.len(),
+                        2,
+                        null_out,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w542_verification_path_plan_batch(null, 5, 1, o, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w542_verification_path_plan_batch(paths.as_ptr(), paths.len(), 2, o, 3),
+                    -10
+                );
+                assert_eq!(
+                    nntmux_w542_verification_path_plan_batch(paths.as_ptr(), paths.len(), 1, o, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w542_runtime_probe_plan_batch(
+                        b"disk".as_ptr(),
+                        4,
+                        one.as_ptr(),
+                        8,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w542_process_output_limit_batch(null, 3, ints.as_ptr(), 16, 1, o, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w542_db_fingerprint_status_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        null,
+                        8,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w542_verification_result_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        b"a\0b".as_ptr(),
+                        3,
+                        one.as_ptr(),
+                        8,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(out, [7; 32]);
+                // An output overlapping an input is refused.
+                let mut shared = [0i64; 32];
+                shared[0] = i64::from_le_bytes(*b"database");
+                assert_eq!(
+                    nntmux_w542_verification_path_plan_batch(
+                        shared.as_ptr() as *const u8,
+                        8,
+                        1,
+                        shared.as_mut_ptr(),
+                        32
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}
