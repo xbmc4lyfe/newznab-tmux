@@ -42468,3 +42468,722 @@ pub mod w561_prometheus_tmux_snapshot_probe_result_redis_registry {
         }
     }
 }
+
+pub mod w571_configuration_runtime_horizon_verification {
+    //! Wave 57.1 per-row batch kernels for configuration values (ConfigurationProvider), stored
+    //! versus submitted domain settings (DomainConfigurationRepository), processing runtime state
+    //! records (ProcessingRuntimeStateRepository), Horizon workload rows (HorizonCollector) and
+    //! release verification latency windows (ReleaseVerificationCollector). Every export reads
+    //! NUL-joined rows, writes a fixed number of `i64` words per item into `out` and returns the
+    //! item count, `SHORT_CAPACITY` when `out_cap` (in words) is too small, or -1 for a malformed
+    //! batch (a row holding a NUL byte splits into extra rows, so PHP falls back to its own code).
+
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+    pub const SHORT_CAPACITY: isize = -2;
+
+    /// ConfigurationProvider value words: `kind | flags | domain << VALUE_DOMAIN_SHIFT | trimmed
+    /// length << VALUE_LENGTH_SHIFT`, then the coerced integer.
+    pub const VALUE_WORDS: usize = 2;
+    pub const VALUE_EMPTY: i64 = 0;
+    pub const VALUE_TRUE: i64 = 1;
+    pub const VALUE_FALSE: i64 = 2;
+    pub const VALUE_INT: i64 = 3;
+    pub const VALUE_FLOAT: i64 = 4;
+    pub const VALUE_JSON: i64 = 5;
+    pub const VALUE_STRING: i64 = 6;
+    pub const VALUE_TRIMMED: i64 = 16;
+    pub const VALUE_KEY: i64 = 32;
+    pub const VALUE_NON_ASCII: i64 = 64;
+    pub const VALUE_DOMAIN_SHIFT: u32 = 8;
+    pub const VALUE_LENGTH_SHIFT: u32 = 12;
+    /// `ConfigurationDomain` case values in declaration order.
+    pub const DOMAINS: [&[u8]; 6] = [b"site", b"registration", b"ingestion", b"post-processing", b"metadata", b"tmux"];
+
+    /// DomainConfigurationRepository diff words: flags `| submitted length << DIFF_LENGTH_SHIFT`,
+    /// then PHP `crc32()` of the submitted value.
+    pub const DIFF_WORDS: usize = 2;
+    pub const DIFF_CHANGED: i64 = 1;
+    pub const DIFF_TRIM_EQUAL: i64 = 2;
+    pub const DIFF_CASE_EQUAL: i64 = 4;
+    pub const DIFF_NUMERIC_EQUAL: i64 = 8;
+    pub const DIFF_CLEARED: i64 = 16;
+    pub const DIFF_ADDED: i64 = 32;
+    pub const DIFF_JSON: i64 = 64;
+    pub const DIFF_MULTILINE: i64 = 128;
+    pub const DIFF_LENGTH_SHIFT: u32 = 8;
+
+    /// ProcessingRuntimeStateRepository words: `running | stop << 1 | invalid << 2 | unknown << 3 |
+    /// state << 4 | next << 8 | transition << 12 | conflict << 14`, then pending and active (-1
+    /// when absent or invalid).
+    pub const STATE_WORDS: usize = 3;
+    pub const STATES: [&[u8]; 5] = [b"running", b"paused", b"draining", b"drained", b"stopped"];
+    /// Allowed `next` states (bit `to - 1`) per `state - 1`.
+    pub const TRANSITIONS: [u8; 5] = [0b00110, 0b00101, 0b01001, 0b10001, 0b00001];
+
+    /// HorizonCollector words: `status | flags | name length << WORKLOAD_NAME_SHIFT`, then the
+    /// length, wait, processes and failed fields (-1 when invalid).
+    pub const WORKLOAD_WORDS: usize = 5;
+    pub const WORKLOAD_IDLE: i64 = 0;
+    pub const WORKLOAD_HEALTHY: i64 = 1;
+    pub const WORKLOAD_BACKLOGGED: i64 = 2;
+    pub const WORKLOAD_STALLED: i64 = 3;
+    pub const WORKLOAD_INVALID: i64 = 7;
+    pub const WORKLOAD_SKIP: i64 = 8;
+    pub const WORKLOAD_FAILING: i64 = 16;
+    pub const WORKLOAD_NAME_VALID: i64 = 32;
+    pub const WORKLOAD_NAME_SHIFT: u32 = 8;
+    pub const WORKLOAD_BACKLOG_SECONDS: i64 = 60;
+
+    /// ReleaseVerificationCollector words: `health | invalid flag | invalid count (max 255) << 8`,
+    /// count, sum, nearest-rank p50/p95/p99, max (-1 without samples) and eight 8-bit saturating
+    /// bucket counts packed low to high.
+    pub const LATENCY_WORDS: usize = 8;
+    pub const LATENCY_BUCKETS: [i64; 7] = [100, 250, 500, 1000, 2500, 5000, 10000];
+    pub const LATENCY_INVALID: i64 = 4;
+    pub const LATENCY_DEGRADED_P95: i64 = 1000;
+    pub const LATENCY_CRITICAL_P99: i64 = 5000;
+
+    fn overlaps(input: *const u8, len: usize, out: *mut i64, words: usize) -> bool {
+        let (a, b, b_len) = (input as usize, out as usize, words.saturating_mul(8));
+        len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(len)
+    }
+
+    /// Validates the batch and output window for `count` items of `per_item` words.
+    unsafe fn window<'a>(
+        input: *const u8,
+        len: usize,
+        count: usize,
+        per_item: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> Result<(&'a [u8], &'a mut [i64]), isize> {
+        if out.is_null()
+            || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+            || count > MAX_ITEMS
+            || out_cap > isize::MAX as usize / 8
+            || len > MAX_INPUT
+            || (len != 0 && input.is_null())
+        {
+            return Err(-1);
+        }
+        let words = count * per_item;
+        if words > out_cap {
+            return Err(SHORT_CAPACITY);
+        }
+        if overlaps(input, len, out, words) {
+            return Err(-1);
+        }
+        // A null pointer is never sliced, even for an empty batch.
+        let bytes: &[u8] = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(input, len) } };
+        // `words` words, checked against `out_cap` above; disjoint from the input.
+        let dst = unsafe { std::slice::from_raw_parts_mut(out, words) };
+        Ok((bytes, dst))
+    }
+
+    /// Writes `per_row` words from `row(entry, dst)` for each of exactly `count` rows.
+    unsafe fn run(
+        input: *const u8,
+        len: usize,
+        count: usize,
+        per_row: usize,
+        out: *mut i64,
+        out_cap: usize,
+        mut row: impl FnMut(&[u8], &mut [i64]),
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (bytes, dst) = match unsafe { window(input, len, count, per_row, out, out_cap) } {
+                Ok(window) => window,
+                Err(code) => return code,
+            };
+            if count == 0 {
+                return if bytes.is_empty() { 0 } else { -1 };
+            }
+            let mut n = 0;
+            for entry in bytes.split(|&b| b == 0) {
+                if n < count {
+                    row(entry, &mut dst[n * per_row..(n + 1) * per_row]);
+                }
+                n += 1;
+            }
+            if n == count { n as isize } else { -1 }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Reads `2 * pairs` rows (every first-half row, then every second-half row) and writes
+    /// `per_pair` words from `pair(first[i], second[i], dst)`.
+    unsafe fn run_pairs(
+        input: *const u8,
+        len: usize,
+        pairs: usize,
+        per_pair: usize,
+        out: *mut i64,
+        out_cap: usize,
+        mut pair: impl FnMut(&[u8], &[u8], &mut [i64]),
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (bytes, dst) = match unsafe { window(input, len, pairs, per_pair, out, out_cap) } {
+                Ok(window) => window,
+                Err(code) => return code,
+            };
+            if pairs == 0 {
+                return if bytes.is_empty() { 0 } else { -1 };
+            }
+            let mut rows: Vec<&[u8]> = Vec::with_capacity(pairs * 2);
+            for entry in bytes.split(|&b| b == 0) {
+                if rows.len() == pairs * 2 {
+                    return -1;
+                }
+                rows.push(entry);
+            }
+            if rows.len() != pairs * 2 {
+                return -1;
+            }
+            let (first, second) = rows.split_at(pairs);
+            for (i, (a, b)) in first.iter().zip(second).enumerate() {
+                pair(a, b, &mut dst[i * per_pair..(i + 1) * per_pair]);
+            }
+            pairs as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// PHP `trim()` without a character list.
+    fn php_trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    /// `1..=max` ASCII digits as an integer (`ctype_digit()` plus a length cap).
+    fn digits(s: &[u8], max: usize) -> Option<i64> {
+        if s.is_empty() || s.len() > max || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(s.iter().fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0')))
+    }
+
+    fn split_sign(s: &[u8]) -> (bool, &[u8]) {
+        match s.first() {
+            Some(b'-') => (true, &s[1..]),
+            Some(b'+') => (false, &s[1..]),
+            _ => (false, s),
+        }
+    }
+
+    /// `/\A[+-]?[0-9]{1,18}\z/` as PHP `(int)`.
+    fn signed_int(s: &[u8]) -> Option<i64> {
+        let (neg, body) = split_sign(s);
+        digits(body, 18).map(|v| if neg { -v } else { v })
+    }
+
+    /// `/\A[+-]?(?:[0-9]{1,15}\.[0-9]{0,15}|\.[0-9]{1,15})\z/` as PHP `(int)` of its integer part.
+    fn float_int_part(s: &[u8]) -> Option<i64> {
+        let (neg, body) = split_sign(s);
+        let dot = body.iter().position(|&b| b == b'.')?;
+        let (int, frac) = (&body[..dot], &body[dot + 1..]);
+        let ok = |p: &[u8]| p.len() <= 15 && p.iter().all(u8::is_ascii_digit);
+        if !ok(int) || !ok(frac) || (int.is_empty() && frac.is_empty()) {
+            return None;
+        }
+        let v = digits(int, 15).unwrap_or(0);
+        Some(if neg { -v } else { v })
+    }
+
+    fn bool_literal(s: &[u8]) -> Option<bool> {
+        if s.eq_ignore_ascii_case(b"true") || s.eq_ignore_ascii_case(b"yes") || s.eq_ignore_ascii_case(b"on") {
+            Some(true)
+        } else if s.eq_ignore_ascii_case(b"false") || s.eq_ignore_ascii_case(b"no") || s.eq_ignore_ascii_case(b"off") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn json_shape(s: &[u8]) -> bool {
+        matches!((s.first(), s.last()), (Some(b'{'), Some(b'}')) | (Some(b'['), Some(b']'))) && s.len() >= 2
+    }
+
+    /// `/\A[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\z/`.
+    fn dotted_key(s: &[u8]) -> bool {
+        s.split(|&b| b == b'.').all(|segment| {
+            segment.first().is_some_and(u8::is_ascii_lowercase)
+                && segment[1..].iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        })
+    }
+
+    /// ConfigurationProvider value words over `trim($value)`.
+    pub fn value_words(s: &[u8], dst: &mut [i64]) {
+        let t = php_trim(s);
+        let mut int = 0i64;
+        let kind = if t.is_empty() {
+            VALUE_EMPTY
+        } else if let Some(v) = signed_int(t) {
+            int = v;
+            VALUE_INT
+        } else if let Some(v) = float_int_part(t) {
+            int = v;
+            VALUE_FLOAT
+        } else if let Some(b) = bool_literal(t) {
+            int = i64::from(b);
+            if b { VALUE_TRUE } else { VALUE_FALSE }
+        } else if json_shape(t) {
+            VALUE_JSON
+        } else {
+            VALUE_STRING
+        };
+        let domain = DOMAINS.iter().position(|d| t.eq_ignore_ascii_case(d)).map_or(0, |i| i as i64 + 1);
+        dst[0] = kind
+            | (VALUE_TRIMMED * i64::from(t.len() != s.len()))
+            | (VALUE_KEY * i64::from(dotted_key(t)))
+            | (VALUE_NON_ASCII * i64::from(!t.is_ascii()))
+            | (domain << VALUE_DOMAIN_SHIFT)
+            | ((t.len() as i64) << VALUE_LENGTH_SHIFT);
+        dst[1] = int;
+    }
+
+    const CRC_TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                k += 1;
+            }
+            table[i] = c;
+            i += 1;
+        }
+        table
+    };
+
+    fn crc32_table(data: &[u8]) -> u32 {
+        !data.iter().fold(!0u32, |c, &b| CRC_TABLE[((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8))
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "crc")]
+    unsafe fn crc32_hw(data: &[u8]) -> u32 {
+        use std::arch::aarch64::{__crc32b, __crc32d};
+        let mut crc = 0xFFFF_FFFFu32;
+        let (chunks, tail) = data.as_chunks::<8>();
+        for chunk in chunks {
+            crc = __crc32d(crc, u64::from_le_bytes(*chunk));
+        }
+        for &b in tail {
+            crc = __crc32b(crc, b);
+        }
+        !crc
+    }
+
+    /// PHP `crc32()`: the ARMv8 CRC32 instructions when present, else the table.
+    pub fn crc32(data: &[u8]) -> u32 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("crc") {
+                return unsafe { crc32_hw(data) };
+            }
+        }
+        crc32_table(data)
+    }
+
+    /// DomainConfigurationRepository diff words for a stored/submitted setting pair.
+    pub fn diff_words(a: &[u8], b: &[u8], dst: &mut [i64]) {
+        let (ta, tb) = (php_trim(a), php_trim(b));
+        let numeric = match (signed_int(ta), signed_int(tb)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        };
+        dst[0] = (DIFF_CHANGED * i64::from(a != b))
+            | (DIFF_TRIM_EQUAL * i64::from(ta == tb))
+            | (DIFF_CASE_EQUAL * i64::from(a.eq_ignore_ascii_case(b)))
+            | (DIFF_NUMERIC_EQUAL * i64::from(numeric))
+            | (DIFF_CLEARED * i64::from(!a.is_empty() && b.is_empty()))
+            | (DIFF_ADDED * i64::from(a.is_empty() && !b.is_empty()))
+            | (DIFF_JSON * i64::from(json_shape(tb)))
+            | (DIFF_MULTILINE * i64::from(b.contains(&b'\n')))
+            | ((b.len() as i64) << DIFF_LENGTH_SHIFT);
+        dst[1] = i64::from(crc32(b));
+    }
+
+    fn flag_value(v: &[u8]) -> Option<bool> {
+        if v == b"1" || v.eq_ignore_ascii_case(b"true") || v.eq_ignore_ascii_case(b"on") || v.eq_ignore_ascii_case(b"yes") {
+            Some(true)
+        } else if v == b"0" || v.eq_ignore_ascii_case(b"false") || v.eq_ignore_ascii_case(b"off") || v.eq_ignore_ascii_case(b"no") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn state_index(v: &[u8]) -> i64 {
+        STATES.iter().position(|s| v.eq_ignore_ascii_case(s)).map_or(0, |i| i as i64 + 1)
+    }
+
+    /// ProcessingRuntimeStateRepository words over `;`-separated `key=value` segments (both
+    /// trimmed, the last duplicate key winning).
+    pub fn state_words(s: &[u8], dst: &mut [i64]) {
+        let (mut running, mut stop, mut invalid, mut unknown) = (false, false, false, false);
+        let (mut state, mut next, mut pending, mut active) = (0i64, 0i64, -1i64, -1i64);
+        for segment in s.split(|&b| b == b';') {
+            if php_trim(segment).is_empty() {
+                continue;
+            }
+            let Some(eq) = segment.iter().position(|&b| b == b'=') else {
+                unknown = true;
+                continue;
+            };
+            let (key, value) = (php_trim(&segment[..eq]), php_trim(&segment[eq + 1..]));
+            match key {
+                b"tmux_running" | b"stop_requested" => match flag_value(value) {
+                    Some(v) if key == b"tmux_running" => running = v,
+                    Some(v) => stop = v,
+                    None => invalid = true,
+                },
+                b"state" | b"next" => {
+                    let index = state_index(value);
+                    invalid |= index == 0;
+                    if key == b"state" {
+                        state = index;
+                    } else {
+                        next = index;
+                    }
+                }
+                b"pending" | b"active" => {
+                    let v = digits(value, 18);
+                    invalid |= v.is_none();
+                    if key == b"pending" {
+                        pending = v.unwrap_or(-1);
+                    } else {
+                        active = v.unwrap_or(-1);
+                    }
+                }
+                _ => unknown = true,
+            }
+        }
+        let transition = if next == 0 {
+            0
+        } else if state == next {
+            3
+        } else if state != 0 && TRANSITIONS[(state - 1) as usize] & (1 << (next - 1)) != 0 {
+            1
+        } else {
+            2
+        };
+        let conflict = state != 0 && if running { state == 4 || state == 5 } else { state == 1 || state == 3 };
+        dst[0] = i64::from(running)
+            | (i64::from(stop) << 1)
+            | (i64::from(invalid) << 2)
+            | (i64::from(unknown) << 3)
+            | (state << 4)
+            | (next << 8)
+            | (transition << 12)
+            | (i64::from(conflict) << 14);
+        dst[1] = pending;
+        dst[2] = active;
+    }
+
+    /// HorizonCollector words for a `name\tlength\twait\tprocesses\tfailed` workload row.
+    pub fn workload_words(s: &[u8], worker_is_rust: bool, dst: &mut [i64]) {
+        let mut fields: [&[u8]; 5] = [&[]; 5];
+        let mut n = 0;
+        for field in s.split(|&b| b == b'\t') {
+            if n < 5 {
+                fields[n] = field;
+            }
+            n += 1;
+        }
+        let name = fields[0];
+        let mut nums = [-1i64; 4];
+        if n == 5 {
+            for (slot, field) in nums.iter_mut().zip(&fields[1..]) {
+                *slot = digits(field, 18).unwrap_or(-1);
+            }
+        }
+        let [length, wait, processes, failed] = nums;
+        let status = if nums.contains(&-1) {
+            WORKLOAD_INVALID
+        } else if length == 0 {
+            WORKLOAD_IDLE
+        } else if processes == 0 {
+            WORKLOAD_STALLED
+        } else if wait >= WORKLOAD_BACKLOG_SECONDS {
+            WORKLOAD_BACKLOGGED
+        } else {
+            WORKLOAD_HEALTHY
+        };
+        let name_valid = !name.is_empty() && name.iter().all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b':' | b'-'));
+        dst[0] = status
+            | (WORKLOAD_SKIP * i64::from(worker_is_rust && name == b"release-fingerprint"))
+            | (WORKLOAD_FAILING * i64::from(failed > 0))
+            | (WORKLOAD_NAME_VALID * i64::from(name_valid))
+            | ((name.len() as i64) << WORKLOAD_NAME_SHIFT);
+        dst[1..].copy_from_slice(&nums);
+    }
+
+    /// ReleaseVerificationCollector words for a `,`-separated window of millisecond samples
+    /// (each trimmed; blanks skipped; anything but 1-9 digits counted invalid).
+    pub fn latency_words(s: &[u8], samples: &mut Vec<i64>, dst: &mut [i64]) {
+        samples.clear();
+        let mut invalid = 0i64;
+        for raw in s.split(|&b| b == b',') {
+            let t = php_trim(raw);
+            if t.is_empty() {
+                continue;
+            }
+            match digits(t, 9) {
+                Some(v) => samples.push(v),
+                None => invalid += 1,
+            }
+        }
+        samples.sort_unstable();
+        let n = samples.len();
+        let (mut sum, mut buckets) = (0i64, [0u64; 8]);
+        for &v in samples.iter() {
+            sum += v;
+            buckets[LATENCY_BUCKETS.iter().position(|&t| v <= t).unwrap_or(7)] += 1;
+        }
+        let packed = buckets.iter().enumerate().fold(0u64, |acc, (i, &c)| acc | (c.min(255) << (8 * i))) as i64;
+        let pct = |p: usize| if n == 0 { -1 } else { samples[(p * n).div_ceil(100) - 1] };
+        let (p50, p95, p99) = (pct(50), pct(95), pct(99));
+        let health = if n == 0 {
+            0
+        } else if p99 >= LATENCY_CRITICAL_P99 {
+            3
+        } else if p95 >= LATENCY_DEGRADED_P95 || invalid > 0 {
+            2
+        } else {
+            1
+        };
+        dst.copy_from_slice(&[
+            health | (LATENCY_INVALID * i64::from(invalid > 0)) | (invalid.min(255) << 8),
+            n as i64,
+            sum,
+            p50,
+            p95,
+            p99,
+            if n == 0 { -1 } else { samples[n - 1] },
+            packed,
+        ]);
+    }
+
+    /// Writes [`VALUE_WORDS`] words per NUL-joined configuration value.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w571_config_value_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, VALUE_WORDS, out, out_cap, value_words) }
+    }
+
+    /// Writes [`DIFF_WORDS`] words per stored/submitted pair; `rows` holds the `pairs` stored
+    /// values, then the `pairs` submitted values, all NUL-joined.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w571_domain_setting_diff_batch(
+        rows: *const u8,
+        rows_len: usize,
+        pairs: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run_pairs(rows, rows_len, pairs, DIFF_WORDS, out, out_cap, diff_words) }
+    }
+
+    /// Writes [`STATE_WORDS`] words per NUL-joined runtime state record.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w571_runtime_state_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, STATE_WORDS, out, out_cap, state_words) }
+    }
+
+    /// Writes [`WORKLOAD_WORDS`] words per NUL-joined Horizon workload row.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes, `worker` for `worker_len` bytes and `out`
+    /// writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w571_horizon_workload_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        worker: *const u8,
+        worker_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        if worker_len > MAX_INPUT || (worker_len != 0 && worker.is_null()) {
+            return -1;
+        }
+        let worker: &[u8] = if worker_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(worker, worker_len) } };
+        let is_rust = worker == b"rust";
+        unsafe { run(rows, rows_len, count, WORKLOAD_WORDS, out, out_cap, |s, d| workload_words(s, is_rust, d)) }
+    }
+
+    /// Writes [`LATENCY_WORDS`] words per NUL-joined latency window.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w571_verification_latency_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let mut samples = Vec::with_capacity(512);
+        unsafe { run(rows, rows_len, count, LATENCY_WORDS, out, out_cap, |s, d| latency_words(s, &mut samples, d)) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn value(s: &[u8]) -> [i64; 2] {
+            let mut d = [0i64; 2];
+            value_words(s, &mut d);
+            d
+        }
+
+        #[test]
+        fn w571_value_words_classify_and_coerce() {
+            let len = |n: i64| n << VALUE_LENGTH_SHIFT;
+            assert_eq!(value(b""), [0, 0]);
+            assert_eq!(value(b" 42 "), [VALUE_INT | VALUE_TRIMMED | len(2), 42]);
+            assert_eq!(value(b"-007"), [VALUE_INT | len(4), -7]);
+            assert_eq!(value(b"1234567890123456789"), [VALUE_STRING | len(19), 0]);
+            assert_eq!(value(b"-12.75"), [VALUE_FLOAT | len(6), -12]);
+            assert_eq!(value(b".5"), [VALUE_FLOAT | len(2), 0]);
+            assert_eq!(value(b"3."), [VALUE_FLOAT | len(2), 3]);
+            assert_eq!(value(b"."), [VALUE_STRING | len(1), 0]);
+            assert_eq!(value(b"YES"), [VALUE_TRUE | len(3), 1]);
+            assert_eq!(value(b"off"), [VALUE_FALSE | VALUE_KEY | len(3), 0]);
+            assert_eq!(value(b"{}"), [VALUE_JSON | len(2), 0]);
+            assert_eq!(value(b"{"), [VALUE_STRING | len(1), 0]);
+            assert_eq!(value(b"Post-Processing"), [VALUE_STRING | 4 << VALUE_DOMAIN_SHIFT | len(15), 0]);
+            assert_eq!(value(b"tmux"), [VALUE_STRING | VALUE_KEY | 6 << VALUE_DOMAIN_SHIFT | len(4), 0]);
+            assert_eq!(value(b"site.title_2"), [VALUE_STRING | VALUE_KEY | len(12), 0]);
+            assert_eq!(value(b"a..b"), [VALUE_STRING | len(4), 0]);
+            assert_eq!(value("caf\u{e9}".as_bytes()), [VALUE_STRING | VALUE_NON_ASCII | len(5), 0]);
+        }
+
+        #[test]
+        fn w571_diff_words_compare_and_fingerprint() {
+            let mut d = [0i64; 2];
+            diff_words(b"Yes", b" yes", &mut d);
+            assert_eq!(d[0], DIFF_CHANGED | 4 << DIFF_LENGTH_SHIFT);
+            diff_words(b"007", b"7 ", &mut d);
+            assert_eq!(d[0], DIFF_CHANGED | DIFF_NUMERIC_EQUAL | 2 << DIFF_LENGTH_SHIFT);
+            diff_words(b"x", b"", &mut d);
+            assert_eq!(d, [DIFF_CHANGED | DIFF_CLEARED, 0]);
+            diff_words(b"", b"[1]\n", &mut d);
+            assert_eq!(d[0], DIFF_CHANGED | DIFF_ADDED | DIFF_JSON | DIFF_MULTILINE | 4 << DIFF_LENGTH_SHIFT);
+            diff_words(b"abc", b"ABC", &mut d);
+            assert_eq!(d[0], DIFF_CHANGED | DIFF_CASE_EQUAL | 3 << DIFF_LENGTH_SHIFT);
+            assert_eq!(crc32(b"The quick brown fox jumps over the lazy dog"), 0x414F_A339);
+            let long: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+            assert_eq!(crc32(&long), crc32_table(&long));
+        }
+
+        #[test]
+        fn w571_state_words_parse_and_validate_transitions() {
+            let mut d = [0i64; 3];
+            state_words(b"tmux_running=1;stop_requested=0;state=running;next=paused;pending=12;active=3", &mut d);
+            assert_eq!(d, [1 | 1 << 4 | 2 << 8 | 1 << 12, 12, 3]);
+            state_words(b" state = DRAINED ; next=draining;tmux_running=yes", &mut d);
+            assert_eq!(d, [1 | 4 << 4 | 3 << 8 | 2 << 12 | 1 << 14, -1, -1]);
+            state_words(b"state=bogus;next=running;pending=x;foo", &mut d);
+            assert_eq!(d, [4 | 8 | 1 << 8 | 2 << 12, -1, -1]);
+            state_words(b"state=stopped;next=stopped;stop_requested=on", &mut d);
+            assert_eq!(d, [2 | 5 << 4 | 5 << 8 | 3 << 12, -1, -1]);
+            state_words(b"", &mut d);
+            assert_eq!(d, [0, -1, -1]);
+        }
+
+        #[test]
+        fn w571_workload_words_classify_rows() {
+            let mut d = [0i64; 5];
+            workload_words(b"default\t12\t3\t4\t0", true, &mut d);
+            assert_eq!(d, [WORKLOAD_HEALTHY | WORKLOAD_NAME_VALID | 7 << WORKLOAD_NAME_SHIFT, 12, 3, 4, 0]);
+            workload_words(b"release-fingerprint\t5\t90\t1\t2", true, &mut d);
+            assert_eq!(d[0], WORKLOAD_BACKLOGGED | WORKLOAD_SKIP | WORKLOAD_FAILING | WORKLOAD_NAME_VALID | 19 << WORKLOAD_NAME_SHIFT);
+            workload_words(b"release-fingerprint\t0\t0\t0\t0", false, &mut d);
+            assert_eq!(d[0], WORKLOAD_IDLE | WORKLOAD_NAME_VALID | 19 << WORKLOAD_NAME_SHIFT);
+            workload_words(b"q a\t5\t0\t0\t0", true, &mut d);
+            assert_eq!(d, [WORKLOAD_STALLED | 3 << WORKLOAD_NAME_SHIFT, 5, 0, 0, 0]);
+            workload_words(b"q\t5\t-1\t0", true, &mut d);
+            assert_eq!(d, [WORKLOAD_INVALID | WORKLOAD_NAME_VALID | 1 << WORKLOAD_NAME_SHIFT, -1, -1, -1, -1]);
+        }
+
+        #[test]
+        fn w571_latency_words_rank_and_bucket() {
+            let mut d = [0i64; 8];
+            let mut buf = Vec::new();
+            latency_words(b"", &mut buf, &mut d);
+            assert_eq!(d, [0, 0, 0, -1, -1, -1, -1, 0]);
+            latency_words(b"300, 50 ,,x,20000", &mut buf, &mut d);
+            assert_eq!(d, [3 | LATENCY_INVALID | 1 << 8, 3, 20350, 300, 20000, 20000, 20000, 1 | 1 << 16 | 1 << 56]);
+            latency_words(b"10,20,30,40", &mut buf, &mut d);
+            assert_eq!(d, [1, 4, 100, 20, 40, 40, 40, 4]);
+        }
+
+        #[test]
+        fn w571_exports_guard_counts_and_capacity() {
+            type Export = unsafe extern "C" fn(*const u8, usize, usize, *mut i64, usize) -> isize;
+            let rows = b"a=1\0b";
+            let exports: [(Export, usize); 3] = [
+                (nntmux_w571_config_value_batch, VALUE_WORDS),
+                (nntmux_w571_runtime_state_batch, STATE_WORDS),
+                (nntmux_w571_verification_latency_batch, LATENCY_WORDS),
+            ];
+            for (export, per_row) in exports {
+                let mut out = vec![0i64; 8 * per_row];
+                unsafe {
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, out.as_mut_ptr(), out.len()), 2);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, out.as_mut_ptr(), 2 * per_row - 1), SHORT_CAPACITY);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 3, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(export(std::ptr::null(), 0, 0, out.as_mut_ptr(), out.len()), 0);
+                    assert_eq!(export(std::ptr::null(), 0, 1, out.as_mut_ptr(), out.len()), 1);
+                    assert_eq!(export(std::ptr::null(), 2, 1, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, std::ptr::null_mut(), 8), -1);
+                }
+            }
+            let mut out = [0i64; 8];
+            let pairs = b"a\0b\0A\0c";
+            unsafe {
+                assert_eq!(nntmux_w571_domain_setting_diff_batch(pairs.as_ptr(), pairs.len(), 2, out.as_mut_ptr(), 8), 2);
+                assert_eq!(out[0], DIFF_CHANGED | DIFF_CASE_EQUAL | 1 << DIFF_LENGTH_SHIFT);
+                assert_eq!(nntmux_w571_domain_setting_diff_batch(pairs.as_ptr(), pairs.len(), 1, out.as_mut_ptr(), 8), -1);
+                assert_eq!(nntmux_w571_domain_setting_diff_batch(pairs.as_ptr(), 3, 2, out.as_mut_ptr(), 8), -1);
+                assert_eq!(nntmux_w571_domain_setting_diff_batch(pairs.as_ptr(), pairs.len(), 2, out.as_mut_ptr(), 3), SHORT_CAPACITY);
+                let horizon = b"default\t1\t2\t3\t0";
+                let worker = b"rust";
+                assert_eq!(nntmux_w571_horizon_workload_batch(horizon.as_ptr(), horizon.len(), 1, worker.as_ptr(), 4, out.as_mut_ptr(), 8), 1);
+                assert_eq!(out[..5], [WORKLOAD_HEALTHY | WORKLOAD_NAME_VALID | 7 << WORKLOAD_NAME_SHIFT, 1, 2, 3, 0]);
+                assert_eq!(nntmux_w571_horizon_workload_batch(horizon.as_ptr(), horizon.len(), 1, std::ptr::null(), 4, out.as_mut_ptr(), 8), -1);
+            }
+        }
+    }
+}

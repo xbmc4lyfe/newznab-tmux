@@ -15,9 +15,11 @@ use App\Models\TmuxColorExclusion;
 use App\Models\TmuxConfiguration;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use InvalidArgumentException;
 use RuntimeException;
 use Throwable;
 
@@ -289,5 +291,168 @@ final readonly class DomainConfigurationRepository
         }
 
         return $ffi === false ? null : $ffi;
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W57 parity test measures 2.991x common mean, 1.735x
+     * common p99, 2.656x uncommon mean and 2.428x uncommon p99 (per-metric minimum of four runs),
+     * above the 1.5x rule.
+     */
+    private const bool W57_RUST_FFI_DEFAULT = true;
+
+    private const string W57_FFI_CDEF = 'ssize_t nntmux_w571_domain_setting_diff_batch(const char *rows, size_t rows_len, size_t pairs, int64_t *out, size_t out_cap);';
+
+    public const int W57_DIFF_WORDS = 2;
+
+    public const int W57_DIFF_CHANGED = 1;
+
+    public const int W57_DIFF_TRIM_EQUAL = 2;
+
+    public const int W57_DIFF_CASE_EQUAL = 4;
+
+    public const int W57_DIFF_NUMERIC_EQUAL = 8;
+
+    public const int W57_DIFF_CLEARED = 16;
+
+    public const int W57_DIFF_ADDED = 32;
+
+    public const int W57_DIFF_JSON = 64;
+
+    public const int W57_DIFF_MULTILINE = 128;
+
+    public const int W57_DIFF_LENGTH_SHIFT = 8;
+
+    public static function usesW57RustFfi(): bool
+    {
+        $enabled = self::w57RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W57_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 57 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW57RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w57RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w57RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Two words per positional stored/submitted setting pair: W57_DIFF_CHANGED, TRIM_EQUAL,
+     * CASE_EQUAL (ASCII case-insensitive), NUMERIC_EQUAL (both trimmed values 18-digit integers
+     * of equal value), CLEARED, ADDED, JSON (trimmed submitted `{...}`/`[...]`) and MULTILINE
+     * flags plus the submitted length `<< W57_DIFF_LENGTH_SHIFT`; then `crc32()` of the
+     * submitted value as its fingerprint.
+     *
+     * @param  array<array-key, string>  $stored
+     * @param  array<array-key, string>  $submitted
+     * @return list<int>
+     *
+     * @throws InvalidArgumentException when the two lists differ in length
+     */
+    public static function settingDiffBatch(array $stored, array $submitted): array
+    {
+        return self::usesW57RustFfi() ? self::settingDiffBatchNative($stored, $submitted) : self::settingDiffBatchPhp($stored, $submitted);
+    }
+
+    /**
+     * @param  array<array-key, string>  $stored
+     * @param  array<array-key, string>  $submitted
+     * @return list<int>
+     */
+    public static function settingDiffBatchPhp(array $stored, array $submitted): array
+    {
+        if (\count($stored) !== \count($submitted)) {
+            throw new InvalidArgumentException('Stored and submitted settings must pair up.');
+        }
+        $submitted = array_values($submitted);
+        $words = [];
+        foreach (array_values($stored) as $i => $before) {
+            $after = $submitted[$i];
+            $trimmedBefore = trim($before);
+            $trimmedAfter = trim($after);
+            $words[] = ($before !== $after ? self::W57_DIFF_CHANGED : 0)
+                | ($trimmedBefore === $trimmedAfter ? self::W57_DIFF_TRIM_EQUAL : 0)
+                | (strtolower($before) === strtolower($after) ? self::W57_DIFF_CASE_EQUAL : 0)
+                | (preg_match('/\A[+-]?[0-9]{1,18}\z/', $trimmedBefore) === 1 && preg_match('/\A[+-]?[0-9]{1,18}\z/', $trimmedAfter) === 1 && (int) $trimmedBefore === (int) $trimmedAfter ? self::W57_DIFF_NUMERIC_EQUAL : 0)
+                | ($before !== '' && $after === '' ? self::W57_DIFF_CLEARED : 0)
+                | ($before === '' && $after !== '' ? self::W57_DIFF_ADDED : 0)
+                | ($trimmedAfter !== '' && (($trimmedAfter[0] === '{' && $trimmedAfter[-1] === '}') || ($trimmedAfter[0] === '[' && $trimmedAfter[-1] === ']')) ? self::W57_DIFF_JSON : 0)
+                | (str_contains($after, "\n") ? self::W57_DIFF_MULTILINE : 0)
+                | \strlen($after) << self::W57_DIFF_LENGTH_SHIFT;
+            $words[] = crc32($after);
+        }
+
+        return $words;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * Rust declines the batch (a value holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $stored
+     * @param  array<array-key, string>  $submitted
+     * @return list<int>
+     */
+    public static function settingDiffBatchNative(array $stored, array $submitted): array
+    {
+        $count = \count($stored);
+        $words = $count * self::W57_DIFF_WORDS;
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 || $count !== \count($submitted) ? null : self::w57RustFfiState('out', $words);
+        if ($buffer === null) {
+            return self::settingDiffBatchPhp($stored, $submitted);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $stored)."\0".implode("\0", $submitted);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w571_domain_setting_diff_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', FFI::string($out, $words * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::settingDiffBatchPhp($stored, $submitted);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 57 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w57RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('domain_configuration_repository_w57', self::W57_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }
