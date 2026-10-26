@@ -426,4 +426,229 @@ final class MetricFamily
             return null;
         }
     }
+
+    /**
+     * Enabled: the paired benchmark in the W60 parity test measures 5.091x common mean, 4.889x
+     * common p99, 4.185x uncommon mean and 3.895x uncommon p99 (per-metric minimum of four runs),
+     * above the 1.5x rule.
+     */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    private const string W60_METRIC_FAMILY_FFI_CDEF = 'ssize_t nntmux_w601_metric_family_summary_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public const int W60_FAMILY_WORDS = 6;
+
+    public const int W60_FAMILY_TAIL = 9;
+
+    public const int W60_TYPE_EXACT = 8;
+
+    public const int W60_TYPE_SUPPORTED = 16;
+
+    public const int W60_NAME_VALID = 32;
+
+    public const int W60_NAME_RESERVED = 64;
+
+    public const int W60_NAME_TOTAL = 128;
+
+    public const int W60_COUNTER_NO_TOTAL = 256;
+
+    public const int W60_GAUGE_TOTAL = 512;
+
+    public const int W60_HELP_EMPTY = 1024;
+
+    public const int W60_HELP_ESCAPED = 2048;
+
+    public const int W60_LABEL_INVALID = 4096;
+
+    public const int W60_LABEL_DUPLICATE = 8192;
+
+    public const int W60_LABEL_RESERVED = 16384;
+
+    public const int W60_SERIES_CLAMPED = 32768;
+
+    public const int W60_CARDINALITY_EXCEEDED = 65536;
+
+    public const int W60_DEFINITION_VALID = 131072;
+
+    public const int W60_MALFORMED = 262144;
+
+    private const array W60_TYPES = ['gauge' => 1, 'counter' => 2, 'histogram' => 3, 'summary' => 4, 'untyped' => 5];
+
+    public static function usesW60RustFfi(): bool
+    {
+        $enabled = self::w60RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 60 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function familySummaryBatch(array $rows): array
+    {
+        return self::usesW60RustFfi() ? self::familySummaryBatchNative($rows) : self::familySummaryBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or Rust declines the batch (a
+     * row holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function familySummaryBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count * self::W60_FAMILY_WORDS + self::W60_FAMILY_TAIL;
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w60RustFfiState('out', $words);
+        if ($buffer === null) {
+            return self::familySummaryBatchPhp($rows);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $rows);
+        try {
+            // @phpstan-ignore method.notFound (Declared by W60_METRIC_FAMILY_FFI_CDEF.)
+            $written = $ffi->nntmux_w601_metric_family_summary_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $result = $written === $count ? unpack('q*', FFI::string($out, $words * 8)) : false;
+        if (! \is_array($result)) {
+            return self::familySummaryBatchPhp($rows);
+        }
+
+        /** @var list<int> */
+        return array_values($result);
+    }
+
+    /**
+     * Six words per `name\ttype\thelp\tlabels\tseries\tmax_series` row (labels comma-separated):
+     * the type code (0 unknown, 1 gauge, 2 counter, 3 histogram, 4 summary, 5 untyped; trimmed,
+     * case-insensitive) with the exact-type, supported (exactly gauge or counter), name valid
+     * ({@see validateDefinitionPhp()}'s pattern), reserved `__` name, `_total` suffix, counter
+     * without / gauge with `_total`, empty help, escaped help, invalid, duplicate or reserved
+     * label, series clamped (0-1000000000), cardinality exceeded (max > 0 and series > max) and
+     * definition-valid flags; then the label count, first invalid label index (-1), escaped help
+     * length, clamped series and headroom (max - series, -1 without a max). A malformed row
+     * yields `[W60_MALFORMED, 0, 0, 0, 0, 0]`. The W60_FAMILY_TAIL words count rows, valid
+     * definitions, labels, series, exceeded rows, the largest series, gauges, counters and
+     * malformed rows.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function familySummaryBatchPhp(array $rows): array
+    {
+        $words = [];
+        $tail = array_fill(0, self::W60_FAMILY_TAIL, 0);
+        foreach ($rows as $row) {
+            $tail[0]++;
+            $f = explode("\t", $row);
+            $ints = [];
+            if (\count($f) === 6) {
+                for ($i = 4; $i <= 5 && preg_match('/\A-?[0-9]{1,18}\z/', $f[$i]) === 1; $i++) {
+                    $ints[] = (int) $f[$i];
+                }
+            }
+            if (\count($ints) !== 2) {
+                array_push($words, self::W60_MALFORMED, 0, 0, 0, 0, 0);
+                $tail[8]++;
+
+                continue;
+            }
+            [$name, $type, $help, $labelList] = $f;
+            [$series, $max] = $ints;
+            $code = self::W60_TYPES[strtolower(trim($type))] ?? 0;
+            $nameValid = preg_match('/^[a-zA-Z_:][a-zA-Z0-9_:]*$/', $name) === 1;
+            $supported = $type === self::GAUGE || $type === self::COUNTER;
+            $total = str_ends_with($name, '_total');
+            $escaped = \strlen(str_replace(['\\', "\n"], ['\\\\', '\\n'], $help));
+            $flags = $code
+                | (isset(self::W60_TYPES[$type]) ? self::W60_TYPE_EXACT : 0)
+                | ($supported ? self::W60_TYPE_SUPPORTED : 0)
+                | ($nameValid ? self::W60_NAME_VALID : 0)
+                | (str_starts_with($name, '__') ? self::W60_NAME_RESERVED : 0)
+                | ($total ? self::W60_NAME_TOTAL : 0)
+                | ($code === 2 && ! $total ? self::W60_COUNTER_NO_TOTAL : 0)
+                | ($code === 1 && $total ? self::W60_GAUGE_TOTAL : 0)
+                | (trim($help) === '' ? self::W60_HELP_EMPTY : 0)
+                | ($escaped !== \strlen($help) ? self::W60_HELP_ESCAPED : 0);
+            $labels = $labelList === '' ? [] : explode(',', $labelList);
+            $bad = -1;
+            $reserved = false;
+            foreach ($labels as $index => $label) {
+                if ($bad < 0 && preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $label) !== 1) {
+                    $bad = $index;
+                }
+                $reserved = $reserved || str_starts_with($label, '__');
+            }
+            $count = \count($labels);
+            $flags |= ($bad >= 0 ? self::W60_LABEL_INVALID : 0)
+                | (\count(array_unique($labels)) !== $count ? self::W60_LABEL_DUPLICATE : 0)
+                | ($reserved ? self::W60_LABEL_RESERVED : 0);
+            $clamped = max(0, min(1_000_000_000, $series));
+            $exceeded = $max > 0 && $clamped > $max;
+            $valid = $nameValid && $supported && $bad < 0;
+            $flags |= ($clamped !== $series ? self::W60_SERIES_CLAMPED : 0)
+                | ($exceeded ? self::W60_CARDINALITY_EXCEEDED : 0)
+                | ($valid ? self::W60_DEFINITION_VALID : 0);
+            array_push($words, $flags, $count, $bad, $escaped, $clamped, $max > 0 ? $max - $clamped : -1);
+            $tail[1] += $valid ? 1 : 0;
+            $tail[2] += $count;
+            $tail[3] += $clamped;
+            $tail[4] += $exceeded ? 1 : 0;
+            $tail[5] = max($tail[5], $clamped);
+            $tail[6] += $code === 1 ? 1 : 0;
+            $tail[7] += $code === 2 ? 1 : 0;
+        }
+
+        return [...$words, ...$tail];
+    }
+
+    /**
+     * Wave 60 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics so the
+     * class gains no Wave 60 static properties.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('metric_family_w60', self::W60_METRIC_FAMILY_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
+    }
 }
