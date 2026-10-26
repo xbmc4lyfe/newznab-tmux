@@ -7,6 +7,7 @@ namespace App\Services\Tmux;
 use App\Enums\TmuxPaneRole;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Contracts\Process\InvokedProcess;
 use Illuminate\Contracts\Process\ProcessResult;
 use Illuminate\Support\Facades\Process;
@@ -1119,5 +1120,250 @@ class TmuxPaneManager
         }
 
         return $this->recordResult(Process::timeout(5)->run(TmuxCommand::arguments(['wait-for', '-S', $channel])));
+    }
+
+    // ========================================================================
+    // WAVE 58.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean 3.13x, p99 2.61x; uncommon mean 2.90x, p99 2.74x); see RustTmuxLayoutMonitorOutputPaneSessionManagerW58ParityTest. */
+    public const bool W58_RUST_FFI_DEFAULT = true;
+
+    public const string W58_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w58_pane_health_row_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** int64 words per paneHealthRowBatch() record. */
+    public const int W58_ROW_WORDS = 10;
+
+    /** int64 summary words after the paneHealthRowBatch() records (none for an empty batch). */
+    public const int W58_TRAILER_WORDS = 7;
+
+    /**
+     * Pane health rows for listPanes() lines ("pane_id, role, pane_dead, pane_dead_status,
+     * pane_pid, pane_pipe, window_id, pane_dead_signal, server pid" separated by tabs). Each
+     * item is [line, now timestamp, last reap request timestamp]. Numeric fields read -1 when
+     * empty, their value for 1-18 ASCII digits and -2 otherwise. A line whose pane ID is not
+     * "%" and digits yields [-1 x 9, 0]; otherwise [pane number, TmuxPaneRole case index (-1
+     * unknown, -2 empty), role span, window span (offset << 32 | length, -1 when absent), state
+     * (0 alive, 1 exited 0, 2 failed, 3 dead without an exit status or signal), exit status,
+     * exit signal, pid, server pid, flags (1 dead, 2 piped, 4 unreaped, 8 reap due after
+     * REAP_RETRY_SECONDS, 16 respawn eligible, 32 idle untagged pane, 64 extra fields, 128
+     * "@" window ID)], followed by the trailer [valid, alive, dead, unreaped, reap due, repeated
+     * roles, last server pid].
+     *
+     * @param  list<array{0: string, 1: int, 2: int}>  $items
+     * @return list<int>
+     */
+    public static function paneHealthRowBatch(array $items): array
+    {
+        return self::usesW58RustFfi() ? self::paneHealthRowBatchNative($items) : self::paneHealthRowBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: int, 2: int}>  $items
+     * @return list<int>
+     */
+    public static function paneHealthRowBatchPhp(array $items): array
+    {
+        self::w58Items($items);
+        /** @var array<string, int>|null $roles */
+        static $roles = null;
+        $roles ??= array_flip(array_map(static fn (TmuxPaneRole $role): string => $role->value, TmuxPaneRole::cases()));
+        $out = [];
+        $summary = [0, 0, 0, 0, 0, 0, 0];
+        $seen = [];
+        foreach ($items as [$line, $now, $lastReap]) {
+            $fields = explode("\t", $line);
+            $present = \count($fields);
+            [$id, $role, $dead, $status, $pid, $pipe, $window, $signal, $server] = array_pad($fields, 9, '');
+            if (! self::w58Prefixed($id, '%')) {
+                array_push($out, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0);
+
+                continue;
+            }
+            $isDead = $dead === '1';
+            $exit = self::w58Int($status);
+            $signalNumber = self::w58Int($signal);
+            $unreaped = $isDead && $exit === -1 && $signalNumber === -1;
+            $gap = $now - $lastReap;
+            $reapDue = $unreaped && (\is_int($gap) ? $gap >= self::REAP_RETRY_SECONDS : $now > $lastReap);
+            $serverPid = self::w58Int($server);
+            $roleOffset = \strlen($id) + 1;
+            $windowOffset = $roleOffset + \strlen($role) + \strlen($dead) + \strlen($status) + \strlen($pid) + \strlen($pipe) + 5;
+            array_push(
+                $out,
+                self::w58Int(substr($id, 1)),
+                $role === '' ? -2 : ($roles[$role] ?? -1),
+                $present > 1 ? ($roleOffset << 32) | \strlen($role) : -1,
+                $present > 6 ? ($windowOffset << 32) | \strlen($window) : -1,
+                ! $isDead ? 0 : ($unreaped ? 3 : ($exit === 0 && $signalNumber < 0 ? 1 : 2)),
+                $exit,
+                $signalNumber,
+                self::w58Int($pid),
+                $serverPid,
+                ($isDead ? 1 : 0) | ($pipe === '1' ? 2 : 0) | ($unreaped ? 4 : 0) | ($reapDue ? 8 : 0) | ($isDead && ! $unreaped ? 16 : 0)
+                    | (! $isDead && $role === '' ? 32 : 0) | ($present > 9 ? 64 : 0) | (self::w58Prefixed($window, '@') ? 128 : 0),
+            );
+            $summary[0]++;
+            $summary[$isDead ? 2 : 1]++;
+            $summary[3] += $unreaped ? 1 : 0;
+            $summary[4] += $reapDue ? 1 : 0;
+            if ($role !== '') {
+                if (isset($seen[$role])) {
+                    $summary[5]++;
+                } else {
+                    $seen[$role] = true;
+                }
+            }
+            $summary[6] = $serverPid;
+        }
+
+        return $items === [] ? [] : [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: int, 2: int}>  $items
+     * @return list<int>
+     */
+    public static function paneHealthRowBatchNative(array $items): array
+    {
+        self::w58Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        $blob = '';
+        $lens = [];
+        $now = [];
+        $lastReap = [];
+        foreach ($items as $item) {
+            $blob .= $item[0];
+            $lens[] = \strlen($item[0]);
+            $now[] = $item[1];
+            $lastReap[] = $item[2];
+        }
+
+        return self::w58Call($blob, pack('P*', ...$lens, ...$now, ...$lastReap), $count, $count * self::W58_ROW_WORDS + self::W58_TRAILER_WORDS)
+            ?? self::paneHealthRowBatchPhp($items);
+    }
+
+    /** -1 for '', the value of 1-18 ASCII digits, else -2. */
+    private static function w58Int(string $value): int
+    {
+        if ($value === '') {
+            return -1;
+        }
+
+        return \strlen($value) <= 18 && ctype_digit($value) ? (int) $value : -2;
+    }
+
+    private static function w58Prefixed(string $value, string $prefix): bool
+    {
+        return \strlen($value) > 1 && $value[0] === $prefix && ctype_digit(substr($value, 1));
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        $enabled = self::w58RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W58 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('enabled');
+        self::w58RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('enabled', $previous);
+        }
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w58Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new \InvalidArgumentException('W58 pane health batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || ! array_is_list($item) || \count($item) !== 3 || ! \is_string($item[0]) || ! \is_int($item[1]) || ! \is_int($item[2])) {
+                throw new \InvalidArgumentException('W58 pane health batch items must be [string line, int now, int last reap] lists.');
+            }
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w58Call(string $blob, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w58RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w58', self::W58_FFI_CDEF) ?? false;
+            self::w58RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w58RustFfiState('out', $out);
+                self::w58RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W58_FFI_CDEF.)
+            $written = $ffi->nntmux_w58_pane_health_row_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w58RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W58 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static: no arguments returns the state, one argument reads a key ('reset'
+     * clears everything) and two arguments write a key.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }
