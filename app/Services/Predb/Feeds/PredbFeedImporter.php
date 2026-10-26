@@ -10,6 +10,7 @@ use App\Services\Predb\PredbIdentityWriter;
 use App\Support\PredbSearchDocument;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\Connection;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\UniqueConstraintViolationException;
@@ -489,7 +490,7 @@ class PredbFeedImporter
             $mask |= 1 << $bit;
         }
         [$existingCategory, $existingSize, $existingFiles, $existingReason, $category, $size, $files, $predate, $reason] = $strings;
-        $call = static fn (FFI\CData $scratch, int $capacity): mixed => $ffi->nntmux_predb_feed_importer_changes_for_json( // @phpstan-ignore method.notFound
+        $call = static fn (CData $scratch, int $capacity): mixed => $ffi->nntmux_predb_feed_importer_changes_for_json( // @phpstan-ignore method.notFound
             $existingCategory, $existingCategory === null ? 0 : strlen($existingCategory),
             $existingSize, $existingSize === null ? 0 : strlen($existingSize),
             $existingFiles, $existingFiles === null ? 0 : strlen($existingFiles),
@@ -786,5 +787,286 @@ class PredbFeedImporter
         self::$w462RustFfiHandle ??= RustPipelineLibrary::resolveDomain(self::W462_FFI_DOMAIN, self::W462_FFI_CDEF) ?? false;
 
         return self::$w462RustFfiHandle === false ? null : self::$w462RustFfiHandle;
+    }
+
+    // ========================================================================
+    // WAVE 61.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 5.77x, p99 5.44x; uncommon mean 5.08x, p99 4.07x); see RustPredbFeedEntryImporterSourceFactoryIrcNetworksParserW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    public const string W61_PREDB_FEED_IMPORTER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w613_predb_feed_importer_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 61.3 batch. */
+    public const int W61_PREDB_FEED_IMPORTER_TRAILER = 22;
+
+    /** Inserts per planned chunk. */
+    public const int W61_CHUNK = 100;
+
+    private const string W61_CONTROL_CHARS = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F";
+
+    public static function usesW61RustFfi(): bool
+    {
+        $override = self::w61RustFfiState();
+
+        return \is_bool($override) ? $override : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the PredbFeedImporter Wave 61 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 61.3 import plans. Each item is `title|existing|nuked|existingNuked|details|existingDetails`, every
+     * field trimmed: existing is a boolean token (w61Flag()), the nuke statuses 1-2 digits and the detail masks one
+     * digit (bit 1 category, 2 size, 4 files). Per item `decision | reason << 3 | existingState << 5 |
+     * nukeChange << 7 | fill << 8 | padded << 11 | malformed << 12 | min(titleLength, 255) << 13 | chunk << 21`:
+     * the reason is 0 valid, 1 empty, 2 over 255 bytes and 3 a control byte; the decision is 0 rejected, 1 a
+     * duplicate of an earlier valid title (ASCII case-insensitive), 2 insert (chunk = insert ordinal / W61_CHUNK),
+     * 3 a nuke update (an entry status other than PRE_NONUKE that differs from the stored one), 4 a detail fill
+     * (`details & ~existingDetails`) and 5 an unchanged skip; padded marks a title trim() changed and malformed any
+     * field that is not empty or well-formed. Then the decision, reason and existing-state counts, the nuke updates,
+     * the three fill bit counts, the padded and malformed counts, the accepted title bytes (decisions 2-4), the
+     * insert chunk count and the distinct valid titles.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61ImportPlanBatch(array $items): array
+    {
+        return self::usesW61RustFfi() ? self::w61ImportPlanBatchNative($items) : self::w61ImportPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61ImportPlanBatchNative(array $items): array
+    {
+        return self::w61Invoke($items, \count($items) + self::W61_PREDB_FEED_IMPORTER_TRAILER) ?? self::w61ImportPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61ImportPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $decisions = [0, 0, 0, 0, 0, 0];
+        $reasons = [0, 0, 0, 0];
+        $existingStates = [0, 0, 0];
+        $fills = [0, 0, 0];
+        $nukeChanges = $padded = $malformed = $acceptedBytes = $inserts = 0;
+        $seen = [];
+        foreach ($items as $item) {
+            [$rawTitle, $rawExisting, $rawNuked, $rawPrior, $rawDetails, $rawKnown] = explode('|', (string) $item, 6) + ['', '', '', '', '', ''];
+            $title = trim($rawTitle);
+            $length = \strlen($title);
+            $reason = match (true) {
+                $length === 0 => 1,
+                $length > 255 => 2,
+                strcspn($title, self::W61_CONTROL_CHARS) !== $length => 3,
+                default => 0,
+            };
+            $pad = $length > 0 && $length !== \strlen($rawTitle) ? 1 : 0;
+            [$existingState, $existing] = self::w61Flag($rawExisting);
+            [$nukedState, $nuked] = self::w61Small($rawNuked, 2);
+            [$priorState, $prior] = self::w61Small($rawPrior, 2);
+            [$detailState, $details] = self::w61Small($rawDetails, 1);
+            [$knownState, $known] = self::w61Small($rawKnown, 1);
+            $bad = $existingState === 2 || $nukedState === 2 || $priorState === 2 || $detailState === 2 || $knownState === 2 ? 1 : 0;
+            $nukeChange = $fill = $chunk = 0;
+            if ($reason !== 0) {
+                $decision = 0;
+            } else {
+                $identity = strtolower($title);
+                if (isset($seen[$identity])) {
+                    $decision = 1;
+                } else {
+                    $seen[$identity] = true;
+                    if ($existing === 0) {
+                        $decision = 2;
+                        $chunk = intdiv($inserts, self::W61_CHUNK);
+                        $inserts++;
+                    } else {
+                        $nukeChange = $nuked !== Predb::PRE_NONUKE && $nuked !== $prior ? 1 : 0;
+                        $fill = $details & ~$known & 7;
+                        $decision = $nukeChange === 1 ? 3 : ($fill !== 0 ? 4 : 5);
+                    }
+                }
+            }
+            $decisions[$decision]++;
+            $reasons[$reason]++;
+            $existingStates[$existingState]++;
+            $nukeChanges += $nukeChange;
+            for ($bit = 0; $bit < 3; $bit++) {
+                $fills[$bit] += $fill >> $bit & 1;
+            }
+            $padded += $pad;
+            $malformed += $bad;
+            if ($decision >= 2 && $decision <= 4) {
+                $acceptedBytes += $length;
+            }
+            $out[] = $decision | $reason << 3 | $existingState << 5 | $nukeChange << 7 | $fill << 8 | $pad << 11 | $bad << 12
+                | min($length, 255) << 13 | $chunk << 21;
+        }
+        array_push($out, ...$decisions, ...$reasons, ...$existingStates);
+        $out[] = $nukeChanges;
+        array_push($out, ...$fills);
+        array_push($out, $padded, $malformed, $acceptedBytes, intdiv($inserts + self::W61_CHUNK - 1, self::W61_CHUNK), \count($seen));
+
+        return $out;
+    }
+
+    /**
+     * Trimmed boolean token: [0, 0] empty, [1, 1] for 1/true/yes/on, [1, 0] for 0/false/no/off (any case), else [2, 0].
+     *
+     * @return array{int, int}
+     */
+    private static function w61Flag(string $raw): array
+    {
+        return match (strtolower(trim($raw))) {
+            '' => [0, 0],
+            '1', 'true', 'yes', 'on' => [1, 1],
+            '0', 'false', 'no', 'off' => [1, 0],
+            default => [2, 0],
+        };
+    }
+
+    /**
+     * Trimmed 1-$maxDigits digit number: [0, 0] empty, [1, value] or [2, 0] malformed.
+     *
+     * @return array{int, int}
+     */
+    private static function w61Small(string $raw, int $maxDigits): array
+    {
+        $value = trim($raw);
+        $length = \strlen($value);
+        if ($length === 0) {
+            return [0, 0];
+        }
+
+        return $length <= $maxDigits && strspn($value, '0123456789') === $length ? [1, (int) $value] : [2, 0];
+    }
+
+    /**
+     * Wave 61 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('predb_w613', self::W61_PREDB_FEED_IMPORTER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 61.3 PredbFeedImporter export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w61Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w61RustFfiState('ffi');
+            $out = self::w61RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w61RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W61_PREDB_FEED_IMPORTER_FFI_CDEF.)
+            $written = $ffi->nntmux_w613_predb_feed_importer_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

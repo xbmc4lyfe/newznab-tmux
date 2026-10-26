@@ -59454,3 +59454,1247 @@ mod w604_tests {
         assert_eq!(empty, 0);
     }
 }
+// =============================================================================
+// Wave 61.4: NntmuxUpdateLock, PasswordBreachService, PopulateAniListService,
+// RecaptchaService and RegistrationFailureLogService batch plan rows.
+// =============================================================================
+
+pub mod w614_batch {
+    use super::w574_batch::MAX_RECORDS;
+    use super::w594_batch::{fnv, split};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// Record body: blob values (field-major), the int64 columns, the record count, output.
+    type Body = fn(&[&[u8]], &[i64], usize, &mut [i64]);
+
+    /// Upper clamp for epoch-second timestamps.
+    pub(crate) const TIME_MAX: i64 = 1 << 40;
+
+    const FNV_BASIS: i64 = 2_166_136_261;
+
+    /// Column `k` of the packed int64 words for record `i`.
+    #[inline(always)]
+    fn col(ints: &[i64], count: usize, k: usize, i: usize) -> i64 {
+        ints[k * count + i]
+    }
+
+    #[inline(always)]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point to `len` readable bytes unless `len` is zero.
+    unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Validate the frame, split the blob and run `body`. Returns the words written, -1 for a
+    /// malformed frame or panic and `-needed` when `out_cap` is too small.
+    ///
+    /// # Safety
+    ///
+    /// See the exported functions.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        fields: usize,
+        columns: usize,
+        words: usize,
+        trailer: usize,
+        body: Body,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(blob as usize, blob_len, out as usize, out_bytes)
+                || overlaps(twin as usize, twin_len, out as usize, out_bytes)
+                || overlaps(ints as usize, ints_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(blob), Some(twin), Some(ints)) = (
+                unsafe { bytes(blob, blob_len) },
+                unsafe { bytes(twin, twin_len) },
+                unsafe { bytes(ints, ints_len) },
+            ) else {
+                return -1;
+            };
+            if ints.len() != count * columns * 8 {
+                return -1;
+            }
+            if count == 0 {
+                return if blob.is_empty() && twin.is_empty() {
+                    0
+                } else {
+                    -1
+                };
+            }
+            let all: Vec<i64> = ints
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|w| i64::from_le_bytes(*w))
+                .collect();
+            let mut values: Vec<&[u8]> = Vec::with_capacity(count * fields);
+            if !split(blob, twin, count * fields, &mut values) {
+                return -1;
+            }
+            let need = count * words + trailer;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from every input.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            body(&values, &all, count, out);
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// PHP `trim($s)` with the default " \t\n\r\0\x0B" set.
+    #[inline(always)]
+    pub(crate) fn trim(s: &[u8]) -> &[u8] {
+        let space = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = s.iter().position(|b| !space(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !space(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    #[inline(always)]
+    fn utf8(s: &[u8]) -> bool {
+        s.is_ascii() || std::str::from_utf8(s).is_ok()
+    }
+
+    #[inline(always)]
+    fn control(s: &[u8]) -> bool {
+        s.iter().any(|b| *b < 0x20 || *b == 0x7f)
+    }
+
+    #[inline(always)]
+    fn digits(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |a, d| a * 10 + i64::from(d - b'0'))
+    }
+
+    #[inline(always)]
+    fn token_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    }
+
+    #[inline(always)]
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Case-insensitive (ASCII) containment of a lowercase `needle`.
+    #[inline(always)]
+    fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.len() >= needle.len()
+            && haystack
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle))
+    }
+
+    /// PHP `unpack('N', hash('fnv1a32', strtolower($s), true))[1]`.
+    #[inline(always)]
+    fn fnv1a32_lower(s: &[u8]) -> i64 {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in s {
+            h ^= u32::from(b.to_ascii_lowercase());
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        i64::from(h)
+    }
+
+    /// Strict dotted-quad IPv4: four 1-3 digit octets without leading zeros, each <= 255.
+    pub(crate) fn ipv4(s: &[u8]) -> Option<[i64; 4]> {
+        let mut octets = [0i64; 4];
+        let mut n = 0;
+        for part in s.split(|b| *b == b'.') {
+            if n == 4
+                || part.is_empty()
+                || part.len() > 3
+                || !part.iter().all(u8::is_ascii_digit)
+                || (part.len() > 1 && part[0] == b'0')
+            {
+                return None;
+            }
+            let v = digits(part);
+            if v > 255 {
+                return None;
+            }
+            octets[n] = v;
+            n += 1;
+        }
+        (n == 4).then_some(octets)
+    }
+
+    /// (class, masked): 0 empty, 1 IPv4 (`a << 16 | b << 8 | c`), 2 IPv6-shaped (its ':'
+    /// count: 2-39 hex digits and colons, at least two colons, at most one '::'), 3 other (-1).
+    pub(crate) fn ip_class(s: &[u8]) -> (i64, i64, Option<[i64; 4]>) {
+        if s.is_empty() {
+            return (0, -1, None);
+        }
+        if let Some(o) = ipv4(s) {
+            return (1, o[0] << 16 | o[1] << 8 | o[2], Some(o));
+        }
+        let colons = s.iter().filter(|b| **b == b':').count() as i64;
+        let mut doubles = 0;
+        let mut i = 0;
+        while i + 1 < s.len() {
+            if s[i] == b':' && s[i + 1] == b':' {
+                doubles += 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        if (2..=39).contains(&s.len())
+            && colons >= 2
+            && doubles <= 1
+            && s.iter().all(|b| b.is_ascii_hexdigit() || *b == b':')
+        {
+            return (2, colons, None);
+        }
+        (3, -1, None)
+    }
+
+    // -- NntmuxUpdateLock ----------------------------------------------------------------------
+
+    const LOCK_SKEW: i64 = 300;
+    const LOCK_MAX_TTL: i64 = 604_800;
+    const LOCK_DEFAULT_TTL: i64 = 3600;
+    const PID_MAX: i64 = 4_194_304;
+
+    /// (class, name length): 0 empty, 1-4 known update commands, 14 another
+    /// `[a-z][a-z0-9:_-]{0,63}` name, 15 otherwise; the name ends at the first space.
+    pub(crate) fn lock_command(c: &[u8]) -> (i64, i64) {
+        if c.is_empty() {
+            return (0, 0);
+        }
+        let name = &c[..c.iter().position(|b| *b == b' ').unwrap_or(c.len())];
+        let class = match name {
+            b"nntmux:all" => 1,
+            b"nntmux:git" => 2,
+            b"migrate" => 3,
+            b"optimize:clear" => 4,
+            _ if (1..=64).contains(&name.len())
+                && name[0].is_ascii_lowercase()
+                && name.iter().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b':' | b'_' | b'-')
+                }) =>
+            {
+                14
+            }
+            _ => 15,
+        };
+        (class, name.len() as i64)
+    }
+
+    /// (class, hash): 0 empty, 1 a 1-253 byte `[a-z0-9.-]` hostname (lowercased, trimmed)
+    /// that neither starts nor ends with '.' or '-' and holds no '..', 2 otherwise; the hash is
+    /// FNV-1a 32 of the lowercased, trimmed name (0 when empty).
+    pub(crate) fn lock_host(h: &[u8]) -> (i64, i64) {
+        let h = trim(h);
+        if h.is_empty() {
+            return (0, 0);
+        }
+        let edge = |b: u8| b == b'.' || b == b'-';
+        let valid = h.len() <= 253
+            && h.iter().all(|b| {
+                let l = b.to_ascii_lowercase();
+                l.is_ascii_lowercase() || l.is_ascii_digit() || l == b'.' || l == b'-'
+            })
+            && !edge(h[0])
+            && !edge(h[h.len() - 1])
+            && !contains(h, b"..");
+        (if valid { 1 } else { 2 }, fnv1a32_lower(h))
+    }
+
+    /// Rows [status | command << 4 | host << 8 | flags << 12 | options << 16 | name length <<
+    /// 24, pid, age, remaining, expires at, host hash]; trailer [invalid, future, stale, own,
+    /// contended, max age, min contended remaining, digest].
+    fn lock_row(values: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut summary = [0i64; 8];
+        summary[6] = -1;
+        let mut digest = FNV_BASIS;
+        for (i, slot) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let (command, host) = (values[i], values[count + i]);
+            let (command_class, name_len) = lock_command(command);
+            let options = command.windows(3).filter(|w| *w == b" --").count() as i64;
+            let (host_class, host_hash) = lock_host(host);
+            let pid = col(ints, count, 0, i);
+            let started = col(ints, count, 1, i);
+            let ttl = col(ints, count, 2, i);
+            let now = col(ints, count, 3, i).clamp(0, TIME_MAX);
+            let current = col(ints, count, 4, i);
+            let custom = (1..=LOCK_MAX_TTL).contains(&ttl);
+            let effective = if custom { ttl } else { LOCK_DEFAULT_TTL };
+            let mut flags = i64::from(custom) | if options > 0 { 2 } else { 0 };
+            let pid_ok = (1..=PID_MAX).contains(&pid);
+            let (mut age, mut remaining, mut expires) = (0, -1, -1);
+            let status = if !pid_ok {
+                1
+            } else if !(1..=TIME_MAX).contains(&started) {
+                2
+            } else if started > now + LOCK_SKEW {
+                3
+            } else {
+                if started > now {
+                    flags |= 8;
+                }
+                age = (now - started).max(0);
+                expires = started + effective;
+                if age > effective {
+                    4
+                } else {
+                    remaining = effective - age;
+                    if remaining * 10 <= effective {
+                        flags |= 4;
+                    }
+                    if pid == current { 5 } else { 6 }
+                }
+            };
+            let word = status
+                | command_class << 4
+                | host_class << 8
+                | flags << 12
+                | options.min(255) << 16
+                | name_len.min(255) << 24;
+            *slot = [
+                word,
+                if pid_ok { pid } else { -1 },
+                age,
+                remaining,
+                expires,
+                host_hash,
+            ];
+            match status {
+                1 | 2 => summary[0] += 1,
+                3 => summary[1] += 1,
+                4 => summary[2] += 1,
+                5 => summary[3] += 1,
+                _ => {
+                    summary[4] += 1;
+                    summary[6] = if summary[6] < 0 {
+                        remaining
+                    } else {
+                        summary[6].min(remaining)
+                    };
+                }
+            }
+            summary[5] = summary[5].max(age);
+            digest = fnv(digest, word ^ age << 20 ^ remaining);
+        }
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- PasswordBreachService -----------------------------------------------------------------
+
+    #[inline(always)]
+    fn hex_value(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |a, b| {
+            a << 4
+                | i64::from(match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    _ => b - b'A' + 10,
+                })
+        })
+    }
+
+    /// One trimmed range line: Some((matches suffix, count)) for `35 hex:1-10 digits`, None
+    /// for a malformed line.
+    #[inline(always)]
+    fn range_line(line: &[u8], suffix: &[u8]) -> Option<(bool, i64)> {
+        let colon = line.iter().position(|b| *b == b':');
+        let (candidate, tally): (&[u8], &[u8]) = match colon {
+            Some(p) => (&line[..p], &line[p + 1..]),
+            None => (line, b""),
+        };
+        if candidate.len() != 35
+            || !candidate.iter().all(u8::is_ascii_hexdigit)
+            || tally.is_empty()
+            || tally.len() > 10
+            || !tally.iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        Some((
+            !suffix.is_empty() && candidate.eq_ignore_ascii_case(suffix),
+            digits(tally),
+        ))
+    }
+
+    /// Rows [status | hash class << 4 | prefix class << 6 | found << 8 | padding hit << 9 |
+    /// CR << 10, count, prefix value, lines | malformed << 20 | padding << 40, body bytes];
+    /// trailer [clean, breached, invalid hash, prefix mismatch, empty range, found count sum,
+    /// max count, digest].
+    fn breach_row(values: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut summary = [0i64; 8];
+        let mut digest = FNV_BASIS;
+        for (i, slot) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let (hash, prefix, body) = (values[i], values[count + i], values[2 * count + i]);
+            let threshold = col(ints, count, 0, i).max(0);
+            let hash_class = if hash.is_empty() {
+                0
+            } else if hash.len() == 40 && hash.iter().all(u8::is_ascii_hexdigit) {
+                1
+            } else {
+                2
+            };
+            let prefix_class = if prefix.is_empty() {
+                0
+            } else if prefix.len() == 5 && prefix.iter().all(u8::is_ascii_hexdigit) {
+                1
+            } else {
+                2
+            };
+            let suffix: &[u8] = if hash_class == 1 { &hash[5..] } else { b"" };
+            let (mut found, mut hits) = (false, 0i64);
+            let (mut lines, mut malformed, mut padding) = (0i64, 0i64, 0i64);
+            for line in body.split(|b| *b == b'\n') {
+                let line = trim(line);
+                if line.is_empty() {
+                    continue;
+                }
+                match range_line(line, suffix) {
+                    None => malformed += 1,
+                    Some((matched, n)) => {
+                        lines += 1;
+                        if n == 0 {
+                            padding += 1;
+                        }
+                        if matched && !found {
+                            found = true;
+                            hits = n;
+                        }
+                    }
+                }
+            }
+            let status = if hash_class != 1 {
+                2
+            } else if prefix_class != 1 || !prefix.eq_ignore_ascii_case(&hash[..5]) {
+                3
+            } else if lines == 0 {
+                4
+            } else if found && hits > threshold {
+                1
+            } else {
+                0
+            };
+            let word = status
+                | hash_class << 4
+                | prefix_class << 6
+                | i64::from(found) << 8
+                | i64::from(found && hits == 0) << 9
+                | i64::from(body.contains(&b'\r')) << 10;
+            *slot = [
+                word,
+                hits,
+                if hash_class == 1 {
+                    hex_value(&hash[..5])
+                } else {
+                    -1
+                },
+                lines.min(0xF_FFFF) | malformed.min(0xF_FFFF) << 20 | padding.min(0xF_FFFF) << 40,
+                body.len() as i64,
+            ];
+            match status {
+                0 => summary[0] += 1,
+                1 => summary[1] += 1,
+                2 => summary[2] += 1,
+                3 => summary[3] += 1,
+                _ => summary[4] += 1,
+            }
+            summary[5] += hits;
+            summary[6] = summary[6].max(hits);
+            digest = fnv(digest, word ^ hits << 8 ^ lines);
+        }
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- PopulateAniListService ----------------------------------------------------------------
+
+    const ID_MAX: i64 = 2_147_483_647;
+
+    /// AniList media status after trim + strtoupper: 0 empty, 1-5 known, 15 other.
+    pub(crate) fn anilist_status(s: &[u8]) -> i64 {
+        let s = trim(s);
+        if s.is_empty() {
+            return 0;
+        }
+        const KNOWN: [&[u8]; 5] = [
+            b"FINISHED",
+            b"RELEASING",
+            b"NOT_YET_RELEASED",
+            b"CANCELLED",
+            b"HIATUS",
+        ];
+        KNOWN
+            .iter()
+            .position(|k| s.eq_ignore_ascii_case(k))
+            .map_or(15, |p| p as i64 + 1)
+    }
+
+    /// AniList media format after trim + strtoupper: 0 empty, 1-7 known, 15 other.
+    pub(crate) fn anilist_format(s: &[u8]) -> i64 {
+        let s = trim(s);
+        if s.is_empty() {
+            return 0;
+        }
+        const KNOWN: [&[u8]; 7] = [
+            b"TV",
+            b"TV_SHORT",
+            b"MOVIE",
+            b"SPECIAL",
+            b"OVA",
+            b"ONA",
+            b"MUSIC",
+        ];
+        KNOWN
+            .iter()
+            .position(|k| s.eq_ignore_ascii_case(k))
+            .map_or(15, |p| p as i64 + 1)
+    }
+
+    /// Rows [status | source << 4 | media status << 8 | format << 12 | flags << 16, anilist id,
+    /// mal id, episodes, season year, primary title bytes, completeness]; trailer [ready,
+    /// invalid id, untitled, bad encoding, review, completeness sum, max primary bytes, digest].
+    fn anilist_row(values: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 7);
+        let mut summary = [0i64; 8];
+        let mut digest = FNV_BASIS;
+        for (i, slot) in rows.as_chunks_mut::<7>().0.iter_mut().enumerate() {
+            let romaji = trim(values[i]);
+            let english = trim(values[count + i]);
+            let native = trim(values[2 * count + i]);
+            let media_status = anilist_status(values[3 * count + i]);
+            let format = anilist_format(values[4 * count + i]);
+            let anilist = col(ints, count, 0, i);
+            let mal = col(ints, count, 1, i);
+            let episodes = col(ints, count, 2, i);
+            let year = col(ints, count, 3, i);
+            let anilist = if (1..=ID_MAX).contains(&anilist) {
+                anilist
+            } else {
+                -1
+            };
+            let mal = if mal == 0 || (1..=ID_MAX).contains(&mal) {
+                mal
+            } else {
+                -1
+            };
+            let episodes = if (0..=10_000).contains(&episodes) {
+                episodes
+            } else {
+                -1
+            };
+            let year = if year == 0 || (1940..=2100).contains(&year) {
+                year
+            } else {
+                -1
+            };
+            let bad_utf8 = !utf8(romaji) || !utf8(english) || !utf8(native);
+            let flags = i64::from(!romaji.is_empty())
+                | i64::from(!english.is_empty()) << 1
+                | i64::from(!native.is_empty()) << 2
+                | i64::from(!native.is_ascii()) << 3
+                | i64::from(!english.is_empty() && english.eq_ignore_ascii_case(romaji)) << 4
+                | i64::from(control(romaji) || control(english) || control(native)) << 5
+                | i64::from(bad_utf8) << 6
+                | i64::from(format == 3 && episodes > 1) << 7;
+            let (source, primary) = if !english.is_empty() {
+                (1, english)
+            } else if !romaji.is_empty() {
+                (2, romaji)
+            } else if !native.is_empty() {
+                (3, native)
+            } else {
+                (0, &b""[..])
+            };
+            let status = if anilist == -1 {
+                1
+            } else if source == 0 {
+                2
+            } else if bad_utf8 {
+                3
+            } else if media_status == 15
+                || format == 15
+                || mal == -1
+                || episodes == -1
+                || year == -1
+            {
+                4
+            } else {
+                0
+            };
+            let score = if anilist > 0 { 20 } else { 0 }
+                + if romaji.is_empty() { 0 } else { 15 }
+                + if english.is_empty() { 0 } else { 15 }
+                + if native.is_empty() { 0 } else { 10 }
+                + if mal > 0 { 10 } else { 0 }
+                + if episodes > 0 { 10 } else { 0 }
+                + if year > 0 { 10 } else { 0 }
+                + if (1..=5).contains(&media_status) {
+                    5
+                } else {
+                    0
+                }
+                + if (1..=7).contains(&format) { 5 } else { 0 };
+            let word = status | source << 4 | media_status << 8 | format << 12 | flags << 16;
+            let primary_len = primary.len() as i64;
+            *slot = [word, anilist, mal, episodes, year, primary_len, score];
+            summary[status as usize] += 1;
+            summary[5] += score;
+            summary[6] = summary[6].max(primary_len);
+            digest = fnv(digest, word ^ anilist << 24 ^ score);
+        }
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- RecaptchaService ----------------------------------------------------------------------
+
+    const TOKEN_MAX_AGE: i64 = 120;
+
+    /// Siteverify error-code bit, matching RecaptchaService::W48_ERROR_CODES (7 for others).
+    #[inline(always)]
+    fn recaptcha_error_bit(code: &[u8]) -> i64 {
+        match code {
+            b"missing-input-secret" => 0,
+            b"invalid-input-secret" => 1,
+            b"missing-input-response" => 2,
+            b"invalid-input-response" => 3,
+            b"bad-request" => 4,
+            b"timeout-or-duplicate" => 5,
+            b"internal-error" => 6,
+            _ => 7,
+        }
+    }
+
+    /// (mask, codes) over comma-separated, trimmed, non-empty error codes.
+    pub(crate) fn recaptcha_errors(s: &[u8]) -> (i64, i64) {
+        let (mut mask, mut codes) = (0i64, 0i64);
+        for code in s.split(|b| *b == b',') {
+            let code = trim(code);
+            if !code.is_empty() {
+                codes += 1;
+                mask |= 1 << recaptcha_error_bit(code);
+            }
+        }
+        (mask, codes)
+    }
+
+    /// Rows [outcome | token << 4 | secret << 6 | ip << 8 | action << 10 | category << 12 |
+    /// action match << 15 | error mask << 16 | codes << 24 | score state << 32 | future << 34 |
+    /// expired << 35, score micros, age, token bytes, masked ip]; trailer [accepted, rejected,
+    /// error coded, expired, low score, action mismatch, digest].
+    fn recaptcha_row(values: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut summary = [0i64; 7];
+        let mut digest = FNV_BASIS;
+        for (i, slot) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let (token, secret, ip, action, expected, errors) = (
+                values[i],
+                values[count + i],
+                values[2 * count + i],
+                values[3 * count + i],
+                values[4 * count + i],
+                values[5 * count + i],
+            );
+            let micros = col(ints, count, 0, i);
+            let threshold = col(ints, count, 1, i).clamp(0, 1_000_000);
+            let ts = col(ints, count, 2, i).clamp(0, TIME_MAX);
+            let now = col(ints, count, 3, i).clamp(0, TIME_MAX);
+            let token_class = if token.is_empty() {
+                0
+            } else if token.len() > 4096 {
+                2
+            } else if token.len() >= 20 && token.iter().all(|b| token_byte(*b)) {
+                1
+            } else {
+                3
+            };
+            let secret_class = if secret.is_empty() {
+                0
+            } else if secret.len() == 40 && secret.iter().all(|b| token_byte(*b)) {
+                1
+            } else {
+                2
+            };
+            let (ip_class, masked, _) = ip_class(ip);
+            let action_class = if action.is_empty() {
+                0
+            } else if action.len() <= 100
+                && action
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'/')
+            {
+                1
+            } else {
+                2
+            };
+            let matched = !expected.is_empty() && action == expected;
+            let (mask, codes) = recaptcha_errors(errors);
+            let score_state = if micros == -1 {
+                0
+            } else if (0..=1_000_000).contains(&micros) {
+                1
+            } else {
+                2
+            };
+            let future = ts > now;
+            let expired = ts > 0 && !future && now - ts > TOKEN_MAX_AGE;
+            let age = if ts == 0 || future { -1 } else { now - ts };
+            let category = if mask & 3 != 0 {
+                1
+            } else if mask & 32 != 0 {
+                3
+            } else if mask & 12 != 0 {
+                2
+            } else if mask & 80 != 0 {
+                4
+            } else if mask & 128 != 0 {
+                5
+            } else {
+                0
+            };
+            let outcome = if token_class == 0 || secret_class == 0 {
+                1
+            } else if token_class != 1 || secret_class != 1 {
+                2
+            } else if codes > 0 {
+                3
+            } else if future || expired {
+                4
+            } else if !expected.is_empty() && !matched {
+                5
+            } else if score_state == 2 {
+                7
+            } else if score_state == 1 && micros < threshold {
+                6
+            } else {
+                0
+            };
+            let word = outcome
+                | token_class << 4
+                | secret_class << 6
+                | ip_class << 8
+                | action_class << 10
+                | category << 12
+                | i64::from(matched) << 15
+                | mask << 16
+                | codes.min(255) << 24
+                | score_state << 32
+                | i64::from(future) << 34
+                | i64::from(expired) << 35;
+            let score = if score_state == 1 { micros } else { -1 };
+            *slot = [word, score, age, token.len() as i64, masked];
+            if outcome == 0 {
+                summary[0] += 1;
+            } else {
+                summary[1] += 1;
+            }
+            match outcome {
+                3 => summary[2] += 1,
+                4 => summary[3] += 1,
+                6 => summary[4] += 1,
+                5 => summary[5] += 1,
+                _ => {}
+            }
+            digest = fnv(digest, word ^ age << 8 ^ score);
+        }
+        summary[6] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- RegistrationFailureLogService ---------------------------------------------------------
+
+    const REASON_WEIGHTS: [i64; 16] = [0, 15, 10, 5, 5, 25, 0, 30, 20, 5, 5, 10, 10, 10, 10, 10];
+
+    const AGENT_WEIGHTS: [i64; 5] = [15, 25, 30, 0, 5];
+
+    const BOT_AGENTS: [&[u8]; 3] = [b"bot", b"spider", b"crawl"];
+
+    const SCRIPT_AGENTS: [&[u8]; 7] = [
+        b"curl/",
+        b"wget/",
+        b"python-requests",
+        b"go-http-client",
+        b"okhttp",
+        b"libwww",
+        b"java/",
+    ];
+
+    const DISPOSABLE: [&[u8]; 6] = [
+        b"mailinator.com",
+        b"guerrillamail.com",
+        b"10minutemail.com",
+        b"tempmail.com",
+        b"yopmail.com",
+        b"trashmail.com",
+    ];
+
+    /// Reason code for `[a-z0-9]` runs of the lowercased reason joined by '_' (W48_REASONS):
+    /// 0 empty, 1-10 known, 15 other.
+    pub(crate) fn failure_reason(r: &[u8]) -> i64 {
+        let mut buf = [0u8; 32];
+        let mut n = 0;
+        let mut long = false;
+        let mut gap = false;
+        for b in r {
+            let l = b.to_ascii_lowercase();
+            if l.is_ascii_lowercase() || l.is_ascii_digit() {
+                if gap && n > 0 {
+                    if n == buf.len() {
+                        long = true;
+                        break;
+                    }
+                    buf[n] = b'_';
+                    n += 1;
+                }
+                gap = false;
+                if n == buf.len() {
+                    long = true;
+                    break;
+                }
+                buf[n] = l;
+                n += 1;
+            } else {
+                gap = true;
+            }
+        }
+        if n == 0 {
+            return 0;
+        }
+        if long {
+            return 15;
+        }
+        match &buf[..n] {
+            b"captcha_failed" => 1,
+            b"invalid_invite" => 2,
+            b"email_taken" => 3,
+            b"username_taken" => 4,
+            b"disposable_email" => 5,
+            b"registration_closed" => 6,
+            b"proxy_detected" => 7,
+            b"rate_limited" => 8,
+            b"validation_failed" => 9,
+            b"password_breached" => 10,
+            _ => 15,
+        }
+    }
+
+    /// (class, disposable): 0 empty, 1 valid, 2 invalid, on the trimmed, lowercased address.
+    pub(crate) fn failure_email(e: &[u8]) -> (i64, bool) {
+        let e = trim(e);
+        if e.is_empty() {
+            return (0, false);
+        }
+        let Some(at) = e.iter().position(|b| *b == b'@') else {
+            return (2, false);
+        };
+        let (local, domain) = (&e[..at], &e[at + 1..]);
+        let valid = (1..=64).contains(&at)
+            && !domain.contains(&b'@')
+            && !local.iter().any(|b| *b <= 0x20 || *b == 0x7f)
+            && (3..=253).contains(&domain.len())
+            && domain.iter().all(|b| {
+                let l = b.to_ascii_lowercase();
+                l.is_ascii_lowercase() || l.is_ascii_digit() || l == b'.' || l == b'-'
+            })
+            && domain.contains(&b'.')
+            && domain[0] != b'.'
+            && domain[domain.len() - 1] != b'.'
+            && !contains(domain, b"..");
+        if !valid {
+            return (2, false);
+        }
+        (1, DISPOSABLE.iter().any(|d| domain.eq_ignore_ascii_case(d)))
+    }
+
+    /// (class, control byte): 0 empty, 1 bot, 2 script, 3 browser, 4 other, on the lowercased
+    /// first 255 bytes.
+    pub(crate) fn failure_agent(a: &[u8]) -> (i64, bool) {
+        let a = &a[..a.len().min(255)];
+        if a.is_empty() {
+            return (0, false);
+        }
+        let class = if BOT_AGENTS.iter().any(|n| contains_ci(a, n)) {
+            1
+        } else if SCRIPT_AGENTS.iter().any(|n| contains_ci(a, n)) {
+            2
+        } else if contains_ci(a, b"mozilla/") {
+            3
+        } else {
+            4
+        };
+        (class, control(a))
+    }
+
+    /// Rows [reason | ip << 4 | private << 6 | username << 8 | email << 10 | agent << 12 |
+    /// invite << 16 | severity << 18 | flags << 20, abuse score, age, masked ip, attempts];
+    /// trailer [watch, throttle, block, automated, disposable, recent, score sum, digest].
+    fn failure_row(values: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut summary = [0i64; 8];
+        let mut digest = FNV_BASIS;
+        for (i, slot) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let reason = failure_reason(values[i]);
+            let (ip_class, masked, octets) = ip_class(values[count + i]);
+            let private = octets.is_some_and(|[a, b, _, _]| {
+                a == 10
+                    || a == 127
+                    || (a == 172 && b & 0xF0 == 16)
+                    || (a == 192 && b == 168)
+                    || (a == 169 && b == 254)
+                    || (a == 100 && b & 0xC0 == 64)
+            });
+            let user = trim(values[2 * count + i]);
+            let user_class = if user.is_empty() {
+                0
+            } else if (3..=32).contains(&user.len())
+                && user
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+            {
+                1
+            } else {
+                2
+            };
+            let admin = contains_ci(user, b"admin");
+            let numeric = !user.is_empty() && user.iter().all(u8::is_ascii_digit);
+            let (email_class, disposable) = failure_email(values[3 * count + i]);
+            let agent_raw = values[4 * count + i];
+            let (agent_class, agent_control) = failure_agent(agent_raw);
+            let invite = trim(values[5 * count + i]);
+            let invite_class = if invite.is_empty() {
+                0
+            } else if (8..=64).contains(&invite.len())
+                && invite
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+            {
+                1
+            } else {
+                2
+            };
+            let attempts = col(ints, count, 0, i).clamp(0, 1 << 31);
+            let ts = col(ints, count, 1, i).clamp(0, TIME_MAX);
+            let now = col(ints, count, 2, i).clamp(0, TIME_MAX);
+            let age = if ts > now { -1 } else { now - ts };
+            let recent = (0..=3600).contains(&age);
+            let score = (REASON_WEIGHTS[reason as usize]
+                + AGENT_WEIGHTS[agent_class as usize]
+                + if disposable { 20 } else { 0 }
+                + if email_class == 2 { 10 } else { 0 }
+                + if admin { 10 } else { 0 }
+                + if user_class == 2 { 5 } else { 0 }
+                + if invite_class == 2 { 10 } else { 0 }
+                + if ip_class == 3 { 10 } else { 0 }
+                + (attempts * 3).min(30))
+            .min(100);
+            let severity = if score >= 70 {
+                3
+            } else if score >= 40 {
+                2
+            } else if score >= 15 {
+                1
+            } else {
+                0
+            };
+            let flags = i64::from(admin)
+                | i64::from(numeric) << 1
+                | i64::from(disposable) << 2
+                | i64::from(agent_control) << 3
+                | i64::from(agent_raw.len() > 255) << 4
+                | i64::from(recent) << 5;
+            let word = reason
+                | ip_class << 4
+                | i64::from(private) << 6
+                | user_class << 8
+                | email_class << 10
+                | agent_class << 12
+                | invite_class << 16
+                | severity << 18
+                | flags << 20;
+            *slot = [word, score, age, masked, attempts];
+            if severity > 0 {
+                summary[severity as usize - 1] += 1;
+            }
+            if agent_class == 1 || agent_class == 2 {
+                summary[3] += 1;
+            }
+            if disposable {
+                summary[4] += 1;
+            }
+            if recent {
+                summary[5] += 1;
+            }
+            summary[6] += score;
+            digest = fnv(digest, word ^ score << 32 ^ age);
+        }
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    macro_rules! export614 {
+        ($name:ident, $fields:literal, $columns:literal, $words:literal, $trailer:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `blob` must point to `blob_len` readable bytes (`count * fields` NUL-joined
+            /// values, field-major), `twin` to `twin_len` readable bytes (empty, or the same
+            /// values joined by 0x01), `ints` to `ints_len` readable bytes (`columns` columns
+            /// of `count` packed little-endian int64 words) and `out` to `out_cap` writable,
+            /// aligned int64 words that overlap no input; null pointers are accepted only with
+            /// zero lengths. Bad shapes return -1 before writing, a short output returns
+            /// `-needed` without writing and panics map to -1.
+            #[unsafe(no_mangle)]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                twin: *const u8,
+                twin_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                const BODY: Body = $body;
+                unsafe {
+                    run(
+                        blob, blob_len, twin, twin_len, ints, ints_len, count, out, out_cap,
+                        $fields, $columns, $words, $trailer, BODY,
+                    )
+                }
+            }
+        };
+    }
+
+    export614!(nntmux_w614_update_lock_plan_row_batch, 2, 5, 6, 8, lock_row);
+    export614!(
+        nntmux_w614_password_breach_plan_row_batch,
+        3,
+        1,
+        5,
+        8,
+        breach_row
+    );
+    export614!(
+        nntmux_w614_anilist_population_plan_row_batch,
+        5,
+        4,
+        7,
+        8,
+        anilist_row
+    );
+    export614!(
+        nntmux_w614_recaptcha_verification_plan_row_batch,
+        6,
+        4,
+        5,
+        7,
+        recaptcha_row
+    );
+    export614!(
+        nntmux_w614_registration_failure_plan_row_batch,
+        6,
+        3,
+        5,
+        8,
+        failure_row
+    );
+}
+
+#[cfg(test)]
+mod w614_tests {
+    use super::w614_batch::*;
+
+    type Export = unsafe extern "C" fn(
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        usize,
+        *mut i64,
+        usize,
+    ) -> isize;
+
+    /// Field-major frame without NULs, then the int columns.
+    fn call(export: Export, fields: &[&[&[u8]]], columns: &[&[i64]], out: &mut [i64]) -> isize {
+        let count = fields[0].len();
+        let blob = fields
+            .iter()
+            .flat_map(|f| f.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(&0u8);
+        let ints: Vec<u8> = columns
+            .iter()
+            .flat_map(|c| c.iter())
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        unsafe {
+            export(
+                blob.as_ptr(),
+                blob.len(),
+                std::ptr::null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn w614_classifiers() {
+        assert_eq!(lock_command(b"nntmux:all --skip-git"), (1, 10));
+        assert_eq!(lock_command(b"tmux:drain"), (14, 10));
+        assert_eq!(lock_command(b" nntmux:all"), (15, 0));
+        assert_eq!(lock_command(b""), (0, 0));
+        assert_eq!(lock_host(b" M5.Local ").0, 1);
+        assert_eq!(lock_host(b"a..b").0, 2);
+        assert_eq!(lock_host(b"-a").0, 2);
+        assert_eq!(anilist_status(b" finished "), 1);
+        assert_eq!(anilist_status(b"bogus"), 15);
+        assert_eq!(anilist_format(b"movie"), 3);
+        assert_eq!(anilist_format(b""), 0);
+        assert_eq!(
+            recaptcha_errors(b"timeout-or-duplicate, nope,,"),
+            (32 | 128, 2)
+        );
+        assert_eq!(recaptcha_errors(b""), (0, 0));
+        assert_eq!(failure_reason(b"  Captcha -- FAILED!! "), 1);
+        assert_eq!(failure_reason(b"!!"), 0);
+        assert_eq!(failure_reason(b"reason_reason_reason_reason_reason_"), 15);
+        assert_eq!(failure_email(b" X@Mailinator.COM "), (1, true));
+        assert_eq!(failure_email(b"a@b..com"), (2, false));
+        assert_eq!(failure_email(b"two@@at.com"), (2, false));
+        assert_eq!(failure_agent(b"Googlebot/2.1"), (1, false));
+        assert_eq!(failure_agent(b"curl/8.7.1"), (2, false));
+        assert_eq!(failure_agent(b"Mozilla/5.0\x01"), (3, true));
+        assert_eq!(ip_class(b"192.168.1.20").0, 1);
+        assert_eq!(ip_class(b"01.2.3.4").0, 3);
+        assert_eq!(ip_class(b"2001:db8::1").1, 3);
+        assert_eq!(ipv4(b"1.2.3.4.5"), None);
+    }
+
+    #[test]
+    fn w614_rows_and_frames() {
+        let now = 1_793_000_000i64;
+        let mut out = vec![0i64; 6 + 8];
+        let written = call(
+            nntmux_w614_update_lock_plan_row_batch,
+            &[&[b"migrate"], &[b""]],
+            &[&[42], &[now - 3500], &[0], &[now], &[42]],
+            &mut out,
+        );
+        assert_eq!(written, 14);
+        assert_eq!(
+            &out[..6],
+            &[5 | 3 << 4 | 4 << 12 | 7 << 24, 42, 3500, 100, now + 100, 0]
+        );
+        assert_eq!(&out[6..13], &[0, 0, 0, 1, 0, 3500, -1]);
+
+        let suffix = [b'A'; 35];
+        let mut hash = b"ABCDE".to_vec();
+        hash.extend_from_slice(&suffix);
+        let mut body = suffix.to_vec();
+        body.extend_from_slice(b":7\r\n:1");
+        let mut out = vec![0i64; 5 + 8];
+        let written = call(
+            nntmux_w614_password_breach_plan_row_batch,
+            &[&[&hash], &[b"abcde"], &[&body]],
+            &[&[0]],
+            &mut out,
+        );
+        assert_eq!(written, 13);
+        assert_eq!(
+            &out[..5],
+            &[
+                1 | 1 << 4 | 1 << 6 | 256 | 1024,
+                7,
+                0xABCDE,
+                1 | 1 << 20,
+                body.len() as i64
+            ]
+        );
+
+        // Short output and malformed frames.
+        let mut short = vec![0i64; 4];
+        assert_eq!(
+            call(
+                nntmux_w614_registration_failure_plan_row_batch,
+                &[&[b""], &[b""], &[b""], &[b""], &[b""], &[b""]],
+                &[&[0], &[0], &[0]],
+                &mut short,
+            ),
+            -13
+        );
+        assert_eq!(
+            call(
+                nntmux_w614_anilist_population_plan_row_batch,
+                &[&[b"a"], &[b"b"]],
+                &[&[0], &[0], &[0], &[0]],
+                &mut out,
+            ),
+            -1
+        );
+        assert_eq!(
+            call(
+                nntmux_w614_recaptcha_verification_plan_row_batch,
+                &[&[b""], &[b""], &[b""], &[b""], &[b""], &[b""]],
+                &[&[0], &[0], &[0]],
+                &mut out,
+            ),
+            -1
+        );
+        let empty = unsafe {
+            nntmux_w614_update_lock_plan_row_batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(empty, 0);
+    }
+}

@@ -1536,4 +1536,239 @@ class ImdbScraper
             return null;
         }
     }
+
+    /** C signature of the Wave 61.5 {@see self::scrapePlanBatch()} helper. */
+    private const string W61_IMDB_PLAN_FFI_CDEF = 'int64_t nntmux_w615_imdb_scrape_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 61.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 5.27/4.32/5.34/3.44x); see tests/Unit/RustGoogleBooksIgdbImdbScraperItunesLogIndexerW61ParityTest.php.
+     */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    /** normalizeApiDevType() TV spellings. */
+    private const array W61_TV_TYPES = ['tvseries' => true, 'tv_series' => true, 'tv mini series' => true, 'tv_mini_series' => true, 'tvminiseries' => true, 'tvspecial' => true, 'tv_special' => true, 'tvmovie' => true, 'tv_movie' => true, 'tvepisode' => true, 'tv_episode' => true];
+
+    /**
+     * Wave 61.5 routing and FFI cache, kept in function-local statics (no static properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w61_5', self::W61_IMDB_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W61_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW61RustFfi(): bool
+    {
+        return self::w61RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with scrapePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 61.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w61Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w61RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w615_imdb_scrape_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch IMDb scrape summary over `id\ttitle\tyear\trating\tgenres\tdirectors\tactors\ttype`. Ten words per record:
+     * `[imdb_num, id_kind, title_len, year, rating_x10, genre_count, director_count, actor_count, type_code, flags]`.
+     * The trimmed id takes an optional ASCII case-insensitive `tt` and 1-10 digits with a positive value; its kind is
+     * 0 empty, 1 canonical (`tt` plus 7-8 digits), 2 other valid, 3 invalid. The year is the first `(19|20)\d{2}` run
+     * (extractYearFromText()), else 0. The trimmed rating is `\d{1,2}(\.\d)?` up to 10.0 in tenths, else -1. Genres
+     * (distinct ASCII case-insensitively), directors and actors (capped at 10, as mapImdbApiDevTitle()) count trimmed,
+     * non-empty comma-separated items. Type is 2 for the normalizeApiDevType() TV spellings, else 1. Flags: 1 empty
+     * id, 2 invalid id, 4 empty title, 8 no year in a non-empty field, 16 invalid rating, 32 capped actors,
+     * 64 duplicate genre, 128 unknown type, 256 not exactly eight fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function scrapePlanBatch(array $records): array
+    {
+        return self::usesW61RustFfi() ? self::scrapePlanBatchNative($records) : self::scrapePlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function scrapePlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 8 ? 0 : 256;
+            $id = trim($fields[0]);
+            [$number, $kind] = [0, 0];
+            if ($id === '') {
+                $flags |= 1;
+            } else {
+                $body = \strlen($id) >= 2 && strncasecmp($id, 'tt', 2) === 0 ? substr($id, 2) : $id;
+                $value = self::w61Digits($body, 10);
+                if ($value !== null && $value > 0) {
+                    $number = $value;
+                    $kind = str_starts_with($id, 'tt') && (\strlen($body) === 7 || \strlen($body) === 8) ? 1 : 2;
+                } else {
+                    $kind = 3;
+                    $flags |= 2;
+                }
+            }
+            $titleLength = \strlen(trim($fields[1] ?? ''));
+            if ($titleLength === 0) {
+                $flags |= 4;
+            }
+            $year = 0;
+            if (preg_match('/(19|20)\d{2}/', $fields[2] ?? '', $matches) === 1) {
+                $year = (int) $matches[0];
+            } elseif (trim($fields[2] ?? '') !== '') {
+                $flags |= 8;
+            }
+            $rating = -1;
+            $text = trim($fields[3] ?? '');
+            if ($text !== '') {
+                if (preg_match('/^(\d{1,2})(?:\.(\d))?$/D', $text, $matches) === 1 && (int) $matches[1] * 10 + (int) ($matches[2] ?? 0) <= 100) {
+                    $rating = (int) $matches[1] * 10 + (int) ($matches[2] ?? 0);
+                } else {
+                    $flags |= 16;
+                }
+            }
+            $genres = [];
+            foreach (explode(',', $fields[4] ?? '') as $genre) {
+                $genre = strtolower(trim($genre));
+                if ($genre === '') {
+                    continue;
+                }
+                if (isset($genres[$genre])) {
+                    $flags |= 64;
+                } else {
+                    $genres[$genre] = true;
+                }
+            }
+            $directors = self::w61Count($fields[5] ?? '');
+            $actors = self::w61Count($fields[6] ?? '');
+            if ($actors > 10) {
+                $actors = 10;
+                $flags |= 32;
+            }
+            $type = strtolower(trim($fields[7] ?? ''));
+            $typeCode = isset(self::W61_TV_TYPES[$type]) ? 2 : 1;
+            if ($typeCode === 1 && $type !== '' && $type !== 'movie') {
+                $flags |= 128;
+            }
+            array_push($out, $number, $kind, $titleLength, $year, $rating, \count($genres), $directors, $actors, $typeCode, $flags);
+        }
+
+        return $out;
+    }
+
+    /** Trimmed, non-empty comma-separated items. */
+    private static function w61Count(string $list): int
+    {
+        $count = 0;
+        foreach (explode(',', $list) as $item) {
+            if (trim($item) !== '') {
+                $count++;
+            }
+        }
+
+        return $count;
+    }
+
+    /** 1-$max ASCII digits as an integer, else null. */
+    private static function w61Digits(string $text, int $max): ?int
+    {
+        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function scrapePlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w61Words($count, implode("\0", $records), 10 * $count) ?? self::scrapePlanBatchPhp($records);
+    }
 }

@@ -27,6 +27,7 @@ use App\Services\Predb\Feeds\Sources\ThreeDsDbSource;
 use App\Services\Predb\Feeds\Sources\XrelSource;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use InvalidArgumentException;
 use Throwable;
 
@@ -339,5 +340,278 @@ class PredbFeedSourceFactory
             '3dsdb' => new ThreeDsDbSource($endpoint, $pageSize, $timeout, $userAgent),
             default => throw new InvalidArgumentException("Unknown PreDB feed source [{$key}]. Available: ".implode(', ', $this->availableKeys())),
         };
+    }
+
+    // ========================================================================
+    // WAVE 61.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 10.55x, p99 8.76x; uncommon mean 6.83x, p99 5.53x); see RustPredbFeedEntryImporterSourceFactoryIrcNetworksParserW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    public const string W61_PREDB_FEED_SOURCE_FACTORY_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w613_predb_feed_source_factory_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 61.3 batch. */
+    public const int W61_PREDB_FEED_SOURCE_FACTORY_TRAILER = 31;
+
+    /** Normalized aliases (host names and short forms) for make() keys. */
+    public const array W61_SOURCE_ALIASES = ['predb' => 'predb_club', 'predb.club' => 'predb_club', 'predb.net' => 'predb_net', 'predb.me' => 'predb_me',
+        'predb.org' => 'predb_org', 'predb.ovh' => 'predb_ovh', 'srrdb.com' => 'srrdb', 'xrel.to' => 'xrel', 'xrel.to_p2p' => 'xrel_p2p', 'eztv.re' => 'eztv',
+        'apibay.org' => 'apibay', 'knaben.eu' => 'knaben', 'crowdnfo.net' => 'crowdnfo', 'nima4k.org' => 'nima4k', '1techno' => 'one_techno',
+        '1gabba' => 'one_gabba', 'threedsdb' => '3dsdb', 'scnsrc' => 'scnsrc_me', 'hd_encode' => 'hdencode'];
+
+    /** Minimum request spacing per W48_SOURCES rate tier (local, RSS, standard, API), in milliseconds. */
+    public const array W61_TIER_INTERVAL_MS = [0, 2000, 1000, 3000];
+
+    /** Most items an RSS source returns per page. */
+    public const int W61_RSS_PAGE_CAP = 50;
+
+    public static function usesW61RustFfi(): bool
+    {
+        $override = self::w61RustFfiState();
+
+        return \is_bool($override) ? $override : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the PredbFeedSourceFactory Wave 61 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 61.3 source policy plans. Each item is `key|pageSize|timeout|maxBodyBytes`, every field trimmed. Per item
+     * `status | (index + 1) << 3 | kind << 9 | flags << 11 | tier << 18 | pageState << 20 | timeoutState << 22 |
+     * bodyState << 24 | page << 26 | timeout << 36 | duplicate << 43 | min(keyLength, 63) << 44`: the status is 0
+     * blank, 1 an exact W48_SOURCES key, 2 a normalized key (lower-cased, dashes and spaces as underscores), 3 a
+     * normalized W61_SOURCE_ALIASES key, 4 unknown and 5 an unmatched key over 32 bytes; a resolved source has
+     * its W48_SOURCES index, kind, flags and rate tier (zero otherwise) and is a duplicate when an earlier item
+     * resolved to it. Page size (default 100, 1-1000), timeout (15, 1-120 s) and body cap (1048576, 1024-67108864)
+     * are 0 empty (default), 1 in range, 2 clamped and 3 malformed (default); a resolved RSS source caps the page
+     * at W61_RSS_PAGE_CAP. Then the status, kind and tier counts (resolved items), the page, timeout and body state
+     * counts, the duplicates, the resolved source mask, the page sum, largest timeout and body sum of resolved items
+     * and the summed W61_TIER_INTERVAL_MS of the distinct sources.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61SourcePlanBatch(array $items): array
+    {
+        return self::usesW61RustFfi() ? self::w61SourcePlanBatchNative($items) : self::w61SourcePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61SourcePlanBatchNative(array $items): array
+    {
+        return self::w61Invoke($items, \count($items) + self::W61_PREDB_FEED_SOURCE_FACTORY_TRAILER) ?? self::w61SourcePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61SourcePlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $statuses = [0, 0, 0, 0, 0, 0];
+        $kinds = [0, 0, 0];
+        $tiers = $pageStates = $timeoutStates = $bodyStates = [0, 0, 0, 0];
+        $duplicates = $mask = $pageSum = $maxTimeout = $bodySum = $intervals = 0;
+        foreach ($items as $item) {
+            [$rawKey, $rawPage, $rawTimeout, $rawBody] = explode('|', (string) $item, 4) + ['', '', '', ''];
+            $key = trim($rawKey);
+            $length = \strlen($key);
+            $entry = null;
+            if ($length === 0) {
+                $status = 0;
+            } elseif (($entry = self::W48_SOURCES[$key] ?? null) !== null) {
+                $status = 1;
+            } elseif ($length > 32) {
+                $status = 5;
+            } else {
+                $normal = strtolower(strtr($key, '- ', '__'));
+                if (($entry = self::W48_SOURCES[$normal] ?? null) !== null) {
+                    $status = 2;
+                } elseif (isset(self::W61_SOURCE_ALIASES[$normal])) {
+                    $entry = self::W48_SOURCES[self::W61_SOURCE_ALIASES[$normal]];
+                    $status = 3;
+                } else {
+                    $status = 4;
+                }
+            }
+            [$pageState, $page] = self::w61Bounded($rawPage, 100, 1, 1000);
+            [$timeoutState, $timeout] = self::w61Bounded($rawTimeout, 15, 1, 120);
+            [$bodyState, $body] = self::w61Bounded($rawBody, 1048576, 1024, 67108864);
+            $index = -1;
+            $kind = $flags = $tier = $duplicate = 0;
+            if ($entry !== null) {
+                [$index, $kind, $flags, $tier] = $entry;
+                if ($kind === 1) {
+                    $page = min($page, self::W61_RSS_PAGE_CAP);
+                }
+                if (($mask >> $index & 1) === 1) {
+                    $duplicate = 1;
+                } else {
+                    $mask |= 1 << $index;
+                    $intervals += self::W61_TIER_INTERVAL_MS[$tier];
+                }
+                $kinds[$kind]++;
+                $tiers[$tier]++;
+                $pageSum += $page;
+                $maxTimeout = max($maxTimeout, $timeout);
+                $bodySum += $body;
+            }
+            $statuses[$status]++;
+            $pageStates[$pageState]++;
+            $timeoutStates[$timeoutState]++;
+            $bodyStates[$bodyState]++;
+            $duplicates += $duplicate;
+            $out[] = $status | ($index + 1) << 3 | $kind << 9 | $flags << 11 | $tier << 18 | $pageState << 20 | $timeoutState << 22
+                | $bodyState << 24 | $page << 26 | $timeout << 36 | $duplicate << 43 | min($length, 63) << 44;
+        }
+        array_push($out, ...$statuses, ...$kinds, ...$tiers, ...$pageStates, ...$timeoutStates, ...$bodyStates);
+        array_push($out, $duplicates, $mask, $pageSum, $maxTimeout, $bodySum, $intervals);
+
+        return $out;
+    }
+
+    /**
+     * Trimmed setting of up to 9 digits: [0, default] empty, [1, value] in range, [2, clamped] or [3, default] malformed.
+     *
+     * @return array{int, int}
+     */
+    private static function w61Bounded(string $raw, int $default, int $min, int $max): array
+    {
+        $value = trim($raw);
+        $length = \strlen($value);
+        if ($length === 0) {
+            return [0, $default];
+        }
+        if ($length > 9 || strspn($value, '0123456789') !== $length) {
+            return [3, $default];
+        }
+        $number = (int) $value;
+
+        return $number >= $min && $number <= $max ? [1, $number] : [2, max($min, min($max, $number))];
+    }
+
+    /**
+     * Wave 61 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('predb_w613', self::W61_PREDB_FEED_SOURCE_FACTORY_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 61.3 PredbFeedSourceFactory export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w61Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w61RustFfiState('ffi');
+            $out = self::w61RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w61RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W61_PREDB_FEED_SOURCE_FACTORY_FFI_CDEF.)
+            $written = $ffi->nntmux_w613_predb_feed_source_factory_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
