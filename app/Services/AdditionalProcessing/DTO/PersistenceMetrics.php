@@ -7,6 +7,7 @@ namespace App\Services\AdditionalProcessing\DTO;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
+use InvalidArgumentException;
 use Throwable;
 
 final class PersistenceMetrics
@@ -519,5 +520,270 @@ final class PersistenceMetrics
         }
 
         return $values === false ? null : array_values($values);
+    }
+
+    // ========================================================================
+    // WAVE 64.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 1000-round paired runs reached 1.94x common mean, 1.62x common p99, 1.79x uncommon mean and 1.83x uncommon p99; see RustAdditionalSourcePlanPar2EntryPersistenceSlicerContainerW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    private const string W64_FFI_CDEF = 'ssize_t nntmux_w644_persistence_metrics_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w64PersistenceMetricsPlanBatch() record. */
+    public const int W64_ROW_WORDS = 4;
+
+    /** int64 summary words after the w64PersistenceMetricsPlanBatch() records (none for an empty batch). */
+    public const int W64_TRAILER_WORDS = 16;
+
+    private const array W64_KINDS = ['media' => 1, 'audio' => 2, 'video' => 3, 'nfo' => 4, 'file' => 5];
+
+    private const int W64_VALUE_CAP = (1 << 40) - 1;
+
+    /**
+     * Persistence counter and latency rollup rows for [artifact kind, error message, release id,
+     * write microseconds, rows written, bytes written] writes.
+     *
+     * Kinds (trimmed, case-insensitive): 1 media, 2 audio, 3 video, 4 nfo, 5 file, else 0. A write
+     * succeeded when its trimmed error is empty. Latencies and bytes clamp to [0, 2^40), rows to
+     * [0, 2^24); latency buckets are <1ms, <10ms, <100ms, <1s and longer. Flags: 1 succeeded, 2 the
+     * release already wrote this kind, 4 release id < 1, 8 unknown kind. Release ordinals number
+     * distinct release ids by first appearance.
+     *
+     * Rows [kind | flags << 4 | bucket << 8 | rows << 12 | trimmed error length << 40 (clamped to
+     * 4095), fnv1a32(trimmed error) (0 when empty), microseconds, release ordinal], then the trailer
+     * [writes, other, media, audio, video, nfo and file writes, failures, repeated release kinds,
+     * distinct releases, total microseconds, longest write, its first index, rows, bytes, FNV-1a
+     * digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function w64PersistenceMetricsPlanBatch(array $items): array
+    {
+        return self::usesW64RustFfi() ? self::w64PersistenceMetricsPlanBatchNative($items) : self::w64PersistenceMetricsPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function w64PersistenceMetricsPlanBatchPhp(array $items): array
+    {
+        self::w64Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = $seen = $releases = [];
+        $t = array_fill(0, self::W64_TRAILER_WORDS, 0);
+        $t[0] = \count($items);
+        $t[12] = -1;
+        $max = -1;
+        $digest = 2_166_136_261;
+        foreach ($items as $i => [$kind, $error, $release, $micros, $rows, $bytes]) {
+            $code = self::W64_KINDS[strtolower(trim($kind))] ?? 0;
+            $error = trim($error);
+            $micros = max(0, min($micros, self::W64_VALUE_CAP));
+            $rows = max(0, min($rows, 0xFFFFFF));
+            $bytes = max(0, min($bytes, self::W64_VALUE_CAP));
+            $ok = $error === '';
+            $dup = isset($seen[$release][$code]);
+            $seen[$release][$code] = true;
+            $ordinal = $releases[$release] ??= \count($releases);
+            $flags = ($ok ? 1 : 0) | ($dup ? 2 : 0) | ($release <= 0 ? 4 : 0) | ($code === 0 ? 8 : 0);
+            $hash = self::w64Fnv($error);
+            $bucket = $micros < 1_000 ? 0 : ($micros < 10_000 ? 1 : ($micros < 100_000 ? 2 : ($micros < 1_000_000 ? 3 : 4)));
+            $word = $code | $flags << 4 | $bucket << 8 | $rows << 12 | min(\strlen($error), 0xFFF) << 40;
+            array_push($out, $word, $hash, $micros, $ordinal);
+            $t[1 + $code]++;
+            if (! $ok) {
+                $t[7]++;
+            }
+            if ($dup) {
+                $t[8]++;
+            }
+            $t[10] += $micros;
+            if ($micros > $max) {
+                $max = $micros;
+                $t[12] = $i;
+            }
+            $t[13] += $rows;
+            $t[14] += $bytes;
+            $value = $word ^ $hash << 20 ^ $micros;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $t[9] = \count($releases);
+        $t[11] = $max;
+        $t[15] = $digest;
+
+        return [...$out, ...$t];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function w64PersistenceMetricsPlanBatchNative(array $items): array
+    {
+        self::w64Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w64Join([array_column($items, 0), array_column($items, 1)]);
+        $ints = pack('P*', ...array_column($items, 2), ...array_column($items, 3), ...array_column($items, 4), ...array_column($items, 5));
+
+        return self::w64Call($blob, $twin, $ints, $count, $count * self::W64_ROW_WORDS + self::W64_TRAILER_WORDS)
+            ?? self::w64PersistenceMetricsPlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w64Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W64 persistence metrics plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 6 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_int($item[2]) || ! \is_int($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5])) {
+                throw new InvalidArgumentException('W64 persistence metrics plan batch items must be [string kind, string error, int release id, int microseconds, int rows, int bytes] lists.');
+            }
+        }
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $enabled = self::w64RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('enabled', true);
+    }
+
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('enabled', false);
+    }
+
+    /** Drop the W64 override, binding, output buffer and declined-call count; routing returns to W64_RUST_FFI_DEFAULT. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W64 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('enabled');
+        self::w64RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w64Join(array $columns): array
+    {
+        $values = array_merge(...$columns);
+        $joined = implode("\0", $values);
+
+        return substr_count($joined, "\0") === \count($values) - 1 ? [$joined, ''] : [$joined, implode("\x01", $values)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w64Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w64RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w64', self::W64_FFI_CDEF) ?? false;
+            self::w64RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w64RustFfiState('out', $out);
+                self::w64RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W64_FFI_CDEF.)
+            $written = $ffi->nntmux_w644_persistence_metrics_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w64RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W64 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int, 0 for an empty string. */
+    private static function w64Fnv(string $bytes): int
+    {
+        if ($bytes === '') {
+            return 0;
+        }
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
     }
 }

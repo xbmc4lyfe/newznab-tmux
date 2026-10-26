@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace App\Services\AdditionalProcessing\DTO;
 
+use App\Services\AdditionalProcessing\Enums\VideoContainer;
 use App\Services\Par2FileList;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
+use InvalidArgumentException;
 use Throwable;
 
 /**
@@ -359,5 +362,311 @@ final readonly class Par2FileEntry
 
         return (substr_count($data, "\0") === 2 * $count - 1 ? self::w52Words($count, $data, '', 3 * $count) : null)
             ?? self::volumePlanBatchPhp($entries);
+    }
+
+    // ========================================================================
+    // WAVE 64.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 1000-round paired runs reached 3.74x common mean, 3.09x common p99, 3.24x uncommon mean and 3.11x uncommon p99; see RustAdditionalSourcePlanPar2EntryPersistenceSlicerContainerW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    private const string W64_FFI_CDEF = 'ssize_t nntmux_w644_par2_file_entry_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w64Par2FileEntryPlanBatch() record. */
+    public const int W64_ROW_WORDS = 5;
+
+    /** int64 summary words after the w64Par2FileEntryPlanBatch() records (none for an empty batch). */
+    public const int W64_TRAILER_WORDS = 10;
+
+    private const array W64_CONTAINER_CODES = ['matroska' => 1, 'avi' => 2, 'mpeg' => 3, 'mpegts' => 4, 'mov' => 5, 'asf' => 6, 'ogg' => 7];
+
+    private const string W64_SAMPLE = '/(?:^|[\\\\\/._ -])sample(?:[\\\\\/._ -]|$)/i';
+
+    private const int W64_VALUE_CAP = (1 << 40) - 1;
+
+    /**
+     * PAR2 file entry plan rows for [name, hash16k, size] descriptors.
+     *
+     * Roles, first match wins: 6 `.volN+M.par2` (number `N | M << 20`), 5 `.par2`, 2
+     * `.partN.rar` (number N) or `.rar`, 3 `.rNN`, 4 `.NNN`, 7 `.7z`, 8 `.zip`, 1 a
+     * VideoContainer::fromFileName() video, 9 `.nfo`, 10 audio, 11 image, else 0 (suffixes are
+     * case-insensitive; number -1 when absent). Hash classes: 0 empty, 1 32 hex digits with an
+     * upper-case one, 2 32 lower-case hex digits, 3 other. Flags: 1 repeated name, 2 repeated
+     * (lower-cased) valid hash, 4 sample name, 8 size < 1, 16 empty name. The 16k slice covers
+     * min(size, 16384) bytes (0 for size < 1).
+     *
+     * Rows [role | hash class << 4 | flags << 8 | container << 16 | name length << 20 (clamped
+     * to 2^16 - 1) | slice << 36, fnv1a32(name) (0 when empty), the first 15 hex digits of a
+     * valid hash as an int (-1 otherwise), size (clamped to [0, 2^40)), number], then the trailer
+     * [records, media, archive volumes (roles 2, 3, 4, 7, 8), PAR2 files, other, valid hashes,
+     * repeated names, repeated hashes, total size, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: int}>  $items
+     * @return list<int>
+     */
+    public static function w64Par2FileEntryPlanBatch(array $items): array
+    {
+        return self::usesW64RustFfi() ? self::w64Par2FileEntryPlanBatchNative($items) : self::w64Par2FileEntryPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int}>  $items
+     * @return list<int>
+     */
+    public static function w64Par2FileEntryPlanBatchPhp(array $items): array
+    {
+        self::w64Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = $names = $hashes = [];
+        $t = [\count($items), 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        foreach ($items as [$name, $hash, $raw]) {
+            $video = VideoContainer::fromFileName($name);
+            $container = $video === null ? 0 : self::W64_CONTAINER_CODES[$video->value];
+            [$role, $number] = self::w64Role($name, $container);
+            $class = match (true) {
+                $hash === '' => 0,
+                \strlen($hash) !== 32 || strspn($hash, '0123456789abcdefABCDEF') !== 32 => 3,
+                strspn($hash, '0123456789abcdef') === 32 => 2,
+                default => 1,
+            };
+            $size = max(0, min($raw, self::W64_VALUE_CAP));
+            $dupName = isset($names[$name]);
+            $names[$name] = true;
+            $dupHash = false;
+            $prefix = -1;
+            if ($class === 1 || $class === 2) {
+                $lower = strtolower($hash);
+                $dupHash = isset($hashes[$lower]);
+                $hashes[$lower] = true;
+                $prefix = (int) hexdec(substr($lower, 0, 15));
+                $t[5]++;
+            }
+            $flags = ($dupName ? 1 : 0) | ($dupHash ? 2 : 0) | (preg_match(self::W64_SAMPLE, $name) === 1 ? 4 : 0) | ($raw <= 0 ? 8 : 0) | ($name === '' ? 16 : 0);
+            $nameHash = self::w64Fnv($name);
+            $word = $role | $class << 4 | $flags << 8 | $container << 16 | min(\strlen($name), 0xFFFF) << 20 | ($raw > 0 ? min($raw, 16_384) : 0) << 36;
+            array_push($out, $word, $nameHash, $prefix, $size, $number);
+            $t[match ($role) {
+                1 => 1,
+                2, 3, 4, 7, 8 => 2,
+                5, 6 => 3,
+                default => 4,
+            }]++;
+            $t[6] += $dupName ? 1 : 0;
+            $t[7] += $dupHash ? 1 : 0;
+            $t[8] += $size;
+            $value = $word ^ $nameHash << 12 ^ $number;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $t[9] = $digest;
+
+        return [...$out, ...$t];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int}>  $items
+     * @return list<int>
+     */
+    public static function w64Par2FileEntryPlanBatchNative(array $items): array
+    {
+        self::w64Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w64Join([array_column($items, 0), array_column($items, 1)]);
+        $ints = pack('P*', ...array_column($items, 2));
+
+        return self::w64Call($blob, $twin, $ints, $count, $count * self::W64_ROW_WORDS + self::W64_TRAILER_WORDS)
+            ?? self::w64Par2FileEntryPlanBatchPhp($items);
+    }
+
+    /**
+     * [role, number] of a PAR2-described name; see w64Par2FileEntryPlanBatch().
+     *
+     * @return array{0: int, 1: int}
+     */
+    private static function w64Role(string $name, int $container): array
+    {
+        if (preg_match('/\.vol(\d{1,5})\+(\d{1,5})\.par2$/iD', $name, $match) === 1) {
+            return [6, (int) $match[1] | (int) $match[2] << 20];
+        }
+        if (preg_match('/\.par2$/iD', $name) === 1) {
+            return [5, -1];
+        }
+        if (preg_match('/\.part(\d{1,4})\.rar$/iD', $name, $match) === 1) {
+            return [2, (int) $match[1]];
+        }
+        if (preg_match('/\.rar$/iD', $name) === 1) {
+            return [2, -1];
+        }
+        if (preg_match('/\.r(\d{2,3})$/iD', $name, $match) === 1) {
+            return [3, (int) $match[1]];
+        }
+        if (preg_match('/\.(\d{3})$/D', $name, $match) === 1) {
+            return [4, (int) $match[1]];
+        }
+
+        return match (true) {
+            preg_match('/\.7z$/iD', $name) === 1 => [7, -1],
+            preg_match('/\.zip$/iD', $name) === 1 => [8, -1],
+            $container !== 0 => [1, -1],
+            preg_match('/\.nfo$/iD', $name) === 1 => [9, -1],
+            preg_match('/\.(?:mp3|flac|m4a|ogg|wav)$/iD', $name) === 1 => [10, -1],
+            preg_match('/\.(?:jpe?g|png|gif)$/iD', $name) === 1 => [11, -1],
+            default => [0, -1],
+        };
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w64Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W64 PAR2 file entry plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 3 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_int($item[2])) {
+                throw new InvalidArgumentException('W64 PAR2 file entry plan batch items must be [string name, string hash16k, int size] lists.');
+            }
+        }
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $enabled = self::w64RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('enabled', true);
+    }
+
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('enabled', false);
+    }
+
+    /** Drop the W64 override, binding, output buffer and declined-call count; routing returns to W64_RUST_FFI_DEFAULT. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W64 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('enabled');
+        self::w64RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w64Join(array $columns): array
+    {
+        $values = array_merge(...$columns);
+        $joined = implode("\0", $values);
+
+        return substr_count($joined, "\0") === \count($values) - 1 ? [$joined, ''] : [$joined, implode("\x01", $values)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w64Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w64RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w64', self::W64_FFI_CDEF) ?? false;
+            self::w64RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w64RustFfiState('out', $out);
+                self::w64RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W64_FFI_CDEF.)
+            $written = $ffi->nntmux_w644_par2_file_entry_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w64RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W64 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int, 0 for an empty string. */
+    private static function w64Fnv(string $bytes): int
+    {
+        if ($bytes === '') {
+            return 0;
+        }
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
     }
 }
