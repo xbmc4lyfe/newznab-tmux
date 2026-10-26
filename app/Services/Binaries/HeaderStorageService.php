@@ -965,4 +965,262 @@ final class HeaderStorageService
                 return $enabled;
         }
     }
+
+    // ---- Wave 66.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 5.55x/5.25x, uncommon 5.91x/4.97x); see RustBinariesCollectionHeaderParserStorageTxMissedPartW66ParityTest. */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    private const string W66_HEADER_STORAGE_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w662_header_storage_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W66_HEADER_STORAGE_TAIL = 15;
+
+    /**
+     * Wave 66 routing, binding and output buffer, kept in function-local statics (no static or
+     * instance properties). Operations: null reads the routing override, 'set' replaces it
+     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
+     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
+     * (null without the library).
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'reset':
+                $previous = $enabled;
+                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w66', self::W66_HEADER_STORAGE_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w66RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    /** Routes w66HeaderStoragePlanBatch() to Rust until reset. */
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', true);
+    }
+
+    /** Routes w66HeaderStoragePlanBatch() to PHP until reset. */
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', false);
+    }
+
+    /** Restores W66_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('reset');
+    }
+
+    public static function usesW66RustFfi(): bool
+    {
+        $enabled = self::w66RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W66_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w66HeaderStoragePlanBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w66HeaderStoragePlanBatch(array $rows): array
+    {
+        return self::usesW66RustFfi() ? self::w66HeaderStoragePlanBatchNative($rows) : self::w66HeaderStoragePlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w66HeaderStoragePlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W66_HEADER_STORAGE_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w66RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w66HeaderStoragePlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W66_HEADER_STORAGE_FFI_CDEF.)
+            $written = $ffi->nntmux_w662_header_storage_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w66HeaderStoragePlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w66Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w66Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /** Parts, payload bytes or new collections that close a storage chunk. */
+    private const int W66_STORAGE_CHUNK_PARTS = 500;
+
+    private const int W66_STORAGE_CHUNK_BYTES = 8_388_608;
+
+    private const int W66_STORAGE_CHUNK_COLLECTIONS = 100;
+
+    /**
+     * Wave 66.2 storage flush plan. Per `collection_key\tbinary_hash\tpart\tmessage_id\tbytes` row
+     * `action | new_collection << 2 | new_binary << 3 | flushed << 4 | flush_reason << 5 |
+     * min(collection, 65535) << 7 | min(binary, 65535) << 23 | min(chunk, 4095) << 39 |
+     * min(part, 4095) << 51`. Collection key and message id are trimmed, the binary hash trimmed
+     * and lowercased; part and bytes are w66Int() fields of 6 and 12 digits. No collection key,
+     * binary hash or message id, no positive part or unparsable bytes is malformed (action 0); a
+     * repeated message id is a duplicate (2), a repeated collection/binary/part a duplicate part
+     * (3); otherwise the part is stored (1) under its collection and binary ordinals (first
+     * sight in the batch sets the new flags) and joins the pending chunk. A stored part that
+     * brings the chunk to W66_STORAGE_CHUNK_PARTS parts (reason 1), W66_STORAGE_CHUNK_BYTES bytes
+     * (2) or W66_STORAGE_CHUNK_COLLECTIONS new collections (3) flushes it; chunk is the index of
+     * the chunk the row belongs to. Then four action counts, collections, binaries, flushes, the
+     * pending parts, bytes and new collections, the largest flushed chunk, stored bytes, the most
+     * parts of one binary, distinct message ids and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w66HeaderStoragePlanBatchPhp(array $rows): array
+    {
+        $out = $mids = $parts = $colls = $bins = [];
+        $actions = array_fill(0, 4, 0);
+        $flushes = $pendingParts = $pendingBytes = $pendingColls = $maxChunk = $newBytes = $maxBinParts = 0;
+        foreach ($rows as $row) {
+            [$ck, $bh, $part, $mid, $bytes] = explode("\t", (string) $row, 5) + ['', '', '', '', ''];
+            $ck = trim($ck);
+            $bh = strtolower(trim($bh));
+            $mid = trim($mid);
+            $part = self::w66Int($part, 6);
+            $pn = \is_int($part) && $part > 0 ? $part : 0;
+            $bytes = self::w66Int($bytes, 12);
+            $b = \is_int($bytes) ? $bytes : 0;
+            $newColl = $newBin = $flushed = false;
+            $reason = $collOrd = $binOrd = 0;
+            $chunk = $flushes;
+            if ($ck === '' || $bh === '' || $pn === 0 || $mid === '' || $bytes === false) {
+                $action = 0;
+            } elseif (isset($mids[$mid])) {
+                $action = 2;
+            } else {
+                $mids[$mid] = true;
+                $binKey = \strlen($ck).':'.$ck.$bh;
+                $partKey = $binKey.':'.$pn;
+                if (isset($parts[$partKey])) {
+                    $action = 3;
+                } else {
+                    $parts[$partKey] = true;
+                    if (! isset($colls[$ck])) {
+                        $colls[$ck] = \count($colls);
+                        $newColl = true;
+                    }
+                    $collOrd = $colls[$ck];
+                    if (! isset($bins[$binKey])) {
+                        $bins[$binKey] = [\count($bins), 0];
+                        $newBin = true;
+                    }
+                    $binOrd = $bins[$binKey][0];
+                    $maxBinParts = max($maxBinParts, ++$bins[$binKey][1]);
+                    $pendingParts++;
+                    $pendingBytes += $b;
+                    $pendingColls += (int) $newColl;
+                    $newBytes += $b;
+                    $reason = match (true) {
+                        $pendingParts >= self::W66_STORAGE_CHUNK_PARTS => 1,
+                        $pendingBytes >= self::W66_STORAGE_CHUNK_BYTES => 2,
+                        $pendingColls >= self::W66_STORAGE_CHUNK_COLLECTIONS => 3,
+                        default => 0,
+                    };
+                    if ($reason !== 0) {
+                        $flushed = true;
+                        $flushes++;
+                        $maxChunk = max($maxChunk, $pendingParts);
+                        $pendingParts = $pendingBytes = $pendingColls = 0;
+                    }
+                    $action = 1;
+                }
+            }
+            $actions[$action]++;
+            $out[] = $action | (int) $newColl << 2 | (int) $newBin << 3 | (int) $flushed << 4 | $reason << 5 | min($collOrd, 0xFFFF) << 7 | min($binOrd, 0xFFFF) << 23
+                | min($chunk, 0xFFF) << 39 | min($pn, 0xFFF) << 51;
+        }
+        array_push($out, ...$actions);
+        array_push($out, \count($colls), \count($bins), $flushes, $pendingParts, $pendingBytes, $pendingColls, $maxChunk, $newBytes, $maxBinParts, \count($mids));
+        $out[] = self::w66Digest($out);
+
+        return $out;
+    }
 }
