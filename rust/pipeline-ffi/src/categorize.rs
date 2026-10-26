@@ -56258,3 +56258,1272 @@ pub mod games_gdpr_genre_igdb_client_exception_w673 {
         }
     }
 }
+
+pub mod monitoring_horizon_verification_status_tmux_grafana_w683 {
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hasher};
+
+    /// Declined call: bad pointers, lengths or alignment, overlapping buffers, a count that does
+    /// not match the items, or a panic.
+    const DECLINE: isize = -1;
+
+    /// Largest accepted item count.
+    const MAX_COUNT: usize = 1 << 24;
+
+    /// Cap for running totals.
+    const TOTAL_CAP: i64 = 1 << 62;
+
+    type Batch = fn(&[&[u8]]) -> Vec<i64>;
+
+    /// Byte-wise FNV-1a hasher for the per-call key sets; keys never outlive one call.
+    #[derive(Default)]
+    struct KeyHasher(u64);
+
+    impl Hasher for KeyHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            let mut hash = self.0 ^ 0xCBF2_9CE4_8422_2325;
+            for &b in bytes {
+                hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            self.0 = hash;
+        }
+
+        fn write_u8(&mut self, value: u8) {
+            self.0 = (self.0 ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+
+        fn write_u64(&mut self, value: u64) {
+            self.0 = (self.0 ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn write_i64(&mut self, value: i64) {
+            self.write_u64(value as u64);
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.write_u64(value as u64);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0 ^ (self.0 >> 31)
+        }
+    }
+
+    type KeySet<T> = HashSet<T, BuildHasherDefault<KeyHasher>>;
+
+    fn trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    /// PHP `trim()` with its default characters.
+    fn ptrim(s: &[u8]) -> &[u8] {
+        let Some(start) = s.iter().position(|&b| !trim_byte(b)) else {
+            return &[];
+        };
+        let end = s.iter().rposition(|&b| !trim_byte(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// PHP `explode('|', $item, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(item: &[u8]) -> [&[u8]; N] {
+        let mut out: [&[u8]; N] = [&[]; N];
+        let mut rest = item;
+        for (i, slot) in out.iter_mut().enumerate() {
+            if i + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'|') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn digits_value(t: &[u8]) -> i64 {
+        t.iter()
+            .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0'))
+    }
+
+    fn all_digits(t: &[u8]) -> bool {
+        t.iter().all(u8::is_ascii_digit)
+    }
+
+    /// (0 empty, 1 one to `max` ASCII digits, 2 other; the value) for the trimmed field.
+    fn count_state(s: &[u8], max: usize) -> (i64, i64) {
+        let t = ptrim(s);
+        if t.is_empty() {
+            return (0, 0);
+        }
+        if t.len() > max || !all_digits(t) {
+            return (2, 0);
+        }
+        (1, digits_value(t))
+    }
+
+    /// The trimmed field, caselessly matched against `words`: 0 empty, 1-based index, or the
+    /// word count + 1.
+    fn keyword(s: &[u8], words: &[&[u8]]) -> i64 {
+        let t = ptrim(s);
+        if t.is_empty() {
+            return 0;
+        }
+        words
+            .iter()
+            .position(|w| t.eq_ignore_ascii_case(w))
+            .map_or(words.len() as i64 + 1, |p| p as i64 + 1)
+    }
+
+    fn total(acc: i64, value: i64) -> i64 {
+        (acc + value).min(TOTAL_CAP)
+    }
+
+    /// Byte length of the decimal form of a non-negative value.
+    fn decimal_len(mut value: i64) -> i64 {
+        let mut len = 1;
+        while value >= 10 {
+            value /= 10;
+            len += 1;
+        }
+        len
+    }
+
+    // ---------------------------------------------------------------------
+    // HorizonCollector
+    // ---------------------------------------------------------------------
+
+    const HORIZON_STATUSES: [&[u8]; 4] = [b"running", b"paused", b"inactive", b"terminating"];
+
+    /// Wait seconds that mark a queue as warning, then critical.
+    const HORIZON_WAIT_WARN: i64 = 60;
+    const HORIZON_WAIT_CRITICAL: i64 = 300;
+
+    /// Longest valid queue name.
+    const HORIZON_QUEUE_MAX: usize = 64;
+
+    fn queue_name_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-')
+    }
+
+    /// `HorizonCollector::w68HorizonCollectorPlanBatch()`.
+    fn horizon_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 23);
+        let mut decisions = [0i64; 7];
+        let mut statuses = [0i64; 6];
+        let mut levels = [0i64; 3];
+        let (mut samples_total, mut length_sum, mut process_sum, mut max_wait) =
+            (0i64, 0i64, 0i64, 0i64);
+        let mut first_critical = 0i64;
+        let mut supervisors: KeySet<Vec<u8>> = KeySet::default();
+        let mut queues: KeySet<&[u8]> = KeySet::default();
+        for (index, item) in items.iter().enumerate() {
+            let [f_sup, f_status, f_queue, f_length, f_wait, f_proc, f_tput] = fields::<7>(item);
+            let supervisor = ptrim(f_sup);
+            let status = keyword(f_status, &HORIZON_STATUSES);
+            let queue = ptrim(f_queue);
+            let name_state = if queue.is_empty() {
+                0
+            } else if queue.len() <= HORIZON_QUEUE_MAX && queue.iter().all(|&b| queue_name_byte(b))
+            {
+                1
+            } else {
+                2
+            };
+            let skip = queue == b"release-fingerprint";
+            let (ls, length) = count_state(f_length, 9);
+            let (ws, wait) = count_state(f_wait, 9);
+            let (ps, processes) = count_state(f_proc, 4);
+            let (ts, throughput) = count_state(f_tput, 9);
+            let level = if wait >= HORIZON_WAIT_CRITICAL {
+                2
+            } else if wait >= HORIZON_WAIT_WARN {
+                1
+            } else {
+                0
+            };
+            let drain = if ts == 1 && throughput > 0 {
+                (length * 60 + throughput - 1) / throughput
+            } else {
+                0
+            };
+            let decision = if status == 5 || name_state == 2 || ls == 2 || ws == 2 || ps == 2 || ts == 2
+            {
+                6
+            } else if name_state == 0 || skip {
+                0
+            } else if length == 0 {
+                3
+            } else if status != 1 {
+                1
+            } else if processes == 0 {
+                2
+            } else if level >= 1 || drain >= HORIZON_WAIT_CRITICAL {
+                4
+            } else {
+                5
+            };
+            let samples = if (1..=5).contains(&decision) {
+                3 + i64::from(ts == 1)
+            } else {
+                0
+            };
+            decisions[decision as usize] += 1;
+            statuses[status as usize] += 1;
+            levels[level as usize] += 1;
+            samples_total += samples;
+            if (1..=5).contains(&decision) {
+                length_sum = total(length_sum, length);
+                process_sum = total(process_sum, processes);
+                max_wait = max_wait.max(wait);
+                if level == 2 && first_critical == 0 {
+                    first_critical = index as i64 + 1;
+                }
+            }
+            if !supervisor.is_empty() {
+                supervisors.insert(supervisor.to_ascii_lowercase());
+            }
+            if name_state == 1 {
+                queues.insert(queue);
+            }
+            out.push(
+                status
+                    | name_state << 3
+                    | i64::from(skip) << 5
+                    | ls << 6
+                    | ws << 8
+                    | ps << 10
+                    | ts << 12
+                    | level << 14
+                    | decision << 16
+                    | samples << 19
+                    | processes.min(1023) << 22
+                    | drain.min((1 << 20) - 1) << 32
+                    | (queue.len() as i64).min(255) << 52,
+            );
+        }
+        out.extend_from_slice(&decisions);
+        out.extend_from_slice(&statuses);
+        out.extend_from_slice(&levels);
+        out.extend_from_slice(&[
+            samples_total,
+            length_sum,
+            process_sum,
+            max_wait,
+            first_critical,
+            supervisors.len() as i64,
+            queues.len() as i64,
+        ]);
+        out
+    }
+
+    // ---------------------------------------------------------------------
+    // ReleaseVerificationCollector
+    // ---------------------------------------------------------------------
+
+    const VERIFY_STATUSES: [&[u8]; 11] = [
+        b"verified",
+        b"ready",
+        b"pending",
+        b"waiting_upload",
+        b"verifying",
+        b"unknown",
+        b"header_rejected",
+        b"dirty",
+        b"unrepairable",
+        b"quarantined",
+        b"failed",
+    ];
+
+    /// Verification latency histogram bounds in milliseconds.
+    const VERIFY_BUCKETS: [i64; 7] = [100, 250, 500, 1000, 2500, 5000, 10_000];
+
+    /// In-flight age after which a candidate counts as stale.
+    const VERIFY_STALE_SECONDS: i64 = 3600;
+
+    /// `ReleaseVerificationCollector::w68ReleaseVerificationCollectorPlanBatch()`.
+    fn verification_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 36);
+        let mut buckets = [0i64; 7];
+        let mut statuses = [0i64; 13];
+        let mut histogram = [0i64; 9];
+        let (mut duration_sum, mut bytes_sum, mut stale_count, mut max_attempts) =
+            (0i64, 0i64, 0i64, 0i64);
+        let mut first_failed = 0i64;
+        for (index, item) in items.iter().enumerate() {
+            let [f_status, f_bytes, f_duration, f_attempts, f_age] = fields::<5>(item);
+            let status_text = ptrim(f_status);
+            let status = keyword(f_status, &VERIFY_STATUSES);
+            let (bs, bytes) = count_state(f_bytes, 15);
+            let (ds, duration) = count_state(f_duration, 9);
+            let (ats, attempts) = count_state(f_attempts, 3);
+            let (ags, age) = count_state(f_age, 10);
+            let bucket = if status == 12 || bs == 2 || ds == 2 || ats == 2 || ags == 2 {
+                6
+            } else {
+                match status {
+                    0 => 0,
+                    1 | 2 => 1,
+                    3..=6 => 2,
+                    7 | 8 => 3,
+                    9 | 10 => 4,
+                    _ => 5,
+                }
+            };
+            let hist = if ds == 1 {
+                VERIFY_BUCKETS
+                    .iter()
+                    .position(|&b| duration <= b)
+                    .map_or(8, |p| p as i64 + 1)
+            } else {
+                0
+            };
+            let stale = bucket == 2 && age >= VERIFY_STALE_SECONDS;
+            let bps = if ds == 1 && duration > 0 {
+                bytes * 1000 / duration
+            } else {
+                0
+            };
+            buckets[bucket as usize] += 1;
+            statuses[status as usize] += 1;
+            histogram[hist as usize] += 1;
+            stale_count += i64::from(stale);
+            if bucket != 6 {
+                if ds == 1 {
+                    duration_sum = total(duration_sum, duration);
+                }
+                bytes_sum = total(bytes_sum, bytes);
+                max_attempts = max_attempts.max(attempts);
+            }
+            if bucket == 5 && first_failed == 0 {
+                first_failed = index as i64 + 1;
+            }
+            out.push(
+                status
+                    | bucket << 4
+                    | bs << 7
+                    | ds << 9
+                    | ats << 11
+                    | ags << 13
+                    | hist << 15
+                    | i64::from(stale) << 19
+                    | attempts.min(255) << 20
+                    | (bps / 1024).min((1 << 24) - 1) << 28
+                    | (status_text.len() as i64).min(63) << 52,
+            );
+        }
+        let terminal = buckets[1] + buckets[3] + buckets[4] + buckets[5];
+        let (quarantine_ppm, failure_ppm) = if terminal > 0 {
+            (
+                buckets[4] * 1_000_000 / terminal,
+                (buckets[3] + buckets[4] + buckets[5]) * 1_000_000 / terminal,
+            )
+        } else {
+            (0, 0)
+        };
+        out.extend_from_slice(&buckets);
+        out.extend_from_slice(&statuses);
+        out.extend_from_slice(&histogram);
+        out.extend_from_slice(&[
+            duration_sum,
+            bytes_sum,
+            quarantine_ppm,
+            failure_ppm,
+            stale_count,
+            max_attempts,
+            first_failed,
+        ]);
+        out
+    }
+
+    // ---------------------------------------------------------------------
+    // ServiceStatusCollector
+    // ---------------------------------------------------------------------
+
+    const SERVICE_STATUSES: [&[u8]; 5] = [
+        b"operational",
+        b"degraded",
+        b"partial_outage",
+        b"major_outage",
+        b"maintenance",
+    ];
+
+    /// Probe words: the first six read as up, the rest as down.
+    const PROBE_WORDS: [&[u8]; 11] = [
+        b"1", b"true", b"yes", b"up", b"ok", b"pass", b"0", b"false", b"no", b"down", b"fail",
+    ];
+
+    /// Check age after which a stored probe counts as stale.
+    const SERVICE_STALE_SECONDS: i64 = 300;
+
+    /// 0 empty, 1 up, 2 down or 3 malformed.
+    fn probe_state(s: &[u8]) -> i64 {
+        match keyword(s, &PROBE_WORDS) {
+            0 => 0,
+            1..=6 => 1,
+            7..=11 => 2,
+            _ => 3,
+        }
+    }
+
+    /// `ServiceStatusCollector::w68ServiceStatusCollectorPlanBatch()`.
+    fn service_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 29);
+        let mut decisions = [0i64; 7];
+        let mut statuses = [0i64; 7];
+        let mut levels = [0i64; 5];
+        let mut severities = [0i64; 4];
+        let (mut alerts, mut up_count, mut latency_sum, mut max_latency) = (0i64, 0i64, 0i64, 0i64);
+        let mut first_critical = 0i64;
+        let mut services: KeySet<Vec<u8>> = KeySet::default();
+        for (index, item) in items.iter().enumerate() {
+            let [f_service, f_status, f_latency, f_ready, f_live, f_age] = fields::<6>(item);
+            let service = ptrim(f_service);
+            let status = keyword(f_status, &SERVICE_STATUSES);
+            let (ls, latency) = count_state(f_latency, 9);
+            let level = if ls != 1 {
+                0
+            } else if latency < 250 {
+                1
+            } else if latency < 1000 {
+                2
+            } else if latency < 5000 {
+                3
+            } else {
+                4
+            };
+            let ready = probe_state(f_ready);
+            let live = probe_state(f_live);
+            let (ags, age) = count_state(f_age, 10);
+            let stale = ags == 1 && age > SERVICE_STALE_SECONDS;
+            let mut severity = match status {
+                2 => 1,
+                3 => 2,
+                4 => 3,
+                _ => 0,
+            };
+            if level == 3 {
+                severity = severity.max(1);
+            }
+            if level == 4 || ready == 2 {
+                severity = severity.max(2);
+            }
+            if live == 2 {
+                severity = 3;
+            }
+            let up = (status == 1 || status == 2) && live != 2 && ready != 2;
+            let decision = if status == 6 || ls == 2 || ags == 2 || ready == 3 || live == 3 {
+                6
+            } else if service.is_empty() || status == 0 {
+                0
+            } else if status == 5 {
+                1
+            } else if stale {
+                2
+            } else if severity == 3 {
+                3
+            } else if severity >= 1 {
+                4
+            } else {
+                5
+            };
+            let alert = decision == 3 || decision == 4;
+            decisions[decision as usize] += 1;
+            statuses[status as usize] += 1;
+            levels[level as usize] += 1;
+            severities[severity as usize] += 1;
+            alerts += i64::from(alert);
+            up_count += i64::from(up);
+            if ls == 1 && decision != 6 {
+                latency_sum = total(latency_sum, latency);
+                max_latency = max_latency.max(latency);
+            }
+            if decision == 3 && first_critical == 0 {
+                first_critical = index as i64 + 1;
+            }
+            if !service.is_empty() {
+                services.insert(service.to_ascii_lowercase());
+            }
+            out.push(
+                status
+                    | ls << 3
+                    | level << 5
+                    | ready << 8
+                    | live << 10
+                    | ags << 12
+                    | i64::from(stale) << 14
+                    | i64::from(up) << 15
+                    | severity << 16
+                    | i64::from(alert) << 18
+                    | decision << 19
+                    | latency.min((1 << 24) - 1) << 22
+                    | (service.len() as i64).min(255) << 46,
+            );
+        }
+        out.extend_from_slice(&decisions);
+        out.extend_from_slice(&statuses);
+        out.extend_from_slice(&levels);
+        out.extend_from_slice(&severities);
+        out.extend_from_slice(&[
+            alerts,
+            up_count,
+            latency_sum,
+            max_latency,
+            first_critical,
+            services.len() as i64,
+        ]);
+        out
+    }
+
+    // ---------------------------------------------------------------------
+    // TmuxSnapshotCollector
+    // ---------------------------------------------------------------------
+
+    const TMUX_COMMANDS: [&[u8]; 10] = [
+        b"update_binaries",
+        b"backfill",
+        b"releases",
+        b"postprocess",
+        b"fixnames",
+        b"removecrap",
+        b"predb",
+        b"sharing",
+        b"idle",
+        b"monitor",
+    ];
+
+    /// Activity ages closing the fresh, idle and stale windows.
+    const TMUX_FRESH_SECONDS: i64 = 300;
+    const TMUX_IDLE_SECONDS: i64 = 900;
+    const TMUX_STALE_SECONDS: i64 = 3600;
+
+    /// `session:window.pane` with a `[A-Za-z0-9_-]+` session and one to four digit indexes:
+    /// (session, window, pane).
+    fn pane_target(pane: &[u8]) -> Option<(&[u8], i64, i64)> {
+        let colon = pane.iter().position(|&b| b == b':')?;
+        let session = &pane[..colon];
+        if session.is_empty()
+            || !session
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return None;
+        }
+        let rest = &pane[colon + 1..];
+        let dot = rest.iter().position(|&b| b == b'.')?;
+        let (window, index) = (&rest[..dot], &rest[dot + 1..]);
+        let shaped = |d: &[u8]| (1..=4).contains(&d.len()) && all_digits(d);
+        if !shaped(window) || !shaped(index) {
+            return None;
+        }
+        Some((session, digits_value(window), digits_value(index)))
+    }
+
+    /// `TmuxSnapshotCollector::w68TmuxSnapshotCollectorPlanBatch()`.
+    fn tmux_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 24);
+        let mut decisions = [0i64; 7];
+        let mut windows = [0i64; 4];
+        let mut categories = [0i64; 7];
+        let (mut backlog_sum, mut processed_sum, mut max_age, mut stale_age) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut oldest_stale, mut active_count) = (0i64, 0i64);
+        let mut sessions: KeySet<&[u8]> = KeySet::default();
+        for (index, item) in items.iter().enumerate() {
+            let [f_pane, f_command, f_age, f_backlog, f_processed, f_active] = fields::<6>(item);
+            let pane = ptrim(f_pane);
+            let target = pane_target(pane);
+            let pane_state = if pane.is_empty() {
+                0
+            } else if target.is_some() {
+                1
+            } else {
+                2
+            };
+            let (window_index, pane_index) = target.map_or((0, 0), |(_, w, p)| (w, p));
+            let command = keyword(f_command, &TMUX_COMMANDS);
+            let category = match command {
+                0 => 0,
+                1 | 2 => 1,
+                3 => 2,
+                4 | 5 => 3,
+                6..=8 => 4,
+                9 | 10 => 5,
+                _ => 6,
+            };
+            let (ags, age) = count_state(f_age, 10);
+            let (bs, backlog) = count_state(f_backlog, 12);
+            let (prs, processed) = count_state(f_processed, 12);
+            let active = match count_state(f_active, 1) {
+                (0, _) => 0,
+                (1, 1) => 1,
+                (1, 0) => 2,
+                _ => 3,
+            };
+            let window = if ags != 1 || age <= TMUX_FRESH_SECONDS {
+                0
+            } else if age <= TMUX_IDLE_SECONDS {
+                1
+            } else if age <= TMUX_STALE_SECONDS {
+                2
+            } else {
+                3
+            };
+            let decision = if pane_state == 2 || ags == 2 || bs == 2 || prs == 2 || active == 3 {
+                6
+            } else if pane_state == 0 {
+                0
+            } else if category == 0 || category == 5 {
+                1
+            } else if window == 3 {
+                2
+            } else if backlog > 0 && window == 2 {
+                3
+            } else if active == 1 && backlog > 0 {
+                4
+            } else {
+                5
+            };
+            let rate = if ags == 1 && age > 0 {
+                processed * 60 / age
+            } else {
+                processed
+            };
+            decisions[decision as usize] += 1;
+            windows[window as usize] += 1;
+            categories[category as usize] += 1;
+            active_count += i64::from(active == 1);
+            if decision != 6 {
+                backlog_sum = total(backlog_sum, backlog);
+                processed_sum = total(processed_sum, processed);
+                if ags == 1 {
+                    max_age = max_age.max(age);
+                }
+                if window >= 2 && (oldest_stale == 0 || age > stale_age) {
+                    stale_age = age;
+                    oldest_stale = index as i64 + 1;
+                }
+            }
+            if let Some((session, _, _)) = target {
+                sessions.insert(session);
+            }
+            out.push(
+                pane_state
+                    | command << 2
+                    | category << 6
+                    | ags << 9
+                    | bs << 11
+                    | prs << 13
+                    | active << 15
+                    | window << 17
+                    | decision << 19
+                    | window_index.min(255) << 22
+                    | pane_index.min(255) << 30
+                    | rate.min((1 << 20) - 1) << 38,
+            );
+        }
+        out.extend_from_slice(&decisions);
+        out.extend_from_slice(&windows);
+        out.extend_from_slice(&categories);
+        out.extend_from_slice(&[
+            backlog_sum,
+            processed_sum,
+            max_age,
+            oldest_stale,
+            active_count,
+            sessions.len() as i64,
+        ]);
+        out
+    }
+
+    // ---------------------------------------------------------------------
+    // GrafanaEmbedService
+    // ---------------------------------------------------------------------
+
+    const GRAFANA_THEMES: [&[u8]; 3] = [b"light", b"dark", b"system"];
+
+    /// Kiosk words: the first three read as kiosk, `tv` as TV mode, the rest as off.
+    const GRAFANA_KIOSK: [&[u8]; 7] = [b"1", b"true", b"kiosk", b"tv", b"0", b"false", b"off"];
+
+    /// Longest valid dashboard UID.
+    const GRAFANA_UID_MAX: usize = 40;
+
+    /// `from` and `to` used when the field is empty.
+    const GRAFANA_DEFAULT_FROM: &[u8] = b"now-6h";
+    const GRAFANA_DEFAULT_TO: &[u8] = b"now";
+
+    fn grafana_unit(b: u8) -> Option<i64> {
+        Some(match b {
+            b's' => 1,
+            b'm' => 60,
+            b'h' => 3600,
+            b'd' => 86_400,
+            b'w' => 604_800,
+            b'M' => 2_592_000,
+            b'y' => 31_536_000,
+            _ => return None,
+        })
+    }
+
+    /// Seconds before now for `now[-<1-6 digits><unit>][/<unit>]`.
+    fn relative_offset(t: &[u8]) -> Option<i64> {
+        let mut rest = t.strip_prefix(b"now")?;
+        let mut offset = 0;
+        if let Some(after) = rest.strip_prefix(b"-") {
+            let run = after.iter().take_while(|b| b.is_ascii_digit()).count();
+            if !(1..=6).contains(&run) || run >= after.len() {
+                return None;
+            }
+            offset = digits_value(&after[..run]) * grafana_unit(after[run])?;
+            rest = &after[run + 1..];
+        }
+        match rest {
+            [] => Some(offset),
+            [b'/', unit] => grafana_unit(*unit).map(|_| offset),
+            _ => None,
+        }
+    }
+
+    /// (0 empty, 1 relative, 2 epoch milliseconds, 3 invalid; the offset or milliseconds).
+    fn range_state(t: &[u8]) -> (i64, i64) {
+        if t.is_empty() {
+            return (0, 0);
+        }
+        if let Some(offset) = relative_offset(t) {
+            return (1, offset);
+        }
+        if t.len() <= 13 && all_digits(t) {
+            return (2, digits_value(t));
+        }
+        (3, 0)
+    }
+
+    /// 32-bit FNV-1a, as PHP `hash('fnv1a32', ...)`.
+    fn fnv1a32(parts: &[&[u8]]) -> i64 {
+        let mut hash: u32 = 0x811C_9DC5;
+        for part in parts {
+            for &b in *part {
+                hash = (hash ^ u32::from(b)).wrapping_mul(0x0100_0193);
+            }
+        }
+        i64::from(hash)
+    }
+
+    /// `GrafanaEmbedService::w68GrafanaEmbedServicePlanBatch()`.
+    fn grafana_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 30);
+        let mut decisions = [0i64; 6];
+        let mut from_states = [0i64; 4];
+        let mut to_states = [0i64; 4];
+        let mut themes = [0i64; 5];
+        let mut kiosks = [0i64; 5];
+        let (mut max_span, mut url_sum, mut first_panel, mut signatures) = (0i64, 0i64, 0i64, 0i64);
+        let mut uids: KeySet<&[u8]> = KeySet::default();
+        let mut panels: KeySet<(&[u8], i64)> = KeySet::default();
+        for (index, item) in items.iter().enumerate() {
+            let [f_uid, f_panel, f_from, f_to, f_theme, f_kiosk, f_org] = fields::<7>(item);
+            let uid = ptrim(f_uid);
+            let uid_state = if uid.is_empty() {
+                0
+            } else if uid.len() <= GRAFANA_UID_MAX
+                && uid
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            {
+                1
+            } else {
+                2
+            };
+            let (ps, panel) = count_state(f_panel, 9);
+            let kind = match (ps, panel) {
+                (0, _) => 1,
+                (1, p) if p > 0 => 2,
+                _ => 3,
+            };
+            let from_text = ptrim(f_from);
+            let to_text = ptrim(f_to);
+            let (fs, from_value) = range_state(from_text);
+            let (ts, to_value) = range_state(to_text);
+            let from_text = if fs == 0 { GRAFANA_DEFAULT_FROM } else { from_text };
+            let to_text = if ts == 0 { GRAFANA_DEFAULT_TO } else { to_text };
+            let from_value = if fs == 0 { 21_600 } else { from_value };
+            let theme = keyword(f_theme, &GRAFANA_THEMES);
+            let kiosk = match keyword(f_kiosk, &GRAFANA_KIOSK) {
+                0 => 0,
+                1..=3 => 1,
+                4 => 2,
+                5..=7 => 3,
+                _ => 4,
+            };
+            let (mut os, mut org) = count_state(f_org, 9);
+            if os == 0 {
+                org = 1;
+            } else if os == 1 && org == 0 {
+                os = 2;
+            }
+            let relative = fs <= 1 && ts <= 1;
+            let absolute = fs == 2 && ts == 2;
+            let span = if relative {
+                from_value - to_value
+            } else if absolute {
+                (to_value - from_value) / 1000
+            } else {
+                0
+            };
+            let decision = if uid_state == 2
+                || kind == 3
+                || fs == 3
+                || ts == 3
+                || theme == 4
+                || kiosk == 4
+                || os == 2
+            {
+                5
+            } else if uid_state == 0 {
+                0
+            } else if !relative && !absolute {
+                2
+            } else if span <= 0 {
+                1
+            } else if kind == 2 {
+                4
+            } else {
+                3
+            };
+            let (mut url_len, mut signature) = (0i64, 0i64);
+            if decision == 3 || decision == 4 {
+                let theme_len = match theme {
+                    1 => 5,
+                    2 => 4,
+                    3 => 6,
+                    _ => -7,
+                };
+                url_len = if kind == 2 { 8 + 9 + decimal_len(panel) } else { 3 }
+                    + uid.len() as i64
+                    + 7
+                    + decimal_len(org)
+                    + 6
+                    + from_text.len() as i64
+                    + 4
+                    + to_text.len() as i64
+                    + 7
+                    + theme_len
+                    + match kiosk {
+                        0 | 1 => 6,
+                        2 => 9,
+                        _ => 0,
+                    };
+                let panel_text = panel.to_string();
+                let theme_text = theme.to_string();
+                let kiosk_text = kiosk.to_string();
+                let org_text = org.to_string();
+                signature = fnv1a32(&[
+                    uid,
+                    b"\n",
+                    panel_text.as_bytes(),
+                    b"\n",
+                    from_text,
+                    b"\n",
+                    to_text,
+                    b"\n",
+                    theme_text.as_bytes(),
+                    b"\n",
+                    kiosk_text.as_bytes(),
+                    b"\n",
+                    org_text.as_bytes(),
+                ]);
+                max_span = max_span.max(span);
+                url_sum = total(url_sum, url_len);
+                signatures ^= signature;
+            }
+            if decision == 4 {
+                panels.insert((uid, panel));
+                if first_panel == 0 {
+                    first_panel = index as i64 + 1;
+                }
+            }
+            if uid_state == 1 {
+                uids.insert(uid);
+            }
+            decisions[decision as usize] += 1;
+            from_states[fs as usize] += 1;
+            to_states[ts as usize] += 1;
+            themes[theme as usize] += 1;
+            kiosks[kiosk as usize] += 1;
+            out.push(
+                uid_state
+                    | (kind - 1) << 2
+                    | fs << 4
+                    | ts << 6
+                    | theme << 8
+                    | kiosk << 11
+                    | os << 14
+                    | decision << 16
+                    | url_len.min(1023) << 19
+                    | signature << 29,
+            );
+        }
+        out.extend_from_slice(&decisions);
+        out.extend_from_slice(&from_states);
+        out.extend_from_slice(&to_states);
+        out.extend_from_slice(&themes);
+        out.extend_from_slice(&kiosks);
+        out.extend_from_slice(&[
+            uids.len() as i64,
+            panels.len() as i64,
+            max_span,
+            url_sum,
+            first_panel,
+            signatures,
+        ]);
+        out
+    }
+
+    // ---------------------------------------------------------------------
+    // Exports
+    // ---------------------------------------------------------------------
+
+    /// Byte ranges `[a, a + a_len)` and `[b, b + b_len)` share a byte.
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// Validates the buffers, splits the items (on NUL, or by the `lens` column when non-null),
+    /// runs `body` under `catch_unwind` and copies its words to `out`.
+    ///
+    /// # Safety
+    /// Non-null pointers must be valid for their lengths (`blob` for `blob_len` bytes, `lens` for
+    /// `count` and `out` for `out_cap` `i64`s).
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        lens: *const i64,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        body: Batch,
+    ) -> isize {
+        let align = std::mem::align_of::<i64>();
+        if out.is_null()
+            || !(out as usize).is_multiple_of(align)
+            || (blob.is_null() && blob_len != 0)
+            || blob_len > isize::MAX as usize
+            || out_cap > isize::MAX as usize / 8
+            || count > MAX_COUNT
+            || (!lens.is_null() && !(lens as usize).is_multiple_of(align))
+        {
+            return DECLINE;
+        }
+        let out_bytes = out_cap * 8;
+        if (!blob.is_null() && overlaps(out as usize, out_bytes, blob as usize, blob_len))
+            || (!lens.is_null() && overlaps(out as usize, out_bytes, lens as usize, count * 8))
+        {
+            return DECLINE;
+        }
+        let blob: &[u8] = if blob.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(blob, blob_len) }
+        };
+        let lens: Option<&[i64]> =
+            (!lens.is_null()).then(|| unsafe { std::slice::from_raw_parts(lens, count) });
+        let result = std::panic::catch_unwind(|| {
+            let mut items: Vec<&[u8]> = Vec::with_capacity(count);
+            match lens {
+                Some(lens) => {
+                    let mut offset = 0usize;
+                    for &len in lens {
+                        let end = offset.checked_add(usize::try_from(len).ok()?)?;
+                        items.push(blob.get(offset..end)?);
+                        offset = end;
+                    }
+                    if offset != blob.len() {
+                        return None;
+                    }
+                }
+                None if count == 0 => {
+                    if !blob.is_empty() {
+                        return None;
+                    }
+                }
+                None => {
+                    items.extend(blob.split(|&b| b == 0));
+                    if items.len() != count {
+                        return None;
+                    }
+                }
+            }
+            Some(body(&items))
+        });
+        let Ok(Some(values)) = result else {
+            return DECLINE;
+        };
+        if values.len() > out_cap {
+            return -(values.len() as isize);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len());
+        }
+        values.len() as isize
+    }
+
+    macro_rules! w683_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// Items are NUL-joined in `blob`, or concatenated with their byte lengths in `lens`
+            /// when it is non-null. Returns the word count, `-needed` when `out_cap` is too small,
+            /// or `-1` when it declines (null or misaligned `out`, misaligned `lens`, null `blob`
+            /// with a length, `out` overlapping `blob` or `lens`, `count` other than the number of
+            /// NUL-separated items, `lens` that do not tile `blob`, or a panic).
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`blob` for `blob_len` bytes,
+            /// `lens` for `count` and `out` for `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run(blob, blob_len, lens, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w683_export!(
+        /// `HorizonCollector::w68HorizonCollectorPlanBatch()`.
+        nntmux_w683_horizon_collector_batch => horizon_plan
+    );
+    w683_export!(
+        /// `ReleaseVerificationCollector::w68ReleaseVerificationCollectorPlanBatch()`.
+        nntmux_w683_release_verification_collector_batch => verification_plan
+    );
+    w683_export!(
+        /// `ServiceStatusCollector::w68ServiceStatusCollectorPlanBatch()`.
+        nntmux_w683_service_status_collector_batch => service_plan
+    );
+    w683_export!(
+        /// `TmuxSnapshotCollector::w68TmuxSnapshotCollectorPlanBatch()`.
+        nntmux_w683_tmux_snapshot_collector_batch => tmux_plan
+    );
+    w683_export!(
+        /// `GrafanaEmbedService::w68GrafanaEmbedServicePlanBatch()`.
+        nntmux_w683_grafana_embed_service_batch => grafana_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        /// Each export with the words an empty batch writes.
+        const EXPORTS: [(Export, isize); 5] = [
+            (nntmux_w683_horizon_collector_batch, 23),
+            (nntmux_w683_release_verification_collector_batch, 36),
+            (nntmux_w683_service_status_collector_batch, 29),
+            (nntmux_w683_tmux_snapshot_collector_batch, 24),
+            (nntmux_w683_grafana_embed_service_batch, 30),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        #[test]
+        fn w683_helpers() {
+            assert_eq!(count_state(b" 12 ", 6), (1, 12));
+            assert_eq!(count_state(b"1234567", 6), (2, 0));
+            assert_eq!(keyword(b" Running ", &HORIZON_STATUSES), 1);
+            assert_eq!(keyword(b"nope", &HORIZON_STATUSES), 5);
+            assert_eq!(decimal_len(0), 1);
+            assert_eq!(decimal_len(1000), 4);
+            assert_eq!(pane_target(b"nntmux:0.1"), Some((&b"nntmux"[..], 0, 1)));
+            assert_eq!(pane_target(b"nn tmux:0.1"), None);
+            assert_eq!(pane_target(b"nntmux:00000.1"), None);
+            assert_eq!(pane_target(b":0.1"), None);
+            assert_eq!(relative_offset(b"now"), Some(0));
+            assert_eq!(relative_offset(b"now-6h"), Some(21_600));
+            assert_eq!(relative_offset(b"now-1d/d"), Some(86_400));
+            assert_eq!(relative_offset(b"now/M"), Some(0));
+            assert_eq!(relative_offset(b"now-6"), None);
+            assert_eq!(relative_offset(b"now-1234567d"), None);
+            assert_eq!(relative_offset(b"now-6x"), None);
+            assert_eq!(range_state(b"1700000000000"), (2, 1_700_000_000_000));
+            assert_eq!(range_state(b"17000000000000"), (3, 0));
+            assert_eq!(fnv1a32(&[b"hello"]), 0x4F9F_2CAB);
+            assert_eq!(fnv1a32(&[b"hel", b"lo"]), 0x4F9F_2CAB);
+        }
+
+        #[test]
+        fn w683_items() {
+            let horizon = call(
+                nntmux_w683_horizon_collector_batch,
+                &[
+                    b"master-1|running|default|10|5|2|120",
+                    b"master-1|running|release-fingerprint|10|5|2|",
+                    b"master-2|paused|default|10|5|2|",
+                    b"master-2|running|slow|10|400|2|",
+                    b"x|bogus|default|1|1|1|1",
+                    b"x|running|q|0|0|0|",
+                ],
+            );
+            assert_eq!(horizon[0] >> 16 & 7, 5);
+            assert_eq!(horizon[0] >> 19 & 7, 4);
+            assert_eq!(horizon[0] >> 32 & 0xF_FFFF, 5);
+            assert_eq!(horizon[1] >> 16 & 7, 0);
+            assert_eq!(horizon[2] >> 16 & 7, 1);
+            assert_eq!(horizon[3] >> 16 & 7, 4);
+            assert_eq!(horizon[3] >> 14 & 3, 2);
+            assert_eq!(horizon[4] >> 16 & 7, 6);
+            assert_eq!(horizon[5] >> 16 & 7, 3);
+            assert_eq!(horizon[6..13], [1, 1, 0, 1, 1, 1, 1]);
+            assert_eq!(horizon[6 + 16..], [13, 30, 6, 400, 4, 3, 4]);
+
+            let verify = call(
+                nntmux_w683_release_verification_collector_batch,
+                &[
+                    b"verified|1048576|500|1|10",
+                    b"pending|0||0|7200",
+                    b"quarantined|10||2|0",
+                    b"failed|10|20000|3|0",
+                    b"bogus|1|1|1|1",
+                ],
+            );
+            assert_eq!(verify[0] >> 4 & 7, 1);
+            assert_eq!(verify[0] >> 15 & 15, 3);
+            assert_eq!(verify[0] >> 28 & 0xFF_FFFF, 2048);
+            assert_eq!(verify[1] >> 4 & 7, 2);
+            assert_eq!(verify[1] >> 19 & 1, 1);
+            assert_eq!(verify[2] >> 4 & 7, 4);
+            assert_eq!(verify[3] >> 15 & 15, 8);
+            assert_eq!(verify[4] >> 4 & 7, 6);
+            assert_eq!(verify[5 + 29 + 2..], [333_333, 666_666, 1, 3, 4]);
+
+            let service = call(
+                nntmux_w683_service_status_collector_batch,
+                &[
+                    b"NNTP|operational|120|ok|ok|10",
+                    b"Redis|degraded|50|ok|ok|10",
+                    b"DB|operational|50|ok|down|10",
+                    b"Search|maintenance|||| ",
+                    b"API|operational|50|||400",
+                    b"Bad|operational|x|||",
+                ],
+            );
+            assert_eq!(service[0] >> 19 & 7, 5);
+            assert_eq!(service[1] >> 19 & 7, 4);
+            assert_eq!(service[1] >> 18 & 1, 1);
+            assert_eq!(service[2] >> 19 & 7, 3);
+            assert_eq!(service[3] >> 19 & 7, 1);
+            assert_eq!(service[4] >> 19 & 7, 2);
+            assert_eq!(service[5] >> 19 & 7, 6);
+
+            let tmux = call(
+                nntmux_w683_tmux_snapshot_collector_batch,
+                &[
+                    b"nntmux:0.1|update_binaries|30|100|600|1",
+                    b"nntmux:1.0|releases|1800|5|0|0",
+                    b"nntmux:2.0|postprocess|7200|0|0|0",
+                    b"nntmux:3.0|monitor|0|0|0|",
+                    b"bad pane|releases|0|0|0|",
+                ],
+            );
+            assert_eq!(tmux[0] >> 19 & 7, 4);
+            assert_eq!(tmux[0] >> 38, 1200);
+            assert_eq!(tmux[0] >> 30 & 0xFF, 1);
+            assert_eq!(tmux[1] >> 19 & 7, 3);
+            assert_eq!(tmux[2] >> 19 & 7, 2);
+            assert_eq!(tmux[3] >> 19 & 7, 1);
+            assert_eq!(tmux[4] >> 19 & 7, 6);
+            assert_eq!(tmux[5 + 18..], [105, 600, 7200, 3, 1, 1]);
+
+            let grafana = call(
+                nntmux_w683_grafana_embed_service_batch,
+                &[
+                    b"nntmux-overview||||dark||",
+                    b"nntmux-overview|4|now-1h|now|light|tv|2",
+                    b"abc||now|now-1h|||",
+                    b"abc||1700000000000|now|||",
+                    b"abc||1700000000000|1700003600000|||",
+                    b"bad uid!||||||",
+                ],
+            );
+            assert_eq!(grafana[0] >> 16 & 7, 3);
+            assert_eq!(grafana[0] >> 19 & 1023, 3 + 15 + 7 + 1 + 6 + 6 + 4 + 3 + 7 + 4 + 6);
+            assert_eq!(grafana[1] >> 16 & 7, 4);
+            assert_eq!(grafana[2] >> 16 & 7, 1);
+            assert_eq!(grafana[3] >> 16 & 7, 2);
+            assert_eq!(grafana[4] >> 16 & 7, 3);
+            assert_eq!(grafana[5] >> 16 & 7, 5);
+            assert_eq!(grafana[6..12], [0, 1, 1, 2, 1, 1]);
+        }
+
+        #[test]
+        fn w683_exports_guard_their_buffers() {
+            let mut buf = [0i64; 128];
+            let o = buf.as_mut_ptr();
+            let n = ptr::null::<i64>();
+            for (f, trailer) in EXPORTS {
+                unsafe {
+                    assert_eq!(f(b"x".as_ptr(), 1, n, 1, ptr::null_mut(), 128), -1);
+                    assert_eq!(f(ptr::null(), 1, n, 1, o, 128), -1);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 1, o, 128), -1);
+                    assert_eq!(f(b"a".as_ptr(), 1, n, 0, o, 128), -1);
+                    assert_eq!(f(ptr::null(), 0, n, 0, o, 128), trailer);
+                    assert_eq!(f(ptr::null(), 0, n, 1, o, 128), trailer + 1);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 2, o, 1), -(trailer + 2));
+                    assert_eq!(f(b"a".as_ptr(), 1, n, 1, o, usize::MAX), -1);
+                    assert_eq!(f(b"a".as_ptr(), 1, n, MAX_COUNT + 1, o, 128), -1);
+                    let lens = [1i64, 2];
+                    assert_eq!(
+                        f(b"a\0b".as_ptr(), 3, lens.as_ptr(), 2, o, 128),
+                        trailer + 2
+                    );
+                    assert_eq!(f(b"a\0bc".as_ptr(), 4, lens.as_ptr(), 2, o, 128), -1);
+                    let negative = [-1i64, 4];
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, negative.as_ptr(), 2, o, 128), -1);
+                    // Misaligned output and length columns decline.
+                    let misaligned = (o as *mut u8).add(1) as *mut i64;
+                    assert_eq!(f(b"a".as_ptr(), 1, n, 1, misaligned, 64), -1);
+                    let lens_bytes = [0u8; 24];
+                    let odd = lens_bytes.as_ptr().add(1) as *const i64;
+                    assert_eq!(f(b"a".as_ptr(), 1, odd, 1, o, 128), -1);
+                    // Output overlapping the blob or the length column declines.
+                    let mut shared = [0i64; 64];
+                    let s = shared.as_mut_ptr();
+                    assert_eq!(f(s as *const u8, 8, n, 1, s, 64), -1);
+                    assert_eq!(f(b"a".as_ptr(), 1, s as *const i64, 1, s, 64), -1);
+                    assert_eq!(f(s as *const u8, 0, n, 1, s, 64), trailer + 1);
+                }
+            }
+        }
+    }
+}
