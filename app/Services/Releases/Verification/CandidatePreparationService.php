@@ -10,6 +10,7 @@ use FFI\CData;
 use Illuminate\Database\Connection;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use InvalidArgumentException;
 use stdClass;
 use Throwable;
 
@@ -494,5 +495,303 @@ final class CandidatePreparationService
         $words[] = $digest[1];
 
         return $words;
+    }
+
+    // ========================================================================
+    // WAVE 63.4 BATCH HELPER
+    // ========================================================================
+
+    /** Disabled: the minimum of three 1000-round paired runs reached 1.54x common mean and 1.61x common p99 but only 1.33x uncommon mean and 1.38x uncommon p99, so PHP stays the default; see RustVerificationAdmissionInventoryPrepRepoSampleBatchW63ParityTest. */
+    public const bool W63_RUST_FFI_DEFAULT = false;
+
+    private const string W63_FFI_CDEF = 'ssize_t nntmux_w634_candidate_preparation_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w63PreparationPlanBatch() record. */
+    public const int W63_ROW_WORDS = 4;
+
+    /** int64 summary words after the w63PreparationPlanBatch() records (none for an empty batch). */
+    public const int W63_TRAILER_WORDS = 12;
+
+    private const array W63_STATUS_CODES = ['ready' => 0, 'waiting_upload' => 1, 'header_rejected' => 2, 'unknown' => 3];
+
+    /** Control bytes and DEL, which no manifest path may hold. */
+    private const string W63_CONTROL = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f";
+
+    private const int W63_REASON_BYTES = 2000;
+
+    private const int W63_MAX_ATTEMPTS = 8;
+
+    private const int W63_BYTES_MAX = 1 << 36;
+
+    /**
+     * Preparation disposition plan rows for [assessment status, reason, manifest path, NZB bytes,
+     * PAR2 files, sample articles, attempts, retry seconds] items.
+     *
+     * Status codes follow planAssessmentUpdates() (0 ready, 1 waiting_upload, 2 header_rejected,
+     * 3 unknown, 4 other); the stored reason is its first 2000 bytes. Manifest paths are class 0
+     * empty, 1 relative, 2 absolute or 3 control bytes or a `..` segment, with extension 1 .json,
+     * 2 .json.gz, 3 .json.zst or 0 other. Readiness bits: 1 NZB bytes, 2 PAR2 files, 4 sample
+     * articles. Disposition: 1 reject, 2 give up (unknown after 8 attempts), 3 retry after
+     * min(retry seconds (1..86400) << min(attempts, 6), 604800), 4 wait for upload, 5 broken
+     * manifest path, 6 NZB pending, 7 no sample, 8 verify, 9 unknown status. Verify rows score
+     * 100, plus 50 with PAR2 files, plus the sample articles clamped to 0..64.
+     *
+     * Rows [disposition | status << 4 | path class << 8 | extension << 10 | readiness << 12 |
+     * stored reason length << 16 | attempts << 32 (clamped to 65535), fnv1a32(stored reason) (0
+     * when empty), retry delay (-1), score], then the trailer [one count per disposition,
+     * positive NZB bytes (each clamped to 2^36), longest delay (-1), FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int}>  $items
+     * @return list<int>
+     */
+    public static function w63PreparationPlanBatch(array $items): array
+    {
+        return self::usesW63RustFfi() ? self::w63PreparationPlanBatchNative($items) : self::w63PreparationPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int}>  $items
+     * @return list<int>
+     */
+    public static function w63PreparationPlanBatchPhp(array $items): array
+    {
+        self::w63Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $summary = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0];
+        $digest = 2_166_136_261;
+        foreach ($items as [$status, $reason, $manifestPath, $nzb, $par2, $samples, $attempts, $retrySeconds]) {
+            $code = self::W63_STATUS_CODES[$status] ?? 4;
+            $text = substr($reason, 0, self::W63_REASON_BYTES);
+            if ($manifestPath === '') {
+                $path = $ext = 0;
+            } else {
+                $path = strcspn($manifestPath, self::W63_CONTROL) !== \strlen($manifestPath) || str_contains('/'.$manifestPath.'/', '/../') ? 3
+                    : ($manifestPath[0] === '/' ? 2 : 1);
+                $ext = match (true) {
+                    str_ends_with($manifestPath, '.json') => 1,
+                    str_ends_with($manifestPath, '.json.gz') => 2,
+                    str_ends_with($manifestPath, '.json.zst') => 3,
+                    default => 0,
+                };
+            }
+            $attempts = max(0, min(1_000_000, $attempts));
+            $readiness = ($nzb > 0 ? 1 : 0) | ($par2 > 0 ? 2 : 0) | ($samples > 0 ? 4 : 0);
+            $delay = -1;
+            if ($code === 2) {
+                $disposition = 1;
+            } elseif ($code === 3) {
+                if ($attempts >= self::W63_MAX_ATTEMPTS) {
+                    $disposition = 2;
+                } else {
+                    $delay = min(max(1, min(86_400, $retrySeconds)) << min($attempts, 6), 604_800);
+                    $disposition = 3;
+                }
+            } elseif ($code === 1) {
+                $disposition = 4;
+            } elseif ($code === 4) {
+                $disposition = 9;
+            } elseif ($path !== 1) {
+                $disposition = 5;
+            } elseif (($readiness & 1) === 0) {
+                $disposition = 6;
+            } elseif (($readiness & 4) === 0) {
+                $disposition = 7;
+            } else {
+                $disposition = 8;
+            }
+            $score = $disposition === 8 ? 100 + ($par2 > 0 ? 50 : 0) + max(0, min(64, $samples)) : 0;
+            $hash = $text === '' ? 0 : self::w63Fnv($text);
+            $word = $disposition | $code << 4 | $path << 8 | $ext << 10 | $readiness << 12 | \strlen($text) << 16 | min($attempts, 0xFFFF) << 32;
+            array_push($out, $word, $hash, $delay, $score);
+            $summary[$disposition - 1]++;
+            if ($nzb > 0) {
+                $summary[9] += min($nzb, self::W63_BYTES_MAX);
+            }
+            if ($delay > $summary[10]) {
+                $summary[10] = $delay;
+            }
+            $value = $word ^ $hash << 20 ^ $delay;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $summary[11] = $digest;
+
+        return [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int}>  $items
+     * @return list<int>
+     */
+    public static function w63PreparationPlanBatchNative(array $items): array
+    {
+        self::w63Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w63Join([array_column($items, 0), array_column($items, 1), array_column($items, 2)], $count);
+        $ints = pack('P*', ...array_column($items, 3), ...array_column($items, 4), ...array_column($items, 5), ...array_column($items, 6), ...array_column($items, 7));
+
+        return self::w63Call($blob, $twin, $ints, $count, $count * self::W63_ROW_WORDS + self::W63_TRAILER_WORDS)
+            ?? self::w63PreparationPlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w63Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W63 candidate preparation plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 8 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_string($item[2]) || ! \is_int($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5]) || ! \is_int($item[6]) || ! \is_int($item[7])) {
+                throw new InvalidArgumentException('W63 candidate preparation plan batch items must be [string status, string reason, string manifest path, int nzb bytes, int par2 files, int sample articles, int attempts, int retry seconds] lists.');
+            }
+        }
+    }
+
+    public static function usesW63RustFfi(): bool
+    {
+        $enabled = self::w63RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W63_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW63RustFfi(): void
+    {
+        self::w63RustFfiState('enabled', true);
+    }
+
+    public static function disableW63RustFfi(): void
+    {
+        self::w63RustFfiState('enabled', false);
+    }
+
+    /** Drop the W63 override, binding, output buffer and declined-call count; routing returns to W63_RUST_FFI_DEFAULT. */
+    public static function resetW63RustFfi(): void
+    {
+        self::w63RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W63 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW63RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w63RustFfiState('enabled');
+        self::w63RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w63RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w63Join(array $columns, int $count): array
+    {
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\0", $column);
+        }
+        $joined = implode("\0", $parts);
+        if (substr_count($joined, "\0") === \count($columns) * $count - 1) {
+            return [$joined, ''];
+        }
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\x01", $column);
+        }
+
+        return [$joined, implode("\x01", $parts)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w63Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w63RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w63', self::W63_FFI_CDEF) ?? false;
+            self::w63RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w63RustFfiState('out', $out);
+                self::w63RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W63_FFI_CDEF.)
+            $written = $ffi->nntmux_w634_candidate_preparation_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w63RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W63 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w63RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int. */
+    private static function w63Fnv(string $bytes): int
+    {
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
     }
 }
