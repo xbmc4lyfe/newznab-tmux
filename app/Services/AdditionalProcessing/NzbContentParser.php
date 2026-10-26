@@ -12,6 +12,7 @@ use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
@@ -904,5 +905,317 @@ class NzbContentParser
             && basename($name) === $name && ! str_contains($name, '\\');
 
         return [$valid ? 2 : 1, $offset + strspn($raw, " \t\n\r\0\x0B"), \strlen($name), isset($match[2]) ? (int) $match[2][0] : -1];
+    }
+
+    // ---- Wave 65.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 6.95x/5.57x, uncommon 6.56x/5.66x); see RustAdditionalNzbParserFileManagerArchiveFallbackProcessorSyncW65ParityTest. */
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    private const string W65_NZB_CONTENT_PARSER_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w652_nzb_content_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W65_NZB_CONTENT_PARSER_TAIL = 30;
+
+    /**
+     * Wave 65 routing, binding and output buffer, kept in function-local statics (no static or
+     * instance properties). Operations: null reads the routing override, 'set' replaces it
+     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
+     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
+     * (null without the library).
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'reset':
+                $previous = $enabled;
+                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w65', self::W65_NZB_CONTENT_PARSER_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w65RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    /** Routes w65NzbContentParserPlanBatch() to Rust until reset. */
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', true);
+    }
+
+    /** Routes w65NzbContentParserPlanBatch() to PHP until reset. */
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', false);
+    }
+
+    /** Restores W65_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('reset');
+    }
+
+    public static function usesW65RustFfi(): bool
+    {
+        $enabled = self::w65RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W65_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w65NzbContentParserPlanBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w65NzbContentParserPlanBatch(array $rows): array
+    {
+        return self::usesW65RustFfi() ? self::w65NzbContentParserPlanBatchNative($rows) : self::w65NzbContentParserPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w65NzbContentParserPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W65_NZB_CONTENT_PARSER_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w65RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w65NzbContentParserPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W65_NZB_CONTENT_PARSER_FFI_CDEF.)
+            $written = $ffi->nntmux_w652_nzb_content_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w65NzbContentParserPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w65Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w65Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /** Extension => class: 1 video, 2 audio, 5 nfo, 6 image, 7 support (archives and PAR2 are matched first). */
+    private const array W65_NZB_CLASSES = ['avi' => 1, 'mkv' => 1, 'mp4' => 1, 'm4v' => 1, 'mov' => 1, 'wmv' => 1, 'mpg' => 1, 'mpeg' => 1, 'ts' => 1,
+        'vob' => 1, 'ogv' => 1, 'rmvb' => 1, 'webm' => 1, 'mp3' => 2, 'flac' => 2, 'ogg' => 2, 'wav' => 2, 'aac' => 2, 'm4a' => 2, 'wma' => 2, 'ape' => 2,
+        'opus' => 2, 'ac3' => 2, 'dts' => 2, 'mka' => 2, 'nfo' => 5, 'jpg' => 6, 'jpeg' => 6, 'png' => 6, 'gif' => 6, 'webp' => 6, 'sfv' => 7, 'srr' => 7,
+        'srs' => 7, 'nzb' => 7, 'txt' => 7];
+
+    private static function w65Digits(string $value): bool
+    {
+        return strspn($value, '0123456789') === \strlen($value);
+    }
+
+    /**
+     * Class (0 other, 1 video, 2 audio, 3 archive, 4 par2, 5 nfo, 6 image, 7 support), group stem
+     * and PAR2 volume flag of a lowercased file name. Archives (`rar`, `7z`, `zip`, `rNN`, `NNN`)
+     * drop a `.partN` (1-4 digits) stem suffix and PAR2 files a `.vol...` one.
+     *
+     * @return array{int, string, bool}
+     */
+    private static function w65NzbClass(string $name): array
+    {
+        $dot = strrpos($name, '.');
+        $base = $dot === false ? $name : substr($name, 0, $dot);
+        $ext = $dot === false ? '' : substr($name, $dot + 1);
+        if ($ext === '') {
+            return [0, $base, false];
+        }
+        $length = \strlen($ext);
+        if ($ext === 'rar' || $ext === '7z' || $ext === 'zip' || ($length === 3 && $ext[0] === 'r' && self::w65Digits(substr($ext, 1)))
+            || ($length === 3 && self::w65Digits($ext))) {
+            $part = strrpos($base, '.');
+            if ($part !== false) {
+                $tail = substr($base, $part + 1);
+                $size = \strlen($tail);
+                if ($size >= 5 && $size <= 8 && str_starts_with($tail, 'part') && self::w65Digits(substr($tail, 4))) {
+                    return [3, substr($base, 0, $part), false];
+                }
+            }
+
+            return [3, $base, false];
+        }
+        if ($ext === 'par2') {
+            $part = strrpos($base, '.');
+
+            return $part !== false && str_starts_with(substr($base, $part + 1), 'vol') ? [4, substr($base, 0, $part), true] : [4, $base, false];
+        }
+
+        return [self::W65_NZB_CLASSES[$ext] ?? 0, $base, false];
+    }
+
+    /**
+     * The last `(part/total)` of a subject (1 to 6 digits each), else `[0, 0]`.
+     *
+     * @return array{int, int}
+     */
+    private static function w65YencPart(string $subject): array
+    {
+        $open = strrpos($subject, '(');
+        if ($open === false) {
+            return [0, 0];
+        }
+        $rest = substr($subject, $open + 1);
+        $slash = strpos($rest, '/');
+        $close = strpos($rest, ')');
+        if ($slash === false || $close === false || $slash < 1 || $slash > 6 || $close <= $slash + 1 || $close - $slash - 1 > 6) {
+            return [0, 0];
+        }
+        $part = substr($rest, 0, $slash);
+        $total = substr($rest, $slash + 1, $close - $slash - 1);
+
+        return self::w65Digits($part) && self::w65Digits($total) ? [(int) $part, (int) $total] : [0, 0];
+    }
+
+    /**
+     * Wave 65.2 NZB content plan. Per `subject\tsegments\tbytes` row `class | sample << 3 | par2_volume
+     * << 4 | quoted << 5 | complete << 6 | malformed << 7 | duplicate << 8 | min(part, 4095) << 9 |
+     * min(total, 4095) << 21 | min(leader, 2^20 - 1) << 33 | (crc32(stem) & 0x3FF) << 53`. The file
+     * name is the trimmed text between the first two quotes (when they hold a byte) or the trimmed
+     * subject, lowercased; class and stem follow w65NzbClass() and part/total the last
+     * `(part/total)` of the subject. Segments and bytes are w65Int() fields (6 and 12 digits); an
+     * unparsable one or an empty name sets malformed. Complete is a known total with at least that
+     * many segments; sample is a name containing `sample`; a non-empty name seen earlier is a
+     * duplicate; the leader is the first row of the same stem. Then eight class row counts, eight
+     * class byte totals, groups, groups with an archive, a PAR2, an NFO and a video or audio file,
+     * sample, PAR2 volume, complete, malformed and duplicate rows, total segments, total bytes,
+     * the highest total and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w65NzbContentParserPlanBatchPhp(array $rows): array
+    {
+        $out = $groups = $info = $names = [];
+        $classCounts = $classBytes = array_fill(0, 8, 0);
+        $sampleRows = $volRows = $completeRows = $malformedRows = $duplicateRows = $totalSegments = $totalBytes = $maxTotal = 0;
+        $index = 0;
+        foreach ($rows as $row) {
+            [$subject, $segments, $bytes] = explode("\t", (string) $row, 3) + ['', '', ''];
+            $name = trim($subject);
+            $quoted = false;
+            $q = strpos($subject, '"');
+            if ($q !== false) {
+                $e = strpos($subject, '"', $q + 1);
+                if ($e !== false && $e > $q + 1) {
+                    $name = trim(substr($subject, $q + 1, $e - $q - 1));
+                    $quoted = true;
+                }
+            }
+            $name = strtolower($name);
+            [$class, $stem, $vol] = self::w65NzbClass($name);
+            [$part, $total] = self::w65YencPart($subject);
+            $segments = self::w65Int($segments, 6);
+            $bytes = self::w65Int($bytes, 12);
+            $malformed = $name === '' || $segments === false || $bytes === false;
+            $size = \is_int($bytes) ? $bytes : 0;
+            $complete = $total > 0 && \is_int($segments) && $segments >= $total;
+            $sample = str_contains($name, 'sample');
+            if (! isset($groups[$stem])) {
+                $groups[$stem] = \count($info);
+                $info[] = [$index, 0];
+            }
+            $group = $groups[$stem];
+            $info[$group][1] |= 1 << $class;
+            $duplicate = false;
+            if ($name !== '') {
+                $duplicate = isset($names[$name]);
+                $names[$name] = true;
+            }
+            $classCounts[$class]++;
+            $classBytes[$class] += $size;
+            $sampleRows += (int) $sample;
+            $volRows += (int) $vol;
+            $completeRows += (int) $complete;
+            $malformedRows += (int) $malformed;
+            $duplicateRows += (int) $duplicate;
+            $totalSegments += \is_int($segments) ? $segments : 0;
+            $totalBytes += $size;
+            $maxTotal = max($maxTotal, $total);
+            $out[] = $class | (int) $sample << 3 | (int) $vol << 4 | (int) $quoted << 5 | (int) $complete << 6 | (int) $malformed << 7 | (int) $duplicate << 8
+                | min($part, 4095) << 9 | min($total, 4095) << 21 | min($info[$group][0], 0xFFFFF) << 33 | (crc32($stem) & 0x3FF) << 53;
+            $index++;
+        }
+        $with = static fn (int $mask): int => \count(array_filter($info, static fn (array $g): bool => ($g[1] & $mask) !== 0));
+        array_push($out, ...$classCounts, ...$classBytes);
+        array_push($out, \count($info), $with(8), $with(16), $with(32), $with(6), $sampleRows, $volRows, $completeRows, $malformedRows, $duplicateRows,
+            $totalSegments, $totalBytes, $maxTotal);
+        $out[] = self::w65Digest($out);
+
+        return $out;
     }
 }
