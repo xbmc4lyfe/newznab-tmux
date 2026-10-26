@@ -45382,3 +45382,779 @@ pub mod wave58_2_constrained_predb_filename_nfo_obfuscated_name_checker {
         }
     }
 }
+
+pub mod wave59_2_tmux_enums_predb_identity_key_season_pack {
+    //! Wave 59.2 batch kernels for the TmuxPaneRole, TmuxPostProcessMode and TmuxSequentialMode
+    //! enums, PredbIdentityKey and SeasonPackDetector in the Wave 49.2 framing: one NUL-joined
+    //! string column (exactly `count` entries) in, one `i64` word per item, a few summary words
+    //! and one XXH64 digest of the preceding words out. Each export returns the word count,
+    //! `-needed` when `out_cap` (in words) is short, or -1 for a null output, a malformed batch,
+    //! an output overlapping the input or a panic. Every rule is byte-level ASCII (no locale
+    //! tables), so the PHP twins agree under any `setlocale()`.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, span,
+    };
+    use std::collections::HashSet;
+
+    /// PHP `trim()`'s default character set.
+    #[inline]
+    fn is_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+    }
+
+    fn trim(s: &[u8]) -> &[u8] {
+        let start = s.iter().position(|&b| !is_trim(b)).unwrap_or(s.len());
+        let end = s
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    fn lower_into(s: &[u8], buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.extend(s.iter().map(u8::to_ascii_lowercase));
+    }
+
+    /// `[+-]?[0-9]+` as a value no larger than `max`: `Some(Some(v))` in range, `Some(None)`
+    /// numeric but out of range (negative non-zero values included), `None` not numeric.
+    fn numeric(v: &[u8], max: u8) -> Option<Option<u8>> {
+        let (neg, digits) = match v.first() {
+            Some(b'-') => (true, &v[1..]),
+            Some(b'+') => (false, &v[1..]),
+            _ => (false, v),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let significant = &digits[digits
+            .iter()
+            .position(|&b| b != b'0')
+            .unwrap_or(digits.len())..];
+        Some(match significant {
+            [] => Some(0),
+            [d] if !neg && d - b'0' <= max => Some(d - b'0'),
+            _ => None,
+        })
+    }
+
+    /// Mode resolution shared by the integer-backed enums: 1 a canonical single digit, 2 another
+    /// numeric spelling, 3 a case name (case-insensitive), 0 invalid (mode 0).
+    fn resolve_mode(v: &[u8], names: &[&[u8]], buf: &mut Vec<u8>) -> (u8, i64) {
+        match numeric(v, (names.len() - 1) as u8) {
+            Some(Some(mode)) => (mode, if v.len() == 1 { 1 } else { 2 }),
+            Some(None) => (0, 0),
+            None => {
+                lower_into(v, buf);
+                names
+                    .iter()
+                    .position(|n| *n == buf.as_slice())
+                    .map_or((0, 0), |m| (m as u8, 3))
+            }
+        }
+    }
+
+    // ---- TmuxPaneRole ------------------------------------------------------------------------
+
+    /// Backing value, canonical tmux window and pane, and layout eligibility (1 Full, 2 Basic,
+    /// 4 Stripped) in case order.
+    const ROLES: [(&[u8], u8, u8, u8); 20] = [
+        (b"monitor", 0, 0, 7),
+        (b"binaries", 0, 1, 1),
+        (b"backfill", 0, 2, 1),
+        (b"releases", 0, 3, 3),
+        (b"sequential", 0, 1, 4),
+        (b"fix_names", 1, 0, 7),
+        (b"remove_crap", 1, 1, 3),
+        (b"post_additional", 2, 0, 3),
+        (b"post_tv", 2, 1, 3),
+        (b"post_metadata", 2, 2, 7),
+        (b"post_movies", 2, 3, 3),
+        (b"irc_scraper", 3, 0, 7),
+        (b"htop", 4, 0, 0),
+        (b"nmon", 4, 1, 0),
+        (b"vnstat", 4, 2, 0),
+        (b"tcptrack", 4, 3, 0),
+        (b"bandwidth_monitor", 4, 4, 0),
+        (b"mytop", 4, 5, 0),
+        (b"redis", 4, 6, 0),
+        (b"console", 5, 0, 0),
+    ];
+
+    /// The backing value without underscores equals `compact`.
+    fn compact_eq(value: &[u8], compact: &[u8]) -> bool {
+        let mut it = value.iter().filter(|&&b| b != b'_');
+        compact.iter().all(|b| it.next() == Some(b)) && it.next().is_none()
+    }
+
+    /// Per token `role | kind << 5 | layouts << 8 | worker << 11 | window << 12 | pane << 16 |
+    /// min(len, 0xFFF) << 20 | crc32(strtolower(trim(token))) << 32`. Role is the case index
+    /// (31 unresolved). Kind: 1 the exact backing value, 2 the trimmed, lowercased token with
+    /// `-`, `.` and spaces as `_`, 3 the lowercased token without `_-. ` equal to a case name,
+    /// 4 a legacy `W.P` pane target (the first role in case order on that window and pane), 0
+    /// unresolved. Workers are Binaries through IrcScraper. Then the resolved and unresolved
+    /// counts, the Full, Basic and Stripped eligible counts, the bitmask of resolved roles and
+    /// the worker count.
+    pub fn pane_role_plan(tokens: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(tokens.len() + 8);
+        let (mut resolved, mut layouts, mut mask, mut workers) = (0i64, [0i64; 3], 0i64, 0i64);
+        let (mut lower, mut buf) = (Vec::new(), Vec::new());
+        for &raw in tokens {
+            let t = trim(raw);
+            lower_into(t, &mut lower);
+            let found = if let Some(r) = ROLES.iter().position(|r| r.0 == raw) {
+                Some((r, 1))
+            } else {
+                buf.clear();
+                buf.extend(lower.iter().map(|&b| match b {
+                    b'-' | b'.' | b' ' => b'_',
+                    b => b,
+                }));
+                if let Some(r) = ROLES.iter().position(|r| r.0 == buf.as_slice()) {
+                    Some((r, 2))
+                } else {
+                    buf.clear();
+                    buf.extend(
+                        lower
+                            .iter()
+                            .filter(|&&b| !matches!(b, b'_' | b'-' | b'.' | b' ')),
+                    );
+                    if let Some(r) = ROLES.iter().position(|r| compact_eq(r.0, &buf)) {
+                        Some((r, 3))
+                    } else if let [w @ b'0'..=b'9', b'.', p @ b'0'..=b'9'] = *t {
+                        ROLES
+                            .iter()
+                            .position(|r| r.1 == w - b'0' && r.2 == p - b'0')
+                            .map(|r| (r, 4))
+                    } else {
+                        None
+                    }
+                }
+            };
+            let mut word = (raw.len().min(0xFFF) as i64) << 20 | i64::from(crc32(&lower)) << 32;
+            match found {
+                Some((r, kind)) => {
+                    let (_, window, pane, eligible) = ROLES[r];
+                    let worker = (1..=11).contains(&r);
+                    resolved += 1;
+                    mask |= 1 << r;
+                    workers += i64::from(worker);
+                    for (l, count) in layouts.iter_mut().enumerate() {
+                        *count += i64::from(eligible >> l & 1);
+                    }
+                    word |= r as i64
+                        | kind << 5
+                        | i64::from(eligible) << 8
+                        | i64::from(worker) << 11
+                        | i64::from(window) << 12
+                        | i64::from(pane) << 16;
+                }
+                None => word |= 31,
+            }
+            out.push(word);
+        }
+        out.extend([resolved, tokens.len() as i64 - resolved]);
+        out.extend(layouts);
+        out.extend([mask, workers]);
+        out
+    }
+
+    // ---- TmuxPostProcessMode -----------------------------------------------------------------
+
+    const POST_MODES: [&[u8]; 4] = [b"disabled", b"additional", b"nfo", b"all"];
+
+    /// Work bits per scope (post, amazon, non, unknown) and mode: 1 additional, 2 NFO, 4 movie,
+    /// 8 TV, 16 Amazon.
+    const POST_WORK: [[i64; 4]; 4] = [[0, 1, 2, 15], [0, 16, 18, 28], [0, 4, 8, 12], [0; 4]];
+
+    /// Per token `mode | kind << 2 | scope << 4 | valid << 6 | work << 8 | min(len, 0x7FFFF) << 13
+    /// | crc32(strtolower(trim(token))) << 32`. An optional `scope:` prefix (before the first
+    /// colon, trimmed, case-insensitive) selects post (0, also without a colon), amazon (1), non
+    /// (2) or unknown (3); the trimmed rest resolves as [`resolve_mode`]. Then the per-mode
+    /// counts, the invalid count, the union of work bits and the per-scope counts.
+    pub fn post_process_mode_plan(tokens: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(tokens.len() + 11);
+        let (mut modes, mut invalid, mut work, mut scopes) = ([0i64; 4], 0i64, 0i64, [0i64; 4]);
+        let (mut lower, mut buf) = (Vec::new(), Vec::new());
+        for &raw in tokens {
+            let (scope, value) = match raw.iter().position(|&b| b == b':') {
+                None => (0, raw),
+                Some(c) => {
+                    lower_into(trim(&raw[..c]), &mut buf);
+                    let scope = match buf.as_slice() {
+                        b"post" => 0,
+                        b"amazon" => 1,
+                        b"non" => 2,
+                        _ => 3,
+                    };
+                    (scope, &raw[c + 1..])
+                }
+            };
+            let (mode, kind) = resolve_mode(trim(value), &POST_MODES, &mut buf);
+            let valid = kind != 0;
+            let bits = POST_WORK[scope][mode as usize];
+            modes[mode as usize] += 1;
+            invalid += i64::from(!valid);
+            work |= bits;
+            scopes[scope] += 1;
+            lower_into(trim(raw), &mut lower);
+            out.push(
+                i64::from(mode)
+                    | kind << 2
+                    | (scope as i64) << 4
+                    | i64::from(valid) << 6
+                    | bits << 8
+                    | (raw.len().min(0x7_FFFF) as i64) << 13
+                    | i64::from(crc32(&lower)) << 32,
+            );
+        }
+        out.extend(modes);
+        out.extend([invalid, work]);
+        out.extend(scopes);
+        out
+    }
+
+    // ---- TmuxSequentialMode ------------------------------------------------------------------
+
+    const SEQUENTIAL_MODES: [&[u8]; 3] = [b"full", b"basic", b"stripped"];
+
+    /// Runner stages per mode (bit order binaries, backfill, releases, fix names, remove crap,
+    /// additional, TV, movies, Amazon, IRC), runner panes and the cycle multiplier.
+    const SEQUENTIAL_PLAN: [(i64, i64, i64); 3] = [(0x3FF, 10, 1), (0x3FC, 8, 2), (0x30F, 4, 6)];
+
+    /// Per token `mode | kind << 2 | valid << 4 | sleep << 5 | runners << 6 | stages << 10 |
+    /// min(len, 0xFFF) << 20 | cycle << 32`. The trimmed text before the first `@` resolves as
+    /// [`resolve_mode`]; the trimmed text after it is the sleep when it is 1-6 ASCII digits
+    /// (flag `sleep`), else 0. Cycle is sleep times the mode's multiplier. Then the per-mode
+    /// counts, the invalid count, the cycle sum and maximum and the union of stages.
+    pub fn sequential_mode_plan(tokens: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(tokens.len() + 8);
+        let (mut modes, mut invalid, mut sum, mut max, mut stages) =
+            ([0i64; 3], 0i64, 0i64, 0i64, 0i64);
+        let mut buf = Vec::new();
+        for &raw in tokens {
+            let (value, sleep) = match raw.iter().position(|&b| b == b'@') {
+                None => (raw, None),
+                Some(a) => {
+                    let s = trim(&raw[a + 1..]);
+                    let ok = !s.is_empty() && s.len() <= 6 && s.iter().all(u8::is_ascii_digit);
+                    (
+                        &raw[..a],
+                        ok.then(|| s.iter().fold(0i64, |n, &d| n * 10 + i64::from(d - b'0'))),
+                    )
+                }
+            };
+            let (mode, kind) = resolve_mode(trim(value), &SEQUENTIAL_MODES, &mut buf);
+            let valid = kind != 0;
+            let (mask, runners, multiplier) = SEQUENTIAL_PLAN[mode as usize];
+            let cycle = sleep.unwrap_or(0) * multiplier;
+            modes[mode as usize] += 1;
+            invalid += i64::from(!valid);
+            sum += cycle;
+            max = max.max(cycle);
+            stages |= mask;
+            out.push(
+                i64::from(mode)
+                    | kind << 2
+                    | i64::from(valid) << 4
+                    | i64::from(sleep.is_some()) << 5
+                    | runners << 6
+                    | mask << 10
+                    | (raw.len().min(0xFFF) as i64) << 20
+                    | cycle << 32,
+            );
+        }
+        out.extend(modes);
+        out.extend([invalid, sum, max, stages]);
+        out
+    }
+
+    // ---- PredbIdentityKey --------------------------------------------------------------------
+
+    /// Per key `type | changed << 2 | empty << 3 | hash << 4 | edge << 6 | min(len, 0xFFFFFF) << 8
+    /// | crc32(canonical) << 32`. Type: 0 empty, 1 over 512 bytes, 2 non-ASCII (left to the
+    /// ICU/mbstring normalizer), 3 ASCII. For ASCII keys the canonical token is
+    /// `normalizePhp()`'s result: `strtolower(trim(key))` with every run of `[._ \t\n\v\f\r]`
+    /// replaced by one dot; other types use the empty token. Flags: changed (canonical differs
+    /// from the key), empty canonical, hash kind (32, 40 or 64 lowercase hex digits: 1, 2, 3)
+    /// and a leading or trailing dot. Then the per-type counts, the changed and hash counts and
+    /// the distinct non-empty canonical tokens.
+    pub fn identity_key_summary(keys: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(keys.len() + 8);
+        let (mut types, mut changed_total, mut hashes) = ([0i64; 4], 0i64, 0i64);
+        let mut seen: HashSet<Vec<u8>, FoldState> =
+            HashSet::with_capacity_and_hasher(keys.len(), FoldState::default());
+        let mut canonical = Vec::new();
+        for &key in keys {
+            canonical.clear();
+            let kind = if key.is_empty() {
+                0
+            } else if key.len() > 512 {
+                1
+            } else if !key.is_ascii() {
+                2
+            } else {
+                let mut run = false;
+                for &b in trim(key) {
+                    if matches!(b, b'.' | b'_' | b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r') {
+                        if !run {
+                            canonical.push(b'.');
+                        }
+                        run = true;
+                    } else {
+                        canonical.push(b.to_ascii_lowercase());
+                        run = false;
+                    }
+                }
+                3
+            };
+            types[kind as usize] += 1;
+            let mut word = kind;
+            if kind == 3 {
+                let changed = canonical.as_slice() != key;
+                let hash = match canonical.len() {
+                    32 => 1,
+                    40 => 2,
+                    64 => 3,
+                    _ => 0,
+                };
+                let hash = if hash != 0
+                    && canonical
+                        .iter()
+                        .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    hash
+                } else {
+                    0
+                };
+                let edge = canonical.first() == Some(&b'.') || canonical.last() == Some(&b'.');
+                changed_total += i64::from(changed);
+                hashes += i64::from(hash != 0);
+                if !canonical.is_empty() && !seen.contains(canonical.as_slice()) {
+                    seen.insert(canonical.clone());
+                }
+                word |= i64::from(changed) << 2
+                    | i64::from(canonical.is_empty()) << 3
+                    | hash << 4
+                    | i64::from(edge) << 6;
+            }
+            out.push(
+                word | (canonical.len().min(0xFF_FFFF) as i64) << 8
+                    | i64::from(crc32(&canonical)) << 32,
+            );
+        }
+        out.extend(types);
+        out.extend([changed_total, hashes, seen.len() as i64]);
+        out
+    }
+
+    // ---- SeasonPackDetector ------------------------------------------------------------------
+
+    /// The value of `s` when it is `min..=max` ASCII digits.
+    fn number(s: &[u8], min: usize, max: usize) -> Option<u32> {
+        (s.len() >= min && s.len() <= max && s.iter().all(u8::is_ascii_digit))
+            .then(|| s.iter().fold(0u32, |n, &d| n * 10 + u32::from(d - b'0')))
+    }
+
+    #[inline]
+    fn digit_run(s: &[u8]) -> usize {
+        s.iter().take_while(|b| b.is_ascii_digit()).count()
+    }
+
+    #[inline]
+    fn is_season_separator(b: u8) -> bool {
+        matches!(b, b'.' | b'_' | b' ' | b'-' | b'[' | b']' | b'(' | b')')
+    }
+
+    /// One lowercased token's markers.
+    enum Marker {
+        Season(u32, bool),
+        Episodes(u32, Vec<u32>),
+        Bare(u32),
+        Cross(u32, u32),
+        Disc,
+        Complete,
+        SeasonWord(Option<u32>),
+        None,
+    }
+
+    fn marker(t: &[u8]) -> Marker {
+        if let Some(rest) = t.strip_prefix(b"s") {
+            let n = digit_run(rest);
+            if (1..=4).contains(&n) {
+                let season = number(&rest[..n], 1, 4).unwrap_or(0);
+                let mut tail = &rest[n..];
+                if tail.is_empty() {
+                    return Marker::Season(season, false);
+                }
+                if let Some(d) = tail.strip_prefix(b"d")
+                    && number(d, 1, 2).is_some()
+                {
+                    return Marker::Season(season, true);
+                }
+                let mut episodes = Vec::new();
+                while let Some(e) = tail.strip_prefix(b"e") {
+                    let m = digit_run(e);
+                    if !(1..=4).contains(&m) {
+                        return Marker::None;
+                    }
+                    episodes.push(number(&e[..m], 1, 4).unwrap_or(0));
+                    tail = &e[m..];
+                }
+                return if tail.is_empty() && !episodes.is_empty() {
+                    Marker::Episodes(season, episodes)
+                } else {
+                    Marker::None
+                };
+            }
+        }
+        if let Some(rest) = t.strip_prefix(b"e") {
+            let rest = rest.strip_prefix(b"p").unwrap_or(rest);
+            if let Some(e) = number(rest, 1, 4) {
+                return Marker::Bare(e);
+            }
+        }
+        let n = digit_run(t);
+        if (1..=2).contains(&n)
+            && t.get(n) == Some(&b'x')
+            && let Some(e) = number(&t[n + 1..], 2, 3)
+        {
+            return Marker::Cross(number(&t[..n], 1, 2).unwrap_or(0), e);
+        }
+        for prefix in [b"disc".as_slice(), b"disk", b"d"] {
+            if let Some(d) = t.strip_prefix(prefix)
+                && number(d, 1, 2).is_some()
+            {
+                return Marker::Disc;
+            }
+        }
+        if t == b"complete" {
+            return Marker::Complete;
+        }
+        let rest = t
+            .strip_prefix(b"seasons")
+            .or_else(|| t.strip_prefix(b"season"));
+        match rest {
+            Some([]) => Marker::SeasonWord(None),
+            Some(d) => number(d, 1, 2).map_or(Marker::None, |s| Marker::SeasonWord(Some(s))),
+            None => Marker::None,
+        }
+    }
+
+    /// Per name `flags | class << 7 | score << 10 | first_season << 18 | min(tokens, 0xFFFF) << 32
+    /// | first_episode << 48` over the lowercased name split on `[._ \-\[\]()]`. Tokens (whole,
+    /// case-insensitive): `s\d{1,4}` season, `s\d{1,4}d\d{1,2}` season on a disc,
+    /// `s\d{1,4}(e\d{1,4})+` episodes, `ep?\d{1,4}` a bare episode (season 0),
+    /// `\d{1,2}x\d{2,3}` an episode, `(disc|disk|d)\d{1,2}` a disc, `complete`, and
+    /// `seasons?\d{1,2}` or `season`/`seasons` before a `\d{1,2}` token as a season word.
+    /// Flags: 1 season token, 2 episode, 4 several episodes (one token with two or more, or two
+    /// distinct season/episode pairs), 8 two or more distinct seasons from season tokens and
+    /// words, 16 disc, 32 complete, 64 season word. Class: 2 several episodes, 1 an episode, 4 a
+    /// season range, 3 a season token, word or `complete`, else 0. Score: 40 season token + 30
+    /// word + 25 complete + 20 range + 10 disc, quartered (integer division) with an episode.
+    /// The first season and episode come from the first token carrying one. Then the per-class
+    /// counts, the score sum and the union of flags.
+    pub fn season_pack_plan(names: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(names.len() + 8);
+        let (mut classes, mut score_sum, mut union) = ([0i64; 5], 0i64, 0i64);
+        let mut lower = Vec::new();
+        let mut seasons: Vec<u32> = Vec::new();
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        for &name in names {
+            lower_into(name, &mut lower);
+            seasons.clear();
+            pairs.clear();
+            let tokens: Vec<&[u8]> = lower
+                .split(|&b| is_season_separator(b))
+                .filter(|t| !t.is_empty())
+                .collect();
+            let (mut flags, mut multi) = (0i64, false);
+            let (mut first_season, mut first_episode) = (None::<u32>, None::<u32>);
+            for (i, &t) in tokens.iter().enumerate() {
+                match marker(t) {
+                    Marker::Season(s, disc) => {
+                        flags |= if disc { 1 | 16 } else { 1 };
+                        first_season.get_or_insert(s);
+                        if !seasons.contains(&s) {
+                            seasons.push(s);
+                        }
+                    }
+                    Marker::Episodes(s, eps) => {
+                        flags |= 2;
+                        first_season.get_or_insert(s);
+                        first_episode.get_or_insert(eps[0]);
+                        multi |= eps.len() >= 2;
+                        for e in eps {
+                            if !pairs.contains(&(s, e)) {
+                                pairs.push((s, e));
+                            }
+                        }
+                    }
+                    Marker::Bare(e) => {
+                        flags |= 2;
+                        first_episode.get_or_insert(e);
+                        if !pairs.contains(&(0, e)) {
+                            pairs.push((0, e));
+                        }
+                    }
+                    Marker::Cross(s, e) => {
+                        flags |= 2;
+                        first_season.get_or_insert(s);
+                        first_episode.get_or_insert(e);
+                        if !pairs.contains(&(s, e)) {
+                            pairs.push((s, e));
+                        }
+                    }
+                    Marker::Disc => flags |= 16,
+                    Marker::Complete => flags |= 32,
+                    Marker::SeasonWord(n) => {
+                        let n = n.or_else(|| tokens.get(i + 1).and_then(|next| number(next, 1, 2)));
+                        if let Some(s) = n {
+                            flags |= 64;
+                            first_season.get_or_insert(s);
+                            if !seasons.contains(&s) {
+                                seasons.push(s);
+                            }
+                        }
+                    }
+                    Marker::None => {}
+                }
+            }
+            if multi || pairs.len() >= 2 {
+                flags |= 4;
+            }
+            if seasons.len() >= 2 {
+                flags |= 8;
+            }
+            let class = if flags & 4 != 0 {
+                2
+            } else if flags & 2 != 0 {
+                1
+            } else if flags & 8 != 0 {
+                4
+            } else if flags & (1 | 32 | 64) != 0 {
+                3
+            } else {
+                0
+            };
+            let mut score = 40 * (flags & 1)
+                + 30 * (flags >> 6 & 1)
+                + 25 * (flags >> 5 & 1)
+                + 20 * (flags >> 3 & 1)
+                + 10 * (flags >> 4 & 1);
+            if flags & 2 != 0 {
+                score /= 4;
+            }
+            classes[class as usize] += 1;
+            score_sum += score;
+            union |= flags;
+            out.push(
+                flags
+                    | class << 7
+                    | score << 10
+                    | i64::from(first_season.unwrap_or(0)) << 18
+                    | (tokens.len().min(0xFFFF) as i64) << 32
+                    | i64::from(first_episode.unwrap_or(0)) << 48,
+            );
+        }
+        out.extend(classes);
+        out.extend([score_sum, union]);
+        out
+    }
+
+    // ---- Exports -----------------------------------------------------------------------------
+
+    macro_rules! export {
+        ($name:ident, $plan:ident) => {
+            /// # Safety
+            /// `items` must be readable for `items_len` bytes and `out` writable for `out_cap`
+            /// words.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                items: *const u8,
+                items_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let inputs = [(items, items_len)];
+                unsafe {
+                    emit(out, out_cap, count, &inputs, || {
+                        Some($plan(&column(span(items, items_len)?, count)?))
+                    })
+                }
+            }
+        };
+    }
+
+    export!(nntmux_w592_tmux_pane_role_plan_batch, pane_role_plan);
+    export!(
+        nntmux_w592_tmux_post_process_mode_plan_batch,
+        post_process_mode_plan
+    );
+    export!(
+        nntmux_w592_tmux_sequential_mode_plan_batch,
+        sequential_mode_plan
+    );
+    export!(
+        nntmux_w592_predb_identity_key_summary_batch,
+        identity_key_summary
+    );
+    export!(
+        nntmux_w592_season_pack_detection_plan_batch,
+        season_pack_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn refs<'a>(v: &[&'a str]) -> Vec<&'a [u8]> {
+            v.iter().map(|s| s.as_bytes()).collect()
+        }
+
+        #[test]
+        fn pane_roles_resolve_by_value_name_and_legacy_target() {
+            let words = pane_role_plan(&refs(&[
+                "fix_names",
+                " Post-TV ",
+                "BandwidthMonitor",
+                "0.1",
+                "9.9",
+                "",
+            ]));
+            assert_eq!(words[0] & 0xFFFFF, 5 | 1 << 5 | 7 << 8 | 1 << 11 | 1 << 12);
+            assert_eq!(words[1] & 0xFF, 8 | 2 << 5);
+            assert_eq!(words[2] & 0xFF, 16 | 3 << 5);
+            assert_eq!(words[3] & 0xFFFFF, 1 | 4 << 5 | 1 << 8 | 1 << 11 | 1 << 16);
+            assert_eq!(words[4] & 0xFFFFF, 31);
+            assert_eq!(words[5], 31 | i64::from(crc32(b"")) << 32);
+            assert_eq!(
+                words[6..],
+                [4, 2, 3, 2, 1, 1 << 1 | 1 << 5 | 1 << 8 | 1 << 16, 3]
+            );
+        }
+
+        #[test]
+        fn post_process_modes_carry_scope_and_work() {
+            let words =
+                post_process_mode_plan(&refs(&["3", "amazon: nfo", "NON:+01", "x:2", "4", "-0"]));
+            assert_eq!(words[0] & 0x1FFF, 3 | 1 << 2 | 1 << 6 | 15 << 8);
+            assert_eq!(words[1] & 0x1FFF, 2 | 3 << 2 | 1 << 4 | 1 << 6 | 18 << 8);
+            assert_eq!(words[2] & 0x1FFF, 1 | 2 << 2 | 2 << 4 | 1 << 6 | 4 << 8);
+            assert_eq!(words[3] & 0x1FFF, 2 | 1 << 2 | 3 << 4 | 1 << 6);
+            assert_eq!(words[4] & 0x1FFF, 0);
+            assert_eq!(words[5] & 0x1FFF, 2 << 2 | 1 << 6);
+            assert_eq!(words[6..], [2, 1, 2, 1, 1, 31, 3, 1, 1, 1]);
+        }
+
+        #[test]
+        fn sequential_modes_compute_cycles() {
+            let words = sequential_mode_plan(&refs(&["2@30", "basic @ 10", "0@x", "7@5"]));
+            assert_eq!(
+                words[0] & 0xFFFFF,
+                2 | 1 << 2 | 1 << 4 | 1 << 5 | 4 << 6 | 0x30F << 10
+            );
+            assert_eq!(words[0] >> 32, 180);
+            assert_eq!(words[1] >> 32, 20);
+            assert_eq!(words[2] & 0x3F, 1 << 2 | 1 << 4);
+            assert_eq!(words[3] & 0x3F, 1 << 5);
+            assert_eq!(words[3] >> 32, 5);
+            assert_eq!(words[4..], [2, 1, 1, 1, 205, 180, 0x3FF]);
+        }
+
+        #[test]
+        fn identity_keys_normalize_ascii_and_defer_unicode() {
+            let md5 = "D41D8CD98F00B204E9800998ECF8427E";
+            let words = identity_key_summary(&refs(&[
+                "  Some__Movie. 2019 ",
+                "",
+                "caf\u{e9}",
+                md5,
+                "a.b",
+            ]));
+            assert_eq!(words[0] & 0xFF, 3 | 4);
+            assert_eq!(
+                words[0] >> 32 & 0xFFFF_FFFF,
+                i64::from(crc32(b"some.movie.2019"))
+            );
+            assert_eq!(words[1], 0);
+            assert_eq!(words[2], 2);
+            assert_eq!(words[3] & 0xFF, 3 | 4 | 16);
+            assert_eq!(words[4] & 0xFF, 3);
+            assert_eq!(words[5..], [1, 0, 1, 3, 2, 1, 3]);
+        }
+
+        #[test]
+        fn season_packs_classify_tokens() {
+            let words = season_pack_plan(&refs(&[
+                "Show.S01.1080p-GRP",
+                "Show.S01-S03.Complete-GRP",
+                "Show.S01E01E02.720p",
+                "Show.1x05.HDTV",
+                "Show.Season.2.D1",
+                "Movie.2019.1080p",
+            ]));
+            assert_eq!(words[0] & 0x3FFFF, 1 | 3 << 7 | 40 << 10);
+            assert_eq!(words[1] & 0x3FFFF, 1 | 8 | 32 | 4 << 7 | 85 << 10);
+            assert_eq!(words[2] & 0x3FF, 2 | 4 | 2 << 7);
+            assert_eq!(words[2] >> 48, 1);
+            assert_eq!(words[3] & 0x3FF, 2 | 1 << 7);
+            assert_eq!(words[3] >> 18 & 0x3FFF, 1);
+            assert_eq!(words[4] & 0x3FFFF, 16 | 64 | 3 << 7 | 40 << 10);
+            assert_eq!(words[5] & 0x3FF, 0);
+            assert_eq!(words[6..], [1, 1, 1, 2, 1, 165, 127]);
+        }
+
+        #[test]
+        fn exports_guard_null_short_and_malformed_batches() {
+            let mut out = [0i64; 32];
+            let o = out.as_mut_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w592_tmux_pane_role_plan_batch(b"a".as_ptr(), 1, 1, o, 32),
+                    9
+                );
+                assert_eq!(
+                    nntmux_w592_tmux_pane_role_plan_batch(b"a".as_ptr(), 1, 1, o, 8),
+                    -9
+                );
+                assert_eq!(
+                    nntmux_w592_tmux_post_process_mode_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w592_tmux_sequential_mode_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w592_predb_identity_key_summary_batch(std::ptr::null(), 0, 0, o, 32),
+                    8
+                );
+                assert_eq!(
+                    nntmux_w592_season_pack_detection_plan_batch(std::ptr::null(), 3, 1, o, 32),
+                    -1
+                );
+                let mut shared = [0u8; 128];
+                shared[0] = b'a';
+                assert_eq!(
+                    nntmux_w592_season_pack_detection_plan_batch(
+                        shared.as_ptr(),
+                        1,
+                        1,
+                        shared.as_mut_ptr() as *mut i64,
+                        16
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}
