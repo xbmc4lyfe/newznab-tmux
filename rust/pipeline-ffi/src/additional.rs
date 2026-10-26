@@ -45236,3 +45236,987 @@ mod w606_entry_result_kind_mapping_source_tests {
         assert_eq!(status, 1);
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 61.6: blacklist rule, collection filecheck, configuration domain, file
+// completion and image asset profile plans (`nntmux_w616_*`) for
+// BlacklistConstants, CollectionFileCheckStatus, ConfigurationDomain,
+// FileCompletionStatus and ImageAssetProfile. Same contract as Wave 60.6:
+// strings are NUL-joined column after column (with a 0x01-joined twin when one
+// holds a NUL), integer columns are machine-order `int64_t`, and the result is
+// fixed-width `int64_t` words. Every export returns 1, -1 for invalid input
+// (PHP then computes the batch) or -2 when `out` is null, misaligned or too
+// small, and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+/// PHP `strtolower(trim($value))` into `buffer`.
+#[inline]
+fn w616_lower_trim_into(value: &[u8], buffer: &mut Vec<u8>) {
+    w47_lower_into(w566_trim(value), buffer);
+}
+
+/// `(int)` of a 1-3 byte `ctype_digit()` token.
+#[inline]
+fn w616_small_int(value: &[u8]) -> Option<i64> {
+    (!value.is_empty() && value.len() <= 3 && value.iter().all(u8::is_ascii_digit))
+        .then(|| w47_parse(value))
+}
+
+// --- BlacklistConstants::planBlacklistRuleBatch ------------------------------
+
+pub(crate) const W616_BLACKLIST_HEADER: usize = 20;
+
+/// Longest pattern the `binaryblacklist.regex` column holds.
+const W616_PATTERN_CAP: usize = 2_000;
+
+/// Operation type 1 blacklist, 2 whitelist, 0 unknown; source 0 constant name,
+/// 1 alias of the lowercased trimmed token, 2 unknown.
+#[inline]
+fn w616_optype(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+    match raw {
+        b"OPTYPE_BLACKLIST" => (1, 0),
+        b"OPTYPE_WHITELIST" => (2, 0),
+        _ => {
+            w616_lower_trim_into(raw, lower);
+            match lower.as_slice() {
+                b"blacklist" | b"black" | b"block" | b"deny" | b"1" => (1, 1),
+                b"whitelist" | b"white" | b"allow" | b"2" => (2, 1),
+                _ => (0, 2),
+            }
+        }
+    }
+}
+
+/// Message column 1 subject, 2 from, 3 message-id, 0 unknown; sources as
+/// [`w616_optype`].
+#[inline]
+fn w616_msgcol(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+    match raw {
+        b"BLACKLIST_FIELD_SUBJECT" => (1, 0),
+        b"BLACKLIST_FIELD_FROM" => (2, 0),
+        b"BLACKLIST_FIELD_MESSAGEID" => (3, 0),
+        _ => {
+            w616_lower_trim_into(raw, lower);
+            match lower.as_slice() {
+                b"subject" | b"name" | b"1" => (1, 1),
+                b"from" | b"poster" | b"fromname" | b"2" => (2, 1),
+                b"messageid" | b"message-id" | b"message_id" | b"msgid" | b"3" => (3, 1),
+                _ => (0, 2),
+            }
+        }
+    }
+}
+
+/// Operation type, message column and pattern columns with a status column.
+/// Flags: 1 unknown type, 2 unknown column, 4 status not 0/1, 8 blank pattern,
+/// 16 NUL in pattern, 32 pattern over 2,000 bytes, 64 catch-all pattern. `[0]`
+/// count, `[1..4]` per type, `[4..8]` per column, `[8..10]` type by name /
+/// alias, `[10..12]` column by name / alias, `[12]` valid, `[13]` active
+/// blacklist and `[14]` whitelist rules, `[15]` invalid and `[16]` the first
+/// invalid index (-1), `[17]` pattern bytes, `[18]` longest pattern, `[19]`
+/// FNV-1a digest; then per rule `type | column << 2 | type source << 4 |
+/// column source << 6 | flags << 8 | valid << 15 | active << 16 |
+/// min(pattern bytes, 2^20-1) << 17`.
+pub(crate) fn w616_blacklist_batch(fields: &[&[u8]], statuses: &[i64], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W616_BLACKLIST_HEADER + count];
+    out[0] = count as i64;
+    out[16] = -1;
+    let mut lower = Vec::new();
+    for at in 0..count {
+        let (optype, type_source) = w616_optype(fields[at], &mut lower);
+        let (msgcol, column_source) = w616_msgcol(fields[count + at], &mut lower);
+        let pattern = fields[2 * count + at];
+        let trimmed = w566_trim(pattern);
+        let status = statuses[at];
+        let flags = i64::from(optype == 0)
+            | i64::from(msgcol == 0) << 1
+            | i64::from(status != 0 && status != 1) << 2
+            | i64::from(trimmed.is_empty()) << 3
+            | i64::from(pattern.contains(&0)) << 4
+            | i64::from(pattern.len() > W616_PATTERN_CAP) << 5
+            | i64::from(matches!(
+                trimmed,
+                b".*" | b".+" | b"^.*$" | b".*?" | b"^" | b"$"
+            )) << 6;
+        let valid = i64::from(flags == 0);
+        let active = valid & i64::from(status == 1);
+        let length = pattern.len() as i64;
+        out[1 + optype as usize] += 1;
+        out[4 + msgcol as usize] += 1;
+        if type_source < 2 {
+            out[8 + type_source as usize] += 1;
+        }
+        if column_source < 2 {
+            out[10 + column_source as usize] += 1;
+        }
+        out[12] += valid;
+        if active == 1 {
+            out[12 + optype as usize] += 1;
+        }
+        if valid == 0 {
+            out[15] += 1;
+            w586_first(&mut out[16], at);
+        }
+        out[17] += length;
+        out[18] = out[18].max(length);
+        out[W616_BLACKLIST_HEADER + at] = optype
+            | msgcol << 2
+            | type_source << 4
+            | column_source << 6
+            | flags << 8
+            | valid << 15
+            | active << 16
+            | (pattern.len().min(W566_LEN_CAP) as i64) << 17;
+    }
+    out[19] = w526_digest(&out[W616_BLACKLIST_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w616_blacklist_rule_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let fields = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                3,
+                count,
+            )?;
+            let statuses = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+            Some(w616_blacklist_batch(&fields, &statuses, count))
+        })
+    }
+}
+
+// --- CollectionFileCheckStatus::planFileCheckBatch ---------------------------
+
+pub(crate) const W616_FILECHECK_HEADER: usize = 28;
+
+/// Backing value per case index (8 is unknown).
+const W616_FILECHECK_VALUES: [i64; 8] = [0, 1, 2, 3, 4, 5, 15, 16];
+
+/// Allowed target case indexes per current case index, one bit per case.
+const W616_FILECHECK_NEXT: [u32; 8] = [
+    1 << 1 | 1 << 2 | 1 << 5 | 1 << 6 | 1 << 7,
+    1 << 2 | 1 << 3 | 1 << 5 | 1 << 6,
+    1 << 3 | 1 << 5,
+    1 << 4 | 1 << 5,
+    1 << 5,
+    0,
+    1 << 1 | 1 << 2 | 1 << 3 | 1 << 5,
+    1 << 1 | 1 << 2 | 1 << 5,
+];
+
+/// Count clamp (2^20 - 1).
+const W616_COUNT_CAP: i64 = (1 << 20) - 1;
+
+#[inline]
+fn w616_filecheck_index(value: i64) -> Option<usize> {
+    match value {
+        0..=5 => Some(value as usize),
+        15 => Some(6),
+        16 => Some(7),
+        _ => None,
+    }
+}
+
+/// Case index (8 unknown) and source: 0 backing value digits, 1 case name, 2
+/// lowercased trimmed case name, 3 unknown.
+#[inline]
+fn w616_filecheck_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+    if let Some(case) = w616_small_int(raw).and_then(w616_filecheck_index) {
+        return (case as i64, 0);
+    }
+    let named = match raw {
+        b"Default" => Some(0),
+        b"CompleteCollection" => Some(1),
+        b"CompleteParts" => Some(2),
+        b"Sized" => Some(3),
+        b"Inserted" => Some(4),
+        b"Delete" => Some(5),
+        b"TempComplete" => Some(6),
+        b"ZeroPart" => Some(7),
+        _ => None,
+    };
+    if let Some(case) = named {
+        return (case, 1);
+    }
+    w616_lower_trim_into(raw, lower);
+    match lower.as_slice() {
+        b"default" => (0, 2),
+        b"completecollection" => (1, 2),
+        b"completeparts" => (2, 2),
+        b"sized" => (3, 2),
+        b"inserted" => (4, 2),
+        b"delete" => (5, 2),
+        b"tempcomplete" => (6, 2),
+        b"zeropart" => (7, 2),
+        _ => (8, 3),
+    }
+}
+
+/// Status tokens with target, received, expected and byte columns. Transitions:
+/// 0 none (negative or same target), 1 allowed, 2 forbidden, 3 unknown target,
+/// 4 unknown status. Counts clamp to 0..2^20-1 and bytes (and `min_bytes`) to
+/// 0..2^40-1. Ready reasons: 1 not sized, 2 no expected files, 4 missing
+/// files, 8 below `min_bytes`. `[0]` count, `[1..10]` per case, `[10..14]` per
+/// source, `[14..19]` per transition, `[19]` ready, `[20]` in progress, `[21]`
+/// processing complete, `[22]` first ready and `[23]` first forbidden index
+/// (-1), `[24]` ready bytes, `[25]` received and `[26]` expected files, `[27]`
+/// FNV-1a digest; then per collection `case | source << 4 | transition << 6 |
+/// reasons << 9 | ready << 13 | in progress << 14 | complete << 15 | permille
+/// << 16 | received << 26 | min(MiB, 2^17-1) << 46`.
+pub(crate) fn w616_filecheck_batch(statuses: &[&[u8]], ints: &[i64], min_bytes: i64) -> Vec<i64> {
+    let count = statuses.len();
+    let mut out = vec![0i64; W616_FILECHECK_HEADER + count];
+    out[0] = count as i64;
+    out[22] = -1;
+    out[23] = -1;
+    let min_bytes = w47_clamp(min_bytes);
+    let mut lower = Vec::new();
+    for (at, &status) in statuses.iter().enumerate() {
+        let (case, source) = w616_filecheck_case(status, &mut lower);
+        let target = ints[at];
+        let transition: i64 = if case == 8 {
+            4
+        } else if target < 0 || target == W616_FILECHECK_VALUES[case as usize] {
+            0
+        } else {
+            match w616_filecheck_index(target) {
+                None => 3,
+                Some(next) if W616_FILECHECK_NEXT[case as usize] >> next & 1 == 1 => 1,
+                Some(_) => 2,
+            }
+        };
+        let received = ints[count + at].clamp(0, W616_COUNT_CAP);
+        let expected = ints[2 * count + at].clamp(0, W616_COUNT_CAP);
+        let bytes = w47_clamp(ints[3 * count + at]);
+        let reasons = i64::from(case != 3)
+            | i64::from(expected == 0) << 1
+            | i64::from(received < expected) << 2
+            | i64::from(bytes < min_bytes) << 3;
+        let ready = i64::from(reasons == 0);
+        let in_progress = i64::from(matches!(case, 0 | 1 | 2 | 6 | 7));
+        let complete = i64::from(matches!(case, 4 | 5));
+        let permille = if expected > 0 {
+            (received * 1_000 / expected).min(1_000)
+        } else {
+            0
+        };
+        out[1 + case as usize] += 1;
+        out[10 + source as usize] += 1;
+        out[14 + transition as usize] += 1;
+        out[19] += ready;
+        out[20] += in_progress;
+        out[21] += complete;
+        if ready == 1 {
+            w586_first(&mut out[22], at);
+            out[24] = (out[24] + bytes).min(W47_TOTAL_CAP);
+        }
+        if transition == 2 {
+            w586_first(&mut out[23], at);
+        }
+        out[25] += received;
+        out[26] += expected;
+        out[W616_FILECHECK_HEADER + at] = case
+            | source << 4
+            | transition << 6
+            | reasons << 9
+            | ready << 13
+            | in_progress << 14
+            | complete << 15
+            | permille << 16
+            | received << 26
+            | (bytes >> 20).min((1 << 17) - 1) << 46;
+    }
+    out[27] = w526_digest(&out[W616_FILECHECK_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w616_collection_filecheck_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    min_bytes: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let statuses = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                1,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 4, count)?;
+            Some(w616_filecheck_batch(&statuses, &ints, min_bytes))
+        })
+    }
+}
+
+// --- ConfigurationDomain::planConfigurationDomainBatch -----------------------
+
+pub(crate) const W616_DOMAIN_HEADER: usize = 24;
+
+const W616_DOMAIN_NAMES: [&[u8]; 6] = [
+    b"Site",
+    b"Registration",
+    b"Ingestion",
+    b"PostProcessing",
+    b"Metadata",
+    b"Tmux",
+];
+
+/// Longest valid setting name.
+const W616_SETTING_CAP: usize = 64;
+
+/// Setting name byte: `[a-z0-9.-]`.
+#[inline]
+fn w616_setting_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
+}
+
+/// Keys resolve by backing value (source 0, kind domain), case name (1,
+/// domain), `configuration:` cache key (2, cache), the backing value of
+/// `str_replace('_', '-', strtolower(trim($key)))` (3, domain), a backing value
+/// before its first `.` (4, setting), else unknown case 6 (5, unknown). Kinds:
+/// 0 domain, 1 setting, 2 cache key, 3 unknown. Flags: 1 unknown domain, 2
+/// empty setting, 4 setting byte outside `[a-z0-9.-]`, 8 setting over 64
+/// bytes. `[0]` count, `[1..8]` per case, `[8..14]` per source, `[14..18]` per
+/// kind, `[18]` valid settings, `[19]` flagged and `[20]` the first flagged
+/// index (-1), `[21]` setting bytes, `[22]` longest key, `[23]` FNV-1a digest;
+/// then per key `case | source << 3 | kind << 6 | flags << 8 | valid setting
+/// << 12 | min(setting bytes, 65535) << 13 | min(key bytes, 2^20-1) << 29`.
+pub(crate) fn w616_domain_batch(keys: &[&[u8]]) -> Vec<i64> {
+    let count = keys.len();
+    let mut out = vec![0i64; W616_DOMAIN_HEADER + count];
+    out[0] = count as i64;
+    out[20] = -1;
+    let mut normalized = Vec::new();
+    for (at, &key) in keys.iter().enumerate() {
+        let mut setting: Option<&[u8]> = None;
+        let (case, source, kind): (i64, i64, i64) = if let Some(case) = w20cd_index(key) {
+            (case as i64, 0, 0)
+        } else if let Some(case) = W616_DOMAIN_NAMES.iter().position(|name| *name == key) {
+            (case as i64, 1, 0)
+        } else if let Some(rest) = key.strip_prefix(W20CD_CACHE_PREFIX) {
+            (w20cd_index(rest).map_or(6, |case| case as i64), 2, 2)
+        } else {
+            w606_normalize_into(key, &mut normalized);
+            if let Some(case) = w20cd_index(&normalized) {
+                (case as i64, 3, 0)
+            } else {
+                match normalized
+                    .iter()
+                    .position(|&b| b == b'.')
+                    .and_then(|dot| w20cd_index(&normalized[..dot]).map(|case| (case, dot)))
+                {
+                    Some((case, dot)) => {
+                        setting = Some(&normalized[dot + 1..]);
+                        (case as i64, 4, 1)
+                    }
+                    None => (6, 5, 3),
+                }
+            }
+        };
+        let setting_len = setting.map_or(0, <[u8]>::len);
+        let flags = match setting {
+            Some(name) => {
+                i64::from(name.is_empty()) << 1
+                    | i64::from(!name.iter().all(|&b| w616_setting_byte(b))) << 2
+                    | i64::from(name.len() > W616_SETTING_CAP) << 3
+            }
+            None => i64::from(case == 6),
+        };
+        let valid = i64::from(kind == 1 && flags == 0);
+        out[1 + case as usize] += 1;
+        out[8 + source as usize] += 1;
+        out[14 + kind as usize] += 1;
+        out[18] += valid;
+        if flags != 0 {
+            out[19] += 1;
+            w586_first(&mut out[20], at);
+        }
+        out[21] += setting_len as i64;
+        out[22] = out[22].max(key.len() as i64);
+        out[W616_DOMAIN_HEADER + at] = case
+            | source << 3
+            | kind << 6
+            | flags << 8
+            | valid << 12
+            | (setting_len.min(65_535) as i64) << 13
+            | (key.len().min(W566_LEN_CAP) as i64) << 29;
+    }
+    out[23] = w526_digest(&out[W616_DOMAIN_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w616_configuration_domain_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let keys = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                1,
+                count,
+            )?;
+            Some(w616_domain_batch(&keys))
+        })
+    }
+}
+
+// --- FileCompletionStatus::planFileCompletionBatch ---------------------------
+
+pub(crate) const W616_COMPLETION_HEADER: usize = 24;
+
+/// Part count clamp (2^24 - 1).
+const W616_PART_CAP: i64 = (1 << 24) - 1;
+
+/// Case 0 incomplete, 1 complete, 2 unknown; source 0 backing value, 1 case
+/// name, 2 alias of the lowercased trimmed token, 3 unknown.
+#[inline]
+fn w616_completion_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+    match raw {
+        b"0" => (0, 0),
+        b"1" => (1, 0),
+        b"Incomplete" => (0, 1),
+        b"Complete" => (1, 1),
+        _ => {
+            w616_lower_trim_into(raw, lower);
+            match lower.as_slice() {
+                b"incomplete" | b"partial" | b"missing" | b"false" | b"no" | b"0" => (0, 2),
+                b"complete" | b"completed" | b"done" | b"full" | b"true" | b"yes" | b"1" => (1, 2),
+                _ => (2, 3),
+            }
+        }
+    }
+}
+
+/// Stored status tokens with received and total part columns (clamped to
+/// 0..2^24-1). Ratio classes: 0 no parts, 1 none received, 2 partial, 3 partial
+/// at or above `repairable_permille` (clamped to 0..1000), 4 complete, 5 more
+/// received than total. Transitions to the derived status (complete when every
+/// part arrived): 0 unchanged, 1 promote, 2 demote, 3 assign an unknown status.
+/// `[0]` count, `[1..4]` per case, `[4..8]` per source, `[8..14]` per class,
+/// `[14..18]` per transition, `[18]` derived complete, `[19]` first demotion
+/// (-1), `[20]` received and `[21]` total parts, `[22]` overall permille,
+/// `[23]` FNV-1a digest; then per file `case | source << 2 | class << 4 |
+/// transition << 7 | derived << 9 | permille << 10 | received << 20 |
+/// min(token bytes, 255) << 44`.
+pub(crate) fn w616_completion_batch(
+    statuses: &[&[u8]],
+    ints: &[i64],
+    repairable_permille: i64,
+) -> Vec<i64> {
+    let count = statuses.len();
+    let mut out = vec![0i64; W616_COMPLETION_HEADER + count];
+    out[0] = count as i64;
+    out[19] = -1;
+    let threshold = repairable_permille.clamp(0, 1_000);
+    let mut lower = Vec::new();
+    let mut covered = 0i64;
+    for (at, &status) in statuses.iter().enumerate() {
+        let (case, source) = w616_completion_case(status, &mut lower);
+        let received = ints[at].clamp(0, W616_PART_CAP);
+        let total = ints[count + at].clamp(0, W616_PART_CAP);
+        let have = received.min(total);
+        let permille = if total > 0 { have * 1_000 / total } else { 0 };
+        let class: i64 = if total == 0 {
+            0
+        } else if received == 0 {
+            1
+        } else if received < total {
+            if permille >= threshold { 3 } else { 2 }
+        } else if received == total {
+            4
+        } else {
+            5
+        };
+        let derived = i64::from(total > 0 && received >= total);
+        let transition: i64 = if case == 2 {
+            3
+        } else if case == derived {
+            0
+        } else if derived == 1 {
+            1
+        } else {
+            2
+        };
+        out[1 + case as usize] += 1;
+        out[4 + source as usize] += 1;
+        out[8 + class as usize] += 1;
+        out[14 + transition as usize] += 1;
+        out[18] += derived;
+        if transition == 2 {
+            w586_first(&mut out[19], at);
+        }
+        out[20] += received;
+        out[21] += total;
+        covered += have;
+        out[W616_COMPLETION_HEADER + at] = case
+            | source << 2
+            | class << 4
+            | transition << 7
+            | derived << 9
+            | permille << 10
+            | received << 20
+            | (status.len().min(255) as i64) << 44;
+    }
+    if out[21] > 0 {
+        out[22] = covered * 1_000 / out[21];
+    }
+    out[23] = w526_digest(&out[W616_COMPLETION_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w616_file_completion_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    repairable_permille: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let statuses = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                1,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w616_completion_batch(&statuses, &ints, repairable_permille))
+        })
+    }
+}
+
+// --- ImageAssetProfile::planImageAssetBatch ----------------------------------
+
+pub(crate) const W616_IMAGE_HEADER: usize = 27;
+
+/// `[maxWidth, maxHeight]` per case (0 unbounded; 5 is unknown).
+const W616_IMAGE_BOUNDS: [(i64, i64); 6] = [
+    (0, 0),
+    (250, 250),
+    (1920, 1024),
+    (800, 600),
+    (650, 650),
+    (0, 0),
+];
+
+/// JPEG quality per case.
+const W616_IMAGE_QUALITY: [i64; 6] = [100, 85, 80, 75, 70, 0];
+
+/// Dimension clamp and pixel ceiling.
+const W616_DIMENSION_CAP: i64 = 65_535;
+const W616_PIXEL_CAP: i64 = 40_000_000;
+
+/// Case (5 unknown) and source: 0 case name, 1 `str_replace(['_', '-'], '',
+/// strtolower(trim($name)))` of a case name, 2 alias of it, 3 unknown.
+#[inline]
+fn w616_image_profile(raw: &[u8], buffer: &mut Vec<u8>) -> (i64, i64) {
+    match raw {
+        b"Original" => return (0, 0),
+        b"MetadataCover" => return (1, 0),
+        b"Backdrop" => return (2, 0),
+        b"Preview" => return (3, 0),
+        b"Sample" => return (4, 0),
+        _ => {}
+    }
+    buffer.clear();
+    buffer.extend(
+        w566_trim(raw)
+            .iter()
+            .filter(|&&b| b != b'_' && b != b'-')
+            .map(u8::to_ascii_lowercase),
+    );
+    match buffer.as_slice() {
+        b"original" => (0, 1),
+        b"metadatacover" => (1, 1),
+        b"backdrop" => (2, 1),
+        b"preview" => (3, 1),
+        b"sample" => (4, 1),
+        b"full" | b"raw" | b"source" => (0, 2),
+        b"cover" | b"poster" | b"metadata" => (1, 2),
+        b"fanart" | b"background" | b"banner" => (2, 2),
+        b"thumbnail" | b"thumb" | b"screenshot" => (3, 2),
+        b"samples" | b"still" => (4, 2),
+        _ => (5, 3),
+    }
+}
+
+/// Format of `ltrim(strtolower(trim($format)) without an `image/` prefix,
+/// '.')`: 1 JPEG, 2 PNG, 3 WebP, 4 GIF, 5 BMP, 6 AVIF, 0 unknown.
+#[inline]
+fn w616_image_format(raw: &[u8], buffer: &mut Vec<u8>) -> i64 {
+    w616_lower_trim_into(raw, buffer);
+    let mut format = buffer.strip_prefix(b"image/").unwrap_or(buffer);
+    while let [b'.', rest @ ..] = format {
+        format = rest;
+    }
+    match format {
+        b"jpg" | b"jpeg" | b"pjpeg" | b"jpe" => 1,
+        b"png" => 2,
+        b"webp" => 3,
+        b"gif" => 4,
+        b"bmp" => 5,
+        b"avif" => 6,
+        _ => 0,
+    }
+}
+
+/// Profile and format columns with width and height columns (clamped to
+/// 0..65535). Bounded profiles fit oversized images within their bounds keeping
+/// the aspect ratio (at least 1 pixel). Original and unknown profiles keep a
+/// known format (else JPEG), metadata covers keep PNG, others encode JPEG;
+/// quality is the profile's JPEG quality, or 9 for PNG. Flags: 1 unknown
+/// profile, 2 unknown format, 4 zero dimension, 8 resized, 16 under 32 pixels,
+/// 32 over 40 megapixels, 64 converted; accepted without 1, 2, 4, 16 or 32.
+/// `[0]` count, `[1..7]` per case, `[7..11]` per source, `[11..18]` per
+/// format, `[18]` resized, `[19]` converted, `[20]` accepted, `[21]` rejected
+/// and `[22]` the first rejected index (-1), `[23]` output pixels, `[24]` widest
+/// and `[25]` tallest output, `[26]` FNV-1a digest; then per image `case |
+/// source << 3 | format << 5 | target << 8 | flags << 11 | accepted << 18 |
+/// quality << 19 | width << 26 | height << 42 | min(profile bytes, 31) << 58`.
+pub(crate) fn w616_image_batch(fields: &[&[u8]], ints: &[i64], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W616_IMAGE_HEADER + count];
+    out[0] = count as i64;
+    out[22] = -1;
+    let mut buffer = Vec::new();
+    for at in 0..count {
+        let profile = fields[at];
+        let (case, source) = w616_image_profile(profile, &mut buffer);
+        let format = w616_image_format(fields[count + at], &mut buffer);
+        let width = ints[at].clamp(0, W616_DIMENSION_CAP);
+        let height = ints[count + at].clamp(0, W616_DIMENSION_CAP);
+        let (max_width, max_height) = W616_IMAGE_BOUNDS[case as usize];
+        let zero = width == 0 || height == 0;
+        let resized = !zero && max_width > 0 && (width > max_width || height > max_height);
+        let (out_width, out_height) = if resized {
+            if width * max_height >= height * max_width {
+                (max_width, (height * max_width / width).max(1))
+            } else {
+                ((width * max_height / height).max(1), max_height)
+            }
+        } else if zero {
+            (0, 0)
+        } else {
+            (width, height)
+        };
+        let target = if case == 0 || case == 5 {
+            if format == 0 { 1 } else { format }
+        } else if case == 1 && format == 2 {
+            2
+        } else {
+            1
+        };
+        let quality = if target == 2 {
+            9
+        } else {
+            W616_IMAGE_QUALITY[case as usize]
+        };
+        let flags = i64::from(case == 5)
+            | i64::from(format == 0) << 1
+            | i64::from(zero) << 2
+            | i64::from(resized) << 3
+            | i64::from(!zero && (width < 32 || height < 32)) << 4
+            | i64::from(width * height > W616_PIXEL_CAP) << 5
+            | i64::from(target != format) << 6;
+        let accepted = i64::from(flags & 0b11_0111 == 0);
+        out[1 + case as usize] += 1;
+        out[7 + source as usize] += 1;
+        out[11 + format as usize] += 1;
+        out[18] += i64::from(resized);
+        out[19] += flags >> 6 & 1;
+        out[20] += accepted;
+        if accepted == 0 {
+            out[21] += 1;
+            w586_first(&mut out[22], at);
+        }
+        out[23] += out_width * out_height;
+        out[24] = out[24].max(out_width);
+        out[25] = out[25].max(out_height);
+        out[W616_IMAGE_HEADER + at] = case
+            | source << 3
+            | format << 5
+            | target << 8
+            | flags << 11
+            | accepted << 18
+            | quality << 19
+            | out_width << 26
+            | out_height << 42
+            | (profile.len().min(31) as i64) << 58;
+    }
+    out[26] = w526_digest(&out[W616_IMAGE_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w616_image_asset_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let fields = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                2,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w616_image_batch(&fields, &ints, count))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w616_blacklist_filecheck_domain_completion_image_tests {
+    use super::*;
+    use std::ptr::null;
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn w616_blacklist_batch_resolves_and_validates() {
+        let fields: [&[u8]; 9] = [
+            b"OPTYPE_BLACKLIST",
+            b" Allow ",
+            b"nope",
+            b"BLACKLIST_FIELD_SUBJECT",
+            b"message-id",
+            b"poster",
+            b"^foo.*bar$",
+            b"x",
+            b" .* ",
+        ];
+        let out = w616_blacklist_batch(&fields, &[1, 0, 1], 3);
+        assert_eq!(&out[1..12], &[1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 2]);
+        assert_eq!(&out[12..19], &[2, 1, 0, 1, 2, 15, 10]);
+        let row = out[W616_BLACKLIST_HEADER];
+        assert_eq!(row & 3, 1);
+        assert_eq!(row >> 15 & 3, 3);
+        assert_eq!(row >> 17, 10);
+        assert_eq!(out[W616_BLACKLIST_HEADER + 2] >> 8 & 0x7F, 1 | 64);
+    }
+
+    #[test]
+    fn w616_filecheck_batch_gates_and_transitions() {
+        let statuses: [&[u8]; 5] = [b"3", b"Sized", b" inserted ", b"7", b"016"];
+        let ints = [
+            4,
+            3,
+            3,
+            4,
+            9,
+            10,
+            9,
+            0,
+            0,
+            0,
+            10,
+            10,
+            0,
+            0,
+            0,
+            5 << 20,
+            5 << 20,
+            0,
+            0,
+            0,
+        ];
+        let out = w616_filecheck_batch(&statuses, &ints, 1 << 20);
+        assert_eq!(&out[10..14], &[2, 1, 1, 1]);
+        assert_eq!(&out[14..19], &[1, 1, 1, 1, 1]);
+        assert_eq!(&out[19..27], &[1, 1, 1, 0, 2, 5 << 20, 19, 20]);
+        assert_eq!(out[W616_FILECHECK_HEADER] >> 16 & 0x3FF, 1_000);
+        assert_eq!(out[W616_FILECHECK_HEADER + 1] >> 9 & 0xF, 4);
+    }
+
+    #[test]
+    fn w616_domain_batch_classifies_keys() {
+        let keys: [&[u8]; 7] = [
+            b"site",
+            b"PostProcessing",
+            b"configuration:tmux",
+            b" POST_PROCESSING ",
+            b"metadata.Max_Size",
+            b"ingestion.",
+            b"bogus",
+        ];
+        let out = w616_domain_batch(&keys);
+        assert_eq!(&out[8..14], &[1, 1, 1, 1, 2, 1]);
+        assert_eq!(&out[14..18], &[3, 2, 1, 1]);
+        assert_eq!(&out[18..22], &[1, 2, 5, 8]);
+        assert_eq!(out[W616_DOMAIN_HEADER + 4] >> 12 & 1, 1);
+        assert_eq!(out[W616_DOMAIN_HEADER + 5] >> 8 & 0xF, 2);
+    }
+
+    #[test]
+    fn w616_completion_batch_derives_status() {
+        let statuses: [&[u8]; 4] = [b"0", b"Complete", b" yes ", b"?"];
+        let ints = [10, 5, 96, 3, 10, 10, 100, 2];
+        let out = w616_completion_batch(&statuses, &ints, 950);
+        assert_eq!(&out[1..8], &[1, 2, 1, 1, 1, 1, 1]);
+        assert_eq!(&out[8..14], &[0, 0, 1, 1, 1, 1]);
+        assert_eq!(&out[14..24][..6], &[0, 1, 2, 1, 2, 1]);
+        assert_eq!(&out[20..23], &[114, 122, (10 + 5 + 96 + 2) * 1_000 / 122]);
+    }
+
+    #[test]
+    fn w616_image_batch_fits_bounds() {
+        let fields: [&[u8]; 6] = [b"Backdrop", b"cover", b"x", b"image/JPEG", b".png", b"tiff"];
+        let ints = [3_840, 500, 10, 2_160, 1_000, 10];
+        let out = w616_image_batch(&fields, &ints, 3);
+        let row = out[W616_IMAGE_HEADER];
+        assert_eq!(row >> 26 & 0xFFFF, 1_820);
+        assert_eq!(row >> 42 & 0xFFFF, 1_024);
+        assert_eq!(row >> 19 & 0x7F, 80);
+        let cover = out[W616_IMAGE_HEADER + 1];
+        assert_eq!((cover >> 26 & 0xFFFF, cover >> 42 & 0xFFFF), (125, 250));
+        assert_eq!(cover >> 8 & 7, 2);
+        assert_eq!(&out[18..23], &[2, 1, 2, 1, 2]);
+    }
+
+    #[test]
+    fn w616_exports_report_status() {
+        let mut out = [0i64; 64];
+        let ints = packed(&[1]);
+        let status = unsafe {
+            nntmux_w616_blacklist_rule_batch(
+                b"1\x002\x00x".as_ptr(),
+                5,
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[12]), (1, 1, 1));
+        let status = unsafe {
+            nntmux_w616_blacklist_rule_batch(
+                b"1".as_ptr(),
+                1,
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+        let status = unsafe {
+            nntmux_w616_configuration_domain_batch(
+                b"site".as_ptr(),
+                4,
+                null(),
+                0,
+                1,
+                out.as_mut_ptr(),
+                4,
+            )
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w616_collection_filecheck_batch(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                0,
+                0,
+                null::<i64>().cast_mut(),
+                64,
+            )
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w616_file_completion_batch(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                0,
+                950,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[19]), (1, 0, -1));
+        let status = unsafe {
+            nntmux_w616_image_asset_batch(null(), 0, null(), 0, null(), 0, 0, out.as_mut_ptr(), 64)
+        };
+        assert_eq!((status, out[22]), (1, -1));
+    }
+}
