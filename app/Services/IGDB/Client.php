@@ -863,4 +863,316 @@ class Client
 
         return $state[$op] ?? null;
     }
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 4.09x, p99 3.60x; uncommon mean 4.82x, p99 3.75x); see RustGamesProcessorGdprNotificationGenreIgdbClientExceptionW67ParityTest. */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    public const string W67_IGDB_CLIENT_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w673_igdb_client_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 67.3 batch. */
+    public const int W67_IGDB_CLIENT_TRAILER = 21;
+
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', true);
+    }
+
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', false);
+    }
+
+    /** Restores W67_RUST_FFI_DEFAULT and drops the cached library handle and scratch buffers. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('reset');
+    }
+
+    public static function usesW67RustFfi(): bool
+    {
+        $override = self::w67RustFfiState();
+
+        return \is_bool($override) ? $override : self::W67_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the IGDB Client Wave 67 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 67.3 IGDB request plan. Each item is `endpoint|expiresIn|tokenAge|requestsInWindow|windowAgeMs|query` (the
+     * query is last, so it may hold `|`). The endpoint is trimmed of whitespace and `/`: code 0 empty, 1-21 per
+     * W54_ENDPOINT_CODES, 22 another `[a-z0-9_/]` path or 23 other bytes; nested when it holds `/`. The trimmed query
+     * sets bit i of the clause mask when it caselessly holds W67_IGDB_CLAUSES[i]; its limit is the digit run after the
+     * first caseless "limit " (999999 beyond 6 digits). Query state 0 empty, 1 valid, 2 not ending in `;`, 3 without a
+     * fields clause (other than multiquery) or 4 limit over W67_IGDB_MAX_LIMIT. Expiry, token age (9 digits), window
+     * requests and window age (6) are 0 empty, 1 digits or 2 other; the token TTL is max(60, expiresIn (3600 unless
+     * digits) - 60), expired when the age reaches it and refresh-soon within 300 seconds. A window of 1000 ms or more
+     * resets the request count; W67_IGDB_RATE_LIMIT requests throttle until the window ends. Decision 6 malformed, 0
+     * skipped (empty endpoint or query), 1 invalid endpoint, 2 invalid query, 3 refresh the token then send, 4
+     * throttled or 5 send. Per item `code | nested << 5 | queryState << 6 | clauses << 9 | expiresState << 16 |
+     * ageState << 18 | requestsState << 20 | windowState << 22 | expired << 24 | refreshSoon << 25 | throttled << 26 |
+     * decision << 27 | waitMs << 30 | limit (cap 1023) << 40 | semicolons (cap 63) << 50 | queryLength (cap 127) <<
+     * 56`. Then the seven decision counts, the known and nested endpoints, the five query-state counts, the expired,
+     * refresh-soon and throttled rows, the wait and TTL totals, the distinct known endpoints and the 1-based first
+     * sent item.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67IgdbClientPlanBatch(array $items): array
+    {
+        return self::usesW67RustFfi() ? self::w67IgdbClientPlanBatchNative($items) : self::w67IgdbClientPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67IgdbClientPlanBatchNative(array $items): array
+    {
+        return self::w67Invoke($items, \count($items) + self::W67_IGDB_CLIENT_TRAILER) ?? self::w67IgdbClientPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67IgdbClientPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $decisions = [0, 0, 0, 0, 0, 0, 0];
+        $queryStates = [0, 0, 0, 0, 0];
+        $known = $nestedCount = $expiredCount = $refreshCount = $throttledCount = $waitSum = $ttlSum = $firstSend = 0;
+        $endpoints = [];
+        $index = 0;
+        foreach ($items as $item) {
+            [$rawEndpoint, $rawExpires, $rawAge, $rawUsed, $rawWindow, $rawQuery] = explode('|', (string) $item, 6) + ['', '', '', '', '', ''];
+            $endpoint = trim($rawEndpoint, self::W54_ENDPOINT_TRIM);
+            $code = $endpoint === '' ? 0 : (self::W54_ENDPOINT_CODES[$endpoint]
+                ?? (strspn($endpoint, 'abcdefghijklmnopqrstuvwxyz0123456789_/') === \strlen($endpoint) ? 22 : 23));
+            $nested = str_contains($endpoint, '/');
+            $query = trim($rawQuery);
+            $clauses = 0;
+            foreach (self::W67_IGDB_CLAUSES as $bit => $clause) {
+                if (stripos($query, $clause) !== false) {
+                    $clauses |= 1 << $bit;
+                }
+            }
+            $semicolons = substr_count($query, ';');
+            $limit = 0;
+            $at = stripos($query, 'limit ');
+            if ($at !== false) {
+                $run = strspn($query, '0123456789', $at + 6);
+                $limit = $run > 6 ? 999_999 : (int) substr($query, $at + 6, $run);
+            }
+            $queryState = match (true) {
+                $query === '' => 0,
+                $query[-1] !== ';' => 2,
+                $code !== 14 && ($clauses & 1) === 0 => 3,
+                $limit > self::W67_IGDB_MAX_LIMIT => 4,
+                default => 1,
+            };
+            [$expiresState, $expires] = self::w67Count($rawExpires, 9);
+            $ttl = max(60, ($expiresState === 1 ? $expires : 3600) - 60);
+            [$ageState, $age] = self::w67Count($rawAge, 9);
+            $expired = $age >= $ttl;
+            $refreshSoon = ! $expired && $ttl - $age < 300;
+            [$usedState, $used] = self::w67Count($rawUsed, 6);
+            [$windowState, $window] = self::w67Count($rawWindow, 6);
+            if ($window >= 1000) {
+                $used = 0;
+            }
+            $throttled = $used >= self::W67_IGDB_RATE_LIMIT;
+            $wait = $throttled ? 1000 - $window : 0;
+            $decision = match (true) {
+                $expiresState === 2 || $ageState === 2 || $usedState === 2 || $windowState === 2 => 6,
+                $code === 0 || $queryState === 0 => 0,
+                $code >= 22 => 1,
+                $queryState >= 2 => 2,
+                $throttled => 4,
+                $expired => 3,
+                default => 5,
+            };
+            $decisions[$decision]++;
+            $queryStates[$queryState]++;
+            if ($code >= 1 && $code <= 21) {
+                $known++;
+                $endpoints[$code] = true;
+            }
+            $nestedCount += $nested ? 1 : 0;
+            $expiredCount += $expired ? 1 : 0;
+            $refreshCount += $refreshSoon ? 1 : 0;
+            $throttledCount += $throttled ? 1 : 0;
+            $waitSum = min($waitSum + $wait, self::W67_TOTAL_CAP);
+            $ttlSum = min($ttlSum + $ttl, self::W67_TOTAL_CAP);
+            if ($decision === 5 && $firstSend === 0) {
+                $firstSend = $index + 1;
+            }
+            $out[] = $code | ($nested ? 1 : 0) << 5 | $queryState << 6 | $clauses << 9 | $expiresState << 16 | $ageState << 18 | $usedState << 20
+                | $windowState << 22 | ($expired ? 1 : 0) << 24 | ($refreshSoon ? 1 : 0) << 25 | ($throttled ? 1 : 0) << 26 | $decision << 27
+                | $wait << 30 | min($limit, 1023) << 40 | min($semicolons, 63) << 50 | min(\strlen($query), 127) << 56;
+            $index++;
+        }
+        array_push($out, ...$decisions);
+        array_push($out, $known, $nestedCount);
+        array_push($out, ...$queryStates);
+        array_push($out, $expiredCount, $refreshCount, $throttledCount, $waitSum, $ttlSum, \count($endpoints), $firstSend);
+
+        return $out;
+    }
+
+    /** Query clauses whose presence sets bits 0-6 of the Wave 67.3 clause mask. */
+    private const array W67_IGDB_CLAUSES = ['fields ', 'where ', 'limit ', 'search ', 'sort ', 'offset ', 'exclude '];
+
+    /** IGDB requests allowed per one-second window. */
+    public const int W67_IGDB_RATE_LIMIT = 4;
+
+    /** Largest IGDB `limit`. */
+    public const int W67_IGDB_MAX_LIMIT = 500;
+
+    /** Cap for the Wave 67.3 running totals. */
+    private const int W67_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /**
+     * (0 empty, 1 one to $max ASCII digits, 2 other; the value) for the trimmed field.
+     *
+     * @return array{int, int}
+     */
+    private static function w67Count(string $text, int $max): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $length = \strlen($text);
+
+        return $length <= $max && strspn($text, '0123456789') === $length ? [1, (int) $text] : [2, 0];
+    }
+
+    /**
+     * Wave 67 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and returns the
+     * previous override, 'reset' clears the override, library handle and buffers, 'ffi' resolves the library
+     * (null when unavailable) and 'out' and 'lens' return `int64_t` output and length-column buffers of at least
+     * $val words. Function statics keep the class's property set unchanged.
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('services_w673', self::W67_IGDB_CLIENT_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w67RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w67RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 67.3 IGDB Client export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call declines
+     * or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w67Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w67RustFfiState('ffi');
+            $out = self::w67RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w67RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W67_IGDB_CLIENT_FFI_CDEF.)
+            $written = $ffi->nntmux_w673_igdb_client_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
