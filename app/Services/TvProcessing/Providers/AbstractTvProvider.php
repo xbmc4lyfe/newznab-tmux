@@ -262,6 +262,260 @@ abstract class AbstractTvProvider extends BaseVideoProvider
         }
     }
 
+    /** Wave 56.3 paired benchmarks decide this default; see RustTvProcessingPipesProviderPassableResultW56ParityTest. */
+    public const bool W56_RUST_FFI_DEFAULT = true;
+
+    public const string W56_TV_PROVIDER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w563_tv_provider_title_match_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-pair words of w56TitleMatchBatch(). */
+    public const int W56_TITLE_MATCH_TRAILER = 4;
+
+    /** Lowercase trailing country tokens stripped before comparing titles; flags compare index + 1. */
+    public const array W56_TITLE_COUNTRIES = ['us', 'uk', 'au', 'ca', 'nz'];
+
+    /**
+     * The Wave 56 toggle of this base class. Provider subclasses may declare their own
+     * usesW56RustFfi(); this name always reads the base class state.
+     */
+    public static function usesAbstractTvProviderW56RustFfi(): bool
+    {
+        $override = self::w56RustFfiState();
+
+        return \is_bool($override) ? $override : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the base class Wave 56 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withAbstractTvProviderW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        return self::usesAbstractTvProviderW56RustFfi();
+    }
+
+    /**
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        return self::withAbstractTvProviderW56RustFfi($enabled, $callback);
+    }
+
+    /**
+     * Wave 56.3 title matching. Items pair up as (ours, theirs); an odd last item pairs with ''.
+     * Each side becomes its lowercase `[a-z0-9]` tokens without a trailing 19xx/20xx year and then
+     * a trailing W56_TITLE_COUNTRIES token (each only while two or more tokens remain), joined by
+     * spaces. Per pair `min(similar, 0xFFFFF) | min(total length, 0xFFFFF) << 20 | flags << 40`,
+     * with `similar` the similar_text() count and flags 1 equal and non-empty, 2 at least
+     * MATCH_PROBABILITY percent similar, 4 either side empty, 8 equal years, 16 years more than one
+     * apart and 32 equal countries. Then the match, equal and empty counts and the index of the most
+     * similar match (first on ties, -1 without one).
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w56TitleMatchBatch(array $items): array
+    {
+        return self::usesAbstractTvProviderW56RustFfi() ? self::w56TitleMatchBatchNative($items) : self::w56TitleMatchBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w56TitleMatchBatchNative(array $items): array
+    {
+        return self::w56Invoke($items, intdiv(\count($items) + 1, 2) + self::W56_TITLE_MATCH_TRAILER) ?? self::w56TitleMatchBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w56TitleMatchBatchPhp(array $items): array
+    {
+        $items = array_values($items);
+        $count = \count($items);
+        $out = [];
+        [$matches, $equal, $empty, $best, $bestSimilar, $bestTotal] = [0, 0, 0, -1, 0, 1];
+        for ($i = 0; $i < $count; $i += 2) {
+            [$ours, $ourYear, $ourCountry] = self::w56TitleParts((string) $items[$i]);
+            [$theirs, $theirYear, $theirCountry] = self::w56TitleParts((string) ($items[$i + 1] ?? ''));
+            $similar = similar_text($ours, $theirs);
+            $total = \strlen($ours) + \strlen($theirs);
+            $flags = 0;
+            if ($ours !== '' && $ours === $theirs) {
+                $flags |= 1;
+                $equal++;
+            }
+            if ($total > 0 && $similar * 200 >= self::MATCH_PROBABILITY * $total) {
+                $flags |= 2;
+                $matches++;
+                if ($best < 0 || $similar * $bestTotal > $bestSimilar * $total) {
+                    [$best, $bestSimilar, $bestTotal] = [$i >> 1, $similar, $total];
+                }
+            }
+            if ($ours === '' || $theirs === '') {
+                $flags |= 4;
+                $empty++;
+            }
+            if ($ourYear > 0 && $theirYear > 0) {
+                $flags |= ($ourYear === $theirYear ? 8 : 0) | (abs($ourYear - $theirYear) > 1 ? 16 : 0);
+            }
+            if ($ourCountry > 0 && $ourCountry === $theirCountry) {
+                $flags |= 32;
+            }
+            $out[] = min($similar, 0xFFFFF) | min($total, 0xFFFFF) << 20 | $flags << 40;
+        }
+        array_push($out, $matches, $equal, $empty, $best);
+
+        return $out;
+    }
+
+    /**
+     * The comparable title of w56TitleMatchBatchPhp(), its year (0 without one) and its country index + 1 (0 without one).
+     *
+     * @return array{string, int, int}
+     */
+    private static function w56TitleParts(string $title): array
+    {
+        $tokens = preg_split('/[^a-z0-9]+/', strtolower($title), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $n = \count($tokens);
+        $year = 0;
+        $country = 0;
+        if ($n >= 2 && preg_match('/^(?:19|20)\d{2}$/', $tokens[$n - 1]) === 1) {
+            $year = (int) $tokens[--$n];
+        }
+        if ($n >= 2 && ($index = array_search($tokens[$n - 1], self::W56_TITLE_COUNTRIES, true)) !== false) {
+            $country = $index + 1;
+            $n--;
+        }
+
+        return [implode(' ', \array_slice($tokens, 0, $n)), $year, $country];
+    }
+
+    /**
+     * Wave 56 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('tv_w56', self::W56_TV_PROVIDER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w56RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w56RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 56.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w56Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w56RustFfiState('ffi');
+            $out = self::w56RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w56RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W56_TV_PROVIDER_FFI_CDEF.)
+            $written = $ffi->nntmux_w563_tv_provider_title_match_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     /**
      * @string Path to Save Images
      */

@@ -6,6 +6,7 @@ namespace App\Services\TvProcessing;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -351,5 +352,229 @@ class TvProcessingResult
         }
 
         return self::$w47RustFfiHandle === false ? null : self::$w47RustFfiHandle;
+    }
+
+    /** Wave 56.3 paired benchmarks decide this default; see RustTvProcessingPipesProviderPassableResultW56ParityTest. */
+    public const bool W56_RUST_FFI_DEFAULT = true;
+
+    public const string W56_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w563_tv_result_outcome_summary_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public static function usesW56RustFfi(): bool
+    {
+        $override = self::w56RustFfiState();
+
+        return \is_bool($override) ? $override : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 56 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /** Trailer words after the per-record words of w56OutcomeSummaryBatch(). */
+    public const int W56_OUTCOME_SUMMARY_TRAILER = 8;
+
+    /** Largest video id stored in a w56OutcomeSummaryBatch() word. */
+    public const int W56_MAX_WORD_VIDEO = (1 << 40) - 1;
+
+    /**
+     * Wave 56.3 outcome summaries. Per `status:video_id:episode_id` snapshot (explode limit 3)
+     * `class | code << 2 | flags << 6 | min(video, W56_MAX_WORD_VIDEO) << 10`, with `class` 0 matched
+     * (matched, season_pack), 1 skipped (skipped, pending), 2 not found (not_found, episode_missing)
+     * or 3 failed (anything else), `code` the W47_STATUS_CODES code of the trimmed lowercase status
+     * (0 unknown), ids '' as 0, 1-18 ASCII digits as their value and anything else malformed, and
+     * flags 1 positive video, 2 positive episode, 4 malformed id and 8 ids consistent with the
+     * status (matched both positive; season_pack and episode_missing a positive video and no
+     * episode; otherwise no episode). Then the four class counts, the inconsistent and malformed
+     * counts, the distinct positive videos and the max episode.
+     *
+     * @param  array<array-key, string>  $records
+     * @return list<int>
+     */
+    public static function w56OutcomeSummaryBatch(array $records): array
+    {
+        return self::usesW56RustFfi() ? self::w56OutcomeSummaryBatchNative($records) : self::w56OutcomeSummaryBatchPhp($records);
+    }
+
+    /**
+     * @param  array<array-key, string>  $records
+     * @return list<int>
+     */
+    public static function w56OutcomeSummaryBatchNative(array $records): array
+    {
+        return self::w56Invoke($records, \count($records) + self::W56_OUTCOME_SUMMARY_TRAILER) ?? self::w56OutcomeSummaryBatchPhp($records);
+    }
+
+    /**
+     * @param  array<array-key, string>  $records
+     * @return list<int>
+     */
+    public static function w56OutcomeSummaryBatchPhp(array $records): array
+    {
+        $out = [];
+        $classes = [0, 0, 0, 0];
+        $inconsistent = 0;
+        $malformedCount = 0;
+        $videos = [];
+        $maxEpisode = 0;
+        foreach ($records as $record) {
+            $parts = explode(':', (string) $record, 3);
+            $code = self::W47_STATUS_CODES[strtolower(trim($parts[0]))] ?? 0;
+            $video = self::w56OutcomeId($parts[1] ?? '');
+            $episode = self::w56OutcomeId($parts[2] ?? '');
+            $class = match ($code) {
+                1, 2 => 0,
+                7, 8 => 1,
+                3, 4 => 2,
+                default => 3,
+            };
+            $malformed = $video < 0 || $episode < 0;
+            $consistent = ! $malformed && match ($code) {
+                1 => $video > 0 && $episode > 0,
+                2, 3 => $video > 0 && $episode === 0,
+                default => $episode === 0,
+            };
+            $flags = ($video > 0 ? 1 : 0) | ($episode > 0 ? 2 : 0) | ($malformed ? 4 : 0) | ($consistent ? 8 : 0);
+            $classes[$class]++;
+            $inconsistent += $consistent ? 0 : 1;
+            $malformedCount += $malformed ? 1 : 0;
+            if ($video > 0) {
+                $videos[$video] = true;
+            }
+            $maxEpisode = max($maxEpisode, $episode);
+            $out[] = $class | $code << 2 | $flags << 6 | max(0, min($video, self::W56_MAX_WORD_VIDEO)) << 10;
+        }
+        array_push($out, ...$classes);
+        array_push($out, $inconsistent, $malformedCount, \count($videos), $maxEpisode);
+
+        return $out;
+    }
+
+    /** A snapshot id: '' is 0, 1-18 ASCII digits their value, anything else -1 (malformed). */
+    private static function w56OutcomeId(string $value): int
+    {
+        if ($value === '') {
+            return 0;
+        }
+
+        return \strlen($value) <= 18 && ctype_digit($value) ? (int) $value : -1;
+    }
+
+    /**
+     * Wave 56 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('tv_w56', self::W56_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w56RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w56RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 56.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w56Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w56RustFfiState('ffi');
+            $out = self::w56RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w56RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w563_tv_result_outcome_summary_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

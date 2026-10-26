@@ -10,6 +10,7 @@ use App\Services\TvProcessing\TvProcessingResult;
 use App\Support\RustPipelineLibrary;
 use Closure;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -281,6 +282,246 @@ abstract class AbstractTvProviderPipe
         }
 
         return self::$w48RustFfiHandle === false ? null : self::$w48RustFfiHandle;
+    }
+
+    /** Wave 56.3 paired benchmarks decide this default; see RustTvProcessingPipesProviderPassableResultW56ParityTest. */
+    public const bool W56_RUST_FFI_DEFAULT = true;
+
+    public const string W56_TV_PIPE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w563_tv_pipe_gate_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the two per-name words of w56PipeGateBatch(). */
+    public const int W56_PIPE_GATE_TRAILER = 10;
+
+    public static function usesW56RustFfi(): bool
+    {
+        $override = self::w56RustFfiState();
+
+        return \is_bool($override) ? $override : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 56 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 56.3 pipe execution gates. Two words per release name split into `[A-Za-z0-9]` tokens:
+     * `flags | season << 8 | episode << 16 | airdate << 28` for the first reference token (flags
+     * 2 `SxxEyy`, 4 `NxNN`, 8 a `YYYY MM DD` airdate with month 1-12 and day 1-31 as `Ymd`,
+     * 16 an `Sxx` season pack; then 1 no tokens, 32 any reference and 64 a reference without
+     * title tokens), and the FNV-1a 32 of the lowercase title tokens before it joined by spaces
+     * `| min(length, 0xFFFFFFF) << 32`. Then the seven flag counts, the max season and episode and
+     * the distinct non-empty title hashes.
+     *
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w56PipeGateBatch(array $names): array
+    {
+        return self::usesW56RustFfi() ? self::w56PipeGateBatchNative($names) : self::w56PipeGateBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w56PipeGateBatchNative(array $names): array
+    {
+        return self::w56Invoke($names, 2 * \count($names) + self::W56_PIPE_GATE_TRAILER) ?? self::w56PipeGateBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w56PipeGateBatchPhp(array $names): array
+    {
+        $out = [];
+        $totals = [0, 0, 0, 0, 0, 0, 0];
+        $maxSeason = 0;
+        $maxEpisode = 0;
+        $titles = [];
+        foreach ($names as $name) {
+            $tokens = self::w56Tokens((string) $name);
+            $count = \count($tokens);
+            [$flags, $season, $episode, $airdate, $at] = [0, 0, 0, 0, $count];
+            foreach ($tokens as $i => $token) {
+                if (preg_match('/^S(\d{1,2})E(\d{1,3})$/i', $token, $m) === 1) {
+                    [$flags, $season, $episode, $at] = [2, (int) $m[1], (int) $m[2], $i];
+                    break;
+                }
+                if (preg_match('/^(\d{1,2})x(\d{1,3})$/i', $token, $m) === 1) {
+                    [$flags, $season, $episode, $at] = [4, (int) $m[1], (int) $m[2], $i];
+                    break;
+                }
+                if (preg_match('/^S(\d{1,2})$/i', $token, $m) === 1) {
+                    [$flags, $season, $at] = [16, (int) $m[1], $i];
+                    break;
+                }
+                if (preg_match('/^(?:19|20)\d{2}$/', $token) === 1
+                    && preg_match('/^\d{2}$/', $tokens[$i + 1] ?? '') === 1
+                    && preg_match('/^\d{2}$/', $tokens[$i + 2] ?? '') === 1) {
+                    $month = (int) $tokens[$i + 1];
+                    $day = (int) $tokens[$i + 2];
+                    if ($month >= 1 && $month <= 12 && $day >= 1 && $day <= 31) {
+                        [$flags, $airdate, $at] = [8, (int) $token * 10000 + $month * 100 + $day, $i];
+                        break;
+                    }
+                }
+            }
+            if ($count === 0) {
+                $flags |= 1;
+            } elseif ($at === 0) {
+                $flags |= 64;
+            }
+            if (($flags & 30) !== 0) {
+                $flags |= 32;
+            }
+            $title = strtolower(implode(' ', \array_slice($tokens, 0, $at)));
+            $fnv = self::w48Fnv($title);
+            if ($at > 0) {
+                $titles[$fnv] = true;
+            }
+            for ($bit = 0; $bit < 7; $bit++) {
+                $totals[$bit] += ($flags >> $bit) & 1;
+            }
+            $maxSeason = max($maxSeason, $season);
+            $maxEpisode = max($maxEpisode, $episode);
+            $out[] = $flags | $season << 8 | $episode << 16 | $airdate << 28;
+            $out[] = $fnv | min(\strlen($title), 0xFFFFFFF) << 32;
+        }
+        array_push($out, ...$totals);
+        array_push($out, $maxSeason, $maxEpisode, \count($titles));
+
+        return $out;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function w56Tokens(string $value): array
+    {
+        $tokens = preg_split('/[^A-Za-z0-9]+/', $value, -1, PREG_SPLIT_NO_EMPTY);
+
+        return $tokens === false ? [] : $tokens;
+    }
+
+    /**
+     * Wave 56 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('tv_w56', self::W56_TV_PIPE_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w56RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w56RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 56.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w56Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w56RustFfiState('ffi');
+            $out = self::w56RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w56RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W56_TV_PIPE_FFI_CDEF.)
+            $written = $ffi->nntmux_w563_tv_pipe_gate_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     protected int $priority = 50;

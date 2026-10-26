@@ -42342,7 +42342,7 @@ pub mod release_image_browse_duplicate_group_management_w553 {
     /// # Safety
     /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
     /// `out_cap` `i64`s).
-    unsafe fn run_items(
+    pub(super) unsafe fn run_items(
         blob: *const u8,
         blob_len: usize,
         lens: *const i64,
@@ -42722,6 +42722,733 @@ pub mod release_image_browse_duplicate_group_management_w553 {
                     assert_eq!(f(b"ab".as_ptr(), 2, [3i64, -1].as_ptr(), 2, o, 64), DECLINE);
                     assert_eq!(f(ptr::null(), 0, l, 0, o, 64), trailer);
                     assert_eq!(f(b"x".as_ptr(), 1, l, (1 << 24) + 1, o, 64), DECLINE);
+                }
+            }
+        }
+    }
+}
+
+/// Wave 56.3 TV processing batches for `AbstractTvProviderPipe`, `AbstractApiProviderPipe`,
+/// `AbstractTvProvider`, `TvProcessingPassable` and `TvProcessingResult`. Every export takes the
+/// Wave 55.3 item layout (NUL-joined, or concatenated with an `int64_t` length column) and writes
+/// the `int64_t` words of the matching PHP `w56...Php()` helper.
+pub mod tv_processing_pipes_provider_passable_result_w563 {
+    use super::release_image_browse_duplicate_group_management_w553::run_items;
+    use super::tv_book_service_books_consoles_games_w533::{tokens, trim};
+    use std::collections::HashSet;
+
+    const FNV_OFFSET: u32 = 0x811C_9DC5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+
+    /// `AbstractTvProvider::MATCH_PROBABILITY`.
+    const MATCH_PROBABILITY: u64 = 75;
+
+    /// Trailing country tokens stripped from search titles; the word stores index + 1.
+    const COUNTRIES: [&[u8]; 5] = [b"us", b"uk", b"au", b"ca", b"nz"];
+
+    /// `TvProcessingResult::W47_STATUS_CODES`.
+    const STATUS_CODES: [&[u8]; 8] = [
+        b"matched",
+        b"season_pack",
+        b"episode_missing",
+        b"not_found",
+        b"parse_failed",
+        b"transient",
+        b"skipped",
+        b"pending",
+    ];
+
+    /// Largest video id stored in an outcome word.
+    const MAX_WORD_VIDEO: i64 = (1 << 40) - 1;
+
+    #[inline]
+    fn fnv_lower(mut h: u32, bytes: &[u8]) -> u32 {
+        for &b in bytes {
+            h = (h ^ u32::from(b.to_ascii_lowercase())).wrapping_mul(FNV_PRIME);
+        }
+        h
+    }
+
+    /// FNV-1a 32 and byte length of the lowercase tokens joined by `sep`, without building it.
+    fn joined_fnv(parts: &[&[u8]], sep: u8) -> (u32, usize) {
+        let (mut h, mut len) = (FNV_OFFSET, 0usize);
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                h = (h ^ u32::from(sep)).wrapping_mul(FNV_PRIME);
+                len += 1;
+            }
+            h = fnv_lower(h, part);
+            len += part.len();
+        }
+        (h, len)
+    }
+
+    /// Lowercase tokens joined by a space.
+    fn joined(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(parts.iter().map(|p| p.len() + 1).sum());
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                out.push(b' ');
+            }
+            out.extend(part.iter().map(u8::to_ascii_lowercase));
+        }
+        out
+    }
+
+    #[inline]
+    fn all_digits(t: &[u8]) -> bool {
+        !t.is_empty() && t.iter().all(u8::is_ascii_digit)
+    }
+
+    /// Decimal value of an all-digit run of at most 18 bytes.
+    #[inline]
+    fn number(t: &[u8]) -> i64 {
+        t.iter().fold(0i64, |n, b| n * 10 + i64::from(b - b'0'))
+    }
+
+    /// Leading ASCII digits and the rest.
+    #[inline]
+    fn split_digits(t: &[u8]) -> (&[u8], &[u8]) {
+        let n = t.iter().take_while(|b| b.is_ascii_digit()).count();
+        t.split_at(n)
+    }
+
+    #[inline]
+    fn strip_letter(t: &[u8], letter: u8) -> Option<&[u8]> {
+        match t.split_first() {
+            Some((&first, rest)) if first.to_ascii_lowercase() == letter => Some(rest),
+            _ => None,
+        }
+    }
+
+    /// `/^(?:19|20)\d{2}$/`.
+    #[inline]
+    fn year_token(t: &[u8]) -> Option<i64> {
+        (t.len() == 4 && (t.starts_with(b"19") || t.starts_with(b"20")) && all_digits(t))
+            .then(|| number(t))
+    }
+
+    /// `/^\d{2}$/`.
+    #[inline]
+    fn two_digits(t: &[u8]) -> Option<i64> {
+        (t.len() == 2 && all_digits(t)).then(|| number(t))
+    }
+
+    /// `/^S(\d{1,2})E(\d{1,3})$/i`.
+    fn season_episode(t: &[u8]) -> Option<(i64, i64)> {
+        let (season, rest) = split_digits(strip_letter(t, b's')?);
+        let (episode, rest) = split_digits(strip_letter(rest, b'e')?);
+        ((1..=2).contains(&season.len()) && (1..=3).contains(&episode.len()) && rest.is_empty())
+            .then(|| (number(season), number(episode)))
+    }
+
+    /// `/^(\d{1,2})x(\d{1,3})$/i`.
+    fn cross_episode(t: &[u8]) -> Option<(i64, i64)> {
+        let (season, rest) = split_digits(t);
+        let (episode, rest) = split_digits(strip_letter(rest, b'x')?);
+        ((1..=2).contains(&season.len()) && (1..=3).contains(&episode.len()) && rest.is_empty())
+            .then(|| (number(season), number(episode)))
+    }
+
+    /// `/^S(\d{1,2})$/i`.
+    fn season_pack(t: &[u8]) -> Option<i64> {
+        let (season, rest) = split_digits(strip_letter(t, b's')?);
+        ((1..=2).contains(&season.len()) && rest.is_empty()).then(|| number(season))
+    }
+
+    /// Tokens left after the PHP `w56TitleParts()` trailing year and country strip, with the year
+    /// (0 without one) and the country index + 1 (0 without one).
+    fn title_parts(toks: &[&[u8]]) -> (usize, i64, i64) {
+        let mut n = toks.len();
+        let mut year = 0;
+        let mut country = 0;
+        if n >= 2
+            && let Some(y) = year_token(toks[n - 1])
+        {
+            year = y;
+            n -= 1;
+        }
+        if n >= 2
+            && let Some(i) = COUNTRIES
+                .iter()
+                .position(|c| toks[n - 1].eq_ignore_ascii_case(c))
+        {
+            country = i as i64 + 1;
+            n -= 1;
+        }
+        (n, year, country)
+    }
+
+    /// `AbstractTvProviderPipe::w56PipeGateBatchPhp()`: two words per release name. The first is
+    /// `flags | season << 8 | episode << 16 | airdate << 28` for the first reference token
+    /// (flags 2 `SxxEyy`, 4 `NxNN`, 8 `YYYY MM DD` airdate, 16 `Sxx` season pack; then 1 no tokens,
+    /// 32 any reference and 64 a reference without title tokens); the second is the FNV-1a 32 of
+    /// the lowercase title tokens before it joined by spaces `| min(length, 0xFFFFFFF) << 32`. Then
+    /// the seven flag counts, the max season and episode and the distinct non-empty title hashes.
+    fn pipe_gates(names: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(names.len() * 2 + 10);
+        let mut totals = [0i64; 7];
+        let (mut max_season, mut max_episode) = (0i64, 0i64);
+        let mut titles = HashSet::with_capacity(names.len());
+        let mut toks: Vec<&[u8]> = Vec::with_capacity(16);
+        for name in names {
+            toks.clear();
+            toks.extend(tokens(name));
+            let (mut flags, mut season, mut episode, mut airdate, mut at) =
+                (0i64, 0i64, 0i64, 0i64, toks.len());
+            for (i, &t) in toks.iter().enumerate() {
+                if let Some((s, e)) = season_episode(t) {
+                    (flags, season, episode, at) = (2, s, e, i);
+                    break;
+                }
+                if let Some((s, e)) = cross_episode(t) {
+                    (flags, season, episode, at) = (4, s, e, i);
+                    break;
+                }
+                if let Some(s) = season_pack(t) {
+                    (flags, season, at) = (16, s, i);
+                    break;
+                }
+                if let Some(y) = year_token(t)
+                    && let (Some(m), Some(d)) = (
+                        toks.get(i + 1).and_then(|t| two_digits(t)),
+                        toks.get(i + 2).and_then(|t| two_digits(t)),
+                    )
+                    && (1..=12).contains(&m)
+                    && (1..=31).contains(&d)
+                {
+                    (flags, airdate, at) = (8, y * 10_000 + m * 100 + d, i);
+                    break;
+                }
+            }
+            if toks.is_empty() {
+                flags |= 1;
+            } else if at == 0 {
+                flags |= 64;
+            }
+            if flags & 30 != 0 {
+                flags |= 32;
+            }
+            let (fp, len) = joined_fnv(&toks[..at], b' ');
+            if at > 0 {
+                titles.insert(fp);
+            }
+            for (k, total) in totals.iter_mut().enumerate() {
+                *total += (flags >> k) & 1;
+            }
+            max_season = max_season.max(season);
+            max_episode = max_episode.max(episode);
+            out.push(flags | season << 8 | episode << 16 | airdate << 28);
+            out.push(i64::from(fp) | (len.min(0xFFF_FFFF) as i64) << 32);
+        }
+        out.extend(totals);
+        out.extend([max_season, max_episode, titles.len() as i64]);
+        out
+    }
+
+    /// `AbstractApiProviderPipe::w56SearchEligibilityBatchPhp()`: per clean title
+    /// `flags | country << 5 | (year - 1900) << 8 | min(length, 0x7FFF) << 16 | fnv << 31` for the
+    /// lowercase search tokens left after a trailing year and country (flags 1 no tokens, 2 all
+    /// numeric, 4 year stripped, 8 country stripped, 16 searchable: neither 1 nor 2 and at least two
+    /// bytes). Then the five flag counts, the distinct searchable hashes and the max length.
+    fn search_eligibility(titles: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(titles.len() + 7);
+        let mut totals = [0i64; 5];
+        let mut keys = HashSet::with_capacity(titles.len());
+        let mut max_len = 0i64;
+        let mut toks: Vec<&[u8]> = Vec::with_capacity(16);
+        for title in titles {
+            toks.clear();
+            toks.extend(tokens(title));
+            let (n, year, country) = title_parts(&toks);
+            let mut flags = 0i64;
+            if toks.is_empty() {
+                flags |= 1;
+            }
+            if n > 0 && toks[..n].iter().all(|t| all_digits(t)) {
+                flags |= 2;
+            }
+            if year > 0 {
+                flags |= 4;
+            }
+            if country > 0 {
+                flags |= 8;
+            }
+            let (fp, len) = joined_fnv(&toks[..n], b' ');
+            let len = len.min(0x7FFF) as i64;
+            if flags & 3 == 0 && len >= 2 {
+                flags |= 16;
+                keys.insert(fp);
+            }
+            for (k, total) in totals.iter_mut().enumerate() {
+                *total += (flags >> k) & 1;
+            }
+            max_len = max_len.max(len);
+            let year = if year > 0 { year - 1900 } else { 0 };
+            out.push(flags | country << 5 | year << 8 | len << 16 | i64::from(fp) << 31);
+        }
+        out.extend(totals);
+        out.extend([keys.len() as i64, max_len]);
+        out
+    }
+
+    /// PHP `similar_text()` common byte count (`php_similar_char`; its `count > 1` guard only skips
+    /// a prefix pair that shares no byte, so it is omitted).
+    fn similar_char(a: &[u8], b: &[u8]) -> usize {
+        let (mut max, mut pos1, mut pos2) = (0usize, 0usize, 0usize);
+        let mut p = 0;
+        while p + max < a.len() {
+            let first = a[p];
+            let mut q = 0;
+            // Only a run longer than `max` updates, so later starts cannot win once too short.
+            while q + max < b.len() {
+                if b[q] == first {
+                    let l = 1 + a[p + 1..]
+                        .iter()
+                        .zip(&b[q + 1..])
+                        .take_while(|(x, y)| x == y)
+                        .count();
+                    if l > max {
+                        (max, pos1, pos2) = (l, p, q);
+                    }
+                }
+                q += 1;
+            }
+            p += 1;
+        }
+        if max == 0 {
+            return 0;
+        }
+        let mut sum = max;
+        if pos1 > 0 && pos2 > 0 {
+            sum += similar_char(&a[..pos1], &b[..pos2]);
+        }
+        if pos1 + max < a.len() && pos2 + max < b.len() {
+            sum += similar_char(&a[pos1 + max..], &b[pos2 + max..]);
+        }
+        sum
+    }
+
+    /// The lowercase space-joined title of `w56TitleParts()`, its year and its country index + 1.
+    fn title_side<'a>(toks: &mut Vec<&'a [u8]>, title: &'a [u8]) -> (Vec<u8>, i64, i64) {
+        toks.clear();
+        toks.extend(tokens(title));
+        let (n, year, country) = title_parts(toks);
+        (joined(&toks[..n]), year, country)
+    }
+
+    /// `AbstractTvProvider::w56TitleMatchBatchPhp()`: items pair up (ours, theirs; an odd last
+    /// item pairs with ''). Per pair, on the lowercase titles without a trailing year and country,
+    /// `min(similar, 0xFFFFF) | min(total length, 0xFFFFF) << 20 | flags << 40` with flags 1 equal
+    /// and non-empty, 2 similarity at least MATCH_PROBABILITY percent, 4 either side empty, 8 equal
+    /// years, 16 years more than one apart and 32 equal countries. Then the match, equal and empty
+    /// counts and the index of the most similar match (-1 without one).
+    fn title_matches(items: &[&[u8]]) -> Vec<i64> {
+        let pairs = items.len().div_ceil(2);
+        let mut out = Vec::with_capacity(pairs + 4);
+        let (mut matches, mut equal, mut empty) = (0i64, 0i64, 0i64);
+        let (mut best, mut best_sim, mut best_sum) = (-1i64, 0u64, 1u64);
+        let mut toks: Vec<&[u8]> = Vec::with_capacity(16);
+        for (index, pair) in items.chunks(2).enumerate() {
+            let (a, a_year, a_country) = title_side(&mut toks, pair[0]);
+            let (b, b_year, b_country) = title_side(&mut toks, pair.get(1).copied().unwrap_or(b""));
+            let sim = similar_char(&a, &b) as u64;
+            let sum = (a.len() + b.len()) as u64;
+            let mut flags = 0i64;
+            if !a.is_empty() && a == b {
+                flags |= 1;
+                equal += 1;
+            }
+            if sum > 0 && sim * 200 >= MATCH_PROBABILITY * sum {
+                flags |= 2;
+                matches += 1;
+                if best < 0 || sim * best_sum > best_sim * sum {
+                    (best, best_sim, best_sum) = (index as i64, sim, sum);
+                }
+            }
+            if a.is_empty() || b.is_empty() {
+                flags |= 4;
+                empty += 1;
+            }
+            if a_year > 0 && b_year > 0 {
+                flags |= if a_year == b_year { 8 } else { 0 }
+                    | if (a_year - b_year).abs() > 1 { 16 } else { 0 };
+            }
+            if a_country > 0 && a_country == b_country {
+                flags |= 32;
+            }
+            out.push(sim.min(0xF_FFFF) as i64 | (sum.min(0xF_FFFF) as i64) << 20 | flags << 40);
+        }
+        out.extend([matches, equal, empty, best]);
+        out
+    }
+
+    /// `TvProcessingPassable::w56ContextFingerprintBatchPhp()`: per search name
+    /// `fnv | min(tokens, 0xFFFF) << 32 | group << 48 | flags << 53`, with `fnv` the FNV-1a 32 of
+    /// the lowercase tokens joined by dots, `group` the trimmed `-GROUP` suffix length (1-20 word
+    /// bytes after a dash that is not first) and flags 1 no tokens, 2 group suffix, 4 non-ASCII byte
+    /// and 8 a `[...]` tag. Then the four flag counts, the distinct hashes and the token total.
+    fn context_fingerprints(names: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(names.len() + 6);
+        let mut totals = [0i64; 4];
+        let mut keys = HashSet::with_capacity(names.len());
+        let mut total_tokens = 0i64;
+        let mut toks: Vec<&[u8]> = Vec::with_capacity(16);
+        for &name in names {
+            let trimmed = trim(name);
+            toks.clear();
+            toks.extend(tokens(trimmed));
+            let (fp, _) = joined_fnv(&toks, b'.');
+            let mut flags = 0i64;
+            if toks.is_empty() {
+                flags |= 1;
+            }
+            let run = trimmed
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+                .count();
+            let mut group = 0i64;
+            if (1..=20).contains(&run)
+                && trimmed.len() >= run + 2
+                && trimmed[trimmed.len() - run - 1] == b'-'
+            {
+                flags |= 2;
+                group = run as i64;
+            }
+            if name.iter().any(|&b| b >= 0x80) {
+                flags |= 4;
+            }
+            if let (Some(open), Some(close)) = (
+                name.iter().position(|&b| b == b'['),
+                name.iter().rposition(|&b| b == b']'),
+            ) && open < close
+            {
+                flags |= 8;
+            }
+            for (k, total) in totals.iter_mut().enumerate() {
+                *total += (flags >> k) & 1;
+            }
+            keys.insert(fp);
+            total_tokens += toks.len() as i64;
+            out.push(
+                i64::from(fp) | (toks.len().min(0xFFFF) as i64) << 32 | group << 48 | flags << 53,
+            );
+        }
+        out.extend(totals);
+        out.extend([keys.len() as i64, total_tokens]);
+        out
+    }
+
+    /// PHP `w56OutcomeId()`: '' is 0, 1-18 ASCII digits their value, anything else malformed.
+    #[inline]
+    fn outcome_id(v: &[u8]) -> Option<i64> {
+        if v.is_empty() {
+            Some(0)
+        } else {
+            (v.len() <= 18 && all_digits(v)).then(|| number(v))
+        }
+    }
+
+    /// `TvProcessingResult::w56OutcomeSummaryBatchPhp()`: per `status:video_id:episode_id`
+    /// snapshot `class | code << 2 | flags << 6 | min(video, 2^40 - 1) << 10`, with `class` 0
+    /// matched (matched, season_pack), 1 skipped (skipped, pending), 2 not found (not_found,
+    /// episode_missing) or 3 failed (anything else), `code` the W47_STATUS_CODES code of the
+    /// trimmed lowercase status (0 unknown) and flags 1 positive video, 2 positive episode,
+    /// 4 malformed id and 8 consistent ids for the status. Then the four class counts, the
+    /// inconsistent and malformed counts, the distinct positive videos and the max episode.
+    fn outcome_summaries(records: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(records.len() + 8);
+        let mut classes = [0i64; 4];
+        let (mut inconsistent, mut malformed_count, mut max_episode) = (0i64, 0i64, 0i64);
+        let mut videos = HashSet::with_capacity(records.len());
+        for record in records {
+            let mut parts = record.splitn(3, |&b| b == b':');
+            let status = trim(parts.next().unwrap_or(b""));
+            let video = outcome_id(parts.next().unwrap_or(b""));
+            let episode = outcome_id(parts.next().unwrap_or(b""));
+            let code = STATUS_CODES
+                .iter()
+                .position(|s| status.eq_ignore_ascii_case(s))
+                .map_or(0, |i| i as i64 + 1);
+            let class = match code {
+                1 | 2 => 0,
+                7 | 8 => 1,
+                3 | 4 => 2,
+                _ => 3,
+            };
+            let malformed = video.is_none() || episode.is_none();
+            let (v, e) = (video.unwrap_or(-1), episode.unwrap_or(-1));
+            let consistent = !malformed
+                && match code {
+                    1 => v > 0 && e > 0,
+                    2 | 3 => v > 0 && e == 0,
+                    _ => e == 0,
+                };
+            let flags = i64::from(v > 0)
+                | i64::from(e > 0) << 1
+                | i64::from(malformed) << 2
+                | i64::from(consistent) << 3;
+            classes[class as usize] += 1;
+            inconsistent += i64::from(!consistent);
+            malformed_count += i64::from(malformed);
+            if v > 0 {
+                videos.insert(v);
+            }
+            max_episode = max_episode.max(e);
+            out.push(class | code << 2 | flags << 6 | v.clamp(0, MAX_WORD_VIDEO) << 10);
+        }
+        out.extend(classes);
+        out.extend([
+            inconsistent,
+            malformed_count,
+            videos.len() as i64,
+            max_episode,
+        ]);
+        out
+    }
+
+    macro_rules! w563_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// Items are NUL-joined in `blob`, or concatenated with their byte lengths in `lens`
+            /// when it is non-null. Returns the word count, `-needed` when `out_cap` is too small,
+            /// or `-1` when it declines (null `out`, null `blob` with a length, `count` other than
+            /// the number of NUL-separated items, or `lens` that do not tile `blob`).
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+            /// `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run_items(blob, blob_len, lens, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w563_export!(
+        /// `AbstractTvProviderPipe::w56PipeGateBatch()`.
+        nntmux_w563_tv_pipe_gate_batch => pipe_gates
+    );
+    w563_export!(
+        /// `AbstractApiProviderPipe::w56SearchEligibilityBatch()`.
+        nntmux_w563_tv_api_search_eligibility_batch => search_eligibility
+    );
+    w563_export!(
+        /// `AbstractTvProvider::w56TitleMatchBatch()`; items pair up as (ours, theirs).
+        nntmux_w563_tv_provider_title_match_batch => title_matches
+    );
+    w563_export!(
+        /// `TvProcessingPassable::w56ContextFingerprintBatch()`.
+        nntmux_w563_tv_passable_context_fingerprint_batch => context_fingerprints
+    );
+    w563_export!(
+        /// `TvProcessingResult::w56OutcomeSummaryBatch()`.
+        nntmux_w563_tv_result_outcome_summary_batch => outcome_summaries
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        /// Each export with the words an empty batch writes.
+        const EXPORTS: [(Export, isize); 5] = [
+            (nntmux_w563_tv_pipe_gate_batch, 10),
+            (nntmux_w563_tv_api_search_eligibility_batch, 7),
+            (nntmux_w563_tv_provider_title_match_batch, 4),
+            (nntmux_w563_tv_passable_context_fingerprint_batch, 6),
+            (nntmux_w563_tv_result_outcome_summary_batch, 8),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            if items.iter().all(|i| !i.contains(&0)) {
+                let joined = items.join(&0u8);
+                let mut nul = vec![0i64; 4096];
+                let w = unsafe {
+                    f(
+                        joined.as_ptr(),
+                        joined.len(),
+                        ptr::null(),
+                        items.len(),
+                        nul.as_mut_ptr(),
+                        nul.len(),
+                    )
+                };
+                nul.truncate(w.max(0) as usize);
+                assert_eq!(out, nul, "NUL split differs");
+            }
+            out
+        }
+
+        fn fnv(bytes: &[u8]) -> i64 {
+            i64::from(fnv_lower(FNV_OFFSET, bytes))
+        }
+
+        #[test]
+        fn w563_similar_char_matches_php_similar_text() {
+            assert_eq!(similar_char(b"World", b"Word"), 4);
+            assert_eq!(similar_char(b"Hello", b"World"), 1);
+            assert_eq!(similar_char(b"World", b"Hello"), 1);
+            assert_eq!(similar_char(b"the office", b"office the"), 6);
+            assert_eq!(similar_char(b"", b"abc"), 0);
+            assert_eq!(similar_char(b"abc", b"abc"), 3);
+        }
+
+        #[test]
+        fn w563_pipe_gates_classify_references() {
+            let out = call(
+                nntmux_w563_tv_pipe_gate_batch,
+                &[
+                    b"The.Show.S01E02.720p",
+                    b"Show 3x105",
+                    b"Daily.Show.2023.12.25.HDTV",
+                    b"Show.S02.Complete",
+                    b"",
+                    b"S01E01",
+                    b"Show.2023.13.01",
+                ],
+            );
+            assert_eq!(out[0], 2 | 32 | 1 << 8 | 2 << 16);
+            assert_eq!(out[1], fnv(b"the show") | 8 << 32);
+            assert_eq!(out[2], 4 | 32 | 3 << 8 | 105 << 16);
+            assert_eq!(out[4], 8 | 32 | 20_231_225 << 28);
+            assert_eq!(out[5], fnv(b"daily show") | 10 << 32);
+            assert_eq!(out[6], 16 | 32 | 2 << 8);
+            assert_eq!(out[8], 1);
+            assert_eq!(out[9], i64::from(FNV_OFFSET));
+            assert_eq!(out[10], 2 | 32 | 64 | 1 << 8 | 1 << 16);
+            assert_eq!(out[12], 0);
+            assert_eq!(out[13], fnv(b"show 2023 13 01") | 15 << 32);
+            assert_eq!(&out[14..], [1, 2, 1, 1, 1, 5, 1, 3, 105, 4]);
+        }
+
+        #[test]
+        fn w563_search_eligibility_strips_year_and_country() {
+            let out = call(
+                nntmux_w563_tv_api_search_eligibility_batch,
+                &[
+                    b"Doctor Who 2005",
+                    b"The Office US",
+                    b"2019",
+                    b"",
+                    b"Show UK 2010",
+                    b"a",
+                ],
+            );
+            assert_eq!(
+                out[0],
+                4 | 16 | 105 << 8 | 10 << 16 | fnv(b"doctor who") << 31
+            );
+            assert_eq!(
+                out[1],
+                8 | 16 | 1 << 5 | 10 << 16 | fnv(b"the office") << 31
+            );
+            assert_eq!(out[2], 2 | 4 << 16 | fnv(b"2019") << 31);
+            assert_eq!(out[3], 1 | i64::from(FNV_OFFSET) << 31);
+            assert_eq!(
+                out[4],
+                4 | 8 | 16 | 2 << 5 | 110 << 8 | 4 << 16 | fnv(b"show") << 31
+            );
+            assert_eq!(out[5], 1 << 16 | fnv(b"a") << 31);
+            assert_eq!(&out[6..], [1, 1, 2, 2, 3, 3, 10]);
+        }
+
+        #[test]
+        fn w563_title_matches_pair_items() {
+            let out = call(
+                nntmux_w563_tv_provider_title_match_batch,
+                &[
+                    b"Doctor Who 2005",
+                    b"doctor.who.2005",
+                    b"Hello",
+                    b"World",
+                    b"Lonely",
+                ],
+            );
+            assert_eq!(out[0], 10 | 20 << 20 | (1 | 2 | 8) << 40);
+            assert_eq!(out[1], 1 | 10 << 20);
+            assert_eq!(out[2], 6 << 20 | 4 << 40);
+            assert_eq!(&out[3..], [1, 1, 1, 0]);
+        }
+
+        #[test]
+        fn w563_context_fingerprints_flag_groups_and_tags() {
+            let out = call(
+                nntmux_w563_tv_passable_context_fingerprint_batch,
+                &[b" The.Show.S01E02-GRP ", b"-GRP", b"[x] caf\xc3\xa9", b""],
+            );
+            assert_eq!(
+                out[0],
+                fnv(b"the.show.s01e02.grp") | 4 << 32 | 3 << 48 | 2 << 53
+            );
+            assert_eq!(out[1], fnv(b"grp") | 1 << 32);
+            assert_eq!(out[2], fnv(b"x.caf") | 2 << 32 | (4 | 8) << 53);
+            assert_eq!(out[3], i64::from(FNV_OFFSET) | 1 << 53);
+            assert_eq!(&out[4..], [1, 1, 1, 1, 4, 7]);
+        }
+
+        #[test]
+        fn w563_outcome_summaries_validate_ids() {
+            let out = call(
+                nntmux_w563_tv_result_outcome_summary_batch,
+                &[
+                    b"matched:12:34",
+                    b" Season_Pack :12",
+                    b"not_found",
+                    b"matched:x:1",
+                    b"odd:0:0:0",
+                ],
+            );
+            assert_eq!(out[0], 1 << 2 | (1 | 2 | 8) << 6 | 12 << 10);
+            assert_eq!(out[1], 2 << 2 | (1 | 8) << 6 | 12 << 10);
+            assert_eq!(out[2], 2 | 4 << 2 | 8 << 6);
+            assert_eq!(out[3], 1 << 2 | (2 | 4) << 6);
+            assert_eq!(out[4], 3 | 4 << 6);
+            assert_eq!(&out[5..], [3, 0, 1, 1, 2, 2, 1, 34]);
+        }
+
+        #[test]
+        fn w563_exports_guard_pointers_and_capacity() {
+            let mut out = [0i64; 64];
+            let o = out.as_mut_ptr();
+            let n = ptr::null::<i64>();
+            for (f, trailer) in EXPORTS {
+                unsafe {
+                    assert_eq!(f(b"x".as_ptr(), 1, n, 1, ptr::null_mut(), 64), -1);
+                    assert_eq!(f(ptr::null(), 1, n, 1, o, 64), -1);
+                    assert_eq!(f(b"a".as_ptr(), 1, n, 2, o, 64), -1);
+                    assert_eq!(f(ptr::null(), 0, n, 0, o, 64), trailer);
+                    assert!(f(b"a\0b".as_ptr(), 3, n, 2, o, 1) < -1);
+                    let lens = [1i64, 2];
+                    assert!(f(b"a\0b".as_ptr(), 3, lens.as_ptr(), 2, o, 64) > trailer);
+                    assert_eq!(f(b"a\0bc".as_ptr(), 4, lens.as_ptr(), 2, o, 64), -1);
                 }
             }
         }
