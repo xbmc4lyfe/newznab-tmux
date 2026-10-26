@@ -462,4 +462,265 @@ final class ImageInspector
 
         return [0, 0, 0];
     }
+
+    /** C signature of the Wave 64.5 {@see self::w64ImageInspectorPlanBatch()} helper. */
+    private const string W64_IMAGE_INSPECTOR_PLAN_FFI_CDEF = 'int64_t nntmux_w645_image_inspector_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 64.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 3.05/2.80/1.97/1.95x); see tests/Unit/RustAdditionalFfmpegFrameScorerRankerInspectorFetcherW64ParityTest.php.
+     */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 64.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w64_5', self::W64_IMAGE_INSPECTOR_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W64_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 64.5 plan batch to Rust until disabled or reset. */
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    /** Route the Wave 64.5 plan batch to PHP until enabled or reset. */
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restore W64_RUST_FFI_DEFAULT routing and drop the cached Wave 64.5 handle and buffer. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', null);
+        self::w64RustFfiState('reset', null);
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        return self::w64RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w64ImageInspectorPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 64.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w64Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w64RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w645_image_inspector_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w64Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /**
+     * Batch inspection plan over `file_size\thead_hex\ttail_hex`, the hex-encoded first and last bytes of a file.
+     * Nine words per record: `[type, width, height, complete, edges_ok, pixels, usable, reason, flags]`. The type
+     * is IMAGETYPE_JPEG, PNG, GIF or WEBP by magic bytes (else 0). GIF dimensions are the logical screen size;
+     * the others come from headerProbeBatch() when it reports the same type (else 0). Completeness mirrors
+     * isCompleteTailPhp() for files of 16 bytes or more: WebP compares the RIFF size in the head, JPEG and PNG look
+     * for their end marker in the right-trimmed last 4096 tail bytes, and a GIF must end with its `;` trailer.
+     * Edges are ok at 150 pixels or more; pixels is the product with each side capped at 2^31. Reason, checked in
+     * order: 1 unknown type, 6 file under 16 bytes, 2 GIF (not publishable), 3 no dimensions, 4 too small, 5
+     * incomplete, else 0 usable. The size is trimmed 1-15 ASCII digits (else 0); invalid hex (odd length or other
+     * bytes) is read as empty. Flags: 1 invalid number, 2 not exactly three fields, 4 invalid head hex, 8 invalid
+     * tail hex, 16 uppercase hex, 32 more than MAX_MEASURED_PIXELS.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w64ImageInspectorPlanBatch(array $records): array
+    {
+        return self::usesW64RustFfi() ? self::w64ImageInspectorPlanBatchNative($records) : self::w64ImageInspectorPlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w64ImageInspectorPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w64Words($count, implode("\0", $records), 9 * $count) ?? self::w64ImageInspectorPlanBatchPhp($records);
+    }
+
+    /** Bytes of an even-length ASCII hex field (empty stays empty); invalid hex sets $invalid and reads as empty. */
+    private static function w64Unhex(string $field, int $invalid, int &$flags): string
+    {
+        if ($field === '') {
+            return '';
+        }
+        if (\strlen($field) % 2 !== 0 || ! ctype_xdigit($field)) {
+            $flags |= $invalid;
+
+            return '';
+        }
+        if (strpbrk($field, 'ABCDEF') !== false) {
+            $flags |= 16;
+        }
+
+        return (string) hex2bin($field);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w64ImageInspectorPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 3 ? 0 : 2;
+            $size = self::w64Number($fields[0], 0, $flags);
+            $head = self::w64Unhex($fields[1] ?? '', 4, $flags);
+            $tail = self::w64Unhex($fields[2] ?? '', 8, $flags);
+            $type = match (true) {
+                str_starts_with($head, "\xFF\xD8\xFF") => IMAGETYPE_JPEG,
+                str_starts_with($head, "\x89PNG\r\n\x1a\n") => IMAGETYPE_PNG,
+                str_starts_with($head, 'GIF87a') || str_starts_with($head, 'GIF89a') => IMAGETYPE_GIF,
+                \strlen($head) >= 12 && str_starts_with($head, 'RIFF') && substr($head, 8, 4) === 'WEBP' => IMAGETYPE_WEBP,
+                default => 0,
+            };
+            $width = $height = 0;
+            if ($type === IMAGETYPE_GIF) {
+                if (\strlen($head) >= 10) {
+                    /** @var array{1: int, 2: int} $screen */
+                    $screen = unpack('v2', $head, 6);
+                    [$width, $height] = [$screen[1], $screen[2]];
+                }
+            } elseif ($type !== 0) {
+                [$probed, $probedWidth, $probedHeight] = self::w52ProbeHeader($head);
+                if ($probed === $type) {
+                    [$width, $height] = [$probedWidth, $probedHeight];
+                }
+            }
+            if ($type === 0 || $size < 16) {
+                $complete = false;
+            } elseif ($type === IMAGETYPE_WEBP) {
+                /** @var array{1: int} $declared */
+                $declared = \strlen($head) >= 8 ? unpack('V', $head, 4) : [1 => 0];
+                $complete = \strlen($head) >= 8 && $size >= $declared[1] + 8;
+            } else {
+                $slice = rtrim(\strlen($tail) > 4096 ? substr($tail, -4096) : $tail, "\0\r\n ");
+                $complete = match ($type) {
+                    IMAGETYPE_PNG => str_contains(substr($slice, -64), 'IEND'),
+                    IMAGETYPE_JPEG => str_contains(substr($slice, -1024), "\xFF\xD9"),
+                    default => str_ends_with($slice, ';'),
+                };
+            }
+            $edges = $width >= self::MIN_EDGE && $height >= self::MIN_EDGE;
+            $pixels = min($width, 1 << 31) * min($height, 1 << 31);
+            if ($pixels > self::MAX_MEASURED_PIXELS) {
+                $flags |= 32;
+            }
+            $reason = match (true) {
+                $type === 0 => 1,
+                $size < 16 => 6,
+                $type === IMAGETYPE_GIF => 2,
+                $width === 0 || $height === 0 => 3,
+                ! $edges => 4,
+                ! $complete => 5,
+                default => 0,
+            };
+            array_push($out, $type, $width, $height, (int) $complete, (int) $edges, $pixels, (int) ($reason === 0), $reason, $flags);
+        }
+
+        return $out;
+    }
 }
