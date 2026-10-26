@@ -16,6 +16,7 @@ use App\Services\Nzb\NzbService;
 use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
 use dariusiii\rarinfo\SfvInfo;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -2375,5 +2376,166 @@ class NfoService
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /** Wave 55.2 paired benchmarks decide this default; see RustNfoServiceDbNzbStoreNfoImportNzbContentsParserW55ParityTest. */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    private const string W55_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w552_nfo_show_id_plan_batch(const char *texts, size_t texts_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 55 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w55', self::W55_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w55RustFfiState('ffi');
+                    $buffer = $resolved instanceof \FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planShowIdBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    /** parseShowIdNative()'s patterns in priority order (TVDB has two). */
+    private const array W55_SHOW_ID_PATTERNS = [
+        '/tvmaze\.com\/shows\/(\d{1,6})/i',
+        '/imdb\.com\/title\/(tt\d{7,})/i',
+        '/thetvdb\.com\/\?tab=series&id=(\d{1,8})/i',
+        '/thetvdb\.com\/series\/(\d{1,8}|[\w-]+)/i',
+        '/themoviedb\.org\/movie\/(\d{1,8})/i',
+        '/themoviedb\.org\/tv\/(\d{1,8})/i',
+        '/anidb\.net\/(?:perl-bin\/animedb\.pl\?show=anime&aid=|anime\/)(\d{1,6})/i',
+        '/trakt\.tv\/(?:shows|movies)\/([\w-]+)/i',
+    ];
+
+    /**
+     * Batch show-id plan, as parseShowIdNative() reads each NFO. One word per text:
+     * `pattern | min(id length, 0xFFFFFF) << 8 | crc32(id) << 32`, where pattern is the first
+     * matching W55_SHOW_ID_PATTERNS entry (1-8, both TVDB forms are site `thetvdb`) and the word
+     * is 0 without a match. The matched texts, the per-pattern counts (1-8) and the XXH64 digest
+     * of all earlier words follow.
+     *
+     * @param  list<string>  $texts
+     * @return list<int>
+     */
+    public static function planShowIdBatch(array $texts): array
+    {
+        return self::usesW55RustFfi() ? self::planShowIdBatchNative($texts) : self::planShowIdBatchPhp($texts);
+    }
+
+    /**
+     * @param  list<string>  $texts
+     * @return list<int>
+     */
+    public static function planShowIdBatchPhp(array $texts): array
+    {
+        $out = [];
+        $counts = array_fill(0, 9, 0);
+        foreach ($texts as $text) {
+            $pattern = 0;
+            $id = '';
+            foreach (self::W55_SHOW_ID_PATTERNS as $i => $regex) {
+                if (preg_match($regex, $text, $hits)) {
+                    $pattern = $i + 1;
+                    $id = trim($hits[1]);
+                    break;
+                }
+            }
+            $counts[$pattern]++;
+            $out[] = $pattern === 0 ? 0 : $pattern | min(\strlen($id), 0xFFFFFF) << 8 | crc32($id) << 32;
+        }
+        $out[] = \count($texts) - $counts[0];
+        array_push($out, ...\array_slice($counts, 1));
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, PCRE's character tables are not the
+     * default (C) ones, or the texts are not a list.
+     *
+     * @param  list<string>  $texts
+     * @return list<int>
+     */
+    public static function planShowIdBatchNative(array $texts): array
+    {
+        $count = \count($texts);
+        $words = $count + 10;
+        /** @var array{\FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w55RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($texts) || ! NzbParserService::pcreUsesDefaultTables()) {
+            return self::planShowIdBatchPhp($texts);
+        }
+        $blob = implode('', $texts);
+        $ints = pack('P*', ...array_map(strlen(...), $texts));
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
+            $written = $ffi->nntmux_w552_nfo_show_id_plan_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', \FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planShowIdBatchPhp($texts);
     }
 }
