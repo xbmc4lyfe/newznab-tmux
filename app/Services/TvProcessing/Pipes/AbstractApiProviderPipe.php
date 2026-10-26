@@ -13,6 +13,7 @@ use App\Services\TvProcessing\TvProcessingResult;
 use App\Services\TvProcessing\TvProcessingRunState;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -197,6 +198,220 @@ abstract class AbstractApiProviderPipe extends AbstractTvProviderPipe
         }
 
         return self::$w48RustFfiHandle === false ? null : self::$w48RustFfiHandle;
+    }
+
+    /** Wave 56.3 paired benchmarks decide this default; see RustTvProcessingPipesProviderPassableResultW56ParityTest. */
+    public const bool W56_RUST_FFI_DEFAULT = true;
+
+    public const string W56_API_PIPE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w563_tv_api_search_eligibility_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-title words of w56SearchEligibilityBatch(). */
+    public const int W56_SEARCH_ELIGIBILITY_TRAILER = 7;
+
+    /** Lowercase trailing country tokens stripped from search titles; words store index + 1. */
+    public const array W56_SEARCH_COUNTRIES = ['us', 'uk', 'au', 'ca', 'nz'];
+
+    public static function usesW56RustFfi(): bool
+    {
+        $override = self::w56RustFfiState();
+
+        return \is_bool($override) ? $override : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 56 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 56.3 search eligibility. Per clean title, its lowercase `[a-z0-9]` tokens lose a trailing
+     * 19xx/20xx year and then a trailing W56_SEARCH_COUNTRIES token (each only while two or more
+     * tokens remain); the word is `flags | country << 5 | (year - 1900) << 8 | min(length, 0x7FFF) << 16
+     * | fnv << 31` for the space-joined search title, with flags 1 no tokens, 2 all-numeric search
+     * tokens, 4 year stripped, 8 country stripped and 16 searchable (neither 1 nor 2, two or more
+     * bytes), `country` the list index + 1 and `fnv` its FNV-1a 32. Then the five flag counts, the
+     * distinct searchable hashes and the max length.
+     *
+     * @param  array<array-key, string>  $titles
+     * @return list<int>
+     */
+    public static function w56SearchEligibilityBatch(array $titles): array
+    {
+        return self::usesW56RustFfi() ? self::w56SearchEligibilityBatchNative($titles) : self::w56SearchEligibilityBatchPhp($titles);
+    }
+
+    /**
+     * @param  array<array-key, string>  $titles
+     * @return list<int>
+     */
+    public static function w56SearchEligibilityBatchNative(array $titles): array
+    {
+        return self::w56Invoke($titles, \count($titles) + self::W56_SEARCH_ELIGIBILITY_TRAILER) ?? self::w56SearchEligibilityBatchPhp($titles);
+    }
+
+    /**
+     * @param  array<array-key, string>  $titles
+     * @return list<int>
+     */
+    public static function w56SearchEligibilityBatchPhp(array $titles): array
+    {
+        $out = [];
+        $totals = [0, 0, 0, 0, 0];
+        $keys = [];
+        $maxLength = 0;
+        foreach ($titles as $title) {
+            $tokens = preg_split('/[^a-z0-9]+/', strtolower((string) $title), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $n = \count($tokens);
+            $flags = $n === 0 ? 1 : 0;
+            $year = 0;
+            $country = 0;
+            if ($n >= 2 && preg_match('/^(?:19|20)\d{2}$/', $tokens[$n - 1]) === 1) {
+                $year = (int) $tokens[--$n];
+                $flags |= 4;
+            }
+            if ($n >= 2 && ($index = array_search($tokens[$n - 1], self::W56_SEARCH_COUNTRIES, true)) !== false) {
+                $country = $index + 1;
+                $flags |= 8;
+                $n--;
+            }
+            $search = implode(' ', \array_slice($tokens, 0, $n));
+            if ($n > 0 && ctype_digit(str_replace(' ', '', $search))) {
+                $flags |= 2;
+            }
+            $fnv = self::w48Fnv($search);
+            $length = min(\strlen($search), 0x7FFF);
+            if (($flags & 3) === 0 && $length >= 2) {
+                $flags |= 16;
+                $keys[$fnv] = true;
+            }
+            for ($bit = 0; $bit < 5; $bit++) {
+                $totals[$bit] += ($flags >> $bit) & 1;
+            }
+            $maxLength = max($maxLength, $length);
+            $out[] = $flags | $country << 5 | ($year > 0 ? $year - 1900 : 0) << 8 | $length << 16 | $fnv << 31;
+        }
+        array_push($out, ...$totals);
+        array_push($out, \count($keys), $maxLength);
+
+        return $out;
+    }
+
+    /**
+     * Wave 56 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('tv_w56', self::W56_API_PIPE_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w56RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w56RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 56.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w56Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w56RustFfiState('ffi');
+            $out = self::w56RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w56RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W56_API_PIPE_FFI_CDEF.)
+            $written = $ffi->nntmux_w563_tv_api_search_eligibility_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     public function __construct(

@@ -6,6 +6,7 @@ namespace App\Services\TvProcessing;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -591,5 +592,208 @@ class TvProcessingPassable
         }
 
         return self::$w47RustFfiHandle === false ? null : self::$w47RustFfiHandle;
+    }
+
+    /** Wave 56.3 paired benchmarks decide this default; see RustTvProcessingPipesProviderPassableResultW56ParityTest. */
+    public const bool W56_RUST_FFI_DEFAULT = true;
+
+    public const string W56_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w563_tv_passable_context_fingerprint_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public static function usesW56RustFfi(): bool
+    {
+        $override = self::w56RustFfiState();
+
+        return \is_bool($override) ? $override : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 56 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /** Trailer words after the per-name words of w56ContextFingerprintBatch(). */
+    public const int W56_CONTEXT_FINGERPRINT_TRAILER = 6;
+
+    /**
+     * Wave 56.3 release context fingerprints. Per search name `fnv | min(tokens, 0xFFFF) << 32 |
+     * group << 48 | flags << 53`, with `fnv` the FNV-1a 32 cache key of the lowercase `[a-z0-9]`
+     * tokens joined by dots, `group` the length of a trimmed `-GROUP` suffix (1-20 word bytes after
+     * a dash that is not the first byte) and flags 1 no tokens, 2 group suffix, 4 a non-ASCII byte
+     * and 8 a `[...]` tag. Then the four flag counts, the distinct keys and the token total.
+     *
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w56ContextFingerprintBatch(array $names): array
+    {
+        return self::usesW56RustFfi() ? self::w56ContextFingerprintBatchNative($names) : self::w56ContextFingerprintBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w56ContextFingerprintBatchNative(array $names): array
+    {
+        return self::w56Invoke($names, \count($names) + self::W56_CONTEXT_FINGERPRINT_TRAILER) ?? self::w56ContextFingerprintBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w56ContextFingerprintBatchPhp(array $names): array
+    {
+        $out = [];
+        $totals = [0, 0, 0, 0];
+        $keys = [];
+        $tokenTotal = 0;
+        foreach ($names as $name) {
+            $name = (string) $name;
+            $trimmed = trim($name);
+            $tokens = preg_split('/[^a-z0-9]+/', strtolower($trimmed), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $count = \count($tokens);
+            $fnv = self::w47Fnv(implode('.', $tokens));
+            $flags = $count === 0 ? 1 : 0;
+            $group = 0;
+            if (preg_match('/.-([A-Za-z0-9_]{1,20})\z/s', $trimmed, $m) === 1) {
+                $flags |= 2;
+                $group = \strlen($m[1]);
+            }
+            if (preg_match('/[\x80-\xff]/', $name) === 1) {
+                $flags |= 4;
+            }
+            if (preg_match('/\[[^\]]*\]/', $name) === 1) {
+                $flags |= 8;
+            }
+            for ($bit = 0; $bit < 4; $bit++) {
+                $totals[$bit] += ($flags >> $bit) & 1;
+            }
+            $keys[$fnv] = true;
+            $tokenTotal += $count;
+            $out[] = $fnv | min($count, 0xFFFF) << 32 | $group << 48 | $flags << 53;
+        }
+        array_push($out, ...$totals);
+        array_push($out, \count($keys), $tokenTotal);
+
+        return $out;
+    }
+
+    /**
+     * Wave 56 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('tv_w56', self::W56_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w56RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w56RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 56.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w56Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w56RustFfiState('ffi');
+            $out = self::w56RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w56RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w563_tv_passable_context_fingerprint_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
