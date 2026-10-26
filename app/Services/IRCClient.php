@@ -7,6 +7,8 @@ namespace App\Services;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
+use Throwable;
 
 /**
  * Basic IRC client for fetching IRCScraper.
@@ -987,5 +989,348 @@ class IRCClient
         }
 
         return $summary;
+    }
+
+    // ========================================================================
+    // WAVE 63.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 7.47x, p99 6.60x; uncommon mean 2.19x, p99 2.00x); see RustIgdbDataNodeBaseModelQueryBuilderIrcClientScraperW63ParityTest. */
+    public const bool W63_RUST_FFI_DEFAULT = true;
+
+    public const string W63_IRC_CLIENT_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w631_irc_client_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w63IrcClientPlanBatch(). */
+    public const int W63_IRC_CLIENT_TRAILER = 23;
+
+    public static function usesW63RustFfi(): bool
+    {
+        $override = self::w63RustFfiState();
+
+        return \is_bool($override) ? $override : self::W63_RUST_FFI_DEFAULT;
+    }
+
+    /** Forces the IRCClient Wave 63 Rust path on until reset. */
+    public static function enableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', true);
+    }
+
+    /** Forces the IRCClient Wave 63 PHP path until reset. */
+    public static function disableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', false);
+    }
+
+    /** Restores the benchmark default and drops the cached library handle and scratch buffers; earlier toggles are untouched. */
+    public static function resetW63RustFfi(): void
+    {
+        self::w63RustFfiState('reset');
+    }
+
+    /**
+     * Runs $callback with the IRCClient Wave 63 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW63RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w63RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w63RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 63.1 IRC wire-line plans. Each item is `seconds|line`: a receive time (1-15 digits; empty is none, other
+     * text sets flag 32) and the raw line, whose trailing CRLF (flag 1) or LF (flag 2) is dropped as _readSocket()
+     * does. A `:prefix` is 1 server, 2 `nick!user@host`, or 3 malformed (empty, no command, or `!` without `@`).
+     * The command is indexed 1 three-digit numeric, 2-14 PING PONG PRIVMSG NOTICE JOIN PART QUIT KICK NICK MODE
+     * TOPIC ERROR CAP (case-insensitive; flag 512 lowercase), 15 other, 0 none; middle parameters are counted and a
+     * `:` parameter is the trailing text. A first parameter starting with `#` or `&` is a channel, invalid (flag
+     * 256) over 50 bytes or holding BEL or a comma. Times feed a 10-second rate window over the batch (flag 64 when
+     * time goes backwards and the window restarts, flag 128 above 5 lines). Other flags: 4 mIRC control codes, 8
+     * over the 8701-byte payload allowance, 16 non-ASCII. Class: 0 empty, 1 keepalive, 2 channel message, 3
+     * private message, 4 numeric, 5 membership or mode command, 6 error or malformed, 7 unknown command. Per item
+     * `class | command << 3 | prefix << 7 | flags << 9 | min(params, 15) << 19 | trailing << 23 | numeric << 24 |
+     * min(window, 63) << 34 | min(controls, 63) << 40 | min(length, 16383) << 46 | needsPong << 60`; then 8 class
+     * counts, 10 flag counts, the PONG replies due, the largest window, the control-code sum, the distinct valid
+     * channels and the lines with trailing text.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w63IrcClientPlanBatch(array $items): array
+    {
+        return self::usesW63RustFfi() ? self::w63IrcClientPlanBatchNative($items) : self::w63IrcClientPlanBatchPhp($items);
+    }
+
+    /**
+     * Rust plan; falls back to the PHP reference when the library is missing or the call declines.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w63IrcClientPlanBatchNative(array $items): array
+    {
+        return self::w63Invoke($items, \count($items) + self::W63_IRC_CLIENT_TRAILER) ?? self::w63IrcClientPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w63IrcClientPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W63_IRC_CLIENT_TRAILER, 0);
+        $window = [];
+        $head = 0;
+        $previous = null;
+        $channels = [];
+        foreach ($items as $item) {
+            [$rawTime, $rawLine] = explode('|', (string) $item, 2) + ['', ''];
+            $flags = 0;
+            $time = trim($rawTime);
+            $t = null;
+            if ($time !== '') {
+                $length = \strlen($time);
+                if ($length <= 15 && strspn($time, '0123456789') === $length) {
+                    $t = (int) $time;
+                } else {
+                    $flags |= 32;
+                }
+            }
+            if (str_ends_with($rawLine, "\r\n")) {
+                $flags |= 1;
+                $s = substr($rawLine, 0, -2);
+            } elseif (str_ends_with($rawLine, "\n")) {
+                $flags |= 2;
+                $s = substr($rawLine, 0, -1);
+            } else {
+                $s = $rawLine;
+            }
+            $len = \strlen($s);
+            $at = 0;
+            $prefixKind = 0;
+            if ($len > 0 && $s[0] === ':') {
+                $end = strpos($s, ' ');
+                $end = $end === false ? $len : $end;
+                $prefix = substr($s, 1, $end - 1);
+                if ($prefix === '' || $end === $len) {
+                    $prefixKind = 3;
+                } else {
+                    $bang = strpos($prefix, '!');
+                    $prefixKind = $bang === false ? 1 : (str_contains(substr($prefix, $bang + 1), '@') ? 2 : 3);
+                }
+                $at = $end;
+            }
+            $at += strspn($s, ' ', $at);
+            $end = strpos($s, ' ', $at);
+            $end = $end === false ? $len : $end;
+            $command = substr($s, $at, $end - $at);
+            $at = $end;
+            $params = 0;
+            $first = $trailing = null;
+            while (true) {
+                $at += strspn($s, ' ', $at);
+                if ($at >= $len) {
+                    break;
+                }
+                if ($s[$at] === ':') {
+                    $trailing = substr($s, $at + 1);
+                    break;
+                }
+                $end = strpos($s, ' ', $at);
+                $end = $end === false ? $len : $end;
+                $params++;
+                $first ??= substr($s, $at, $end - $at);
+                $at = $end;
+            }
+            $numeric = 0;
+            if ($command === '') {
+                $commandIdx = 0;
+            } elseif (\strlen($command) === 3 && strspn($command, '0123456789') === 3) {
+                $numeric = (int) $command;
+                $commandIdx = 1;
+            } else {
+                $flags |= strpbrk($command, 'abcdefghijklmnopqrstuvwxyz') !== false ? 512 : 0;
+                $commandIdx = self::W63_IRC_COMMANDS[strtoupper($command)] ?? 15;
+            }
+            $channel = $first !== null && ($first[0] === '#' || $first[0] === '&') ? $first : null;
+            if ($channel !== null) {
+                if (\strlen($channel) > 50 || strpbrk($channel, "\x07,") !== false) {
+                    $flags |= 256;
+                } else {
+                    $channels[strtolower($channel)] = true;
+                }
+            }
+            $controls = $len - \strlen(str_replace(self::W63_IRC_CONTROLS, '', $s));
+            $flags |= ($controls > 0 ? 4 : 0) | ($len > 8701 ? 8 : 0) | (preg_match('/[\x80-\xff]/', $s) === 1 ? 16 : 0);
+            $size = 0;
+            if ($t !== null) {
+                if ($previous !== null && $t < $previous) {
+                    $flags |= 64;
+                    $window = [];
+                    $head = 0;
+                }
+                while ($head < \count($window) && $t >= $window[$head] + 10) {
+                    $head++;
+                }
+                $window[] = $t;
+                $size = \count($window) - $head;
+                $previous = $t;
+                $flags |= $size > 5 ? 128 : 0;
+            }
+            $hasTrailing = $trailing !== null ? 1 : 0;
+            $needsPong = $commandIdx === 2 && (($trailing !== null && $trailing !== '') || $first !== null) ? 1 : 0;
+            $class = match (true) {
+                $len === 0 => 0,
+                $prefixKind === 3 || $commandIdx === 0 || $commandIdx === 13 => 6,
+                $commandIdx === 2 || $commandIdx === 3 => 1,
+                $commandIdx === 4 || $commandIdx === 5 => $channel !== null ? 2 : 3,
+                $commandIdx === 1 => 4,
+                $commandIdx === 15 => 7,
+                default => 5,
+            };
+            $tail[$class]++;
+            for ($b = 0; $b < 10; $b++) {
+                $tail[8 + $b] += $flags >> $b & 1;
+            }
+            $tail[18] += $needsPong;
+            $tail[19] = max($tail[19], $size);
+            $tail[20] += $controls;
+            $tail[22] += $hasTrailing;
+            $out[] = $class | $commandIdx << 3 | $prefixKind << 7 | $flags << 9 | min($params, 15) << 19 | $hasTrailing << 23 | $numeric << 24
+                | min($size, 63) << 34 | min($controls, 63) << 40 | min($len, 16383) << 46 | $needsPong << 60;
+        }
+        $tail[21] = \count($channels);
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    /** @var array<string, int> */
+    private const array W63_IRC_COMMANDS = ['PING' => 2, 'PONG' => 3, 'PRIVMSG' => 4, 'NOTICE' => 5, 'JOIN' => 6, 'PART' => 7, 'QUIT' => 8,
+        'KICK' => 9, 'NICK' => 10, 'MODE' => 11, 'TOPIC' => 12, 'ERROR' => 13, 'CAP' => 14];
+
+    /** The mIRC formatting codes _stripControlCharactersPhp() removes. */
+    private const array W63_IRC_CONTROLS = ["\x02", "\x03", "\x04", "\x0F", "\x11", "\x16", "\x1D", "\x1E", "\x1F"];
+
+    /**
+     * Wave 63 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'reset' clears the override, library handle and buffers, 'ffi'
+     * resolves the library (null when unavailable) and 'out' and 'lens' return `int64_t` output and
+     * length-column buffers of at least $val words.
+     */
+    private static function w63RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('irc_client_w631', self::W63_IRC_CLIENT_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w63RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w63RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 63.1 IRCClient export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w63Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w63RustFfiState('ffi');
+            $out = self::w63RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w63RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W63_IRC_CLIENT_FFI_CDEF.)
+            $written = $ffi->nntmux_w631_irc_client_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
