@@ -324,4 +324,305 @@ final readonly class ArchiveCandidate
 
         return [$ffi, $out];
     }
+
+    // ---- Wave 64.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 8.00x/6.89x, uncommon 7.38x/6.77x); see RustAdditionalConfigConsoleBatchResultWorkPlanArchiveCandidateW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    private const string W64_ARCHIVE_CANDIDATE_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w642_archive_candidate_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W64_ARCHIVE_CANDIDATE_TAIL = 19;
+
+    /**
+     * Wave 64 routing, binding and output buffer, kept in function-local statics (no static or
+     * instance properties). Operations: null reads the routing override, 'set' replaces it
+     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
+     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
+     * (null without the library).
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'reset':
+                $previous = $enabled;
+                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w64', self::W64_ARCHIVE_CANDIDATE_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w64RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    /** Routes w64ArchiveCandidatePlanBatch() to Rust until reset. */
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    /** Routes w64ArchiveCandidatePlanBatch() to PHP until reset. */
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restores W64_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $enabled = self::w64RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w64ArchiveCandidatePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w64ArchiveCandidatePlanBatch(array $rows): array
+    {
+        return self::usesW64RustFfi() ? self::w64ArchiveCandidatePlanBatchNative($rows) : self::w64ArchiveCandidatePlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w64ArchiveCandidatePlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W64_ARCHIVE_CANDIDATE_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w64RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w64ArchiveCandidatePlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W64_ARCHIVE_CANDIDATE_FFI_CDEF.)
+            $written = $ffi->nntmux_w642_archive_candidate_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w64ArchiveCandidatePlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w64Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w64Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /** Bytes of first volumes one batch may sample. */
+    public const int W64_ARCHIVE_BUDGET = 67_108_864;
+
+    /** Budget class upper bounds: under 1 MiB, up to 16 MiB, up to 4 GiB. */
+    private const int W64_SMALL_BYTES = 1_048_576;
+
+    private const int W64_SAMPLE_BYTES = 16_777_216;
+
+    private const int W64_LARGE_BYTES = 4_294_967_296;
+
+    private static function w64Digits(string $value): bool
+    {
+        return strspn($value, '0123456789') === \strlen($value);
+    }
+
+    /**
+     * Family (0 rar, 1 7z, 2 zip, 3 split, 4 file), part order and set stem of a lowercased name:
+     * `.partN.rar` (1-4 digits) is part N and `.rar` part 1 of a RAR set, `.rNN`/`.rNNN` part NN
+     * + 2; `.7z` is part 1 and `.7z.NNN` part NNN of a 7-Zip set; `.zip`/`.zipx` part 1 and
+     * `.zNN`/`.zNNN` part NN + 1 of a zip set; any other `.NNN` part NNN of a split file. A name
+     * with no such suffix, or an empty stem, is a part-1 file keyed by the whole name.
+     *
+     * @return array{int, int, string}
+     */
+    private static function w64Volume(string $name): array
+    {
+        $dot = strrpos($name, '.');
+        if ($dot === false) {
+            return [4, 1, $name];
+        }
+        $base = substr($name, 0, $dot);
+        $extension = substr($name, $dot + 1);
+        $length = \strlen($extension);
+        $numbered = static fn (string $lead): bool => ($length === 3 || $length === 4) && $extension[0] === $lead && self::w64Digits(substr($extension, 1));
+        if ($extension === 'rar') {
+            $part = strrpos($base, '.');
+            $tail = $part === false ? '' : substr($base, $part + 1);
+            if ($part !== false && \strlen($tail) >= 5 && \strlen($tail) <= 8 && str_starts_with($tail, 'part') && self::w64Digits(substr($tail, 4))) {
+                [$family, $order, $base] = [0, (int) substr($tail, 4), substr($base, 0, $part)];
+            } else {
+                [$family, $order] = [0, 1];
+            }
+        } elseif ($numbered('r')) {
+            [$family, $order] = [0, (int) substr($extension, 1) + 2];
+        } elseif ($extension === '7z') {
+            [$family, $order] = [1, 1];
+        } elseif ($length === 3 && self::w64Digits($extension)) {
+            [$family, $order] = str_ends_with($base, '.7z') ? [1, (int) $extension] : [3, (int) $extension];
+            if ($family === 1) {
+                $base = substr($base, 0, -3);
+            }
+        } elseif ($extension === 'zip' || $extension === 'zipx') {
+            [$family, $order] = [2, 1];
+        } elseif ($numbered('z')) {
+            [$family, $order] = [2, (int) substr($extension, 1) + 1];
+        } else {
+            return [4, 1, $name];
+        }
+
+        return $base === '' ? [4, 1, $name] : [$family, $order, $base];
+    }
+
+    /**
+     * Wave 64.2 archive candidate plan. Per `name\tsegments\tbytes\tsource_index` row `family |
+     * first << 3 | min(order, 65535) << 4 | budget_class << 20 | included << 23 | duplicate_source
+     * << 24 | malformed << 25 | min(leader, 2^20 - 1) << 26 | (crc32(stem) & 0xFFFF) << 46`. The
+     * trimmed, lowercased name gives family, order and stem (see w64Volume()); first is order <= 1
+     * and the leader is the position of the first row of the same family and stem. Segments, bytes
+     * and source_index are w64Int() fields (6, 12 and 9 digits); an unparsable one sets malformed.
+     * Budget classes: 0 unknown bytes, 1 under 1 MiB, 2 up to 16 MiB, 3 up to 4 GiB, 4 larger.
+     * First archive volumes (not plain files) with known bytes are included while the running
+     * total stays within W64_ARCHIVE_BUDGET; a source index seen earlier is a duplicate. Then five
+     * family and five budget class counts, first volumes, distinct sets, sets without a first
+     * volume, included and total known bytes, malformed rows, duplicate sources, the highest order
+     * and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w64ArchiveCandidatePlanBatchPhp(array $rows): array
+    {
+        $out = $setOf = $leaders = $hasFirst = $sources = [];
+        $families = $classes = array_fill(0, 5, 0);
+        $firstRows = $includedBytes = $totalBytes = $malformedRows = $duplicateRows = $maxOrder = 0;
+        $index = 0;
+        foreach ($rows as $row) {
+            [$name, $segments, $bytes, $source] = explode("\t", (string) $row, 4) + array_fill(0, 4, '');
+            [$family, $order, $base] = self::w64Volume(strtolower(trim($name)));
+            $segments = self::w64Int($segments, 6);
+            $bytes = self::w64Int($bytes, 12);
+            $source = self::w64Int($source, 9);
+            $malformed = $segments === false || $bytes === false || $source === false;
+            $bytes = \is_int($bytes) ? $bytes : null;
+            $first = $order <= 1;
+            $key = $family.$base;
+            if (! isset($setOf[$key])) {
+                $setOf[$key] = \count($leaders);
+                $leaders[] = $index;
+                $hasFirst[] = false;
+            }
+            $set = $setOf[$key];
+            if ($first) {
+                $hasFirst[$set] = true;
+            }
+            $class = match (true) {
+                $bytes === null => 0,
+                $bytes < self::W64_SMALL_BYTES => 1,
+                $bytes <= self::W64_SAMPLE_BYTES => 2,
+                $bytes <= self::W64_LARGE_BYTES => 3,
+                default => 4,
+            };
+            $included = $bytes !== null && $first && $family !== 4 && $includedBytes + $bytes <= self::W64_ARCHIVE_BUDGET;
+            if ($included) {
+                $includedBytes += $bytes;
+            }
+            $duplicate = false;
+            if (\is_int($source)) {
+                $duplicate = isset($sources[$source]);
+                $sources[$source] = true;
+            }
+            $families[$family]++;
+            $classes[$class]++;
+            $firstRows += (int) $first;
+            $totalBytes += $bytes ?? 0;
+            $malformedRows += (int) $malformed;
+            $duplicateRows += (int) $duplicate;
+            $maxOrder = max($maxOrder, $order);
+            $out[] = $family | (int) $first << 3 | min($order, 0xFFFF) << 4 | $class << 20 | (int) $included << 23 | (int) $duplicate << 24 | (int) $malformed << 25
+                | min($leaders[$set], 0xFFFFF) << 26 | (crc32($base) & 0xFFFF) << 46;
+            $index++;
+        }
+        array_push($out, ...$families, ...$classes);
+        array_push($out, $firstRows, \count($leaders), \count(array_filter($hasFirst, static fn (bool $seen): bool => ! $seen)), $includedBytes, $totalBytes,
+            $malformedRows, $duplicateRows, $maxOrder);
+        $out[] = self::w64Digest($out);
+
+        return $out;
+    }
 }
