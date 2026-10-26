@@ -8,6 +8,7 @@ use App\Models\Release;
 use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /** Proves single-release article coverage without metadata-only suppression. */
@@ -374,5 +375,195 @@ final class NzbArticleCoverage
         $covered = $candidate['covered'] ?? 0;
 
         return [\is_int($required) ? $required : 0, \is_int($covered) ? $covered : 0];
+    }
+
+    /** Wave 56.2 paired benchmarks decide this default; see RustDirectorySyncCoverageCreationImportNzbServiceW56ParityTest. */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    private const string W56_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w56_article_coverage_plan_batch(const char *ints, size_t ints_len, size_t count, int64_t tolerance, int64_t min_ratio_bp, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 56 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w56', self::W56_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w56RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planCoverageBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w56Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w56Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /**
+     * Batch coverage plan over (required, covered) article counts. Per candidate: `class |
+     * acceptable << 2 | sufficient << 3 | ratio_bp << 8` and the missing articles. A required
+     * count that is not a positive integer is invalid (both words 0); covered counts only as an
+     * integer, clamped to [0, required]. Class: 0 invalid, 1 none, 2 partial, 3 full. The ratio
+     * is in basis points: exact `covered * 10000 / required` up to PHP_INT_MAX / 10000, else
+     * `min(10000, covered / (required / 10000))`. Acceptable: at most max(0, $tolerance) missing;
+     * sufficient: ratio >= $minRatioBp. Full, partial, none, invalid, acceptable, sufficient,
+     * the saturating required and missing totals, the largest gap and the XXH64 digest of all
+     * earlier words follow.
+     *
+     * @param  list<int>  $required
+     * @param  list<int>  $covered
+     * @return list<int>
+     */
+    public static function planCoverageBatch(array $required, array $covered, int $tolerance = 0, int $minRatioBp = 10000): array
+    {
+        return self::usesW56RustFfi() ? self::planCoverageBatchNative($required, $covered, $tolerance, $minRatioBp)
+            : self::planCoverageBatchPhp($required, $covered, $tolerance, $minRatioBp);
+    }
+
+    /**
+     * @param  list<int>  $required
+     * @param  list<int>  $covered
+     * @return list<int>
+     */
+    public static function planCoverageBatchPhp(array $required, array $covered, int $tolerance = 0, int $minRatioBp = 10000): array
+    {
+        $tolerance = max(0, $tolerance);
+        $covered = array_values($covered);
+        $out = [];
+        $classes = [0, 0, 0, 0];
+        $acceptable = $sufficient = $total = $missing = $largest = 0;
+        foreach (array_values($required) as $i => $need) {
+            if (! \is_int($need) || $need <= 0) {
+                $classes[0]++;
+                array_push($out, 0, 0);
+
+                continue;
+            }
+            $cov = $covered[$i] ?? 0;
+            $cov = \is_int($cov) ? min(max(0, $cov), $need) : 0;
+            $gap = $need - $cov;
+            $class = $gap === 0 ? 3 : ($cov === 0 ? 1 : 2);
+            $bp = $need <= 922337203685477 ? intdiv($cov * 10000, $need) : min(10000, intdiv($cov, intdiv($need, 10000)));
+            $ok = $gap <= $tolerance;
+            $enough = $bp >= $minRatioBp;
+            $classes[$class]++;
+            $acceptable += $ok ? 1 : 0;
+            $sufficient += $enough ? 1 : 0;
+            $total = $total > PHP_INT_MAX - $need ? PHP_INT_MAX : $total + $need;
+            $missing = $missing > PHP_INT_MAX - $gap ? PHP_INT_MAX : $missing + $gap;
+            $largest = max($largest, $gap);
+            array_push($out, $class | ($ok ? 4 : 0) | ($enough ? 8 : 0) | $bp << 8, $gap);
+        }
+        array_push($out, $classes[3], $classes[2], $classes[1], $classes[0], $acceptable, $sufficient, $total, $missing, $largest);
+        $out[] = self::w56Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the columns are not integer
+     * lists of one length.
+     *
+     * @param  list<int>  $required
+     * @param  list<int>  $covered
+     * @return list<int>
+     */
+    public static function planCoverageBatchNative(array $required, array $covered, int $tolerance = 0, int $minRatioBp = 10000): array
+    {
+        $count = \count($required);
+        $words = 2 * $count + 10;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 || \count($covered) !== $count ? null : self::w56RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($required) || ! array_is_list($covered)) {
+            return self::planCoverageBatchPhp($required, $covered, $tolerance, $minRatioBp);
+        }
+        foreach ($required as $i => $need) {
+            if (! \is_int($need) || ! \is_int($covered[$i])) {
+                return self::planCoverageBatchPhp($required, $covered, $tolerance, $minRatioBp);
+            }
+        }
+        $table = pack('P*', ...$required, ...$covered);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w56_article_coverage_plan_batch($table, \strlen($table), $count, $tolerance, $minRatioBp, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w56Words($written, $out, $words) ?? self::planCoverageBatchPhp($required, $covered, $tolerance, $minRatioBp);
     }
 }
