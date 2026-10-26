@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace App\Services\AdditionalProcessing\DTO;
 
+use App\Services\AdditionalProcessing\Enums\VideoContainer;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
+use InvalidArgumentException;
 use Throwable;
 
 /**
@@ -629,5 +631,297 @@ final readonly class MediaSourcePlan
     private static function w54Fit(array $values, int $count, int $default = 0): array
     {
         return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, $default);
+    }
+
+    // ========================================================================
+    // WAVE 64.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 1000-round paired runs reached 2.79x common mean, 2.34x common p99, 2.49x uncommon mean and 2.16x uncommon p99; see RustAdditionalSourcePlanPar2EntryPersistenceSlicerContainerW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    private const string W64_FFI_CDEF = 'ssize_t nntmux_w644_media_source_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w64MediaSourcePlanBatch() record. */
+    public const int W64_ROW_WORDS = 5;
+
+    /** int64 summary words after the w64MediaSourcePlanBatch() records (none for an empty batch). */
+    public const int W64_TRAILER_WORDS = 10;
+
+    private const array W64_CONTAINER_CODES = ['matroska' => 1, 'avi' => 2, 'mpeg' => 3, 'mpegts' => 4, 'mov' => 5, 'asf' => 6, 'ogg' => 7];
+
+    private const string W64_SAMPLE = '/(?:^|[\\\\\/._ -])sample(?:[\\\\\/._ -]|$)/i';
+
+    private const int W64_VALUE_CAP = (1 << 40) - 1;
+
+    private const int W64_TOTAL_CAP = 1 << 62;
+
+    private const int W64_SEGMENT_CAP = 0xFFFFFF;
+
+    private const int W64_DEFAULT_PART = 716_800;
+
+    private const int W64_PART_CAP = 1 << 30;
+
+    /**
+     * Media source plan rows for [file name, real size, posted articles, decoded bytes per
+     * article, downloaded segments, byte budget] items.
+     *
+     * The container is VideoContainer::fromFileName()'s case code (1 matroska, 2 avi, 3 mpeg, 4
+     * mpegts, 5 mov, 6 asf, 7 ogg, 0 none) and a sample matches the ArchivedMediaSlicer pattern.
+     * Real sizes and budgets clamp to [0, 2^40), posted articles to [0, 2^24); a part size of 0 or
+     * less is 716,800 bytes (capped at 2^30). Segments are the posted articles, else the expected
+     * ones (capped at 2^24 - 1); downloaded segments clamp to them. The budget buys
+     * `budget / part` more segments: the head window [0, head end) takes at least half of the
+     * wanted segments and the tail window [tail start, segments) the rest. Decisions: 1 not a
+     * video, 2 sample, 3 no segments, 4 head only, 5 head and tail, 6 complete, 7 budget spent.
+     *
+     * Rows [decision | container << 4 | sample << 7 | name length << 8 (clamped to 2^16 - 1) |
+     * segments << 24, fnv1a32(strtolower(name)) (0 when empty), head end | tail start << 24,
+     * bytes to fetch, expected articles], then the trailer [records, planned (decisions 4-6),
+     * samples, non-videos, complete, planned fetch bytes (saturating at 2^62), planned segments,
+     * first index of the largest planned real size (-1 when none), budget-spent records, FNV-1a
+     * digest].
+     *
+     * @param  list<array{0: string, 1: int, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function w64MediaSourcePlanBatch(array $items): array
+    {
+        return self::usesW64RustFfi() ? self::w64MediaSourcePlanBatchNative($items) : self::w64MediaSourcePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: int, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function w64MediaSourcePlanBatchPhp(array $items): array
+    {
+        self::w64Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $t = [\count($items), 0, 0, 0, 0, 0, 0, -1, 0, 0];
+        $largest = -1;
+        $digest = 2_166_136_261;
+        foreach ($items as $i => [$name, $real, $posted, $part, $downloaded, $budget]) {
+            $real = max(0, min($real, self::W64_VALUE_CAP));
+            $posted = max(0, min($posted, self::W64_SEGMENT_CAP));
+            $part = $part > 0 ? min($part, self::W64_PART_CAP) : self::W64_DEFAULT_PART;
+            $budget = max(0, min($budget, self::W64_VALUE_CAP));
+            $video = VideoContainer::fromFileName($name);
+            $container = $video === null ? 0 : self::W64_CONTAINER_CODES[$video->value];
+            $sample = preg_match(self::W64_SAMPLE, $name) === 1;
+            $expected = $real > 0 ? intdiv($real + $part - 1, $part) : 0;
+            $segments = $posted > 0 ? $posted : min($expected, self::W64_SEGMENT_CAP);
+            $have = max(0, min($downloaded, $segments));
+            $want = min($segments, intdiv($budget, $part) + $have);
+            $headEnd = max($have, intdiv($want + 1, 2));
+            $tail = $want - $headEnd;
+            $fetch = $headEnd - $have + $tail;
+            $fetchBytes = $fetch * $part;
+            $decision = match (true) {
+                $container === 0 => 1,
+                $sample => 2,
+                $segments === 0 => 3,
+                $want === $segments => 6,
+                $fetch === 0 => 7,
+                $tail > 0 => 5,
+                default => 4,
+            };
+            $hash = self::w64Fnv(strtolower($name));
+            $word = $decision | $container << 4 | ($sample ? 128 : 0) | min(\strlen($name), 0xFFFF) << 8 | $segments << 24;
+            array_push($out, $word, $hash, $headEnd | ($segments - $tail) << 24, $fetchBytes, $expected);
+            if ($decision === 1) {
+                $t[3]++;
+            } elseif ($decision === 2) {
+                $t[2]++;
+            } elseif ($decision === 7) {
+                $t[8]++;
+            } elseif ($decision >= 4) {
+                $t[1]++;
+                if ($decision === 6) {
+                    $t[4]++;
+                }
+                $t[5] = min($t[5] + $fetchBytes, self::W64_TOTAL_CAP);
+                $t[6] += $want;
+                if ($real > $largest) {
+                    $largest = $real;
+                    $t[7] = $i;
+                }
+            }
+            $value = $word ^ $hash << 16 ^ $fetchBytes;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $t[9] = $digest;
+
+        return [...$out, ...$t];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: int, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function w64MediaSourcePlanBatchNative(array $items): array
+    {
+        self::w64Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w64Join([array_column($items, 0)]);
+        $ints = pack('P*', ...array_column($items, 1), ...array_column($items, 2), ...array_column($items, 3), ...array_column($items, 4), ...array_column($items, 5));
+
+        return self::w64Call($blob, $twin, $ints, $count, $count * self::W64_ROW_WORDS + self::W64_TRAILER_WORDS)
+            ?? self::w64MediaSourcePlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w64Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W64 media source plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 6 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_int($item[1]) || ! \is_int($item[2]) || ! \is_int($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5])) {
+                throw new InvalidArgumentException('W64 media source plan batch items must be [string file name, int real size, int posted articles, int part size, int downloaded segments, int byte budget] lists.');
+            }
+        }
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $enabled = self::w64RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('enabled', true);
+    }
+
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('enabled', false);
+    }
+
+    /** Drop the W64 override, binding, output buffer and declined-call count; routing returns to W64_RUST_FFI_DEFAULT. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W64 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('enabled');
+        self::w64RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w64Join(array $columns): array
+    {
+        $values = array_merge(...$columns);
+        $joined = implode("\0", $values);
+
+        return substr_count($joined, "\0") === \count($values) - 1 ? [$joined, ''] : [$joined, implode("\x01", $values)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w64Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w64RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w64', self::W64_FFI_CDEF) ?? false;
+            self::w64RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w64RustFfiState('out', $out);
+                self::w64RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W64_FFI_CDEF.)
+            $written = $ffi->nntmux_w644_media_source_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w64RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W64 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int, 0 for an empty string. */
+    private static function w64Fnv(string $bytes): int
+    {
+        if ($bytes === '') {
+            return 0;
+        }
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
     }
 }
