@@ -11,6 +11,7 @@ use App\Services\TvProcessing\TvProcessingPassable;
 use App\Services\TvProcessing\TvProcessingResult;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -433,5 +434,301 @@ class LocalDbPipe extends AbstractTvProviderPipe
             2 => TvProcessingResult::matched($videoId, $episodeId, $providerName),
             default => TvProcessingResult::episodeMissing($videoId, $providerName),
         };
+    }
+
+    // ========================================================================
+    // WAVE 62.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 7.25x, p99 5.70x; uncommon mean 4.76x, p99 3.79x); see RustTvParsedReleaseLocalDbParseInfoTmdbTraktPipeW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    public const string W62_LOCAL_DB_PIPE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w623_local_db_pipe_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 62.3 batch. */
+    public const int W62_LOCAL_DB_PIPE_TRAILER = 12;
+
+    public static function usesW62RustFfi(): bool
+    {
+        $override = self::w62RustFfiState();
+
+        return \is_bool($override) ? $override : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the LocalDbPipe Wave 62 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 62.3 local DB lookup plans. Each item is `title|year|country|candidateTitle|candidateYear|candidateCountry|
+     * videoId|episodeId|seasonPack`. Titles become lowercase `[a-z0-9]+` tokens less a leading `the` while another
+     * token follows. Per item `titleScore | yearCode << 7 | countryCode << 9 | videoState << 11 | episodeState << 13 |
+     * seasonPack << 15 | outcome << 16 | decision << 18 | score << 20 | min(titleTokens, 255) << 29 |
+     * min(candidateTokens, 255) << 37 | exact << 45`: the title score is the distinct-token Jaccard percent (0 when
+     * both are empty); the year code is 0 unless both trimmed fields are 19xx/20xx years, then 1 equal, 2 one apart
+     * or 3 conflicting; the country code is 0 unless both are two letters, then 1 equal (any case) or 2 differing;
+     * ids are 0 empty, 1 a positive trimmed `[+-]?\d{1,18}` (not negative) or 2 other; seasonPack is a 1/true/yes/on
+     * flag; the outcome follows classifyOutcome() (0 no valid video, 1 season pack, 2 valid episode, 3 episode
+     * missing); the score is the title score + 20/10 for year code 1/2 + 10 for an equal country - 40 for a year
+     * conflict - 20 for a country conflict, at least 0; the decision is 2 from 110, 1 from 80, else 0; exact marks
+     * equal non-empty token lists. Then the four outcome and three decision counts, the 1-based index of the first
+     * best score (0 when empty), that score, the distinct valid video ids, the score sum and the exact matches.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62LocalPlanBatch(array $items): array
+    {
+        return self::usesW62RustFfi() ? self::w62LocalPlanBatchNative($items) : self::w62LocalPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62LocalPlanBatchNative(array $items): array
+    {
+        return self::w62Invoke($items, \count($items) + self::W62_LOCAL_DB_PIPE_TRAILER) ?? self::w62LocalPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62LocalPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $outcomes = [0, 0, 0, 0];
+        $decisions = [0, 0, 0];
+        $best = $bestScore = $scoreSum = $exacts = $index = 0;
+        $videos = [];
+        foreach ($items as $item) {
+            $index++;
+            [$title, $year, $country, $candidate, $candidateYear, $candidateCountry, $video, $episode, $pack] = explode('|', (string) $item, 9)
+                + ['', '', '', '', '', '', '', '', ''];
+            $a = self::w62LocalTokens($title);
+            $b = self::w62LocalTokens($candidate);
+            $exact = $a !== [] && $a === $b ? 1 : 0;
+            $setA = array_flip($a);
+            $setB = array_flip($b);
+            $shared = \count(array_intersect_key($setA, $setB));
+            $union = \count($setA) + \count($setB) - $shared;
+            $titleScore = $union === 0 ? 0 : intdiv(100 * $shared, $union);
+            $p = self::w62Year(trim($year));
+            $q = self::w62Year(trim($candidateYear));
+            $yearCode = $p === null || $q === null ? 0 : ($p === $q ? 1 : (abs($p - $q) === 1 ? 2 : 3));
+            $ca = trim($country);
+            $cb = trim($candidateCountry);
+            $countryCode = self::w62Country2($ca) && self::w62Country2($cb) ? (strtolower($ca) === strtolower($cb) ? 1 : 2) : 0;
+            [$videoState, $videoId] = self::w62SiteId($video);
+            [$episodeState] = self::w62SiteId($episode);
+            $seasonPack = \in_array(strtolower(trim($pack)), ['1', 'true', 'yes', 'on'], true) ? 1 : 0;
+            $outcome = match (true) {
+                $videoState !== 1 => 0,
+                $seasonPack === 1 => 1,
+                $episodeState === 1 => 2,
+                default => 3,
+            };
+            $score = max(0, $titleScore + [0, 20, 10, 0][$yearCode] + ($countryCode === 1 ? 10 : 0) - ($yearCode === 3 ? 40 : 0) - ($countryCode === 2 ? 20 : 0));
+            $decision = $score >= 110 ? 2 : ($score >= 80 ? 1 : 0);
+            $outcomes[$outcome]++;
+            $decisions[$decision]++;
+            if ($best === 0 || $score > $bestScore) {
+                $best = $index;
+                $bestScore = $score;
+            }
+            if ($videoState === 1) {
+                $videos[$videoId] = true;
+            }
+            $scoreSum += $score;
+            $exacts += $exact;
+            $out[] = $titleScore | $yearCode << 7 | $countryCode << 9 | $videoState << 11 | $episodeState << 13 | $seasonPack << 15 | $outcome << 16
+                | $decision << 18 | min($score, 511) << 20 | min(\count($a), 255) << 29 | min(\count($b), 255) << 37 | $exact << 45;
+        }
+        array_push($out, ...$outcomes, ...$decisions);
+        array_push($out, $best, $bestScore, \count($videos), $scoreSum, $exacts);
+
+        return $out;
+    }
+
+    /** Two ASCII letters. */
+    private static function w62Country2(string $text): bool
+    {
+        return \strlen($text) === 2 && strspn($text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz') === 2;
+    }
+
+    /**
+     * Title tokens without a leading `the` while another token follows.
+     *
+     * @return list<string>
+     */
+    private static function w62LocalTokens(string $title): array
+    {
+        $tokens = self::w62Tokens($title);
+        if (\count($tokens) > 1 && $tokens[0] === 'the') {
+            array_shift($tokens);
+        }
+
+        return $tokens;
+    }
+
+    /**
+     * (0 empty, 1 positive, 2 other; the id) for a trimmed `[+-]?\d{1,18}` site id.
+     *
+     * @return array{int, int}
+     */
+    private static function w62SiteId(string $text): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $negative = $text[0] === '-';
+        $value = self::w62Digits($negative || $text[0] === '+' ? substr($text, 1) : $text, 1, 18);
+
+        return $value !== null && ! $negative && $value > 0 ? [1, $value] : [2, 0];
+    }
+
+    /** $min to $max ASCII digits as their value, else null. */
+    private static function w62Digits(string $text, int $min, int $max): ?int
+    {
+        $length = \strlen($text);
+
+        return $length >= $min && $length <= $max && strspn($text, '0123456789') === $length ? (int) $text : null;
+    }
+
+    /** A 19xx/20xx four-digit year, else null. */
+    private static function w62Year(string $text): ?int
+    {
+        return \strlen($text) === 4 && (str_starts_with($text, '19') || str_starts_with($text, '20')) ? self::w62Digits($text, 4, 4) : null;
+    }
+
+    /**
+     * Lowercase `[a-z0-9]+` tokens.
+     *
+     * @return list<string>
+     */
+    private static function w62Tokens(string $text): array
+    {
+        return preg_split('/[^a-z0-9]+/', strtolower($text), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+    }
+
+    /**
+     * Wave 62 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('tv_w623', self::W62_LOCAL_DB_PIPE_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w62RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w62RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 62.3 LocalDbPipe export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w62Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w62RustFfiState('ffi');
+            $out = self::w62RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w62RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W62_LOCAL_DB_PIPE_FFI_CDEF.)
+            $written = $ffi->nntmux_w623_local_db_pipe_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
