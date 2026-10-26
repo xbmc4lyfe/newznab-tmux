@@ -6,6 +6,7 @@ namespace App\Services;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -561,5 +562,295 @@ class GamesTitleParser
         } catch (Throwable) {
             return null;
         }
+    }
+
+    // ---- Wave 61.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 5.46x/4.41x, uncommon 4.50x/4.06x); see RustCategorizersTvXxxConsoleGamesServiceTitleParserW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    private const string W61_GAMES_TITLE_PARSER_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w612_game_title_parse_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W61_GAMES_TITLE_PARSER_TAIL = 32;
+
+    /** Lowercase SCENE_GROUPS that a 1-20 byte `[A-Za-z0-9_]` group suffix can name. */
+    private const array W61_SCENE_GROUPS = [
+        'codex' => true, 'plaza' => true, 'gog' => true, 'cpy' => true, 'hoodlum' => true, 'empress' => true, 'rune' => true, 'tenoke' => true,
+        'flt' => true, 'reloaded' => true, 'skidrow' => true, 'prophet' => true, 'razor1911' => true, 'core' => true, 'reflex' => true, 'p2p' => true,
+        'goldberg' => true, 'darksiders' => true, 'tinyiso' => true, 'doge' => true, 'anomaly' => true, 'elamigos' => true, 'fitgirl' => true,
+        'dodi' => true, 'xatab' => true, 'blg' => true, 'rargb' => true, 'chronos' => true, 'fckdrm' => true, 'i_know' => true, 'steam' => true,
+        'sptgames' => true, 'kaos' => true, 'simplex' => true, 'ali213' => true, 'fltdox' => true, '3dmgame' => true, 'postmortem' => true,
+        'vace' => true, 'rogue' => true, 'outlaws' => true,
+    ];
+
+    /** Lowercase extension => w61GameTitleParsePlanBatch() extension index (cleanReleaseNamePhp()'s stripped extensions). */
+    private const array W61_TITLE_EXTENSIONS = ['zip' => 1, 'rar' => 2, '7z' => 3, 'iso' => 4, 'nfo' => 5, 'sfv' => 6, 'exe' => 7, 'mkv' => 8, 'mp4' => 9,
+        'avi' => 10];
+
+    /** Lowercase dropped token => flag (128 repack, 512 crack, 2048 noise or scene group, 4096 DLC). */
+    private const array W61_TITLE_TOKENS = [
+        'repack' => 128, 'proper' => 128, 'rip' => 128, 'rerip' => 128, 'crack' => 512, 'crackfix' => 512, 'crackonly' => 512, 'cracked' => 512,
+        'dlc' => 4096, 'dlcs' => 4096,
+        'iso' => 2048, 'x64' => 2048, 'x86' => 2048, 'win' => 2048, 'win64' => 2048, 'win32' => 2048, 'pc' => 2048, 'incl' => 2048, 'readnfo' => 2048,
+        'nfofix' => 2048, 'retail' => 2048,
+        'codex' => 2048, 'plaza' => 2048, 'gog' => 2048, 'cpy' => 2048, 'hoodlum' => 2048, 'empress' => 2048, 'rune' => 2048, 'tenoke' => 2048,
+        'flt' => 2048, 'reloaded' => 2048, 'skidrow' => 2048, 'prophet' => 2048, 'razor1911' => 2048, 'core' => 2048, 'reflex' => 2048, 'p2p' => 2048,
+        'goldberg' => 2048, 'darksiders' => 2048, 'tinyiso' => 2048, 'doge' => 2048, 'anomaly' => 2048, 'elamigos' => 2048, 'fitgirl' => 2048,
+        'dodi' => 2048, 'xatab' => 2048, 'blg' => 2048, 'rargb' => 2048, 'chronos' => 2048, 'fckdrm' => 2048, 'steam' => 2048, 'sptgames' => 2048,
+        'kaos' => 2048, 'simplex' => 2048, 'ali213' => 2048, 'fltdox' => 2048, '3dmgame' => 2048, 'postmortem' => 2048, 'vace' => 2048,
+        'rogue' => 2048, 'outlaws' => 2048,
+    ];
+
+    /**
+     * Wave 61 routing, binding and output buffer, kept in function-local statics (no static
+     * properties). Operations: null reads the routing override, 'set' replaces it (returning the
+     * previous one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]`
+     * with room for at least $val words (null without the library).
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w61', self::W61_GAMES_TITLE_PARSER_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w61RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW61RustFfi(): bool
+    {
+        $enabled = self::w61RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w61GameTitleParsePlanBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61GameTitleParsePlanBatch(array $rows): array
+    {
+        return self::usesW61RustFfi() ? self::w61GameTitleParsePlanBatchNative($rows) : self::w61GameTitleParsePlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61GameTitleParsePlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W61_GAMES_TITLE_PARSER_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w61RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w61GameTitleParsePlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W61_GAMES_TITLE_PARSER_FFI_CDEF.)
+            $written = $ffi->nntmux_w612_game_title_parse_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w61GameTitleParsePlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w61Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** $min to $max ASCII digits as an integer, otherwise null. */
+    private static function w61Digits(string $value, int $min, int $max): ?int
+    {
+        $length = \strlen($value);
+
+        return $length >= $min && $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : null;
+    }
+
+    /**
+     * The maximal `[a-z0-9]` runs of the ASCII-lowercased value.
+     *
+     * @return list<string>
+     */
+    private static function w61Tokens(string $value): array
+    {
+        $tokens = $value === '' ? false : preg_split('/[^a-z0-9]+/', strtolower($value), -1, PREG_SPLIT_NO_EMPTY);
+
+        return $tokens === false ? [] : $tokens;
+    }
+
+    /**
+     * Wave 61.2 game title cleaning and similarity plan. Per `release\tcompare` row `extension |
+     * flags << 4 | state << 17 | exact << 19 | prefix << 20 | dice << 21 | min(kept, 63) << 28 |
+     * min(len(clean), 255) << 34 | (crc32(clean) & 0x1FFFFF) << 42`. The release loses a final
+     * W61_TITLE_EXTENSIONS extension (after its last `.`, any case; flag 1), a leading `[...]`
+     * tag (flag 2) and a `-` group suffix (1-20 bytes of `[A-Za-z0-9_]` after the last `-`; flag
+     * 4, plus 8 for a W61_SCENE_GROUPS entry). Its w61Tokens() then drop W61_TITLE_TOKENS
+     * entries, versions (`v` + 1-9 digits; 16), builds (`build` or `build` + 1-9 digits; 32),
+     * updates (`update`, `patch`, `hotfix` or `update` + 1-9 digits; 64) together with the
+     * all-digit tokens right after any of those three, `multi` + 0-2 digits (256) and 1970-2099
+     * years (1024). Clean is the kept tokens joined by single spaces. Against the compare
+     * w61Tokens(): exact when clean is non-empty and equals them joined, prefix when both first
+     * tokens match, dice 200 * shared / (distinct kept + distinct compare tokens). State: 0 empty
+     * clean, 1 no compare tokens, 3 exact or dice >= 70, else 2. Then eleven extension, thirteen
+     * flag and four state counts, the exact rows, the distinct clean titles of rows in states 1-3
+     * (by crc32), the dice sum and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61GameTitleParsePlanBatchPhp(array $rows): array
+    {
+        $out = $cleans = [];
+        $extensions = array_fill(0, 11, 0);
+        $flagCounts = array_fill(0, 13, 0);
+        $states = [0, 0, 0, 0];
+        $exactRows = $diceSum = 0;
+        foreach ($rows as $row) {
+            [$release, $compare] = explode("\t", (string) $row, 2) + ['', ''];
+            $value = $release;
+            $extension = $flags = 0;
+            $dot = strrpos($value, '.');
+            if ($dot !== false) {
+                $extension = self::W61_TITLE_EXTENSIONS[strtolower(substr($value, $dot + 1))] ?? 0;
+                if ($extension !== 0) {
+                    $value = substr($value, 0, $dot);
+                    $flags |= 1;
+                }
+            }
+            if ($value !== '' && $value[0] === '[' && ($close = strpos($value, ']', 1)) !== false) {
+                $value = substr($value, $close + 1);
+                $flags |= 2;
+            }
+            $dash = strrpos($value, '-');
+            if ($dash !== false) {
+                $suffix = substr($value, $dash + 1);
+                $length = \strlen($suffix);
+                if ($length >= 1 && $length <= 20 && strspn($suffix, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_') === $length) {
+                    $flags |= isset(self::W61_SCENE_GROUPS[strtolower($suffix)]) ? 12 : 4;
+                    $value = substr($value, 0, $dash);
+                }
+            }
+            $kept = [];
+            $chain = false;
+            foreach (self::w61Tokens($value) as $token) {
+                $length = \strlen($token);
+                if ($chain && strspn($token, '0123456789') === $length) {
+                    continue;
+                }
+                $chain = false;
+                $f = self::W61_TITLE_TOKENS[$token] ?? 0;
+                if ($token[0] === 'v' && self::w61Digits(substr($token, 1), 1, 9) !== null) {
+                    $f |= 16;
+                    $chain = true;
+                } elseif ($token === 'build' || (str_starts_with($token, 'build') && self::w61Digits(substr($token, 5), 1, 9) !== null)) {
+                    $f |= 32;
+                    $chain = true;
+                } elseif ($token === 'update' || $token === 'patch' || $token === 'hotfix'
+                    || (str_starts_with($token, 'update') && self::w61Digits(substr($token, 6), 1, 9) !== null)) {
+                    $f |= 64;
+                    $chain = true;
+                } elseif (str_starts_with($token, 'multi') && ($length === 5 || self::w61Digits(substr($token, 5), 1, 2) !== null)) {
+                    $f |= 256;
+                } elseif ($length === 4 && ($year = self::w61Digits($token, 4, 4)) !== null && $year >= 1970 && $year <= 2099) {
+                    $f |= 1024;
+                }
+                $flags |= $f;
+                if ($f === 0) {
+                    $kept[] = $token;
+                }
+            }
+            $clean = implode(' ', $kept);
+            $compareTokens = self::w61Tokens($compare);
+            $exact = $clean !== '' && $clean === implode(' ', $compareTokens);
+            $prefix = $kept !== [] && $compareTokens !== [] && $kept[0] === $compareTokens[0];
+            $keptSet = array_fill_keys($kept, true);
+            $compareSet = array_fill_keys($compareTokens, true);
+            $sum = \count($keptSet) + \count($compareSet);
+            $dice = $sum > 0 ? intdiv(200 * \count(array_intersect_key($keptSet, $compareSet)), $sum) : 0;
+            $state = match (true) {
+                $clean === '' => 0,
+                $compareSet === [] => 1,
+                $exact || $dice >= 70 => 3,
+                default => 2,
+            };
+            $crc = crc32($clean);
+            $extensions[$extension]++;
+            for ($k = 0; $k < 13; $k++) {
+                $flagCounts[$k] += $flags >> $k & 1;
+            }
+            $states[$state]++;
+            $exactRows += (int) $exact;
+            $diceSum += $dice;
+            if ($state >= 1) {
+                $cleans[$crc] = true;
+            }
+            $out[] = $extension | $flags << 4 | $state << 17 | (int) $exact << 19 | (int) $prefix << 20 | $dice << 21 | min(\count($kept), 63) << 28
+                | min(\strlen($clean), 255) << 34 | ($crc & 0x1FFFFF) << 42;
+        }
+        array_push($out, ...$extensions, ...$flagCounts, ...$states);
+        array_push($out, $exactRows, \count($cleans), $diceSum);
+        $out[] = self::w61Digest($out);
+
+        return $out;
     }
 }
