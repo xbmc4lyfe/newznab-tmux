@@ -14,6 +14,8 @@ use App\Services\NfoService;
 use App\Services\TempWorkspaceService;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
@@ -65,7 +67,7 @@ class PostProcessRunner extends BaseRunner
                 return null;
             }
 
-            return $written === 0 ? '' : \FFI::string($scratch, $written);
+            return $written === 0 ? '' : FFI::string($scratch, $written);
         } catch (\Throwable) {
             return null;
         }
@@ -945,5 +947,216 @@ class PostProcessRunner extends BaseRunner
         }
 
         $this->runPostProcessMixed($tasks, $maxProcesses, 'amazon (books+music+console+games)');
+    }
+
+    // ========================================================================
+    // WAVE 58.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 3.37x, p99 3.26x; uncommon mean 3.02x, p99 2.78x); see RustPostProcessReleasesRunnerDowntimeCompensatorTmuxCommandW58ParityTest. */
+    public const bool W58_RUST_FFI_DEFAULT = true;
+
+    public const string W58_POSTPROCESS_RUNNER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w58_postprocess_runner_work_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** ASCII-lowercased postprocess mode => mode index of w58PostProcessWorkBatch(). */
+    public const array W58_POSTPROCESS_MODES = ['additional' => 1, 'nfo' => 2, 'movie' => 3, 'tv' => 4, 'amazon' => 5];
+
+    /** Base score per mode index of w58PostProcessWorkBatch(). */
+    public const array W58_POSTPROCESS_MODE_WEIGHTS = [0, 40, 30, 50, 50, 20];
+
+    /** Trailer words after the per-item words of w58PostProcessWorkBatch(). */
+    public const int W58_POSTPROCESS_TRAILER = 25;
+
+    public static function usesW58RustFfi(): bool
+    {
+        $override = self::w58RustFfiState();
+
+        return \is_bool($override) ? $override : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 58 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 58.3 postprocess work items `mode:guid:retries` (split as explode(':', $item, 3)). Per item
+     * `mode | bucket << 3 | valid << 8 | numeric << 9 | retries << 10 | score << 17 | min(length, 1023) << 25`:
+     * mode is the W58_POSTPROCESS_MODES index of the ASCII-lowercased first field (0 unknown), bucket the hex
+     * value of the guid's first byte (16 when it is missing or not hex), valid a 40-byte hex guid, numeric an
+     * all-digit retry field, retries its value (99 past two digits, 0 when not numeric) and score
+     * max(0, mode weight + 20 valid + 5 hex bucket - 5 * min(retries, 10)). Then the six mode counts, the 17
+     * bucket counts, the valid count and the max score.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w58PostProcessWorkBatch(array $items): array
+    {
+        return self::usesW58RustFfi() ? self::w58PostProcessWorkBatchNative($items) : self::w58PostProcessWorkBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w58PostProcessWorkBatchNative(array $items): array
+    {
+        return self::w58Invoke($items, \count($items) + self::W58_POSTPROCESS_TRAILER) ?? self::w58PostProcessWorkBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w58PostProcessWorkBatchPhp(array $items): array
+    {
+        $out = [];
+        $modes = array_fill(0, 6, 0);
+        $buckets = array_fill(0, 17, 0);
+        $validCount = 0;
+        $maxScore = 0;
+        foreach ($items as $item) {
+            $item = (string) $item;
+            $parts = explode(':', $item, 3);
+            $mode = self::W58_POSTPROCESS_MODES[strtolower($parts[0])] ?? 0;
+            $guid = $parts[1] ?? '';
+            $retry = $parts[2] ?? '';
+            $bucket = $guid === '' ? false : strpos('0123456789abcdef', strtolower($guid[0]));
+            $bucket = $bucket === false ? 16 : $bucket;
+            $valid = \strlen($guid) === 40 && strspn($guid, '0123456789abcdefABCDEF') === 40;
+            $numeric = $retry !== '' && strspn($retry, '0123456789') === \strlen($retry);
+            $retries = $numeric ? (\strlen($retry) > 2 ? 99 : (int) $retry) : 0;
+            $score = max(0, self::W58_POSTPROCESS_MODE_WEIGHTS[$mode] + ($valid ? 20 : 0) + ($bucket < 16 ? 5 : 0) - 5 * min($retries, 10));
+            $modes[$mode]++;
+            $buckets[$bucket]++;
+            $validCount += $valid ? 1 : 0;
+            $maxScore = max($maxScore, $score);
+            $out[] = $mode | $bucket << 3 | ($valid ? 1 : 0) << 8 | ($numeric ? 1 : 0) << 9 | $retries << 10 | $score << 17
+                | min(\strlen($item), 1023) << 25;
+        }
+        array_push($out, ...$modes);
+        array_push($out, ...$buckets);
+        array_push($out, $validCount, $maxScore);
+
+        return $out;
+    }
+
+    /**
+     * Wave 58 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w58', self::W58_POSTPROCESS_RUNNER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w58RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w58RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 58.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w58Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w58RustFfiState('ffi');
+            $out = self::w58RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w58RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W58_POSTPROCESS_RUNNER_FFI_CDEF.)
+            $written = $ffi->nntmux_w58_postprocess_runner_work_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (\Throwable) {
+            return null;
+        }
     }
 }
