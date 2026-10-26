@@ -508,4 +508,227 @@ class MiscPipe extends AbstractCategorizationPipe
             return null;
         }
     }
+
+    /** C signature of the Wave 66.5 {@see self::w66MiscPipePlanBatch()} helper. */
+    private const string W66_MISC_PIPE_PLAN_FFI_CDEF = 'int64_t nntmux_w665_misc_pipe_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 66.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 5.63/5.82/4.06/4.25x); see tests/Unit/RustCategorizationBookPassableConsoleGroupNameMiscPipeW66ParityTest.php.
+     */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 66.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w66_5', self::W66_MISC_PIPE_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W66_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 66.5 plan batch to Rust until disabled or reset. */
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', true);
+    }
+
+    /** Route the Wave 66.5 plan batch to PHP until enabled or reset. */
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', false);
+    }
+
+    /** Restore W66_RUST_FFI_DEFAULT routing and drop the cached Wave 66.5 handle and buffer. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', null);
+        self::w66RustFfiState('reset', null);
+    }
+
+    public static function usesW66RustFfi(): bool
+    {
+        return self::w66RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w66MiscPipePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 66.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w66Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w66RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w665_misc_pipe_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w66Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /**
+     * Batch Misc pipe plan over `subject\tcategoryId\tconfidence\tmatchedBy\tcurrentCategory`, confidences in
+     * permille. Eight words per record: `[length, tokens, shape, longest, mask, decision, target, errors]` for the trimmed
+     * subject. Shape: 16 empty, 1 hash-like (at least 16 hex digits and nothing else), plus per maximal ASCII
+     * alphanumeric token 2 archive (W54_ARCHIVE_TOKENS, case-insensitive), 4 long (16+ bytes) and not all hex, 8 a
+     * vowelless word of 6+ letters (no AEIOUY). Longest is the longest token's length. Mask: 1 successful, 2 locks like
+     * shouldLockPhp(), 4 terminal (>= 950). Decision/target: 1 locks a successful locking result to its category, 2
+     * moves a hash-like subject with an empty or misc current category to OTHER_HASHED, 3 takes a successful misc or
+     * hashed result, 0 keeps the current category (default OTHER_MISC). Numbers are trimmed 1-15 ASCII digits; errors:
+     * 1 invalid number, 2 not exactly five fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66MiscPipePlanBatch(array $records): array
+    {
+        return self::usesW66RustFfi() ? self::w66MiscPipePlanBatchNative($records) : self::w66MiscPipePlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66MiscPipePlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w66Words($count, implode("\0", $records), 8 * $count) ?? self::w66MiscPipePlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66MiscPipePlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $errors = \count($fields) === 5 ? 0 : 2;
+            $subject = trim($fields[0]);
+            $length = \strlen($subject);
+            $shape = $length === 0 ? 16 : ($length >= 16 && strspn($subject, '0123456789abcdefABCDEF') === $length ? 1 : 0);
+            $tokens = $longest = 0;
+            foreach (preg_split('/[^A-Z0-9]+/', strtoupper($subject), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                $tokens++;
+                $size = \strlen($token);
+                $longest = max($longest, $size);
+                if ($size >= 16 && strspn($token, '0123456789ABCDEF') !== $size) {
+                    $shape |= 4;
+                }
+                if ($size >= 6 && strspn($token, 'BCDFGHJKLMNPQRSTVWXZ') === $size) {
+                    $shape |= 8;
+                }
+                if (isset(self::W54_ARCHIVE_TOKENS[$token])) {
+                    $shape |= 2;
+                }
+            }
+            $category = self::w66Number($fields[1] ?? '', 0, $errors);
+            $confidence = self::w66Number($fields[2] ?? '', 0, $errors);
+            $label = $fields[3] ?? '';
+            $current = self::w66Number($fields[4] ?? '', Category::OTHER_MISC, $errors);
+            $success = $confidence > 0 && ! ($category === Category::OTHER_MISC && $label === 'no_match');
+            $lock = $category === Category::OTHER_HASHED;
+            foreach (self::LOCK_PREFIXES as $prefix) {
+                $lock = $lock || str_starts_with($label, $prefix);
+            }
+            [$decision, $target] = match (true) {
+                $success && $lock => [1, $category],
+                ($shape & 1) !== 0 && ($current === 0 || $current === Category::OTHER_MISC) => [2, Category::OTHER_HASHED],
+                $success && ($category === Category::OTHER_MISC || $category === Category::OTHER_HASHED) => [3, $category],
+                default => [0, $current],
+            };
+            array_push($out, $length, $tokens, $shape, $longest, ($success ? 1 : 0) | ($lock ? 2 : 0) | ($confidence >= 950 ? 4 : 0), $decision, $target, $errors);
+        }
+
+        return $out;
+    }
 }

@@ -461,4 +461,273 @@ final class PerArticleObfuscationGate
                 return $enabled;
         }
     }
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 4.36x, p99 3.82x; uncommon mean 2.16x, p99 1.91x); see RustBinariesObfuscationPartHandlerGateBookQueryServiceW66ParityTest. */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    public const string W66_OBFUSCATION_GATE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w663_obfuscation_gate_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 66.3 batch. */
+    public const int W66_OBFUSCATION_GATE_TRAILER = 18;
+
+    /** Cap for the Wave 66.3 running totals. */
+    private const int W66_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', true);
+    }
+
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', false);
+    }
+
+    /** Restores W66_RUST_FFI_DEFAULT and drops the cached library handle and scratch buffers. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('reset');
+    }
+
+    public static function usesW66RustFfi(): bool
+    {
+        $override = self::w66RustFfiState();
+
+        return \is_bool($override) ? $override : self::W66_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the PerArticleObfuscationGate Wave 66 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 66.3 gate eligibility and routing plan with worthNativeMarking() and mayCarryPartCounts()'s rules. Each
+     * item is `group|poster|subject|headerCount`. The trimmed group is 0 empty, 1 `alt.binaries.*`, 2 other `alt.*` or
+     * 3 other (any case); the trimmed poster 0 empty, 1 with `@` or 2 other. The subject sets marker (holds ` (`, as
+     * every yEnc part count needs), yEnc (any case) and quoted (a non-empty `"..."`). The header count (up to 9
+     * trimmed digits) is 0 empty, 1 digits or 2 other. Eligible: digits, at least HeaderParser::NATIVE_MIN_HEADERS
+     * headers, an `alt.*` group and a marker. The sampling rate is the per-mille share of 16 probes (16000 / count,
+     * capped at 1000). The route is 4 invalid count, 0 skipped (empty group or count), 1 PHP (not eligible), 3 native
+     * (eligible yEnc range of at least W66_GATE_DIRECT_HEADERS) or 2 sampled. Per item `group | poster << 2 |
+     * countState << 4 | marker << 6 | yenc << 7 | quoted << 8 | eligible << 9 | route << 10 | rate << 13 | count (cap
+     * 2^30 - 1) << 23 | groupLength (cap 255) << 53`. Then the five route, four group and three poster counts, the
+     * marker, yEnc and quoted counts, the header total (capped at 2^62), the distinct lower-cased groups and the
+     * eligible count.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66ObfuscationGatePlanBatch(array $items): array
+    {
+        return self::usesW66RustFfi() ? self::w66ObfuscationGatePlanBatchNative($items) : self::w66ObfuscationGatePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66ObfuscationGatePlanBatchNative(array $items): array
+    {
+        return self::w66Invoke($items, \count($items) + self::W66_OBFUSCATION_GATE_TRAILER) ?? self::w66ObfuscationGatePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66ObfuscationGatePlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $routes = [0, 0, 0, 0, 0];
+        $kinds = [0, 0, 0, 0];
+        $posters = [0, 0, 0];
+        $markers = $yencs = $quoteds = $headerTotal = $eligibleCount = 0;
+        $groups = [];
+        foreach ($items as $item) {
+            [$rawGroup, $rawPoster, $subject, $rawCount] = explode('|', (string) $item, 4) + ['', '', '', ''];
+            $group = strtolower(trim($rawGroup));
+            $kind = $group === '' ? 0 : (str_starts_with($group, 'alt.binaries.') ? 1 : (str_starts_with($group, 'alt.') ? 2 : 3));
+            $poster = trim($rawPoster);
+            $posterKind = $poster === '' ? 0 : (str_contains($poster, '@') ? 1 : 2);
+            $marker = str_contains($subject, ' (');
+            $yenc = stripos($subject, 'yenc') !== false;
+            $quoted = preg_match('/"[^"]+"/', $subject) === 1;
+            [$countState, $count] = self::w66Count($rawCount, 9);
+            $eligible = $countState === 1 && $count >= HeaderParser::NATIVE_MIN_HEADERS && ($kind === 1 || $kind === 2) && $marker;
+            $rate = $countState === 1 && $count > 0 ? min(intdiv(16_000, $count), 1000) : 0;
+            if ($countState === 2) {
+                $route = 4;
+            } elseif ($kind === 0 || $countState === 0) {
+                $route = 0;
+            } elseif (! $eligible) {
+                $route = 1;
+            } else {
+                $route = $count >= self::W66_GATE_DIRECT_HEADERS && $yenc ? 3 : 2;
+            }
+            $routes[$route]++;
+            $kinds[$kind]++;
+            $posters[$posterKind]++;
+            $markers += $marker ? 1 : 0;
+            $yencs += $yenc ? 1 : 0;
+            $quoteds += $quoted ? 1 : 0;
+            $headerTotal = min($headerTotal + $count, self::W66_TOTAL_CAP);
+            $eligibleCount += $eligible ? 1 : 0;
+            if ($group !== '') {
+                $groups[$group] = true;
+            }
+            $out[] = $kind | $posterKind << 2 | $countState << 4 | ($marker ? 1 : 0) << 6 | ($yenc ? 1 : 0) << 7 | ($quoted ? 1 : 0) << 8
+                | ($eligible ? 1 : 0) << 9 | $route << 10 | $rate << 13 | min($count, 1_073_741_823) << 23 | min(\strlen($group), 255) << 53;
+        }
+        array_push($out, ...$routes);
+        array_push($out, ...$kinds);
+        array_push($out, ...$posters);
+        array_push($out, $markers, $yencs, $quoteds, $headerTotal, \count($groups), $eligibleCount);
+
+        return $out;
+    }
+
+    /** Eligible yEnc ranges at least this large go straight to the native marker in the Wave 66.3 plan. */
+    public const int W66_GATE_DIRECT_HEADERS = 65_536;
+
+    /**
+     * (0 empty, 1 one to $max ASCII digits, 2 other; the value) for the trimmed field.
+     *
+     * @return array{int, int}
+     */
+    private static function w66Count(string $text, int $max): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $length = \strlen($text);
+
+        return $length <= $max && strspn($text, '0123456789') === $length ? [1, (int) $text] : [2, 0];
+    }
+
+    /**
+     * Wave 66 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and returns the
+     * previous override, 'reset' clears the override, library handle and buffers, 'ffi' resolves the library
+     * (null when unavailable) and 'out' and 'lens' return `int64_t` output and length-column buffers of at least
+     * $val words. Function statics keep the class's property set unchanged.
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('binaries_w663', self::W66_OBFUSCATION_GATE_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w66RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w66RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 66.3 PerArticleObfuscationGate export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call declines
+     * or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w66Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w66RustFfiState('ffi');
+            $out = self::w66RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w66RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W66_OBFUSCATION_GATE_FFI_CDEF.)
+            $written = $ffi->nntmux_w663_obfuscation_gate_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

@@ -937,4 +937,309 @@ final class PartHandler
 
         return \is_array($values) ? array_values($values) : self::planPartAdmissionPhp($messageIds, $binaryIds, $partNumbers, $sizes, $numbers);
     }
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 8.71x, p99 7.03x; uncommon mean 6.47x, p99 4.40x); see RustBinariesObfuscationPartHandlerGateBookQueryServiceW66ParityTest. */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    public const string W66_PART_HANDLER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w663_part_handler_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 66.3 batch. */
+    public const int W66_PART_HANDLER_TRAILER = 16;
+
+    /** Cap for the Wave 66.3 running totals. */
+    private const int W66_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', true);
+    }
+
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', false);
+    }
+
+    /** Restores W66_RUST_FFI_DEFAULT and drops the cached library handle and scratch buffers. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('reset');
+    }
+
+    public static function usesW66RustFfi(): bool
+    {
+        $override = self::w66RustFfiState();
+
+        return \is_bool($override) ? $override : self::W66_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the PartHandler Wave 66 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 66.3 part buffering and repair plan with addPart(), validationErrorPhp() and flush()'s rules. Each item is
+     * `binaryId|partNumber|totalParts|messageId|bytes`; binary (up to 15 trimmed digits), part and total (up to 9) and
+     * bytes (up to 12) are 0 empty, 1 digits or 2 other. The error is 1 invalid part number (not digits or 0), 2 invalid
+     * message ID (trimmed, empty, over 255 bytes or outside printable ASCII), 3 invalid binary (not digits or 0), 4
+     * malformed bytes or total, else 0. Valid parts are buffered by (binary, part): action 0 new, 1 replaces a smaller
+     * buffered duplicate or 2 keeps the buffered one. Per binary the buffer tracks the last part: out-of-order when the
+     * part is lower, gap when it skips one. Final marks part == total and overflow part > total (known total). When
+     * W66_PART_FLUSH_THRESHOLD distinct parts are buffered the buffer flushes and clears. Per item `error | binaryState
+     * << 3 | partState << 5 | totalState << 7 | bytesState << 9 | action << 11 | outOfOrder << 13 | gap << 14 | final
+     * << 15 | overflow << 16 | flush << 17 | bufferedAfter (cap 1023) << 18 | part (cap 2^20 - 1) << 28 | KiB (cap
+     * 2^15 - 1) << 48`. Then the five error and three action counts, the out-of-order, gap and flush counts, the parts
+     * still buffered, the valid bytes total (capped at 2^62), the distinct valid binaries, and the binaries with a known
+     * total that need repair (fewer distinct parts than the total) or are complete.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66PartHandlerPlanBatch(array $items): array
+    {
+        return self::usesW66RustFfi() ? self::w66PartHandlerPlanBatchNative($items) : self::w66PartHandlerPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66PartHandlerPlanBatchNative(array $items): array
+    {
+        return self::w66Invoke($items, \count($items) + self::W66_PART_HANDLER_TRAILER) ?? self::w66PartHandlerPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66PartHandlerPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $errors = [0, 0, 0, 0, 0];
+        $actions = [0, 0, 0];
+        $outOfOrderCount = $gapCount = $flushes = $bytesSum = 0;
+        $buffer = $lastPart = $seenParts = $binaries = [];
+        foreach ($items as $item) {
+            [$rawBinary, $rawPart, $rawTotal, $rawMid, $rawBytes] = explode('|', (string) $item, 5) + ['', '', '', '', ''];
+            [$binaryState, $binary] = self::w66Count($rawBinary, 15);
+            [$partState, $part] = self::w66Count($rawPart, 9);
+            [$totalState, $total] = self::w66Count($rawTotal, 9);
+            [$bytesState, $bytes] = self::w66Count($rawBytes, 12);
+            $mid = trim($rawMid);
+            if ($partState !== 1 || $part === 0) {
+                $error = 1;
+            } elseif ($mid === '' || \strlen($mid) > 255 || preg_match('/^[\x20-\x7E]+$/D', $mid) !== 1) {
+                $error = 2;
+            } elseif ($binaryState !== 1 || $binary === 0) {
+                $error = 3;
+            } elseif ($bytesState === 2 || $totalState === 2) {
+                $error = 4;
+            } else {
+                $error = 0;
+            }
+            $errors[$error]++;
+            $action = 0;
+            $outOfOrder = $gap = $final = $overflow = $flush = false;
+            if ($error === 0) {
+                $key = $binary.':'.$part;
+                if (isset($buffer[$key])) {
+                    if ($bytes > $buffer[$key]) {
+                        $buffer[$key] = $bytes;
+                        $action = 1;
+                    } else {
+                        $action = 2;
+                    }
+                } else {
+                    $buffer[$key] = $bytes;
+                }
+                $actions[$action]++;
+                if (isset($lastPart[$binary])) {
+                    $outOfOrder = $part < $lastPart[$binary];
+                    $gap = $part > $lastPart[$binary] + 1;
+                }
+                $lastPart[$binary] = $part;
+                $final = $totalState === 1 && $total > 0 && $part === $total;
+                $overflow = $totalState === 1 && $total > 0 && $part > $total;
+                $outOfOrderCount += $outOfOrder ? 1 : 0;
+                $gapCount += $gap ? 1 : 0;
+                $bytesSum = min($bytesSum + $bytes, self::W66_TOTAL_CAP);
+                $binaries[$binary] ??= [0, 0];
+                if (! isset($seenParts[$key])) {
+                    $seenParts[$key] = true;
+                    $binaries[$binary][0]++;
+                }
+                if ($totalState === 1 && $total > $binaries[$binary][1]) {
+                    $binaries[$binary][1] = $total;
+                }
+                if (\count($buffer) >= self::W66_PART_FLUSH_THRESHOLD) {
+                    $flush = true;
+                    $flushes++;
+                    $buffer = $lastPart = [];
+                }
+            }
+            $out[] = $error | $binaryState << 3 | $partState << 5 | $totalState << 7 | $bytesState << 9 | $action << 11 | ($outOfOrder ? 1 : 0) << 13
+                | ($gap ? 1 : 0) << 14 | ($final ? 1 : 0) << 15 | ($overflow ? 1 : 0) << 16 | ($flush ? 1 : 0) << 17 | min(\count($buffer), 1023) << 18
+                | min($part, 1_048_575) << 28 | min($bytes >> 10, 32_767) << 48;
+        }
+        $repair = $complete = 0;
+        foreach ($binaries as [$parts, $total]) {
+            if ($total > 0) {
+                if ($parts < $total) {
+                    $repair++;
+                } else {
+                    $complete++;
+                }
+            }
+        }
+        array_push($out, ...$errors);
+        array_push($out, ...$actions);
+        array_push($out, $outOfOrderCount, $gapCount, $flushes, \count($buffer), $bytesSum, \count($binaries), $repair, $complete);
+
+        return $out;
+    }
+
+    /** Buffered distinct parts that trigger a Wave 66.3 plan flush. */
+    public const int W66_PART_FLUSH_THRESHOLD = 100;
+
+    /**
+     * (0 empty, 1 one to $max ASCII digits, 2 other; the value) for the trimmed field.
+     *
+     * @return array{int, int}
+     */
+    private static function w66Count(string $text, int $max): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $length = \strlen($text);
+
+        return $length <= $max && strspn($text, '0123456789') === $length ? [1, (int) $text] : [2, 0];
+    }
+
+    /**
+     * Wave 66 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and returns the
+     * previous override, 'reset' clears the override, library handle and buffers, 'ffi' resolves the library
+     * (null when unavailable) and 'out' and 'lens' return `int64_t` output and length-column buffers of at least
+     * $val words. Function statics keep the class's property set unchanged.
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('binaries_w663', self::W66_PART_HANDLER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w66RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w66RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 66.3 PartHandler export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call declines
+     * or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w66Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w66RustFfiState('ffi');
+            $out = self::w66RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w66RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W66_PART_HANDLER_FFI_CDEF.)
+            $written = $ffi->nntmux_w663_part_handler_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
