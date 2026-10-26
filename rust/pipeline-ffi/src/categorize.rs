@@ -44908,3 +44908,1290 @@ pub mod postprocess_releases_runner_downtime_tmux_command_w583 {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 59.3: SeriesController, AdminLogFileRequest, AdminLogViewerRequest,
+// HorizonServiceProvider and HttpFeedSource batch rows
+// ---------------------------------------------------------------------------
+
+/// Batch helpers for series view queries, admin log file and viewer requests, Horizon access
+/// checks and HTTP PreDB feed responses. Each export reads `|`-separated items as zero-copy
+/// slices of one blob (NUL-joined, or tiled by a length column) and writes one int64 word per
+/// item plus a trailer, so a batch costs one FFI crossing. The PHP `w59*BatchPhp()` methods are
+/// the reference implementation.
+pub mod series_admin_log_requests_horizon_http_feed_w593 {
+    use super::release_image_browse_duplicate_group_management_w553::run_items;
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hash, Hasher};
+
+    /// Byte-wise FNV-1a hasher for the per-call distinct-key sets; keys never outlive one call.
+    #[derive(Default)]
+    struct KeyHasher(u64);
+
+    impl Hasher for KeyHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            let mut hash = self.0 ^ 0xCBF2_9CE4_8422_2325;
+            for &b in bytes {
+                hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            self.0 = hash;
+        }
+
+        fn write_u8(&mut self, value: u8) {
+            self.0 = (self.0 ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.0 = (self.0 ^ value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn write_i64(&mut self, value: i64) {
+            self.0 = (self.0 ^ value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0 ^ (self.0 >> 31)
+        }
+    }
+
+    type KeySet<T> = HashSet<T, BuildHasherDefault<KeyHasher>>;
+
+    /// A key compared and hashed as PHP `strtolower()` would leave it.
+    #[derive(Clone, Copy)]
+    struct Caseless<'a>(&'a [u8]);
+
+    impl Hash for Caseless<'_> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            for &b in self.0 {
+                state.write_u8(b.to_ascii_lowercase());
+            }
+            state.write_usize(self.0.len());
+        }
+    }
+
+    impl PartialEq for Caseless<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.eq_ignore_ascii_case(other.0)
+        }
+    }
+
+    impl Eq for Caseless<'_> {}
+
+    /// `SeriesController::W59_SERIES_SORTS`.
+    const SERIES_SORTS: [&[u8]; 10] = [
+        b"posted_desc",
+        b"posted_asc",
+        b"name_asc",
+        b"name_desc",
+        b"size_asc",
+        b"size_desc",
+        b"files_asc",
+        b"files_desc",
+        b"stats_asc",
+        b"stats_desc",
+    ];
+
+    /// `LogEntryParser::LEVELS`.
+    const LOG_LEVELS: [&[u8]; 8] = [
+        b"debug",
+        b"info",
+        b"notice",
+        b"warning",
+        b"error",
+        b"critical",
+        b"alert",
+        b"emergency",
+    ];
+
+    /// `AdminLogViewerRequest::W59_LOG_VIEWER_CHANNELS`, in index order from 1.
+    const LOG_CHANNELS: [&[u8]; 7] = [
+        b"laravel",
+        b"single",
+        b"daily",
+        b"stack",
+        b"horizon",
+        b"scheduler",
+        b"indexer",
+    ];
+
+    /// `HorizonServiceProvider::W59_HORIZON_ENVIRONMENTS`, in index order from 1.
+    const HORIZON_ENVIRONMENTS: [&[u8]; 4] = [b"local", b"production", b"staging", b"testing"];
+
+    /// `HttpFeedSource::W59_HTTP_FEED_XML_TYPES`.
+    const FEED_XML_TYPES: [&[u8]; 4] = [
+        b"application/xml",
+        b"text/xml",
+        b"application/rss+xml",
+        b"application/atom+xml",
+    ];
+
+    /// `HttpFeedSource::W59_HTTP_FEED_MAX_PAYLOAD`.
+    const FEED_MAX_PAYLOAD: i64 = 1_048_576;
+
+    /// PHP `trim()` with its default character list.
+    #[inline]
+    fn ptrim(s: &[u8]) -> &[u8] {
+        let keep = |b: &u8| !matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let start = s.iter().position(keep).unwrap_or(s.len());
+        let end = s.iter().rposition(keep).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// PHP `explode('|', $item, N) + array_fill(0, N, '')`.
+    #[inline]
+    fn fields<const N: usize>(item: &[u8]) -> [&[u8]; N] {
+        let mut out: [&[u8]; N] = [&[]; N];
+        let mut rest = item;
+        for slot in out.iter_mut().take(N - 1) {
+            match rest.iter().position(|&b| b == b'|') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    return out;
+                }
+            }
+        }
+        out[N - 1] = rest;
+        out
+    }
+
+    /// One to `max` ASCII digits.
+    #[inline]
+    fn digits(t: &[u8], max: usize) -> bool {
+        !t.is_empty() && t.len() <= max && t.iter().all(u8::is_ascii_digit)
+    }
+
+    #[inline]
+    fn number(t: &[u8]) -> i64 {
+        t.iter().fold(0i64, |n, b| n * 10 + i64::from(b - b'0'))
+    }
+
+    /// 0 empty, 1 one to `max` digits, 2 anything else.
+    #[inline]
+    fn digit_state(t: &[u8], max: usize) -> i64 {
+        if t.is_empty() {
+            0
+        } else if digits(t, max) {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// `str_ends_with(strtolower($s), $suffix)` for a lower-case `suffix`.
+    #[inline]
+    fn ends_ci(s: &[u8], suffix: &[u8]) -> bool {
+        s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+
+    /// `str_starts_with(strtolower($s), $prefix)` for a lower-case `prefix`.
+    #[inline]
+    fn starts_ci(s: &[u8], prefix: &[u8]) -> bool {
+        s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
+
+    /// 0 empty, 1 one to `max` digits worth at least 1, 2 anything else; with the page (1 unless
+    /// state 1).
+    #[inline]
+    fn page_state(t: &[u8]) -> (i64, i64) {
+        if t.is_empty() {
+            (0, 1)
+        } else if digits(t, 6) && number(t) >= 1 {
+            (1, number(t))
+        } else {
+            (2, 1)
+        }
+    }
+
+    /// `/s(\d{1,3})e(\d{1,4})/` on the lower-cased query: the first match's season and episode.
+    fn season_episode(q: &[u8]) -> Option<(i64, i64)> {
+        for i in 0..q.len() {
+            if !q[i].eq_ignore_ascii_case(&b's') {
+                continue;
+            }
+            let run = q[i + 1..].iter().take_while(|b| b.is_ascii_digit()).count();
+            let e = i + 1 + run;
+            if !(1..=3).contains(&run) || e >= q.len() || !q[e].eq_ignore_ascii_case(&b'e') {
+                continue;
+            }
+            let episode = q[e + 1..].iter().take_while(|b| b.is_ascii_digit()).count();
+            if episode > 0 {
+                return Some((
+                    number(&q[i + 1..e]),
+                    number(&q[e + 1..e + 1 + episode.min(4)]),
+                ));
+            }
+        }
+        None
+    }
+
+    /// `SeriesController::w59SeriesQueryBatchPhp()`.
+    fn series_query(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 49);
+        let mut buckets = [0i64; 28];
+        let mut sorts = [0i64; 12];
+        let mut pages = [0i64; 3];
+        let (mut sxe_count, mut seasons, mut episodes) = (0i64, 0i64, 0i64);
+        let (mut max_page, mut score_sum) = (0i64, 0i64);
+        let mut pairs: KeySet<i64> = KeySet::default();
+        for &item in items {
+            let [q, season, episode, sort, page] = fields::<5>(item);
+            let q = ptrim(q);
+            let bucket = if q.first().is_some_and(u8::is_ascii_digit) {
+                0
+            } else {
+                q.iter()
+                    .find(|b| b.is_ascii_alphabetic())
+                    .map_or(27, |&b| i64::from((b & 0xDF) - 64))
+            };
+            let sxe = season_episode(q);
+            let season = ptrim(season);
+            let season_state = digit_state(season, 4);
+            let episode = ptrim(episode);
+            let episode_state = digit_state(episode, 4);
+            let sort = ptrim(sort);
+            let sort_idx = if sort.is_empty() {
+                0
+            } else {
+                SERIES_SORTS
+                    .iter()
+                    .position(|s| s.eq_ignore_ascii_case(sort))
+                    .map_or(11, |p| p as i64 + 1)
+            };
+            let (page_state, page) = page_state(ptrim(page));
+            let eff_season = if season_state == 1 {
+                number(season)
+            } else {
+                sxe.map_or(0, |s| s.0)
+            };
+            let eff_episode = if episode_state == 1 {
+                number(episode)
+            } else {
+                sxe.map_or(0, |s| s.1)
+            };
+            let score = (20 * i64::from(!q.is_empty())
+                + 10 * i64::from((1..=26).contains(&bucket))
+                + 30 * i64::from(sxe.is_some())
+                + 15 * i64::from(season_state == 1)
+                + 15 * i64::from(episode_state == 1)
+                + 5 * i64::from((1..=10).contains(&sort_idx))
+                - 10 * i64::from(season_state == 2)
+                - 10 * i64::from(episode_state == 2)
+                - 10 * i64::from(sort_idx == 11)
+                - 10 * i64::from(page_state == 2)
+                - (q.len() as i64 / 32).min(20))
+            .max(0);
+            buckets[bucket as usize] += 1;
+            sxe_count += i64::from(sxe.is_some());
+            seasons += i64::from(season_state == 1);
+            episodes += i64::from(episode_state == 1);
+            sorts[sort_idx as usize] += 1;
+            pages[page_state as usize] += 1;
+            max_page = max_page.max(page);
+            score_sum += score;
+            if season_state == 1 || sxe.is_some() {
+                pairs.insert(eff_season * 10_000 + eff_episode);
+            }
+            out.push(
+                bucket
+                    | i64::from(sxe.is_some()) << 5
+                    | season_state << 6
+                    | episode_state << 8
+                    | sort_idx << 10
+                    | page_state << 14
+                    | eff_season << 16
+                    | eff_episode << 30
+                    | score << 44
+                    | (q.len().min(1023) as i64) << 51,
+            );
+        }
+        out.extend(buckets);
+        out.extend([sxe_count, seasons, episodes]);
+        out.extend(sorts);
+        out.extend(pages);
+        out.extend([max_page, score_sum, pairs.len() as i64]);
+        out
+    }
+
+    /// Path traversal as `AdminLogFileRequest::w59LogFileCheckBatchPhp()` rejects it.
+    fn traversal(file: &[u8]) -> bool {
+        file[0] == b'/'
+            || file.contains(&b'\\')
+            || file == b".."
+            || file.starts_with(b"../")
+            || file.ends_with(b"/..")
+            || file.windows(4).any(|w| w == b"/../")
+    }
+
+    /// `/-\d{4}-\d{2}-\d{2}\.log\z/` on the lower-cased base name.
+    fn dated_log(base: &[u8]) -> bool {
+        const SHAPE: &[u8; 11] = b"-dddd-dd-dd";
+        base.len() >= 15
+            && ends_ci(base, b".log")
+            && base[base.len() - 15..base.len() - 4]
+                .iter()
+                .zip(SHAPE)
+                .all(|(&b, &s)| {
+                    if s == b'd' {
+                        b.is_ascii_digit()
+                    } else {
+                        b == s
+                    }
+                })
+    }
+
+    /// A `.log.N` rotation with a one to three digit suffix.
+    fn rotated_log(base: &[u8]) -> bool {
+        base.iter()
+            .rposition(|&b| b == b'.')
+            .is_some_and(|dot| digits(&base[dot + 1..], 3) && ends_ci(&base[..dot], b".log"))
+    }
+
+    /// `AdminLogFileRequest::w59LogFileCheckBatchPhp()`.
+    fn log_file_check(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 18);
+        let mut statuses = [0i64; 6];
+        let mut exts = [0i64; 5];
+        let mut modes = [0i64; 3];
+        let (mut conflicts, mut span_sum, mut max_end) = (0i64, 0i64, 0i64);
+        let mut files: KeySet<&[u8]> = KeySet::default();
+        for &item in items {
+            let [file, before, offset, limit] = fields::<4>(item);
+            let file = ptrim(file);
+            let len = file.len();
+            let status: i64 = if len == 0 {
+                1
+            } else if len > 255 {
+                2
+            } else if file.contains(&0) {
+                3
+            } else if traversal(file) {
+                4
+            } else if !file
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+            {
+                5
+            } else {
+                0
+            };
+            let base = file
+                .iter()
+                .rposition(|&b| b == b'/')
+                .map_or(file, |p| &file[p + 1..]);
+            let ext: i64 = if ends_ci(base, b".log") {
+                0
+            } else if ends_ci(base, b".gz") {
+                1
+            } else if rotated_log(base) {
+                2
+            } else if ends_ci(base, b".txt") {
+                3
+            } else {
+                4
+            };
+            let hidden = base.first() == Some(&b'.');
+            let dated = dated_log(base);
+            let depth = file.iter().filter(|&&b| b == b'/').count().min(15) as i64;
+            let before = ptrim(before);
+            let before_state = digit_state(before, 18);
+            let offset = ptrim(offset);
+            let offset_state = digit_state(offset, 18);
+            let limit = ptrim(limit);
+            let index = match limit {
+                b"50" => Some(0),
+                b"100" => Some(1),
+                b"200" => Some(2),
+                b"500" => Some(3),
+                _ => None,
+            };
+            let limit_state: i64 = if limit.is_empty() {
+                0
+            } else if index.is_some() {
+                1
+            } else {
+                2
+            };
+            let limit_idx = index.unwrap_or(1);
+            let limit_value = [50i64, 100, 200, 500][limit_idx];
+            let mode: i64 = if before_state == 1 {
+                2
+            } else if offset_state == 1 {
+                1
+            } else {
+                0
+            };
+            let conflict = before_state == 1 && offset_state == 1;
+            let (start, end) = match mode {
+                2 => {
+                    let before = number(before);
+                    ((before - limit_value).max(0), before)
+                }
+                1 => {
+                    let offset = number(offset);
+                    (offset, offset + limit_value)
+                }
+                _ => (0, limit_value),
+            };
+            statuses[status as usize] += 1;
+            exts[ext as usize] += 1;
+            modes[mode as usize] += 1;
+            conflicts += i64::from(conflict);
+            span_sum += end - start;
+            max_end = max_end.max(end);
+            if status == 0 {
+                files.insert(file);
+            }
+            out.push(
+                status
+                    | ext << 3
+                    | i64::from(hidden) << 6
+                    | i64::from(dated) << 7
+                    | depth << 8
+                    | before_state << 12
+                    | offset_state << 14
+                    | limit_state << 16
+                    | (limit_idx as i64) << 18
+                    | mode << 20
+                    | i64::from(conflict) << 22
+                    | (len.min(1023) as i64) << 23
+                    | start.min((1 << 30) - 1) << 33,
+            );
+        }
+        out.extend(statuses);
+        out.extend(exts);
+        out.extend(modes);
+        out.extend([conflicts, span_sum, max_end, files.len() as i64]);
+        out
+    }
+
+    /// `AdminLogViewerRequest::w59LogViewerPlanBatchPhp()`.
+    fn log_viewer_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 26);
+        let mut plans = [0i64; 5];
+        let mut level_bits = [0i64; 8];
+        let mut channels = [0i64; 10];
+        let (mut complexity_sum, mut max_complexity, mut max_page) = (0i64, 0i64, 0i64);
+        for &item in items {
+            let [file, q, levels, channel, page] = fields::<5>(item);
+            let file_len = ptrim(file).len();
+            let file_state: i64 = if file_len == 0 {
+                0
+            } else if file_len > 255 {
+                2
+            } else {
+                1
+            };
+            let q = ptrim(q);
+            let q_state: i64 = if q.is_empty() {
+                0
+            } else if q.len() > 255 {
+                2
+            } else {
+                1
+            };
+            let (mut terms, mut in_term) = (0i64, false);
+            let (mut quotes, mut wild, mut special, mut non_ascii) = (0i64, 0i64, 0i64, false);
+            for &b in q {
+                let gap = b == b' ' || b == b'\t';
+                terms += i64::from(!gap && !in_term);
+                in_term = !gap;
+                match b {
+                    b'"' => quotes += 1,
+                    b'*' | b'?' => wild += 1,
+                    b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'^' | b'$' | b'\\' | b'+' => {
+                        special += 1
+                    }
+                    _ => non_ascii |= b >= 0x80,
+                }
+            }
+            let unbalanced = quotes % 2;
+            let complexity = (terms * 2
+                + quotes / 2 * 3
+                + wild * 4
+                + special * 5
+                + unbalanced * 10
+                + q.len() as i64 / 16)
+                .min(255);
+            let (mut mask, mut unknown) = (0i64, 0i64);
+            for level in levels.split(|&b| b == b',') {
+                let level = ptrim(level);
+                if level.is_empty() {
+                    continue;
+                }
+                match LOG_LEVELS
+                    .iter()
+                    .position(|l| l.eq_ignore_ascii_case(level))
+                {
+                    Some(p) => mask |= 1 << p,
+                    None => unknown += 1,
+                }
+            }
+            let channel = ptrim(channel);
+            let channel_idx = if channel.is_empty() {
+                0
+            } else {
+                match LOG_CHANNELS
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(channel))
+                {
+                    Some(p) => p as i64 + 1,
+                    None if channel
+                        .iter()
+                        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+                    {
+                        8
+                    }
+                    None => 9,
+                }
+            };
+            let (page_state, page) = page_state(ptrim(page));
+            let plan: i64 = if file_state == 2
+                || q_state == 2
+                || channel_idx == 9
+                || page_state == 2
+                || unknown > 0
+            {
+                4
+            } else if q.is_empty() {
+                i64::from(mask != 0)
+            } else if complexity < 20 {
+                2
+            } else {
+                3
+            };
+            plans[plan as usize] += 1;
+            for (bit, count) in level_bits.iter_mut().enumerate() {
+                *count += mask >> bit & 1;
+            }
+            channels[channel_idx as usize] += 1;
+            complexity_sum += complexity;
+            max_complexity = max_complexity.max(complexity);
+            max_page = max_page.max(page);
+            out.push(
+                file_state
+                    | q_state << 2
+                    | plan << 4
+                    | channel_idx << 7
+                    | page_state << 11
+                    | i64::from(non_ascii) << 13
+                    | unbalanced << 14
+                    | mask << 15
+                    | unknown.min(15) << 23
+                    | complexity << 27
+                    | terms.min(255) << 35
+                    | (q.len().min(1023) as i64) << 43
+                    | page.min(1023) << 53,
+            );
+        }
+        out.extend(plans);
+        out.extend(level_bits);
+        out.extend(channels);
+        out.extend([complexity_sum, max_complexity, max_page]);
+        out
+    }
+
+    /// Non-overlapping `::` occurrences, as PHP `substr_count()` counts them.
+    fn double_colons(s: &[u8]) -> usize {
+        let (mut i, mut count) = (0usize, 0usize);
+        while i + 1 < s.len() {
+            if s[i] == b':' && s[i + 1] == b':' {
+                count += 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        count
+    }
+
+    /// `HorizonServiceProvider::w59HorizonIpClass()`: 0 empty, 1 loopback, 2 private, 3 link
+    /// local, 4 public IPv4, 6 public IPv6, 7 invalid.
+    fn ip_class(ip: &[u8]) -> i64 {
+        if ip.is_empty() {
+            return 0;
+        }
+        if ip.iter().all(|&b| b.is_ascii_digit() || b == b'.') {
+            let (mut parts, mut n) = ([0i64; 4], 0usize);
+            for part in ip.split(|&b| b == b'.') {
+                if n == 4 || !digits(part, 3) || number(part) > 255 {
+                    return 7;
+                }
+                parts[n] = number(part);
+                n += 1;
+            }
+            if n != 4 {
+                return 7;
+            }
+            let (a, b) = (parts[0], parts[1]);
+            return if a == 127 {
+                1
+            } else if a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168) {
+                2
+            } else if a == 169 && b == 254 {
+                3
+            } else {
+                4
+            };
+        }
+        if !ip.contains(&b':')
+            || ip.len() > 45
+            || !ip
+                .iter()
+                .all(|&b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+            || double_colons(ip) > 1
+        {
+            7
+        } else if ip == b"::1" {
+            1
+        } else if starts_ci(ip, b"fe80:") {
+            3
+        } else if starts_ci(ip, b"fc") || starts_ci(ip, b"fd") {
+            2
+        } else {
+            6
+        }
+    }
+
+    /// `HorizonServiceProvider::w59HorizonAccessBatchPhp()`.
+    fn horizon_access(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 19);
+        let mut reasons = [0i64; 4];
+        let mut ips = [0i64; 8];
+        let mut metrics = [0i64; 5];
+        let mut max_wait = 0i64;
+        let mut uids: KeySet<&[u8]> = KeySet::default();
+        for &item in items {
+            let [env, uid, roles, email, ip, wait] = fields::<6>(item);
+            let env = ptrim(env);
+            let env_idx = if env.is_empty() {
+                0
+            } else {
+                HORIZON_ENVIRONMENTS
+                    .iter()
+                    .position(|e| *e == env)
+                    .map_or(5, |p| p as i64 + 1)
+            };
+            let local = env == b"local";
+            let uid = ptrim(uid);
+            let uid_state = digit_state(uid, 19);
+            let (mut admin, mut mismatch, mut role_count) = (false, false, 0i64);
+            for role in roles.split(|&b| b == b',') {
+                let role = ptrim(role);
+                if role.is_empty() {
+                    continue;
+                }
+                role_count += 1;
+                if role == b"Admin" {
+                    admin = true;
+                } else if role.eq_ignore_ascii_case(b"admin") {
+                    mismatch = true;
+                }
+            }
+            let email = ptrim(email);
+            let (email_state, internal) = if email.is_empty() {
+                (0i64, false)
+            } else {
+                let domain = email
+                    .iter()
+                    .position(|&b| b == b'@')
+                    .filter(|&at| at > 0)
+                    .map(|at| &email[at + 1..]);
+                let valid = domain.is_some_and(|d| {
+                    !d.is_empty()
+                        && !d.contains(&b'@')
+                        && d.contains(&b'.')
+                        && d[0] != b'.'
+                        && d[d.len() - 1] != b'.'
+                        && email.iter().all(|&b| (0x21..=0x7E).contains(&b))
+                });
+                let internal = valid
+                    && domain.is_some_and(|d| {
+                        ends_ci(d, b".local") || ends_ci(d, b".lan") || ends_ci(d, b".internal")
+                    });
+                (if valid { 1 } else { 2 }, internal)
+            };
+            let ip = ip_class(ptrim(ip));
+            let wait = ptrim(wait);
+            let (metric, wait) = match digit_state(wait, 9) {
+                0 => (0i64, 0i64),
+                1 => {
+                    let w = number(wait);
+                    (
+                        if w < 60 {
+                            1
+                        } else if w < 300 {
+                            2
+                        } else {
+                            3
+                        },
+                        w,
+                    )
+                }
+                _ => (4, 0),
+            };
+            let gate = uid_state == 1 && admin;
+            let allowed = gate || local;
+            let reason: i64 = match (allowed, gate) {
+                (true, true) => 2,
+                (true, false) => 3,
+                _ => i64::from(uid_state == 1),
+            };
+            reasons[reason as usize] += 1;
+            ips[ip as usize] += 1;
+            metrics[metric as usize] += 1;
+            if (1..=3).contains(&metric) {
+                max_wait = max_wait.max(wait);
+            }
+            if allowed && uid_state == 1 {
+                uids.insert(uid);
+            }
+            out.push(
+                env_idx
+                    | uid_state << 3
+                    | i64::from(admin) << 5
+                    | i64::from(mismatch) << 6
+                    | role_count.min(15) << 7
+                    | email_state << 11
+                    | i64::from(internal) << 13
+                    | ip << 14
+                    | metric << 18
+                    | i64::from(gate) << 21
+                    | i64::from(allowed) << 22
+                    | reason << 23
+                    | wait.min((1 << 20) - 1) << 25
+                    | (uid.len().min(31) as i64) << 45,
+            );
+        }
+        out.extend(reasons);
+        out.extend(ips);
+        out.extend(metrics);
+        out.extend([max_wait, uids.len() as i64]);
+        out
+    }
+
+    /// `HttpFeedSource::w59HttpFeedUrl()`: (state, https, query, custom port, host) with state 0
+    /// valid, 1 empty, 2 no scheme, 3 unsupported scheme, 4 bad host and 5 bad port.
+    fn feed_url(url: &[u8]) -> (i64, i64, i64, i64, &[u8]) {
+        if url.is_empty() {
+            return (1, 0, 0, 0, &[]);
+        }
+        let Some(sep) = url.windows(3).position(|w| w == b"://") else {
+            return (2, 0, 0, 0, &[]);
+        };
+        let scheme = &url[..sep];
+        let https = scheme.eq_ignore_ascii_case(b"https");
+        if !https && !scheme.eq_ignore_ascii_case(b"http") {
+            return (3, 0, 0, 0, &[]);
+        }
+        let h = i64::from(https);
+        let rest = &url[sep + 3..];
+        let end = rest
+            .iter()
+            .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+            .unwrap_or(rest.len());
+        let mut authority = &rest[..end];
+        if let Some(at) = authority.iter().rposition(|&b| b == b'@') {
+            authority = &authority[at + 1..];
+        }
+        let colon = authority.iter().rposition(|&b| b == b':');
+        let (host, port) = match colon {
+            Some(c) => (&authority[..c], Some(&authority[c + 1..])),
+            None => (authority, None),
+        };
+        if host.is_empty()
+            || host.len() > 253
+            || !host
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+            || matches!(host[0], b'.' | b'-')
+            || matches!(host[host.len() - 1], b'.' | b'-')
+        {
+            return (4, h, 0, 0, &[]);
+        }
+        let mut custom = 0;
+        if let Some(port) = port {
+            if !digits(port, 5) || !(1..=65_535).contains(&number(port)) {
+                return (5, h, 0, 0, &[]);
+            }
+            custom = i64::from(number(port) != if https { 443 } else { 80 });
+        }
+        (0, h, i64::from(rest[end..].contains(&b'?')), custom, host)
+    }
+
+    /// `/\A[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT\z/`.
+    fn http_date(r: &[u8]) -> bool {
+        const SHAPE: &[u8; 29] = b"aaa, dd aaa dddd dd:dd:dd GMT";
+        r.len() == 29
+            && r.iter().zip(SHAPE).all(|(&b, &s)| match s {
+                b'a' => b.is_ascii_alphabetic(),
+                b'd' => b.is_ascii_digit(),
+                _ => b == s,
+            })
+    }
+
+    /// `HttpFeedSource::w59HttpFeedResponseBatchPhp()`.
+    fn feed_response(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 14);
+        let mut verdicts = [0i64; 11];
+        let (mut payload_sum, mut max_delay) = (0i64, 0i64);
+        let mut hosts: KeySet<Caseless<'_>> = KeySet::default();
+        for &item in items {
+            let [url, status, retry, content_type, length, encoding] = fields::<6>(item);
+            let (url_state, https, query, custom, host) = feed_url(ptrim(url));
+            let status = ptrim(status);
+            let code = if status.len() == 3 && digits(status, 3) {
+                number(status)
+            } else {
+                0
+            };
+            let status_class: i64 = match code {
+                c if !(100..=599).contains(&c) => 0,
+                200..=299 => 1,
+                304 => 2,
+                429 => 3,
+                500.. => 4,
+                400.. => 5,
+                _ => 6,
+            };
+            let retry = ptrim(retry);
+            let retry_state: i64 = if retry.is_empty() {
+                0
+            } else if digits(retry, 10) {
+                1
+            } else if http_date(retry) {
+                2
+            } else {
+                3
+            };
+            let ct = ptrim(content_type);
+            let mime = ptrim(ct.iter().position(|&b| b == b';').map_or(ct, |p| &ct[..p]));
+            let type_class: i64 = if mime.is_empty() {
+                0
+            } else if FEED_XML_TYPES.iter().any(|t| t.eq_ignore_ascii_case(mime)) {
+                1
+            } else if mime.eq_ignore_ascii_case(b"application/json") || ends_ci(mime, b"+json") {
+                2
+            } else if mime.eq_ignore_ascii_case(b"text/html") {
+                3
+            } else if mime.eq_ignore_ascii_case(b"text/plain") {
+                4
+            } else if mime.eq_ignore_ascii_case(b"application/octet-stream") {
+                5
+            } else {
+                6
+            };
+            let charset: i64 = match ct
+                .windows(8)
+                .position(|w| w.eq_ignore_ascii_case(b"charset="))
+            {
+                None => 0,
+                Some(p) => {
+                    let v = &ct[p + 8..];
+                    let v = ptrim(v.iter().position(|&b| b == b';').map_or(v, |s| &v[..s]));
+                    let start = v
+                        .iter()
+                        .position(|&b| b != b'"' && b != b'\'')
+                        .unwrap_or(v.len());
+                    let end = v
+                        .iter()
+                        .rposition(|&b| b != b'"' && b != b'\'')
+                        .map_or(start, |e| e + 1);
+                    let v = &v[start..end];
+                    if v.is_empty() {
+                        3
+                    } else if v.eq_ignore_ascii_case(b"utf-8") || v.eq_ignore_ascii_case(b"utf8") {
+                        1
+                    } else if v.eq_ignore_ascii_case(b"iso-8859-1")
+                        || v.eq_ignore_ascii_case(b"latin1")
+                    {
+                        2
+                    } else {
+                        4
+                    }
+                }
+            };
+            let length = ptrim(length);
+            let (length_state, bytes): (i64, i64) = match digit_state(length, 15) {
+                0 => (0, 0),
+                1 => {
+                    let n = number(length);
+                    (
+                        if n == 0 {
+                            1
+                        } else if n > FEED_MAX_PAYLOAD {
+                            3
+                        } else {
+                            2
+                        },
+                        n,
+                    )
+                }
+                _ => (4, 0),
+            };
+            let encoding = ptrim(encoding);
+            let encoding: i64 = if encoding.is_empty() || encoding.eq_ignore_ascii_case(b"identity")
+            {
+                0
+            } else if encoding.eq_ignore_ascii_case(b"gzip")
+                || encoding.eq_ignore_ascii_case(b"x-gzip")
+            {
+                1
+            } else if encoding.eq_ignore_ascii_case(b"deflate") {
+                2
+            } else if encoding.eq_ignore_ascii_case(b"br") {
+                3
+            } else {
+                4
+            };
+            let verdict: i64 = if url_state != 0 {
+                6
+            } else if status_class == 0 {
+                7
+            } else if status_class == 3 || status_class == 4 {
+                1
+            } else if status_class == 2 {
+                2
+            } else if status_class != 1 {
+                3
+            } else if encoding == 4 {
+                4
+            } else if type_class == 3 {
+                5
+            } else if length_state == 3 {
+                8
+            } else if length_state == 1 {
+                9
+            } else if length_state == 4 {
+                10
+            } else {
+                0
+            };
+            let delay = if verdict != 1 {
+                0
+            } else {
+                match retry_state {
+                    1 => number(retry).min(86_400),
+                    2 => 60,
+                    _ if status_class == 3 => 60,
+                    _ => 5,
+                }
+            };
+            verdicts[verdict as usize] += 1;
+            if verdict == 0 && length_state == 2 {
+                payload_sum += bytes;
+            }
+            max_delay = max_delay.max(delay);
+            if url_state == 0 {
+                hosts.insert(Caseless(host));
+            }
+            out.push(
+                url_state
+                    | https << 3
+                    | query << 4
+                    | custom << 5
+                    | status_class << 6
+                    | retry_state << 9
+                    | type_class << 11
+                    | charset << 14
+                    | length_state << 17
+                    | encoding << 20
+                    | verdict << 23
+                    | delay << 27
+                    | (host.len().min(255) as i64) << 44,
+            );
+        }
+        out.extend(verdicts);
+        out.extend([payload_sum, max_delay, hosts.len() as i64]);
+        out
+    }
+
+    macro_rules! w593_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// Items are NUL-joined in `blob`, or concatenated with their byte lengths in `lens`
+            /// when it is non-null. Returns the word count, `-needed` when `out_cap` is too small,
+            /// or `-1` when it declines (null `out`, null `blob` with a length, `count` other than
+            /// the number of NUL-separated items, or `lens` that do not tile `blob`).
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+            /// `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run_items(blob, blob_len, lens, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w593_export!(
+        /// `SeriesController::w59SeriesQueryBatch()`.
+        nntmux_w593_series_query_batch => series_query
+    );
+    w593_export!(
+        /// `AdminLogFileRequest::w59LogFileCheckBatch()`.
+        nntmux_w593_admin_log_file_check_batch => log_file_check
+    );
+    w593_export!(
+        /// `AdminLogViewerRequest::w59LogViewerPlanBatch()`.
+        nntmux_w593_admin_log_viewer_plan_batch => log_viewer_plan
+    );
+    w593_export!(
+        /// `HorizonServiceProvider::w59HorizonAccessBatch()`.
+        nntmux_w593_horizon_access_batch => horizon_access
+    );
+    w593_export!(
+        /// `HttpFeedSource::w59HttpFeedResponseBatch()`.
+        nntmux_w593_http_feed_response_batch => feed_response
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        /// Each export with the words an empty batch writes.
+        const EXPORTS: [(Export, isize); 5] = [
+            (nntmux_w593_series_query_batch, 49),
+            (nntmux_w593_admin_log_file_check_batch, 18),
+            (nntmux_w593_admin_log_viewer_plan_batch, 26),
+            (nntmux_w593_horizon_access_batch, 19),
+            (nntmux_w593_http_feed_response_batch, 14),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            if items.iter().all(|i| !i.contains(&0)) {
+                let joined = items.join(&0u8);
+                let mut nul = vec![0i64; 4096];
+                let w = unsafe {
+                    f(
+                        joined.as_ptr(),
+                        joined.len(),
+                        ptr::null(),
+                        items.len(),
+                        nul.as_mut_ptr(),
+                        nul.len(),
+                    )
+                };
+                nul.truncate(w.max(0) as usize);
+                assert_eq!(nul, out, "NUL-joined and length-column calls differ");
+            }
+            out
+        }
+
+        #[test]
+        fn w593_php_helpers() {
+            assert_eq!(ptrim(b" \t\0x y\x0b\r\n"), b"x y");
+            assert_eq!(ptrim(b" \0 "), b"");
+            assert_eq!(fields::<4>(b"a|b"), [&b"a"[..], b"b", b"", b""]);
+            assert_eq!(fields::<3>(b"a|b|c|d"), [&b"a"[..], b"b", b"c|d"]);
+            assert_eq!(season_episode(b"x s1234e5 S12E123456"), Some((12, 1234)));
+            assert_eq!(season_episode(b"se1 s01e"), None);
+            assert_eq!(double_colons(b":::"), 1);
+            assert_eq!(double_colons(b"::1::"), 2);
+            assert!(http_date(b"Wed, 21 Oct 2015 07:28:00 GMT"));
+            assert!(!http_date(b"Wed, 21 Oct 2015 07:28:00 gmt"));
+        }
+
+        #[test]
+        fn w593_series_query_items() {
+            let out = call(
+                nntmux_w593_series_query_batch,
+                &[
+                    b"Breaking Bad S01E02|1|2|name_asc|3",
+                    b"24|||",
+                    b"|x|y|zz|0",
+                ],
+            );
+            assert_eq!(
+                out[0],
+                2 | 1 << 5
+                    | 1 << 6
+                    | 1 << 8
+                    | 3 << 10
+                    | 1 << 14
+                    | 1 << 16
+                    | 2 << 30
+                    | 95 << 44
+                    | 19 << 51
+            );
+            assert_eq!(out[1], 20 << 44 | 2 << 51);
+            assert_eq!(out[2], 27 | 2 << 6 | 2 << 8 | 11 << 10 | 2 << 14);
+            assert_eq!((out[3], out[5], out[30]), (1, 1, 1));
+            assert_eq!(&out[31..34], &[1, 1, 1]);
+            assert_eq!((out[34], out[37], out[45]), (1, 1, 1));
+            assert_eq!(&out[46..], &[1, 1, 1, 3, 115, 1]);
+        }
+
+        #[test]
+        fn w593_log_file_items() {
+            let out = call(
+                nntmux_w593_admin_log_file_check_batch,
+                &[
+                    b"laravel.log|100||200",
+                    b"logs/laravel-2026-01-02.log||50|50",
+                    b"../etc/passwd",
+                ],
+            );
+            assert_eq!(out[0], 1 << 12 | 1 << 16 | 2 << 18 | 2 << 20 | 11 << 23);
+            assert_eq!(
+                out[1],
+                1 << 7 | 1 << 8 | 1 << 14 | 1 << 16 | 1 << 20 | 27 << 23 | 50 << 33
+            );
+            assert_eq!(out[2], 4 | 4 << 3 | 2 << 8 | 1 << 18 | 13 << 23);
+            assert_eq!(
+                &out[3..],
+                &[2, 0, 0, 0, 1, 0, 2, 0, 0, 0, 1, 1, 1, 1, 0, 250, 100, 2]
+            );
+        }
+
+        #[test]
+        fn w593_log_viewer_items() {
+            let out = call(
+                nntmux_w593_admin_log_viewer_plan_batch,
+                &[
+                    b"laravel.log|\"foo bar\" baz*|error,WARNING|daily|2",
+                    b"||debug,foo|bad chan|x",
+                ],
+            );
+            assert_eq!(
+                out[0],
+                1 | 1 << 2
+                    | 2 << 4
+                    | 3 << 7
+                    | 1 << 11
+                    | 24 << 15
+                    | 13 << 27
+                    | 3 << 35
+                    | 14 << 43
+                    | 2 << 53
+            );
+            assert_eq!(
+                out[1],
+                4 << 4 | 9 << 7 | 2 << 11 | 1 << 15 | 1 << 23 | 1 << 53
+            );
+            assert_eq!(&out[2..15], &[0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0]);
+            assert_eq!((out[18], out[24]), (1, 1));
+            assert_eq!(&out[25..], &[13, 13, 2]);
+        }
+
+        #[test]
+        fn w593_horizon_access_items() {
+            let out = call(
+                nntmux_w593_horizon_access_batch,
+                &[
+                    b"production|1|Admin,User|a@b.com|10.0.0.1|30",
+                    b"local||admin|x@y.local|::1|500",
+                    b"staging|007|Admin|bad|fe80::1|abc",
+                    b"prod|x|||1.2.3|",
+                ],
+            );
+            assert_eq!(
+                out[0],
+                2 | 1 << 3
+                    | 1 << 5
+                    | 2 << 7
+                    | 1 << 11
+                    | 2 << 14
+                    | 1 << 18
+                    | 1 << 21
+                    | 1 << 22
+                    | 2 << 23
+                    | 30 << 25
+                    | 1 << 45
+            );
+            assert_eq!(
+                out[1],
+                1 | 1 << 6
+                    | 1 << 7
+                    | 1 << 11
+                    | 1 << 13
+                    | 1 << 14
+                    | 3 << 18
+                    | 1 << 22
+                    | 3 << 23
+                    | 500 << 25
+            );
+            assert_eq!(out[3], 5 | 2 << 3 | 7 << 14 | 1 << 45);
+            assert_eq!(
+                &out[4..],
+                &[1, 0, 2, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 500, 2]
+            );
+        }
+
+        #[test]
+        fn w593_http_feed_items() {
+            let out = call(
+                nntmux_w593_http_feed_response_batch,
+                &[
+                    b"https://Example.com/feed?x=1|200||application/rss+xml; charset=\"UTF-8\"|1000|gzip",
+                    b"http://u@h:8080/|429|Wed, 21 Oct 2015 07:28:00 GMT|||",
+                    b"ftp://x|200",
+                    b"http://example.com|503|120",
+                ],
+            );
+            assert_eq!(
+                out[0],
+                1 << 3 | 1 << 4 | 1 << 6 | 1 << 11 | 1 << 14 | 2 << 17 | 1 << 20 | 11 << 44
+            );
+            assert_eq!(
+                out[1],
+                1 << 5 | 3 << 6 | 2 << 9 | 1 << 23 | 60 << 27 | 1 << 44
+            );
+            assert_eq!(out[2], 3 | 1 << 6 | 6 << 23);
+            assert_eq!(out[3], 4 << 6 | 1 << 9 | 1 << 23 | 120 << 27 | 11 << 44);
+            assert_eq!(&out[4..], &[1, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1000, 120, 2]);
+        }
+
+        #[test]
+        fn w593_exports_guard_their_buffers() {
+            let mut buf = [0i64; 128];
+            let o = buf.as_mut_ptr();
+            let n = ptr::null::<i64>();
+            for (f, trailer) in EXPORTS {
+                unsafe {
+                    assert_eq!(f(b"x".as_ptr(), 1, n, 1, ptr::null_mut(), 128), -1);
+                    assert_eq!(f(ptr::null(), 1, n, 1, o, 128), -1);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 1, o, 128), -1);
+                    assert_eq!(f(ptr::null(), 0, n, 0, o, 128), trailer);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 2, o, 1), -(trailer + 2));
+                    let lens = [1i64, 2];
+                    assert_eq!(
+                        f(b"a\0b".as_ptr(), 3, lens.as_ptr(), 2, o, 128),
+                        trailer + 2
+                    );
+                    assert_eq!(f(b"a\0bc".as_ptr(), 4, lens.as_ptr(), 2, o, 128), -1);
+                }
+            }
+        }
+    }
+}
