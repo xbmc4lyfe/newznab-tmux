@@ -7,6 +7,7 @@ namespace App\Services\Runners;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
@@ -15,6 +16,37 @@ class BinariesRunner extends BaseRunner
     public const string FFI_CDEF = <<<'C'
         ssize_t nntmux_runner_release_transform(uint32_t mode, const char *input, size_t len, char *out, size_t cap);
         C;
+
+    /**
+     * Enabled: the paired benchmark in the W58 parity test measures 3.804x common mean, 3.077x
+     * common p99, 3.35x uncommon mean and 2.812x uncommon p99 (per-metric minimum of four runs),
+     * above the 1.5x rule.
+     */
+    public const bool W58_RUST_FFI_DEFAULT = true;
+
+    public const string W58_BINARIES_RUNNER_FFI_CDEF = 'ssize_t nntmux_w581_binaries_work_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public const int W58_BINARIES_WORDS = 4;
+
+    public const int W58_BINARIES_INACTIVE = 0;
+
+    public const int W58_BINARIES_UPDATE_HEADERS = 1;
+
+    public const int W58_BINARIES_RANGES = 2;
+
+    public const int W58_BINARIES_MALFORMED = 3;
+
+    public const int W58_BINARIES_ACTIVE = 4;
+
+    public const int W58_BINARIES_HEADERS_ADJUSTED = 8;
+
+    public const int W58_BINARIES_MESSAGES_ADJUSTED = 16;
+
+    public const int W58_BINARIES_BEHIND = 32;
+
+    public const int W58_BINARIES_GROUP_VALID = 64;
+
+    public const int W58_BINARIES_RANGES_SHIFT = 16;
 
     // Retain PHP until common/uncommon mean and p99 all demonstrate a 1.5x gain.
     private static bool $useRustFfi = false;
@@ -80,6 +112,161 @@ class BinariesRunner extends BaseRunner
         }
 
         return null;
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        $enabled = self::w58RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 58 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Four words per `id\tgroup\tactive\tour_last\ttheir_last\tmax_headers\tmax_messages` row: the
+     * mode (W58_BINARIES_INACTIVE, UPDATE_HEADERS or RANGES, following
+     * planSafeBinariesCommandsPhp()) with the active, headers/messages-adjusted, behind and
+     * group-valid flags plus `min(ranges, 0xFFFF) << W58_BINARIES_RANGES_SHIFT`; then the range
+     * count, the end article and the work-item score (the backlog, 0 to 10^15). A malformed row
+     * yields `[W58_BINARIES_MALFORMED, 0, 0, 0]`.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function binariesWorkBatch(array $rows): array
+    {
+        return self::usesW58RustFfi() ? self::binariesWorkBatchNative($rows) : self::binariesWorkBatchPhp($rows);
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function binariesWorkBatchPhp(array $rows): array
+    {
+        $words = [];
+        foreach ($rows as $row) {
+            $fields = explode("\t", $row);
+            if (\count($fields) !== 7 || ($fields[2] !== '0' && $fields[2] !== '1')
+                || preg_match('/\A-?[0-9]{1,18}\z/', $fields[0]) !== 1 || preg_match('/\A-?[0-9]{1,18}\z/', $fields[3]) !== 1
+                || preg_match('/\A-?[0-9]{1,18}\z/', $fields[4]) !== 1 || preg_match('/\A-?[0-9]{1,18}\z/', $fields[5]) !== 1
+                || preg_match('/\A-?[0-9]{1,18}\z/', $fields[6]) !== 1) {
+                array_push($words, self::W58_BINARIES_MALFORMED, 0, 0, 0);
+
+                continue;
+            }
+            $ourLast = (int) $fields[3];
+            $maxHeaders = (int) $fields[5];
+            $maxMessages = (int) $fields[6];
+            $flags = preg_match('/\A[A-Za-z0-9][A-Za-z0-9.+_-]{0,254}\z/', $fields[1]) === 1 ? self::W58_BINARIES_GROUP_VALID : 0;
+            if ($maxHeaders <= 0) {
+                $maxHeaders = 1000000;
+                $flags |= self::W58_BINARIES_HEADERS_ADJUSTED;
+            } elseif ($maxHeaders > 1000000000) {
+                $maxHeaders = 1000000000;
+                $flags |= self::W58_BINARIES_HEADERS_ADJUSTED;
+            }
+            if ($maxMessages < 1) {
+                $maxMessages = 20000;
+                $flags |= self::W58_BINARIES_MESSAGES_ADJUSTED;
+            } elseif ($maxMessages > 1000000) {
+                $maxMessages = 1000000;
+                $flags |= self::W58_BINARIES_MESSAGES_ADJUSTED;
+            }
+            $backlog = (int) $fields[4] - $ourLast;
+            $flags |= $backlog > 0 ? self::W58_BINARIES_BEHIND : 0;
+            if ($fields[2] === '0') {
+                array_push($words, self::W58_BINARIES_INACTIVE | $flags, 0, $ourLast, 0);
+
+                continue;
+            }
+            $flags |= self::W58_BINARIES_ACTIVE;
+            $count = $backlog - 20000;
+            if ($ourLast === 0 || $count <= $maxMessages * 2) {
+                [$mode, $ranges, $end] = [self::W58_BINARIES_UPDATE_HEADERS, 1, $ourLast];
+            } else {
+                $end = $ourLast + min($count, $maxHeaders);
+                [$mode, $ranges] = [self::W58_BINARIES_RANGES, intdiv($end - $ourLast + $maxMessages - 1, $maxMessages)];
+            }
+            array_push($words, $mode | $flags | min($ranges, 0xFFFF) << self::W58_BINARIES_RANGES_SHIFT, $ranges, $end, max(0, min(1000000000000000, $backlog)));
+        }
+
+        return $words;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or Rust declines the batch (a
+     * row holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function binariesWorkBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w58RustFfiState('out', $count * self::W58_BINARIES_WORDS);
+        if ($buffer === null) {
+            return self::binariesWorkBatchPhp($rows);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $rows);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w581_binaries_work_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        $words = $written === $count ? unpack('q*', FFI::string($out, $count * self::W58_BINARIES_WORDS * 8)) : false;
+        if (! \is_array($words)) {
+            return self::binariesWorkBatchPhp($rows);
+        }
+
+        /** @var list<int> */
+        return array_values($words);
+    }
+
+    /**
+     * Wave 58 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('binaries_runner_w58', self::W58_BINARIES_RUNNER_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 
     private const string ROTATION_KEY = 'binaries:rotation:last-group';

@@ -6,6 +6,7 @@ namespace App\Services\Monitoring;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 
 /**
  * Builds Grafana dashboard and panel URLs for the admin pages.
@@ -24,6 +25,39 @@ class GrafanaEmbedService
         ssize_t nntmux_grafana_frame_origin(const char *grafana_url, size_t grafana_url_len, const char *app_url, size_t app_url_len, char *out_buf, size_t out_cap);
         ssize_t nntmux_grafana_cookie_path(const char *base_url, size_t base_url_len, char *out_buf, size_t out_cap);
         C;
+
+    /**
+     * Enabled: the paired benchmark in the W58 parity test measures 3.933x common mean, 3.272x
+     * common p99, 3.85x uncommon mean and 3.0x uncommon p99 (per-metric minimum of four runs),
+     * above the 1.5x rule.
+     */
+    public const bool W58_RUST_FFI_DEFAULT = true;
+
+    public const string W58_GRAFANA_EMBED_FFI_CDEF = 'ssize_t nntmux_w581_grafana_embed_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public const int W58_EMBED_WORDS = 3;
+
+    public const int W58_EMBED_DASHBOARD = 1;
+
+    public const int W58_EMBED_PANEL = 2;
+
+    public const int W58_EMBED_UID_VALID = 4;
+
+    public const int W58_EMBED_SLUG_VALID = 8;
+
+    public const int W58_EMBED_ORG_VALID = 16;
+
+    public const int W58_EMBED_PANEL_VALID = 32;
+
+    public const int W58_EMBED_RANGE_VALID = 64;
+
+    public const int W58_EMBED_REFRESH_VALID = 128;
+
+    public const int W58_EMBED_ABSOLUTE = 256;
+
+    public const int W58_EMBED_TRAILING_SLASH = 512;
+
+    public const int W58_EMBED_LENGTH_SHIFT = 16;
 
     public static bool $useRustFfi = false;
 
@@ -370,6 +404,149 @@ class GrafanaEmbedService
         }
 
         return FFI::string($scratch, $written);
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        $enabled = self::w58RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 58 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Three words per `base\tuid\tslug\torgId\tfrom\trefresh\tpanelId` row: the kind
+     * (W58_EMBED_DASHBOARD, or W58_EMBED_PANEL for a positive panel ID) with the UID, slug, org,
+     * panel, time-range, refresh, absolute-base and trailing-slash validation flags plus the
+     * embed URL length `<< W58_EMBED_LENGTH_SHIFT`; then `crc32()` of the URL that
+     * buildDashboardEmbedUrlPhp()/buildPanelEmbedUrlPhp() assemble, and the query-string length.
+     * A row without exactly seven fields yields three zeros.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function embedUrlBatch(array $rows): array
+    {
+        return self::usesW58RustFfi() ? self::embedUrlBatchNative($rows) : self::embedUrlBatchPhp($rows);
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function embedUrlBatchPhp(array $rows): array
+    {
+        $words = [];
+        foreach ($rows as $row) {
+            $fields = explode("\t", $row);
+            if (\count($fields) !== 7) {
+                array_push($words, 0, 0, 0);
+
+                continue;
+            }
+            [$baseUrl, $uid, $slug, $org, $from, $refresh, $panel] = $fields;
+            $orgValid = preg_match('/\A-?[0-9]{1,18}\z/', $org) === 1;
+            $orgId = $orgValid ? (int) $org : 0;
+            $panelValid = preg_match('/\A-?[0-9]{1,18}\z/', $panel) === 1;
+            $panelId = $panelValid ? (int) $panel : 0;
+            $isPanel = $panelId > 0;
+            $trimmed = rtrim($baseUrl, '/');
+            $query = ['orgId' => $orgId, 'from' => $from, 'to' => 'now', 'refresh' => $refresh];
+            if ($isPanel) {
+                $query['panelId'] = $panelId;
+            }
+            $query = http_build_query($query, '', '&');
+            $url = $trimmed.($isPanel ? '/d-solo/' : '/d/').rawurlencode($uid).'/'.rawurlencode($slug).'?'.$query.($isPanel ? '' : '&kiosk');
+            $words[] = ($isPanel ? self::W58_EMBED_PANEL : self::W58_EMBED_DASHBOARD)
+                | (preg_match('/\A[A-Za-z0-9_-]{1,40}\z/', $uid) === 1 ? self::W58_EMBED_UID_VALID : 0)
+                | (preg_match('/\A[a-z0-9]+(?:-[a-z0-9]+)*\z/', $slug) === 1 ? self::W58_EMBED_SLUG_VALID : 0)
+                | ($orgValid && $orgId > 0 ? self::W58_EMBED_ORG_VALID : 0)
+                | ($panelValid && $panelId >= 0 ? self::W58_EMBED_PANEL_VALID : 0)
+                | (preg_match('/\A(?:now(?:-[0-9]{1,6}[smhdwMy])?|[0-9]{10,13})\z/', $from) === 1 ? self::W58_EMBED_RANGE_VALID : 0)
+                | (preg_match('/\A(?:[0-9]{1,4}[smhd])?\z/', $refresh) === 1 ? self::W58_EMBED_REFRESH_VALID : 0)
+                | (strncasecmp($trimmed, 'http://', 7) === 0 || strncasecmp($trimmed, 'https://', 8) === 0 ? self::W58_EMBED_ABSOLUTE : 0)
+                | (\strlen($trimmed) !== \strlen($baseUrl) ? self::W58_EMBED_TRAILING_SLASH : 0)
+                | \strlen($url) << self::W58_EMBED_LENGTH_SHIFT;
+            $words[] = crc32($url);
+            $words[] = \strlen($query);
+        }
+
+        return $words;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or Rust declines the batch (a
+     * row holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function embedUrlBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w58RustFfiState('out', $count * self::W58_EMBED_WORDS);
+        if ($buffer === null) {
+            return self::embedUrlBatchPhp($rows);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $rows);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w581_grafana_embed_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        $words = $written === $count ? unpack('q*', FFI::string($out, $count * self::W58_EMBED_WORDS * 8)) : false;
+        if (! \is_array($words)) {
+            return self::embedUrlBatchPhp($rows);
+        }
+
+        /** @var list<int> */
+        return array_values($words);
+    }
+
+    /**
+     * Wave 58 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('grafana_embed_w58', self::W58_GRAFANA_EMBED_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 
     private function callEmbedUrlFfi(
