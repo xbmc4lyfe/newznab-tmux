@@ -4,6 +4,7 @@ namespace App\Services\Nzb;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 final class DirectorySyncBridge
@@ -369,5 +370,193 @@ final class DirectorySyncBridge
 
         return [\is_string($function) && $function !== '' ? 1 : 0, ($attempt['extension'] ?? false) === true ? 1 : 0,
             $synced === true ? 1 : ($synced === false ? 0 : -1), \is_int($elapsed) ? $elapsed : 0];
+    }
+
+    /** Wave 56.2 paired benchmarks decide this default; see RustDirectorySyncCoverageCreationImportNzbServiceW56ParityTest. */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    private const string W56_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w56_directory_sync_plan_batch(const char *paths, size_t paths_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 56 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w56', self::W56_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w56RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planDirectorySyncBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w56Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w56Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /**
+     * Batch directory sync plan: per path, `flags | min(normalized length, 0xFFFFFF) << 8 |
+     * crc32(normalized) << 32` and, for sync candidates, the index of the first candidate with
+     * the same parent directory (-1 otherwise). Stream wrappers (`://`) stay as given; other
+     * paths get backslashes as slashes, slash runs collapsed and one trailing slash dropped
+     * (except for the root). Flags: 1 stream wrapper, 2 absolute, 4 normalization changed the
+     * path, 8 repeats an earlier normalized path, 16 local sync candidate, 32 empty. Candidates,
+     * wrappers, duplicates, empties, distinct candidate parents and the XXH64 digest of all
+     * earlier words follow.
+     *
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function planDirectorySyncBatch(array $paths): array
+    {
+        return self::usesW56RustFfi() ? self::planDirectorySyncBatchNative($paths) : self::planDirectorySyncBatchPhp($paths);
+    }
+
+    /**
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function planDirectorySyncBatchPhp(array $paths): array
+    {
+        $out = $seen = $parents = [];
+        $candidates = $wrappers = $duplicates = $empties = 0;
+        foreach (array_values($paths) as $i => $path) {
+            $wrapper = str_contains($path, '://');
+            $norm = $wrapper ? $path : self::w56SyncPath($path);
+            $flags = ($wrapper ? 1 : 0) | (! $wrapper && str_starts_with($norm, '/') ? 2 : 0) | ($norm !== $path ? 4 : 0);
+            $first = -1;
+            if ($norm === '') {
+                $flags |= 32;
+                $empties++;
+            } elseif (isset($seen[$norm])) {
+                $flags |= 8;
+                $duplicates++;
+            } else {
+                $seen[$norm] = true;
+                if (! $wrapper) {
+                    $flags |= 16;
+                    $candidates++;
+                    $slash = strrpos($norm, '/');
+                    $first = $parents[$slash === false ? '.' : ($slash === 0 ? '/' : substr($norm, 0, $slash))] ??= $i;
+                }
+            }
+            $wrappers += $wrapper ? 1 : 0;
+            array_push($out, $flags | min(\strlen($norm), 0xFFFFFF) << 8 | crc32($norm) << 32, $first);
+        }
+        array_push($out, $candidates, $wrappers, $duplicates, $empties, \count($parents));
+        $out[] = self::w56Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a path holds a NUL byte or the
+     * paths are not a list.
+     *
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function planDirectorySyncBatchNative(array $paths): array
+    {
+        $count = \count($paths);
+        $words = 2 * $count + 6;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w56RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($paths)) {
+            return self::planDirectorySyncBatchPhp($paths);
+        }
+        $blob = implode("\0", $paths);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w56_directory_sync_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w56Words($written, $out, $words) ?? self::planDirectorySyncBatchPhp($paths);
+    }
+
+    private static function w56SyncPath(string $path): string
+    {
+        $norm = str_replace('\\', '/', $path);
+        while (str_contains($norm, '//')) {
+            $norm = str_replace('//', '/', $norm);
+        }
+
+        return $norm !== '/' && str_ends_with($norm, '/') ? substr($norm, 0, -1) : $norm;
     }
 }

@@ -8,6 +8,7 @@ use App\Models\Release;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Facades\DB;
@@ -492,5 +493,226 @@ final class NzbCreationCandidateQuery
         $claimed = $candidate['claimed_at'] ?? null;
 
         return [\is_int($id) ? $id : 0, $claimed === null ? 0 : (\is_int($claimed) ? 1 : 2), \is_int($claimed) ? $claimed : 0];
+    }
+
+    /** Wave 56.2 paired benchmarks decide this default; see RustDirectorySyncCoverageCreationImportNzbServiceW56ParityTest. */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    private const string W56_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w56_creation_candidate_plan_batch(const char *ints, size_t ints_len, size_t count, int64_t min_completion, int64_t limit, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 56 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w56', self::W56_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w56RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planCandidateBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w56Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w56Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /**
+     * Batch NZB creation candidate plan over (id, received parts, total parts, postdate). Per
+     * candidate: `flags | completion_pct << 8` and its rank in claimBatch() order (postdate
+     * descending, then id) among qualifiers (-1 otherwise). Non-integer values count as 0. The
+     * completion is exact `min(max(0, received), total) * 100 / total` up to PHP_INT_MAX / 100,
+     * else `min(100, received / (total / 100))`, and 0 without a positive total. Flags: 1
+     * positive id, 2 repeats an earlier id, 4 every part received, 8 qualifies (first positive
+     * id, positive total, completion >= clamp($minCompletionPct, 0, 100)), 16 selected (rank
+     * below $limit, or any rank when $limit <= 0). Unique ids, duplicates, complete, qualifying,
+     * selected and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<int>  $ids
+     * @param  list<int>  $received
+     * @param  list<int>  $totals
+     * @param  list<int>  $postdates
+     * @return list<int>
+     */
+    public static function planCandidateBatch(array $ids, array $received, array $totals, array $postdates, int $minCompletionPct = 100, int $limit = 0): array
+    {
+        return self::usesW56RustFfi() ? self::planCandidateBatchNative($ids, $received, $totals, $postdates, $minCompletionPct, $limit)
+            : self::planCandidateBatchPhp($ids, $received, $totals, $postdates, $minCompletionPct, $limit);
+    }
+
+    /**
+     * @param  list<int>  $ids
+     * @param  list<int>  $received
+     * @param  list<int>  $totals
+     * @param  list<int>  $postdates
+     * @return list<int>
+     */
+    public static function planCandidateBatchPhp(array $ids, array $received, array $totals, array $postdates, int $minCompletionPct = 100, int $limit = 0): array
+    {
+        $min = min(100, max(0, $minCompletionPct));
+        [$received, $totals, $postdates] = [array_values($received), array_values($totals), array_values($postdates)];
+        $ids = array_map(static fn (mixed $id): int => \is_int($id) ? $id : 0, array_values($ids));
+        $dates = $seen = $flags = $qualifiers = [];
+        $unique = $duplicates = $complete = 0;
+        foreach ($ids as $i => $id) {
+            $got = $received[$i] ?? 0;
+            $got = \is_int($got) ? $got : 0;
+            $total = $totals[$i] ?? 0;
+            $total = \is_int($total) ? $total : 0;
+            $date = $postdates[$i] ?? 0;
+            $dates[$i] = \is_int($date) ? $date : 0;
+            $f = $pct = 0;
+            if ($id > 0) {
+                $f = 1;
+                if (isset($seen[$id])) {
+                    $f |= 2;
+                    $duplicates++;
+                } else {
+                    $seen[$id] = true;
+                    $unique++;
+                }
+            }
+            if ($total > 0) {
+                if ($got >= $total) {
+                    $f |= 4;
+                    $complete++;
+                }
+                $got = min(max(0, $got), $total);
+                $pct = $total <= 92233720368547758 ? intdiv($got * 100, $total) : min(100, intdiv($got, intdiv($total, 100)));
+                if (($f & 3) === 1 && $pct >= $min) {
+                    $f |= 8;
+                    $qualifiers[] = $i;
+                }
+            }
+            $flags[$i] = $f | $pct << 8;
+        }
+        usort($qualifiers, static fn (int $a, int $b): int => $dates[$b] <=> $dates[$a] ?: $ids[$a] <=> $ids[$b]);
+        $ranks = array_fill(0, \count($ids), -1);
+        $selected = 0;
+        foreach ($qualifiers as $rank => $i) {
+            $ranks[$i] = $rank;
+            if ($limit <= 0 || $rank < $limit) {
+                $flags[$i] |= 16;
+                $selected++;
+            }
+        }
+        $out = [];
+        foreach ($flags as $i => $f) {
+            array_push($out, $f, $ranks[$i]);
+        }
+        array_push($out, $unique, $duplicates, $complete, \count($qualifiers), $selected);
+        $out[] = self::w56Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or the columns are not integer
+     * lists of one length.
+     *
+     * @param  list<int>  $ids
+     * @param  list<int>  $received
+     * @param  list<int>  $totals
+     * @param  list<int>  $postdates
+     * @return list<int>
+     */
+    public static function planCandidateBatchNative(array $ids, array $received, array $totals, array $postdates, int $minCompletionPct = 100, int $limit = 0): array
+    {
+        $count = \count($ids);
+        $words = 2 * $count + 6;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 || \count($received) !== $count || \count($totals) !== $count || \count($postdates) !== $count
+            ? null : self::w56RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($ids) || ! array_is_list($received) || ! array_is_list($totals) || ! array_is_list($postdates)) {
+            return self::planCandidateBatchPhp($ids, $received, $totals, $postdates, $minCompletionPct, $limit);
+        }
+        foreach ($ids as $i => $id) {
+            if (! \is_int($id) || ! \is_int($received[$i]) || ! \is_int($totals[$i]) || ! \is_int($postdates[$i])) {
+                return self::planCandidateBatchPhp($ids, $received, $totals, $postdates, $minCompletionPct, $limit);
+            }
+        }
+        $table = pack('P*', ...$ids, ...$received, ...$totals, ...$postdates);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w56_creation_candidate_plan_batch($table, \strlen($table), $count, $minCompletionPct, $limit, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w56Words($written, $out, $words) ?? self::planCandidateBatchPhp($ids, $received, $totals, $postdates, $minCompletionPct, $limit);
     }
 }

@@ -42680,3 +42680,889 @@ pub mod wave55_2_nfo_service_db_nzb_store_nfo_import_nzb_contents_parser {
         }
     }
 }
+
+// ============================================================================
+// Wave 56.2: DirectorySyncBridge, NzbArticleCoverage, NzbCreationCandidateQuery,
+// NzbImportService and NzbService batch plans
+// ============================================================================
+
+pub mod wave56_2_directory_sync_coverage_creation_import_nzb_service {
+    //! Wave 56.2 batch kernels in the Wave 49.2 framing: NUL-joined string columns (exactly
+    //! `count` entries) or a length-framed blob, whole little-endian `i64` columns back to back,
+    //! two `i64` words per item, a few summary words and one XXH64 digest of the preceding
+    //! words. Each export returns the word count, `-needed` when `out_cap` (in words) is short,
+    //! or -1 for a null output, a malformed batch, an output overlapping an input or a panic.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, ints, span,
+    };
+    use std::borrow::Cow;
+    use std::cmp::Reverse;
+    use std::collections::HashMap;
+
+    /// Saturation limit of the 24-bit length fields.
+    const FIELD: usize = 0xFF_FFFF;
+
+    fn map<K, V>(n: usize) -> HashMap<K, V, FoldState> {
+        HashMap::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    #[inline]
+    fn word(flags: i64, text: &[u8]) -> i64 {
+        flags | (text.len().min(FIELD) as i64) << 8 | i64::from(crc32(text)) << 32
+    }
+
+    /// Splits a blob into `lengths`-sized items that cover it exactly.
+    fn framed<'a>(blob: &'a [u8], lengths: &[i64]) -> Option<Vec<&'a [u8]>> {
+        let mut items = Vec::with_capacity(lengths.len());
+        let mut offset = 0usize;
+        for &length in lengths {
+            let end = offset.checked_add(usize::try_from(length).ok()?)?;
+            items.push(blob.get(offset..end)?);
+            offset = end;
+        }
+        (offset == blob.len()).then_some(items)
+    }
+
+    /// `min(100|10000 scale, covered * scale / need)` without overflow, as the PHP helpers
+    /// compute it: exact below `PHP_INT_MAX / scale`, else `covered / (need / scale)` capped.
+    #[inline]
+    fn ratio(covered: i64, need: i64, scale: i64) -> i64 {
+        if need <= i64::MAX / scale {
+            covered * scale / need
+        } else {
+            (covered / (need / scale)).min(scale)
+        }
+    }
+
+    // ---- DirectorySyncBridge -----------------------------------------------------------------
+
+    /// The directory a sync targets: stream wrappers (`://`) unchanged, otherwise backslashes as
+    /// slashes, slash runs collapsed and one trailing slash dropped (except for the root).
+    pub fn sync_path(path: &[u8]) -> (bool, Cow<'_, [u8]>) {
+        if path.windows(3).any(|w| w == b"://") {
+            return (true, Cow::Borrowed(path));
+        }
+        let mut previous = 0u8;
+        let clean = path.iter().all(|&b| {
+            let ok = b != b'\\' && !(b == b'/' && previous == b'/');
+            previous = b;
+            ok
+        }) && !(path.len() > 1 && path.last() == Some(&b'/'));
+        if clean {
+            return (false, Cow::Borrowed(path));
+        }
+        let mut norm = Vec::with_capacity(path.len());
+        for &b in path {
+            let c = if b == b'\\' { b'/' } else { b };
+            if !(c == b'/' && norm.last() == Some(&b'/')) {
+                norm.push(c);
+            }
+        }
+        if norm.len() > 1 && norm.last() == Some(&b'/') {
+            norm.pop();
+        }
+        (false, Cow::Owned(norm))
+    }
+
+    fn parent(norm: &[u8]) -> &[u8] {
+        match norm.iter().rposition(|&b| b == b'/') {
+            None => b".",
+            Some(0) => b"/",
+            Some(p) => &norm[..p],
+        }
+    }
+
+    /// Per path: `flags | min(len, 0xFFFFFF) << 8 | crc32(normalized) << 32` (flags: 1 stream
+    /// wrapper, 2 absolute, 4 normalization changed it, 8 repeats an earlier normalized path, 16
+    /// sync candidate, 32 empty) and, for candidates, the first candidate with the same parent
+    /// directory (else -1). Summary: candidates, wrappers, duplicates, empties, distinct parents.
+    pub fn directory_sync_plan(paths: &[&[u8]]) -> Vec<i64> {
+        let norms: Vec<(bool, Cow<'_, [u8]>)> = paths.iter().map(|p| sync_path(p)).collect();
+        let mut seen = map::<&[u8], ()>(paths.len());
+        let mut parents = map::<&[u8], i64>(paths.len());
+        let mut out = Vec::with_capacity(paths.len() * 2 + 6);
+        let (mut candidates, mut wrappers, mut duplicates, mut empties) = (0i64, 0i64, 0i64, 0i64);
+        for (i, ((wrapper, norm), &path)) in norms.iter().zip(paths).enumerate() {
+            let norm: &[u8] = norm;
+            let mut flags = i64::from(*wrapper);
+            flags |= i64::from(!wrapper && norm.first() == Some(&b'/')) << 1;
+            flags |= i64::from(norm != path) << 2;
+            let mut first = -1;
+            if norm.is_empty() {
+                flags |= 32;
+                empties += 1;
+            } else if seen.insert(norm, ()).is_some() {
+                flags |= 8;
+                duplicates += 1;
+            } else if !wrapper {
+                flags |= 16;
+                candidates += 1;
+                first = *parents.entry(parent(norm)).or_insert(i as i64);
+            }
+            wrappers += i64::from(*wrapper);
+            out.extend([word(flags, norm), first]);
+        }
+        out.extend([
+            candidates,
+            wrappers,
+            duplicates,
+            empties,
+            parents.len() as i64,
+        ]);
+        out
+    }
+
+    // ---- NzbArticleCoverage ------------------------------------------------------------------
+
+    /// Per candidate: `class | acceptable << 2 | sufficient << 3 | ratio_bp << 8` (class 0
+    /// invalid, 1 none, 2 partial, 3 full; ratio in basis points) and the missing articles.
+    /// Summary: full, partial, none, invalid, acceptable, sufficient, saturating required and
+    /// missing totals, and the largest gap.
+    pub fn coverage_plan(
+        required: &[i64],
+        covered: &[i64],
+        tolerance: i64,
+        min_bp: i64,
+    ) -> Vec<i64> {
+        let tolerance = tolerance.max(0);
+        let mut out = Vec::with_capacity(required.len() * 2 + 10);
+        let mut class_counts = [0i64; 4];
+        let (mut acceptable, mut sufficient, mut total, mut missing, mut largest) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for (&need, &cov) in required.iter().zip(covered) {
+            if need <= 0 {
+                class_counts[0] += 1;
+                out.extend([0, 0]);
+                continue;
+            }
+            let cov = cov.clamp(0, need);
+            let gap = need - cov;
+            let class = if gap == 0 {
+                3
+            } else if cov == 0 {
+                1
+            } else {
+                2
+            };
+            let bp = ratio(cov, need, 10_000);
+            let ok = gap <= tolerance;
+            let enough = bp >= min_bp;
+            class_counts[class as usize] += 1;
+            acceptable += i64::from(ok);
+            sufficient += i64::from(enough);
+            total = total.saturating_add(need);
+            missing = missing.saturating_add(gap);
+            largest = largest.max(gap);
+            out.extend([
+                class | i64::from(ok) << 2 | i64::from(enough) << 3 | bp << 8,
+                gap,
+            ]);
+        }
+        out.extend([
+            class_counts[3],
+            class_counts[2],
+            class_counts[1],
+            class_counts[0],
+            acceptable,
+            sufficient,
+            total,
+            missing,
+            largest,
+        ]);
+        out
+    }
+
+    // ---- NzbCreationCandidateQuery -----------------------------------------------------------
+
+    /// Per candidate: `flags | completion_pct << 8` (flags: 1 positive id, 2 repeats an earlier
+    /// id, 4 all parts received, 8 qualifies, 16 selected within `limit`) and its rank in claim
+    /// order (postdate descending, then id) among qualifiers (else -1). Summary: unique ids,
+    /// duplicates, complete, qualifying, selected.
+    pub fn candidate_plan(
+        ids: &[i64],
+        received: &[i64],
+        totals: &[i64],
+        postdates: &[i64],
+        min_pct: i64,
+        limit: i64,
+    ) -> Vec<i64> {
+        let n = ids.len();
+        let min_pct = min_pct.clamp(0, 100);
+        let mut seen = map::<i64, ()>(n);
+        let mut flags = vec![0i64; n];
+        let mut pcts = vec![0i64; n];
+        let mut qualifiers = Vec::with_capacity(n);
+        let (mut unique, mut duplicates, mut complete) = (0i64, 0i64, 0i64);
+        for i in 0..n {
+            let (id, got, total) = (ids[i], received[i], totals[i]);
+            let mut f = 0;
+            if id > 0 {
+                f |= 1;
+                if seen.insert(id, ()).is_some() {
+                    f |= 2;
+                    duplicates += 1;
+                } else {
+                    unique += 1;
+                }
+            }
+            if total > 0 {
+                if got >= total {
+                    f |= 4;
+                    complete += 1;
+                }
+                pcts[i] = ratio(got.clamp(0, total), total, 100);
+                if f & 3 == 1 && pcts[i] >= min_pct {
+                    f |= 8;
+                    qualifiers.push(i);
+                }
+            }
+            flags[i] = f;
+        }
+        qualifiers.sort_unstable_by_key(|&i| (Reverse(postdates[i]), ids[i]));
+        let mut ranks = vec![-1i64; n];
+        let mut selected = 0i64;
+        for (rank, &i) in qualifiers.iter().enumerate() {
+            ranks[i] = rank as i64;
+            if limit <= 0 || (rank as i64) < limit {
+                flags[i] |= 16;
+                selected += 1;
+            }
+        }
+        let mut out = Vec::with_capacity(n * 2 + 6);
+        for i in 0..n {
+            out.extend([flags[i] | pcts[i] << 8, ranks[i]]);
+        }
+        out.extend([
+            unique,
+            duplicates,
+            complete,
+            qualifiers.len() as i64,
+            selected,
+        ]);
+        out
+    }
+
+    // ---- NzbImportService --------------------------------------------------------------------
+
+    /// PHP `basename()` in an ASCII-compatible locale.
+    fn basename(path: &[u8]) -> &[u8] {
+        let end = path.iter().rposition(|&b| b != b'/').map_or(0, |p| p + 1);
+        let start = path[..end]
+            .iter()
+            .rposition(|&b| b == b'/')
+            .map_or(0, |p| p + 1);
+        &path[start..end]
+    }
+
+    fn media_ext(ext: &[u8]) -> bool {
+        const EXTS: [&[u8]; 16] = [
+            b"mkv", b"mp4", b"avi", b"mov", b"wmv", b"flv", b"m4v", b"ts", b"webm", b"mpg",
+            b"mpeg", b"iso", b"m2ts", b"ogm", b"divx", b"vob",
+        ];
+        EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e))
+    }
+
+    /// Moves one final `\n` out of `core` (PCRE `$` also matches before it).
+    #[inline]
+    fn peel<'a>(core: &mut &'a [u8], newline: &mut bool) {
+        if !*newline && let Some(rest) = core.strip_suffix(b"\n") {
+            *core = rest;
+            *newline = true;
+        }
+    }
+
+    /// NzbImportService::deriveReleaseNameFromNzbPathPhp(): the `.nzb(.gz)` wrapper and one
+    /// media extension stripped (each `$`-anchored, so before a final newline too), then
+    /// `rtrim(". \t\n\r\0\x0B")`.
+    pub fn release_name(path: &[u8]) -> &[u8] {
+        let (mut core, mut newline) = (basename(path), false);
+        peel(&mut core, &mut newline);
+        let len = core.len();
+        if len >= 7 && core[len - 7..].eq_ignore_ascii_case(b".nzb.gz") {
+            core = &core[..len - 7];
+        } else if len >= 4 && core[len - 4..].eq_ignore_ascii_case(b".nzb") {
+            core = &core[..len - 4];
+        }
+        peel(&mut core, &mut newline);
+        if let Some(dot) = core.iter().rposition(|&b| b == b'.')
+            && media_ext(&core[dot + 1..])
+        {
+            core = &core[..dot];
+        }
+        let end = core
+            .iter()
+            .rposition(|&b| !matches!(b, b'.' | b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B))
+            .map_or(0, |p| p + 1);
+        &core[..end]
+    }
+
+    fn xml_head(head: &[u8]) -> bool {
+        let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+        head.iter()
+            .find(|&&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            .is_some_and(|&b| b == b'<')
+    }
+
+    /// Per file: `flags | min(len, 0xFFFFFF) << 8 | crc32(release name) << 32` (flags: 1 `.nzb`,
+    /// 2 `.nzb.gz`, 4 gzip magic, 8 XML head, 16 extension/content mismatch, 32 repeats an
+    /// earlier release name, 64 importable) and the import batch of importable files (else -1).
+    /// Summary: NZB files, gzip heads, importable, duplicates, batches.
+    pub fn import_file_plan(paths: &[&[u8]], heads: &[&[u8]], batch_size: i64) -> Vec<i64> {
+        let size = batch_size.max(1);
+        let mut seen = map::<&[u8], ()>(paths.len());
+        let mut out = Vec::with_capacity(paths.len() * 2 + 6);
+        let (mut nzb, mut gzip, mut importable, mut duplicates) = (0i64, 0i64, 0i64, 0i64);
+        for (&path, &head) in paths.iter().zip(heads) {
+            let base = basename(path);
+            let gz_ext = base.len() >= 7 && base[base.len() - 7..].eq_ignore_ascii_case(b".nzb.gz");
+            let plain =
+                !gz_ext && base.len() >= 4 && base[base.len() - 4..].eq_ignore_ascii_case(b".nzb");
+            let magic = head.starts_with(b"\x1f\x8b");
+            let xml = xml_head(head);
+            let mismatch = (gz_ext && !magic) || (plain && magic);
+            let name = release_name(path);
+            let duplicate = !name.is_empty() && seen.insert(name, ()).is_some();
+            let ok =
+                (gz_ext || plain) && (magic || xml) && !mismatch && !name.is_empty() && !duplicate;
+            let flags = i64::from(plain)
+                | i64::from(gz_ext) << 1
+                | i64::from(magic) << 2
+                | i64::from(xml) << 3
+                | i64::from(mismatch) << 4
+                | i64::from(duplicate) << 5
+                | i64::from(ok) << 6;
+            nzb += i64::from(gz_ext || plain);
+            gzip += i64::from(magic);
+            duplicates += i64::from(duplicate);
+            let batch = if ok { importable / size } else { -1 };
+            importable += i64::from(ok);
+            out.extend([word(flags, name), batch]);
+        }
+        let batches = if importable > 0 {
+            (importable - 1) / size + 1
+        } else {
+            0
+        };
+        out.extend([nzb, gzip, importable, duplicates, batches]);
+        out
+    }
+
+    // ---- NzbService --------------------------------------------------------------------------
+
+    fn escape_len(b: u8) -> usize {
+        match b {
+            b'&' => 5,
+            b'<' | b'>' => 4,
+            b'"' | b'\'' => 6,
+            _ => 0,
+        }
+    }
+
+    /// Per release: `flags | min(len, 0xFFFFFF) << 8 | crc32(subpath) << 32` for the
+    /// `g[0]/…/g[L-1]/guid.nzb.gz` storage subpath (L = clamp(levels, 0, min(32, len)); flags: 1
+    /// lowercase SHA-1 guid, 2 repeats an earlier guid, 4 the subject needs XML escaping) and
+    /// `min(escapes, 0xFFFFFFFF) | crc32(escaped subject) << 32`. Summary: valid guids,
+    /// duplicates, subjects needing escapes, saturating escape total, distinct top directories.
+    pub fn storage_plan(guids: &[&[u8]], subjects: &[&[u8]], levels: i64) -> Vec<i64> {
+        let mut seen = map::<&[u8], ()>(guids.len());
+        let mut tops = [false; 256];
+        let mut buf = Vec::new();
+        let mut out = Vec::with_capacity(guids.len() * 2 + 6);
+        let (mut valid, mut duplicates, mut escaped_n, mut escapes_total) =
+            (0i64, 0i64, 0i64, 0i64);
+        for (&guid, &subject) in guids.iter().zip(subjects) {
+            let depth = usize::try_from(levels.max(0))
+                .unwrap_or(usize::MAX)
+                .min(32)
+                .min(guid.len());
+            buf.clear();
+            for &b in &guid[..depth] {
+                buf.extend([b, b'/']);
+            }
+            buf.extend_from_slice(guid);
+            buf.extend_from_slice(b".nzb.gz");
+            if depth > 0 {
+                tops[usize::from(guid[0])] = true;
+            }
+            let sha1 = guid.len() == 40
+                && guid
+                    .iter()
+                    .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            let duplicate = seen.insert(guid, ()).is_some();
+            let escapes = subject.iter().filter(|&&b| escape_len(b) > 0).count();
+            let flags = i64::from(sha1) | i64::from(duplicate) << 1 | i64::from(escapes > 0) << 2;
+            let first = word(flags, &buf);
+            let crc = if escapes == 0 {
+                crc32(subject)
+            } else {
+                buf.clear();
+                for &b in subject {
+                    match escape_len(b) {
+                        0 => buf.push(b),
+                        _ => buf.extend_from_slice(match b {
+                            b'&' => b"&amp;",
+                            b'<' => b"&lt;",
+                            b'>' => b"&gt;",
+                            b'"' => b"&quot;",
+                            _ => b"&apos;",
+                        }),
+                    }
+                }
+                crc32(&buf)
+            };
+            valid += i64::from(sha1);
+            duplicates += i64::from(duplicate);
+            escaped_n += i64::from(escapes > 0);
+            escapes_total = escapes_total.saturating_add(escapes as i64);
+            out.extend([
+                first,
+                (escapes.min(0xFFFF_FFFF) as i64) | i64::from(crc) << 32,
+            ]);
+        }
+        out.extend([
+            valid,
+            duplicates,
+            escaped_n,
+            escapes_total,
+            tops.iter().filter(|&&t| t).count() as i64,
+        ]);
+        out
+    }
+
+    // ---- exports -----------------------------------------------------------------------------
+
+    /// # Safety
+    /// `paths` must be readable for `paths_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w56_directory_sync_plan_batch(
+        paths: *const u8,
+        paths_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(paths, paths_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                Some(directory_sync_plan(&column(
+                    span(paths, paths_len)?,
+                    count,
+                )?))
+            })
+        }
+    }
+
+    /// # Safety
+    /// `ints` must be readable for `ints_len` bytes and `out` writable for `out_cap` words.
+    /// `ints` holds the required and covered counts as two whole columns.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w56_article_coverage_plan_batch(
+        ints_ptr: *const u8,
+        ints_len: usize,
+        count: usize,
+        tolerance: i64,
+        min_ratio_bp: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(ints_ptr, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let table = ints(span(ints_ptr, ints_len)?, count.checked_mul(2)?)?;
+                let (required, covered) = table.split_at(count);
+                Some(coverage_plan(required, covered, tolerance, min_ratio_bp))
+            })
+        }
+    }
+
+    /// # Safety
+    /// `ints` must be readable for `ints_len` bytes and `out` writable for `out_cap` words.
+    /// `ints` holds the ids, received parts, total parts and postdates as four whole columns.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w56_creation_candidate_plan_batch(
+        ints_ptr: *const u8,
+        ints_len: usize,
+        count: usize,
+        min_completion: i64,
+        limit: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(ints_ptr, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let table = ints(span(ints_ptr, ints_len)?, count.checked_mul(4)?)?;
+                let (ids, rest) = table.split_at(count);
+                let (received, rest) = rest.split_at(count);
+                let (totals, postdates) = rest.split_at(count);
+                Some(candidate_plan(
+                    ids,
+                    received,
+                    totals,
+                    postdates,
+                    min_completion,
+                    limit,
+                ))
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `heads` holds the file heads back to back; `ints` their byte lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w56_import_file_plan_batch(
+        paths: *const u8,
+        paths_len: usize,
+        heads: *const u8,
+        heads_len: usize,
+        ints_ptr: *const u8,
+        ints_len: usize,
+        count: usize,
+        batch_size: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(paths, paths_len), (heads, heads_len), (ints_ptr, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let paths = column(span(paths, paths_len)?, count)?;
+                let lengths = ints(span(ints_ptr, ints_len)?, count)?;
+                let heads = framed(span(heads, heads_len)?, &lengths)?;
+                Some(import_file_plan(&paths, &heads, batch_size))
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w56_nzb_storage_plan_batch(
+        guids: *const u8,
+        guids_len: usize,
+        subjects: *const u8,
+        subjects_len: usize,
+        count: usize,
+        levels: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(guids, guids_len), (subjects, subjects_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let guids = column(span(guids, guids_len)?, count)?;
+                let subjects = column(span(subjects, subjects_len)?, count)?;
+                Some(storage_plan(&guids, &subjects, levels))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod w562_tests {
+        use super::super::wave49_verification_admission_inventory_prep_repo_sample::digest;
+        use super::*;
+
+        fn p(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn run(call: impl Fn(*mut i64, usize) -> isize) -> Vec<i64> {
+            let mut out = vec![0i64; 256];
+            let n = call(out.as_mut_ptr(), out.len());
+            assert!(n > 0, "export returned {n}");
+            out.truncate(n as usize);
+            let (body, last) = out.split_at(out.len() - 1);
+            assert_eq!(last[0], digest(body));
+            out.pop();
+            out
+        }
+
+        #[test]
+        fn w562_sync_path_normalizes_like_php() {
+            assert_eq!(sync_path(b"a//b\\c/").1.as_ref(), b"a/b/c");
+            assert_eq!(sync_path(b"///").1.as_ref(), b"/");
+            assert_eq!(sync_path(b"/x").1.as_ref(), b"/x");
+            assert!(matches!(sync_path(b"/x").1, Cow::Borrowed(_)));
+            assert_eq!(
+                sync_path(b"s3://a//b/"),
+                (true, Cow::Borrowed(&b"s3://a//b/"[..]))
+            );
+            assert_eq!(parent(b"a"), b".");
+            assert_eq!(parent(b"/a"), b"/");
+            assert_eq!(parent(b"/a/b"), b"/a");
+            let plan = directory_sync_plan(&[b"/a/b", b"/a//b/", b"/a/c", b"", b"x://y", b"d"]);
+            assert_eq!(plan[0], word(2 | 16, b"/a/b"));
+            assert_eq!(plan[1], 0);
+            assert_eq!(plan[2], word(2 | 4 | 8, b"/a/b"));
+            assert_eq!(plan[3], -1);
+            assert_eq!(plan[5], 0);
+            assert_eq!(plan[6], word(32, b""));
+            assert_eq!(plan[8], word(1, b"x://y"));
+            assert_eq!(plan[11], 5);
+            assert_eq!(&plan[12..], &[3, 1, 1, 1, 2]);
+        }
+
+        #[test]
+        fn w562_coverage_classifies_and_saturates() {
+            let plan = coverage_plan(
+                &[10, 10, 10, 0, i64::MAX],
+                &[10, 4, -3, 5, i64::MAX - 1],
+                6,
+                4000,
+            );
+            assert_eq!(plan[0], 3 | 4 | 8 | 10_000 << 8);
+            assert_eq!(plan[2], 2 | 4 | 8 | 4000 << 8);
+            assert_eq!(plan[3], 6);
+            assert_eq!(plan[4], 1);
+            assert_eq!(plan[5], 10);
+            assert_eq!(&plan[6..8], &[0, 0]);
+            assert_eq!(plan[8], 2 | 4 | 8 | 10_000 << 8);
+            assert_eq!(&plan[10..], &[1, 2, 1, 1, 3, 3, i64::MAX, 17, 10]);
+        }
+
+        #[test]
+        fn w562_candidates_rank_by_postdate_then_id() {
+            let plan = candidate_plan(
+                &[5, 3, 5, 0, 9, 4],
+                &[10, 10, 10, 10, 1, 10],
+                &[10, 10, 10, 10, 10, 10],
+                &[100, 200, 300, 400, 500, 200],
+                100,
+                2,
+            );
+            assert_eq!(plan[0], 1 | 4 | 8 | 100 << 8);
+            assert_eq!(plan[1], 2);
+            assert_eq!(plan[2], 1 | 4 | 8 | 16 | 100 << 8);
+            assert_eq!(plan[3], 0);
+            assert_eq!(plan[4], 1 | 2 | 4 | 100 << 8);
+            assert_eq!(plan[5], -1);
+            assert_eq!(plan[9], -1);
+            assert_eq!(plan[8], 1 | 10 << 8);
+            assert_eq!(plan[10], 1 | 4 | 8 | 16 | 100 << 8);
+            assert_eq!(plan[11], 1);
+            assert_eq!(&plan[12..], &[4, 1, 5, 3, 2]);
+        }
+
+        #[test]
+        fn w562_release_name_matches_php_regexes() {
+            assert_eq!(
+                release_name(b"dir/Show - S01E07 [1080p].mkv.nzb.gz"),
+                b"Show - S01E07 [1080p]"
+            );
+            assert_eq!(release_name(b"a/b/"), b"b");
+            assert_eq!(release_name(b"Movie.MKV.NZB\n"), b"Movie");
+            assert_eq!(release_name(b"x\n.nzb"), b"x");
+            assert_eq!(release_name(b"x.nzb\n\n"), b"x.nzb");
+            assert_eq!(release_name(b"x.nzb.."), b"x.nzb");
+            assert_eq!(release_name(b"a.mpeg.nzb"), b"a");
+            assert_eq!(release_name(b"..."), b"");
+            assert!(xml_head(b"\xEF\xBB\xBF \r\n<?xml"));
+            assert!(!xml_head(b" \x0b<"));
+        }
+
+        #[test]
+        fn w562_import_and_storage_plans() {
+            let plan = import_file_plan(
+                &[b"a.nzb", b"b.nzb.gz", b"c.nzb.gz", b"a.nzb", b"d.txt"],
+                &[b"<nzb", b"\x1f\x8b\x08", b"<nzb", b"<x", b"\x1f\x8b"],
+                1,
+            );
+            assert_eq!(plan[0], word(1 | 8 | 64, b"a"));
+            assert_eq!(plan[1], 0);
+            assert_eq!(plan[3], 1);
+            assert_eq!(plan[4], word(2 | 8 | 16, b"c"));
+            assert_eq!(plan[6], word(1 | 8 | 32, b"a"));
+            assert_eq!(&plan[10..], &[4, 2, 2, 1, 2]);
+            let guid = b"0123456789abcdef0123456789abcdef01234567";
+            let plan = storage_plan(&[guid, b"Z", guid], &[b"a&b", b"plain", b"<'\">"], 2);
+            assert_eq!(
+                plan[0],
+                word(
+                    1 | 4,
+                    b"0/1/0123456789abcdef0123456789abcdef01234567.nzb.gz"
+                )
+            );
+            assert_eq!(plan[1], 1 | i64::from(crc32(b"a&amp;b")) << 32);
+            assert_eq!(plan[2], word(0, b"Z/Z.nzb.gz"));
+            assert_eq!(plan[5], 4 | i64::from(crc32(b"&lt;&apos;&quot;&gt;")) << 32);
+            assert_eq!(&plan[6..], &[2, 1, 2, 5, 2]);
+        }
+
+        #[test]
+        fn w562_exports_frame_and_guard_batches() {
+            let null = std::ptr::null();
+            unsafe {
+                let words = run(|o, c| {
+                    nntmux_w56_directory_sync_plan_batch(b"/a\0/b".as_ptr(), 5, 2, o, c)
+                });
+                assert_eq!(words.len(), 9);
+                let table = p(&[3, 0, 1, 1]);
+                let words = run(|o, c| {
+                    nntmux_w56_article_coverage_plan_batch(
+                        table.as_ptr(),
+                        table.len(),
+                        2,
+                        0,
+                        0,
+                        o,
+                        c,
+                    )
+                });
+                assert_eq!(words.len(), 13);
+                let table = p(&[1, 2, 3, 3, 3, 3, 1, 2]);
+                let words = run(|o, c| {
+                    nntmux_w56_creation_candidate_plan_batch(
+                        table.as_ptr(),
+                        table.len(),
+                        2,
+                        50,
+                        0,
+                        o,
+                        c,
+                    )
+                });
+                assert_eq!(
+                    &words[..4],
+                    &[1 | 4 | 8 | 16 | 100 << 8, 1, 1 | 4 | 8 | 16 | 100 << 8, 0]
+                );
+                let lengths = p(&[2, 0]);
+                let words = run(|o, c| {
+                    nntmux_w56_import_file_plan_batch(
+                        b"a.nzb\0b".as_ptr(),
+                        7,
+                        b"\x1f\x8b".as_ptr(),
+                        2,
+                        lengths.as_ptr(),
+                        16,
+                        2,
+                        10,
+                        o,
+                        c,
+                    )
+                });
+                assert_eq!(words[0] & 0xFF, 1 | 4 | 16);
+                let words = run(|o, c| {
+                    nntmux_w56_nzb_storage_plan_batch(
+                        b"g".as_ptr(),
+                        1,
+                        b"s".as_ptr(),
+                        1,
+                        1,
+                        1,
+                        o,
+                        c,
+                    )
+                });
+                assert_eq!(words.len(), 7);
+
+                let mut out = [7i64; 32];
+                let o = out.as_mut_ptr();
+                // Empty batches need no input pointers.
+                assert_eq!(nntmux_w56_directory_sync_plan_batch(null, 0, 0, o, 32), 6);
+                assert_eq!(
+                    nntmux_w56_article_coverage_plan_batch(null, 0, 0, 0, 0, o, 32),
+                    10
+                );
+                assert_eq!(
+                    nntmux_w56_creation_candidate_plan_batch(null, 0, 0, 0, 0, o, 32),
+                    6
+                );
+                assert_eq!(
+                    nntmux_w56_import_file_plan_batch(null, 0, null, 0, null, 0, 0, 1, o, 32),
+                    6
+                );
+                assert_eq!(
+                    nntmux_w56_nzb_storage_plan_batch(null, 0, null, 0, 0, 0, o, 32),
+                    6
+                );
+                // Null output, short output, wrong counts, null inputs and ragged tables are refused.
+                assert_eq!(
+                    nntmux_w56_directory_sync_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w56_directory_sync_plan_batch(b"a".as_ptr(), 1, 1, o, 3),
+                    -8
+                );
+                assert_eq!(
+                    nntmux_w56_directory_sync_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 32),
+                    -1
+                );
+                assert_eq!(nntmux_w56_directory_sync_plan_batch(null, 3, 1, o, 32), -1);
+                assert_eq!(
+                    nntmux_w56_article_coverage_plan_batch(table.as_ptr(), 8, 1, 0, 0, o, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w56_creation_candidate_plan_batch(table.as_ptr(), 16, 1, 0, 0, o, 32),
+                    -1
+                );
+                let bad = p(&[3, 0]);
+                assert_eq!(
+                    nntmux_w56_import_file_plan_batch(
+                        b"a\0b".as_ptr(),
+                        3,
+                        b"\x1f\x8b".as_ptr(),
+                        2,
+                        bad.as_ptr(),
+                        16,
+                        2,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                let negative = p(&[-1, 3]);
+                assert_eq!(
+                    nntmux_w56_import_file_plan_batch(
+                        b"a\0b".as_ptr(),
+                        3,
+                        b"\x1f\x8b".as_ptr(),
+                        2,
+                        negative.as_ptr(),
+                        16,
+                        2,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w56_nzb_storage_plan_batch(
+                        b"g".as_ptr(),
+                        1,
+                        b"s\0t".as_ptr(),
+                        3,
+                        1,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                // An output overlapping an input is refused.
+                let mut shared = [0i64; 32];
+                shared[0] = i64::from_le_bytes(*b"/a/b/c/d");
+                assert_eq!(
+                    nntmux_w56_directory_sync_plan_batch(
+                        shared.as_ptr() as *const u8,
+                        8,
+                        1,
+                        shared.as_mut_ptr(),
+                        32
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}
