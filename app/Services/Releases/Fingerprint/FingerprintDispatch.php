@@ -8,6 +8,7 @@ use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Services\NNTP\NNTPService;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use InvalidArgumentException;
 use RuntimeException;
 use Throwable;
@@ -315,5 +316,236 @@ final class FingerprintDispatch
         self::$w47DispatchRustFfiHandle ??= RustPipelineLibrary::resolveDomain(self::W47_FFI_DOMAIN, self::W47_FFI_CDEF) ?? false;
 
         return self::$w47DispatchRustFfiHandle === false ? null : self::$w47DispatchRustFfiHandle;
+    }
+
+    // ---- Wave 62.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 11.00x/8.56x, uncommon 7.81x/6.68x); see RustFingerprintQueueDispatchBreakerAnalyzerPar2ParserW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    private const string W62_FINGERPRINT_DISPATCH_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w622_dispatch_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W62_FINGERPRINT_DISPATCH_TAIL = 20;
+
+    /**
+     * Wave 62 routing, binding and output buffer, kept in function-local statics (no static
+     * properties). Operations: null reads the routing override, 'set' replaces it (returning the
+     * previous one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]`
+     * with room for at least $val words (null without the library).
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w62', self::W62_FINGERPRINT_DISPATCH_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w62RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW62RustFfi(): bool
+    {
+        $enabled = self::w62RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w62DispatchPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62DispatchPlanBatch(array $rows): array
+    {
+        return self::usesW62RustFfi() ? self::w62DispatchPlanBatchNative($rows) : self::w62DispatchPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62DispatchPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W62_FINGERPRINT_DISPATCH_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w62RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w62DispatchPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W62_FINGERPRINT_DISPATCH_FFI_CDEF.)
+            $written = $ffi->nntmux_w622_dispatch_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w62DispatchPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w62Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** Accepted rows per dispatch chunk in w62DispatchPlanBatch(). */
+    public const int W62_DISPATCH_CHUNK = 64;
+
+    /**
+     * Wave 62.2 fingerprint dispatch plan. Per `release_id\tgeneration\tforce\tworker\tpriority` row
+     * `route | reason << 2 | tier << 5 | duplicate << 7 | force_applies << 8 | priority_defaulted << 9
+     * | shard << 10 | min(chunk, 255) << 14 | min(len(generation), 255) << 22 | min(release_id,
+     * 2^32 - 1) << 30`, following planEnqueue(): a release id (w62Int(), up to 18 digits) below one
+     * is rejected (route 2, reason 4), a trimmed worker that is empty or exactly `rust` routes to the
+     * database queue (route 0, reason 1 when w62Truthy(force), else 0) and anything else to the
+     * metadata job (route 1, reason 2 with a trimmed generation, else 3). Priority is a w62Int() of
+     * up to 3 digits (5 and the defaulted flag otherwise); accepted rows are tier 1 when force
+     * applies or priority <= 1, 2 when priority <= 4, else 3. Accepted rows shard by `release_id &
+     * 15`; a release id seen on an earlier accepted row is a duplicate, and the others are numbered
+     * per route into W62_DISPATCH_CHUNK-row chunks. Then three route, five reason and four tier
+     * counts, the duplicates, the distinct non-empty job generations (by crc32), the busiest shard's
+     * load and index, the database and job chunk counts, the largest accepted release id and the
+     * XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62DispatchPlanBatchPhp(array $rows): array
+    {
+        $out = $seen = $generations = [];
+        $routes = [0, 0, 0];
+        $reasons = array_fill(0, 5, 0);
+        $tiers = [0, 0, 0, 0];
+        $shards = array_fill(0, 16, 0);
+        $ordinals = [0, 0];
+        $duplicates = $maxId = 0;
+        foreach ($rows as $row) {
+            [$id, $generation, $force, $worker, $priority] = explode("\t", (string) $row, 5) + array_fill(0, 5, '');
+            $id = self::w62Int($id, 18);
+            $id = \is_int($id) ? $id : 0;
+            $generation = trim($generation);
+            $force = self::w62Truthy($force);
+            $worker = trim($worker);
+            $priority = self::w62Int($priority, 3);
+            $defaulted = ! \is_int($priority);
+            $priority = \is_int($priority) ? $priority : 5;
+            [$route, $reason] = match (true) {
+                $id < 1 => [2, 4],
+                $worker === '' || $worker === 'rust' => [0, (int) $force],
+                default => [1, $generation === '' ? 3 : 2],
+            };
+            $forceApplies = $route === 0 && $force;
+            $tier = match (true) {
+                $route === 2 => 0,
+                $forceApplies || $priority <= 1 => 1,
+                $priority <= 4 => 2,
+                default => 3,
+            };
+            $dup = false;
+            $shard = $chunk = 0;
+            if ($route !== 2) {
+                $shard = $id & 15;
+                if (isset($seen[$id])) {
+                    $dup = true;
+                    $duplicates++;
+                } else {
+                    $seen[$id] = true;
+                    $chunk = intdiv($ordinals[$route], self::W62_DISPATCH_CHUNK);
+                    $ordinals[$route]++;
+                    $shards[$shard]++;
+                    $maxId = max($maxId, $id);
+                    if ($route === 1 && $generation !== '') {
+                        $generations[crc32($generation)] = true;
+                    }
+                }
+            }
+            $routes[$route]++;
+            $reasons[$reason]++;
+            $tiers[$tier]++;
+            $out[] = $route | $reason << 2 | $tier << 5 | (int) $dup << 7 | (int) $forceApplies << 8 | (int) $defaulted << 9 | $shard << 10
+                | min($chunk, 255) << 14 | min(\strlen($generation), 255) << 22 | min($id, 0xFFFFFFFF) << 30;
+        }
+        $load = max($shards);
+        $busiest = $load === 0 ? 0 : (int) array_search($load, $shards, true);
+        array_push($out, ...$routes, ...$reasons, ...$tiers);
+        array_push($out, $duplicates, \count($generations), $load, $busiest, intdiv($ordinals[0] + self::W62_DISPATCH_CHUNK - 1, self::W62_DISPATCH_CHUNK),
+            intdiv($ordinals[1] + self::W62_DISPATCH_CHUNK - 1, self::W62_DISPATCH_CHUNK), $maxId);
+        $out[] = self::w62Digest($out);
+
+        return $out;
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w62Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /** A trimmed `1`, `true`, `yes` or `on` in any case. */
+    private static function w62Truthy(string $value): bool
+    {
+        return \in_array(strtolower(trim($value)), ['1', 'true', 'yes', 'on'], true);
     }
 }

@@ -48326,3 +48326,1058 @@ pub mod wave61_2_categorizers_tv_xxx_console_games_service_title_parser {
         }
     }
 }
+
+pub mod wave62_2_fingerprint_queue_dispatch_breaker_analyzer_par2_parser {
+    //! Wave 62.2 batch kernels for DatabaseFingerprintQueue, FingerprintDispatch,
+    //! FingerprintProviderBreaker, NzbFingerprintAnalyzer and Par2MetadataParser in the Wave
+    //! 49.2 framing: one `i64` word per row, a few summary words and one XXH64 digest of the
+    //! preceding words out. The first four take one NUL-joined string column (exactly `count`
+    //! tab-separated rows); the PAR2 export takes the concatenated raw packets plus a
+    //! little-endian `i64` length table, because packets hold NUL bytes. Each export returns the
+    //! word count, `-needed` when `out_cap` (in words) is short, or -1 for a null output, a
+    //! malformed batch, an output overlapping an input or a panic. Rows are borrowed from the
+    //! input and every rule is byte-level ASCII, so the PHP twins agree under any `setlocale()`.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, ints, span,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    type Set<T> = HashSet<T, FoldState>;
+
+    fn set<T>(n: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// PHP `explode("\t", $row, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(row: &[u8]) -> [&[u8]; N] {
+        let mut out = [&row[..0]; N];
+        let mut rest = row;
+        for (k, slot) in out.iter_mut().enumerate() {
+            if k + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'\t') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// PHP `trim()` with its default character set.
+    fn trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// A trimmed field: `Ok(None)` when empty, `Ok(Some(n))` for 1 to `max` ASCII digits,
+    /// otherwise `Err(())` (PHP `w62Int()`: null, int or false).
+    #[inline]
+    fn int(v: &[u8], max: usize) -> Result<Option<i64>, ()> {
+        let v = trim(v);
+        if v.is_empty() {
+            return Ok(None);
+        }
+        if v.len() > max || !v.iter().all(u8::is_ascii_digit) {
+            return Err(());
+        }
+        Ok(Some(
+            v.iter()
+                .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0')),
+        ))
+    }
+
+    /// PHP `in_array(strtolower(trim($v)), ['1', 'true', 'yes', 'on'], true)`.
+    fn truthy(v: &[u8]) -> bool {
+        let v = trim(v);
+        v == b"1"
+            || v.eq_ignore_ascii_case(b"true")
+            || v.eq_ignore_ascii_case(b"yes")
+            || v.eq_ignore_ascii_case(b"on")
+    }
+
+    fn lower(s: &[u8]) -> Vec<u8> {
+        s.iter().map(u8::to_ascii_lowercase).collect()
+    }
+
+    #[inline]
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    /// PHP `strrpos($hay, $needle)`.
+    fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.len() > hay.len() {
+            return None;
+        }
+        (0..=hay.len() - needle.len())
+            .rev()
+            .find(|&i| &hay[i..i + needle.len()] == needle)
+    }
+
+    // ---- DatabaseFingerprintQueue ------------------------------------------------------------
+
+    const QUEUE_MAX_ATTEMPTS: i64 = 5;
+    const QUEUE_CLAIM_BATCH: i64 = 32;
+
+    fn queue_status(s: &[u8]) -> i64 {
+        let s = trim(s);
+        [
+            &b"pending"[..],
+            b"processing",
+            b"failed",
+            b"completed",
+            b"stale",
+        ]
+        .iter()
+        .position(|name| s.eq_ignore_ascii_case(name))
+        .map_or(0, |p| p as i64 + 1)
+    }
+
+    pub fn queue_lease_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 23);
+        let mut decisions = [0i64; 10];
+        let mut flag_counts = [0i64; 6];
+        let mut workers: Set<u32> = set(16);
+        let (mut claimable, mut min_backoff_wait, mut max_lease_wait, mut attempts_sum) =
+            (0i64, 0i64, 0i64, 0i64);
+        for row in rows {
+            let [
+                status,
+                attempts,
+                available,
+                lease,
+                now,
+                worker,
+                digest,
+                error,
+            ] = fields::<8>(row);
+            let code = queue_status(status);
+            let attempts = int(attempts, 9);
+            let available = int(available, 12);
+            let lease = int(lease, 12);
+            let now = int(now, 12);
+            let worker = trim(worker);
+            let digest = trim(digest);
+            let digest_ok = digest.len() == 64 && digest.iter().all(u8::is_ascii_hexdigit);
+            let has_error = !trim(error).is_empty();
+            let valid = code != 0
+                && digest_ok
+                && matches!(now, Ok(Some(_)))
+                && attempts.is_ok()
+                && available.is_ok()
+                && lease.is_ok();
+            let att = attempts.ok().flatten().unwrap_or(0);
+            let (mut decision, mut wait) = (0i64, 0i64);
+            if valid {
+                let now = now.ok().flatten().unwrap_or(0);
+                let available = available.ok().flatten();
+                let lease = lease.ok().flatten();
+                match code {
+                    1 => match available {
+                        Some(a) if a > now => (decision, wait) = (2, a - now),
+                        _ => decision = 1,
+                    },
+                    2 => match lease {
+                        _ if worker.is_empty() => decision = 3,
+                        None => decision = 3,
+                        Some(l) if l <= now => decision = 4,
+                        Some(l) => (decision, wait) = (5, l - now),
+                    },
+                    3 => match available {
+                        _ if att >= QUEUE_MAX_ATTEMPTS => decision = 6,
+                        Some(a) if a > now => (decision, wait) = (2, a - now),
+                        _ => decision = 7,
+                    },
+                    4 => decision = 8,
+                    _ => decision = 9,
+                }
+                attempts_sum += att;
+            }
+            let claim = matches!(decision, 1 | 3 | 4 | 7);
+            let exhausted = claim && att + 1 >= QUEUE_MAX_ATTEMPTS;
+            let backoff = if claim {
+                (30i64 << att.min(7)).min(3600)
+            } else {
+                0
+            };
+            let flags = i64::from(!worker.is_empty())
+                | i64::from(digest_ok) << 1
+                | i64::from(exhausted) << 2
+                | i64::from(has_error) << 3
+                | i64::from(matches!(available, Ok(Some(_)))) << 4
+                | i64::from(matches!(lease, Ok(Some(_)))) << 5;
+            let crc = crc32(&lower(worker));
+            decisions[decision as usize] += 1;
+            for (k, slot) in flag_counts.iter_mut().enumerate() {
+                *slot += flags >> k & 1;
+            }
+            if decision == 5 {
+                workers.insert(crc);
+                max_lease_wait = max_lease_wait.max(wait);
+            }
+            if decision == 2 && (min_backoff_wait == 0 || wait < min_backoff_wait) {
+                min_backoff_wait = wait;
+            }
+            claimable += i64::from(claim);
+            out.push(
+                decision
+                    | flags << 4
+                    | att.min(255) << 10
+                    | wait.min(0xFF_FFFF) << 18
+                    | backoff << 42
+                    | (i64::from(crc) & 0x1FF) << 54,
+            );
+        }
+        out.extend(decisions);
+        out.extend(flag_counts);
+        out.extend([
+            workers.len() as i64,
+            claimable,
+            claimable.min(QUEUE_CLAIM_BATCH),
+            min_backoff_wait,
+            max_lease_wait,
+            attempts_sum,
+        ]);
+        out
+    }
+
+    // ---- FingerprintDispatch -----------------------------------------------------------------
+
+    const DISPATCH_CHUNK: i64 = 64;
+
+    pub fn dispatch_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 20);
+        let mut routes = [0i64; 3];
+        let mut reasons = [0i64; 5];
+        let mut tiers = [0i64; 4];
+        let mut shards = [0i64; 16];
+        let mut ordinals = [0i64; 2];
+        let mut seen: Set<i64> = set(rows.len());
+        let mut generations: Set<u32> = set(16);
+        let (mut duplicates, mut max_id) = (0i64, 0i64);
+        for row in rows {
+            let [id, generation, force, worker, priority] = fields::<5>(row);
+            let id = int(id, 18).ok().flatten().unwrap_or(0);
+            let generation = trim(generation);
+            let force = truthy(force);
+            let worker = trim(worker);
+            let (priority, defaulted) = match int(priority, 3) {
+                Ok(Some(p)) => (p, false),
+                _ => (5, true),
+            };
+            let (route, reason) = if id < 1 {
+                (2i64, 4i64)
+            } else if worker.is_empty() || worker == b"rust" {
+                (0, i64::from(force))
+            } else {
+                (1, if generation.is_empty() { 3 } else { 2 })
+            };
+            let force_applies = route == 0 && force;
+            let tier = if route == 2 {
+                0
+            } else if force_applies || priority <= 1 {
+                1
+            } else if priority <= 4 {
+                2
+            } else {
+                3
+            };
+            let (mut dup, mut shard, mut chunk) = (false, 0i64, 0i64);
+            if route != 2 {
+                shard = id & 15;
+                if seen.insert(id) {
+                    let ordinal = &mut ordinals[route as usize];
+                    chunk = *ordinal / DISPATCH_CHUNK;
+                    *ordinal += 1;
+                    shards[shard as usize] += 1;
+                    max_id = max_id.max(id);
+                    if route == 1 && !generation.is_empty() {
+                        generations.insert(crc32(generation));
+                    }
+                } else {
+                    dup = true;
+                    duplicates += 1;
+                }
+            }
+            routes[route as usize] += 1;
+            reasons[reason as usize] += 1;
+            tiers[tier as usize] += 1;
+            out.push(
+                route
+                    | reason << 2
+                    | tier << 5
+                    | i64::from(dup) << 7
+                    | i64::from(force_applies) << 8
+                    | i64::from(defaulted) << 9
+                    | shard << 10
+                    | chunk.min(255) << 14
+                    | (generation.len().min(255) as i64) << 22
+                    | id.min(0xFFFF_FFFF) << 30,
+            );
+        }
+        let (mut busiest, mut load) = (0i64, 0i64);
+        for (k, &n) in shards.iter().enumerate() {
+            if n > load {
+                (busiest, load) = (k as i64, n);
+            }
+        }
+        out.extend(routes);
+        out.extend(reasons);
+        out.extend(tiers);
+        out.extend([
+            duplicates,
+            generations.len() as i64,
+            load,
+            busiest,
+            (ordinals[0] + DISPATCH_CHUNK - 1) / DISPATCH_CHUNK,
+            (ordinals[1] + DISPATCH_CHUNK - 1) / DISPATCH_CHUNK,
+            max_id,
+        ]);
+        out
+    }
+
+    // ---- FingerprintProviderBreaker ----------------------------------------------------------
+
+    const BREAKER_PROBE_SECONDS: i64 = 1800;
+
+    pub fn breaker_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 16);
+        let mut states = [0i64; 8];
+        let mut providers: HashMap<Vec<u8>, (), FoldState> =
+            HashMap::with_capacity_and_hasher(16, FoldState::default());
+        let mut probing: Set<u32> = set(16);
+        let mut tripping: Set<u32> = set(16);
+        let (mut skew_rows, mut tls_rows, mut max_failures) = (0i64, 0i64, 0i64);
+        let mut key = Vec::with_capacity(64);
+        for row in rows {
+            let [
+                name,
+                port,
+                tls,
+                failures,
+                last_failure,
+                opened,
+                probe,
+                now,
+                window,
+                threshold,
+            ] = fields::<10>(row);
+            let name = trim(name);
+            let port = int(port, 5);
+            let failures = int(failures, 9);
+            let last_failure = int(last_failure, 12);
+            let opened = int(opened, 12);
+            let probe = int(probe, 12);
+            let now = int(now, 12);
+            let window = int(window, 7);
+            let threshold = int(threshold, 4);
+            let (
+                Ok(Some(port)),
+                Ok(Some(now)),
+                Ok(failures),
+                Ok(last_failure),
+                Ok(opened),
+                Ok(probe),
+                Ok(window),
+                Ok(threshold),
+            ) = (
+                port,
+                now,
+                failures,
+                last_failure,
+                opened,
+                probe,
+                window,
+                threshold,
+            )
+            else {
+                states[0] += 1;
+                out.push(0);
+                continue;
+            };
+            if name.is_empty() || !(1..=65535).contains(&port) {
+                states[0] += 1;
+                out.push(0);
+                continue;
+            }
+            let tls = truthy(tls);
+            let failures = failures.unwrap_or(0);
+            let window = window.unwrap_or(900);
+            let threshold = threshold.unwrap_or(3).max(1);
+            let suspect = (window * 4).max(3600);
+            key.clear();
+            key.extend(name.iter().map(u8::to_ascii_lowercase));
+            key.push(b':');
+            key.extend(port.to_string().as_bytes());
+            key.extend([b':', if tls { b'1' } else { b'0' }]);
+            let crc = crc32(&key);
+            let dup = providers.insert(key.clone(), ()).is_some();
+            let (state, remaining) = if window == 0 {
+                (1i64, 0i64)
+            } else if let Some(opened) = opened {
+                if now < opened + window {
+                    (4, opened + window - now)
+                } else if now < opened + suspect {
+                    match probe {
+                        Some(p) if now < p + BREAKER_PROBE_SECONDS => {
+                            (5, p + BREAKER_PROBE_SECONDS - now)
+                        }
+                        _ if !probing.insert(crc) => (5, 0),
+                        _ => (6, 0),
+                    }
+                } else {
+                    (7, 0)
+                }
+            } else {
+                match last_failure {
+                    Some(lf) if failures > 0 && lf <= now && now - lf < window => (
+                        if failures >= threshold { 3 } else { 2 },
+                        window - (now - lf),
+                    ),
+                    _ => (1, 0),
+                }
+            };
+            let skew = [last_failure, opened, probe]
+                .iter()
+                .any(|t| t.is_some_and(|t| t > now));
+            if state == 3 {
+                tripping.insert(crc);
+            }
+            states[state as usize] += 1;
+            skew_rows += i64::from(skew);
+            tls_rows += i64::from(tls);
+            max_failures = max_failures.max(failures);
+            out.push(
+                state
+                    | i64::from(tls) << 3
+                    | i64::from(skew) << 4
+                    | i64::from(dup) << 5
+                    | failures.min(255) << 6
+                    | remaining.min(0xF_FFFF) << 14
+                    | port << 34
+                    | (i64::from(crc) & 0x1FFF) << 50,
+            );
+        }
+        out.extend(states);
+        out.extend([
+            providers.len() as i64,
+            states[4] + states[5],
+            states[1] + states[2] + states[3] + states[6] + states[7],
+            tripping.len() as i64,
+            skew_rows,
+            tls_rows,
+            max_failures,
+        ]);
+        out
+    }
+
+    // ---- NzbFingerprintAnalyzer --------------------------------------------------------------
+
+    #[inline]
+    fn is_alnum_lower(b: u8) -> bool {
+        b.is_ascii_lowercase() || b.is_ascii_digit()
+    }
+
+    /// The last `(N/M)` with 1-9 digit runs as `(N, M)`.
+    fn counter(s: &[u8]) -> Option<(i64, i64)> {
+        let mut i = s.len();
+        while i > 0 {
+            i -= 1;
+            if s[i] != b'(' {
+                continue;
+            }
+            let rest = &s[i + 1..];
+            let a = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            if !(1..=9).contains(&a) || rest.get(a) != Some(&b'/') {
+                continue;
+            }
+            let rest2 = &rest[a + 1..];
+            let b = rest2.iter().take_while(|b| b.is_ascii_digit()).count();
+            if !(1..=9).contains(&b) || rest2.get(b) != Some(&b')') {
+                continue;
+            }
+            let num = |d: &[u8]| {
+                d.iter()
+                    .fold(0i64, |acc, &c| acc * 10 + i64::from(c - b'0'))
+            };
+            return Some((num(&rest[..a]), num(&rest2[..b])));
+        }
+        None
+    }
+
+    /// `(kind, part)` of a lowercased filename.
+    fn nzb_kind(lower: &[u8]) -> (i64, i64) {
+        let Some(dot) = lower.iter().rposition(|&b| b == b'.') else {
+            return (0, 0);
+        };
+        let run = lower[dot + 1..]
+            .iter()
+            .take_while(|&&b| is_alnum_lower(b))
+            .count();
+        if !(1..=8).contains(&run) {
+            return (0, 0);
+        }
+        let ext = &lower[dot + 1..dot + 1 + run];
+        let base = &lower[..dot];
+        let num = |d: &[u8]| {
+            d.iter()
+                .fold(0i64, |acc, &c| acc * 10 + i64::from(c - b'0'))
+        };
+        match ext {
+            b"par2" => {
+                if let Some(v) = rfind(base, b".vol") {
+                    let tail = &base[v + 4..];
+                    let a = tail.iter().take_while(|b| b.is_ascii_digit()).count();
+                    if (1..=9).contains(&a) && matches!(tail.get(a), Some(b'+' | b'-')) {
+                        let b = tail.len() - a - 1;
+                        if (1..=9).contains(&b) && all_digits(&tail[a + 1..]) {
+                            return (2, num(&tail[..a]));
+                        }
+                    }
+                }
+                (1, 0)
+            }
+            b"rar" => {
+                if let Some(p) = rfind(base, b".part") {
+                    let tail = &base[p + 5..];
+                    if (1..=4).contains(&tail.len()) && all_digits(tail) {
+                        return (3, num(tail));
+                    }
+                }
+                (4, 0)
+            }
+            _ if (ext.len() == 3 || ext.len() == 4) && ext[0] == b'r' && all_digits(&ext[1..]) => {
+                (5, num(&ext[1..]))
+            }
+            _ if ext.len() == 3 && all_digits(ext) => (5, num(ext)),
+            b"zip" | b"7z" | b"tar" | b"gz" | b"bz2" | b"xz" => (6, 0),
+            b"nfo" | b"sfv" | b"nzb" | b"txt" | b"jpg" | b"png" | b"srr" => (7, 0),
+            b"mkv" | b"mp4" | b"avi" | b"m4v" | b"ts" | b"wmv" | b"mp3" | b"flac" | b"iso"
+            | b"img" | b"bin" | b"epub" | b"pdf" => (8, 0),
+            _ => (9, 0),
+        }
+    }
+
+    /// The lowercase domain of a valid message id (optionally `<>`-wrapped, one `@` with text on
+    /// both sides, no whitespace or angle brackets inside).
+    fn message_domain(mid: &[u8]) -> Option<&[u8]> {
+        let mut mid = trim(mid);
+        if mid.len() >= 2 && mid[0] == b'<' && mid[mid.len() - 1] == b'>' {
+            mid = &mid[1..mid.len() - 1];
+        }
+        let at = mid.iter().position(|&b| b == b'@')?;
+        let ok = at > 0
+            && at + 1 < mid.len()
+            && !mid[at + 1..].contains(&b'@')
+            && !mid
+                .iter()
+                .any(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'<' | b'>'));
+        ok.then(|| &mid[at + 1..])
+    }
+
+    pub fn nzb_analysis_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 30);
+        let mut kinds = [0i64; 10];
+        let mut ranks = [0i64; 8];
+        let mut flag_counts = [0i64; 6];
+        let mut names: Set<u32> = set(rows.len());
+        let mut domains: Set<u32> = set(16);
+        let (mut best, mut best_rank, mut best_bytes) = (-1i64, 7i64, 0i64);
+        let (mut max_declared, mut total_bytes) = (0i64, 0i64);
+        for (index, row) in rows.iter().enumerate() {
+            let [subject, poster, segments, bytes, mid] = fields::<5>(row);
+            let quoted = subject.iter().position(|&b| b == b'"').and_then(|q| {
+                subject[q + 1..]
+                    .iter()
+                    .position(|&b| b == b'"')
+                    .map(|e| &subject[q + 1..q + 1 + e])
+            });
+            let file = quoted.unwrap_or_else(|| trim(subject));
+            let lower = lower(file);
+            let (kind, part) = nzb_kind(&lower);
+            let rank = match kind {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                3 if part <= 1 => 2,
+                3 | 5 => 3,
+                6 => 4,
+                8 => 5,
+                7 => 6,
+                _ => 7,
+            };
+            let segments = int(segments, 9);
+            let bytes = int(bytes, 12);
+            let bad = segments.is_err() || bytes.is_err();
+            let segments = segments.ok().flatten().unwrap_or(0);
+            let bytes = bytes.ok().flatten().unwrap_or(0);
+            let counter = counter(subject);
+            let domain = message_domain(mid);
+            let complete = counter.is_some_and(|(_, m)| segments >= m);
+            let flags = i64::from(domain.is_some())
+                | i64::from(poster.contains(&b'@')) << 1
+                | i64::from(counter.is_some()) << 2
+                | i64::from(complete) << 3
+                | i64::from(bad) << 4
+                | i64::from(quoted.is_some()) << 5;
+            let avg = if segments > 0 { bytes / segments } else { 0 };
+            let crc = crc32(&lower);
+            kinds[kind as usize] += 1;
+            ranks[rank as usize] += 1;
+            for (k, slot) in flag_counts.iter_mut().enumerate() {
+                *slot += flags >> k & 1;
+            }
+            if !lower.is_empty() {
+                names.insert(crc);
+            }
+            if let Some(d) = domain {
+                domains.insert(crc32(&self::lower(d)));
+            }
+            if rank < best_rank || (rank == best_rank && rank < 7 && bytes < best_bytes) {
+                (best, best_rank, best_bytes) = (index as i64, rank, bytes);
+            }
+            if let Some((_, m)) = counter {
+                max_declared = max_declared.max(m);
+            }
+            total_bytes += bytes;
+            out.push(
+                kind | rank << 4
+                    | flags << 7
+                    | part.min(0xFFFF) << 13
+                    | segments.min(0xFFFF) << 29
+                    | (avg >> 10).min(0x3FFF) << 45
+                    | (i64::from(crc) & 0xF) << 59,
+            );
+        }
+        out.extend(kinds);
+        out.extend(ranks);
+        out.extend(flag_counts);
+        out.extend([
+            names.len() as i64,
+            domains.len() as i64,
+            best,
+            max_declared,
+            total_bytes,
+        ]);
+        out
+    }
+
+    // ---- Par2MetadataParser ------------------------------------------------------------------
+
+    const PAR2_MAGIC: &[u8; 8] = b"PAR2\0PKT";
+
+    fn le64(b: &[u8]) -> i64 {
+        i64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]))
+    }
+
+    fn par2_type(t: &[u8]) -> i64 {
+        match t {
+            b"PAR 2.0\0Main\0\0\0\0" => 1,
+            b"PAR 2.0\0FileDesc" => 2,
+            b"PAR 2.0\0IFSC\0\0\0\0" => 3,
+            b"PAR 2.0\0RecvSlic" => 4,
+            b"PAR 2.0\0Creator\0" => 5,
+            _ if t.starts_with(b"PAR 2.0\0") => 6,
+            _ => 7,
+        }
+    }
+
+    fn par2_name_class(name: &[u8]) -> i64 {
+        if name.is_empty() {
+            return 1;
+        }
+        if name.iter().any(|&b| b == b'/' || b == b'\\') || name[0] == b'.' {
+            return 2;
+        }
+        if name.iter().any(|&b| b < 0x20 || b == 0x7F) {
+            return 3;
+        }
+        let ext = match name.iter().rposition(|&b| b == b'.') {
+            Some(d) => lower(&name[d + 1..]),
+            None => Vec::new(),
+        };
+        if ext == b"par2" {
+            4
+        } else if ext == b"rar" || (ext.len() == 3 && ext[0] == b'r' && all_digits(&ext[1..])) {
+            5
+        } else if !ext.is_empty() {
+            6
+        } else {
+            7
+        }
+    }
+
+    pub fn par2_packet_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 36);
+        let mut statuses = [0i64; 7];
+        let mut types = [0i64; 8];
+        let mut name_classes = [0i64; 8];
+        let mut hash_classes = [0i64; 7];
+        let mut sets: Set<&[u8]> = set(8);
+        let mut file_ids: Set<&[u8]> = set(rows.len());
+        let mut primary: Option<&[u8]> = None;
+        let (mut foreign_rows, mut valid_bytes, mut max_name) = (0i64, 0i64, 0i64);
+        for row in rows {
+            let n = row.len();
+            let (status, kind, length) = if n < 64 {
+                (1i64, 0i64, 0i64)
+            } else if &row[..8] != PAR2_MAGIC {
+                (2, 0, 0)
+            } else {
+                let length = le64(&row[8..16]);
+                let status = if length < 64 || length % 4 != 0 {
+                    3
+                } else if length as u64 > n as u64 {
+                    4
+                } else if crate::md5_raw_slice(&row[32..length as usize]) != row[16..32] {
+                    5
+                } else {
+                    6
+                };
+                (status, par2_type(&row[48..64]), length)
+            };
+            let (mut foreign, mut name_class, mut hash_class) = (false, 0i64, 0i64);
+            let (mut name_len, mut set_crc, mut mib, mut id_crc) = (0i64, 0i64, 0i64, 0i64);
+            if status == 6 {
+                let set_id = &row[32..48];
+                set_crc = i64::from(crc32(set_id)) & 0xFFFF;
+                sets.insert(set_id);
+                match primary {
+                    None => primary = Some(set_id),
+                    Some(p) => foreign = p != set_id,
+                }
+                valid_bytes += length;
+                if kind == 2 && length >= 120 {
+                    let l = length as usize;
+                    let file_id = &row[64..80];
+                    let (full, k16) = (&row[80..96], &row[96..112]);
+                    let file_len = le64(&row[112..120]);
+                    let mut name = &row[120..l];
+                    while let [rest @ .., 0] = name {
+                        name = rest;
+                    }
+                    name_class = par2_name_class(name);
+                    hash_class = if file_len < 0 {
+                        6
+                    } else if k16.iter().all(|&b| b == 0) {
+                        1
+                    } else if file_len <= 16384 {
+                        if k16 == full { 2 } else { 3 }
+                    } else if k16 == full {
+                        4
+                    } else {
+                        5
+                    };
+                    name_len = name.len().min(255) as i64;
+                    max_name = max_name.max(name.len() as i64);
+                    mib = if file_len >= 0 {
+                        (file_len >> 20).min(0x3F_FFFF)
+                    } else {
+                        0
+                    };
+                    id_crc = i64::from(crc32(file_id)) & 0xF;
+                    file_ids.insert(file_id);
+                }
+            }
+            statuses[status as usize] += 1;
+            types[kind as usize] += 1;
+            name_classes[name_class as usize] += 1;
+            hash_classes[hash_class as usize] += 1;
+            foreign_rows += i64::from(foreign);
+            out.push(
+                status
+                    | kind << 3
+                    | i64::from(foreign) << 6
+                    | name_class << 7
+                    | hash_class << 10
+                    | name_len << 13
+                    | set_crc << 21
+                    | mib << 37
+                    | id_crc << 59,
+            );
+        }
+        out.extend(statuses);
+        out.extend(types);
+        out.extend(name_classes);
+        out.extend(hash_classes);
+        out.extend([
+            sets.len() as i64,
+            foreign_rows,
+            file_ids.len() as i64,
+            valid_bytes,
+            max_name,
+        ]);
+        out
+    }
+
+    // ---- Exports -----------------------------------------------------------------------------
+
+    macro_rules! export {
+        ($name:ident, $plan:ident) => {
+            /// # Safety
+            /// `items` must be readable for `items_len` bytes and `out` writable for `out_cap`
+            /// words.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                items: *const u8,
+                items_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let inputs = [(items, items_len)];
+                unsafe {
+                    emit(out, out_cap, count, &inputs, || {
+                        Some($plan(&column(span(items, items_len)?, count)?))
+                    })
+                }
+            }
+        };
+    }
+
+    export!(nntmux_w622_queue_lease_plan_batch, queue_lease_plan);
+    export!(nntmux_w622_dispatch_plan_batch, dispatch_plan);
+    export!(nntmux_w622_breaker_plan_batch, breaker_plan);
+    export!(nntmux_w622_nzb_analysis_plan_batch, nzb_analysis_plan);
+
+    /// # Safety
+    /// `items` must be readable for `items_len` bytes, `lengths` for `lengths_len` bytes
+    /// (`count` little-endian `i64` packet lengths summing to `items_len`) and `out` writable for
+    /// `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w622_par2_packet_plan_batch(
+        items: *const u8,
+        items_len: usize,
+        lengths: *const u8,
+        lengths_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(items, items_len), (lengths, lengths_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let blob = span(items, items_len)?;
+                let mut rows = Vec::with_capacity(count);
+                let mut at = 0usize;
+                for len in ints(span(lengths, lengths_len)?, count)? {
+                    let end = at.checked_add(usize::try_from(len).ok()?)?;
+                    rows.push(blob.get(at..end)?);
+                    at = end;
+                }
+                (at == blob.len()).then(|| par2_packet_plan(&rows))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn refs<'a>(v: &[&'a str]) -> Vec<&'a [u8]> {
+            v.iter().map(|s| s.as_bytes()).collect()
+        }
+
+        const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        #[test]
+        fn helpers_follow_php() {
+            assert_eq!(fields::<3>(b"a\tb\tc\td"), [b"a".as_slice(), b"b", b"c\td"]);
+            assert_eq!(int(b" 42 ", 3), Ok(Some(42)));
+            assert_eq!(int(b"", 3), Ok(None));
+            assert_eq!(int(b"1234", 3), Err(()));
+            assert_eq!(int(b"-1", 3), Err(()));
+            assert!(truthy(b" YES ") && !truthy(b"2"));
+            assert_eq!(rfind(b"a.vol.vol1", b".vol"), Some(5));
+            assert_eq!(counter(b"x (1/5) y (2/7)"), Some((2, 7)));
+            assert_eq!(counter(b"(1/2(3/4"), None);
+            assert_eq!(message_domain(b"<a@B.c>"), Some(b"B.c".as_slice()));
+            assert_eq!(message_domain(b"a@b@c"), None);
+        }
+
+        #[test]
+        fn queue_rows_classify_leases() {
+            let rows = [
+                format!("pending\t0\t\t\t100\t\t{HEX}\t"),
+                format!("pending\t1\t160\t\t100\t\t{HEX}\t"),
+                format!("processing\t4\t\t90\t100\tw1\t{HEX}\terr"),
+                format!("processing\t0\t\t150\t100\tW1\t{HEX}\t"),
+                format!("failed\t5\t\t\t100\t\t{HEX}\t"),
+                format!("bogus\t0\t\t\t100\t\t{HEX}\t"),
+            ];
+            let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
+            let words = queue_lease_plan(&refs);
+            assert_eq!(words[0], 1 | 2 << 4 | 30 << 42);
+            assert_eq!(words[1] & ((1 << 42) - 1), 2 | 18 << 4 | 1 << 10 | 60 << 18);
+            assert_eq!(words[2] & 0x3FF, 4 | (1 | 2 | 4 | 8 | 32) << 4);
+            assert_eq!(words[3] & 15, 5);
+            assert_eq!(words[4] & 15, 6);
+            assert_eq!(words[5] & 15, 0);
+            assert_eq!(words[6..16], [1, 1, 1, 0, 1, 1, 1, 0, 0, 0]);
+            assert_eq!(words[22..], [1, 2, 2, 60, 50, 10]);
+        }
+
+        #[test]
+        fn dispatch_rows_route_and_chunk() {
+            let words = dispatch_plan(&refs(&[
+                "17\t\t1\trust\t",
+                "18\tgen\t0\tlegacy\t2",
+                "17\t\t\t\t",
+                "0\t\t\t\t",
+            ]));
+            assert_eq!(
+                words[0],
+                1 << 2 | 1 << 5 | 1 << 8 | 1 << 9 | 1 << 10 | 17 << 30
+            );
+            assert_eq!(words[1], 1 | 2 << 2 | 2 << 5 | 2 << 10 | 3 << 22 | 18 << 30);
+            assert_eq!(words[2], 3 << 5 | 1 << 7 | 1 << 9 | 1 << 10 | 17 << 30);
+            assert_eq!(words[3], 2 | 4 << 2 | 1 << 9);
+            assert_eq!(
+                words[4..],
+                [2, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 18]
+            );
+        }
+
+        #[test]
+        fn breaker_rows_gate_half_open_probes() {
+            let words = breaker_plan(&refs(&[
+                "News\t563\t1\t1\t\t1000\t\t1100\t900\t",
+                "news\t0563\tyes\t1\t\t1000\t\t2000\t900\t",
+                "news\t563\ttrue\t1\t\t1000\t\t2000\t900\t",
+                "alt\t119\t0\t3\t950\t\t\t1000\t\t",
+                "alt\t119\t0\t1\t950\t\t\t1000\t\t",
+                "x\t0\t\t\t\t\t\t1\t\t",
+            ]));
+            assert_eq!(words[0] & 0x3FFF_FFFF, 4 | 1 << 3 | 1 << 6 | 800 << 14);
+            assert_eq!(words[1] & 0x3FFF, 6 | 1 << 3 | 1 << 5 | 1 << 6);
+            assert_eq!(words[2] & 7, 5);
+            assert_eq!(words[3] & 0x3FFF_FFFF, 3 | 3 << 6 | 850 << 14);
+            assert_eq!(words[4] & 7, 2);
+            assert_eq!(words[5], 0);
+            assert_eq!(words[6..], [1, 0, 1, 1, 1, 1, 1, 0, 2, 2, 3, 1, 0, 3, 3]);
+        }
+
+        #[test]
+        fn nzb_rows_rank_candidates() {
+            let words = nzb_analysis_plan(&refs(&[
+                "[1/3] - \"Movie.vol00+01.par2\" yEnc (1/2)\tposter@x\t2\t2048\t<a@b.c>",
+                "[2/3] - \"Movie.par2\" yEnc (1/1)\tp\t1\t500\ta@b.c",
+                "Movie.part01.rar (1/50)\t\t49\t1x\tbad",
+                "Movie.r07\t\t\t\t",
+            ]));
+            assert_eq!(words[0] & ((1 << 45) - 1), 2 | 1 << 4 | 47 << 7 | 2 << 29);
+            assert_eq!(words[1] & ((1 << 45) - 1), 1 | 45 << 7 | 1 << 29);
+            assert_eq!(
+                words[2] & ((1 << 45) - 1),
+                3 | 2 << 4 | 20 << 7 | 1 << 13 | 49 << 29
+            );
+            assert_eq!(words[3] & ((1 << 45) - 1), 5 | 3 << 4 | 7 << 13);
+            assert_eq!(words[4 + 24..], [4, 1, 1, 50, 2548]);
+        }
+
+        fn packet(kind: &[u8; 16], body: &[u8], set_id: &[u8; 16]) -> Vec<u8> {
+            let len = 64 + body.len();
+            let mut p = Vec::with_capacity(len);
+            p.extend_from_slice(PAR2_MAGIC);
+            p.extend_from_slice(&(len as u64).to_le_bytes());
+            p.extend_from_slice(&[0; 16]);
+            p.extend_from_slice(set_id);
+            p.extend_from_slice(kind);
+            p.extend_from_slice(body);
+            let md5 = crate::md5_raw_slice(&p[32..]);
+            p[16..32].copy_from_slice(&md5);
+            p
+        }
+
+        #[test]
+        fn par2_packets_validate_and_classify() {
+            let mut desc = vec![7u8; 16];
+            desc.extend([1u8; 16]);
+            desc.extend([1u8; 16]);
+            desc.extend(100u64.to_le_bytes());
+            desc.extend(b"Movie.PAR2\0\0");
+            let a = packet(b"PAR 2.0\0FileDesc", &desc, &[9; 16]);
+            let b = packet(b"PAR 2.0\0Creator\0", b"abcd", &[8; 16]);
+            let mut c = a.clone();
+            c[70] ^= 1;
+            let rows: Vec<&[u8]> = vec![&a, &b, &c, b"short", &a[..70]];
+            let words = par2_packet_plan(&rows);
+            assert_eq!(
+                words[0] & ((1 << 21) - 1),
+                6 | 2 << 3 | 4 << 7 | 2 << 10 | 10 << 13
+            );
+            assert_eq!(words[1] & ((1 << 21) - 1), 6 | 5 << 3 | 1 << 6);
+            assert_eq!(words[2], 5 | 2 << 3);
+            assert_eq!(words[3], 1);
+            assert_eq!(words[4], 4 | 2 << 3);
+            assert_eq!(words[5..12], [0, 1, 0, 0, 1, 1, 2]);
+            assert_eq!(words[5 + 30..], [2, 1, 1, a.len() as i64 + 68, 10]);
+        }
+
+        #[test]
+        fn exports_guard_null_short_and_malformed_batches() {
+            let mut out = [0i64; 64];
+            let o = out.as_mut_ptr();
+            let one = 1i64.to_le_bytes();
+            unsafe {
+                assert_eq!(
+                    nntmux_w622_queue_lease_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    24
+                );
+                assert_eq!(
+                    nntmux_w622_queue_lease_plan_batch(b"a".as_ptr(), 1, 1, o, 23),
+                    -24
+                );
+                assert_eq!(
+                    nntmux_w622_dispatch_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w622_breaker_plan_batch(std::ptr::null(), 0, 0, o, 64),
+                    16
+                );
+                assert_eq!(
+                    nntmux_w622_nzb_analysis_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        64
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w622_par2_packet_plan_batch(b"a".as_ptr(), 1, one.as_ptr(), 8, 1, o, 64),
+                    37
+                );
+                assert_eq!(
+                    nntmux_w622_par2_packet_plan_batch(
+                        b"ab".as_ptr(),
+                        2,
+                        one.as_ptr(),
+                        8,
+                        1,
+                        o,
+                        64
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w622_par2_packet_plan_batch(b"a".as_ptr(), 1, one.as_ptr(), 7, 1, o, 64),
+                    -1
+                );
+            }
+        }
+    }
+}

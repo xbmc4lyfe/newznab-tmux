@@ -5,6 +5,10 @@ declare(strict_types=1);
 namespace App\Services\Releases\Fingerprint;
 
 use App\Services\Par2PacketAccumulator;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
+use Throwable;
 
 /**
  * `findCrossVolumeRecoveryConflicts`, `validateCrossVolumeIfscRelationships` and
@@ -1573,5 +1577,264 @@ final class Par2MetadataParser
         }
 
         return ['rows' => $count, 'invalid' => $invalid, 'bad_set' => $badSet, 'bad_file' => $badFile, 'wildcard' => $wildcard, 'file' => $file, 'distinct' => $distinct];
+    }
+
+    // ---- Wave 62.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 2.71x/2.77x, uncommon 2.53x/2.51x); see RustFingerprintQueueDispatchBreakerAnalyzerPar2ParserW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    private const string W62_PAR2_METADATA_PARSER_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w622_par2_packet_plan_batch(const char *items, size_t items_len, const char *lengths, size_t lengths_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W62_PAR2_METADATA_PARSER_TAIL = 36;
+
+    /**
+     * Wave 62 routing, binding and output buffer, kept in function-local statics (no static
+     * properties). Operations: null reads the routing override, 'set' replaces it (returning the
+     * previous one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]`
+     * with room for at least $val words (null without the library).
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w62', self::W62_PAR2_METADATA_PARSER_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w62RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW62RustFfi(): bool
+    {
+        $enabled = self::w62RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w62Par2PacketPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62Par2PacketPlanBatch(array $rows): array
+    {
+        return self::usesW62RustFfi() ? self::w62Par2PacketPlanBatchNative($rows) : self::w62Par2PacketPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w62Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** PAR2 packet type => w62Par2PacketPlanBatch() type code. */
+    private const array W62_PAR2_TYPES = ["PAR 2.0\0Main\0\0\0\0" => 1, "PAR 2.0\0FileDesc" => 2, "PAR 2.0\0IFSC\0\0\0\0" => 3, "PAR 2.0\0RecvSlic" => 4,
+        "PAR 2.0\0Creator\0" => 5];
+
+    /**
+     * Rust batch over the concatenated packets and their little-endian `i64` lengths; falls back
+     * to PHP when the library is missing or the batch is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62Par2PacketPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W62_PAR2_METADATA_PARSER_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w62RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w62Par2PacketPlanBatchPhp($rows);
+        }
+        $blob = implode('', $rows);
+        $lengths = pack('P*', ...array_map(strlen(...), $rows));
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W62_PAR2_METADATA_PARSER_FFI_CDEF.)
+            $written = $ffi->nntmux_w622_par2_packet_plan_batch($blob, \strlen($blob), $lengths, \strlen($lengths), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w62Par2PacketPlanBatchPhp($rows);
+    }
+
+    /**
+     * Wave 62.2 PAR2 packet header and file-description plan over raw packets (one per row). Per
+     * packet `status | type << 3 | foreign_set << 6 | name_class << 7 | hash_class << 10 |
+     * min(len(name), 255) << 13 | (crc32(set_id) & 0xFFFF) << 21 | min(file_length >> 20, 0x3FFFFF)
+     * << 37 | (crc32(file_id) & 0xF) << 59`. Status: 1 shorter than the 64-byte header, 2 no
+     * `PAR2\0PKT` magic, 3 a declared length below 64 or not a multiple of 4, 4 a declared length
+     * past the row, 5 an MD5 (over bytes 32 to the declared length) that differs from the header,
+     * 6 valid. Statuses 3-6 carry the type (1 Main, 2 FileDesc, 3 IFSC, 4 RecvSlic, 5 Creator, 6
+     * another `PAR 2.0\0` type, 7 foreign). Valid packets carry the set-ID crc and flag a set other
+     * than the first valid packet's. A valid FileDesc of at least 120 bytes classifies its
+     * NUL-trimmed name (w62Par2NameClass()) and 16k hash: 1 all zero, 2 equal to the full MD5 for
+     * a file of at most 16 KiB, 3 different for such a file, 4 equal for a larger file, 5 different
+     * for a larger file, 6 a negative length. Then seven status, eight type, eight name-class and
+     * seven hash-class counts, the distinct valid set IDs, the foreign-set packets, the distinct
+     * file IDs, the valid packet bytes, the longest name and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62Par2PacketPlanBatchPhp(array $rows): array
+    {
+        $out = $sets = $fileIds = [];
+        $statuses = array_fill(0, 7, 0);
+        $types = array_fill(0, 8, 0);
+        $nameClasses = array_fill(0, 8, 0);
+        $hashClasses = array_fill(0, 7, 0);
+        $primary = null;
+        $foreignRows = $validBytes = $maxName = 0;
+        foreach ($rows as $row) {
+            $row = (string) $row;
+            $n = \strlen($row);
+            $type = $length = 0;
+            if ($n < 64) {
+                $status = 1;
+            } elseif (! str_starts_with($row, "PAR2\0PKT")) {
+                $status = 2;
+            } else {
+                $length = self::w62Le64($row, 8);
+                $status = match (true) {
+                    $length < 64 || $length % 4 !== 0 => 3,
+                    $length > $n => 4,
+                    md5(substr($row, 32, $length - 32), true) !== substr($row, 16, 16) => 5,
+                    default => 6,
+                };
+                $header = substr($row, 48, 16);
+                $type = self::W62_PAR2_TYPES[$header] ?? (str_starts_with($header, "PAR 2.0\0") ? 6 : 7);
+            }
+            $foreign = false;
+            $nameClass = $hashClass = $nameLength = $setCrc = $mib = $idCrc = 0;
+            if ($status === 6) {
+                $setId = substr($row, 32, 16);
+                $setCrc = crc32($setId) & 0xFFFF;
+                $sets[$setId] = true;
+                if ($primary === null) {
+                    $primary = $setId;
+                } else {
+                    $foreign = $primary !== $setId;
+                }
+                $validBytes += $length;
+                if ($type === 2 && $length >= 120) {
+                    $fileId = substr($row, 64, 16);
+                    $full = substr($row, 80, 16);
+                    $hash16k = substr($row, 96, 16);
+                    $fileLength = self::w62Le64($row, 112);
+                    $name = rtrim(substr($row, 120, $length - 120), "\0");
+                    $nameClass = self::w62Par2NameClass($name);
+                    $hashClass = match (true) {
+                        $fileLength < 0 => 6,
+                        $hash16k === str_repeat("\0", 16) => 1,
+                        $fileLength <= 16384 => $hash16k === $full ? 2 : 3,
+                        default => $hash16k === $full ? 4 : 5,
+                    };
+                    $nameLength = min(\strlen($name), 255);
+                    $maxName = max($maxName, \strlen($name));
+                    $mib = $fileLength >= 0 ? min($fileLength >> 20, 0x3FFFFF) : 0;
+                    $idCrc = crc32($fileId) & 0xF;
+                    $fileIds[$fileId] = true;
+                }
+            }
+            $statuses[$status]++;
+            $types[$type]++;
+            $nameClasses[$nameClass]++;
+            $hashClasses[$hashClass]++;
+            $foreignRows += (int) $foreign;
+            $out[] = $status | $type << 3 | (int) $foreign << 6 | $nameClass << 7 | $hashClass << 10 | $nameLength << 13 | $setCrc << 21 | $mib << 37 | $idCrc << 59;
+        }
+        array_push($out, ...$statuses, ...$types, ...$nameClasses, ...$hashClasses);
+        array_push($out, \count($sets), $foreignRows, \count($fileIds), $validBytes, $maxName);
+        $out[] = self::w62Digest($out);
+
+        return $out;
+    }
+
+    /** The little-endian 64-bit integer at $offset (PHP's signed reinterpretation). */
+    private static function w62Le64(string $bytes, int $offset): int
+    {
+        /** @var array{1: int} $value */
+        $value = unpack('P', $bytes, $offset);
+
+        return $value[1];
+    }
+
+    /**
+     * 1 empty, 2 a path separator or leading dot, 3 a control byte, else by the lowercased text
+     * after the last dot: 4 `par2`, 5 `rar` or `r` + two digits, 6 another extension, 7 none.
+     */
+    private static function w62Par2NameClass(string $name): int
+    {
+        if ($name === '') {
+            return 1;
+        }
+        if (strcspn($name, '/\\') !== \strlen($name) || $name[0] === '.') {
+            return 2;
+        }
+        if (preg_match('/[\x00-\x1F\x7F]/', $name) === 1) {
+            return 3;
+        }
+        $dot = strrpos($name, '.');
+        $ext = $dot === false ? '' : strtolower(substr($name, $dot + 1));
+
+        return match (true) {
+            $ext === 'par2' => 4,
+            $ext === 'rar' || (\strlen($ext) === 3 && $ext[0] === 'r' && strspn($ext, '0123456789', 1) === 2) => 5,
+            $ext !== '' => 6,
+            default => 7,
+        };
     }
 }
