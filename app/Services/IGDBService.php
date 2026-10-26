@@ -1337,4 +1337,252 @@ class IGDBService
             return null;
         }
     }
+
+    /** C signature of the Wave 61.5 {@see self::lookupPlanBatch()} helper. */
+    private const string W61_IGDB_PLAN_FFI_CDEF = 'int64_t nntmux_w615_igdb_lookup_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 61.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 5.44/3.76/4.75/3.51x); see tests/Unit/RustGoogleBooksIgdbImdbScraperItunesLogIndexerW61ParityTest.php.
+     */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    /** Canonical {@see self::lookupPlanBatch()} platforms in 1-based code order: the alias targets plus `pc`. */
+    private const array W61_PLATFORMS = ['xbox 360', 'xbox one', 'xbox', 'nintendo ds', 'nintendo 3ds', 'playstation2', 'playstation 3', 'playstation 4', 'sony psp', 'playstation vita', 'playstation', 'nintendo wii u', 'nintendo wii', 'gamecube', 'nintendo 64', 'nintendo nes', 'snes', 'pc'];
+
+    /**
+     * Wave 61.5 routing and FFI cache, kept in function-local statics (no static properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w61_5', self::W61_IGDB_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W61_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW61RustFfi(): bool
+    {
+        return self::w61RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with lookupPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 61.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w61Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w61RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w615_igdb_lookup_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch IGDB lookup plan over `title\tplatform\ttoken_expires_at\tnow\trequests\twindow_started\tcandidate_platforms`.
+     * Nine words per record: `[title_len, word_count, platform_code, platform_match, token_state, token_ttl, allowed,
+     * rate_wait, flags]`. The title length joins its tokens (ASCII alphanumeric or non-ASCII runs) with single spaces.
+     * The trimmed platform resolves through PLATFORM_ALIASES (ASCII case-insensitive) to a 1-based code over the alias
+     * targets plus `pc`, 0 empty, -1 unknown; the match is the 1-based position of the first comma-separated candidate
+     * resolving to the same platform. Times are 1-12 digit Unix seconds (empty 0): the Twitch token state is 0
+     * missing, 1 valid beyond the 60 second refresh margin, 2 due for refresh, 3 expired, with its remaining seconds.
+     * The rate window allows REQUESTS_PER_MINUTE (1-6 digit count, empty 0) per DECAY_SECONDS and reports the seconds
+     * until it reopens. Flags: 1 empty title, 2 unknown platform, 4 invalid expiry, 8 invalid now, 16 invalid request
+     * count, 32 invalid window start, 64 window starting in the future, 128 not exactly seven fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatch(array $records): array
+    {
+        return self::usesW61RustFfi() ? self::lookupPlanBatchNative($records) : self::lookupPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 7 ? 0 : 128;
+            $tokens = self::w61Tokens($fields[0]);
+            $titleLength = \strlen(implode(' ', $tokens));
+            $words = \count($tokens);
+            if ($words === 0) {
+                $flags |= 1;
+            }
+            $hint = self::w61Platform($fields[1] ?? '');
+            $code = 0;
+            $matched = 0;
+            if ($hint !== '') {
+                $position = array_search($hint, self::W61_PLATFORMS, true);
+                if ($position === false) {
+                    $code = -1;
+                    $flags |= 2;
+                } else {
+                    $code = $position + 1;
+                }
+                foreach (explode(',', $fields[6] ?? '') as $index => $candidate) {
+                    if (self::w61Platform($candidate) === $hint) {
+                        $matched = $index + 1;
+                        break;
+                    }
+                }
+            }
+            $expires = self::w61Number($fields[2] ?? '', 12, 4, $flags);
+            $now = self::w61Number($fields[3] ?? '', 12, 8, $flags);
+            $requests = self::w61Number($fields[4] ?? '', 6, 16, $flags);
+            $window = self::w61Number($fields[5] ?? '', 12, 32, $flags);
+            [$state, $ttl] = [0, 0];
+            if ($expires !== 0) {
+                $remaining = $expires - $now;
+                $state = $remaining > 60 ? 1 : ($remaining > 0 ? 2 : 3);
+                $ttl = max(0, $remaining);
+            }
+            [$allowed, $wait] = [1, 0];
+            if ($window !== 0) {
+                $elapsed = $now - $window;
+                if ($now < $window) {
+                    $elapsed = 0;
+                    $flags |= 64;
+                }
+                if ($elapsed < self::DECAY_SECONDS && $requests >= self::REQUESTS_PER_MINUTE) {
+                    [$allowed, $wait] = [0, self::DECAY_SECONDS - $elapsed];
+                }
+            }
+            array_push($out, $titleLength, $words, $code, $matched, $state, $ttl, $allowed, $wait, $flags);
+        }
+
+        return $out;
+    }
+
+    /** Trimmed, ASCII-lowercased platform resolved through PLATFORM_ALIASES. */
+    private static function w61Platform(string $platform): string
+    {
+        $platform = strtolower(trim($platform));
+
+        return self::PLATFORM_ALIASES[$platform] ?? $platform;
+    }
+
+    /** Trimmed 1-$max digits (empty 0); anything else sets $flag. */
+    private static function w61Number(string $field, int $max, int $flag, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return 0;
+        }
+        $value = self::w61Digits($text, $max);
+        if ($value === null) {
+            $flags |= $flag;
+
+            return 0;
+        }
+
+        return $value;
+    }
+
+    /**
+     * Lowercased runs of ASCII alphanumeric or non-ASCII bytes.
+     *
+     * @return list<string>
+     */
+    private static function w61Tokens(string $text): array
+    {
+        $tokens = preg_split('/[^a-z0-9\x80-\xff]+/', strtolower($text), -1, PREG_SPLIT_NO_EMPTY);
+
+        return \is_array($tokens) ? $tokens : [];
+    }
+
+    /** 1-$max ASCII digits as an integer, else null. */
+    private static function w61Digits(string $text, int $max): ?int
+    {
+        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w61Words($count, implode("\0", $records), 9 * $count) ?? self::lookupPlanBatchPhp($records);
+    }
 }

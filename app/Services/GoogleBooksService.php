@@ -554,4 +554,273 @@ class GoogleBooksService
             return null;
         }
     }
+
+    /** C signature of the Wave 61.5 {@see self::lookupPlanBatch()} helper. */
+    private const string W61_GOOGLE_BOOKS_PLAN_FFI_CDEF = 'int64_t nntmux_w615_google_books_lookup_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 61.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 6.29/4.98/3.54/3.14x); see tests/Unit/RustGoogleBooksIgdbImdbScraperItunesLogIndexerW61ParityTest.php.
+     */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 61.5 routing and FFI cache, kept in function-local statics (no static properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w61_5', self::W61_GOOGLE_BOOKS_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W61_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW61RustFfi(): bool
+    {
+        return self::w61RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with lookupPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 61.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w61Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w61RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w615_google_books_lookup_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch Google Books lookup plan over `query\ttitle\tauthor\tisbn\tcandidate_title\tcandidate_author\tmax_results`.
+     * Eight words per record: `[mode, query_len, isbn_kind, title_score, author_score, max_results, title_tokens, flags]`.
+     * The ISBN keeps `[0-9Xx]` bytes (uppercased) and is 10 or 13 when it passes its checksum, else 0. Mode follows
+     * buildSearchQueryPhp() over the trimmed fields: 1 `isbn:`, 2 `intitle:`/`inauthor:`, 3 plain query, 0 empty; the
+     * query length is that built string's. Scores are `100 * matched / tokens` of the title (the query without one)
+     * against the candidate title and of the author against the candidate author; tokens are ASCII alphanumeric or
+     * non-ASCII runs compared ASCII case-insensitively. Max results (empty 10) are 1-3 digits clamped to 1..40.
+     * Flags: 1 empty request, 2 invalid ISBN, 4 formatted ISBN, 8 clamped max results, 16 invalid max results,
+     * 32 exact title match, 64 empty candidate title, 128 non-ASCII title or author, 256 not exactly seven fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatch(array $records): array
+    {
+        return self::usesW61RustFfi() ? self::lookupPlanBatchNative($records) : self::lookupPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 7 ? 0 : 256;
+            $query = trim($fields[0]);
+            $title = trim($fields[1] ?? '');
+            $author = trim($fields[2] ?? '');
+            $rawIsbn = $fields[3] ?? '';
+            $kept = strtoupper((string) preg_replace('/[^0-9Xx]+/', '', $rawIsbn));
+            $kind = self::w61IsbnKind($kept);
+            $trimmedIsbn = trim($rawIsbn);
+            if ($kind === 0 && $trimmedIsbn !== '') {
+                $flags |= 2;
+            }
+            if ($kind !== 0 && \strlen($kept) !== \strlen($trimmedIsbn)) {
+                $flags |= 4;
+            }
+            if ($kind !== 0) {
+                [$mode, $queryLength] = [1, 5 + $kind];
+            } elseif ($title !== '' || $author !== '') {
+                $queryLength = ($title !== '' ? 8 + \strlen($title) : 0) + ($author !== '' ? 9 + \strlen($author) : 0) + ($title !== '' && $author !== '' ? 1 : 0);
+                $mode = 2;
+            } elseif ($query !== '') {
+                [$mode, $queryLength] = [3, \strlen($query)];
+            } else {
+                [$mode, $queryLength] = [0, 0];
+                $flags |= 1;
+            }
+            $needle = self::w61Tokens($title !== '' ? $title : $query);
+            $candidate = self::w61Tokens($fields[4] ?? '');
+            [$matched, $titleTokens] = self::w61Overlap($needle, $candidate);
+            $titleScore = $titleTokens > 0 ? intdiv(100 * $matched, $titleTokens) : 0;
+            [$matched, $authorTokens] = self::w61Overlap(self::w61Tokens($author), self::w61Tokens($fields[5] ?? ''));
+            $authorScore = $authorTokens > 0 ? intdiv(100 * $matched, $authorTokens) : 0;
+            $max = 10;
+            $text = trim($fields[6] ?? '');
+            if ($text !== '') {
+                $value = self::w61Digits($text, 3);
+                if ($value === null) {
+                    $flags |= 16;
+                } elseif ($value < 1 || $value > 40) {
+                    $max = max(1, min(40, $value));
+                    $flags |= 8;
+                } else {
+                    $max = $value;
+                }
+            }
+            if ($needle !== [] && $needle === $candidate) {
+                $flags |= 32;
+            }
+            if (trim($fields[4] ?? '') === '') {
+                $flags |= 64;
+            }
+            if (preg_match('/[\x80-\xff]/', $title.$author) === 1) {
+                $flags |= 128;
+            }
+            array_push($out, $mode, $queryLength, $kind, $titleScore, $authorScore, $max, $titleTokens, $flags);
+        }
+
+        return $out;
+    }
+
+    /** 13 or 10 for kept ISBN bytes passing their checksum (ISBN-13 with a 978/979 prefix), else 0. */
+    private static function w61IsbnKind(string $isbn): int
+    {
+        if (\strlen($isbn) === 10 && preg_match('/^\d{9}[\dX]$/D', $isbn) === 1) {
+            $sum = 0;
+            for ($index = 0; $index < 10; $index++) {
+                $sum += ($isbn[$index] === 'X' ? 10 : (int) $isbn[$index]) * (10 - $index);
+            }
+
+            return $sum % 11 === 0 ? 10 : 0;
+        }
+        if (\strlen($isbn) === 13 && preg_match('/^97[89]\d{10}$/D', $isbn) === 1) {
+            $sum = 0;
+            for ($index = 0; $index < 13; $index++) {
+                $sum += (int) $isbn[$index] * ($index % 2 === 0 ? 1 : 3);
+            }
+
+            return $sum % 10 === 0 ? 13 : 0;
+        }
+
+        return 0;
+    }
+
+    /**
+     * Lowercased runs of ASCII alphanumeric or non-ASCII bytes.
+     *
+     * @return list<string>
+     */
+    private static function w61Tokens(string $text): array
+    {
+        $tokens = preg_split('/[^a-z0-9\x80-\xff]+/', strtolower($text), -1, PREG_SPLIT_NO_EMPTY);
+
+        return \is_array($tokens) ? $tokens : [];
+    }
+
+    /**
+     * Needle tokens found among the haystack tokens and the needle token count.
+     *
+     * @param  list<string>  $needle
+     * @param  list<string>  $haystack
+     * @return array{int, int}
+     */
+    private static function w61Overlap(array $needle, array $haystack): array
+    {
+        $set = array_flip($haystack);
+        $matched = 0;
+        foreach ($needle as $token) {
+            if (isset($set[$token])) {
+                $matched++;
+            }
+        }
+
+        return [$matched, \count($needle)];
+    }
+
+    /** 1-$max ASCII digits as an integer, else null. */
+    private static function w61Digits(string $text, int $max): ?int
+    {
+        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w61Words($count, implode("\0", $records), 8 * $count) ?? self::lookupPlanBatchPhp($records);
+    }
 }
