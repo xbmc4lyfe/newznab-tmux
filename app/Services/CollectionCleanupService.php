@@ -1369,4 +1369,304 @@ class CollectionCleanupService
                 return $enabled;
         }
     }
+
+    // ========================================================================
+    // WAVE 67.1 BATCH HELPER
+    // ========================================================================
+
+    /** Benchmark-gated default; see RustXxxPipeCollectionCleanupCleaningConfigProviderRepoW67ParityTest. */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    public const string W67_COLLECTION_CLEANUP_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w671_collection_cleanup_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w67CollectionCleanupPlanBatch(). */
+    public const int W67_COLLECTION_CLEANUP_TRAILER = 21;
+
+    public static function usesW67RustFfi(): bool
+    {
+        $override = self::w67RustFfiState();
+
+        return \is_bool($override) ? $override : self::W67_RUST_FFI_DEFAULT;
+    }
+
+    /** Forces the CollectionCleanupService Wave 67 Rust path on until reset. */
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', true);
+    }
+
+    /** Forces the CollectionCleanupService Wave 67 PHP path until reset. */
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', false);
+    }
+
+    /** Restores the benchmark default and drops the cached library handle and scratch buffers; earlier toggles are untouched. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('reset');
+    }
+
+    /**
+     * Runs $callback with the CollectionCleanupService Wave 67 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 67.1 collection retention plans, one per `dateadded|now|retention_hours|binaries|parts|filecheck|chunk` row of
+     * trimmed 1-15 digit numbers (empty: 0, 0, 72, 0, 0, 0, 1000). Hours clamp to 1-8760 and the chunk to 100-10000; the
+     * cutoff is `now - hours * 3600` and the ready cutoff twice as far back. Decision: 0 empty row, 1 malformed number, 2 no
+     * dateadded, 3 active (dateadded >= cutoff), 4 orphan (no binaries) to delete, 5 retained in the band (dateadded >= ready
+     * cutoff with a W401 ready filecheck status), 6 expired to delete. Flags: 1 dateadded in the future, 2 orphan, 4 binaries
+     * without parts, 8 ready status, 16/32 hours/chunk clamped, 64 non-ASCII, 128 control byte. Rows are
+     * `min(1 + binaries + parts, 2^40)`; deletes take `ceil(rows / chunk)` chunks. Per item `decision | flags << 3 |
+     * min(ageHours, 0xFFFFF) << 11 | hours << 31 | min(chunks, 0xFFFF) << 45`; then 7 decision and 8 flag counts, the deleted
+     * and retained row sums, the chunk sum, the oldest age in hours and the first and last `max(0, cutoff)` of dated rows.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67CollectionCleanupPlanBatch(array $items): array
+    {
+        return self::usesW67RustFfi() ? self::w67CollectionCleanupPlanBatchNative($items) : self::w67CollectionCleanupPlanBatchPhp($items);
+    }
+
+    /**
+     * Rust plan; falls back to the PHP reference when the library is missing or the call declines.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67CollectionCleanupPlanBatchNative(array $items): array
+    {
+        return self::w67Invoke($items, \count($items) + self::W67_COLLECTION_CLEANUP_TRAILER) ?? self::w67CollectionCleanupPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67CollectionCleanupPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W67_COLLECTION_CLEANUP_TRAILER, 0);
+        $minCutoff = null;
+        foreach ($items as $item) {
+            $item = (string) $item;
+            [$rawAdded, $rawNow, $rawHours, $rawBinaries, $rawParts, $rawCheck, $rawChunk] = explode('|', $item, 7) + ['', '', '', '', '', '', ''];
+            $added = self::w67Uint($rawAdded, 0);
+            $now = self::w67Uint($rawNow, 0);
+            $hours = self::w67Uint($rawHours, 72);
+            $binaries = self::w67Uint($rawBinaries, 0);
+            $parts = self::w67Uint($rawParts, 0);
+            $check = self::w67Uint($rawCheck, 0);
+            $chunk = self::w67Uint($rawChunk, 1000);
+            $malformed = $added < 0 || $now < 0 || $hours < 0 || $binaries < 0 || $parts < 0 || $check < 0 || $chunk < 0;
+            [$hours, $clampedHours] = self::w67Clamp($hours, 1, 8760);
+            [$chunk, $clampedChunk] = self::w67Clamp($chunk, 100, 10_000);
+            $cutoff = $now - $hours * 3600;
+            $readyCutoff = $now - 2 * $hours * 3600;
+            $age = $added > 0 && $now >= $added ? intdiv($now - $added, 3600) : 0;
+            $orphan = $binaries === 0;
+            $partOrphan = $binaries > 0 && $parts === 0;
+            $ready = \in_array($check, self::W67_READY_STATUSES, true);
+            $decision = match (true) {
+                trim($item) === '' => 0,
+                $malformed => 1,
+                $added === 0 => 2,
+                $added >= $cutoff => 3,
+                $orphan => 4,
+                $added >= $readyCutoff && $ready => 5,
+                default => 6,
+            };
+            $flags = ($added > $now ? 1 : 0) | ($orphan ? 2 : 0) | ($partOrphan ? 4 : 0) | ($ready ? 8 : 0) | ($clampedHours ? 16 : 0)
+                | ($clampedChunk ? 32 : 0) | (preg_match('/[\x80-\xff]/', $item) === 1 ? 64 : 0) | (strcspn($item, self::W67_CONTROL_BYTES) !== \strlen($item) ? 128 : 0);
+            $rows = min(1 + $binaries + $parts, self::W67_SUM_CAP);
+            $chunks = 0;
+            if ($decision === 4 || $decision === 6) {
+                $size = max(1, $chunk);
+                $chunks = intdiv($rows + $size - 1, $size);
+                $tail[15] += $rows;
+            } elseif ($decision === 3 || $decision === 5) {
+                $tail[16] += $rows;
+            }
+            if ($decision >= 2) {
+                $bound = max(0, $cutoff);
+                $minCutoff = $minCutoff === null ? $bound : min($minCutoff, $bound);
+                $tail[20] = max($tail[20], $bound);
+            }
+            $tail[$decision]++;
+            for ($b = 0; $b < 8; $b++) {
+                $tail[7 + $b] += $flags >> $b & 1;
+            }
+            $tail[17] += $chunks;
+            $tail[18] = max($tail[18], $age);
+            $out[] = $decision | $flags << 3 | min($age, 0xFFFFF) << 11 | $hours << 31 | min($chunks, 0xFFFF) << 45;
+        }
+        $tail[19] = $minCutoff ?? 0;
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    private const string W67_CONTROL_BYTES = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F";
+
+    /** Filecheck statuses the retention band keeps (W401_READY_STATUSES). */
+    private const array W67_READY_STATUSES = [0, 1, 2, 15, 16, 3, 10];
+
+    private const string W67_DIGITS = '0123456789';
+
+    private const int W67_SUM_CAP = 1 << 40;
+
+    /** A trimmed field of 1-15 digits; empty is $empty, anything else -1. */
+    private static function w67Uint(string $raw, int $empty): int
+    {
+        $value = trim($raw);
+        if ($value === '') {
+            return $empty;
+        }
+        $length = \strlen($value);
+
+        return $length <= 15 && strspn($value, self::W67_DIGITS) === $length ? (int) $value : -1;
+    }
+
+    /**
+     * $value clamped to $min..$max and whether clamping changed it; malformed (-1) is 0, unchanged.
+     *
+     * @return array{0: int, 1: bool}
+     */
+    private static function w67Clamp(int $value, int $min, int $max): array
+    {
+        if ($value < 0) {
+            return [0, false];
+        }
+        $clamped = max($min, min($max, $value));
+
+        return [$clamped, $clamped !== $value];
+    }
+
+    /**
+     * Wave 67 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'reset' clears the override, library handle and buffers, 'ffi'
+     * resolves the library (null when unavailable) and 'out' and 'lens' return `int64_t` output and
+     * length-column buffers of at least $val words.
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var FFI\CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var FFI\CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('collection_cleanup_w671', self::W67_COLLECTION_CLEANUP_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w67RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w67RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 67.1 CollectionCleanupService export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w67Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w67RustFfiState('ffi');
+            $out = self::w67RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof FFI\CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w67RustFfiState('lens', $count);
+                if (! $column instanceof FFI\CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W67_COLLECTION_CLEANUP_FFI_CDEF.)
+            $written = $ffi->nntmux_w671_collection_cleanup_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
