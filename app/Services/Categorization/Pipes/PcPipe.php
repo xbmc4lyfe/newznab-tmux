@@ -654,4 +654,256 @@ class PcPipe extends AbstractCategorizationPipe
             return null;
         }
     }
+
+    /** C signature of the Wave 66.6 {@see self::w66PcPipePlanBatch()} helper. */
+    private const string W66_PC_PIPE_PLAN_FFI_CDEF = 'int64_t nntmux_w666_pc_pipe_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 66.6 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 7.21/4.77/5.93/3.86x); see tests/Unit/RustCategorizationMiscSafetyMovieMusicPcTvPipeW66ParityTest.php.
+     */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    /** `S\d{1,3}(?:E\d{1,4})?` over a whole uppercased token. */
+    private const string W66_SEASON_PATTERN = '/\AS(\d{1,3})(?:E(\d{1,4}))?\z/';
+
+    /** Wave 66.6 flags per uppercased token: 1 Windows, 2 macOS, 4 Linux, 8 iOS, 16 Android, 32 disc image, 64 game, 128 software, 256 build, 512 console, 1024 media. */
+    private const array W66_PC_TOKENS = [
+        'WIN' => 1, 'WINDOWS' => 1, 'WIN32' => 1, 'WIN64' => 1, 'WINALL' => 1, 'X64' => 1, 'X86' => 1,
+        'MAC' => 2, 'MACOS' => 2, 'MACOSX' => 2, 'OSX' => 2, 'DMG' => 2,
+        'LINUX' => 4, 'UBUNTU' => 4, 'DEB' => 4, 'RPM' => 4,
+        'IOS' => 8, 'IPA' => 8, 'IPHONE' => 8, 'IPAD' => 8,
+        'ANDROID' => 16, 'APK' => 16,
+        'ISO' => 32, 'IMG' => 32, 'BIN' => 32, 'CUE' => 32,
+        'GOG' => 64, 'STEAM' => 64, 'CODEX' => 64, 'PLAZA' => 64, 'SKIDROW' => 64, 'RELOADED' => 64, 'FLT' => 64, 'DARKSIDERS' => 64, 'EMPRESS' => 64, 'TENOKE' => 64, 'RUNE' => 64, 'GAME' => 64,
+        'CRACK' => 128, 'CRACKED' => 128, 'KEYGEN' => 128, 'PATCH' => 128, 'SERIAL' => 128, 'PORTABLE' => 128, 'SETUP' => 128, 'INSTALLER' => 128, 'MSI' => 128, 'EXE' => 128, 'MULTILINGUAL' => 128, 'RETAIL' => 128,
+        'BUILD' => 256,
+        'PS4' => 512, 'PS5' => 512, 'XBOX' => 512, 'XBOX360' => 512, 'X360' => 512, 'NSW' => 512, 'SWITCH' => 512, 'WII' => 512, 'WIIU' => 512, '3DS' => 512, 'NDS' => 512,
+        '720P' => 1024, '1080P' => 1024, '2160P' => 1024, 'X264' => 1024, 'X265' => 1024, 'HEVC' => 1024, 'MP3' => 1024, 'FLAC' => 1024, 'EPUB' => 1024,
+    ];
+
+    /** Wave 66.6 proposals in priority order: flag bits => category. */
+    private const array W66_PC_PROPOSALS = [
+        64 => Category::PC_GAMES,
+        16 => Category::PC_PHONE_ANDROID,
+        8 => Category::PC_PHONE_IOS,
+        2 => Category::PC_MAC,
+        32 => Category::PC_ISO,
+        1 | 4 | 128 | 256 => Category::PC_0DAY,
+    ];
+
+    /**
+     * Wave 66.6 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w66_6', self::W66_PC_PIPE_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W66_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 66.6 plan batch to Rust until disabled or reset. */
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', true);
+    }
+
+    /** Route the Wave 66.6 plan batch to PHP until enabled or reset. */
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', false);
+    }
+
+    /** Restore W66_RUST_FFI_DEFAULT routing and drop the cached Wave 66.6 handle and buffer. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', null);
+        self::w66RustFfiState('reset', null);
+    }
+
+    public static function usesW66RustFfi(): bool
+    {
+        return self::w66RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w66PcPipePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 66.6 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w66Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w66RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w666_pc_pipe_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w66Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /**
+     * Batch PC pipe plan over `subject\tcategoryId\tconfidence\tmatchedBy\tcurrentCategory`, confidences in
+     * permille. Eight words per record: `[tokens, flags, proposed, mask, decision, target, extra, errors]`. Tokens are
+     * maximal ASCII alphanumeric runs of the subject compared case-insensitively; flags: W66_PC_TOKENS bits (256 also `V\d+`, 1024 also a
+     * TV season token). Proposed is the
+     * first W66_PC_PROPOSALS category whose flag bits are set (0 none). Mask: 1 successful (like evaluateResultPhp()),
+     * 2 in domain, 4 terminal (>= 950), 8 proposed equals the result category. Decision/target: 3 keeps an
+     * OTHER_HASHED current category, 1 takes a successful in-domain result, 4 keeps the current category when console or media
+     * markers appear without any PC platform,
+     * 2 moves an empty, OTHER_MISC or PC_0DAY current category to the proposal, 0 keeps the current category
+     * (default OTHER_MISC). Extra: the number of distinct platforms (flag bits 1-16). Numbers are trimmed 1-15 ASCII digits; errors: 1 invalid number, 2 not
+     * exactly five fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66PcPipePlanBatch(array $records): array
+    {
+        return self::usesW66RustFfi() ? self::w66PcPipePlanBatchNative($records) : self::w66PcPipePlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66PcPipePlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w66Words($count, implode("\0", $records), 8 * $count) ?? self::w66PcPipePlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66PcPipePlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $errors = \count($fields) === 5 ? 0 : 2;
+            $tokens = $flags = 0;
+            foreach (preg_split('/[^A-Z0-9]+/', strtoupper($fields[0]), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                $tokens++;
+                $flags |= self::W66_PC_TOKENS[$token] ?? 0;
+                if ($token[0] === 'V' && \strlen($token) > 1 && ctype_digit(substr($token, 1))) {
+                    $flags |= 256;
+                }
+                if ($token[0] === 'S' && preg_match(self::W66_SEASON_PATTERN, $token) === 1) {
+                    $flags |= 1024;
+                }
+            }
+            $proposed = 0;
+            foreach (self::W66_PC_PROPOSALS as $bits => $candidate) {
+                if (($flags & $bits) !== 0) {
+                    $proposed = $candidate;
+                    break;
+                }
+            }
+            $category = self::w66Number($fields[1] ?? '', 0, $errors);
+            $confidence = self::w66Number($fields[2] ?? '', 0, $errors);
+            $label = $fields[3] ?? '';
+            $current = self::w66Number($fields[4] ?? '', Category::OTHER_MISC, $errors);
+            $success = $confidence > 0 && ! ($category === Category::OTHER_MISC && $label === 'no_match');
+            $inDomain = $category >= Category::PC_ROOT && $category <= Category::PC_ROOT + 999;
+            [$decision, $target] = match (true) {
+                $current === Category::OTHER_HASHED => [3, $current],
+                $success && $inDomain => [1, $category],
+                ($flags & (512 | 1024)) !== 0 && ($flags & 31) === 0 => [4, $current],
+                $proposed !== 0 && ($current === 0 || $current === Category::OTHER_MISC || $current === Category::PC_0DAY) => [2, $proposed],
+                default => [0, $current],
+            };
+            $mask = ($success ? 1 : 0) | ($inDomain ? 2 : 0) | ($confidence >= 950 ? 4 : 0) | ($proposed !== 0 && $proposed === $category ? 8 : 0);
+            array_push($out, $tokens, $flags, $proposed, $mask, $decision, $target, substr_count(decbin($flags & 31), '1'), $errors);
+        }
+
+        return $out;
+    }
 }
