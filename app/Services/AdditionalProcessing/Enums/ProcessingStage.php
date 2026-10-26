@@ -414,4 +414,298 @@ enum ProcessingStage: string
 
         return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
     }
+
+    // Rust is the default only while the paired W64.6 benchmark clears 1.5x on all four metrics.
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    private const string W64_STAGE_FFI_CDEF = <<<'C'
+        int32_t nntmux_w646_processing_stage_batch(const char *strings, size_t strings_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t budget, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W64_STAGE_HEADER = 32;
+
+    private const int W64_MAX_ITEMS = 1_048_576;
+
+    /** Elapsed clamp (2^31 - 1) and budget cap (2^50). */
+    private const int W64_STAGE_ELAPSED_CAP = 2_147_483_647;
+
+    private const int W64_STAGE_BUDGET_CAP = 1_125_899_906_842_624;
+
+    /** Timeout in seconds per stage in pipeline order (unknown 0). */
+    private const array W64_STAGE_TIMEOUT = [30, 60, 30, 30, 60, 600, 1_800, 900, 1_200, 900, 60, 120, 60, 0];
+
+    /** Exact token => `case | source << 4`: backing values (0), case names (1) and labels (2). */
+    private const array W64_STAGE_TOKENS = [
+        'workspace-preparation' => 0, 'nzb-parsing' => 1, 'release-initialization' => 2, 'message-id-selection' => 3,
+        'media-source-planning' => 4, 'direct-downloads' => 5, 'archive-downloads' => 6, 'extracted-files' => 7,
+        'media-sources' => 8, 'archive-fallbacks' => 9, 'timeout-handling' => 10, 'finalization' => 11, 'workspace-cleanup' => 12,
+        'WorkspacePreparation' => 16, 'NzbParsing' => 17, 'ReleaseInitialization' => 18, 'MessageIdSelection' => 19,
+        'MediaSourcePlanning' => 20, 'DirectDownloads' => 21, 'ArchiveDownloads' => 22, 'ExtractedFiles' => 23,
+        'MediaSources' => 24, 'ArchiveFallbacks' => 25, 'TimeoutHandling' => 26, 'Finalization' => 27, 'WorkspaceCleanup' => 28,
+        'Workspace preparation' => 32, 'NZB parsing' => 33, 'Release initialization' => 34, 'Message-ID selection' => 35,
+        'Media source planning' => 36, 'Direct downloads' => 37, 'Archive downloads' => 38, 'Extracted files' => 39,
+        'Media sources' => 40, 'Archive fallbacks' => 41, 'Timeout handling' => 42, 'Workspace cleanup' => 44,
+    ];
+
+    /**
+     * Plan an ordered stage trace. Stages resolve by backing value (source 0), case name (1), label (2; the
+     * Finalization label is its case name), the backing value of `str_replace('_', '-', strtolower(trim($s)))`
+     * (3), else unknown case 13 (4); a known case is its `rankPhp()`. Elapsed seconds clamp to 0..2^31-1; a
+     * budget at or below 0 is none, else capped at 2^50. State 0 advance (rank above every earlier one, a gap
+     * when it skips a rank, so its dependency never ran), 1 repeat (equal to the highest), 2 regress (below
+     * it), 3 unknown. A known stage times out when its elapsed exceeds its timeout; a stage is over budget once
+     * the running elapsed total exceeds the budget.
+     *
+     * Layout: `[0]` count, `[1..15]` per case, `[15..20]` per source, `[20..24]` per state, `[24]` gaps, `[25]`
+     * timed out, `[26]` over budget, `[27]` total elapsed, `[28]` highest rank (-1), `[29]` first regress and
+     * `[30]` first timed-out index (-1), `[31]` FNV-1a digest; then per stage `case | source << 4 | state << 7
+     * | gap << 9 | timed out << 10 | over budget << 11 | timeout << 12 | elapsed << 23 | min(token bytes, 255)
+     * << 54`.
+     *
+     * @param  array<array-key, string>  $stages
+     * @param  array<array-key, int>  $elapsed
+     * @return list<int>
+     */
+    public static function w64ProcessingStagePlanBatch(array $stages, array $elapsed, int $budget = 0): array
+    {
+        return (self::usesW64RustFfi() ? self::w64ProcessingStagePlanBatchNative($stages, $elapsed, $budget) : null)
+            ?? self::w64ProcessingStagePlanBatchPhp($stages, $elapsed, $budget);
+    }
+
+    /**
+     * @param  array<array-key, string>  $stages
+     * @param  array<array-key, int>  $elapsed
+     * @return list<int>
+     */
+    public static function w64ProcessingStagePlanBatchPhp(array $stages, array $elapsed, int $budget = 0): array
+    {
+        $stages = array_values($stages);
+        $count = \count($stages);
+        $elapsed = self::w64Column($elapsed, $count);
+        $budget = $budget <= 0 ? -1 : min($budget, self::W64_STAGE_BUDGET_CAP);
+        $out = array_fill(0, self::W64_STAGE_HEADER, 0);
+        $out[0] = $count;
+        $out[28] = $out[29] = $out[30] = -1;
+        $digest = 2_166_136_261;
+        $rows = [];
+        $total = 0;
+        foreach ($stages as $at => $stage) {
+            $stage = (string) $stage;
+            $code = self::W64_STAGE_TOKENS[$stage] ?? null;
+            if ($code === null) {
+                $code = self::W64_STAGE_TOKENS[str_replace('_', '-', strtolower(trim($stage)))] ?? null;
+                $case = $code === null || $code >= 16 ? 13 : $code;
+                $source = $case === 13 ? 4 : 3;
+            } else {
+                $case = $code & 15;
+                $source = $code >> 4;
+            }
+            $seconds = max(0, min((int) $elapsed[$at], self::W64_STAGE_ELAPSED_CAP));
+            $timeout = self::W64_STAGE_TIMEOUT[$case];
+            $gap = 0;
+            if ($case === 13) {
+                $state = 3;
+            } elseif ($case > $out[28]) {
+                $gap = $case > $out[28] + 1 ? 1 : 0;
+                $out[28] = $case;
+                $state = 0;
+            } else {
+                $state = $case === $out[28] ? 1 : 2;
+            }
+            $timedOut = $case < 13 && $seconds > $timeout ? 1 : 0;
+            $total += $seconds;
+            $over = $budget > 0 && $total > $budget ? 1 : 0;
+            $out[1 + $case]++;
+            $out[15 + $source]++;
+            $out[20 + $state]++;
+            $out[24] += $gap;
+            $out[25] += $timedOut;
+            $out[26] += $over;
+            if ($state === 2 && $out[29] < 0) {
+                $out[29] = $at;
+            }
+            if ($timedOut === 1 && $out[30] < 0) {
+                $out[30] = $at;
+            }
+            $row = $case | $source << 4 | $state << 7 | $gap << 9 | $timedOut << 10 | $over << 11 | $timeout << 12 | $seconds << 23 | min(\strlen($stage), 255) << 54;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[27] = $total;
+        $out[31] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust plan, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $stages
+     * @param  array<array-key, int>  $elapsed
+     * @return list<int>|null
+     */
+    public static function w64ProcessingStagePlanBatchNative(array $stages, array $elapsed, int $budget = 0): ?array
+    {
+        $count = \count($stages);
+        if ($count > self::W64_MAX_ITEMS) {
+            return null;
+        }
+        [$joined, $twin] = self::w64Strings(array_values($stages));
+        $ints = pack('q*', ...self::w64Column($elapsed, $count));
+        $words = self::W64_STAGE_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w64Call($words, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w646_processing_stage_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $budget, $out, $words));
+    }
+
+    /**
+     * Route the Wave 64.6 batch plan through Rust for the rest of the process.
+     */
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    /**
+     * Route the Wave 64.6 batch plan through PHP for the rest of the process.
+     */
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /**
+     * Restore the default Wave 64.6 routing and drop the cached binding and scratch buffer.
+     */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $forced = self::w64RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run `$callback` with the Wave 64.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 64.6 routing and binding in function statics (enums cannot declare properties). No `$op` returns
+     * the forced routing (null for the default); `'set'` replaces it with `$val` and returns the previous
+     * value; `'reset'` clears the routing, binding and buffer; `'binding'` returns the cached binding and an
+     * output buffer of at least `$val` values, or null.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $enabled = $ffi = $buffer = null;
+            $capacity = 0;
+
+            return null;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w646', self::W64_STAGE_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 64.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w64Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w64RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Values NUL-joined and, when one holds a NUL, the same values joined with 0x01 so Rust finds the
+     * separators where the two differ.
+     *
+     * @param  list<int|string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w64Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
+    }
+
+    /**
+     * Values by position, cut or padded with `$pad` to `$count`.
+     *
+     * @template T of int|string
+     *
+     * @param  array<array-key, T>  $values
+     * @param  T  $pad
+     * @return list<T>
+     */
+    private static function w64Column(array $values, int $count, int|string $pad = 0): array
+    {
+        $values = array_values($values);
+
+        return \count($values) === $count ? $values : array_pad(\array_slice($values, 0, $count), $count, $pad);
+    }
 }
