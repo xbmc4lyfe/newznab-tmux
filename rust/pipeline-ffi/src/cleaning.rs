@@ -47580,3 +47580,1425 @@ pub mod w621_obfuscation_router_release_creation_extra_processing_xref {
         }
     }
 }
+
+pub mod w631_igdb_data_node_model_query_builder_irc_client_scraper {
+    //! Wave 63.1 per-item plans for DataNode, BaseModel, QueryBuilder, IRCClient and IRCScraper.
+    //! Every export follows the Wave 62.1 contract: items are NUL-joined in `blob`, or concatenated
+    //! with their byte lengths in `lens` when it is non-null; one `i64` word per item is written,
+    //! then a fixed rollup trailer. Returns the word count, `-needed` when `out_cap` (in words) is
+    //! too small, or -1 when it declines (null or misaligned `out`, null `blob` with a length,
+    //! `count` other than the number of NUL-separated items, `lens` that do not tile `blob`, or
+    //! overlapping buffers). Item fields are `|`-separated as PHP `explode('|', $item, N)` padded
+    //! with empty strings, and every helper matches its PHP reference bit for bit.
+
+    use std::collections::{HashSet, VecDeque};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_ITEMS: usize = 1 << 22;
+    const DECLINE: isize = -1;
+
+    pub const DATA_NODE_TRAILER: usize = 24;
+    pub const MODEL_TRAILER: usize = 23;
+    pub const QUERY_BUILDER_TRAILER: usize = 19;
+    pub const IRC_CLIENT_TRAILER: usize = 23;
+    pub const IRC_SCRAPER_TRAILER: usize = 27;
+
+    #[inline]
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    /// PHP `trim()` without a character list.
+    fn trim(s: &[u8]) -> &[u8] {
+        let start = s.iter().position(|&b| !is_ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|&b| !is_ws(b)).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    /// PHP `explode('|', $item, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(item: &[u8]) -> [&[u8]; N] {
+        let mut out = [&item[..0]; N];
+        let mut rest = item;
+        for slot in out.iter_mut().take(N - 1) {
+            match rest.iter().position(|&b| b == b'|') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    return out;
+                }
+            }
+        }
+        out[N - 1] = rest;
+        out
+    }
+
+    #[inline]
+    fn non_ascii(s: &[u8]) -> bool {
+        s.iter().any(|&b| b >= 0x80)
+    }
+
+    #[inline]
+    fn has_control(s: &[u8]) -> bool {
+        s.iter().any(|&b| b < 0x20 || b == 0x7f)
+    }
+
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    /// PHP `strspn($s, '0123456789', $from)`.
+    #[inline]
+    fn digits_at(s: &[u8], from: usize) -> usize {
+        s.get(from..).map_or(0, |r| r.iter().take_while(|b| b.is_ascii_digit()).count())
+    }
+
+    fn digits_value(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |a, &d| a * 10 + i64::from(d - b'0'))
+    }
+
+    /// An unsigned field of 1-15 digits after trimming; empty is `empty`, anything else -1.
+    fn uint_field(raw: &[u8], empty: i64) -> i64 {
+        let t = trim(raw);
+        if t.is_empty() {
+            return empty;
+        }
+        if t.len() <= 15 && all_digits(t) { digits_value(t) } else { -1 }
+    }
+
+    /// A signed value (optional `-`, 1-15 digits).
+    fn sint(t: &[u8]) -> Option<i64> {
+        let (neg, d) = if t.first() == Some(&b'-') { (true, &t[1..]) } else { (false, t) };
+        if d.is_empty() || d.len() > 15 || !all_digits(d) {
+            return None;
+        }
+        let v = digits_value(d);
+        Some(if neg { -v } else { v })
+    }
+
+    fn bit_length(v: i64) -> i64 {
+        if v <= 0 { 0 } else { i64::from(64 - v.leading_zeros()) }
+    }
+
+    /// `strlen((string) $v)` for a non-negative integer.
+    fn dec_len(mut v: i64) -> i64 {
+        let mut n = 1;
+        while v >= 10 {
+            v /= 10;
+            n += 1;
+        }
+        n
+    }
+
+    /// `hexdec(hash('fnv1a32', $s))`.
+    fn fnv1a32(s: &[u8]) -> i64 {
+        let mut h: u32 = 0x811c_9dc5;
+        for &b in s {
+            h ^= u32::from(b);
+            h = h.wrapping_mul(16_777_619);
+        }
+        i64::from(h)
+    }
+
+    #[inline]
+    fn is_field_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
+    }
+
+    trait Plan {
+        const TRAILER: usize;
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64;
+        fn finish(&mut self, tail: &mut [i64]);
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+    /// `out_cap` `i64`s).
+    unsafe fn run<P: Plan>(
+        mut plan: P,
+        blob: *const u8,
+        blob_len: usize,
+        lens: *const i64,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || (blob.is_null() && blob_len != 0)
+                || blob_len > isize::MAX as usize
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+                || (!lens.is_null() && !(lens as usize).is_multiple_of(std::mem::align_of::<i64>()))
+            {
+                return DECLINE;
+            }
+            let words = count + P::TRAILER;
+            if words > out_cap {
+                return -(words as isize);
+            }
+            if overlaps(blob as usize, blob_len, out as usize, words * 8)
+                || (!lens.is_null() && overlaps(lens as usize, count * 8, out as usize, words * 8))
+            {
+                return DECLINE;
+            }
+            // A null pointer is never sliced, even for an empty batch.
+            let bytes: &[u8] = if blob_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(blob, blob_len) } };
+            // `words` words, checked against `out_cap` above; disjoint from the inputs.
+            let dst = unsafe { std::slice::from_raw_parts_mut(out, words) };
+            let (rows, tail) = dst.split_at_mut(count);
+            tail.fill(0);
+            if lens.is_null() {
+                if count == 0 {
+                    if !bytes.is_empty() {
+                        return DECLINE;
+                    }
+                } else {
+                    let mut n = 0;
+                    for entry in bytes.split(|&b| b == 0) {
+                        if n >= count {
+                            return DECLINE;
+                        }
+                        rows[n] = plan.item(entry, tail);
+                        n += 1;
+                    }
+                    if n != count {
+                        return DECLINE;
+                    }
+                }
+            } else {
+                let lens: &[i64] = if count == 0 { &[] } else { unsafe { std::slice::from_raw_parts(lens, count) } };
+                let mut total = 0usize;
+                for &len in lens {
+                    let Some(next) = usize::try_from(len).ok().and_then(|l| total.checked_add(l)) else {
+                        return DECLINE;
+                    };
+                    total = next;
+                }
+                if total != bytes.len() {
+                    return DECLINE;
+                }
+                let mut offset = 0usize;
+                for (slot, &len) in rows.iter_mut().zip(lens) {
+                    let end = offset + len as usize;
+                    *slot = plan.item(&bytes[offset..end], tail);
+                    offset = end;
+                }
+            }
+            plan.finish(tail);
+            words as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // ---- DataNode ----
+
+    const DATE_KEYS: [&[u8]; 7] =
+        [b"created_at", b"updated_at", b"change_date", b"start_date", b"published_at", b"first_release_date", b"date"];
+
+    /// Optional `-`, 1-15 digits, then optionally `.` and up to 15 digits; the truncated integer.
+    fn timestamp_value(t: &[u8]) -> Option<i64> {
+        let (neg, rest) = if t.first() == Some(&b'-') { (true, &t[1..]) } else { (false, t) };
+        let int_len = digits_at(rest, 0);
+        if int_len == 0 || int_len > 15 {
+            return None;
+        }
+        let frac = &rest[int_len..];
+        if !frac.is_empty() && (frac[0] != b'.' || frac.len() > 16 || !all_digits(&frac[1..])) {
+            return None;
+        }
+        let v = digits_value(&rest[..int_len]);
+        Some(if neg { -v } else { v })
+    }
+
+    #[derive(Default)]
+    struct DataNode {
+        keys: HashSet<Vec<u8>>,
+    }
+
+    impl Plan for DataNode {
+        const TRAILER: usize = DATA_NODE_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_key, raw_tag, raw_value, raw_shape] = fields::<4>(item);
+            let key = trim(raw_key);
+            let tag = trim(raw_tag);
+            let value = trim(raw_value);
+            let shape = trim(raw_shape);
+            let tag_idx = match tag {
+                [] => 9,
+                [t] => b"ifsbnlmo".iter().position(|c| c == t).map_or(8, |p| p as i64),
+                _ => 8,
+            };
+            let kclass = if key.is_empty() {
+                0
+            } else if key.iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
+                1
+            } else if key.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_') {
+                2
+            } else {
+                3
+            };
+            let date = DATE_KEYS.contains(&key);
+            let (mut elements, mut scalars, mut lists, mut maps, mut invalid) = (0i64, 0i64, 0i64, 0i64, 0i64);
+            if !shape.is_empty() {
+                for e in shape.split(|&b| b == b',') {
+                    elements += 1;
+                    match trim(e) {
+                        [b'i' | b'f' | b's' | b'b' | b'n'] => scalars += 1,
+                        b"l" => lists += 1,
+                        b"m" => maps += 1,
+                        _ => invalid += 1,
+                    }
+                }
+            }
+            let ts = if date && tag_idx <= 2 { timestamp_value(value) } else { None };
+            let ts_class = match ts {
+                None => 0,
+                Some(v) if v < 0 => 1,
+                Some(0) => 2,
+                Some(v) if v < 946_684_800 => 3,
+                Some(v) if v < 1_893_456_000 => 4,
+                Some(_) => 5,
+            };
+            let container = tag_idx == 5 || tag_idx == 6;
+            let action = if key.is_empty() {
+                0
+            } else if tag_idx >= 8 {
+                6
+            } else if ts.is_some() {
+                1
+            } else if container {
+                if invalid > 0 {
+                    6
+                } else if tag_idx == 6 {
+                    3
+                } else if maps + lists > 0 {
+                    5
+                } else {
+                    4
+                }
+            } else if !shape.is_empty() {
+                6
+            } else {
+                2
+            };
+            let nodes = if container { maps + i64::from(tag_idx == 6) } else { 0 };
+            let mut flags = 0i64;
+            if date {
+                flags |= 1;
+            }
+            if kclass == 2 {
+                flags |= 2;
+            }
+            if non_ascii(key) || non_ascii(value) {
+                flags |= 4;
+            }
+            if has_control(value) {
+                flags |= 8;
+            }
+            if value.len() > 255 {
+                flags |= 16;
+            }
+            if scalars > 0 && maps + lists > 0 {
+                flags |= 32;
+            }
+            if !key.is_empty() && !self.keys.insert(key.to_vec()) {
+                flags |= 64;
+            }
+            if key == b"id" || key.ends_with(b"_id") {
+                flags |= 128;
+            }
+            let ts_bits = ts.map_or(0, |v| bit_length(v.abs()));
+            tail[action as usize] += 1;
+            for (b, slot) in tail[7..15].iter_mut().enumerate() {
+                *slot += flags >> b & 1;
+            }
+            tail[15] += elements;
+            tail[16] += nodes;
+            tail[17] += scalars;
+            tail[18] += lists;
+            tail[19] += invalid;
+            tail[21] = tail[21].max(elements);
+            if action == 1 {
+                tail[22] = tail[22].max(ts.unwrap_or(0));
+            }
+            if kclass == 3 {
+                tail[23] += 1;
+            }
+            action
+                | tag_idx << 3
+                | flags << 7
+                | elements.min(1023) << 15
+                | nodes.min(1023) << 25
+                | ts_bits << 35
+                | ts_class << 41
+                | kclass << 44
+                | (key.len() as i64).min(255) << 46
+                | (value.len() as i64).min(255) << 54
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[20] = self.keys.len() as i64;
+        }
+    }
+
+    // ---- BaseModel ----
+
+    const ENDPOINTS: [&[u8]; 22] = [
+        b"games",
+        b"platforms",
+        b"companies",
+        b"covers",
+        b"genres",
+        b"themes",
+        b"game_modes",
+        b"involved_companies",
+        b"release_dates",
+        b"screenshots",
+        b"artworks",
+        b"websites",
+        b"franchises",
+        b"age_ratings",
+        b"alternative_names",
+        b"platform_logos",
+        b"game_videos",
+        b"keywords",
+        b"collections",
+        b"search",
+        b"player_perspectives",
+        b"multiquery",
+    ];
+
+    /// `BaseModel::normalizeEndpointPhp()` plus flags: 1 uppercase, 2 whitespace removed,
+    /// 4 slashes collapsed, 8 outer whitespace or slashes trimmed.
+    fn normalize_endpoint(raw: &[u8]) -> (Vec<u8>, i64) {
+        let outer = |b: u8| is_ws(b) || b == b'/';
+        let start = raw.iter().position(|&b| !outer(b)).unwrap_or(raw.len());
+        let end = raw.iter().rposition(|&b| !outer(b)).map_or(start, |e| e + 1);
+        let trimmed = &raw[start..end];
+        let mut flags = if trimmed.len() != raw.len() { 8 } else { 0 };
+        let mut out = Vec::with_capacity(trimmed.len());
+        let mut prev_slash = false;
+        for &b in trimmed {
+            if b == b'/' {
+                if prev_slash {
+                    flags |= 4;
+                } else {
+                    out.push(b'/');
+                    prev_slash = true;
+                }
+            } else if is_ws(b) {
+                flags |= 2;
+            } else {
+                if b.is_ascii_uppercase() {
+                    flags |= 1;
+                }
+                out.push(b.to_ascii_lowercase());
+                prev_slash = false;
+            }
+        }
+        (out, flags)
+    }
+
+    #[derive(Default)]
+    struct Model {
+        endpoints: HashSet<Vec<u8>>,
+        keys: HashSet<Vec<u8>>,
+    }
+
+    impl Plan for Model {
+        const TRAILER: usize = MODEL_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_endpoint, raw_id, raw_fields, raw_limit, raw_offset] = fields::<5>(item);
+            let (norm, mut flags) = normalize_endpoint(raw_endpoint);
+            let ep_idx = if norm.is_empty() {
+                0
+            } else {
+                ENDPOINTS.iter().position(|e| *e == norm.as_slice()).map_or(31, |p| p as i64 + 1)
+            };
+            let bad_chars = norm.iter().any(|&b| !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'/'));
+            if bad_chars {
+                flags |= 16;
+            }
+            if norm.contains(&b'/') {
+                flags |= 32;
+            }
+            let id = uint_field(raw_id, 0);
+            let projection = trim(raw_fields);
+            let (mut count, mut wild, mut nested, mut invalid, mut dupes) = (0i64, 0i64, 0i64, 0i64, 0i64);
+            if !projection.is_empty() {
+                let mut seen: HashSet<&[u8]> = HashSet::new();
+                for raw_seg in projection.split(|&b| b == b',') {
+                    count += 1;
+                    let seg = trim(raw_seg);
+                    if seg.is_empty() {
+                        invalid += 1;
+                        continue;
+                    }
+                    if !seen.insert(seg) {
+                        dupes += 1;
+                    }
+                    let parts = seg.split(|&b| b == b'.').count();
+                    let valid = seg.iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.' || b == b'*')
+                        && seg.split(|&b| b == b'.').enumerate().all(|(k, part)| {
+                            !part.is_empty() && (!part.contains(&b'*') || (part == b"*" && k == parts - 1))
+                        });
+                    if !valid {
+                        invalid += 1;
+                        continue;
+                    }
+                    if seg == b"*" || seg.ends_with(b".*") {
+                        wild += 1;
+                    }
+                    if seg.contains(&b'.') {
+                        nested += 1;
+                    }
+                }
+            }
+            let limit = uint_field(raw_limit, 10);
+            let offset = uint_field(raw_offset, 0);
+            if limit > 500 {
+                flags |= 64;
+            }
+            if offset > 5000 {
+                flags |= 128;
+            }
+            let mut key = Vec::with_capacity(norm.len() + item.len() + 4);
+            key.extend_from_slice(&norm);
+            for part in [trim(raw_id), projection, trim(raw_limit), trim(raw_offset)] {
+                key.push(b':');
+                key.extend_from_slice(part);
+            }
+            let digest = fnv1a32(&key);
+            if !self.keys.insert(key) {
+                flags |= 256;
+            }
+            if !norm.is_empty() {
+                self.endpoints.insert(norm.clone());
+            }
+            let decision = if norm.is_empty() {
+                0
+            } else if ep_idx == 31 || bad_chars {
+                1
+            } else if id < 0 {
+                2
+            } else if invalid > 0 {
+                3
+            } else if limit < 0 || offset < 0 {
+                4
+            } else if id > 0 {
+                5
+            } else {
+                6
+            };
+            tail[decision as usize] += 1;
+            for (b, slot) in tail[7..16].iter_mut().enumerate() {
+                *slot += flags >> b & 1;
+            }
+            tail[16] += count;
+            tail[17] += wild;
+            tail[18] += invalid;
+            if decision >= 5 {
+                tail[19] += limit.clamp(1, 500);
+            }
+            tail[20] = tail[20].max(offset);
+            decision
+                | ep_idx << 3
+                | flags << 8
+                | bit_length(id) << 17
+                | count.min(63) << 23
+                | wild.min(15) << 29
+                | nested.min(63) << 33
+                | invalid.min(63) << 39
+                | dupes.min(15) << 45
+                | (digest & 0x3fff) << 49
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[21] = self.endpoints.len() as i64;
+            tail[22] = self.keys.len() as i64;
+        }
+    }
+
+    // ---- QueryBuilder ----
+
+    /// A where condition `field op value`: whether it is valid and its `(a,b,...)` value count.
+    fn where_condition(c: &[u8]) -> (bool, i64) {
+        let f = c.iter().take_while(|&&b| is_field_byte(b)).count();
+        if f == 0 {
+            return (false, 0);
+        }
+        let skip = |mut i: usize| {
+            while c.get(i) == Some(&b' ') {
+                i += 1;
+            }
+            i
+        };
+        let mut i = skip(f);
+        let rest = &c[i..];
+        if rest.starts_with(b"!=") || rest.starts_with(b">=") || rest.starts_with(b"<=") {
+            i += 2;
+        } else if matches!(rest.first(), Some(b'=' | b'<' | b'>' | b'~')) {
+            i += 1;
+        } else {
+            return (false, 0);
+        }
+        let value = &c[skip(i)..];
+        if value.is_empty() {
+            return (false, 0);
+        }
+        let values = if value.len() >= 2 && value[0] == b'(' && value[value.len() - 1] == b')' {
+            value.iter().filter(|&&b| b == b',').count() as i64 + 1
+        } else {
+            0
+        };
+        (true, values)
+    }
+
+    #[derive(Default)]
+    struct QueryBuilder;
+
+    impl Plan for QueryBuilder {
+        const TRAILER: usize = QUERY_BUILDER_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_fields, search, raw_where, raw_sort, raw_limit, raw_offset] = fields::<6>(item);
+            let projection = trim(raw_fields);
+            let conditions = trim(raw_where);
+            let sort = trim(raw_sort);
+            let limit_raw = trim(raw_limit);
+            let offset_raw = trim(raw_offset);
+            let mut flags = 0i64;
+            let mut invalid_fields = 0i64;
+            let mut field_list: Vec<&[u8]> = Vec::new();
+            if projection.is_empty() {
+                field_list.push(b"*");
+            } else {
+                for raw_seg in projection.split(|&b| b == b',') {
+                    let seg = trim(raw_seg);
+                    if seg.is_empty() {
+                        invalid_fields += 1;
+                        continue;
+                    }
+                    if !seg.iter().all(|&b| is_field_byte(b) || b == b'*') {
+                        invalid_fields += 1;
+                    }
+                    if field_list.contains(&seg) {
+                        flags |= 8;
+                    } else {
+                        field_list.push(seg);
+                    }
+                }
+            }
+            let fields_len: i64 = field_list.iter().map(|f| f.len() as i64).sum();
+            let mut length = 8 + fields_len + (field_list.len() as i64 - 1).max(0);
+            let mut segments = 1i64;
+            if !search.is_empty() {
+                flags |= 1;
+                let escapes = search.iter().filter(|&&b| b == b'\\' || b == b'"').count() as i64;
+                if escapes > 0 {
+                    flags |= 2;
+                }
+                length += 1 + 10 + search.len() as i64 + escapes;
+                segments += 1;
+            }
+            let mut invalid_where = 0i64;
+            let mut in_values = 0i64;
+            let mut where_list: Vec<&[u8]> = Vec::new();
+            if !conditions.is_empty() {
+                for raw_cond in conditions.split(|&b| b == b'&') {
+                    let cond = trim(raw_cond);
+                    if cond.is_empty() {
+                        invalid_where += 1;
+                        continue;
+                    }
+                    let (valid, values) = where_condition(cond);
+                    if valid {
+                        in_values += values;
+                        if values > 0 {
+                            flags |= 128;
+                        }
+                    } else {
+                        invalid_where += 1;
+                    }
+                    if where_list.contains(&cond) {
+                        flags |= 16;
+                    } else {
+                        where_list.push(cond);
+                    }
+                }
+            }
+            if !where_list.is_empty() {
+                let sum: i64 = where_list.iter().map(|w| w.len() as i64).sum();
+                length += 1 + 7 + sum + 3 * (where_list.len() as i64 - 1);
+                segments += 1;
+            }
+            let mut sort_invalid = false;
+            if !sort.is_empty() {
+                let (field, dir): (&[u8], Vec<u8>) = match sort.iter().rposition(|&b| b == b' ') {
+                    Some(p) => (trim(&sort[..p]), trim(&sort[p + 1..]).to_ascii_lowercase()),
+                    None => (sort, b"asc".to_vec()),
+                };
+                if dir == b"desc" {
+                    flags |= 32;
+                }
+                sort_invalid = field.is_empty() || !field.iter().all(|&b| is_field_byte(b)) || (dir != b"asc" && dir != b"desc");
+                length += 1 + 7 + field.len() as i64 + dir.len() as i64;
+                segments += 1;
+            }
+            let mut paging_invalid = false;
+            let mut limit_bits = 0;
+            if !limit_raw.is_empty() {
+                match sint(limit_raw) {
+                    Some(v) => {
+                        let eff = v.max(1);
+                        if v > 500 {
+                            flags |= 64;
+                        }
+                        limit_bits = bit_length(eff);
+                        length += 1 + 7 + dec_len(eff);
+                        segments += 1;
+                    }
+                    None => paging_invalid = true,
+                }
+            }
+            let mut offset_bits = 0;
+            if !offset_raw.is_empty() {
+                if offset_raw.len() <= 15 && all_digits(offset_raw) {
+                    let v = digits_value(offset_raw);
+                    offset_bits = bit_length(v);
+                    length += 1 + 8 + dec_len(v);
+                    segments += 1;
+                } else {
+                    paging_invalid = true;
+                }
+            }
+            if non_ascii(item) {
+                flags |= 4;
+            }
+            let status = if projection.is_empty() && search.is_empty() && conditions.is_empty() && sort.is_empty() && limit_raw.is_empty() && offset_raw.is_empty() {
+                5
+            } else if invalid_fields > 0 {
+                1
+            } else if invalid_where > 0 {
+                2
+            } else if sort_invalid {
+                3
+            } else if paging_invalid {
+                4
+            } else {
+                0
+            };
+            let unique_fields = field_list.len() as i64;
+            let unique_where = where_list.len() as i64;
+            tail[status as usize] += 1;
+            for (b, slot) in tail[6..14].iter_mut().enumerate() {
+                *slot += flags >> b & 1;
+            }
+            tail[14] += length;
+            tail[15] += unique_fields;
+            tail[16] += unique_where;
+            tail[17] = tail[17].max(length);
+            tail[18] += invalid_fields + invalid_where;
+            status
+                | flags << 3
+                | unique_fields.min(63) << 11
+                | unique_where.min(63) << 17
+                | segments.min(7) << 23
+                | length.min(65535) << 26
+                | limit_bits << 42
+                | offset_bits << 48
+                | in_values.min(255) << 54
+        }
+
+        fn finish(&mut self, _tail: &mut [i64]) {}
+    }
+
+    // ---- IRCClient ----
+
+    const IRC_COMMANDS: [&[u8]; 13] =
+        [b"PING", b"PONG", b"PRIVMSG", b"NOTICE", b"JOIN", b"PART", b"QUIT", b"KICK", b"NICK", b"MODE", b"TOPIC", b"ERROR", b"CAP"];
+
+    #[derive(Default)]
+    struct IrcClient {
+        window: VecDeque<i64>,
+        previous: Option<i64>,
+        channels: HashSet<Vec<u8>>,
+    }
+
+    impl Plan for IrcClient {
+        const TRAILER: usize = IRC_CLIENT_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_time, raw_line] = fields::<2>(item);
+            let mut flags = 0i64;
+            let time = trim(raw_time);
+            let t = if time.is_empty() {
+                None
+            } else if time.len() <= 15 && all_digits(time) {
+                Some(digits_value(time))
+            } else {
+                flags |= 32;
+                None
+            };
+            let s = if raw_line.ends_with(b"\r\n") {
+                flags |= 1;
+                &raw_line[..raw_line.len() - 2]
+            } else if raw_line.ends_with(b"\n") {
+                flags |= 2;
+                &raw_line[..raw_line.len() - 1]
+            } else {
+                raw_line
+            };
+            let len = s.len();
+            let mut i = 0;
+            let mut prefix_kind = 0i64;
+            if s.first() == Some(&b':') {
+                let end = s.iter().position(|&b| b == b' ').unwrap_or(len);
+                let prefix = &s[1..end];
+                prefix_kind = if prefix.is_empty() || end == len {
+                    3
+                } else if let Some(bang) = prefix.iter().position(|&b| b == b'!') {
+                    if prefix[bang + 1..].contains(&b'@') { 2 } else { 3 }
+                } else {
+                    1
+                };
+                i = end;
+            }
+            while i < len && s[i] == b' ' {
+                i += 1;
+            }
+            let cmd_end = s[i..].iter().position(|&b| b == b' ').map_or(len, |p| i + p);
+            let cmd = &s[i..cmd_end];
+            i = cmd_end;
+            let mut params = 0i64;
+            let mut first: Option<&[u8]> = None;
+            let mut trailing: Option<&[u8]> = None;
+            loop {
+                while i < len && s[i] == b' ' {
+                    i += 1;
+                }
+                if i >= len {
+                    break;
+                }
+                if s[i] == b':' {
+                    trailing = Some(&s[i + 1..]);
+                    break;
+                }
+                let end = s[i..].iter().position(|&b| b == b' ').map_or(len, |p| i + p);
+                params += 1;
+                if first.is_none() {
+                    first = Some(&s[i..end]);
+                }
+                i = end;
+            }
+            let mut numeric = 0i64;
+            let cmd_idx = if cmd.is_empty() {
+                0
+            } else if cmd.len() == 3 && all_digits(cmd) {
+                numeric = digits_value(cmd);
+                1
+            } else {
+                if cmd.iter().any(u8::is_ascii_lowercase) {
+                    flags |= 512;
+                }
+                IRC_COMMANDS.iter().position(|c| c.eq_ignore_ascii_case(cmd)).map_or(15, |p| p as i64 + 2)
+            };
+            let channel = first.filter(|f| f[0] == b'#' || f[0] == b'&');
+            if let Some(ch) = channel {
+                if ch.len() > 50 || ch.iter().any(|&b| b == 0x07 || b == b',') {
+                    flags |= 256;
+                } else {
+                    self.channels.insert(ch.to_ascii_lowercase());
+                }
+            }
+            let controls = s.iter().filter(|&&b| matches!(b, 0x02 | 0x03 | 0x04 | 0x0f | 0x11 | 0x16 | 0x1d | 0x1e | 0x1f)).count() as i64;
+            if controls > 0 {
+                flags |= 4;
+            }
+            if len > 8701 {
+                flags |= 8;
+            }
+            if non_ascii(s) {
+                flags |= 16;
+            }
+            let mut window = 0i64;
+            if let Some(t) = t {
+                if self.previous.is_some_and(|p| t < p) {
+                    flags |= 64;
+                    self.window.clear();
+                }
+                while self.window.front().is_some_and(|&f| f + 10 <= t) {
+                    self.window.pop_front();
+                }
+                self.window.push_back(t);
+                window = self.window.len() as i64;
+                self.previous = Some(t);
+                if window > 5 {
+                    flags |= 128;
+                }
+            }
+            let needs_pong = i64::from(cmd_idx == 2 && (trailing.is_some_and(|t| !t.is_empty()) || first.is_some()));
+            let class = if s.is_empty() {
+                0
+            } else if prefix_kind == 3 || cmd_idx == 0 || cmd_idx == 13 {
+                6
+            } else if cmd_idx == 2 || cmd_idx == 3 {
+                1
+            } else if cmd_idx == 4 || cmd_idx == 5 {
+                if channel.is_some() { 2 } else { 3 }
+            } else if cmd_idx == 1 {
+                4
+            } else if cmd_idx == 15 {
+                7
+            } else {
+                5
+            };
+            tail[class as usize] += 1;
+            for (b, slot) in tail[8..18].iter_mut().enumerate() {
+                *slot += flags >> b & 1;
+            }
+            tail[18] += needs_pong;
+            tail[19] = tail[19].max(window);
+            tail[20] += controls;
+            tail[22] += i64::from(trailing.is_some());
+            class
+                | cmd_idx << 3
+                | prefix_kind << 7
+                | flags << 9
+                | params.min(15) << 19
+                | i64::from(trailing.is_some()) << 23
+                | numeric << 24
+                | window.min(63) << 34
+                | controls.min(63) << 40
+                | (len as i64).min(16383) << 46
+                | needs_pong << 60
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[21] = self.channels.len() as i64;
+        }
+    }
+
+    // ---- IRCScraper ----
+
+    const SCRAPER_TAGS: [&[u8]; 8] = [b"DT", b"TT", b"SC", b"CT", b"RQ", b"SZ", b"FL", b"FN"];
+    const NUKE_TAGS: [&[u8]; 5] = [b"NUKED", b"UNNUKED", b"MODNUKED", b"RENUKED", b"OLDNUKE"];
+    const CATEGORIES: [(&[u8], i64); 23] = [
+        (b"tv", 1),
+        (b"movie", 2),
+        (b"x264", 2),
+        (b"x265", 2),
+        (b"bluray", 2),
+        (b"dvdr", 2),
+        (b"xvid", 2),
+        (b"mp3", 3),
+        (b"flac", 3),
+        (b"music", 3),
+        (b"mvid", 3),
+        (b"games", 4),
+        (b"ps", 4),
+        (b"xbox", 4),
+        (b"nsw", 4),
+        (b"wii", 4),
+        (b"apps", 5),
+        (b"0day", 5),
+        (b"xxx", 6),
+        (b"ebook", 7),
+        (b"books", 7),
+        (b"audiobook", 7),
+        (b"anime", 8),
+    ];
+
+    fn scraper_category(raw: &[u8]) -> i64 {
+        let c = trim(raw).to_ascii_lowercase();
+        if c.is_empty() || c == b"n/a" {
+            return 0;
+        }
+        CATEGORIES.iter().find(|(p, _)| c.starts_with(p)).map_or(15, |&(_, k)| k)
+    }
+
+    /// `[SZ: ...]` in MiB: Some(None) for N/A, None when malformed.
+    fn scraper_size(raw: &[u8]) -> Option<Option<i64>> {
+        let s = trim(raw);
+        if s.eq_ignore_ascii_case(b"n/a") {
+            return Some(None);
+        }
+        let int_len = digits_at(s, 0);
+        if int_len == 0 || int_len > 9 {
+            return None;
+        }
+        let mut i = int_len;
+        let mut frac = 0i64;
+        if s.get(i) == Some(&b'.') {
+            let frac_len = digits_at(s, i + 1);
+            if frac_len == 0 || frac_len > 6 {
+                return None;
+            }
+            for k in 0..3 {
+                frac = frac * 10 + if k < frac_len { i64::from(s[i + 1 + k] - b'0') } else { 0 };
+            }
+            i += 1 + frac_len;
+        }
+        while s.get(i) == Some(&b' ') {
+            i += 1;
+        }
+        let unit = s[i..].to_ascii_lowercase();
+        let (num, den) = match unit.as_slice() {
+            b"b" => (1, 1_048_576),
+            b"kb" | b"kib" => (1, 1024),
+            b"mb" | b"mib" => (1, 1),
+            b"gb" | b"gib" => (1024, 1),
+            b"tb" | b"tib" => (1_048_576, 1),
+            _ => return None,
+        };
+        let milli = digits_value(&s[..int_len]) * 1000 + frac;
+        Some(Some(milli * num / (1000 * den)))
+    }
+
+    #[derive(Default)]
+    struct IrcScraper {
+        titles: HashSet<Vec<u8>>,
+        sources: HashSet<Vec<u8>>,
+    }
+
+    impl Plan for IrcScraper {
+        const TRAILER: usize = IRC_SCRAPER_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let m = trim(item);
+            let prefix = match m.get(..5) {
+                Some(p) if p.eq_ignore_ascii_case(b"new: ") => 1,
+                Some(p) if p.eq_ignore_ascii_case(b"upd: ") => 2,
+                Some(p) if p.eq_ignore_ascii_case(b"nuk: ") => 3,
+                _ => 0,
+            };
+            let mut flags = 0i64;
+            let mut mask = 0i64;
+            let mut nuke = 0i64;
+            let mut values: [&[u8]; 8] = [&m[..0]; 8];
+            let mut pos = 0;
+            while let Some(off) = m[pos..].iter().position(|&b| b == b'[') {
+                let at = pos + off;
+                let name_len = m[at + 1..].iter().take_while(|b| b.is_ascii_alphabetic()).count();
+                let colon = at + 1 + name_len;
+                if !(2..=8).contains(&name_len) || m.get(colon..colon + 2) != Some(&b": "[..]) {
+                    pos = at + 1;
+                    continue;
+                }
+                let start = colon + 2;
+                let Some(close) = m[start..].iter().position(|&b| b == b']') else {
+                    flags |= 4;
+                    break;
+                };
+                let value = &m[start..start + close];
+                pos = start + close + 1;
+                let name = &m[at + 1..colon];
+                let (bit, nuke_idx) = if let Some(k) = SCRAPER_TAGS.iter().position(|t| t.eq_ignore_ascii_case(name)) {
+                    (k, 0)
+                } else if let Some(k) = NUKE_TAGS.iter().position(|t| t.eq_ignore_ascii_case(name)) {
+                    (8, k as i64 + 1)
+                } else {
+                    flags |= 8;
+                    continue;
+                };
+                if mask >> bit & 1 == 1 {
+                    flags |= 2;
+                    continue;
+                }
+                mask |= 1 << bit;
+                if bit == 8 {
+                    nuke = nuke_idx;
+                } else {
+                    values[bit] = value;
+                }
+            }
+            let title = trim(values[1]);
+            let category = if mask & 8 != 0 { scraper_category(values[3]) } else { 0 };
+            let mut invalid = false;
+            let mut mib = 0i64;
+            if mask & 32 != 0 {
+                match scraper_size(values[5]) {
+                    Some(v) => mib = v.unwrap_or(0),
+                    None => invalid = true,
+                }
+            }
+            let mut files = 0i64;
+            if mask & 64 != 0 {
+                let f = trim(values[6]);
+                if !f.eq_ignore_ascii_case(b"n/a") {
+                    if !f.is_empty() && f.len() <= 9 && all_digits(f) {
+                        files = digits_value(f);
+                    } else {
+                        invalid = true;
+                    }
+                }
+            }
+            let mut req = 0i64;
+            if mask & 16 != 0 {
+                let r = trim(values[4]);
+                if !r.eq_ignore_ascii_case(b"n/a") {
+                    match r.iter().position(|&b| b == b':') {
+                        Some(c) if (1..=12).contains(&c) && all_digits(&r[..c]) && c + 1 < r.len() => req = digits_value(&r[..c]),
+                        _ => invalid = true,
+                    }
+                }
+            }
+            if invalid {
+                flags |= 128;
+            }
+            let source = trim(values[2]);
+            if !source.is_empty() {
+                if source[0] == b'#' {
+                    flags |= 64;
+                }
+                self.sources.insert(source.to_ascii_lowercase());
+            }
+            if !title.is_empty() && !self.titles.insert(title.to_ascii_lowercase()) {
+                flags |= 1;
+            }
+            if non_ascii(m) {
+                flags |= 16;
+            }
+            if has_control(m) {
+                flags |= 32;
+            }
+            let decision = if prefix == 0 {
+                0
+            } else if mask & 0x7f != 0x7f || title.is_empty() {
+                1
+            } else if mask & 0x100 != 0 || prefix == 3 {
+                4
+            } else if prefix == 2 || flags & 1 != 0 {
+                3
+            } else {
+                2
+            };
+            tail[decision as usize] += 1;
+            for (b, slot) in tail[5..13].iter_mut().enumerate() {
+                *slot += flags >> b & 1;
+            }
+            for (b, slot) in tail[13..22].iter_mut().enumerate() {
+                *slot += mask >> b & 1;
+            }
+            if decision == 2 || decision == 3 {
+                tail[22] += mib.min(1 << 40);
+            }
+            tail[23] += files;
+            tail[26] = tail[26].max(files);
+            decision
+                | prefix << 3
+                | mask << 5
+                | nuke << 14
+                | category << 17
+                | flags << 21
+                | bit_length(mib) << 29
+                | files.min(4095) << 35
+                | bit_length(req) << 47
+                | (title.len() as i64).min(511) << 53
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[24] = self.titles.len() as i64;
+            tail[25] = self.sources.len() as i64;
+        }
+    }
+
+    macro_rules! w631_export {
+        ($(#[$doc:meta])* $name:ident => $plan:ident) => {
+            $(#[$doc])*
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out`
+            /// for `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run($plan::default(), blob, blob_len, lens, count, out, out_cap) }
+            }
+        };
+    }
+
+    w631_export!(
+        /// `DataNode::w63DataNodePlanBatch()`.
+        nntmux_w631_data_node_plan_batch => DataNode
+    );
+    w631_export!(
+        /// `BaseModel::w63ModelPlanBatch()`.
+        nntmux_w631_model_plan_batch => Model
+    );
+    w631_export!(
+        /// `QueryBuilder::w63QueryBuilderPlanBatch()`.
+        nntmux_w631_query_builder_plan_batch => QueryBuilder
+    );
+    w631_export!(
+        /// `IRCClient::w63IrcClientPlanBatch()`.
+        nntmux_w631_irc_client_plan_batch => IrcClient
+    );
+    w631_export!(
+        /// `IRCScraper::w63IrcScraperPlanBatch()`.
+        nntmux_w631_irc_scraper_plan_batch => IrcScraper
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        const EXPORTS: [(Export, usize); 5] = [
+            (nntmux_w631_data_node_plan_batch, DATA_NODE_TRAILER),
+            (nntmux_w631_model_plan_batch, MODEL_TRAILER),
+            (nntmux_w631_query_builder_plan_batch, QUERY_BUILDER_TRAILER),
+            (nntmux_w631_irc_client_plan_batch, IRC_CLIENT_TRAILER),
+            (nntmux_w631_irc_scraper_plan_batch, IRC_SCRAPER_TRAILER),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe { f(blob.as_ptr(), blob.len(), lens.as_ptr(), items.len(), out.as_mut_ptr(), out.len()) };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            if items.iter().all(|i| !i.contains(&0)) {
+                let joined = items.join(&0u8);
+                let mut nul = vec![0i64; 4096];
+                let w = unsafe { f(joined.as_ptr(), joined.len(), ptr::null(), items.len(), nul.as_mut_ptr(), nul.len()) };
+                nul.truncate(w.max(0) as usize);
+                assert_eq!(nul, out, "NUL-joined and length-column calls differ");
+            }
+            out
+        }
+
+        #[test]
+        fn w631_helpers() {
+            assert_eq!(trim(b" \t a b\0\x0b"), b"a b");
+            assert_eq!(fields::<3>(b"a|b|c|d"), [&b"a"[..], b"b", b"c|d"]);
+            assert_eq!(uint_field(b" 42 ", -1), 42);
+            assert_eq!(uint_field(b"", 10), 10);
+            assert_eq!(uint_field(b"1234567890123456", 0), -1);
+            assert_eq!(sint(b"-3"), Some(-3));
+            assert_eq!(sint(b"-"), None);
+            assert_eq!(dec_len(0), 1);
+            assert_eq!(dec_len(999), 3);
+            assert_eq!(dec_len(1000), 4);
+            assert_eq!(fnv1a32(b"abc"), 0x1a47_e90b);
+            assert_eq!(timestamp_value(b"1700000000"), Some(1_700_000_000));
+            assert_eq!(timestamp_value(b"-12.75"), Some(-12));
+            assert_eq!(timestamp_value(b"1."), Some(1));
+            assert_eq!(timestamp_value(b".5"), None);
+            assert_eq!(timestamp_value(b"1e3"), None);
+            assert_eq!(normalize_endpoint(b" /Games//Covers/ "), (b"games/covers".to_vec(), 1 | 4 | 8));
+            assert_eq!(normalize_endpoint(b"a/ /b"), (b"a/b".to_vec(), 2 | 4));
+            assert_eq!(where_condition(b"id = (1,2,3)"), (true, 3));
+            assert_eq!(where_condition(b"rating>=70"), (true, 0));
+            assert_eq!(where_condition(b"rating ! 70"), (false, 0));
+            assert_eq!(where_condition(b"x ="), (false, 0));
+            assert_eq!(scraper_size(b"1.5 GB"), Some(Some(1536)));
+            assert_eq!(scraper_size(b"700MB"), Some(Some(700)));
+            assert_eq!(scraper_size(b"512 kb"), Some(Some(0)));
+            assert_eq!(scraper_size(b"N/A"), Some(None));
+            assert_eq!(scraper_size(b"1.2345678 GB"), None);
+            assert_eq!(scraper_size(b"12 parsecs"), None);
+            assert_eq!(scraper_category(b" TV-X264 "), 1);
+            assert_eq!(scraper_category(b"N/A"), 0);
+            assert_eq!(scraper_category(b"Unknown"), 15);
+        }
+
+        #[test]
+        fn w631_known_words() {
+            let node = call(nntmux_w631_data_node_plan_batch, &[
+                b"created_at|i|1700000000|",
+                b"cover|m||i,s,m",
+                b"genres|l||i,i,i",
+                b"games|l||m,i",
+                b"Name|s|Zelda|",
+                b"|i|1|",
+                b"name|q|x|",
+                b"name|l||i,zz",
+                b"name|s|x|",
+            ]);
+            assert_eq!(node[0] & 7, 1);
+            assert_eq!(node[0] >> 41 & 7, 4);
+            assert_eq!(node[0] >> 35 & 63, 31);
+            assert_eq!(node[1] & 7, 3);
+            assert_eq!(node[1] >> 25 & 1023, 2);
+            assert_eq!(node[2] & 7, 4);
+            assert_eq!(node[3] & 7, 5);
+            assert_eq!(node[3] >> 7 & 32, 32);
+            assert_eq!(node[4] & 7, 2);
+            assert_eq!(node[4] >> 44 & 3, 2);
+            assert_eq!(node[5] & 7, 0);
+            assert_eq!(node[6] & 7, 6);
+            assert_eq!(node[7] & 7, 6);
+            assert_eq!(node[8] >> 7 & 64, 64);
+            assert_eq!(node[9 + 22], 1_700_000_000);
+
+            let model = call(nntmux_w631_model_plan_batch, &[
+                b"games|1942|name,cover.url|10|0",
+                b"/Games/|0|*|600|",
+                b"unknown|1||",
+                b"games|x",
+                b"games||name,,cover.*.url",
+                b"games|||abc",
+                b"",
+                b"games|1942|name,cover.url|10|0",
+            ]);
+            assert_eq!(model[0] & 7, 5);
+            assert_eq!(model[0] >> 3 & 31, 1);
+            assert_eq!(model[0] >> 23 & 63, 2);
+            assert_eq!(model[0] >> 33 & 63, 1);
+            assert_eq!(model[1] & 7, 6);
+            assert_eq!(model[1] >> 8 & 0x1ff, 1 | 8 | 64);
+            assert_eq!(model[2] & 7, 1);
+            assert_eq!(model[3] & 7, 2);
+            assert_eq!(model[4] & 7, 3);
+            assert_eq!(model[4] >> 39 & 63, 2);
+            assert_eq!(model[5] & 7, 4);
+            assert_eq!(model[6], (fnv1a32(b"::::") & 0x3fff) << 49);
+            assert_eq!(model[7] >> 8 & 256, 256);
+            assert_eq!(model[8 + 21], 2);
+            assert_eq!(model[8 + 22], 7);
+
+            let query = call(nntmux_w631_query_builder_plan_batch, &[
+                b"name,cover.url,name|zel\"da|id = (1,2) & rating > 50|rating desc|10|20",
+                b"",
+                b"na me|||||",
+                b"|||rating sideways||",
+                b"||x|||",
+                b"|||||-5",
+            ]);
+            let compiled = "fields name,cover.url;\nsearch \"zel\\\"da\";\nwhere id = (1,2) & rating > 50;\nsort rating desc;\nlimit 10;\noffset 20;";
+            assert_eq!(query[0] & 7, 0);
+            assert_eq!(query[0] >> 3 & 255, 1 | 2 | 8 | 32 | 128);
+            assert_eq!(query[0] >> 11 & 63, 2);
+            assert_eq!(query[0] >> 17 & 63, 2);
+            assert_eq!(query[0] >> 23 & 7, 6);
+            assert_eq!(query[0] >> 26 & 0xffff, compiled.len() as i64);
+            assert_eq!(query[0] >> 54 & 255, 2);
+            assert_eq!(query[1] & 7, 5);
+            assert_eq!(query[1] >> 26 & 0xffff, 9);
+            assert_eq!(query[2] & 7, 1);
+            assert_eq!(query[3] & 7, 3);
+            assert_eq!(query[4] & 7, 2);
+            assert_eq!(query[5] & 7, 4);
+
+            let irc = call(nntmux_w631_irc_client_plan_batch, &[
+                b"100|PING :irc.example.net\r\n",
+                b"101|:nick!user@host PRIVMSG #pre :\x02NEW\x02: hello",
+                b"102|:irc.example.net 001 me :Welcome",
+                b"103|:nick!user@host privmsg me :hi\n",
+                b"104|:bad!nohost PRIVMSG #x :y",
+                b"",
+                b"105|JOIN #a,b",
+                b"x|FOO bar",
+                b"99|PONG x",
+                b"99|PONG x",
+                b"99|PONG x",
+                b"99|PONG x",
+                b"99|PONG x",
+                b"99|PONG x",
+            ]);
+            assert_eq!(irc[0] & 7, 1);
+            assert_eq!(irc[0] >> 9 & 1, 1);
+            assert_eq!(irc[0] >> 60, 1);
+            assert_eq!(irc[1] & 7, 2);
+            assert_eq!(irc[1] >> 7 & 3, 2);
+            assert_eq!(irc[1] >> 40 & 63, 2);
+            assert_eq!(irc[2] & 7, 4);
+            assert_eq!(irc[2] >> 24 & 1023, 1);
+            assert_eq!(irc[3] & 7, 3);
+            assert_eq!(irc[3] >> 9 & 512, 512);
+            assert_eq!(irc[4] & 7, 6);
+            assert_eq!(irc[5], 0);
+            assert_eq!(irc[6] & 7, 5);
+            assert_eq!(irc[6] >> 9 & 256, 256);
+            assert_eq!(irc[7] & 7, 7);
+            assert_eq!(irc[7] >> 9 & 32, 32);
+            assert_eq!(irc[8] >> 9 & 64, 64);
+            assert_eq!(irc[13] >> 34 & 63, 6);
+            assert_eq!(irc[13] >> 9 & 128, 128);
+            assert_eq!(irc[14 + 21], 2);
+
+            let scraper = call(nntmux_w631_irc_scraper_plan_batch, &[
+                b"NEW: [DT: 2024-01-01 00:00:00] [TT: Some.Show.S01E01-GRP] [SC: #a.b.tv] [CT: TV-X264] [RQ: 123:alt.binaries.tv] [SZ: 1.5 GB] [FL: 50]",
+                b"upd: [DT: x] [TT: some.show.s01e01-grp] [SC: src] [CT: N/A] [RQ: N/A] [SZ: N/A] [FL: N/A]",
+                b"NUK: [DT: x] [TT: Other] [SC: s] [CT: XXX] [RQ: N/A] [SZ: 10 MB] [FL: 1] [MODNUKED: bad.release]",
+                b"NEW: [DT: x] [TT: Third] [SC: s] [CT: apps] [RQ: abc] [SZ: big] [FL: many]",
+                b"NEW: [DT: x] [TT: Short]",
+                b"hello [DT: x",
+                b"",
+            ]);
+            assert_eq!(scraper[0] & 7, 2);
+            assert_eq!(scraper[0] >> 5 & 0x1ff, 0x7f);
+            assert_eq!(scraper[0] >> 17 & 15, 1);
+            assert_eq!(scraper[0] >> 29 & 63, 11);
+            assert_eq!(scraper[0] >> 35 & 4095, 50);
+            assert_eq!(scraper[0] >> 47 & 63, 7);
+            assert_eq!(scraper[0] >> 21 & 64, 64);
+            assert_eq!(scraper[1] & 7, 3);
+            assert_eq!(scraper[1] >> 21 & 1, 1);
+            assert_eq!(scraper[2] & 7, 4);
+            assert_eq!(scraper[2] >> 14 & 7, 3);
+            assert_eq!(scraper[2] >> 17 & 15, 6);
+            assert_eq!(scraper[3] >> 21 & 128, 128);
+            assert_eq!(scraper[4] & 7, 1);
+            assert_eq!(scraper[5] & 7, 0);
+            assert_eq!(scraper[5] >> 21 & 4, 4);
+            assert_eq!(scraper[6], 0);
+            assert_eq!(scraper[7 + 22], 1536);
+            assert_eq!(scraper[7 + 24], 4);
+        }
+
+        #[test]
+        fn w631_exports_guard_counts_capacity_and_tail() {
+            let blob = b"a|1\0b";
+            for (export, trailer) in EXPORTS {
+                let mut out = vec![7i64; 64];
+                unsafe {
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, out.as_mut_ptr(), 64), (trailer + 2) as isize);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, out.as_mut_ptr(), trailer + 1), -((trailer + 2) as isize));
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 3, out.as_mut_ptr(), 64), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 1, out.as_mut_ptr(), 64), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 0, out.as_mut_ptr(), 64), -1);
+                    out.fill(7);
+                    assert_eq!(export(ptr::null(), 0, ptr::null(), 0, out.as_mut_ptr(), 64), trailer as isize);
+                    assert!(out[..trailer].iter().all(|&w| w == 0));
+                    assert_eq!(export(ptr::null(), 0, ptr::null(), 1, out.as_mut_ptr(), 64), (trailer + 1) as isize);
+                    assert_eq!(export(ptr::null(), 2, ptr::null(), 1, out.as_mut_ptr(), 64), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, ptr::null_mut(), 8), -1);
+                    let misaligned = (out.as_mut_ptr() as *mut u8).add(1) as *mut i64;
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, misaligned, 32), -1);
+                    let lens = [3i64, 2];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), lens.as_ptr(), 2, out.as_mut_ptr(), 64), (trailer + 2) as isize);
+                    let bad = [3i64, 3];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), bad.as_ptr(), 2, out.as_mut_ptr(), 64), -1);
+                    let negative = [-1i64, 6];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), negative.as_ptr(), 2, out.as_mut_ptr(), 64), -1);
+                    let alias = out.as_mut_ptr() as *const u8;
+                    assert_eq!(export(alias, 16, ptr::null(), 1, out.as_mut_ptr(), 64), -1);
+                }
+                let nul = call(export, &[b"a\0b", b"", b"\0"]);
+                assert_eq!(nul.len(), trailer + 3);
+                assert!(nul.iter().all(|&w| w >= 0));
+            }
+        }
+    }
+}
