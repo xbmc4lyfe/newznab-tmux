@@ -565,8 +565,7 @@ class TvdbProvider extends AbstractTvProvider
         $imdbId = '';
         $extended = $this->callQuietly(fn (TheTVDbAPI $client) => $client->series()->extended($tvdbId));
         if (\is_object($extended)) {
-            preg_match('/tt(?P<imdbid>\d{6,})$/i', (string) ($extended->getIMDBId() ?? ''), $imdb);
-            $imdbId = (string) ($imdb['imdbid'] ?? '');
+            $imdbId = self::w56TvdbImdbId((string) ($extended->getIMDBId() ?? ''));
         }
 
         $externalIds = $this->lookupExternalIds($tvdbId, $imdbId);
@@ -717,5 +716,268 @@ class TvdbProvider extends AbstractTvProvider
         $this->authorized = true;
 
         return true;
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 56.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Disabled: three paired runs missed the 1.5x uncommon gates (min common mean 2.21x, p99 2.17x; uncommon mean 1.15x, p99 1.20x); see RustTmdbTvMazeTvdbPar2AccumulatorCompactFpW56ParityTest. */
+    public const bool W56_RUST_FFI_DEFAULT = false;
+
+    public const string W56_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w564_tvdb_show_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * TVDB show rows as formatShowInfo(), formatEpisodeInfo() and alias matching see them. Each
+     * record yields five words: flags (valid aired date 1, trimmed case-insensitive title
+     * match 2, alias match 4, tt\d{6,} IMDB id 8, numbered episode 16), the IMDB digits span
+     * (offset << 32 | length, or -1), the aired Y-m-d prefix as YYYYMMDD (month 1-12 and day
+     * 1-31, else -1), the first alias whose trimmed value matches the name case-insensitively
+     * (-1) and season * 1000000 + episode for season 0-9999 and episode 1-999999 (-1).
+     *
+     * @param  list<string>  $imdbIds
+     * @param  list<string>  $aired
+     * @param  list<string>  $titles
+     * @param  list<string>  $ours
+     * @param  list<list<string>>  $aliases
+     * @param  list<int>  $seasons
+     * @param  list<int>  $episodes
+     * @return list<int>
+     */
+    public static function tvdbShowRowBatch(array $imdbIds, array $aired, array $titles, array $ours, array $aliases, array $seasons, array $episodes): array
+    {
+        return self::usesW56RustFfi()
+            ? self::tvdbShowRowBatchNative($imdbIds, $aired, $titles, $ours, $aliases, $seasons, $episodes)
+            : self::tvdbShowRowBatchPhp($imdbIds, $aired, $titles, $ours, $aliases, $seasons, $episodes);
+    }
+
+    /**
+     * Aliases travel US-joined (0x1f); a record whose aliases hold that byte sends none and
+     * has its alias word and flag computed in PHP. Any NUL byte falls back to PHP.
+     *
+     * @param  list<string>  $imdbIds
+     * @param  list<string>  $aired
+     * @param  list<string>  $titles
+     * @param  list<string>  $ours
+     * @param  list<list<string>>  $aliases
+     * @param  list<int>  $seasons
+     * @param  list<int>  $episodes
+     * @return list<int>
+     */
+    public static function tvdbShowRowBatchNative(array $imdbIds, array $aired, array $titles, array $ours, array $aliases, array $seasons, array $episodes): array
+    {
+        self::w56TvdbColumns($imdbIds, $aired, $titles, $ours, $aliases, $seasons, $episodes);
+        $count = \count($imdbIds);
+        if ($count === 0) {
+            return [];
+        }
+        $joined = [];
+        $ints = [];
+        $patch = [];
+        foreach ($aliases as $i => $list) {
+            $alias = implode("\x1f", $list);
+            if ($list !== [] && substr_count($alias, "\x1f") !== \count($list) - 1) {
+                $patch[] = $i;
+                $alias = '';
+            }
+            $joined[] = $alias;
+            $ints[] = $seasons[$i];
+            $ints[] = $episodes[$i];
+        }
+        $text = implode("\0", $imdbIds)."\0".implode("\0", $aired)."\0".implode("\0", $titles)
+            ."\0".implode("\0", $ours)."\0".implode("\0", $joined);
+        $out = self::w56TvdbCall($text, pack('P*', ...$ints), $count, 5);
+        if ($out === null) {
+            return self::tvdbShowRowBatchPhp($imdbIds, $aired, $titles, $ours, $aliases, $seasons, $episodes);
+        }
+        foreach ($patch as $i) {
+            $alias = self::w56TvdbAliasIndex($aliases[$i], trim($ours[$i]));
+            $out[$i * 5 + 3] = $alias;
+            $out[$i * 5] |= $alias >= 0 ? 4 : 0;
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param  list<string>  $imdbIds
+     * @param  list<string>  $aired
+     * @param  list<string>  $titles
+     * @param  list<string>  $ours
+     * @param  list<list<string>>  $aliases
+     * @param  list<int>  $seasons
+     * @param  list<int>  $episodes
+     * @return list<int>
+     */
+    public static function tvdbShowRowBatchPhp(array $imdbIds, array $aired, array $titles, array $ours, array $aliases, array $seasons, array $episodes): array
+    {
+        self::w56TvdbColumns($imdbIds, $aired, $titles, $ours, $aliases, $seasons, $episodes);
+        $out = [];
+        foreach ($imdbIds as $i => $imdb) {
+            $name = trim($ours[$i]);
+            $lower = strtolower($name);
+            $span = self::w56TvdbImdbSpan($imdb);
+            $date = -1;
+            if (preg_match('/\A([0-9]{4})-([0-9]{2})-([0-9]{2})/', $aired[$i], $match) === 1) {
+                [$year, $month, $day] = [(int) $match[1], (int) $match[2], (int) $match[3]];
+                $date = $month >= 1 && $month <= 12 && $day >= 1 && $day <= 31 ? $year * 10000 + $month * 100 + $day : -1;
+            }
+            $alias = self::w56TvdbAliasIndex($aliases[$i], $name);
+            [$season, $episode] = [$seasons[$i], $episodes[$i]];
+            $key = $season >= 0 && $season <= 9999 && $episode >= 1 && $episode <= 999999 ? $season * 1000000 + $episode : -1;
+            $flags = ($date >= 0 ? 1 : 0)
+                | ($name !== '' && strtolower(trim($titles[$i])) === $lower ? 2 : 0)
+                | ($alias >= 0 ? 4 : 0)
+                | ($span >= 0 ? 8 : 0)
+                | ($key >= 0 ? 16 : 0);
+            array_push($out, $flags, $span, $date, $alias, $key);
+        }
+
+        return $out;
+    }
+
+    /**
+     * The first alias whose trimmed value matches the trimmed name case-insensitively; -1 for
+     * none or a blank name.
+     *
+     * @param  list<string>  $aliases
+     */
+    private static function w56TvdbAliasIndex(array $aliases, string $name): int
+    {
+        if ($name !== '') {
+            $lower = strtolower($name);
+            foreach ($aliases as $k => $value) {
+                if (strtolower(trim($value)) === $lower) {
+                    return $k;
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    /** formatShowInfo()'s preg_match('/tt(?P<imdbid>\d{6,})$/i') capture, through the W56 toggle. */
+    private static function w56TvdbImdbId(string $raw): string
+    {
+        $span = self::usesW56RustFfi()
+            ? self::tvdbShowRowBatchNative([$raw], [''], [''], [''], [[]], [0], [0])[1]
+            : self::w56TvdbImdbSpan($raw);
+
+        return $span < 0 ? '' : substr($raw, $span >> 32, $span & 0xFFFFFFFF);
+    }
+
+    private static function w56TvdbImdbSpan(string $value): int
+    {
+        return preg_match('/tt(\d{6,})$/i', $value, $match, PREG_OFFSET_CAPTURE) === 1
+            ? ($match[1][1] << 32) | \strlen($match[1][0])
+            : -1;
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W56 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('enabled');
+        self::w56RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * Equal-length list columns, or InvalidArgumentException.
+     *
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w56TvdbColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (! array_is_list($column) || \count($column) !== $count) {
+                throw new \InvalidArgumentException('W56 batch columns must be lists of equal length.');
+            }
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: `$words` int64 words back per record. Null when the
+     * library is missing or declines a malformed frame, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w56TvdbCall(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+            $state = self::w56RustFfiState();
+            $ffi = $state['ffi'];
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w56', self::W56_FFI_CDEF) ?? false;
+                self::w56RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w56RustFfiState('out', $out);
+                self::w56RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w564_tvdb_show_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W56 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }

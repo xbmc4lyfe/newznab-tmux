@@ -8,6 +8,7 @@ use App\Support\Par2FileHashEvidence;
 use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
 use FFI;
+use FFI\CData;
 use InvalidArgumentException;
 use LengthException;
 use Throwable;
@@ -651,6 +652,7 @@ final class Par2PacketAccumulator
     public static function summarizePacketBatch(array $packets): array
     {
         return (self::usesW442RustFfi() ? self::summarizePacketBatchNative($packets) : null)
+            ?? (self::usesW56RustFfi() ? self::summarizePacketBatchW56($packets) : null)
             ?? self::summarizePacketBatchPhp($packets);
     }
 
@@ -745,5 +747,261 @@ final class Par2PacketAccumulator
         return ['packets' => $count, 'invalid' => $invalid, 'truncated' => $truncated, 'bad_marker' => $badMarker, 'bad_length' => $badLength,
             'main' => $main, 'filedesc' => $filedesc, 'filever' => $filever, 'recovery' => $recovery, 'auxiliary' => $auxiliary,
             'unknown' => $unknown, 'malformed' => $malformed, 'bytes' => $bytes, 'sets' => $sets];
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 56.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean 2.73x, p99 2.24x; uncommon mean 2.17x, p99 1.93x); see RustTmdbTvMazeTvdbPar2AccumulatorCompactFpW56ParityTest. */
+    public const bool W56_RUST_FFI_DEFAULT = true;
+
+    public const string W56_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w564_par2_packet_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** summarizePacketBatchPhp() keys by W56 packet class (1-10). */
+    private const array W56_CLASS_KEYS = [1 => 'truncated', 2 => 'bad_marker', 3 => 'bad_length', 4 => 'main', 5 => 'filedesc',
+        6 => 'filever', 7 => 'recovery', 8 => 'auxiliary', 9 => 'unknown', 10 => 'malformed'];
+
+    /**
+     * Raw PAR2 packets classified as summarizePacketBatchPhp() does, one row each. Each packet
+     * yields five words: the class (truncated 1, bad marker 2, bad length 3, Main 4, FileDesc
+     * 5, IFSC 6, recovery 7, auxiliary 8, unknown 9, malformed 10), the Main slice size or
+     * FileDesc file length (unpack('P'), else -1), the Main file count (else -1), the first
+     * earlier header-valid (class 4-10) packet with the same packet MD5 (-1) and the first
+     * accepted (class 4-8) packet of the same recovery set, itself when first (-1 when the
+     * packet is not accepted).
+     *
+     * @param  list<string>  $packets
+     * @return list<int>
+     */
+    public static function par2PacketRowBatch(array $packets): array
+    {
+        return self::usesW56RustFfi() ? self::par2PacketRowBatchNative($packets) : self::par2PacketRowBatchPhp($packets);
+    }
+
+    /**
+     * @param  list<string>  $packets
+     * @return list<int>
+     */
+    public static function par2PacketRowBatchNative(array $packets): array
+    {
+        self::w56Par2Columns($packets);
+        $count = \count($packets);
+        if ($count === 0) {
+            return [];
+        }
+
+        // Full lengths plus only the first 120 bytes of each packet (header, Main slice size and
+        // count, FileDesc length) cross; payloads stay in PHP.
+        $lens = array_map(\strlen(...), $packets);
+        $prefixes = $packets;
+        foreach ($lens as $i => $length) {
+            if ($length > 120) {
+                $prefixes[$i] = substr($packets[$i], 0, 120);
+            }
+        }
+
+        return self::w56Par2Call(implode('', $prefixes), pack('P*', ...$lens), $count, 5)
+            ?? self::par2PacketRowBatchPhp($packets);
+    }
+
+    /**
+     * @param  list<string>  $packets
+     * @return list<int>
+     */
+    public static function par2PacketRowBatchPhp(array $packets): array
+    {
+        self::w56Par2Columns($packets);
+        $out = [];
+        $digests = [];
+        $sets = [];
+        foreach ($packets as $i => $packet) {
+            $class = self::w56PacketClass($packet);
+            [$size, $files, $duplicate, $set] = [-1, -1, -1, -1];
+            if ($class === 4) {
+                $size = unpack('P', $packet, 64)[1];
+                $files = unpack('V', $packet, 72)[1];
+            } elseif ($class === 5) {
+                $size = unpack('P', $packet, 112)[1];
+            }
+            if ($class >= 4) {
+                $digest = substr($packet, 16, 16);
+                if (isset($digests[$digest])) {
+                    $duplicate = $digests[$digest];
+                } else {
+                    $digests[$digest] = $i;
+                }
+            }
+            if ($class >= 4 && $class <= 8) {
+                $set = $sets[substr($packet, 32, 16)] ??= $i;
+            }
+            array_push($out, $class, $size, $files, $duplicate, $set);
+        }
+
+        return $out;
+    }
+
+    /** summarizePacketBatchPhp()'s classification of one packet as a W56 class (1-10). */
+    private static function w56PacketClass(string $packet): int
+    {
+        $length = \strlen($packet);
+        if ($length < 64) {
+            return 1;
+        }
+        if (substr($packet, 0, 8) !== Par2Info::PACKET_MARKER) {
+            return 2;
+        }
+        /** @var array{low: int, high: int} $parts */
+        $parts = unpack('Vlow/Vhigh', $packet, 8);
+        if ($parts['high'] > 0x7FFFFFFF || $parts['low'] % 4 !== 0 || $length !== $parts['high'] * 0x100000000 + $parts['low']) {
+            return 3;
+        }
+        $type = substr($packet, 48, 16);
+        $body = $length - 64;
+
+        return match (true) {
+            $type === Par2Info::PACKET_MAIN => $body < 12 || ($body - 12) % 16 !== 0 || unpack('V', $packet, 72)[1] > intdiv($body - 12, 16) ? 10 : 4,
+            $type === Par2Info::PACKET_FILEDESC => $body < 56 ? 10 : 5,
+            $type === Par2Info::PACKET_FILEVER => $body < 16 || ($body - 16) % 20 !== 0 ? 10 : 6,
+            \in_array($type, self::W442_RECOVERY_TYPES, true) => 7,
+            \in_array($type, self::W442_AUXILIARY_TYPES, true) => 8,
+            default => 9,
+        };
+    }
+
+    /**
+     * summarizePacketBatch() from W56 packet rows: identical to summarizePacketBatchPhp().
+     *
+     * @param  array<array-key, mixed>  $packets
+     * @return array{packets: int, invalid: int, truncated: int, bad_marker: int, bad_length: int, main: int, filedesc: int, filever: int, recovery: int, auxiliary: int, unknown: int, malformed: int, bytes: int, sets: int}
+     */
+    private static function summarizePacketBatchW56(array $packets): array
+    {
+        $strings = [];
+        $bytes = 0;
+        foreach ($packets as $packet) {
+            if (\is_string($packet)) {
+                $strings[] = $packet;
+                $bytes += \strlen($packet);
+            }
+        }
+        $summary = ['packets' => \count($packets), 'invalid' => \count($packets) - \count($strings), 'truncated' => 0, 'bad_marker' => 0,
+            'bad_length' => 0, 'main' => 0, 'filedesc' => 0, 'filever' => 0, 'recovery' => 0, 'auxiliary' => 0, 'unknown' => 0,
+            'malformed' => 0, 'bytes' => $bytes, 'sets' => 0];
+        $rows = self::par2PacketRowBatchNative($strings);
+        foreach ($strings as $i => $packet) {
+            $summary[self::W56_CLASS_KEYS[$rows[$i * 5]]]++;
+            $summary['sets'] += (int) ($rows[$i * 5 + 4] === $i);
+        }
+
+        return $summary;
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W56 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('enabled');
+        self::w56RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * Equal-length list columns, or InvalidArgumentException.
+     *
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w56Par2Columns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (! array_is_list($column) || \count($column) !== $count) {
+                throw new InvalidArgumentException('W56 batch columns must be lists of equal length.');
+            }
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: `$words` int64 words back per record. Null when the
+     * library is missing or declines a malformed frame, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w56Par2Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+            $state = self::w56RustFfiState();
+            $ffi = $state['ffi'];
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w56', self::W56_FFI_CDEF) ?? false;
+                self::w56RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w56RustFfiState('out', $out);
+                self::w56RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w564_par2_packet_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W56 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }

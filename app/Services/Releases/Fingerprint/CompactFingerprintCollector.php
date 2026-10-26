@@ -13,6 +13,7 @@ use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Nzb\Par2CandidateRecoveryResult;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -1461,5 +1462,216 @@ final class CompactFingerprintCollector
 
         return ['rows' => $count, 'invalid' => $invalid, 'confirmed' => $confirmed, 'unconfirmed' => $unconfirmed,
             'header_mismatch' => $headerMismatch, 'status_mismatch' => $statusMismatch];
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 56.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Disabled: three paired runs missed the 1.5x gates (min common mean 1.35x, p99 1.27x; uncommon mean 1.25x, p99 1.17x); see RustTmdbTvMazeTvdbPar2AccumulatorCompactFpW56ParityTest. */
+    public const bool W56_RUST_FFI_DEFAULT = false;
+
+    public const string W56_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w564_compact_fingerprint_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Compact fingerprint rows: each value normalizes to a 16-byte fingerprint when it is raw
+     * binary (exactly 16 bytes, kind 1), or after trim() 32 hex digits (kind 2) or 0x/0X plus
+     * 32 hex digits (kind 3); anything else is invalid (kind 0). Each value yields four words:
+     * the kind, the fingerprint's high and low 64 bits (unpack('J2'), 0 when invalid) and the
+     * first row holding the same fingerprint, itself when first (-1 when invalid).
+     *
+     * @param  list<string>  $fingerprints
+     * @return list<int>
+     */
+    public static function fingerprintRowBatch(array $fingerprints): array
+    {
+        return self::usesW56RustFfi() ? self::fingerprintRowBatchNative($fingerprints) : self::fingerprintRowBatchPhp($fingerprints);
+    }
+
+    /**
+     * @param  list<string>  $fingerprints
+     * @return list<int>
+     */
+    public static function fingerprintRowBatchNative(array $fingerprints): array
+    {
+        self::w56FpColumns($fingerprints);
+        $count = \count($fingerprints);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w56FpCall(implode('', $fingerprints), pack('P*', ...array_map(\strlen(...), $fingerprints)), $count, 4)
+            ?? self::fingerprintRowBatchPhp($fingerprints);
+    }
+
+    /**
+     * @param  list<string>  $fingerprints
+     * @return list<int>
+     */
+    public static function fingerprintRowBatchPhp(array $fingerprints): array
+    {
+        self::w56FpColumns($fingerprints);
+        $out = [];
+        $seen = [];
+        foreach ($fingerprints as $i => $value) {
+            $binary = null;
+            $kind = 0;
+            if (\strlen($value) === 16) {
+                [$kind, $binary] = [1, $value];
+            } else {
+                $hex = trim($value);
+                $length = \strlen($hex);
+                if ($length === 34 && $hex[0] === '0' && ($hex[1] === 'x' || $hex[1] === 'X')) {
+                    [$kind, $hex] = [3, substr($hex, 2)];
+                } elseif ($length === 32) {
+                    $kind = 2;
+                }
+                if ($kind !== 0 && ctype_xdigit($hex)) {
+                    $binary = (string) hex2bin($hex);
+                }
+            }
+            if ($binary === null) {
+                array_push($out, 0, 0, 0, -1);
+
+                continue;
+            }
+            /** @var array{1: int, 2: int} $words */
+            $words = unpack('J2', $binary);
+            array_push($out, $kind, $words[1], $words[2], $seen[$binary] ??= $i);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Batch SQL parameters for fingerprint lookups: one `?` placeholder and 16-byte binary
+     * binding per distinct valid fingerprint in first-seen order, plus the invalid count.
+     *
+     * @param  list<string>  $fingerprints
+     * @return array{placeholders: string, bindings: list<string>, invalid: int}
+     */
+    public static function fingerprintSqlParameters(array $fingerprints): array
+    {
+        $rows = self::fingerprintRowBatch($fingerprints);
+        $bindings = [];
+        $invalid = 0;
+        foreach (array_keys($fingerprints) as $i) {
+            $base = $i * 4;
+            if ($rows[$base] === 0) {
+                $invalid++;
+            } elseif ($rows[$base + 3] === $i) {
+                $bindings[] = pack('J2', $rows[$base + 1], $rows[$base + 2]);
+            }
+        }
+
+        return ['placeholders' => implode(',', array_fill(0, \count($bindings), '?')), 'bindings' => $bindings, 'invalid' => $invalid];
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W56 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('enabled');
+        self::w56RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * Equal-length list columns, or InvalidArgumentException.
+     *
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w56FpColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (! array_is_list($column) || \count($column) !== $count) {
+                throw new \InvalidArgumentException('W56 batch columns must be lists of equal length.');
+            }
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: `$words` int64 words back per record. Null when the
+     * library is missing or declines a malformed frame, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w56FpCall(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+            $state = self::w56RustFfiState();
+            $ffi = $state['ffi'];
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w56', self::W56_FFI_CDEF) ?? false;
+                self::w56RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w56RustFfiState('out', $out);
+                self::w56RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w564_compact_fingerprint_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W56 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }

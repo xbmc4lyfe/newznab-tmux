@@ -530,8 +530,7 @@ class TvMazeProvider extends AbstractTvProvider
         $imdbId = '';
 
         if (! empty($show->externalIDs['imdb'])) {
-            preg_match('/tt(?P<imdbid>\d{6,})$/i', (string) $show->externalIDs['imdb'], $imdb);
-            $imdbId = (string) ($imdb['imdbid'] ?? '');
+            $imdbId = self::w56TvMazeImdbId((string) $show->externalIDs['imdb']);
         }
 
         $externalIds = $this->lookupExternalIds($tvdbId, $imdbId);
@@ -572,5 +571,223 @@ class TvMazeProvider extends AbstractTvProvider
             'firstaired' => (string) $episode->airdate,
             'summary' => (string) $episode->summary,
         ];
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 56.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean 4.19x, p99 3.69x; uncommon mean 32.55x, p99 23.47x); see RustTmdbTvMazeTvdbPar2AccumulatorCompactFpW56ParityTest. */
+    public const bool W56_RUST_FFI_DEFAULT = true;
+
+    public const string W56_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w564_tvmaze_show_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * TVMaze show rows as formatShowInfo() and candidate matching see them. Each record yields
+     * five words: flags (two-letter uppercase country 1, non-blank network 2, trimmed
+     * case-insensitive title match 4, tt\d{6,} IMDB id 8, summary with tags 16, summary with
+     * '&' 32), the IMDB digits span (offset << 32 | length, or -1), the summary length once
+     * every <...> tag is removed, the removed tag count and similar_text() of the lowercased
+     * trimmed title and name (-1 past 255 bytes).
+     *
+     * @param  list<string>  $summaries
+     * @param  list<string>  $imdbIds
+     * @param  list<string>  $countries
+     * @param  list<string>  $networks
+     * @param  list<string>  $titles
+     * @param  list<string>  $ours
+     * @return list<int>
+     */
+    public static function tvMazeShowRowBatch(array $summaries, array $imdbIds, array $countries, array $networks, array $titles, array $ours): array
+    {
+        return self::usesW56RustFfi()
+            ? self::tvMazeShowRowBatchNative($summaries, $imdbIds, $countries, $networks, $titles, $ours)
+            : self::tvMazeShowRowBatchPhp($summaries, $imdbIds, $countries, $networks, $titles, $ours);
+    }
+
+    /**
+     * @param  list<string>  $summaries
+     * @param  list<string>  $imdbIds
+     * @param  list<string>  $countries
+     * @param  list<string>  $networks
+     * @param  list<string>  $titles
+     * @param  list<string>  $ours
+     * @return list<int>
+     */
+    public static function tvMazeShowRowBatchNative(array $summaries, array $imdbIds, array $countries, array $networks, array $titles, array $ours): array
+    {
+        self::w56TvMazeColumns($summaries, $imdbIds, $countries, $networks, $titles, $ours);
+        $count = \count($summaries);
+        if ($count === 0) {
+            return [];
+        }
+        $text = implode("\0", $summaries)."\0".implode("\0", $imdbIds)."\0".implode("\0", $countries)
+            ."\0".implode("\0", $networks)."\0".implode("\0", $titles)."\0".implode("\0", $ours);
+
+        return self::w56TvMazeCall($text, '', $count, 5)
+            ?? self::tvMazeShowRowBatchPhp($summaries, $imdbIds, $countries, $networks, $titles, $ours);
+    }
+
+    /**
+     * @param  list<string>  $summaries
+     * @param  list<string>  $imdbIds
+     * @param  list<string>  $countries
+     * @param  list<string>  $networks
+     * @param  list<string>  $titles
+     * @param  list<string>  $ours
+     * @return list<int>
+     */
+    public static function tvMazeShowRowBatchPhp(array $summaries, array $imdbIds, array $countries, array $networks, array $titles, array $ours): array
+    {
+        self::w56TvMazeColumns($summaries, $imdbIds, $countries, $networks, $titles, $ours);
+        $out = [];
+        foreach ($summaries as $i => $summary) {
+            $title = trim($titles[$i]);
+            $name = trim($ours[$i]);
+            $span = self::w56TvMazeImdbSpan($imdbIds[$i]);
+            $tags = 0;
+            $visible = \strlen((string) preg_replace('/<[^>]*>/', '', $summary, -1, $tags));
+            $flags = (preg_match('/\A[A-Z]{2}\z/', $countries[$i]) === 1 ? 1 : 0)
+                | (trim($networks[$i]) !== '' ? 2 : 0)
+                | ($name !== '' && strtolower($title) === strtolower($name) ? 4 : 0)
+                | ($span >= 0 ? 8 : 0)
+                | ($tags > 0 ? 16 : 0)
+                | (str_contains($summary, '&') ? 32 : 0);
+            array_push(
+                $out,
+                $flags,
+                $span,
+                $visible,
+                $tags,
+                \strlen($title) > 255 || \strlen($name) > 255 ? -1 : similar_text(strtolower($title), strtolower($name)),
+            );
+        }
+
+        return $out;
+    }
+
+    /** formatShowInfo()'s preg_match('/tt(?P<imdbid>\d{6,})$/i') capture, through the W56 toggle. */
+    private static function w56TvMazeImdbId(string $raw): string
+    {
+        $span = self::usesW56RustFfi()
+            ? self::tvMazeShowRowBatchNative([''], [$raw], [''], [''], [''], [''])[1]
+            : self::w56TvMazeImdbSpan($raw);
+
+        return $span < 0 ? '' : substr($raw, $span >> 32, $span & 0xFFFFFFFF);
+    }
+
+    private static function w56TvMazeImdbSpan(string $value): int
+    {
+        return preg_match('/tt(\d{6,})$/i', $value, $match, PREG_OFFSET_CAPTURE) === 1
+            ? ($match[1][1] << 32) | \strlen($match[1][0])
+            : -1;
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W56 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('enabled');
+        self::w56RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * Equal-length list columns, or InvalidArgumentException.
+     *
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w56TvMazeColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (! array_is_list($column) || \count($column) !== $count) {
+                throw new \InvalidArgumentException('W56 batch columns must be lists of equal length.');
+            }
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: `$words` int64 words back per record. Null when the
+     * library is missing or declines a malformed frame, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w56TvMazeCall(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+            $state = self::w56RustFfiState();
+            $ffi = $state['ffi'];
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w56', self::W56_FFI_CDEF) ?? false;
+                self::w56RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w56RustFfiState('out', $out);
+                self::w56RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w564_tvmaze_show_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W56 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }
