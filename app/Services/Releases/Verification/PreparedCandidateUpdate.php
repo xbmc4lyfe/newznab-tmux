@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
 use Closure;
 use DateTimeInterface;
+use FFI;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Query\Builder;
 use LogicException;
@@ -272,5 +274,263 @@ final class PreparedCandidateUpdate
             'next_attempt_count' => $slots[3],
             'reason' => self::W396_REASONS[$slots[4]],
         ];
+    }
+
+    /** C signature of the Wave 63.5 {@see self::w63PreparedUpdatePlanBatch()} helper. */
+    private const string W63_PREPARED_UPDATE_PLAN_FFI_CDEF = 'int64_t nntmux_w635_prepared_update_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 63.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 5.13/5.20/6.67/6.67x); see tests/Unit/RustVerificationPolicyPar2ProofPayloadUpdateResetW63ParityTest.php.
+     */
+    public const bool W63_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 63.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w63RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w63_5', self::W63_PREPARED_UPDATE_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W63_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 63.5 plan batch to Rust until disabled or reset. */
+    public static function enableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', true);
+    }
+
+    /** Route the Wave 63.5 plan batch to PHP until enabled or reset. */
+    public static function disableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', false);
+    }
+
+    /** Restore W63_RUST_FFI_DEFAULT routing and drop the cached Wave 63.5 handle and buffer. */
+    public static function resetW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', null);
+        self::w63RustFfiState('reset', null);
+    }
+
+    public static function usesW63RustFfi(): bool
+    {
+        return self::w63RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w63PreparedUpdatePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW63RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w63RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w63RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 63.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w63Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w63RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w635_prepared_update_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w63Number(string $field, ?int $default, int &$flags): ?int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /**
+     * Batch prepared candidate update plan over
+     * `current\ttarget\tattempts\tmax_attempts\tdigest\tprevious_digest\tdeclared_bytes\tverified_bytes\treason\tnext_attempt`.
+     * Ten words per record: `[current, target, allowed, reason, next_attempt_count, shape, digest_state, digest_changed,
+     * size_state, flags]`. Statuses are trimmed W396_STATUSES names (ASCII case-insensitive) or one digit 0-6, else -1.
+     * Numbers are trimmed 1-15 ASCII digits (attempts default 0, max attempts 5; invalid sets flag 1). The transition
+     * follows validateUpdateTransitionPhp() with reasons coded in W396_REASONS order; the shape follows
+     * classifyUpdateShapePhp() for a non-empty trimmed reason and next attempt. The digest is 0 empty, 1 64 lowercase
+     * hex digits, 2 64 hex digits with uppercase, 3 invalid; it changed when valid and a non-empty previous digest
+     * differs ASCII case-insensitively. Sizes are 0 unknown, 1 equal, 2 verified below declared, 3 above. Flags: 1
+     * invalid number or next attempt, 2 not exactly ten fields, 4 unknown status, 8 invalid digest, 16 digest change
+     * without a verifying or ready target, 32 reason over 255 bytes, 64 retry without next attempt, 128 next attempt
+     * without a retry target, 256 attempts exhausted.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w63PreparedUpdatePlanBatch(array $records): array
+    {
+        return self::usesW63RustFfi() ? self::w63PreparedUpdatePlanBatchNative($records) : self::w63PreparedUpdatePlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w63PreparedUpdatePlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w63Words($count, implode("\0", $records), 10 * $count) ?? self::w63PreparedUpdatePlanBatchPhp($records);
+    }
+
+    /** W396_STATUSES codes by name. */
+    private const array W63_STATUS_CODES = ['waiting_upload' => 0, 'verifying' => 1, 'ready' => 2, 'retry' => 3, 'published' => 4, 'rejected' => 5, 'expired' => 6];
+
+    /** W396_REASONS codes by name. */
+    private const array W63_REASON_CODES = ['none' => 0, 'unknown_status' => 1, 'terminal_current' => 2, 'unchanged' => 3, 'not_permitted' => 4, 'attempts_exhausted' => 5];
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w63PreparedUpdatePlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 10 ? 0 : 2;
+            $current = self::w63Status($fields[0], $flags);
+            $target = self::w63Status($fields[1] ?? '', $flags);
+            $attempts = (int) self::w63Number($fields[2] ?? '', 0, $flags);
+            $transition = self::validateUpdateTransitionPhp($current, $target, $attempts, (int) self::w63Number($fields[3] ?? '', 5, $flags));
+            $note = trim($fields[8] ?? '');
+            $next = trim($fields[9] ?? '');
+            $shape = self::classifyUpdateShapePhp($note !== '', $next !== '');
+            if (\strlen($note) > 255) {
+                $flags |= 32;
+            }
+            if ($next !== '' && (\strlen($next) > 15 || strspn($next, '0123456789') !== \strlen($next))) {
+                $flags |= 1;
+            }
+            $digest = trim($fields[4] ?? '');
+            $digestState = match (true) {
+                $digest === '' => 0,
+                \strlen($digest) !== 64 || strspn($digest, '0123456789abcdefABCDEF') !== 64 => 3,
+                strpbrk($digest, 'ABCDEF') !== false => 2,
+                default => 1,
+            };
+            if ($digestState === 3) {
+                $flags |= 8;
+            }
+            $previous = trim($fields[5] ?? '');
+            $changed = ($digestState === 1 || $digestState === 2) && $previous !== '' && strcasecmp($previous, $digest) !== 0;
+            if ($changed && $target !== 1 && $target !== 2) {
+                $flags |= 16;
+            }
+            $declared = self::w63Number($fields[6] ?? '', null, $flags);
+            $verified = self::w63Number($fields[7] ?? '', null, $flags);
+            $sizeState = $declared === null || $verified === null ? 0 : match ($verified <=> $declared) {
+                0 => 1,
+                -1 => 2,
+                default => 3,
+            };
+            if ($target === 3 && $next === '') {
+                $flags |= 64;
+            }
+            if ($next !== '' && $target !== 3) {
+                $flags |= 128;
+            }
+            if ($transition['attempts_exhausted']) {
+                $flags |= 256;
+            }
+            array_push($out, $current, $target, $transition['allowed'] ? 1 : 0, self::W63_REASON_CODES[$transition['reason']], $transition['next_attempt_count'], $shape, $digestState, $changed ? 1 : 0, $sizeState, $flags);
+        }
+
+        return $out;
+    }
+
+    /** A trimmed status name (ASCII case-insensitive) or single digit 0-6 as its code; else -1 with bit 4. */
+    private static function w63Status(string $field, int &$flags): int
+    {
+        $text = strtolower(trim($field));
+        if (\strlen($text) === 1 && strspn($text, '0123456') === 1) {
+            return (int) $text;
+        }
+        if (isset(self::W63_STATUS_CODES[$text])) {
+            return self::W63_STATUS_CODES[$text];
+        }
+        $flags |= 4;
+
+        return -1;
     }
 }

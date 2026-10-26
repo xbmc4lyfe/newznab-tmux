@@ -50159,3 +50159,1135 @@ mod wave62_5_steam_tmdb_trakt_turnstile_release_search {
         }
     }
 }
+
+/// Wave 63.5: batch plans for `CollectionReleasePolicy`, `Par2ProofIdentity`, `PayloadIdentityResolver`,
+/// `PreparedCandidateUpdate` and `VerificationResetService` over NUL-joined, tab-separated records.
+mod wave63_5_verification_policy_par2_proof_payload_update_reset {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Plan callback: record bytes and its output words.
+    type Plan = fn(&[u8], &mut [i64]);
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// 1-`max` ASCII digits as an integer; `max` is at most 18.
+    fn digits(field: &[u8], max: usize) -> Option<i64> {
+        if field.is_empty() || field.len() > max {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// Trimmed 1-15 digits; empty is `None`, anything else sets bit 1 and is also `None`.
+    fn number(field: &[u8], flags: &mut i64) -> Option<i64> {
+        match trim(field) {
+            b"" => None,
+            text => digits(text, 15).or_else(|| {
+                *flags |= 1;
+                None
+            }),
+        }
+    }
+
+    /// `data` split on `separator` like `<[u8]>::split()`, searching a word at a time.
+    fn split_on(data: &[u8], separator: u8) -> impl Iterator<Item = &[u8]> {
+        let mut rest = Some(data);
+        std::iter::from_fn(move || {
+            let current = rest?;
+            match memchr(separator, current) {
+                Some(at) => {
+                    rest = Some(&current[at + 1..]);
+                    Some(&current[..at])
+                }
+                None => {
+                    rest = None;
+                    Some(current)
+                }
+            }
+        })
+    }
+
+    /// Up to `N` fields split on `separator` (missing fields empty) and the total field count.
+    fn fields<const N: usize>(record: &[u8], separator: u8) -> ([&[u8]; N], usize) {
+        let mut fields: [&[u8]; N] = [b""; N];
+        let mut total = 0usize;
+        for field in split_on(record, separator) {
+            if total < N {
+                fields[total] = field;
+            }
+            total += 1;
+        }
+        (fields, total)
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records, writing
+    /// `width` words per record straight into `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        width: usize,
+        plan: Plan,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(records) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = records.len() * width;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            for (record, slot) in records.iter().zip(words.chunks_exact_mut(width)) {
+                plan(record, slot);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Whether `name` ends in `.par2` (ASCII case-insensitive).
+    fn is_par2(name: &[u8]) -> bool {
+        name.len() >= 5 && name[name.len() - 5..].eq_ignore_ascii_case(b".par2")
+    }
+
+    /// `CollectionReleasePolicy::w63CollectionPolicyPlanBatch()`: twelve words per record.
+    fn collection_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<13>(record, b'\t');
+        let mut flags = if total_fields == 13 { 0 } else { 2 };
+        let total = number(f[0], &mut flags).unwrap_or(0);
+        let mut available = number(f[1], &mut flags).unwrap_or(0);
+        let age = number(f[2], &mut flags).unwrap_or(0);
+        let min_age = number(f[3], &mut flags).unwrap_or(0);
+        let max_age = number(f[4], &mut flags).unwrap_or(0);
+        let min_completion = number(f[5], &mut flags).unwrap_or(950);
+        let bytes = number(f[6], &mut flags).unwrap_or(0);
+        let min_size = number(f[7], &mut flags).unwrap_or(0);
+        let max_size = number(f[8], &mut flags).unwrap_or(0);
+        let min_files = number(f[9], &mut flags).unwrap_or(0);
+        if available > total {
+            available = total;
+            flags |= 4;
+        }
+        let permille = if total > 0 {
+            available * 1000 / total
+        } else {
+            0
+        };
+        let age_state = if age < min_age {
+            0
+        } else if max_age > 0 && age > max_age {
+            2
+        } else {
+            1
+        };
+        if max_age > 0 && max_age < min_age {
+            flags |= 64;
+        }
+        let met = total > 0 && permille >= min_completion.min(1000);
+        let action = match (age_state, met) {
+            (0, _) => 0,
+            (_, true) => 1,
+            (1, false) => 0,
+            _ => 2,
+        };
+
+        let mut names: Vec<&[u8]> = Vec::new();
+        let mut empty_name = false;
+        if !f[10].is_empty() {
+            for name in split_on(f[10], b'|') {
+                if name.is_empty() {
+                    empty_name = true;
+                } else {
+                    names.push(name);
+                }
+            }
+        }
+        let listed = names.len();
+        names.sort_unstable();
+        names.dedup();
+        if names.len() != listed {
+            flags |= 16;
+        }
+        if empty_name {
+            flags |= 32;
+        }
+        let files = names.len() as i64;
+        let par2 = names.iter().filter(|name| is_par2(name)).count() as i64;
+
+        let source = trim(f[11]);
+        let mode = trim(f[12]);
+        let spot_check = mode.eq_ignore_ascii_case(b"spot_check");
+        if !mode.is_empty() && !spot_check && !mode.eq_ignore_ascii_case(b"full") {
+            flags |= 8;
+        }
+        let gate = if source.eq_ignore_ascii_case(b"import") {
+            0
+        } else if spot_check {
+            1
+        } else {
+            2
+        };
+        let rejection = if gate == 0 {
+            0
+        } else if gate == 2 && (files == 0 || empty_name) {
+            5
+        } else if bytes < min_size {
+            1
+        } else if max_size > 0 && bytes > max_size {
+            2
+        } else if files < min_files {
+            3
+        } else if files > 0 && par2 == files {
+            4
+        } else {
+            0
+        };
+        out.copy_from_slice(&[
+            total,
+            available,
+            permille,
+            age_state,
+            i64::from(met),
+            action,
+            files,
+            par2,
+            gate,
+            rejection,
+            i64::from(action == 1 && rejection == 0),
+            flags,
+        ]);
+    }
+
+    /// Hex digit values; uppercase `A-F` also set 0x10 and other bytes are 0x80.
+    const HEX: [u8; 256] = {
+        let mut table = [0x80u8; 256];
+        let mut at = 0;
+        while at < 10 {
+            table[b'0' as usize + at] = at as u8;
+            at += 1;
+        }
+        at = 0;
+        while at < 6 {
+            table[b'a' as usize + at] = 10 + at as u8;
+            table[b'A' as usize + at] = 0x10 | (10 + at as u8);
+            at += 1;
+        }
+        table
+    };
+
+    /// 32 ASCII hex digits as their value and whether any is uppercase.
+    fn hex32(text: &[u8]) -> Option<(u128, bool)> {
+        let text: &[u8; 32] = text.try_into().ok()?;
+        let (mut value, mut seen) = (0u128, 0u8);
+        for &b in text {
+            let digit = HEX[usize::from(b)];
+            seen |= digit;
+            value = value << 4 | u128::from(digit & 0x0f);
+        }
+        (seen & 0x80 == 0).then_some((value, seen & 0x10 != 0))
+    }
+
+    /// Comma-separated, trimmed 32-hex items of a non-empty field; invalid items set `invalid_flag`
+    /// and `invalid`, and items with uppercase hex set bit 64.
+    fn hex_list(
+        field: &[u8],
+        out: &mut Vec<u128>,
+        invalid_flag: i64,
+        flags: &mut i64,
+        invalid: &mut bool,
+    ) {
+        if field.is_empty() {
+            return;
+        }
+        for item in split_on(field, b',') {
+            match hex32(trim(item)) {
+                Some((value, upper)) => {
+                    if upper {
+                        *flags |= 64;
+                    }
+                    out.push(value);
+                }
+                None => {
+                    *flags |= invalid_flag;
+                    *invalid = true;
+                }
+            }
+        }
+    }
+
+    /// Sorts and deduplicates `ids`, setting bit 32 when duplicates were dropped.
+    fn unique(ids: &mut Vec<u128>, flags: &mut i64) {
+        let listed = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() != listed {
+            *flags |= 32;
+        }
+    }
+
+    /// `Par2ProofIdentity::w63Par2ProofPlanBatch()`: ten words per record.
+    fn par2_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<9>(record, b'\t');
+        let mut flags = if total_fields == 9 { 0 } else { 2 };
+        let set = trim(f[0]);
+        let set_state = if set.is_empty() {
+            0
+        } else if let Some((_, upper)) = hex32(set) {
+            if upper {
+                flags |= 64;
+            }
+            1
+        } else {
+            2
+        };
+        let block_size = number(f[1], &mut flags).unwrap_or(0);
+        let rec_count = number(f[2], &mut flags).unwrap_or(0);
+        let mut invalid_id = false;
+        let (mut recovery, mut other, mut descriptors, mut checksums) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        hex_list(f[3], &mut recovery, 4, &mut flags, &mut invalid_id);
+        hex_list(f[4], &mut other, 4, &mut flags, &mut invalid_id);
+        hex_list(f[5], &mut descriptors, 4, &mut flags, &mut invalid_id);
+        hex_list(f[6], &mut checksums, 4, &mut flags, &mut invalid_id);
+        let mut hashes = Vec::new();
+        let mut invalid_hash = false;
+        hex_list(f[7], &mut hashes, 8, &mut flags, &mut invalid_hash);
+        let mut slices = 0i64;
+        if !f[8].is_empty() {
+            for item in split_on(f[8], b',') {
+                match digits(trim(item), 9) {
+                    Some(value) => slices += value,
+                    None => flags |= 16,
+                }
+            }
+        }
+        let (recovery_len, listed) = (recovery.len(), recovery.len() + other.len());
+        let mut ids = recovery;
+        ids.extend_from_slice(&other);
+        ids.sort_unstable();
+        ids.dedup();
+        unique(&mut descriptors, &mut flags);
+        unique(&mut checksums, &mut flags);
+        let class = if set_state != 1 || block_size < 1 || rec_count < 1 {
+            1
+        } else if invalid_id {
+            6
+        } else if recovery_len as i64 != rec_count {
+            2
+        } else if ids.len() != listed {
+            3
+        } else if ids != descriptors || ids != checksums {
+            4
+        } else if invalid_hash || hashes.len() != descriptors.len() {
+            5
+        } else {
+            0
+        };
+        out.copy_from_slice(&[
+            set_state,
+            block_size,
+            recovery_len as i64,
+            ids.len() as i64,
+            descriptors.len() as i64,
+            checksums.len() as i64,
+            hashes.len() as i64,
+            slices,
+            class,
+            flags,
+        ]);
+    }
+
+    /// `PayloadIdentityResolver::W442_NOISE_PATTERN` words.
+    const NOISE: [&[u8]; 7] = [
+        b"sample",
+        b"proof",
+        b"thumb",
+        b"thumbs",
+        b"sub",
+        b"subs",
+        b"subtitles",
+    ];
+
+    /// `[._\-\s]` with PCRE's default `\s` (space, tab, LF, VT, FF, CR).
+    fn is_noise_separator(byte: u8) -> bool {
+        matches!(
+            byte,
+            b'.' | b'_' | b'-' | b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'
+        )
+    }
+
+    /// Whether some separator-delimited run of `name` is a noise word (ASCII case-insensitive).
+    fn is_noise(name: &[u8]) -> bool {
+        name.split(|&b| is_noise_separator(b))
+            .any(|run| NOISE.iter().any(|word| run.eq_ignore_ascii_case(word)))
+    }
+
+    /// `name` without a final `.` plus 1-5 ASCII alphanumerics (a leading dot is kept).
+    fn strip_extension(name: &[u8]) -> &[u8] {
+        match name.iter().rposition(|&b| b == b'.') {
+            Some(dot)
+                if dot > 0
+                    && (1..=5).contains(&(name.len() - dot - 1))
+                    && name[dot + 1..].iter().all(u8::is_ascii_alphanumeric) =>
+            {
+                &name[..dot]
+            }
+            _ => name,
+        }
+    }
+
+    /// A 16+ byte ASCII alphanumeric stem that is all hex or switches between digits and letters 4+ times.
+    fn is_gibberish(stem: &[u8]) -> bool {
+        stem.len() >= 16
+            && stem.iter().all(u8::is_ascii_alphanumeric)
+            && (stem.iter().all(u8::is_ascii_hexdigit)
+                || stem
+                    .windows(2)
+                    .filter(|pair| pair[0].is_ascii_digit() != pair[1].is_ascii_digit())
+                    .count()
+                    >= 4)
+    }
+
+    /// `PayloadIdentityResolver::w63PayloadIdentityPlanBatch()`: ten words per record.
+    fn payload_plan(record: &[u8], out: &mut [i64]) {
+        let hints = if record.is_empty() {
+            0
+        } else {
+            split_on(record, b'\t').count()
+        };
+        if hints > 4096 {
+            out.copy_from_slice(&[hints as i64, 0, 0, 0, 0, 0, -1, 0, 0, 1]);
+            return;
+        }
+        let (mut invalid, mut noise, mut gibberish, mut candidates) = (0i64, 0i64, 0i64, 0i64);
+        let (mut best, mut best_index, mut flags) = (0i64, -1i64, 0i64);
+        let mut keys: Vec<u8> = Vec::new();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let iter = (!record.is_empty())
+            .then(|| split_on(record, b'\t'))
+            .into_iter()
+            .flatten();
+        for (index, hint) in iter.enumerate() {
+            let Some(bar) = hint.iter().position(|&b| b == b'|') else {
+                invalid += 1;
+                flags |= 2;
+                continue;
+            };
+            let source = trim(&hint[..bar]);
+            let authority = [&b"subject"[..], b"nfo", b"yenc", b"par2"]
+                .iter()
+                .position(|name| source.eq_ignore_ascii_case(name))
+                .map_or(0, |at| at as i64 + 1);
+            if authority == 0 {
+                invalid += 1;
+                flags |= 2;
+                continue;
+            }
+            let name = &hint[bar + 1..];
+            if name.is_empty() {
+                invalid += 1;
+                flags |= 4;
+                continue;
+            }
+            if name.iter().any(|&b| b >= 0x80) {
+                flags |= 8;
+            }
+            if is_noise(name) {
+                noise += 1;
+                continue;
+            }
+            let stem = strip_extension(name);
+            let start = keys.len();
+            for &b in stem {
+                if b.is_ascii_alphanumeric() {
+                    keys.push(b.to_ascii_lowercase());
+                } else if b >= 0x80 {
+                    keys.push(b);
+                }
+            }
+            if keys.len() == start {
+                gibberish += 1;
+                flags |= 16;
+                continue;
+            }
+            if is_gibberish(stem) {
+                keys.truncate(start);
+                gibberish += 1;
+                continue;
+            }
+            candidates += 1;
+            if authority > best {
+                best = authority;
+                best_index = index as i64;
+                keys.drain(..start);
+                ranges.clear();
+                ranges.push((0, keys.len()));
+            } else if authority == best {
+                ranges.push((start, keys.len()));
+            } else {
+                keys.truncate(start);
+            }
+        }
+        ranges.sort_unstable_by(|a, b| keys[a.0..a.1].cmp(&keys[b.0..b.1]));
+        ranges.dedup_by(|a, b| keys[a.0..a.1] == keys[b.0..b.1]);
+        let distinct = ranges.len() as i64;
+        let resolution = match (candidates, distinct) {
+            (0, _) => 0,
+            (_, 1) => 1,
+            _ => 2,
+        };
+        out.copy_from_slice(&[
+            hints as i64,
+            invalid,
+            noise,
+            gibberish,
+            candidates,
+            best,
+            best_index,
+            distinct,
+            resolution,
+            flags,
+        ]);
+    }
+
+    /// `PreparedCandidateUpdate::W396_STATUSES` names in code order.
+    const STATUSES: [&[u8]; 7] = [
+        b"waiting_upload",
+        b"verifying",
+        b"ready",
+        b"retry",
+        b"published",
+        b"rejected",
+        b"expired",
+    ];
+
+    /// A trimmed status name (ASCII case-insensitive) or single digit 0-6 as its code; else -1 with bit 4.
+    fn status(field: &[u8], flags: &mut i64) -> i64 {
+        let text = trim(field);
+        if let [digit @ b'0'..=b'6'] = text {
+            return i64::from(digit - b'0');
+        }
+        match STATUSES
+            .iter()
+            .position(|name| text.eq_ignore_ascii_case(name))
+        {
+            Some(code) => code as i64,
+            None => {
+                *flags |= 4;
+                -1
+            }
+        }
+    }
+
+    /// `PreparedCandidateUpdate::W396_TRANSITIONS`.
+    fn permitted(current: i64, target: i64) -> bool {
+        matches!(
+            (current, target),
+            (0, 1 | 6) | (1, 2 | 3 | 5 | 6) | (2, 3 | 4 | 5) | (3, 1 | 5 | 6)
+        )
+    }
+
+    /// 64 ASCII hex digits: 1 all lowercase, 2 with uppercase, else 3 (0 when empty).
+    fn digest_state(text: &[u8]) -> i64 {
+        if text.is_empty() {
+            0
+        } else if text.len() != 64 || !text.iter().all(u8::is_ascii_hexdigit) {
+            3
+        } else if text.iter().any(u8::is_ascii_uppercase) {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// `PreparedCandidateUpdate::w63PreparedUpdatePlanBatch()`: ten words per record.
+    fn update_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<10>(record, b'\t');
+        let mut flags = if total_fields == 10 { 0 } else { 2 };
+        let current = status(f[0], &mut flags);
+        let target = status(f[1], &mut flags);
+        let attempts = number(f[2], &mut flags).unwrap_or(0);
+        let max_attempts = number(f[3], &mut flags).unwrap_or(5);
+        let exhausted = attempts >= max_attempts.max(1);
+        let reason = if current < 0 || target < 0 {
+            1
+        } else if current > 3 {
+            2
+        } else if current == target {
+            3
+        } else if !permitted(current, target) {
+            4
+        } else if (target == 1 || target == 3) && exhausted {
+            5
+        } else {
+            0
+        };
+        let next_attempts = if reason == 0 && target == 1 {
+            attempts + 1
+        } else {
+            attempts
+        };
+        let mut shape = 0;
+        let note = trim(f[8]);
+        if !note.is_empty() {
+            shape |= 1;
+        }
+        if note.len() > 255 {
+            flags |= 32;
+        }
+        let next = trim(f[9]);
+        if !next.is_empty() {
+            shape |= 2;
+            if digits(next, 15).is_none() {
+                flags |= 1;
+            }
+        }
+        let digest = trim(f[4]);
+        let digest_state = digest_state(digest);
+        if digest_state == 3 {
+            flags |= 8;
+        }
+        let previous = trim(f[5]);
+        let changed = (digest_state == 1 || digest_state == 2)
+            && !previous.is_empty()
+            && !previous.eq_ignore_ascii_case(digest);
+        if changed && target != 1 && target != 2 {
+            flags |= 16;
+        }
+        let declared = number(f[6], &mut flags);
+        let verified = number(f[7], &mut flags);
+        let size_state = match (declared, verified) {
+            (Some(declared), Some(verified)) => match verified.cmp(&declared) {
+                std::cmp::Ordering::Equal => 1,
+                std::cmp::Ordering::Less => 2,
+                std::cmp::Ordering::Greater => 3,
+            },
+            _ => 0,
+        };
+        if target == 3 && next.is_empty() {
+            flags |= 64;
+        }
+        if !next.is_empty() && target != 3 {
+            flags |= 128;
+        }
+        if exhausted {
+            flags |= 256;
+        }
+        out.copy_from_slice(&[
+            current,
+            target,
+            i64::from(reason == 0),
+            reason,
+            next_attempts,
+            shape,
+            digest_state,
+            i64::from(changed),
+            size_state,
+            flags,
+        ]);
+    }
+
+    /// `VerificationResetService::isSafeSubpathPhp()` (records never hold NUL bytes).
+    fn safe_subpath(root: &[u8], path: &[u8]) -> bool {
+        if root.is_empty() {
+            return false;
+        }
+        let base = &root[..root.iter().rposition(|&b| b != b'/').map_or(0, |at| at + 1)];
+        if path.len() <= base.len() || !path.starts_with(base) || path[base.len()] != b'/' {
+            return false;
+        }
+        let mut named = false;
+        for segment in path[base.len() + 1..].split(|&b| b == b'/') {
+            match segment {
+                b"" => {}
+                b"." | b".." => return false,
+                _ => named = true,
+            }
+        }
+        named
+    }
+
+    /// `VerificationResetService::w63VerificationResetPlanBatch()`: nine words per record.
+    fn reset_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total_fields) = fields::<10>(record, b'\t');
+        let mut flags = if total_fields == 10 { 0 } else { 2 };
+        let class = match f[0] {
+            b"dirty" | b"stale" | b"expired" | b"unknown" => 0,
+            b"verifying" => 1,
+            b"ready" => 2,
+            _ => {
+                flags |= 8;
+                3
+            }
+        };
+        let lease = number(f[1], &mut flags);
+        let now = number(f[2], &mut flags);
+        let lease_state = match (lease, now) {
+            (None, _) => 0,
+            (Some(_), None) => {
+                flags |= 16;
+                1
+            }
+            (Some(lease), Some(now)) => {
+                if lease > now {
+                    1
+                } else {
+                    2
+                }
+            }
+        };
+        let attempts = number(f[3], &mut flags).unwrap_or(0);
+        let max_attempts = number(f[4], &mut flags).unwrap_or(5).max(1);
+        let include = trim(f[5]);
+        let include = if include == b"1" || include.eq_ignore_ascii_case(b"true") {
+            true
+        } else {
+            if !(include.is_empty() || include == b"0" || include.eq_ignore_ascii_case(b"false")) {
+                flags |= 4;
+            }
+            false
+        };
+        let eligible = class == 0 || (class == 1 && (include || lease_state == 2));
+        let remaining = (max_attempts - attempts).max(0);
+        let action = if !eligible {
+            0
+        } else if class == 1 && lease_state == 2 {
+            3
+        } else if remaining == 0 {
+            2
+        } else {
+            1
+        };
+        let host = trim(f[6]);
+        let foreign = !host.is_empty() && host != trim(f[7]);
+        let path = f[8];
+        let safe = !path.is_empty() && safe_subpath(f[9], path);
+        if foreign && !path.is_empty() {
+            flags |= 32;
+        }
+        if !path.is_empty() && !safe {
+            flags |= 64;
+        }
+        out.copy_from_slice(&[
+            class,
+            lease_state,
+            i64::from(eligible),
+            remaining,
+            action,
+            i64::from(foreign),
+            i64::from(safe),
+            if action == 1 { attempts + 1 } else { attempts },
+            flags,
+        ]);
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes the
+            /// helper's fixed words per record and returns the words written, `-needed` when
+            /// `out_cap` is too small (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(
+                        count, flags, data, data_len, ints, ints_len, out, out_cap, $width, $plan,
+                    )
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `CollectionReleasePolicy::w63CollectionPolicyPlanBatch()` (see [`collection_plan`]).
+        nntmux_w635_collection_policy_plan, 12, collection_plan
+    );
+    entry!(
+        /// `Par2ProofIdentity::w63Par2ProofPlanBatch()` (see [`par2_plan`]).
+        nntmux_w635_par2_proof_plan, 10, par2_plan
+    );
+    entry!(
+        /// `PayloadIdentityResolver::w63PayloadIdentityPlanBatch()` (see [`payload_plan`]).
+        nntmux_w635_payload_identity_plan, 10, payload_plan
+    );
+    entry!(
+        /// `PreparedCandidateUpdate::w63PreparedUpdatePlanBatch()` (see [`update_plan`]).
+        nntmux_w635_prepared_update_plan, 10, update_plan
+    );
+    entry!(
+        /// `VerificationResetService::w63VerificationResetPlanBatch()` (see [`reset_plan`]).
+        nntmux_w635_verification_reset_plan, 9, reset_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [(Entry, usize); 5] = [
+            (nntmux_w635_collection_policy_plan, 12),
+            (nntmux_w635_par2_proof_plan, 10),
+            (nntmux_w635_payload_identity_plan, 10),
+            (nntmux_w635_prepared_update_plan, 10),
+            (nntmux_w635_verification_reset_plan, 9),
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Vec<i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        #[test]
+        fn w635_collection_plans_gate_release() {
+            assert_eq!(
+                call(
+                    nntmux_w635_collection_policy_plan,
+                    &[
+                        b"100\t98\t7200\t3600\t86400\t950\t5000000\t1000000\t0\t2\tmovie.mkv|movie.par2|movie.vol00+01.PAR2\theader\tfull",
+                        b"",
+                        b"4\t1\t90000\t0\t86400\t1000\t99\t100\t0\t1\ta.par2|a.par2||\tnzb\tspot_check\textra",
+                        b"x\t5\t5\t9\t3\t\t5000\t0\t4000\t0\tCaf\xc3\xa9.mkv\t\tbogus",
+                    ]
+                ),
+                vec![
+                    100, 98, 980, 1, 1, 1, 3, 2, 2, 0, 1, 0, //
+                    0, 0, 0, 1, 0, 0, 0, 0, 2, 5, 0, 2, //
+                    4, 1, 250, 2, 0, 2, 1, 1, 1, 1, 0, 50, //
+                    0, 0, 0, 0, 0, 0, 1, 0, 2, 2, 0, 77,
+                ]
+            );
+        }
+
+        #[test]
+        fn w635_par2_plans_classify_proofs() {
+            let (h, g) = ("ab".repeat(16), format!("{}1", "0".repeat(31)));
+            let upper = "CD".repeat(16);
+            let complete = format!("{h}\t65536\t1\t{h}\t\t{h}\t{h}\t{h}\t10,20");
+            let mismatch =
+                format!(" {upper} \t512\t2\t{upper},{g}\t\t{g},{h}\t{g}\t{h}, nothex\t1,x");
+            let duplicate = format!("{h}\t4\t1\t{h}\t{h}\t{h}\t{h},{h}\t{h}\t");
+            assert_eq!(
+                call(
+                    nntmux_w635_par2_proof_plan,
+                    &[
+                        complete.as_bytes(),
+                        b"",
+                        mismatch.as_bytes(),
+                        duplicate.as_bytes(),
+                    ]
+                ),
+                vec![
+                    1, 65536, 1, 1, 1, 1, 1, 30, 0, 0, //
+                    0, 0, 0, 0, 0, 0, 0, 0, 1, 2, //
+                    1, 512, 2, 2, 2, 1, 1, 1, 4, 88, //
+                    1, 4, 1, 1, 1, 1, 1, 0, 3, 32,
+                ]
+            );
+        }
+
+        #[test]
+        fn w635_payload_plans_rank_hints() {
+            assert_eq!(
+                call(
+                    nntmux_w635_payload_identity_plan,
+                    &[
+                        b"yenc|The.Matrix.1999.1080p.mkv\tpar2|The.Matrix.1999.1080p.par2\tsubject|whatever.nfo",
+                        b"",
+                        b"PAR2 |sample.mkv\tbogus|x\tyenc|\tnfo|a1b2c3d4e5f6g7h8.bin\tsubject|Caf\xc3\xa9 Show.mkv",
+                        b"yenc|Show.S01E01.mkv\tyenc|Other.S01E02.mkv\tnfo|Show.nfo",
+                        b"subject|----.rar\tsubject|deadbeefdeadbeef.rar\tnfo|.hidden",
+                    ]
+                ),
+                vec![
+                    3, 0, 0, 0, 3, 4, 1, 1, 1, 0, //
+                    0, 0, 0, 0, 0, 0, -1, 0, 0, 0, //
+                    5, 2, 1, 1, 1, 1, 4, 1, 1, 14, //
+                    3, 0, 0, 0, 3, 3, 0, 2, 2, 0, //
+                    3, 0, 0, 2, 1, 2, 2, 1, 1, 16,
+                ]
+            );
+            let many = vec![&b"yenc|a.mkv"[..]; 4097].join(&b'\t');
+            assert_eq!(
+                call(nntmux_w635_payload_identity_plan, &[&many]),
+                vec![4097, 0, 0, 0, 0, 0, -1, 0, 0, 1]
+            );
+        }
+
+        #[test]
+        fn w635_update_plans_validate_transitions() {
+            let digest = format!(
+                "verifying\tready\t1\t5\t{}\t{}\t1000\t1000\t\t",
+                "a".repeat(64),
+                "b".repeat(64)
+            );
+            let upper = format!(
+                "Waiting_Upload\t1\t5\t5\t{}\t\t10\t5\tslow\t1700000000\textra",
+                "A".repeat(64)
+            );
+            let note = format!(
+                "published\tbogus\tx\t0\t\t\t5\t10\t{}\tsoon",
+                "r".repeat(300)
+            );
+            assert_eq!(
+                call(
+                    nntmux_w635_prepared_update_plan,
+                    &[
+                        digest.as_bytes(),
+                        b"",
+                        upper.as_bytes(),
+                        b"2\tretry\t0\t\tnot-a-digest\t\t\t9\t\t",
+                        note.as_bytes(),
+                    ]
+                ),
+                vec![
+                    1, 2, 1, 0, 1, 0, 1, 1, 1, 0, //
+                    -1, -1, 0, 1, 0, 0, 0, 0, 0, 6, //
+                    0, 1, 0, 5, 5, 3, 2, 0, 2, 386, //
+                    2, 3, 1, 0, 0, 0, 3, 0, 0, 72, //
+                    4, -1, 0, 1, 0, 3, 0, 0, 3, 165,
+                ]
+            );
+        }
+
+        #[test]
+        fn w635_reset_plans_classify_candidates() {
+            assert_eq!(
+                call(
+                    nntmux_w635_verification_reset_plan,
+                    &[
+                        b"dirty\t\t\t1\t5\t\t\t\t/scratch/a/b\t/scratch/",
+                        b"",
+                        b"verifying\t100\t200\t5\t5\tfalse\tworker-2\tworker-1\t/scratch/x\t/scratch",
+                        b"verifying\t300\t200\t0\t\t1\t\t\t/scratch/../etc\t/scratch",
+                        b"Ready\t100\t\tx\t0\tmaybe\t host \thost\t/other/x\t/scratch\textra",
+                    ]
+                ),
+                vec![
+                    0, 0, 1, 4, 1, 0, 1, 2, 0, //
+                    3, 0, 0, 5, 0, 0, 0, 0, 10, //
+                    1, 2, 1, 0, 3, 1, 1, 5, 32, //
+                    1, 1, 1, 5, 1, 0, 0, 1, 64, //
+                    3, 1, 0, 1, 0, 0, 0, 0, 95,
+                ]
+            );
+            assert!(safe_subpath(b"///", b"/a"));
+            assert!(!safe_subpath(b"/root", b"/root/"));
+            assert!(!safe_subpath(b"/root", b"/rootx/a"));
+            assert!(safe_subpath(b"/root//", b"/root//a//"));
+        }
+
+        #[test]
+        fn w635_entries_validate_the_abi() {
+            for (entry, width) in ENTRIES {
+                let data = b"a\0b\0c";
+                let mut out = [7i64; 64];
+                let call = |count: usize, flags: i64, len: usize, cap: usize, out: *mut i64| unsafe {
+                    entry(
+                        count,
+                        flags,
+                        data.as_ptr(),
+                        len,
+                        std::ptr::null(),
+                        0,
+                        out,
+                        cap,
+                    )
+                };
+                let needed = (3 * width) as i64;
+                assert_eq!(call(3, 0, 5, 64, out.as_mut_ptr()), needed);
+                assert_eq!(call(3, 0, 5, 3 * width - 1, out.as_mut_ptr()), -needed);
+                assert_eq!(call(3, 1, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(4, 0, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(2, 0, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(0, 0, 0, 0, std::ptr::null_mut()), 0);
+                assert_eq!(call(3, 0, 5, 4, std::ptr::null_mut()), -1);
+                let ints = 1u64.to_le_bytes();
+                let with_ints = unsafe {
+                    entry(
+                        3,
+                        0,
+                        data.as_ptr(),
+                        5,
+                        ints.as_ptr(),
+                        8,
+                        out.as_mut_ptr(),
+                        64,
+                    )
+                };
+                assert_eq!(with_ints, -1);
+                let overlapping = unsafe {
+                    entry(
+                        1,
+                        0,
+                        out.as_ptr().cast(),
+                        8,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        64,
+                    )
+                };
+                assert_eq!(overlapping, -1);
+                let misaligned = unsafe {
+                    entry(
+                        3,
+                        0,
+                        data.as_ptr(),
+                        5,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr().cast::<u8>().add(1).cast(),
+                        8,
+                    )
+                };
+                assert_eq!(misaligned, -1);
+            }
+        }
+    }
+}
