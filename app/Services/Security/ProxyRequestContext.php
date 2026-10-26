@@ -6,6 +6,7 @@ namespace App\Services\Security;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Http\Request;
 use Throwable;
 
@@ -543,5 +544,287 @@ final readonly class ProxyRequestContext
         }
 
         return false;
+    }
+
+    // Rust is the default only while the paired W59.6 benchmark clears 1.5x on all four metrics.
+    public const bool W59_RUST_FFI_DEFAULT = true;
+
+    public const string W59_FFI_CDEF = <<<'C'
+        int32_t nntmux_w596_proxy_context_batch(const char *strings, size_t strings_len, const char *twin, size_t twin_len, size_t count, const char *trusted, size_t trusted_len, size_t trusted_count, int64_t *out, size_t out_cap);
+        C;
+
+    private const int W59_MAX_ITEMS = 1_048_576;
+
+    public const int W59_CONTEXT_HEADER = 16;
+
+    private const string W59_ALNUM = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+    /**
+     * Request context summaries: the client of each remote address and X-Forwarded-For chain as
+     * resolveForwardedChainsPhp() picks it, plus the API key class after `trim(" \t")` (0 absent, 1 32
+     * lowercase hex, 2 other alphanumeric up to 64 bytes, 3 other bytes, 4 longer than 64 bytes).
+     * Client source 0 untrusted remote, 1 forwarded hop, 2 trusted remote without a header, 3 malformed
+     * chain, 4 invalid remote.
+     *
+     * Layout: `[0]` count, `[1..5]` per source, `[6..10]` per key class, `[11]` hops, `[12]` trusted hops
+     * skipped, `[13]` distinct client subnets, `[14]` first malformed index (-1), `[15]` FNV-1a digest;
+     * then two words per request: the resolveForwardedChainsPhp() flags `| source << 32 | key class << 35
+     * | trimmed << 38 | min(key bytes, 255) << 39 | min(client + 3, 65535) << 47`, and the client's `/24`
+     * IPv4 (`1 << 48 | a.b.c`) or `/48` IPv6 (`2 << 48 | first six bytes`) subnet key, or -1.
+     *
+     * @param  array<array-key, string>  $remoteAddrs
+     * @param  array<array-key, string>  $forwardedFor  Parallel to $remoteAddrs; '' when absent.
+     * @param  array<array-key, string>  $apiKeys  Parallel to $remoteAddrs; '' when absent.
+     * @param  array<array-key, string>  $trustedProxies
+     * @return list<int>
+     */
+    public static function summarizeContextBatch(array $remoteAddrs, array $forwardedFor, array $apiKeys, array $trustedProxies): array
+    {
+        return (self::usesW59RustFfi() ? self::summarizeContextBatchNative($remoteAddrs, $forwardedFor, $apiKeys, $trustedProxies) : null)
+            ?? self::summarizeContextBatchPhp($remoteAddrs, $forwardedFor, $apiKeys, $trustedProxies);
+    }
+
+    /**
+     * @param  array<array-key, string>  $remoteAddrs
+     * @param  array<array-key, string>  $forwardedFor
+     * @param  array<array-key, string>  $apiKeys
+     * @param  array<array-key, string>  $trustedProxies
+     * @return list<int>
+     */
+    public static function summarizeContextBatchPhp(array $remoteAddrs, array $forwardedFor, array $apiKeys, array $trustedProxies): array
+    {
+        $remotes = array_map(strval(...), array_values($remoteAddrs));
+        $forwardedFor = array_values($forwardedFor);
+        $apiKeys = array_values($apiKeys);
+        $headers = [];
+        foreach ($remotes as $at => $remote) {
+            $headers[] = (string) ($forwardedFor[$at] ?? '');
+        }
+        $chains = self::resolveForwardedChainsPhp($remotes, $headers, array_map(strval(...), array_values($trustedProxies)));
+        $out = array_fill(0, self::W59_CONTEXT_HEADER, 0);
+        $out[0] = \count($remotes);
+        $out[14] = -1;
+        $digest = 2_166_136_261;
+        $rows = $subnets = [];
+        foreach ($remotes as $at => $remote) {
+            $client = $chains[2 * $at];
+            $flags = $chains[2 * $at + 1];
+            if ($client >= 0) {
+                $source = 1;
+                $hop = self::w47Hop(explode(',', $headers[$at])[$client] ?? '');
+                $packed = $hop === null ? null : $hop[0];
+            } elseif ($client === -1) {
+                $valid = ($flags & 1 << 18) !== 0;
+                $source = $valid ? 0 : 4;
+                $packed = $valid ? self::w47PackedIp($remote) : null;
+            } elseif ($client === -3) {
+                $source = 2;
+                $packed = self::w47PackedIp($remote);
+            } else {
+                $source = 3;
+                $packed = null;
+            }
+            $raw = (string) ($apiKeys[$at] ?? '');
+            $key = trim($raw, " \t");
+            $length = \strlen($key);
+            $class = match (true) {
+                $length === 0 => 0,
+                $length > 64 => 4,
+                strspn($key, self::W59_ALNUM) !== $length => 3,
+                $length === 32 && strspn($key, '0123456789abcdef') === 32 => 1,
+                default => 2,
+            };
+            $subnet = $packed === null ? -1 : self::w59Subnet($packed);
+            if ($subnet >= 0) {
+                $subnets[$subnet] = true;
+            }
+            $out[1 + $source]++;
+            $out[6 + $class]++;
+            $out[11] += $flags & 0xFF;
+            $out[12] += ($flags >> 8) & 0xFF;
+            if ($source === 3 && $out[14] < 0) {
+                $out[14] = $at;
+            }
+            $word = $flags | $source << 32 | $class << 35 | (int) ($length !== \strlen($raw)) << 38 | min($length, 255) << 39
+                | min($client + 3, 65_535) << 47;
+            foreach ([$word, $subnet] as $row) {
+                $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+                $rows[] = $row;
+            }
+        }
+        $out[13] = \count($subnets);
+        $out[15] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust summaries, or null when PHP must compute them (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $remoteAddrs
+     * @param  array<array-key, string>  $forwardedFor
+     * @param  array<array-key, string>  $apiKeys
+     * @param  array<array-key, string>  $trustedProxies
+     * @return list<int>|null
+     */
+    public static function summarizeContextBatchNative(array $remoteAddrs, array $forwardedFor, array $apiKeys, array $trustedProxies): ?array
+    {
+        $count = \count($remoteAddrs);
+        if ($count > self::W59_MAX_ITEMS || \count($forwardedFor) !== $count || \count($apiKeys) !== $count
+            || \count($trustedProxies) > self::W59_MAX_ITEMS) {
+            return null;
+        }
+        [$joined, $twin] = self::w59Strings(array_values($remoteAddrs), array_values($forwardedFor), array_values($apiKeys));
+        // A NUL-holding entry is never a valid address or CIDR, so it can be dropped before NUL-joining.
+        $trusted = [];
+        foreach ($trustedProxies as $entry) {
+            $entry = (string) $entry;
+            if (! str_contains($entry, "\0")) {
+                $trusted[] = $entry;
+            }
+        }
+        $trustedJoined = implode("\0", $trusted);
+        $trustedCount = \count($trusted);
+        $fields = self::W59_CONTEXT_HEADER + 2 * $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w59Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w596_proxy_context_batch($joined, \strlen($joined), $twin, \strlen($twin), $count, $trustedJoined, \strlen($trustedJoined), $trustedCount, $out, $fields));
+    }
+
+    /**
+     * `/24` IPv4 or `/48` IPv6 key of `inet_pton()` bytes.
+     */
+    private static function w59Subnet(string $packed): int
+    {
+        if (\strlen($packed) === 4) {
+            return 1 << 48 | \ord($packed[0]) << 16 | \ord($packed[1]) << 8 | \ord($packed[2]);
+        }
+        /** @var array{1: int} $prefix */
+        $prefix = unpack('J', "\0\0".substr($packed, 0, 6));
+
+        return 2 << 48 | $prefix[1];
+    }
+
+    /**
+     * Run `$callback` with the Wave 59.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW59RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w59RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w59RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW59RustFfi(): bool
+    {
+        $forced = self::w59RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W59_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 59.6 routing and binding in function statics (no static properties, so readonly classes can share it).
+     * No `$op` returns the forced routing (null for the default); `'set'` replaces it with `$val`
+     * and returns the previous value; `'binding'` returns the cached `additional_w59` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w59RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w59', self::W59_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 59.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w59Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w59RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Columns NUL-joined one after another and, when a value holds a NUL, the same columns joined
+     * with 0x01 so Rust finds the separators where the two differ.
+     *
+     * @param  list<string>  ...$columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w59Strings(array ...$columns): array
+    {
+        $joined = '';
+        $items = 0;
+        foreach ($columns as $column) {
+            if ($column !== []) {
+                $joined .= ($items > 0 ? "\0" : '').implode("\0", $column);
+                $items += \count($column);
+            }
+        }
+        if ($items === 0 || substr_count($joined, "\0") === $items - 1) {
+            return [$joined, ''];
+        }
+        $twin = '';
+        $items = 0;
+        foreach ($columns as $column) {
+            if ($column !== []) {
+                $twin .= ($items > 0 ? "\x01" : '').implode("\x01", $column);
+                $items += \count($column);
+            }
+        }
+
+        return [$joined, $twin];
     }
 }

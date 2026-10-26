@@ -6,6 +6,7 @@ namespace App\Services\Security;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -351,5 +352,247 @@ final readonly class ProxyVerdict
         $digest = unpack('J', hash('fnv1a64', pack('P*', ...$words), true));
 
         return $digest[1];
+    }
+
+    // Rust is the default only while the paired W59.6 benchmark clears 1.5x on all four metrics.
+    public const bool W59_RUST_FFI_DEFAULT = true;
+
+    public const string W59_FFI_CDEF = <<<'C'
+        int32_t nntmux_w596_proxy_verdict_batch(const char *strings, size_t strings_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t threshold, int64_t *out, size_t out_cap);
+        C;
+
+    private const int W59_MAX_ITEMS = 1_048_576;
+
+    public const int W59_VERDICT_HEADER = 18;
+
+    /** Known reason names and their flag bits. */
+    private const array W59_REASON_BITS = ['referer' => 0, 'ua_pair' => 1, 'download_ratio' => 2, 'ip_correlation' => 3,
+        'indexer_ua' => 4, 'empty_ua' => 5, 'private_ip' => 6, 'local_referer' => 7];
+
+    /**
+     * Verdict rollup over scores with comma-separated reason names (blank-trimmed; empty names skipped).
+     * The score clamps to 0..1000; class 0 allow, 1 suspicious (twice the score reaches the threshold), 2
+     * block; confidence is the score's percent of a positive threshold (100 otherwise).
+     *
+     * Layout: `[0]` count, `[1..3]` per class, `[4..11]` per known reason, `[12]` max score, `[13]` score
+     * sum, `[14]` first blocked index (-1), `[15]` mean confidence, `[16]` out-of-range scores, `[17]`
+     * FNV-1a digest; then per verdict `score | class << 10 | confidence << 12 | reasons << 19 |
+     * min(unknown, 255) << 27 | min(duplicates, 255) << 35 | min(names, 255) << 43 | out of range << 51`.
+     *
+     * @param  array<array-key, int>  $scores
+     * @param  array<array-key, string>  $reasonSpecs  Parallel to $scores.
+     * @return list<int>
+     */
+    public static function rollupVerdictBatch(array $scores, array $reasonSpecs, int $threshold = 50): array
+    {
+        return (self::usesW59RustFfi() ? self::rollupVerdictBatchNative($scores, $reasonSpecs, $threshold) : null)
+            ?? self::rollupVerdictBatchPhp($scores, $reasonSpecs, $threshold);
+    }
+
+    /**
+     * @param  array<array-key, int>  $scores
+     * @param  array<array-key, string>  $reasonSpecs
+     * @return list<int>
+     */
+    public static function rollupVerdictBatchPhp(array $scores, array $reasonSpecs, int $threshold = 50): array
+    {
+        $scores = array_values($scores);
+        $reasonSpecs = array_values($reasonSpecs);
+        $count = \count($scores);
+        $out = array_fill(0, self::W59_VERDICT_HEADER, 0);
+        $out[0] = $count;
+        $out[14] = -1;
+        $digest = 2_166_136_261;
+        $confidenceSum = 0;
+        $rows = [];
+        foreach ($scores as $at => $raw) {
+            $raw = (int) $raw;
+            $score = max(0, min(1_000, $raw));
+            $class = $score >= $threshold ? 2 : ($score * 2 >= $threshold ? 1 : 0);
+            $confidence = $threshold > 0 ? min(100, intdiv($score * 100, $threshold)) : 100;
+            $mask = $unknown = $duplicates = $names = 0;
+            foreach (explode(',', (string) ($reasonSpecs[$at] ?? '')) as $part) {
+                $name = trim($part, " \t");
+                if ($name === '') {
+                    continue;
+                }
+                $names++;
+                $bit = self::W59_REASON_BITS[$name] ?? null;
+                if ($bit === null) {
+                    $unknown++;
+                } elseif (($mask & 1 << $bit) !== 0) {
+                    $duplicates++;
+                } else {
+                    $mask |= 1 << $bit;
+                }
+            }
+            $out[1 + $class]++;
+            if ($mask !== 0) {
+                for ($bit = 0; $bit < 8; $bit++) {
+                    $out[4 + $bit] += ($mask >> $bit) & 1;
+                }
+            }
+            $out[12] = max($out[12], $score);
+            $out[13] += $score;
+            if ($class === 2 && $out[14] < 0) {
+                $out[14] = $at;
+            }
+            $confidenceSum += $confidence;
+            $out[16] += (int) ($raw !== $score);
+            $row = $score | $class << 10 | $confidence << 12 | $mask << 19 | min($unknown, 255) << 27 | min($duplicates, 255) << 35
+                | min($names, 255) << 43 | (int) ($raw !== $score) << 51;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        if ($count > 0) {
+            $out[15] = intdiv($confidenceSum, $count);
+        }
+        $out[17] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust rollup, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, int>  $scores
+     * @param  array<array-key, string>  $reasonSpecs
+     * @return list<int>|null
+     */
+    public static function rollupVerdictBatchNative(array $scores, array $reasonSpecs, int $threshold = 50): ?array
+    {
+        $count = \count($scores);
+        if ($count > self::W59_MAX_ITEMS || \count($reasonSpecs) !== $count) {
+            return null;
+        }
+        [$joined, $twin] = self::w59Strings(array_values($reasonSpecs));
+        $ints = pack('q*', ...array_map(intval(...), array_values($scores)));
+        $fields = self::W59_VERDICT_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w59Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w596_proxy_verdict_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $threshold, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 59.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW59RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w59RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w59RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW59RustFfi(): bool
+    {
+        $forced = self::w59RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W59_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 59.6 routing and binding in function statics (no static properties, so readonly classes can share it).
+     * No `$op` returns the forced routing (null for the default); `'set'` replaces it with `$val`
+     * and returns the previous value; `'binding'` returns the cached `additional_w59` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w59RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w59', self::W59_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 59.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w59Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w59RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Columns NUL-joined one after another and, when a value holds a NUL, the same columns joined
+     * with 0x01 so Rust finds the separators where the two differ.
+     *
+     * @param  list<string>  ...$columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w59Strings(array ...$columns): array
+    {
+        $joined = '';
+        $items = 0;
+        foreach ($columns as $column) {
+            if ($column !== []) {
+                $joined .= ($items > 0 ? "\0" : '').implode("\0", $column);
+                $items += \count($column);
+            }
+        }
+        if ($items === 0 || substr_count($joined, "\0") === $items - 1) {
+            return [$joined, ''];
+        }
+        $twin = '';
+        $items = 0;
+        foreach ($columns as $column) {
+            if ($column !== []) {
+                $twin .= ($items > 0 ? "\x01" : '').implode("\x01", $column);
+                $items += \count($column);
+            }
+        }
+
+        return [$joined, $twin];
     }
 }
