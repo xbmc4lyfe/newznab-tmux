@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace App\Services\NNTP;
 
 use App\Services\RegexService;
+use App\Support\RustPipelineLibrary;
 use Closure;
 use FFI;
+use FFI\CData;
 use RuntimeException;
 use Throwable;
 
@@ -378,5 +380,157 @@ final class RustVerificationFramer
         }
 
         return $summary;
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W55 parity test measures 2.295x common mean, 1.639x common
+     * p99, 3.773x uncommon mean and 3.57x uncommon p99 (per-metric minimum of four runs), above
+     * the 1.5x rule.
+     */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    private const string W55_FFI_CDEF = 'ssize_t nntmux_w551_article_id_code_batch(const char *ids, size_t ids_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 55 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    public const int W55_ARTICLE_ID_VALID = 0;
+
+    public const int W55_ARTICLE_ID_EMPTY = 1;
+
+    public const int W55_ARTICLE_ID_OVERSIZE = 2;
+
+    public const int W55_ARTICLE_ID_INVALID_UTF8 = 3;
+
+    public const int W55_ARTICLE_ID_REJECTED = 4;
+
+    public const int W55_ARTICLE_ID_SPACE = 8;
+
+    public const int W55_ARTICLE_ID_CONTROL = 16;
+
+    public const int W55_ARTICLE_ID_BRACKET = 32;
+
+    /**
+     * One `W55_ARTICLE_ID_*` code per article ID, checked the way validateConnection() checks it:
+     * valid, empty, over MAX_INIT_BYTES, invalid UTF-8, or rejected with the Unicode space, control
+     * character and angle bracket bits it holds.
+     *
+     * @param  array<array-key, string>  $ids
+     * @return list<int>
+     */
+    public static function articleIdCodes(array $ids): array
+    {
+        return self::usesW55RustFfi() ? self::articleIdCodesNative($ids) : self::articleIdCodesPhp($ids);
+    }
+
+    /**
+     * @param  array<array-key, string>  $ids
+     * @return list<int>
+     */
+    public static function articleIdCodesPhp(array $ids): array
+    {
+        $codes = [];
+        foreach ($ids as $id) {
+            if ($id === '') {
+                $codes[] = self::W55_ARTICLE_ID_EMPTY;
+
+                continue;
+            }
+            if (\strlen($id) > self::MAX_INIT_BYTES) {
+                $codes[] = self::W55_ARTICLE_ID_OVERSIZE;
+
+                continue;
+            }
+            $codes[] = match (preg_match(self::INVALID_ID_PATTERN, $id)) {
+                0 => self::W55_ARTICLE_ID_VALID,
+                false => self::W55_ARTICLE_ID_INVALID_UTF8,
+                default => self::W55_ARTICLE_ID_REJECTED
+                    | (preg_match('~(*UCP)\s~u', $id) === 1 ? self::W55_ARTICLE_ID_SPACE : 0)
+                    | (preg_match('~\p{Cc}~u', $id) === 1 ? self::W55_ARTICLE_ID_CONTROL : 0)
+                    | (strpbrk($id, '<>') !== false ? self::W55_ARTICLE_ID_BRACKET : 0),
+            };
+        }
+
+        return $codes;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $ids
+     * @return list<int>
+     */
+    public static function articleIdCodesNative(array $ids): array
+    {
+        $count = \count($ids);
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w55RustFfiState('out', $count);
+        if ($buffer === null) {
+            return self::articleIdCodesPhp($ids);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $ids);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w551_article_id_code_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', FFI::string($out, $count * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::articleIdCodesPhp($ids);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 55 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('framer_w55', self::W55_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }

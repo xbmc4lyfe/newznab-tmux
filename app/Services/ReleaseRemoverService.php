@@ -13,6 +13,7 @@ use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
 use Exception;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -1512,5 +1513,177 @@ class ReleaseRemoverService
     {
         self::$w401UseRustFfi = null;
         self::$w401Ffi = null;
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W55 parity test measures 6.484x common mean, 4.585x common
+     * p99, 4.544x uncommon mean and 3.534x uncommon p99 (per-metric minimum of four runs), above
+     * the 1.5x rule.
+     */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    private const string W55_FFI_CDEF = 'ssize_t nntmux_w551_removal_pattern_mask_batch(const char *names, size_t names_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 55 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    public const int W55_REMOVE_GIBBERISH = 1;
+
+    public const int W55_REMOVE_HASHED = 2;
+
+    public const int W55_REMOVE_SHORT = 4;
+
+    public const int W55_REMOVE_PASSWORDED = 8;
+
+    public const int W55_REMOVE_SCR = 16;
+
+    public const int W55_REMOVE_SAMPLE = 32;
+
+    public const int W55_REMOVE_EXE = 64;
+
+    public const int W55_REMOVE_INSTALL_BIN = 128;
+
+    public const int W55_REMOVE_PASSWORD_URL = 256;
+
+    public const int W55_REMOVE_NZB = 512;
+
+    /**
+     * One `W55_REMOVE_*` mask per release or file name, flagging the name patterns of the crap
+     * removal queries: gibberish, hashed and short names, passworded names (without the excluded
+     * advanced/no password/not password/recovery/reset/unlocker words), `.scr` files, samples,
+     * `.exe` files, install.bin, password.url and `.nzb` names. LIKE patterns are ASCII
+     * case-insensitive, as under the default collation.
+     *
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function removalPatternMasks(array $names): array
+    {
+        return self::usesW55RustFfi() ? self::removalPatternMasksNative($names) : self::removalPatternMasksPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function removalPatternMasksPhp(array $names): array
+    {
+        $masks = [];
+        foreach ($names as $name) {
+            $mask = 0;
+            if (preg_match('/\A[a-zA-Z0-9]{15,}\z/', $name) === 1) {
+                $mask |= self::W55_REMOVE_GIBBERISH;
+            }
+            if (preg_match('/[a-zA-Z0-9]{25}/', $name) === 1) {
+                $mask |= self::W55_REMOVE_HASHED;
+            }
+            if (preg_match('/\A[a-zA-Z0-9]{0,5}\z/', $name) === 1) {
+                $mask |= self::W55_REMOVE_SHORT;
+            }
+            if (stripos($name, 'passwor') !== false && preg_match('/advanced|no password|not password|recovery|reset|unlocker/i', $name) !== 1) {
+                $mask |= self::W55_REMOVE_PASSWORDED;
+            }
+            if (preg_match('/\.scr[$ "]/i', $name) === 1) {
+                $mask |= self::W55_REMOVE_SCR;
+            }
+            if (stripos($name, 'sample') !== false) {
+                $mask |= self::W55_REMOVE_SAMPLE;
+            }
+            if (preg_match('/\.exe\z/i', $name) === 1) {
+                $mask |= self::W55_REMOVE_EXE;
+            }
+            if (stripos($name, 'install.bin') !== false) {
+                $mask |= self::W55_REMOVE_INSTALL_BIN;
+            }
+            if (stripos($name, 'password.url') !== false) {
+                $mask |= self::W55_REMOVE_PASSWORD_URL;
+            }
+            if (stripos($name, '.nzb') !== false) {
+                $mask |= self::W55_REMOVE_NZB;
+            }
+            $masks[] = $mask;
+        }
+
+        return $masks;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function removalPatternMasksNative(array $names): array
+    {
+        $count = \count($names);
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w55RustFfiState('out', $count);
+        if ($buffer === null) {
+            return self::removalPatternMasksPhp($names);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $names);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w551_removal_pattern_mask_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', FFI::string($out, $count * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::removalPatternMasksPhp($names);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 55 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('release_remover_w55', self::W55_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }

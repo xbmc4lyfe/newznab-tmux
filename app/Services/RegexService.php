@@ -13,6 +13,7 @@ use App\Models\UsenetGroup;
 use App\Support\ReleaseNameDisplay;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
@@ -622,5 +623,143 @@ class RegexService
         }
 
         return $summary;
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W55 parity test measures 2.557x common mean, 2.161x common
+     * p99, 1.886x uncommon mean and 1.572x uncommon p99 (per-metric minimum of four runs), above
+     * the 1.5x rule.
+     */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    private const string W55_FFI_CDEF = 'ssize_t nntmux_w551_regex_file_counter_batch(const char *subjects, size_t subjects_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 55 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    public const int W55_COUNTER_SHIFT = 20;
+
+    public const int W55_TOTAL_SHIFT = 2;
+
+    public const int W55_SEPARATOR_SLASH = 0;
+
+    public const int W55_SEPARATOR_OF = 1;
+
+    public const int W55_SEPARATOR_DASH = 2;
+
+    /**
+     * One file counter word per collection subject: FILE_COUNT_PATTERN's leftmost current and
+     * total counts and separator as `current << W55_COUNTER_SHIFT | total << W55_TOTAL_SHIFT |
+     * W55_SEPARATOR_*`, or -1 when the subject carries no file counter.
+     *
+     * @param  array<array-key, string>  $subjects
+     * @return list<int>
+     */
+    public static function collectionFileCounters(array $subjects): array
+    {
+        return self::usesW55RustFfi() ? self::collectionFileCountersNative($subjects) : self::collectionFileCountersPhp($subjects);
+    }
+
+    /**
+     * @param  array<array-key, string>  $subjects
+     * @return list<int>
+     */
+    public static function collectionFileCountersPhp(array $subjects): array
+    {
+        $codes = [];
+        foreach ($subjects as $subject) {
+            if (preg_match(self::FILE_COUNT_PATTERN, $subject, $count) !== 1) {
+                $codes[] = -1;
+
+                continue;
+            }
+            $codes[] = ((int) $count[1] << self::W55_COUNTER_SHIFT) | ((int) $count[3] << self::W55_TOTAL_SHIFT) | match ($count[2]) {
+                '/' => self::W55_SEPARATOR_SLASH,
+                '-' => self::W55_SEPARATOR_DASH,
+                default => self::W55_SEPARATOR_OF,
+            };
+        }
+
+        return $codes;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $subjects
+     * @return list<int>
+     */
+    public static function collectionFileCountersNative(array $subjects): array
+    {
+        $count = \count($subjects);
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w55RustFfiState('out', $count);
+        if ($buffer === null) {
+            return self::collectionFileCountersPhp($subjects);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $subjects);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w551_regex_file_counter_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', FFI::string($out, $count * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::collectionFileCountersPhp($subjects);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 55 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('regex_w55', self::W55_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }
