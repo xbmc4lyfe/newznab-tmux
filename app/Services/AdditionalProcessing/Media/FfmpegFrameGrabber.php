@@ -385,4 +385,242 @@ class FfmpegFrameGrabber implements VideoFrameGrabber
 
         return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
     }
+
+    // Rust is the default only while the paired W56.6 benchmark clears 1.5x on all four metrics.
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    public const string W56_FFI_CDEF = <<<'C'
+        int32_t nntmux_w566_frame_output_batch(const char *paths, size_t paths_len, const char *path_twin, size_t path_twin_len, const char *sizes, size_t sizes_len, size_t count, int64_t from_ms, int64_t spacing_ms, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W56_FRAME_HEADER = 13;
+
+    private const int W56_MAX_ITEMS = 1_048_576;
+
+    private const int W56_SEEK_CAP = 2_147_483_647;
+
+    private const int W56_EXPECTED_CAP = 1_073_741_823;
+
+    private const int W56_VALUE_CAP = 1_099_511_627_775;
+
+    private const int W56_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /**
+     * Validate the frames grab() wrote, as paths and byte sizes, against the seek start and spacing
+     * in milliseconds (each clamped to 0..2^31-1). Basenames must be `frame_<8 hex>_<2-9 digits>.jpg`;
+     * the first matching name fixes the token. Status 0 accepted, 1 bad name, 2 empty (size 0 or
+     * less), 3 foreign token, 4 not after the last accepted frame; missing sizes are 0.
+     *
+     * Layout: `[0]` count, `[1..5]` per status, `[6]` accepted bytes (sizes clamped to 2^40-1, total
+     * capped at 2^62), `[7]` first and `[8]` last accepted frame number (-1 when none), `[9]` frames
+     * missing between accepted ones, `[10]` seek start, `[11]` spacing, `[12]` FNV-1a digest; then
+     * per frame `status | number << 3 | expected << 33` (expected milliseconds `start + (number - 1)
+     * * spacing`, `start` for frame 0 or a bad name, capped at 2^30-1).
+     *
+     * @param  array<array-key, string>  $paths
+     * @param  array<array-key, int>  $sizes
+     * @return list<int>
+     */
+    public static function classifyFrameBatch(array $paths, array $sizes, int $fromMs, int $spacingMs): array
+    {
+        return (self::usesW56RustFfi() ? self::classifyFrameBatchNative($paths, $sizes, $fromMs, $spacingMs) : null)
+            ?? self::classifyFrameBatchPhp($paths, $sizes, $fromMs, $spacingMs);
+    }
+
+    /**
+     * @param  array<array-key, string>  $paths
+     * @param  array<array-key, int>  $sizes
+     * @return list<int>
+     */
+    public static function classifyFrameBatchPhp(array $paths, array $sizes, int $fromMs, int $spacingMs): array
+    {
+        $sizes = array_values($sizes);
+        $from = min(max($fromMs, 0), self::W56_SEEK_CAP);
+        $spacing = min(max($spacingMs, 0), self::W56_SEEK_CAP);
+        $out = array_fill(0, self::W56_FRAME_HEADER, 0);
+        $out[0] = \count($paths);
+        $out[7] = $out[8] = -1;
+        $out[10] = $from;
+        $out[11] = $spacing;
+        $first = null;
+        $digest = 2_166_136_261;
+        $rows = [];
+        $index = 0;
+        foreach ($paths as $path) {
+            $slash = strrpos($path, '/');
+            $base = $slash === false ? $path : substr($path, $slash + 1);
+            $size = $sizes[$index] ?? 0;
+            $number = 0;
+            if (preg_match('/^frame_([0-9a-f]{8})_(\d{2,9})\.jpg$/D', $base, $match) !== 1) {
+                $status = 1;
+            } else {
+                $number = (int) $match[2];
+                $first ??= $match[1];
+                $status = match (true) {
+                    $match[1] !== $first => 3,
+                    $size <= 0 => 2,
+                    $out[8] >= 0 && $number <= $out[8] => 4,
+                    default => 0,
+                };
+            }
+            if ($status === 0) {
+                $out[6] = min($out[6] + min($size, self::W56_VALUE_CAP), self::W56_TOTAL_CAP);
+                if ($out[8] >= 0) {
+                    $out[9] += $number - $out[8] - 1;
+                } else {
+                    $out[7] = $number;
+                }
+                $out[8] = $number;
+            }
+            $out[1 + $status]++;
+            $expected = min($from + max($number - 1, 0) * $spacing, self::W56_EXPECTED_CAP);
+            $row = $status | $number << 3 | $expected << 33;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+            $index++;
+        }
+        $out[12] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust validation, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $paths
+     * @param  array<array-key, int>  $sizes
+     * @return list<int>|null
+     */
+    public static function classifyFrameBatchNative(array $paths, array $sizes, int $fromMs, int $spacingMs): ?array
+    {
+        $count = \count($paths);
+        if ($count > self::W56_MAX_ITEMS) {
+            return null;
+        }
+        [$joined, $twin] = self::w56Strings(array_values($paths));
+        $ints = pack('q*', ...self::w56Fit($sizes, $count, 0));
+        $fields = self::W56_FRAME_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w56Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w566_frame_output_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $fromMs, $spacingMs, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 56.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $forced = self::w56RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 56.6 routing and binding, kept in function statics so earlier waves' static state stays
+     * untouched. No `$op` returns the forced routing (null for the default); `'set'` replaces it with
+     * `$val` and returns the previous value; `'binding'` returns the cached `additional_w56` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w56', self::W56_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 56.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w56Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w56RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * NUL-joined values and, when one holds a NUL, the same list joined with 0x01 so Rust
+     * finds the separators where the two differ.
+     *
+     * @param  list<string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w56Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
+    }
+
+    /**
+     * Exactly `$count` values: the list itself when it already fits, otherwise padded with `$pad`.
+     *
+     * @template TValue
+     *
+     * @param  array<array-key, TValue>  $values
+     * @param  TValue  $pad
+     * @return list<TValue>
+     */
+    private static function w56Fit(array $values, int $count, mixed $pad): array
+    {
+        return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, $pad);
+    }
 }
