@@ -49381,3 +49381,1045 @@ pub mod wave62_2_fingerprint_queue_dispatch_breaker_analyzer_par2_parser {
         }
     }
 }
+
+pub mod wave63_2_fingerprint_collector_yenc_decoder_part_service_log_file {
+    //! Wave 63.2 batch kernels for ReleaseFingerprintCollector, DecoderFactory, YencPart,
+    //! YencService and LogFile in the Wave 49.2 framing: one `i64` word per tab-separated row, a
+    //! few summary words and one XXH64 digest of the preceding words out. Every export takes one
+    //! NUL-joined string column (exactly `count` rows) and returns the word count, `-needed` when
+    //! `out_cap` (in words) is short, or -1 for a null output, a malformed batch, an output
+    //! overlapping the input or a panic. Rows are borrowed from the input and every rule is
+    //! byte-level ASCII, so the PHP twins agree under any `setlocale()`.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, span,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    type Set<T> = HashSet<T, FoldState>;
+    type Map<K, V> = HashMap<K, V, FoldState>;
+
+    fn set<T>(n: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// PHP `explode("\t", $row, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(row: &[u8]) -> [&[u8]; N] {
+        let mut out = [&row[..0]; N];
+        let mut rest = row;
+        for (k, slot) in out.iter_mut().enumerate() {
+            if k + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'\t') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// PHP `trim()` with its default character set.
+    fn trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    #[inline]
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    #[inline]
+    fn num(d: &[u8]) -> i64 {
+        d.iter()
+            .fold(0i64, |acc, &c| acc * 10 + i64::from(c - b'0'))
+    }
+
+    /// A trimmed field: `Ok(None)` when empty, `Ok(Some(n))` for 1 to `max` ASCII digits,
+    /// otherwise `Err(())` (PHP `w63Int()`: null, int or false).
+    #[inline]
+    fn int(v: &[u8], max: usize) -> Result<Option<i64>, ()> {
+        let v = trim(v);
+        if v.is_empty() {
+            return Ok(None);
+        }
+        if v.len() > max || !all_digits(v) {
+            return Err(());
+        }
+        Ok(Some(num(v)))
+    }
+
+    fn lower(s: &[u8]) -> Vec<u8> {
+        s.iter().map(u8::to_ascii_lowercase).collect()
+    }
+
+    /// PHP `strrpos($hay, $needle)`.
+    fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.len() > hay.len() {
+            return None;
+        }
+        (0..=hay.len() - needle.len())
+            .rev()
+            .find(|&i| &hay[i..i + needle.len()] == needle)
+    }
+
+    /// PHP `checkdate($month, $day, $year)`.
+    fn checkdate(year: i64, month: i64, day: i64) -> bool {
+        let days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+            2 => 28,
+            _ => return false,
+        };
+        (1..=32767).contains(&year) && (1..=days).contains(&day)
+    }
+
+    /// `YYYY-MM-DD` at the start of `s` as `YYYYMMDD` (0 when not a calendar date), or None when
+    /// the shape does not match.
+    fn ymd(s: &[u8]) -> Option<i64> {
+        if s.len() < 10
+            || s[4] != b'-'
+            || s[7] != b'-'
+            || !all_digits(&s[..4])
+            || !all_digits(&s[5..7])
+            || !all_digits(&s[8..10])
+        {
+            return None;
+        }
+        let (y, m, d) = (num(&s[..4]), num(&s[5..7]), num(&s[8..10]));
+        Some(if checkdate(y, m, d) {
+            y * 10_000 + m * 100 + d
+        } else {
+            0
+        })
+    }
+
+    // ---- ReleaseFingerprintCollector ---------------------------------------------------------
+
+    const COLLECTOR_MAX_ARTICLE_BYTES: i64 = 2_000_000;
+    const COLLECTOR_MAX_PAR2_SET_BYTES: i64 = 67_108_864;
+    const COLLECTOR_MAX_FRAGMENTS: i64 = 32;
+    const COLLECTOR_SOURCE_SAMPLE_BYTES: i64 = 16_384;
+
+    /// Kind of a lowercased filename: 0 empty, 1 PAR2 index, 2 PAR2 volume, 3 RAR or split
+    /// archive, 4 7-Zip, 5 zip, 6 text, 7 media, 8 other.
+    fn collector_kind(lower: &[u8]) -> i64 {
+        if lower.is_empty() {
+            return 0;
+        }
+        let Some(dot) = lower.iter().rposition(|&b| b == b'.') else {
+            return 8;
+        };
+        let (base, ext) = (&lower[..dot], &lower[dot + 1..]);
+        match ext {
+            b"par2" => match rfind(base, b".vol") {
+                Some(v)
+                    if base.len() > v + 4
+                        && base[v + 4..]
+                            .iter()
+                            .all(|&b| b.is_ascii_digit() || b == b'+' || b == b'-')
+                        && base[v + 4..].contains(&b'+') =>
+                {
+                    2
+                }
+                _ => 1,
+            },
+            b"rar" => 3,
+            b"7z" => 4,
+            b"zip" => 5,
+            b"nfo" | b"sfv" | b"nzb" | b"txt" => 6,
+            b"mkv" | b"mp4" | b"avi" | b"iso" | b"flac" | b"mp3" | b"epub" | b"pdf" => 7,
+            _ if (ext.len() == 3 || ext.len() == 4) && ext[0] == b'r' && all_digits(&ext[1..]) => 3,
+            _ if ext.len() == 3 && all_digits(ext) => {
+                if base.ends_with(b".7z") {
+                    4
+                } else {
+                    3
+                }
+            }
+            _ => 8,
+        }
+    }
+
+    /// 0 none, 1 ok, 2 missing, 3 unavailable, 4 error (any other text), 5 skipped.
+    fn collector_text(t: &[u8]) -> i64 {
+        let t = trim(t);
+        if t.is_empty() {
+            0
+        } else if t.eq_ignore_ascii_case(b"ok") {
+            1
+        } else if t.eq_ignore_ascii_case(b"missing") || t == b"430" {
+            2
+        } else if t.eq_ignore_ascii_case(b"timeout") || t.eq_ignore_ascii_case(b"unavailable") {
+            3
+        } else if t.eq_ignore_ascii_case(b"skipped") {
+            5
+        } else {
+            4
+        }
+    }
+
+    pub fn collector_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 28);
+        let mut kinds = [0i64; 9];
+        let mut outcomes = [0i64; 7];
+        let mut flag_counts = [0i64; 6];
+        let mut names: Set<u32> = set(rows.len());
+        let (mut par2_used, mut fragments_total, mut total_bytes, mut sampled_bytes) =
+            (0i64, 0i64, 0i64, 0i64);
+        for row in rows {
+            let [name, bytes, segments, article, text] = fields::<5>(row);
+            let lname = lower(trim(name));
+            let kind = collector_kind(&lname);
+            let (bytes, segments, article) = (int(bytes, 12), int(segments, 9), int(article, 9));
+            let text = collector_text(text);
+            let valid = kind != 0 && bytes.is_ok() && segments.is_ok() && article.is_ok();
+            let b = bytes.ok().flatten().unwrap_or(0);
+            let s = segments.ok().flatten().unwrap_or(0);
+            let a = article.ok().flatten();
+            let outcome = if !valid {
+                0
+            } else {
+                match text {
+                    5 => 6,
+                    3 => 4,
+                    2 => 3,
+                    4 => 5,
+                    _ => match a {
+                        Some(a) if a > COLLECTOR_MAX_ARTICLE_BYTES => 2,
+                        Some(_) => 1,
+                        None => 6,
+                    },
+                }
+            };
+            let crc = crc32(&lname);
+            let par2 = valid && (kind == 1 || kind == 2);
+            let included = par2 && par2_used + b <= COLLECTOR_MAX_PAR2_SET_BYTES;
+            if included {
+                par2_used += b;
+            }
+            let archive = valid && (kind == 3 || kind == 4);
+            let fragments = if archive {
+                s.min(COLLECTOR_MAX_FRAGMENTS)
+            } else {
+                0
+            };
+            let dup = valid && !names.insert(crc);
+            let flags = i64::from(included)
+                | i64::from(par2 && !included) << 1
+                | i64::from(archive && s > COLLECTOR_MAX_FRAGMENTS) << 2
+                | i64::from(dup) << 3
+                | i64::from(outcome == 1 && !par2 && b >= COLLECTOR_SOURCE_SAMPLE_BYTES) << 4
+                | i64::from(text != 0) << 5;
+            kinds[kind as usize] += 1;
+            outcomes[outcome as usize] += 1;
+            for (k, slot) in flag_counts.iter_mut().enumerate() {
+                *slot += flags >> k & 1;
+            }
+            fragments_total += fragments;
+            if valid {
+                total_bytes += b;
+            }
+            if outcome == 1 {
+                sampled_bytes += a.unwrap_or(0);
+            }
+            out.push(
+                kind | outcome << 4
+                    | flags << 7
+                    | fragments << 13
+                    | (b >> 20).min(0xF_FFFF) << 19
+                    | s.min(0xFFFF) << 39
+                    | (i64::from(crc) & 0xFF) << 55,
+            );
+        }
+        out.extend(kinds);
+        out.extend(outcomes);
+        out.extend(flag_counts);
+        out.extend([
+            names.len() as i64,
+            par2_used,
+            fragments_total,
+            total_bytes,
+            sampled_bytes,
+        ]);
+        out
+    }
+
+    // ---- DecoderFactory ----------------------------------------------------------------------
+
+    const DECODER_MAX_BUFFER: i64 = 64 << 20;
+
+    pub fn decoder_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 20);
+        let mut modes = [0i64; 4];
+        let mut decisions = [0i64; 4];
+        let mut flag_counts = [0i64; 7];
+        let mut keys: Set<u32> = set(16);
+        let (mut total_payload, mut max_exponent, mut total_lines) = (0i64, 0i64, 0i64);
+        let mut key = Vec::with_capacity(64);
+        for row in rows {
+            let [mode, library, sapi, os, payload, line] = fields::<6>(row);
+            let code = match mode {
+                b"auto" => 1i64,
+                b"php" => 2,
+                b"native" => 3,
+                _ => 0,
+            };
+            let selects_php = code == 2
+                || (code == 1 && (library.is_empty() || sapi != b"cli" || os != b"Linux"));
+            let decision = match code {
+                0 => 0i64,
+                _ if selects_php => 1,
+                1 => 2,
+                _ => 3,
+            };
+            let payload = int(payload, 12);
+            let bytes = payload.ok().flatten().unwrap_or(0);
+            let (line, adjusted) = match int(line, 3) {
+                Ok(Some(l)) if (1..=254).contains(&l) => (l, false),
+                Ok(Some(l)) if l > 254 => (254, true),
+                _ => (128, true),
+            };
+            let capacity = bytes.clamp(4096, DECODER_MAX_BUFFER);
+            let exponent = i64::from((capacity - 1).ilog2()) + 1;
+            let lines = if bytes == 0 {
+                0
+            } else {
+                (bytes + line - 1) / line
+            };
+            key.clear();
+            key.extend_from_slice(mode);
+            key.push(b':');
+            key.extend_from_slice(library);
+            let crc = crc32(&key);
+            if code != 0 {
+                keys.insert(crc);
+            }
+            let flags = i64::from(!library.is_empty())
+                | i64::from(sapi == b"cli") << 1
+                | i64::from(os == b"Linux") << 2
+                | i64::from(library.first() == Some(&b'/')) << 3
+                | i64::from(bytes > DECODER_MAX_BUFFER) << 4
+                | i64::from(adjusted) << 5
+                | i64::from(payload.is_err()) << 6;
+            modes[code as usize] += 1;
+            decisions[decision as usize] += 1;
+            for (k, slot) in flag_counts.iter_mut().enumerate() {
+                *slot += flags >> k & 1;
+            }
+            total_payload += bytes;
+            max_exponent = max_exponent.max(exponent);
+            total_lines += lines;
+            out.push(
+                code | decision << 2
+                    | flags << 4
+                    | exponent << 11
+                    | line << 16
+                    | lines.min(0xFF_FFFF) << 24
+                    | (i64::from(crc) & 0x7FFF) << 48,
+            );
+        }
+        out.extend(modes);
+        out.extend(decisions);
+        out.extend(flag_counts);
+        out.extend([keys.len() as i64, total_payload, max_exponent, total_lines]);
+        out
+    }
+
+    // ---- YencPart ----------------------------------------------------------------------------
+
+    /// 0 absent, 1 valid, 2 malformed, 3 valid and zero (normalizeCrc32Php() on the trimmed
+    /// field).
+    fn crc_class(crc: &[u8]) -> i64 {
+        let crc = trim(crc);
+        if crc.is_empty() {
+            0
+        } else if crc.len() > 8 || !crc.iter().all(u8::is_ascii_hexdigit) {
+            2
+        } else if crc.iter().all(|&b| b == b'0') {
+            3
+        } else {
+            1
+        }
+    }
+
+    pub fn yenc_part_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 20);
+        let mut statuses = [0i64; 7];
+        let mut continuity = [0i64; 4];
+        let mut crcs = [0i64; 4];
+        let mut files: Map<Vec<u8>, (Option<i64>, Option<i64>)> =
+            HashMap::with_capacity_and_hasher(16, FoldState::default());
+        let (mut total_length, mut max_end, mut part_gaps) = (0i64, 0i64, 0i64);
+        for row in rows {
+            let [name, size, part, begin, end, crc, body] = fields::<7>(row);
+            let name = trim(name);
+            let (size, part, begin, end, body) = (
+                int(size, 12),
+                int(part, 12),
+                int(begin, 12),
+                int(end, 12),
+                int(body, 12),
+            );
+            let crc_code = crc_class(crc);
+            let (Ok(Some(size)), Ok(part), Ok(begin), Ok(end), Ok(body)) =
+                (size, part, begin, end, body)
+            else {
+                statuses[0] += 1;
+                crcs[crc_code as usize] += 1;
+                out.push(crc_code << 5);
+                continue;
+            };
+            if name.is_empty() {
+                statuses[0] += 1;
+                crcs[crc_code as usize] += 1;
+                out.push(crc_code << 5);
+                continue;
+            }
+            let body = body.unwrap_or(0);
+            let (status, length) = match (begin, end) {
+                (None, None) if part.is_some() => (6i64, 0i64),
+                (None, None) => (if body == size { 1 } else { 2 }, size),
+                (Some(b), Some(e)) if b >= 1 && e >= b && e <= size => {
+                    (if body == e - b + 1 { 3 } else { 4 }, e - b + 1)
+                }
+                (Some(_), Some(_)) => (5, 0),
+                _ => (6, 0),
+            };
+            let key = lower(name);
+            let crc = crc32(&key);
+            let state = files.entry(key).or_insert((None, None));
+            let mut cont = 0i64;
+            if status == 3 || status == 4 {
+                let (b, e) = (begin.unwrap_or(0), end.unwrap_or(0));
+                if let Some(last) = state.0 {
+                    cont = if b == last + 1 {
+                        1
+                    } else if b > last + 1 {
+                        2
+                    } else {
+                        3
+                    };
+                }
+                if let (Some(p), Some(lp)) = (part, state.1)
+                    && p != lp + 1
+                {
+                    part_gaps += 1;
+                }
+                *state = (Some(e), part);
+                max_end = max_end.max(e);
+            }
+            if status == 1 || status == 3 {
+                total_length += length;
+            }
+            statuses[status as usize] += 1;
+            continuity[cont as usize] += 1;
+            crcs[crc_code as usize] += 1;
+            out.push(
+                status
+                    | cont << 3
+                    | crc_code << 5
+                    | part.unwrap_or(0).min(0xFFFF) << 7
+                    | length.min(0xFFFF_FFFF) << 23
+                    | (i64::from(crc) & 0xFF) << 55,
+            );
+        }
+        out.extend(statuses);
+        out.extend(continuity);
+        out.extend(crcs);
+        out.extend([files.len() as i64, total_length, max_end, part_gaps]);
+        out
+    }
+
+    // ---- YencService -------------------------------------------------------------------------
+
+    /// Whether encodePhp() escapes source byte `b`.
+    #[inline]
+    fn escaped(b: u8) -> bool {
+        matches!(b.wrapping_add(42), 0 | 9 | 10 | 13 | 32 | 46 | 61)
+    }
+
+    pub fn yenc_service_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 19);
+        let mut ops = [0i64; 3];
+        let mut statuses = [0i64; 7];
+        let mut crcs: Set<u32> = set(rows.len());
+        let (mut enc_in, mut enc_out, mut dec_in, mut dec_out) = (0i64, 0i64, 0i64, 0i64);
+        let (mut escapes_total, mut max_line_total, mut split_rows) = (0i64, 0i64, 0i64);
+        let mut decoded: Vec<u8> = Vec::with_capacity(1024);
+        for row in rows {
+            let [op, line, size, crc, payload] = fields::<5>(row);
+            let op = trim(op);
+            let code = if op.eq_ignore_ascii_case(b"encode") {
+                1i64
+            } else if op.eq_ignore_ascii_case(b"decode") {
+                2
+            } else {
+                0
+            };
+            let crc_field = trim(crc);
+            let declared =
+                i64::from(!crc_field.is_empty()) << 1 | i64::from(!trim(size).is_empty()) << 2;
+            let n = payload.len() as i64;
+            let (status, lines, max_line, escapes, checksum, split) = match code {
+                1 => {
+                    let line = match int(line, 3) {
+                        Ok(None) => Some(128),
+                        Ok(Some(l)) if l >= 1 => Some(l.min(254)),
+                        _ => None,
+                    };
+                    let Some(line) = line else {
+                        ops[1] += 1;
+                        statuses[2] += 1;
+                        out.push(1 | 2 << 2 | declared << 57);
+                        continue;
+                    };
+                    let (mut col, mut breaks, mut escapes, mut max_col) = (0i64, 0i64, 0i64, 0i64);
+                    for &b in payload.iter() {
+                        let e = i64::from(escaped(b));
+                        if col >= line {
+                            breaks += 1;
+                            col = 0;
+                        }
+                        col += 1 + e;
+                        escapes += e;
+                        max_col = max_col.max(col);
+                    }
+                    let checksum = crc32(payload);
+                    enc_in += n;
+                    enc_out += n + escapes + 2 * breaks;
+                    let lines = if n > 0 { breaks + 1 } else { 0 };
+                    (1i64, lines, max_col, escapes, checksum, false)
+                }
+                2 => {
+                    decoded.clear();
+                    let (mut pending, mut escapes) = (false, 0i64);
+                    for &b in payload.iter() {
+                        if b == b'\r' || b == b'\n' {
+                            continue;
+                        }
+                        if pending {
+                            decoded.push(b.wrapping_sub(106));
+                            escapes += 1;
+                            pending = false;
+                        } else if b == b'=' {
+                            pending = true;
+                        } else {
+                            decoded.push(b.wrapping_sub(42));
+                        }
+                    }
+                    let checksum = crc32(&decoded);
+                    let len = decoded.len() as i64;
+                    let size = int(size, 12);
+                    let crc_ok = crc_field.len() <= 8
+                        && crc_field.iter().all(u8::is_ascii_hexdigit)
+                        && crc_field.iter().fold(0u32, |acc, &h| {
+                            acc << 4 | (h as char).to_digit(16).unwrap_or(0)
+                        }) == checksum;
+                    let status = match size {
+                        Err(()) => 6,
+                        _ if pending => 4,
+                        Ok(Some(s)) if s != len => 2,
+                        _ if !crc_field.is_empty() && !crc_ok => 3,
+                        Ok(None) if crc_field.is_empty() => 5,
+                        _ => 1,
+                    };
+                    let (mut lines, mut max_line) = (1i64, 0i64);
+                    let mut start = 0usize;
+                    for (i, &b) in payload.iter().enumerate() {
+                        if b == b'\n' {
+                            max_line = max_line.max((i - start) as i64);
+                            start = i + 1;
+                            lines += 1;
+                        }
+                    }
+                    max_line = max_line.max((payload.len() - start) as i64);
+                    if payload.is_empty() {
+                        lines = 0;
+                    }
+                    let split = payload
+                        .windows(2)
+                        .any(|w| w[0] == b'=' && (w[1] == b'\r' || w[1] == b'\n'));
+                    dec_in += n;
+                    dec_out += len;
+                    (status, lines, max_line, escapes, checksum, split)
+                }
+                _ => {
+                    ops[0] += 1;
+                    statuses[0] += 1;
+                    out.push(0);
+                    continue;
+                }
+            };
+            crcs.insert(checksum);
+            let density = escapes * 1000 / n.max(1);
+            ops[code as usize] += 1;
+            statuses[status as usize] += 1;
+            escapes_total += escapes;
+            max_line_total = max_line_total.max(max_line);
+            split_rows += i64::from(split);
+            out.push(
+                code | status << 2
+                    | lines.min(0xFFFF) << 5
+                    | max_line.min(1023) << 21
+                    | density.min(1023) << 31
+                    | (i64::from(checksum) & 0xFFFF) << 41
+                    | (i64::from(split) | declared) << 57,
+            );
+        }
+        out.extend(ops);
+        out.extend(statuses);
+        out.extend([
+            enc_in,
+            enc_out,
+            dec_in,
+            dec_out,
+            escapes_total,
+            max_line_total,
+            split_rows,
+            crcs.len() as i64,
+        ]);
+        out
+    }
+
+    // ---- LogFile -----------------------------------------------------------------------------
+
+    const LOG_CHUNK_BYTES: i64 = 65_536;
+    const LOG_ACTIVE_SECONDS: i64 = 600;
+
+    fn log_compression(ext: &[u8]) -> i64 {
+        let e = lower(ext);
+        match e.as_slice() {
+            b"gz" => 1,
+            b"bz2" => 2,
+            b"xz" => 3,
+            b"zst" => 4,
+            b"zip" => 5,
+            _ => 0,
+        }
+    }
+
+    fn log_level(line: &[u8]) -> i64 {
+        if line.first() != Some(&b'[') {
+            return 0;
+        }
+        let Some(rb) = line.iter().position(|&b| b == b']') else {
+            return 0;
+        };
+        let rest = &line[rb + 1..];
+        let Some(colon) = rest.iter().position(|&b| b == b':') else {
+            return 0;
+        };
+        let token = trim(&rest[..colon]);
+        let level = match token.iter().rposition(|&b| b == b'.') {
+            Some(d) => &token[d + 1..],
+            None => token,
+        };
+        [
+            &b"emergency"[..],
+            b"alert",
+            b"critical",
+            b"error",
+            b"warning",
+            b"notice",
+            b"info",
+            b"debug",
+        ]
+        .iter()
+        .position(|l| level.eq_ignore_ascii_case(l))
+        .map_or(0, |p| p as i64 + 1)
+    }
+
+    pub fn log_file_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 31);
+        let mut compressions = [0i64; 6];
+        let mut levels = [0i64; 9];
+        let mut buckets = [0i64; 5];
+        let mut stems: Set<&[u8]> = set(16);
+        let (mut active_rows, mut offset_invalid, mut dated, mut max_date, mut min_date) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let (mut entry_dated, mut total_size, mut max_pages, mut malformed_rows) =
+            (0i64, 0i64, 0i64, 0i64);
+        for row in rows {
+            let [name, size, mtime, now, offset, per_page, line] = fields::<7>(row);
+            let mut stem = name;
+            let mut compression = 0;
+            if let Some(dot) = stem.iter().rposition(|&b| b == b'.') {
+                compression = log_compression(&stem[dot + 1..]);
+                if compression > 0 {
+                    stem = &stem[..dot];
+                }
+            }
+            let mut rotation = 0i64;
+            if let Some(dot) = stem.iter().rposition(|&b| b == b'.') {
+                let tail = &stem[dot + 1..];
+                if (1..=9).contains(&tail.len()) && all_digits(tail) {
+                    rotation = num(tail);
+                    stem = &stem[..dot];
+                }
+            }
+            let ends_log =
+                |s: &[u8]| s.len() >= 4 && s[s.len() - 4..].eq_ignore_ascii_case(b".log");
+            let is_log = ends_log(stem);
+            let mut date = 0i64;
+            let mut has_date = false;
+            if let Some((at, d)) = (0..stem.len())
+                .filter(|&i| stem[i] == b'-')
+                .find_map(|i| ymd(&stem[i + 1..]).map(|d| (i, d)))
+            {
+                date = d;
+                has_date = d > 0;
+                stem = &stem[..at];
+            }
+            if ends_log(stem) {
+                stem = &stem[..stem.len() - 4];
+            }
+            let (size, mtime, now, offset) =
+                (int(size, 12), int(mtime, 12), int(now, 12), int(offset, 12));
+            let per_page = int(per_page, 3);
+            let malformed = size.is_err()
+                || mtime.is_err()
+                || now.is_err()
+                || offset.is_err()
+                || per_page.is_err();
+            let size = size.ok().flatten().unwrap_or(0);
+            let mtime = mtime.ok().flatten().unwrap_or(0);
+            let now = now.ok().flatten().unwrap_or(0);
+            let offset = offset.ok().flatten().unwrap_or(0);
+            let per_page = match per_page {
+                Ok(Some(p)) if p >= 1 => p.min(500),
+                _ => 50,
+            };
+            let bucket = match size {
+                s if s < 1024 => 0i64,
+                s if s < 1_048_576 => 1,
+                s if s < 1_073_741_824 => 2,
+                s if s < 1_099_511_627_776 => 3,
+                _ => 4,
+            };
+            let active = mtime > 0 && mtime > now - LOG_ACTIVE_SECONDS;
+            let offset_valid = offset <= size;
+            let chunk = if offset_valid {
+                offset / LOG_CHUNK_BYTES
+            } else {
+                0
+            };
+            let chunks = (size + LOG_CHUNK_BYTES - 1) / LOG_CHUNK_BYTES;
+            let pages = ((chunks + per_page - 1) / per_page).max(1);
+            let level = log_level(line);
+            let entry_date = line.first() == Some(&b'[') && ymd(&line[1..]).is_some_and(|d| d > 0);
+            let crc = crc32(stem);
+            stems.insert(stem);
+            compressions[compression as usize] += 1;
+            levels[level as usize] += 1;
+            buckets[bucket as usize] += 1;
+            active_rows += i64::from(active);
+            offset_invalid += i64::from(!offset_valid);
+            if has_date {
+                dated += 1;
+                max_date = max_date.max(date);
+                min_date = if min_date == 0 {
+                    date
+                } else {
+                    min_date.min(date)
+                };
+            }
+            entry_dated += i64::from(entry_date);
+            total_size += size;
+            max_pages = max_pages.max(pages);
+            malformed_rows += i64::from(malformed);
+            out.push(
+                compression
+                    | rotation.min(255) << 3
+                    | i64::from(is_log) << 11
+                    | bucket << 12
+                    | level << 15
+                    | i64::from(active) << 19
+                    | i64::from(offset_valid) << 20
+                    | i64::from(entry_date) << 21
+                    | chunk.min(0xF_FFFF) << 22
+                    | pages.min(0xFFFF) << 42
+                    | (i64::from(crc) & 0xF) << 58
+                    | i64::from(malformed) << 62,
+            );
+        }
+        out.extend(compressions);
+        out.extend(levels);
+        out.extend(buckets);
+        out.extend([
+            active_rows,
+            offset_invalid,
+            dated,
+            max_date,
+            min_date,
+            entry_dated,
+            stems.len() as i64,
+            total_size,
+            max_pages,
+            malformed_rows,
+        ]);
+        out
+    }
+
+    // ---- Exports -----------------------------------------------------------------------------
+
+    macro_rules! export {
+        ($name:ident, $plan:ident) => {
+            /// # Safety
+            /// `items` must be readable for `items_len` bytes and `out` writable for `out_cap`
+            /// words.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                items: *const u8,
+                items_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let inputs = [(items, items_len)];
+                unsafe {
+                    emit(out, out_cap, count, &inputs, || {
+                        Some($plan(&column(span(items, items_len)?, count)?))
+                    })
+                }
+            }
+        };
+    }
+
+    export!(nntmux_w632_collector_plan_batch, collector_plan);
+    export!(nntmux_w632_decoder_factory_plan_batch, decoder_plan);
+    export!(nntmux_w632_yenc_part_plan_batch, yenc_part_plan);
+    export!(nntmux_w632_yenc_service_plan_batch, yenc_service_plan);
+    export!(nntmux_w632_log_file_plan_batch, log_file_plan);
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn refs<'a>(v: &[&'a str]) -> Vec<&'a [u8]> {
+            v.iter().map(|s| s.as_bytes()).collect()
+        }
+
+        #[test]
+        fn w632_helpers_follow_php() {
+            assert_eq!(fields::<3>(b"a\tb\tc\td"), [b"a".as_slice(), b"b", b"c\td"]);
+            assert_eq!(int(b" 42 ", 3), Ok(Some(42)));
+            assert_eq!(int(b"", 3), Ok(None));
+            assert_eq!(int(b"1234", 3), Err(()));
+            assert!(checkdate(2024, 2, 29) && !checkdate(2023, 2, 29) && !checkdate(0, 1, 1));
+            assert_eq!(ymd(b"2024-02-29x"), Some(20240229));
+            assert_eq!(ymd(b"2024-13-01"), Some(0));
+            assert_eq!(ymd(b"2024-1-01"), None);
+            assert_eq!(collector_kind(b"a.vol00+01.par2"), 2);
+            assert_eq!(collector_kind(b"a.par2"), 1);
+            assert_eq!(collector_kind(b"a.7z.001"), 4);
+            assert_eq!(collector_kind(b"a.001"), 3);
+            assert_eq!(collector_kind(b"a.r00"), 3);
+            assert_eq!(collector_kind(b"a"), 8);
+            assert_eq!(crc_class(b" 0a "), 1);
+            assert_eq!(crc_class(b"000"), 3);
+            assert_eq!(crc_class(b"123456789"), 2);
+            assert_eq!(log_level(b"[2024-01-01 00:00:00] production.ERROR: x"), 4);
+            assert_eq!(log_level(b"x [a] b.info: y"), 0);
+        }
+
+        #[test]
+        fn w632_collector_rows_plan_samples() {
+            let words = collector_plan(&refs(&[
+                "Movie.par2\t1000\t1\t500\tok",
+                "Movie.vol00+01.par2\t67108000\t2\t\t",
+                "Movie.part01.rar\t50000000\t40\t700000\t",
+                "movie.PART01.rar\t1\t1\t2000001\t",
+                "Movie.nfo\t1\t1\t\tmissing",
+                "\t1\t1\t1\t",
+            ]));
+            assert_eq!(words[0] & 0x1FFF, 1 | 1 << 4 | (1 | 32) << 7);
+            assert_eq!(words[1] & 0x1FFF, 2 | 6 << 4 | 2 << 7);
+            assert_eq!(
+                words[2] & ((1 << 39) - 1),
+                3 | 1 << 4 | (4 | 16) << 7 | 32 << 13 | 47 << 19
+            );
+            assert_eq!(words[3] & 0x7FFFF, 3 | 2 << 4 | 8 << 7 | 1 << 13);
+            assert_eq!(words[4] & 0x1FFF, 6 | 3 << 4 | 32 << 7);
+            assert_eq!(words[5], 1 << 39);
+            assert_eq!(words[6..15], [1, 1, 1, 2, 0, 0, 1, 0, 0]);
+            assert_eq!(words[15..22], [1, 2, 1, 1, 0, 0, 1]);
+            assert_eq!(words[22..28], [1, 1, 1, 1, 1, 2]);
+            assert_eq!(words[28..], [4, 1000, 33, 117109002, 700500]);
+        }
+
+        #[test]
+        fn w632_decoder_rows_select_and_size() {
+            let words = decoder_plan(&refs(&[
+                "auto\t/lib/r.so\tcli\tLinux\t10000\t",
+                "auto\t\tcli\tLinux\t0\t128",
+                "native\tr.so\tfpm\tDarwin\t999999999\t300",
+                "AUTO\t\t\t\tx\t0",
+            ]));
+            assert_eq!(
+                words[0] & 0xFFFF_FFFF_FFFF,
+                1 | 2 << 2 | (1 | 2 | 4 | 8 | 32) << 4 | 14 << 11 | 128 << 16 | 79 << 24
+            );
+            assert_eq!(
+                words[1] & 0xFFFF_FFFF_FFFF,
+                1 | 1 << 2 | (2 | 4) << 4 | 12 << 11 | 128 << 16
+            );
+            assert_eq!(
+                words[2] & 0xFF_FFFF,
+                3 | 3 << 2 | (1 | 16 | 32) << 4 | 26 << 11 | 254 << 16
+            );
+            assert_eq!(words[3] & 0xFF_FFFF, (32 | 64) << 4 | 12 << 11 | 128 << 16);
+            assert_eq!(words[4..19], [1, 2, 0, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 3, 1]);
+            assert_eq!(words[19..], [3, 1000009999, 26, 79 + 3937008]);
+        }
+
+        #[test]
+        fn w632_yenc_part_rows_track_continuity() {
+            let words = yenc_part_plan(&refs(&[
+                "a.bin\t300\t1\t1\t100\tABCDEF01\t100",
+                "A.bin\t300\t2\t101\t200\t\t99",
+                "a.bin\t300\t4\t250\t300\tzz\t51",
+                "a.bin\t300\t5\t260\t301\t0\t1",
+                "single\t5\t\t\t\t000\t5",
+                "x\t1\t1\t\t\t\t",
+                "x\tbad\t\t\t\t\t",
+            ]));
+            assert_eq!(words[0] & ((1 << 55) - 1), 3 | 1 << 5 | 1 << 7 | 100 << 23);
+            assert_eq!(words[1] & ((1 << 55) - 1), 4 | 1 << 3 | 2 << 7 | 100 << 23);
+            assert_eq!(
+                words[2] & ((1 << 55) - 1),
+                3 | 2 << 3 | 2 << 5 | 4 << 7 | 51 << 23
+            );
+            assert_eq!(words[3] & ((1 << 55) - 1), 5 | 3 << 5 | 5 << 7);
+            assert_eq!(words[4] & ((1 << 55) - 1), 1 | 3 << 5 | 5 << 23);
+            assert_eq!(words[5] & ((1 << 55) - 1), 6 | 1 << 7);
+            assert_eq!(words[6], 0);
+            assert_eq!(words[7..22], [1, 1, 0, 2, 1, 1, 1, 4, 1, 1, 0, 3, 1, 1, 2]);
+            assert_eq!(words[22..], [3, 156, 300, 1]);
+        }
+
+        #[test]
+        fn w632_yenc_service_rows_frame_and_verify() {
+            let mut encoded = Vec::new();
+            for &b in b"hello\0=" {
+                let e = b.wrapping_add(42);
+                if escaped(b) {
+                    encoded.extend([b'=', e.wrapping_add(64)]);
+                } else {
+                    encoded.push(e);
+                }
+            }
+            let crc = format!("{:x}", crc32(b"hello\0="));
+            let rows: Vec<Vec<u8>> = vec![
+                b"encode\t3\t\t\tab\xD6cd".to_vec(),
+                [format!("decode\t\t7\t{crc}\t").as_bytes(), &encoded].concat(),
+                [b"decode\t\t7\tdeadbeef\t".as_slice(), &encoded].concat(),
+                b"decode\t\t\t\tab=".to_vec(),
+                b"decode\t\tx\t\tab".to_vec(),
+                b"noop\t\t\t\tab".to_vec(),
+                b"encode\t0\t\t\tab".to_vec(),
+            ];
+            let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+            let words = yenc_service_plan(&refs);
+            assert_eq!(
+                words[0] & ((1 << 41) - 1),
+                1 | 1 << 2 | 2 << 5 | 4 << 21 | 200 << 31
+            );
+            assert_eq!(words[1] & 0x1F, 2 | 1 << 2);
+            assert_eq!(words[2] & 0x1F, 2 | 3 << 2);
+            assert_eq!(words[3] & 0x1F, 2 | 4 << 2);
+            assert_eq!(words[4] & 0x1F, 2 | 6 << 2);
+            assert_eq!(words[5], 0);
+            assert_eq!(words[6], 1 | 2 << 2);
+            assert_eq!(words[7..17], [1, 2, 4, 1, 2, 1, 1, 1, 0, 1]);
+        }
+
+        #[test]
+        fn w632_log_rows_classify_rotation_and_levels() {
+            let words = log_file_plan(&refs(&[
+                "laravel-2024-02-29.log.3.gz\t2048\t1000\t1200\t70000\t1\t[2024-02-29 10:00:00] local.ERROR: x",
+                "worker.log\t0\t1\t5000\t5\t\tplain",
+                "app-2023-02-29.log\tx\t\t\t\t\t[2023-02-30] p.Debug: y",
+            ]));
+            assert_eq!(
+                words[0] & ((1 << 58) - 1),
+                1 | 3 << 3 | 1 << 11 | 1 << 12 | 4 << 15 | 1 << 19 | 1 << 21 | 1 << 42
+            );
+            assert_eq!(words[1] & ((1 << 58) - 1), 1 << 11 | 1 << 42);
+            assert_eq!(
+                words[2] & ((1 << 58) - 1) | words[2] & (1 << 62),
+                1 << 11 | 8 << 15 | 1 << 20 | 1 << 42 | 1 << 62
+            );
+            assert_eq!(words[3..9], [2, 1, 0, 0, 0, 0]);
+            assert_eq!(words[3 + 6 + 9..3 + 6 + 9 + 5], [2, 1, 0, 0, 0]);
+            assert_eq!(words[23..], [1, 2, 1, 20240229, 20240229, 1, 3, 2048, 1, 1]);
+        }
+
+        #[test]
+        fn w632_exports_guard_null_short_and_malformed_batches() {
+            let mut out = [0i64; 64];
+            let o = out.as_mut_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w632_collector_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    29
+                );
+                assert_eq!(
+                    nntmux_w632_collector_plan_batch(b"a".as_ptr(), 1, 1, o, 28),
+                    -29
+                );
+                assert_eq!(
+                    nntmux_w632_decoder_factory_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w632_yenc_part_plan_batch(std::ptr::null(), 0, 0, o, 64),
+                    20
+                );
+                assert_eq!(
+                    nntmux_w632_yenc_service_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        64
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w632_log_file_plan_batch(std::ptr::null(), 1, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w632_log_file_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    32
+                );
+                // An output buffer overlapping the input is refused.
+                let mut shared = [0u8; 512];
+                let p = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w632_log_file_plan_batch(p, 1, 1, p as *mut i64, 64),
+                    -1
+                );
+                // Unaligned outputs are written byte-wise.
+                let mut raw = [0u8; 8 * 40];
+                let unaligned = raw.as_mut_ptr().add(1) as *mut i64;
+                assert_eq!(
+                    nntmux_w632_yenc_service_plan_batch(b"a".as_ptr(), 1, 1, unaligned, 39),
+                    20
+                );
+            }
+        }
+    }
+}
