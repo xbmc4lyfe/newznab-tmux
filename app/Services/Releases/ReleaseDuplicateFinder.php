@@ -12,6 +12,7 @@ use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
 use Illuminate\Database\Eloquent\Builder;
+use Throwable;
 
 /**
  * Finds an existing release that should be treated as a duplicate of an incoming import.
@@ -374,5 +375,201 @@ final class ReleaseDuplicateFinder
         self::$ffi = RustPipelineLibrary::resolveDomain('media', ReleaseImageService::FFI_CDEF) ?? false;
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /** Wave 55.3 paired benchmarks decide this default; see RustReleaseImageBrowseDuplicateGroupManagementW55ParityTest. */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    public const string W55_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w553_release_duplicate_name_match_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public static function usesW55RustFfi(): bool
+    {
+        $override = self::w55RustFfiState();
+
+        return \is_bool($override) ? $override : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 55 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 55.3 duplicate candidate name matches against the incoming $searchName. Per candidate
+     * `flags | shared << 16 | tokens << 32`, with flags 1 empty, 2 exact match (non-empty search name),
+     * 4 folded key match and 8 folded key prefix either way (keys are the lowercased ASCII alphanumerics,
+     * both non-empty), `shared` the distinct search name tokens the candidate carries and `tokens` its
+     * token count (tokens are maximal ASCII alphanumeric runs, lowercased); then the four flag counts and
+     * the distinct search name token count.
+     *
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w55CandidateNameMatchBatch(string $searchName, array $names): array
+    {
+        return self::usesW55RustFfi() ? self::w55CandidateNameMatchBatchNative($searchName, $names) : self::w55CandidateNameMatchBatchPhp($searchName, $names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w55CandidateNameMatchBatchNative(string $searchName, array $names): array
+    {
+        array_unshift($names, $searchName);
+        $words = \count($names) + 4;
+
+        return self::w55Invoke($names, $words) ?? self::w55CandidateNameMatchBatchPhp($searchName, \array_slice($names, 1));
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w55CandidateNameMatchBatchPhp(string $searchName, array $names): array
+    {
+        $targetTokens = preg_split('/[^a-z0-9]+/', strtolower($searchName), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        $targetKey = implode('', $targetTokens);
+        $targetSet = array_flip($targetTokens);
+        $out = [];
+        $totals = [0, 0, 0, 0];
+        foreach ($names as $name) {
+            $name = (string) $name;
+            $tokens = preg_split('/[^a-z0-9]+/', strtolower($name), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $key = implode('', $tokens);
+            $flags = ($name === '' ? 1 : 0) | ($searchName !== '' && $name === $searchName ? 2 : 0);
+            if ($key !== '') {
+                $flags |= ($key === $targetKey ? 4 : 0)
+                    | ($targetKey !== '' && (str_starts_with($key, $targetKey) || str_starts_with($targetKey, $key)) ? 8 : 0);
+            }
+            $shared = $targetSet === [] || $tokens === [] ? 0 : \count(array_intersect_key($targetSet, array_flip($tokens)));
+            $totals[0] += $flags & 1;
+            $totals[1] += ($flags >> 1) & 1;
+            $totals[2] += ($flags >> 2) & 1;
+            $totals[3] += ($flags >> 3) & 1;
+            $out[] = $flags | (min($shared, 0xFFFF) << 16) | (min(\count($tokens), 0x7FFFFFFF) << 32);
+        }
+        array_push($out, ...$totals);
+        $out[] = \count($targetSet);
+
+        return $out;
+    }
+
+    /**
+     * Wave 55 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('release_w55', self::W55_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w55RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w55RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 55.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w55Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w55RustFfiState('ffi');
+            $out = self::w55RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w55RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
+            $written = $ffi->nntmux_w553_release_duplicate_name_match_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
