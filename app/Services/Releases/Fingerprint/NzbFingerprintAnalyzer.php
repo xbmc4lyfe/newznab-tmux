@@ -8,7 +8,9 @@ use App\Services\Yenc\ArticleFrame;
 use App\Services\YencService;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use RuntimeException;
+use Throwable;
 
 final class NzbFingerprintAnalyzer
 {
@@ -1621,5 +1623,318 @@ final class NzbFingerprintAnalyzer
         self::$w47AnalyzerRustFfiHandle ??= RustPipelineLibrary::resolveDomain(FingerprintDispatch::W47_FFI_DOMAIN, self::W47_FFI_CDEF) ?? false;
 
         return self::$w47AnalyzerRustFfiHandle === false ? null : self::$w47AnalyzerRustFfiHandle;
+    }
+
+    // ---- Wave 62.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 7.37x/7.17x, uncommon 7.11x/6.84x); see RustFingerprintQueueDispatchBreakerAnalyzerPar2ParserW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    private const string W62_NZB_FINGERPRINT_ANALYZER_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w622_nzb_analysis_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W62_NZB_FINGERPRINT_ANALYZER_TAIL = 30;
+
+    /**
+     * Wave 62 routing, binding and output buffer, kept in function-local statics (no static
+     * properties). Operations: null reads the routing override, 'set' replaces it (returning the
+     * previous one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]`
+     * with room for at least $val words (null without the library).
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w62', self::W62_NZB_FINGERPRINT_ANALYZER_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w62RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW62RustFfi(): bool
+    {
+        $enabled = self::w62RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w62NzbAnalysisPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62NzbAnalysisPlanBatch(array $rows): array
+    {
+        return self::usesW62RustFfi() ? self::w62NzbAnalysisPlanBatchNative($rows) : self::w62NzbAnalysisPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62NzbAnalysisPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W62_NZB_FINGERPRINT_ANALYZER_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w62RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w62NzbAnalysisPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W62_NZB_FINGERPRINT_ANALYZER_FFI_CDEF.)
+            $written = $ffi->nntmux_w622_nzb_analysis_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w62NzbAnalysisPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w62Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * Wave 62.2 NZB file fingerprint analysis plan. Per `subject\tposter\tsegments\tbytes\t
+     * message_id` row `kind | rank << 4 | flags << 7 | min(part, 0xFFFF) << 13 | min(segments, 0xFFFF)
+     * << 29 | min(avg_segment_bytes >> 10, 0x3FFF) << 45 | (crc32(filename) & 0xF) << 59`. The
+     * filename is the first double-quoted span of the subject (else the trimmed subject), ASCII-
+     * lowercased; w62NzbKind() classifies it. Ranks order fingerprint candidates: 0 PAR2 index, 1
+     * PAR2 volume, 2 first RAR volume, 3 later archive volumes, 4 other archives, 5 media, 6
+     * metadata, 7 anything else. Segments (9 digits) and bytes (12 digits) are w62Int() fields, 0
+     * when missing or malformed. Flags: valid message id (w62MessageDomain()), poster containing
+     * `@`, a `(N/M)` counter in the subject (the last one, w62Counter()), complete (segments >= M),
+     * malformed numbers, quoted filename. Then ten kind, eight rank and six flag counts, the
+     * distinct non-empty filenames and message-id domains (lowercase, by crc32), the best
+     * candidate (lowest rank below 7, then fewest bytes, then earliest row; -1 when none), the
+     * largest declared M, the total bytes and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62NzbAnalysisPlanBatchPhp(array $rows): array
+    {
+        $out = $names = $domains = [];
+        $kinds = array_fill(0, 10, 0);
+        $ranks = array_fill(0, 8, 0);
+        $flagCounts = array_fill(0, 6, 0);
+        $best = -1;
+        $bestRank = 7;
+        $bestBytes = $maxDeclared = $totalBytes = $index = 0;
+        foreach ($rows as $row) {
+            [$subject, $poster, $segments, $bytes, $mid] = explode("\t", (string) $row, 5) + array_fill(0, 5, '');
+            $file = null;
+            if (($q = strpos($subject, '"')) !== false && ($e = strpos($subject, '"', $q + 1)) !== false) {
+                $file = substr($subject, $q + 1, $e - $q - 1);
+            }
+            $lower = strtolower($file ?? trim($subject));
+            [$kind, $part] = self::w62NzbKind($lower);
+            $rank = match ($kind) {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                3 => $part <= 1 ? 2 : 3,
+                5 => 3,
+                6 => 4,
+                8 => 5,
+                7 => 6,
+                default => 7,
+            };
+            $segments = self::w62Int($segments, 9);
+            $bytes = self::w62Int($bytes, 12);
+            $bad = $segments === false || $bytes === false;
+            $segments = \is_int($segments) ? $segments : 0;
+            $bytes = \is_int($bytes) ? $bytes : 0;
+            $counter = self::w62Counter($subject);
+            $domain = self::w62MessageDomain($mid);
+            $complete = $counter !== null && $segments >= $counter[1];
+            $flags = (int) ($domain !== null) | (int) str_contains($poster, '@') << 1 | (int) ($counter !== null) << 2 | (int) $complete << 3
+                | (int) $bad << 4 | (int) ($file !== null) << 5;
+            $avg = $segments > 0 ? intdiv($bytes, $segments) : 0;
+            $crc = crc32($lower);
+            $kinds[$kind]++;
+            $ranks[$rank]++;
+            for ($k = 0; $k < 6; $k++) {
+                $flagCounts[$k] += $flags >> $k & 1;
+            }
+            if ($lower !== '') {
+                $names[$crc] = true;
+            }
+            if ($domain !== null) {
+                $domains[crc32(strtolower($domain))] = true;
+            }
+            if ($rank < $bestRank || ($rank === $bestRank && $rank < 7 && $bytes < $bestBytes)) {
+                [$best, $bestRank, $bestBytes] = [$index, $rank, $bytes];
+            }
+            if ($counter !== null) {
+                $maxDeclared = max($maxDeclared, $counter[1]);
+            }
+            $totalBytes += $bytes;
+            $index++;
+            $out[] = $kind | $rank << 4 | $flags << 7 | min($part, 0xFFFF) << 13 | min($segments, 0xFFFF) << 29 | min($avg >> 10, 0x3FFF) << 45 | ($crc & 0xF) << 59;
+        }
+        array_push($out, ...$kinds, ...$ranks, ...$flagCounts);
+        array_push($out, \count($names), \count($domains), $best, $maxDeclared, $totalBytes);
+        $out[] = self::w62Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * `[kind, part]` of a lowercased filename by the 1-8 `[a-z0-9]` run after its last dot: 1 PAR2
+     * index, 2 PAR2 volume (`.volA+B.par2` or `-`, 1-9 digit runs; part A), 3 `.partN.rar` (1-4
+     * digits; part N), 4 other `.rar`, 5 `.rNN`/`.rNNN` or a three-digit split volume (part the
+     * number), 6 another archive, 7 metadata, 8 media, 9 another extension, 0 none.
+     *
+     * @return array{int, int}
+     */
+    private static function w62NzbKind(string $lower): array
+    {
+        $dot = strrpos($lower, '.');
+        $run = $dot === false ? 0 : strspn($lower, 'abcdefghijklmnopqrstuvwxyz0123456789', $dot + 1);
+        if ($dot === false || $run < 1 || $run > 8) {
+            return [0, 0];
+        }
+        $ext = substr($lower, $dot + 1, $run);
+        $base = substr($lower, 0, $dot);
+        if ($ext === 'par2') {
+            $v = strrpos($base, '.vol');
+            if ($v !== false) {
+                $tail = substr($base, $v + 4);
+                $a = strspn($tail, '0123456789');
+                $b = \strlen($tail) - $a - 1;
+                if ($a >= 1 && $a <= 9 && \in_array($tail[$a] ?? '', ['+', '-'], true) && $b >= 1 && $b <= 9 && strspn($tail, '0123456789', $a + 1) === $b) {
+                    return [2, (int) substr($tail, 0, $a)];
+                }
+            }
+
+            return [1, 0];
+        }
+        if ($ext === 'rar') {
+            $p = strrpos($base, '.part');
+            $tail = $p === false ? '' : substr($base, $p + 5);
+            $length = \strlen($tail);
+
+            return $length >= 1 && $length <= 4 && strspn($tail, '0123456789') === $length ? [3, (int) $tail] : [4, 0];
+        }
+        $length = \strlen($ext);
+        if (($length === 3 || $length === 4) && $ext[0] === 'r' && strspn($ext, '0123456789', 1) === $length - 1) {
+            return [5, (int) substr($ext, 1)];
+        }
+        if ($length === 3 && strspn($ext, '0123456789') === 3) {
+            return [5, (int) $ext];
+        }
+
+        return [match ($ext) {
+            'zip', '7z', 'tar', 'gz', 'bz2', 'xz' => 6,
+            'nfo', 'sfv', 'nzb', 'txt', 'jpg', 'png', 'srr' => 7,
+            'mkv', 'mp4', 'avi', 'm4v', 'ts', 'wmv', 'mp3', 'flac', 'iso', 'img', 'bin', 'epub', 'pdf' => 8,
+            default => 9,
+        }, 0];
+    }
+
+    /**
+     * The last `(N/M)` with 1-9 digit runs as `[N, M]` (matches cannot overlap, so the last of
+     * preg_match_all() is the rightmost), else null.
+     *
+     * @return array{int, int}|null
+     */
+    private static function w62Counter(string $subject): ?array
+    {
+        if (! str_contains($subject, '(') || preg_match_all('/\(([0-9]{1,9})\/([0-9]{1,9})\)/', $subject, $matches) < 1) {
+            return null;
+        }
+        $last = \count($matches[0]) - 1;
+
+        return [(int) $matches[1][$last], (int) $matches[2][$last]];
+    }
+
+    /**
+     * The domain of a valid message id: trimmed, optionally `<>`-wrapped, exactly one `@` with
+     * text on both sides and no whitespace or angle brackets inside; else null.
+     */
+    private static function w62MessageDomain(string $mid): ?string
+    {
+        $mid = trim($mid);
+        $length = \strlen($mid);
+        if ($length >= 2 && $mid[0] === '<' && $mid[$length - 1] === '>') {
+            $mid = substr($mid, 1, -1);
+            $length -= 2;
+        }
+        $at = strpos($mid, '@');
+        if ($at === false || $at === 0 || $at + 1 >= $length || str_contains(substr($mid, $at + 1), '@') || strcspn($mid, " \t\r\n<>") !== $length) {
+            return null;
+        }
+
+        return substr($mid, $at + 1);
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w62Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
     }
 }
