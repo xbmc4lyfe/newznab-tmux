@@ -44376,3 +44376,1009 @@ pub mod wave57_2_mcp_path_guard_repo_context_redactor_status_tmux_collector {
         }
     }
 }
+
+pub mod wave58_2_constrained_predb_filename_nfo_obfuscated_name_checker {
+    //! Wave 58.2 batch kernels for ConstrainedPredbMatcher, FileNameExtractor, NfoNameExtractor,
+    //! ObfuscatedSubjectExtractor and NameCheckerService in the Wave 49.2 framing: NUL-joined
+    //! string columns (exactly `count` entries) and little-endian `i64` tables in, one `i64`
+    //! word per item, a few summary words and one XXH64 digest of the preceding words out. Each
+    //! export returns the word count, `-needed` when `out_cap` (in words) is short, or -1 for a
+    //! null output, a malformed batch, an output overlapping an input or a panic. Every rule is
+    //! byte-level ASCII (no locale tables), so the PHP twins agree under any `setlocale()`.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, ints, span,
+    };
+    use std::cmp::Ordering;
+    use std::collections::HashSet;
+
+    /// Saturation limit of the 24-bit length fields.
+    const FIELD: usize = 0xFF_FFFF;
+
+    fn set<T>(n: usize) -> HashSet<T, FoldState> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    #[inline]
+    fn word(flags: i64, text: &[u8]) -> i64 {
+        flags | (text.len().min(FIELD) as i64) << 8 | i64::from(crc32(text)) << 32
+    }
+
+    fn trim_by(s: &[u8], strip: impl Fn(u8) -> bool) -> &[u8] {
+        let start = s.iter().position(|&b| !strip(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|&b| !strip(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    fn rtrim_by(s: &[u8], strip: impl Fn(u8) -> bool) -> &[u8] {
+        &s[..s.iter().rposition(|&b| !strip(b)).map_or(0, |p| p + 1)]
+    }
+
+    fn ltrim_by(s: &[u8], strip: impl Fn(u8) -> bool) -> &[u8] {
+        &s[s.iter().position(|&b| !strip(b)).unwrap_or(s.len())..]
+    }
+
+    /// PHP `trim()`'s default character set.
+    #[inline]
+    fn is_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+    }
+
+    fn lower_into(s: &[u8], buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.extend(s.iter().map(u8::to_ascii_lowercase));
+    }
+
+    /// Maximal `[a-z0-9]` runs of an ASCII-lowercased string (`preg_split('/[^a-z0-9]+/')`).
+    fn runs(lower: &[u8]) -> impl Iterator<Item = &[u8]> {
+        lower
+            .split(|b| !(b.is_ascii_lowercase() || b.is_ascii_digit()))
+            .filter(|t| !t.is_empty())
+    }
+
+    /// A `(19|20)YY` token.
+    #[inline]
+    fn is_year(t: &[u8]) -> bool {
+        t.len() == 4
+            && (t.starts_with(b"19") || t.starts_with(b"20"))
+            && t[2].is_ascii_digit()
+            && t[3].is_ascii_digit()
+    }
+
+    #[inline]
+    fn digit_run(s: &[u8]) -> usize {
+        s.iter().take_while(|b| b.is_ascii_digit()).count()
+    }
+
+    /// `s` is `[0-9]{min,max}` followed by exactly `tail`.
+    #[inline]
+    fn digits_then(s: &[u8], min: usize, max: usize, tail: &[u8]) -> bool {
+        let n = digit_run(s);
+        n >= min && n <= max && &s[n..] == tail
+    }
+
+    /// The text after the last `-` when it is `min..=max` ASCII alphanumerics; `at_start` also
+    /// accepts a dash at offset 0.
+    fn dash_group(s: &[u8], min: usize, max: usize, at_start: bool) -> Option<&[u8]> {
+        let p = s.iter().rposition(|&b| b == b'-')?;
+        let g = &s[p + 1..];
+        ((at_start || p > 0)
+            && g.len() >= min
+            && g.len() <= max
+            && g.iter().all(u8::is_ascii_alphanumeric))
+        .then_some(g)
+    }
+
+    // ---- ConstrainedPredbMatcher -------------------------------------------------------------
+
+    /// Sizes outside `1..=SIZE_LIMIT` never fall in the window.
+    const SIZE_LIMIT: i64 = 1 << 47;
+
+    /// Sorted distinct tokens and the first year token.
+    fn title_tokens(lower: &[u8]) -> (Vec<&[u8]>, Option<&[u8]>) {
+        let mut tokens: Vec<&[u8]> = Vec::with_capacity(16);
+        let mut year = None;
+        for t in runs(lower) {
+            if year.is_none() && is_year(t) {
+                year = Some(t);
+            }
+            tokens.push(t);
+        }
+        tokens.sort_unstable();
+        tokens.dedup();
+        (tokens, year)
+    }
+
+    fn intersect(a: &[&[u8]], b: &[&[u8]]) -> usize {
+        let (mut i, mut j, mut n) = (0, 0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(b[j]) {
+                Ordering::Less => i += 1,
+                Ordering::Greater => j += 1,
+                Ordering::Equal => {
+                    n += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Per candidate `flags | min(overlap, 255) << 8 | score << 16 | rank << 24`. Flags: 1 both
+    /// sizes in 1..=2^47 within 10% of the larger, 2 a positive query file count equal to the
+    /// candidate's, 4 equal release groups (after the last `-`, 2-20 ASCII alphanumerics,
+    /// case-insensitive), 8 equal first year tokens, 16 eligible (score >= 50, size window,
+    /// file count when the query has one). Score: Dice over distinct lowercase `[a-z0-9]`
+    /// tokens, `intdiv(200 * overlap, |Q| + |C|)`. Rank: stable order by eligibility, score and
+    /// flag count (descending). Then the eligible count, the best eligible index (or -1), its
+    /// score (or 0) and |Q|.
+    pub fn predb_rank(
+        query: &[u8],
+        query_size: i64,
+        query_files: i64,
+        titles: &[&[u8]],
+        sizes: &[i64],
+        files: &[i64],
+    ) -> Vec<i64> {
+        let n = titles.len();
+        let q_lower = query.to_ascii_lowercase();
+        let (q_tokens, q_year) = title_tokens(&q_lower);
+        let q_group = dash_group(query, 2, 20, true);
+        let q_size_ok = query_size > 0 && query_size <= SIZE_LIMIT;
+        let mut keys: Vec<(bool, i64, u32)> = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(n + 5);
+        let mut buf = Vec::new();
+        for i in 0..n {
+            lower_into(titles[i], &mut buf);
+            let (c_tokens, c_year) = title_tokens(&buf);
+            let overlap = intersect(&q_tokens, &c_tokens);
+            let total = q_tokens.len() + c_tokens.len();
+            let score = if total == 0 {
+                0
+            } else {
+                (200 * overlap / total) as i64
+            };
+            let size = sizes[i];
+            let mut flags = 0i64;
+            if q_size_ok
+                && size > 0
+                && size <= SIZE_LIMIT
+                && (query_size - size).abs() * 10 <= query_size.max(size)
+            {
+                flags |= 1;
+            }
+            if query_files > 0 && files[i] == query_files {
+                flags |= 2;
+            }
+            if let (Some(a), Some(b)) = (q_group, dash_group(titles[i], 2, 20, true))
+                && a.eq_ignore_ascii_case(b)
+            {
+                flags |= 4;
+            }
+            if q_year.is_some() && q_year == c_year {
+                flags |= 8;
+            }
+            let eligible = score >= 50 && flags & 1 != 0 && (query_files <= 0 || flags & 2 != 0);
+            if eligible {
+                flags |= 16;
+            }
+            keys.push((eligible, score, (flags & 15).count_ones()));
+            out.push(flags | (overlap.min(255) as i64) << 8 | score << 16);
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by(|&a, &b| keys[b].cmp(&keys[a]).then(a.cmp(&b)));
+        for (rank, &i) in order.iter().enumerate() {
+            out[i] |= (rank as i64) << 24;
+        }
+        let eligible = keys.iter().filter(|k| k.0).count() as i64;
+        let best = order.first().copied().filter(|&i| keys[i].0);
+        out.push(eligible);
+        out.push(best.map_or(-1, |i| i as i64));
+        out.push(best.map_or(0, |i| keys[i].1));
+        out.push(q_tokens.len() as i64);
+        out
+    }
+
+    // ---- FileNameExtractor -------------------------------------------------------------------
+
+    const ARCHIVE_EXACT: [&[u8]; 6] = [b"rar", b"zip", b"7z", b"par2", b"sfv", b"nzb"];
+
+    const MEDIA: [&[u8]; 11] = [
+        b"mkv", b"mp4", b"avi", b"m4v", b"ts", b"m2ts", b"iso", b"nfo", b"srt", b"idx", b"sub",
+    ];
+
+    const JUNK: [&[u8]; 7] = [
+        b"sample", b"proof", b"subs", b"thumbs", b"screens", b"cover", b"extras",
+    ];
+
+    fn vol_suffix(r: &[u8]) -> bool {
+        let n = digit_run(r);
+        (1..=4).contains(&n)
+            && matches!(r.get(n), Some(b'+' | b'-'))
+            && digits_then(&r[n + 1..], 1, 4, b".par2")
+    }
+
+    /// The leftmost `.` whose remainder is an archive suffix, and whether it is a part/volume
+    /// suffix: `/\.(?:(part\d{1,4}\.rar|vol\d{1,4}[+-]\d{1,4}\.par2|7z\.\d{3}|r\d{2,3}|z\d{2}|\d{3})|rar|zip|7z|par2|sfv|nzb)\z/`.
+    fn file_archive_suffix(lower: &[u8]) -> Option<(usize, bool)> {
+        for p in (0..lower.len()).filter(|&p| lower[p] == b'.') {
+            let r = &lower[p + 1..];
+            let part = (r.starts_with(b"part") && digits_then(&r[4..], 1, 4, b".rar"))
+                || (r.starts_with(b"vol") && vol_suffix(&r[3..]))
+                || (r.starts_with(b"7z.") && digits_then(&r[3..], 3, 3, b""))
+                || (r.first() == Some(&b'r') && digits_then(&r[1..], 2, 3, b""))
+                || (r.first() == Some(&b'z') && digits_then(&r[1..], 2, 2, b""))
+                || digits_then(r, 3, 3, b"");
+            if part {
+                return Some((p, true));
+            }
+            if ARCHIVE_EXACT.contains(&r) {
+                return Some((p, false));
+            }
+        }
+        None
+    }
+
+    /// Per filename `flags | min(len, 0xFFFFFF) << 8 | crc32(candidate) << 32`. The basename
+    /// (after the last `/` or `\`) loses one archive suffix (flag 1; flag 16 for part/volume
+    /// suffixes) and then one media extension (flag 2); `_` and spaces become dots, dot runs
+    /// collapse and dots/dashes are trimmed (flag 64 when that changed the stem). Flag 4: a junk
+    /// token (sample, proof, subs, thumbs, screens, cover, extras); 8 generic (under 8 bytes,
+    /// only lowercase hex once lowercased, or fewer than two tokens); 32 scene-shaped (neither
+    /// and a `-GROUP` of 2-15 alphanumerics after offset 0). Then the scene, junk, generic and
+    /// archive counts and the distinct scene candidates.
+    pub fn filename_plan(names: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(names.len() + 6);
+        let (mut scene, mut junk, mut generic, mut archive) = (0i64, 0i64, 0i64, 0i64);
+        let mut seen = set::<Vec<u8>>(names.len());
+        let (mut lower, mut cand, mut cand_lower) = (Vec::new(), Vec::new(), Vec::new());
+        for &name in names {
+            let base = &name[name
+                .iter()
+                .rposition(|&b| b == b'/' || b == b'\\')
+                .map_or(0, |p| p + 1)..];
+            lower_into(base, &mut lower);
+            let mut flags = 0i64;
+            let mut cut = base.len();
+            if let Some((p, part)) = file_archive_suffix(&lower) {
+                cut = p;
+                flags |= if part { 1 | 16 } else { 1 };
+            }
+            let rest = &lower[..cut];
+            if let Some(dot) = rest.iter().rposition(|&b| b == b'.')
+                && MEDIA.contains(&&rest[dot + 1..])
+            {
+                cut = dot;
+                flags |= 2;
+            }
+            let stem = &base[..cut];
+            cand.clear();
+            for &b in stem {
+                let b = if b == b'_' || b == b' ' { b'.' } else { b };
+                if b == b'.' && cand.last() == Some(&b'.') {
+                    continue;
+                }
+                cand.push(b);
+            }
+            let trimmed = trim_by(&cand, |b| b == b'.' || b == b'-');
+            if trimmed != stem {
+                flags |= 64;
+            }
+            lower_into(trimmed, &mut cand_lower);
+            let mut tokens = 0usize;
+            let mut is_junk = false;
+            for t in runs(&cand_lower) {
+                tokens += 1;
+                is_junk |= JUNK.contains(&t);
+            }
+            let is_generic = trimmed.len() < 8
+                || cand_lower
+                    .iter()
+                    .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || tokens < 2;
+            if is_junk {
+                flags |= 4;
+                junk += 1;
+            }
+            if is_generic {
+                flags |= 8;
+                generic += 1;
+            }
+            if !is_junk && !is_generic && dash_group(trimmed, 2, 15, false).is_some() {
+                flags |= 32;
+                scene += 1;
+                if !seen.contains(trimmed) {
+                    seen.insert(trimmed.to_vec());
+                }
+            }
+            archive += flags & 1;
+            out.push(word(flags, trimmed));
+        }
+        out.extend([scene, junk, generic, archive, seen.len() as i64]);
+        out
+    }
+
+    // ---- NfoNameExtractor --------------------------------------------------------------------
+
+    /// High bytes (CP437/UTF-8 box drawing) and ASCII art punctuation.
+    #[inline]
+    fn is_art(b: u8) -> bool {
+        b >= 0x80
+            || matches!(
+                b,
+                b'|' | b'#'
+                    | b'*'
+                    | b'='
+                    | b'~'
+                    | b'^'
+                    | b'<'
+                    | b'>'
+                    | b'['
+                    | b']'
+                    | b'{'
+                    | b'}'
+                    | b'`'
+            )
+    }
+
+    const TITLE_KEYS: [&[u8]; 7] = [
+        b"release",
+        b"title",
+        b"name",
+        b"rls",
+        b"release name",
+        b"releasename",
+        b"rls name",
+    ];
+
+    #[inline]
+    fn nfo_title_char(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'(' | b')' | b'-')
+    }
+
+    /// Release-title score of a cleaned line or value, or 0 when it is not title-shaped
+    /// (8-255 bytes of `[A-Za-z0-9._()-]` with a `.` or `_`): 8 for a title key, 4 for a
+    /// `-GROUP` (2-15 alphanumerics after offset 0), min(separators, 3), 2 for a `(19|20)YY`
+    /// digit run.
+    fn nfo_score(c: &[u8], title_key: bool) -> i64 {
+        if c.len() < 8 || c.len() > 255 || !c.iter().all(|&b| nfo_title_char(b)) {
+            return 0;
+        }
+        let separators = c.iter().filter(|&&b| b == b'.' || b == b'_').count() as i64;
+        if separators == 0 {
+            return 0;
+        }
+        let year = c
+            .split(|b| !b.is_ascii_digit())
+            .any(|r| r.len() == 4 && (r.starts_with(b"19") || r.starts_with(b"20")));
+        (if title_key { 8 } else { 0 })
+            + (if dash_group(c, 2, 15, false).is_some() {
+                4
+            } else {
+                0
+            })
+            + separators.min(3)
+            + (if year { 2 } else { 0 })
+    }
+
+    /// Per NFO `flags | min(len, 0xFFFFFF) << 8 | crc32(best) << 32`. Lines split on `\n`;
+    /// control bytes and art bytes become spaces and lines are trimmed of spaces (empty lines
+    /// skipped). A line `key: value` with a 2-24 byte `[A-Za-z .]` key (right-trimmed of
+    /// spaces) is key-value; its key lowercased and right-trimmed of dots and spaces is a title
+    /// key when it names the release. The value (or the whole line) is scored by nfo_score();
+    /// the first highest score wins. Flags: the best score (bits 0-4), 32 any key-value line,
+    /// 64 any art byte, 128 any title key. Then the non-empty lines, art bytes, key-value lines
+    /// and NFOs with a candidate.
+    pub fn nfo_plan(nfos: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(nfos.len() + 5);
+        let (mut lines, mut art, mut kv_lines, mut found) = (0i64, 0i64, 0i64, 0i64);
+        let (mut clean, mut key_lower, mut best) = (Vec::new(), Vec::new(), Vec::new());
+        for &nfo in nfos {
+            let nfo_art = nfo.iter().filter(|&&b| is_art(b)).count() as i64;
+            art += nfo_art;
+            let mut flags = if nfo_art > 0 { 64 } else { 0 };
+            let mut best_score = 0i64;
+            best.clear();
+            for line in nfo.split(|&b| b == b'\n') {
+                clean.clear();
+                clean.extend(
+                    line.iter()
+                        .map(|&b| if b < 0x20 || is_art(b) { b' ' } else { b }),
+                );
+                let c = trim_by(&clean, |b| b == b' ');
+                if c.is_empty() {
+                    continue;
+                }
+                lines += 1;
+                let mut candidate = c;
+                let mut title_key = false;
+                if let Some(p) = c.iter().position(|&b| b == b':') {
+                    let key = rtrim_by(&c[..p], |b| b == b' ');
+                    if key.len() >= 2
+                        && key.len() <= 24
+                        && key
+                            .iter()
+                            .all(|&b| b.is_ascii_alphabetic() || b == b' ' || b == b'.')
+                    {
+                        kv_lines += 1;
+                        flags |= 32;
+                        lower_into(key, &mut key_lower);
+                        title_key =
+                            TITLE_KEYS.contains(&rtrim_by(&key_lower, |b| b == b'.' || b == b' '));
+                        if title_key {
+                            flags |= 128;
+                        }
+                        candidate = trim_by(&c[p + 1..], |b| b == b' ');
+                    }
+                }
+                let score = nfo_score(candidate, title_key);
+                if score > best_score {
+                    best_score = score;
+                    best.clear();
+                    best.extend_from_slice(candidate);
+                }
+            }
+            if best_score > 0 {
+                found += 1;
+            }
+            out.push(word(flags | best_score, &best));
+        }
+        out.extend([lines, art, kv_lines, found]);
+        out
+    }
+
+    // ---- ObfuscatedSubjectExtractor ----------------------------------------------------------
+
+    const SUBJECT_EXACT: [&[u8]; 7] = [b"rar", b"par2", b"7z", b"zip", b"nzb", b"nfo", b"sfv"];
+
+    /// `/\.(?:part\d{1,4}\.rar|vol\d{1,4}[+-]\d{1,4}\.par2|r\d{2,3}|\d{3}|rar|par2|7z|zip|nzb|nfo|sfv)\z/`
+    /// on the lowercased subject: the offset of the leftmost matching dot.
+    fn subject_archive_suffix(lower: &[u8]) -> Option<usize> {
+        (0..lower.len()).filter(|&p| lower[p] == b'.').find(|&p| {
+            let r = &lower[p + 1..];
+            (r.starts_with(b"part") && digits_then(&r[4..], 1, 4, b".rar"))
+                || (r.starts_with(b"vol") && vol_suffix(&r[3..]))
+                || (r.first() == Some(&b'r') && digits_then(&r[1..], 2, 3, b""))
+                || digits_then(r, 3, 3, b"")
+                || SUBJECT_EXACT.contains(&r)
+        })
+    }
+
+    fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).rposition(|w| w == needle)
+    }
+
+    #[inline]
+    fn is_hex(b: u8) -> bool {
+        b.is_ascii_hexdigit()
+    }
+
+    /// Per subject `flags | min(len, 0xFFFFFF) << 8 | crc32(core) << 32`. After trim(): cut at
+    /// the last `yEnc` and rtrim (flag 1); drop a trailing `(\d{1,5}/\d{1,5})` at the last `(`
+    /// and rtrim (2); drop leading `[...]` tags with 1-80 byte bodies, ltrimming spaces and
+    /// dashes (8); take the first non-empty `"..."` body (4); cut the archive suffix (16); trim
+    /// spaces, quotes, dashes, dots and underscores. Flags 32: 16+ hex digits; 64: an 8-4-4-4-12
+    /// hex UUID; 128: neither, 12-64 alphanumerics with a digit, an upper and a lower letter.
+    /// Then the yEnc, hex, UUID and random counts and the distinct non-empty cores.
+    pub fn subject_plan(subjects: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(subjects.len() + 6);
+        let (mut yenc, mut hex, mut uuid, mut random) = (0i64, 0i64, 0i64, 0i64);
+        let mut seen = set::<&[u8]>(subjects.len());
+        let mut lower = Vec::new();
+        for &subject in subjects {
+            let mut s = trim_by(subject, is_trim);
+            let mut flags = 0i64;
+            if let Some(p) = rfind(s, b"yEnc") {
+                s = rtrim_by(&s[..p], is_trim);
+                flags |= 1;
+            }
+            if s.last() == Some(&b')')
+                && let Some(q) = s.iter().rposition(|&b| b == b'(')
+            {
+                let inner = if q + 1 <= s.len() - 1 {
+                    &s[q + 1..s.len() - 1]
+                } else {
+                    &[][..]
+                };
+                let n = digit_run(inner);
+                if (1..=5).contains(&n)
+                    && inner.get(n) == Some(&b'/')
+                    && digits_then(&inner[n + 1..], 1, 5, b"")
+                {
+                    s = rtrim_by(&s[..q], is_trim);
+                    flags |= 2;
+                }
+            }
+            while s.first() == Some(&b'[') {
+                match s.iter().position(|&b| b == b']') {
+                    Some(q) if (2..=81).contains(&q) => {
+                        s = ltrim_by(&s[q + 1..], |b| b == b' ' || b == b'-');
+                        flags |= 8;
+                    }
+                    _ => break,
+                }
+            }
+            if let Some(p1) = s.iter().position(|&b| b == b'"')
+                && let Some(off) = find(&s[p1 + 1..], b"\"")
+                && off > 0
+            {
+                s = &s[p1 + 1..p1 + 1 + off];
+                flags |= 4;
+            }
+            lower_into(s, &mut lower);
+            if let Some(p) = subject_archive_suffix(&lower) {
+                s = &s[..p];
+                flags |= 16;
+            }
+            let core = trim_by(s, |b| matches!(b, b' ' | b'"' | b'\'' | b'-' | b'.' | b'_'));
+            let len = core.len();
+            if len >= 16 && core.iter().all(|&b| is_hex(b)) {
+                flags |= 32;
+                hex += 1;
+            } else if len == 36
+                && core.iter().enumerate().all(|(i, &b)| {
+                    if matches!(i, 8 | 13 | 18 | 23) {
+                        b == b'-'
+                    } else {
+                        is_hex(b)
+                    }
+                })
+            {
+                flags |= 64;
+                uuid += 1;
+            } else if (12..=64).contains(&len)
+                && core.iter().all(u8::is_ascii_alphanumeric)
+                && core.iter().any(u8::is_ascii_digit)
+                && core.iter().any(u8::is_ascii_uppercase)
+                && core.iter().any(u8::is_ascii_lowercase)
+            {
+                flags |= 128;
+                random += 1;
+            }
+            yenc += flags & 1;
+            if !core.is_empty() {
+                seen.insert(core);
+            }
+            out.push(word(flags, core));
+        }
+        out.extend([yenc, hex, uuid, random, seen.len() as i64]);
+        out
+    }
+
+    // ---- NameCheckerService ------------------------------------------------------------------
+
+    const TV_TOKENS: [&[u8]; 3] = [b"hdtv", b"pdtv", b"sdtv"];
+
+    const MOVIE_TOKENS: [&[u8]; 15] = [
+        b"bluray", b"bdrip", b"brrip", b"dvdrip", b"webrip", b"webdl", b"web", b"remux", b"x264",
+        b"x265", b"hevc", b"xvid", b"720p", b"1080p", b"2160p",
+    ];
+
+    const GAME_TOKENS: [&[u8]; 22] = [
+        b"ps3",
+        b"ps4",
+        b"ps5",
+        b"psv",
+        b"xbox360",
+        b"xboxone",
+        b"nsw",
+        b"wii",
+        b"wiiu",
+        b"nds",
+        b"codex",
+        b"skidrow",
+        b"plaza",
+        b"gog",
+        b"fitgirl",
+        b"dodi",
+        b"flt",
+        b"razor1911",
+        b"reloaded",
+        b"cpy",
+        b"empress",
+        b"tenoke",
+    ];
+
+    const APP_TOKENS: [&[u8]; 13] = [
+        b"x64",
+        b"x86",
+        b"win32",
+        b"win64",
+        b"macos",
+        b"osx",
+        b"linux",
+        b"keygen",
+        b"incl",
+        b"cracked",
+        b"portable",
+        b"multilingual",
+        b"retail",
+    ];
+
+    /// `^s\d{1,2}e\d{1,3}$` or `^\d{1,2}x\d{2,3}$`.
+    fn tv_episode(t: &[u8]) -> bool {
+        if t.first() == Some(&b's') {
+            let n = digit_run(&t[1..]);
+            if (1..=2).contains(&n)
+                && t.get(1 + n) == Some(&b'e')
+                && digits_then(&t[2 + n..], 1, 3, b"")
+            {
+                return true;
+            }
+        }
+        let n = digit_run(t);
+        (1..=2).contains(&n) && t.get(n) == Some(&b'x') && digits_then(&t[n + 1..], 2, 3, b"")
+    }
+
+    /// Per name `routes | qualified << 4 | first << 5 | min(tokens, 0xFFFFFF) << 8 |
+    /// crc32(lowercase name) << 32` over lowercase `[a-z0-9]` tokens. Routes: 1 TV (an
+    /// SxxEyy/NxNN token or hdtv/pdtv/sdtv), 2 Movie (a year token and a source/codec/resolution
+    /// token), 4 Game (a platform or scene game group token), 8 App (a platform/crack token or
+    /// `v\d{1,3}`). Qualified: 8-255 bytes, two or more tokens, an ASCII letter and no NUL.
+    /// First: the lowest route of a qualified name (TV, Movie, Game, App), else 4. Then the
+    /// dispatch count per checker, the qualified names and the qualified unrouted names.
+    pub fn dispatch_plan(names: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(names.len() + 7);
+        let mut counts = [0i64; 4];
+        let (mut qualified_total, mut unrouted) = (0i64, 0i64);
+        let mut lower = Vec::new();
+        for &name in names {
+            lower_into(name, &mut lower);
+            let (mut tokens, mut year, mut movie) = (0usize, false, false);
+            let mut routes = 0i64;
+            for t in runs(&lower) {
+                tokens += 1;
+                if TV_TOKENS.contains(&t) || tv_episode(t) {
+                    routes |= 1;
+                }
+                year |= is_year(t);
+                movie |= MOVIE_TOKENS.contains(&t);
+                if GAME_TOKENS.contains(&t) {
+                    routes |= 4;
+                }
+                if APP_TOKENS.contains(&t)
+                    || (t.first() == Some(&b'v') && digits_then(&t[1..], 1, 3, b""))
+                {
+                    routes |= 8;
+                }
+            }
+            if year && movie {
+                routes |= 2;
+            }
+            let qualified = (8..=255).contains(&name.len())
+                && tokens >= 2
+                && lower.iter().any(u8::is_ascii_lowercase)
+                && !name.contains(&0);
+            let first = if qualified && routes != 0 {
+                routes.trailing_zeros() as i64
+            } else {
+                4
+            };
+            if qualified {
+                qualified_total += 1;
+                if routes == 0 {
+                    unrouted += 1;
+                } else {
+                    counts[first as usize] += 1;
+                }
+            }
+            out.push(
+                routes
+                    | i64::from(qualified) << 4
+                    | first << 5
+                    | (tokens.min(FIELD) as i64) << 8
+                    | i64::from(crc32(&lower)) << 32,
+            );
+        }
+        out.extend(counts);
+        out.extend([qualified_total, unrouted]);
+        out
+    }
+
+    // ---- Exports -----------------------------------------------------------------------------
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w58_predb_candidate_rank_batch(
+        query: *const u8,
+        query_len: usize,
+        query_size: i64,
+        query_files: i64,
+        titles: *const u8,
+        titles_len: usize,
+        sizes: *const u8,
+        sizes_len: usize,
+        files: *const u8,
+        files_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (query, query_len),
+            (titles, titles_len),
+            (sizes, sizes_len),
+            (files, files_len),
+        ];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let q = span(query, query_len)?;
+                let t = column(span(titles, titles_len)?, count)?;
+                let s = ints(span(sizes, sizes_len)?, count)?;
+                let f = ints(span(files, files_len)?, count)?;
+                Some(predb_rank(q, query_size, query_files, &t, &s, &f))
+            })
+        }
+    }
+
+    /// # Safety
+    /// `names` must be readable for `names_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w58_filename_candidate_plan_batch(
+        names: *const u8,
+        names_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(names, names_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                Some(filename_plan(&column(span(names, names_len)?, count)?))
+            })
+        }
+    }
+
+    /// # Safety
+    /// `nfos` must be readable for `nfos_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w58_nfo_title_plan_batch(
+        nfos: *const u8,
+        nfos_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(nfos, nfos_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                Some(nfo_plan(&column(span(nfos, nfos_len)?, count)?))
+            })
+        }
+    }
+
+    /// # Safety
+    /// `subjects` must be readable for `subjects_len` bytes and `out` writable for `out_cap`
+    /// words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w58_obfuscated_subject_plan_batch(
+        subjects: *const u8,
+        subjects_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(subjects, subjects_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                Some(subject_plan(&column(span(subjects, subjects_len)?, count)?))
+            })
+        }
+    }
+
+    /// # Safety
+    /// `names` must be readable for `names_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w58_name_checker_dispatch_plan_batch(
+        names: *const u8,
+        names_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(names, names_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                Some(dispatch_plan(&column(span(names, names_len)?, count)?))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn bytes(v: &[&str]) -> Vec<Vec<u8>> {
+            v.iter().map(|s| s.as_bytes().to_vec()).collect()
+        }
+
+        fn refs(v: &[Vec<u8>]) -> Vec<&[u8]> {
+            v.iter().map(Vec::as_slice).collect()
+        }
+
+        #[test]
+        fn predb_rank_orders_eligible_candidates_first() {
+            let titles = bytes(&[
+                "Other.Show.S01E01-GRP",
+                "Some.Movie.2019.1080p.BluRay.x264-GRP",
+                "Some.Movie.2019.720p.WEB-OTHER",
+            ]);
+            let words = predb_rank(
+                b"Some.Movie.2019.1080p.BluRay.x264-grp",
+                1000,
+                0,
+                &refs(&titles),
+                &[1000, 1050, 5000],
+                &[0, 0, 0],
+            );
+            assert_eq!(words.len(), 3 + 4);
+            assert_eq!(words[1] & 0xFF, 1 | 4 | 8 | 16);
+            assert_eq!(words[1] >> 16 & 0xFF, 100);
+            assert_eq!(words[1] >> 24, 0);
+            assert_eq!(words[3..], [1, 1, 100, 7]);
+        }
+
+        #[test]
+        fn filename_plan_strips_suffixes_and_flags_junk() {
+            let names = bytes(&[
+                "dir\\Some.Show.S01E02.720p.HDTV.x264-GRP.part01.rar",
+                "a/b/sample-grp.mkv",
+                "0123abcdef.r01",
+            ]);
+            let words = filename_plan(&refs(&names));
+            assert_eq!(words[0] & 0xFF, 1 | 16 | 32);
+            assert_eq!(
+                words[0] >> 32 & 0xFFFF_FFFF,
+                i64::from(crc32(b"Some.Show.S01E02.720p.HDTV.x264-GRP"))
+            );
+            assert_eq!(words[1] & 0xFF, 2 | 4);
+            assert_eq!(words[2] & 0xFF, 1 | 16 | 8);
+            assert_eq!(words[3..], [1, 1, 1, 2, 1]);
+        }
+
+        #[test]
+        fn nfo_plan_prefers_title_keys() {
+            let nfo = "\u{2588}\u{2588} Fancy \u{2588}\u{2588}\r\nRelease....: Some.Movie.2019.1080p.BluRay.x264-GRP\r\nSize: 4.37 GB\nOther.Thing.Here";
+            let nfos = bytes(&[nfo, ""]);
+            let words = nfo_plan(&refs(&nfos));
+            assert_eq!(words[0] & 0x1F, 8 + 4 + 3 + 2);
+            assert_eq!(words[0] & 0xE0, 32 | 64 | 128);
+            assert_eq!(words[1], i64::from(crc32(b"")) << 32);
+            assert_eq!(words[2..], [4, 12, 2, 1]);
+        }
+
+        #[test]
+        fn subject_plan_detects_hashes() {
+            let subjects = bytes(&[
+                "[01/10] - \"0123456789abcdef0123.part01.rar\" yEnc (1/50)",
+                "0f8fad5b-d9cb-469f-a165-70867728950e",
+                "aB3dE5fG7hJ9kL",
+                "  plain subject (3/7) ",
+            ]);
+            let words = subject_plan(&refs(&subjects));
+            assert_eq!(words[0] & 0xFF, 1 | 4 | 8 | 16 | 32);
+            assert_eq!(words[1] & 0xFF, 64);
+            assert_eq!(words[2] & 0xFF, 128);
+            assert_eq!(words[3] & 0xFF, 2);
+            assert_eq!(words[4..], [1, 1, 1, 1, 4]);
+        }
+
+        #[test]
+        fn dispatch_plan_routes_in_priority_order() {
+            let names = bytes(&[
+                "Some.Show.S01E02.720p.HDTV.x264-GRP",
+                "Some.Movie.2019.1080p.BluRay.x264-GRP",
+                "Some.Game.PS5-DUPLEX",
+                "Some.App.v2.1.x64.Incl.Keygen-XYZ",
+                "plain words only",
+                "x",
+            ]);
+            let words = dispatch_plan(&refs(&names));
+            assert_eq!(words[0] & 0xFF, 1 | 16);
+            assert_eq!(words[1] & 0xFF, 2 | 16 | 1 << 5);
+            assert_eq!(words[2] & 0xFF, 4 | 16 | 2 << 5);
+            assert_eq!(words[3] & 0xFF, 8 | 16 | 3 << 5);
+            assert_eq!(words[4] & 0xFF, 16 | 4 << 5);
+            assert_eq!(words[5] & 0xFF, 4 << 5);
+            assert_eq!(words[6..], [1, 1, 1, 1, 5, 1]);
+        }
+
+        #[test]
+        fn exports_guard_null_short_and_malformed_batches() {
+            let mut out = [0i64; 32];
+            let o = out.as_mut_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w58_filename_candidate_plan_batch(b"a".as_ptr(), 1, 1, o, 32),
+                    7
+                );
+                assert_eq!(
+                    nntmux_w58_filename_candidate_plan_batch(b"a".as_ptr(), 1, 1, o, 6),
+                    -7
+                );
+                assert_eq!(
+                    nntmux_w58_filename_candidate_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w58_filename_candidate_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w58_nfo_title_plan_batch(std::ptr::null(), 0, 0, o, 32),
+                    5
+                );
+                assert_eq!(
+                    nntmux_w58_obfuscated_subject_plan_batch(std::ptr::null(), 3, 1, o, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w58_name_checker_dispatch_plan_batch(b"ab".as_ptr(), 2, 1, o, 32),
+                    8
+                );
+                let ints = 5i64.to_le_bytes();
+                assert_eq!(
+                    nntmux_w58_predb_candidate_rank_batch(
+                        b"q".as_ptr(),
+                        1,
+                        1,
+                        1,
+                        b"t".as_ptr(),
+                        1,
+                        ints.as_ptr(),
+                        8,
+                        ints.as_ptr(),
+                        8,
+                        1,
+                        o,
+                        32
+                    ),
+                    6
+                );
+                assert_eq!(
+                    nntmux_w58_predb_candidate_rank_batch(
+                        b"q".as_ptr(),
+                        1,
+                        1,
+                        1,
+                        b"t".as_ptr(),
+                        1,
+                        ints.as_ptr(),
+                        4,
+                        ints.as_ptr(),
+                        8,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                let mut shared = [0u8; 64];
+                shared[0] = b'a';
+                assert_eq!(
+                    nntmux_w58_name_checker_dispatch_plan_batch(
+                        shared.as_ptr(),
+                        1,
+                        1,
+                        shared.as_mut_ptr() as *mut i64,
+                        8
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}

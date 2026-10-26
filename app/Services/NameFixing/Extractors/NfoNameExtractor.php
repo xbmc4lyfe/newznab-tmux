@@ -882,4 +882,236 @@ class NfoNameExtractor
 
         return null;
     }
+
+    // ---- Wave 58.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 3.69x/3.78x, uncommon 4.06x/4.00x); see RustConstrainedPredbFileNameNfoObfuscatedNameCheckerW58ParityTest. */
+    private const bool W58_RUST_FFI_DEFAULT = true;
+
+    private const string W58_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w58_nfo_title_plan_batch(const char *nfos, size_t nfos_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 58 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w58', self::W58_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w58RustFfiState('ffi');
+                    $buffer = $resolved instanceof \FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        $enabled = self::w58RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planNfoBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w58Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w58Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', \FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /** High bytes (CP437/UTF-8 box drawing) and ASCII art punctuation. */
+    private const string W58_ART = '/[\x80-\xff|#*=~^<>\[\]{}`]/';
+
+    private const string W58_ART_BYTES = '|#*=~^<>[]{}`';
+
+    private const string W58_KEY_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .';
+
+    private const string W58_TITLE_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._()-';
+
+    private const string W58_ALNUM = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+    private const array W58_TITLE_KEYS = ['release' => true, 'title' => true, 'name' => true, 'rls' => true, 'release name' => true,
+        'releasename' => true, 'rls name' => true];
+
+    /**
+     * Batch plan over NFO texts. Lines split on `\n`; control bytes and art bytes become spaces
+     * and lines are trimmed of spaces (empty lines skipped). A `key: value` line with a 2-24 byte
+     * `[A-Za-z .]` key (right-trimmed of spaces) is key-value; the key, lowercased and
+     * right-trimmed of dots and spaces, is a title key when it names the release (release,
+     * title, name, rls, release name, releasename, rls name). The value (or the whole line) is
+     * a title candidate when it is 8-255 bytes of `[A-Za-z0-9._()-]` with a `.` or `_`, scored
+     * 8 for a title key, 4 for a `-GROUP` (2-15 alphanumerics after offset 0), min(separators,
+     * 3) and 2 for a `(19|20)YY` digit run; the first highest score wins. Per NFO `best score |
+     * 32 any key-value line | 64 any art byte | 128 any title key | min(len, 0xFFFFFF) << 8 |
+     * crc32(best) << 32`; then the non-empty lines, art bytes, key-value lines, NFOs with a
+     * candidate and the XXH64 digest of all earlier words.
+     *
+     * @param  list<string>  $nfos
+     * @return list<int>
+     */
+    public static function planNfoBatch(array $nfos): array
+    {
+        return self::usesW58RustFfi() ? self::planNfoBatchNative($nfos) : self::planNfoBatchPhp($nfos);
+    }
+
+    /**
+     * @param  list<string>  $nfos
+     * @return list<int>
+     */
+    public static function planNfoBatchPhp(array $nfos): array
+    {
+        $from = implode('', array_map(chr(...), [...range(0x00, 0x1F), ...range(0x80, 0xFF)])).self::W58_ART_BYTES;
+        $to = str_repeat(' ', \strlen($from));
+        $out = [];
+        $lines = $art = $kvLines = $found = 0;
+        foreach ($nfos as $nfo) {
+            $nfo = (string) $nfo;
+            $nfoArt = (int) preg_match_all(self::W58_ART, $nfo);
+            $art += $nfoArt;
+            $flags = $nfoArt > 0 ? 64 : 0;
+            $bestScore = 0;
+            $best = '';
+            foreach (explode("\n", $nfo) as $line) {
+                $clean = trim(strtr($line, $from, $to), ' ');
+                if ($clean === '') {
+                    continue;
+                }
+                $lines++;
+                $candidate = $clean;
+                $titleKey = false;
+                if (($p = strpos($clean, ':')) !== false) {
+                    $key = rtrim(substr($clean, 0, $p), ' ');
+                    $keyLength = \strlen($key);
+                    if ($keyLength >= 2 && $keyLength <= 24 && strspn($key, self::W58_KEY_CHARS) === $keyLength) {
+                        $kvLines++;
+                        $flags |= 32;
+                        $titleKey = isset(self::W58_TITLE_KEYS[rtrim(strtolower($key), '. ')]);
+                        if ($titleKey) {
+                            $flags |= 128;
+                        }
+                        $candidate = trim(substr($clean, $p + 1), ' ');
+                    }
+                }
+                $score = self::w58NfoScore($candidate, $titleKey);
+                if ($score > $bestScore) {
+                    $bestScore = $score;
+                    $best = $candidate;
+                }
+            }
+            if ($bestScore > 0) {
+                $found++;
+            }
+            $out[] = $flags | $bestScore | min(\strlen($best), 0xFFFFFF) << 8 | crc32($best) << 32;
+        }
+        array_push($out, $lines, $art, $kvLines, $found);
+        $out[] = self::w58Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, an NFO holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  list<string>  $nfos
+     * @return list<int>
+     */
+    public static function planNfoBatchNative(array $nfos): array
+    {
+        $count = \count($nfos);
+        $words = $count + 5;
+        /** @var array{\FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w58RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($nfos)) {
+            return self::planNfoBatchPhp($nfos);
+        }
+        $blob = implode("\0", $nfos);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W58_FFI_CDEF.)
+            $written = $ffi->nntmux_w58_nfo_title_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+
+        return self::w58Words($written, $out, $words) ?? self::planNfoBatchPhp($nfos);
+    }
+
+    private static function w58NfoScore(string $candidate, bool $titleKey): int
+    {
+        $length = \strlen($candidate);
+        if ($length < 8 || $length > 255 || strspn($candidate, self::W58_TITLE_CHARS) !== $length) {
+            return 0;
+        }
+        $separators = substr_count($candidate, '.') + substr_count($candidate, '_');
+        if ($separators === 0) {
+            return 0;
+        }
+        $p = strrpos($candidate, '-');
+        $group = $p !== false && $p > 0 && ($g = $length - $p - 1) >= 2 && $g <= 15 && strspn($candidate, self::W58_ALNUM, $p + 1) === $g;
+
+        return ($titleKey ? 8 : 0) + ($group ? 4 : 0) + min($separators, 3)
+            + (preg_match('/(?<![0-9])(?:19|20)[0-9]{2}(?![0-9])/', $candidate) === 1 ? 2 : 0);
+    }
 }
