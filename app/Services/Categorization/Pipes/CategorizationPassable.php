@@ -699,4 +699,256 @@ class CategorizationPassable
 
         return \is_array($values) ? array_values($values) : self::planBestResultBatchPhp($categoryIds, $confidences, $matchedBy, $groups, $states);
     }
+
+    /** C signature of the Wave 66.5 {@see self::w66CategorizationPassablePlanBatch()} helper. */
+    private const string W66_CATEGORIZATION_PASSABLE_PLAN_FFI_CDEF = 'int64_t nntmux_w665_categorization_passable_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 66.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 14.87/12.44/13.38/10.91x); see tests/Unit/RustCategorizationBookPassableConsoleGroupNameMiscPipeW66ParityTest.php.
+     */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 66.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w66_5', self::W66_CATEGORIZATION_PASSABLE_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W66_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 66.5 plan batch to Rust until disabled or reset. */
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', true);
+    }
+
+    /** Route the Wave 66.5 plan batch to PHP until enabled or reset. */
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', false);
+    }
+
+    /** Restore W66_RUST_FFI_DEFAULT routing and drop the cached Wave 66.5 handle and buffer. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', null);
+        self::w66RustFfiState('reset', null);
+    }
+
+    public static function usesW66RustFfi(): bool
+    {
+        return self::w66RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w66CategorizationPassablePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 66.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w66Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w66RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w665_categorization_passable_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w66Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /** `CategorizationResult::isProtectedMiscResultPhp()` for a category id and matched-by label. */
+    private static function w66ProtectedMisc(int $category, string $label): bool
+    {
+        return $category === Category::OTHER_HASHED || ($category === Category::OTHER_MISC && (str_starts_with($label, 'hash_')
+            || str_starts_with($label, 'obfuscated_') || str_starts_with($label, 'gibberish_') || $label === 'group_only_low_signal'));
+    }
+
+    /**
+     * `CategorizationResult::shouldOverridePhp()` on permille confidences: 2 blocked by the protected-misc guard,
+     * 1 replaces the best result, 0 keeps it.
+     */
+    private static function w66OverrideDecision(int $category, int $confidence, int $bestCategory, int $bestConfidence, string $bestLabel): int
+    {
+        if ($category !== Category::OTHER_MISC && $category !== Category::OTHER_HASHED && $confidence < 600
+            && self::w66ProtectedMisc($bestCategory, $bestLabel)) {
+            return 2;
+        }
+
+        return $confidence > $bestConfidence || ($confidence === $bestConfidence && $category !== Category::OTHER_MISC && $bestCategory === Category::OTHER_MISC) ? 1 : 0;
+    }
+
+    /**
+     * Batch passable replay over `locked\tbestCategory\tbestConfidence\tbestMatchedBy\tcandidates`, confidences in
+     * permille; candidates are `|`-joined `category:confidence:matchedBy` (the label keeps later colons, empty items are
+     * ignored, items without two colons set error 4). Like updateBestResultPhp() gated by shouldStopProcessingPhp(): a
+     * candidate is skipped while the passable is locked (non-zero) or its best confidence reaches 950; otherwise it is
+     * considered and, when successful, blocked by shouldOverridePhp()'s protected-misc guard or replaces the best result
+     * when it overrides it. Nine words per record: `[bestCategory, bestConfidence, considered, replaced, blocked,
+     * skipped, firstSkipped, crc32(bestMatchedBy), errors]` with the final best result (default OTHER_MISC, 0, '') and
+     * the first skipped candidate's index (-1 none). Numbers are trimmed 1-15 ASCII digits; errors: 1 invalid number,
+     * 2 not exactly five fields, 4 malformed candidate, 8 locked, 16 final protected misc result, 32 final result stops
+     * processing.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66CategorizationPassablePlanBatch(array $records): array
+    {
+        return self::usesW66RustFfi() ? self::w66CategorizationPassablePlanBatchNative($records) : self::w66CategorizationPassablePlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66CategorizationPassablePlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w66Words($count, implode("\0", $records), 9 * $count) ?? self::w66CategorizationPassablePlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66CategorizationPassablePlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $errors = \count($fields) === 5 ? 0 : 2;
+            $locked = self::w66Number($fields[0], 0, $errors) !== 0;
+            $bestCategory = self::w66Number($fields[1] ?? '', Category::OTHER_MISC, $errors);
+            $bestConfidence = self::w66Number($fields[2] ?? '', 0, $errors);
+            $bestLabel = $fields[3] ?? '';
+            $candidates = $fields[4] ?? '';
+            $considered = $replaced = $blocked = $skipped = $index = 0;
+            $firstSkipped = -1;
+            foreach ($candidates === '' ? [] : explode('|', $candidates) as $item) {
+                if ($item === '') {
+                    continue;
+                }
+                $parts = explode(':', $item, 3);
+                if (\count($parts) < 3) {
+                    $errors |= 4;
+
+                    continue;
+                }
+                $category = self::w66Number($parts[0], 0, $errors);
+                $confidence = self::w66Number($parts[1], 0, $errors);
+                $label = $parts[2];
+                if ($locked || $bestConfidence >= 950) {
+                    $skipped++;
+                    if ($firstSkipped < 0) {
+                        $firstSkipped = $index;
+                    }
+                } else {
+                    $considered++;
+                    if ($confidence > 0 && ! ($category === Category::OTHER_MISC && $label === 'no_match')) {
+                        $decision = self::w66OverrideDecision($category, $confidence, $bestCategory, $bestConfidence, $bestLabel);
+                        if ($decision === 2) {
+                            $blocked++;
+                        } elseif ($decision === 1) {
+                            $replaced++;
+                            [$bestCategory, $bestConfidence, $bestLabel] = [$category, $confidence, $label];
+                        }
+                    }
+                }
+                $index++;
+            }
+            $errors |= ($locked ? 8 : 0) | (self::w66ProtectedMisc($bestCategory, $bestLabel) ? 16 : 0) | ($locked || $bestConfidence >= 950 ? 32 : 0);
+            array_push($out, $bestCategory, $bestConfidence, $considered, $replaced, $blocked, $skipped, $firstSkipped, crc32($bestLabel), $errors);
+        }
+
+        return $out;
+    }
 }
