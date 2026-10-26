@@ -48766,3 +48766,1396 @@ mod wave61_5_google_books_igdb_imdb_scraper_itunes_log_indexer {
         }
     }
 }
+
+/// Wave 62.5 batch helpers for `SteamService`, `TmdbClient`, `TraktService`, `TurnstileService` and
+/// `ReleaseSearchService`. Each entry reads `count` NUL-joined, tab-separated records in place and
+/// writes a fixed number of words per record.
+mod wave62_5_steam_tmdb_trakt_turnstile_release_search {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Plan callback: record bytes and its output words.
+    type Plan = fn(&[u8], &mut [i64]);
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// 1-`max` ASCII digits as an integer (PHP `ctype_digit()` plus `(int)`); `max` is at most 18.
+    fn digits(field: &[u8], max: usize) -> Option<i64> {
+        if field.is_empty() || field.len() > max {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// Up to `N` fields split on `separator` (missing fields empty) and the total field count.
+    fn fields<const N: usize>(record: &[u8], separator: u8) -> ([&[u8]; N], usize) {
+        let mut fields: [&[u8]; N] = [b""; N];
+        let mut total = 0usize;
+        for field in record.split(|&b| b == separator) {
+            if total < N {
+                fields[total] = field;
+            }
+            total += 1;
+        }
+        (fields, total)
+    }
+
+    /// Token bytes: ASCII alphanumerics and every non-ASCII byte.
+    fn is_word(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte >= 0x80
+    }
+
+    /// Maximal runs of [`is_word`] bytes (PHP `preg_split('/[^A-Za-z0-9\x80-\xff]+/')` without empties).
+    fn tokens(text: &[u8]) -> impl Iterator<Item = &[u8]> {
+        text.split(|&b| !is_word(b))
+            .filter(|token| !token.is_empty())
+    }
+
+    /// Byte length of the parts joined by single separators and the part count.
+    fn joined_len<'a>(parts: impl Iterator<Item = &'a [u8]>) -> (i64, i64) {
+        let (mut len, mut count) = (0i64, 0i64);
+        for part in parts {
+            len += part.len() as i64;
+            count += 1;
+        }
+        (if count > 0 { len + count - 1 } else { 0 }, count)
+    }
+
+    /// ASCII whitespace (`[ \t\n\r\x0b\x0c]`) separated words.
+    fn whitespace_words(text: &[u8]) -> impl Iterator<Item = &[u8]> {
+        text.split(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+            .filter(|word| !word.is_empty())
+    }
+
+    /// Whether `field` starts with `prefix` ASCII case-insensitively.
+    fn starts_with_ci(field: &[u8], prefix: &[u8]) -> bool {
+        field.len() >= prefix.len() && field[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
+
+    /// Trimmed, ASCII case-insensitive 1-based code in `names`; 0 empty, -1 unknown (sets `flag`).
+    fn code(field: &[u8], names: &[&[u8]], flag: i64, flags: &mut i64) -> i64 {
+        let field = trim(field);
+        if field.is_empty() {
+            return 0;
+        }
+        match names
+            .iter()
+            .position(|name| field.eq_ignore_ascii_case(name))
+        {
+            Some(at) => at as i64 + 1,
+            None => {
+                *flags |= flag;
+                -1
+            }
+        }
+    }
+
+    /// Trimmed 1-`max` digits (empty `default`); anything else sets `flag` and yields `default`.
+    fn number(field: &[u8], max: usize, default: i64, flag: i64, flags: &mut i64) -> i64 {
+        match trim(field) {
+            b"" => default,
+            text => digits(text, max).unwrap_or_else(|| {
+                *flags |= flag;
+                default
+            }),
+        }
+    }
+
+    /// Trimmed 1-`max` digits clamped to `low..=high` (empty `default`; clamping sets `clamped`, other
+    /// input sets `invalid` and yields `default`).
+    fn clamped(
+        field: &[u8],
+        max: usize,
+        (default, low, high): (i64, i64, i64),
+        (clamped, invalid): (i64, i64),
+        flags: &mut i64,
+    ) -> i64 {
+        match trim(field) {
+            b"" => default,
+            text => match digits(text, max) {
+                Some(value) if value < low || value > high => {
+                    *flags |= clamped;
+                    value.clamp(low, high)
+                }
+                Some(value) => value,
+                None => {
+                    *flags |= invalid;
+                    default
+                }
+            },
+        }
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records, writing
+    /// `width` words per record straight into `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        width: usize,
+        plan: Plan,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(records) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = records.len() * width;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            for (record, slot) in records.iter().zip(words.chunks_exact_mut(width)) {
+                plan(record, slot);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `SteamService::STEAM_STORE_URL`.
+    const STORE_URL: &[u8] = b"https://store.steampowered.com/app/";
+
+    /// `SteamService::SCENE_GROUPS` in code order (1-based).
+    const SCENE_GROUPS: [&[u8]; 39] = [
+        b"CODEX",
+        b"PLAZA",
+        b"GOG",
+        b"CPY",
+        b"HOODLUM",
+        b"EMPRESS",
+        b"RUNE",
+        b"TENOKE",
+        b"FLT",
+        b"RELOADED",
+        b"SKIDROW",
+        b"PROPHET",
+        b"RAZOR1911",
+        b"CORE",
+        b"REFLEX",
+        b"P2P",
+        b"GOLDBERG",
+        b"DARKSIDERS",
+        b"TINYISO",
+        b"DOGE",
+        b"ANOMALY",
+        b"ELAMIGOS",
+        b"FITGIRL",
+        b"DODI",
+        b"XATAB",
+        b"CHRONOS",
+        b"FCKDRM",
+        b"I_KNOW",
+        b"KAOS",
+        b"SIMPLEX",
+        b"ALI213",
+        b"FLTDOX",
+        b"3DMGAME",
+        b"POSTMORTEM",
+        b"VACE",
+        b"ROGUE",
+        b"OUTLAWS",
+        b"DARKSIIDERS",
+        b"ONLINEFIX",
+    ];
+
+    /// `SteamService::EDITION_TAGS` in code order (1-based); words are space separated.
+    const EDITION_TAGS: [&[u8]; 18] = [
+        b"GOTY",
+        b"GAME OF THE YEAR",
+        b"DEFINITIVE EDITION",
+        b"DELUXE EDITION",
+        b"ULTIMATE EDITION",
+        b"COMPLETE EDITION",
+        b"REMASTERED",
+        b"HD REMASTER",
+        b"DIRECTORS CUT",
+        b"ANNIVERSARY EDITION",
+        b"ENHANCED EDITION",
+        b"SPECIAL EDITION",
+        b"COLLECTORS EDITION",
+        b"GOLD EDITION",
+        b"PREMIUM EDITION",
+        b"LEGENDARY EDITION",
+        b"STANDARD EDITION",
+        b"DIGITAL EDITION",
+    ];
+
+    /// `SteamService::RELEASE_TAGS`.
+    const RELEASE_TAGS: [&[u8]; 17] = [
+        b"REPACK",
+        b"RIP",
+        b"ISO",
+        b"PROPER",
+        b"UPDATE",
+        b"DLC",
+        b"INCL",
+        b"MULTI",
+        b"CRACK",
+        b"CRACKFIX",
+        b"FIX",
+        b"PATCH",
+        b"HOTFIX",
+        b"BETA",
+        b"ALPHA",
+        b"DEMO",
+        b"PREORDER",
+    ];
+
+    /// `SteamService::MATCH_THRESHOLD` and `RELAXED_MATCH_THRESHOLD`.
+    const MATCH_THRESHOLD: i64 = 85;
+    const RELAXED_MATCH_THRESHOLD: i64 = 75;
+
+    /// Distinct tokens, compared ASCII case-insensitively, in first-seen order.
+    fn distinct<'a>(parts: impl Iterator<Item = &'a [u8]>) -> Vec<&'a [u8]> {
+        let mut seen: Vec<&[u8]> = Vec::new();
+        for part in parts {
+            if !seen.iter().any(|other| other.eq_ignore_ascii_case(part)) {
+                seen.push(part);
+            }
+        }
+        seen
+    }
+
+    /// `SteamService::lookupPlanBatch()` over `appid\ttitle\tcandidate\ttype`: `[appid, appid_kind,
+    /// title_words, clean_len, clean_words, edition_code, scene_code, similarity, tier, flags]`. The
+    /// trimmed app id is 1-10 digits with a positive value (kind 1) or a `STEAM_STORE_URL` link whose
+    /// path segment holds them (kind 2); 0 empty, 3 invalid. Title tokens are ASCII alphanumeric or
+    /// non-ASCII runs. The edition is the 1-based `EDITION_TAGS` entry (code order) whose words first
+    /// occur as a contiguous ASCII case-insensitive token run. The clean title drops that run plus
+    /// `SCENE_GROUPS` and `RELEASE_TAGS` tokens; its length joins the rest with single spaces. The
+    /// scene code is the 1-based `SCENE_GROUPS` index of the first scene token. Similarity is the Dice
+    /// coefficient `200 * common / (|clean| + |candidate|)` over distinct ASCII case-insensitive tokens;
+    /// the tier is 2 at `MATCH_THRESHOLD`, 1 at `RELAXED_MATCH_THRESHOLD`, else 0. Flags: 1 empty title,
+    /// 2 invalid app id, 4 store URL, 8 scene group, 16 release tag, 32 edition tag, 64 empty candidate,
+    /// 128 non-ASCII title, 256 non-game type, 512 not exactly four fields.
+    fn steam_plan(record: &[u8], words: &mut [i64]) {
+        let ([appid, title, candidate, kind], total) = fields::<4>(record, b'\t');
+        let mut flags = if total == 4 { 0 } else { 512 };
+        let appid = trim(appid);
+        let (id, id_kind) = if appid.is_empty() {
+            (0, 0)
+        } else {
+            let (body, kind) = match appid.strip_prefix(STORE_URL) {
+                Some(rest) => {
+                    flags |= 4;
+                    (&rest[..memchr(b'/', rest).unwrap_or(rest.len())], 2)
+                }
+                None => (appid, 1),
+            };
+            match digits(body, 10) {
+                Some(value) if value > 0 => (value, kind),
+                _ => {
+                    flags |= 2;
+                    (0, 3)
+                }
+            }
+        };
+        let title_tokens: Vec<&[u8]> = tokens(title).collect();
+        if title_tokens.is_empty() {
+            flags |= 1;
+        }
+        let mut edition = 0i64;
+        let mut span = 0..0;
+        'tags: for (index, tag) in EDITION_TAGS.iter().enumerate() {
+            let tag_words: Vec<&[u8]> = tag.split(|&b| b == b' ').collect();
+            if tag_words.len() > title_tokens.len() {
+                continue;
+            }
+            for start in 0..=title_tokens.len() - tag_words.len() {
+                if tag_words
+                    .iter()
+                    .zip(&title_tokens[start..])
+                    .all(|(word, token)| token.eq_ignore_ascii_case(word))
+                {
+                    edition = index as i64 + 1;
+                    span = start..start + tag_words.len();
+                    flags |= 32;
+                    break 'tags;
+                }
+            }
+        }
+        let mut scene = 0i64;
+        let mut clean: Vec<&[u8]> = Vec::with_capacity(title_tokens.len());
+        for (index, &token) in title_tokens.iter().enumerate() {
+            if span.contains(&index) {
+                continue;
+            }
+            if let Some(at) = SCENE_GROUPS
+                .iter()
+                .position(|group| token.eq_ignore_ascii_case(group))
+            {
+                if scene == 0 {
+                    scene = at as i64 + 1;
+                }
+                flags |= 8;
+                continue;
+            }
+            if RELEASE_TAGS
+                .iter()
+                .any(|tag| token.eq_ignore_ascii_case(tag))
+            {
+                flags |= 16;
+                continue;
+            }
+            clean.push(token);
+        }
+        let (clean_len, clean_words) = joined_len(clean.iter().copied());
+        let left = distinct(clean.iter().copied());
+        let right = distinct(tokens(candidate));
+        if right.is_empty() {
+            flags |= 64;
+        }
+        let common = left
+            .iter()
+            .filter(|token| right.iter().any(|other| other.eq_ignore_ascii_case(token)))
+            .count() as i64;
+        let sizes = (left.len() + right.len()) as i64;
+        let similarity = if sizes > 0 { 200 * common / sizes } else { 0 };
+        let tier = if similarity >= MATCH_THRESHOLD {
+            2
+        } else if similarity >= RELAXED_MATCH_THRESHOLD {
+            1
+        } else {
+            0
+        };
+        if title.iter().any(|&b| b >= 0x80) {
+            flags |= 128;
+        }
+        let kind = trim(kind);
+        if !kind.is_empty() && !kind.eq_ignore_ascii_case(b"game") {
+            flags |= 256;
+        }
+        words.copy_from_slice(&[
+            id,
+            id_kind,
+            title_tokens.len() as i64,
+            clean_len,
+            clean_words,
+            edition,
+            scene,
+            similarity,
+            tier,
+            flags,
+        ]);
+    }
+
+    /// TMDB endpoints, external-id sources and image sizes in code order (1-based).
+    const TMDB_ENDPOINTS: [&[u8]; 10] = [
+        b"search_movie",
+        b"movie",
+        b"find",
+        b"search_tv",
+        b"tv",
+        b"tv_season",
+        b"tv_episode",
+        b"credits",
+        b"external_ids",
+        b"alternative_titles",
+    ];
+    const TMDB_SOURCES: [&[u8]; 3] = [b"imdb_id", b"tvdb_id", b"tmdb"];
+    const TMDB_SIZES: [&[u8]; 10] = [
+        b"w92",
+        b"w154",
+        b"w185",
+        b"w300",
+        b"w342",
+        b"w500",
+        b"w780",
+        b"w1280",
+        b"h632",
+        b"original",
+    ];
+
+    /// `(a-z) * 26 + (a-z) + 1` for two ASCII letters (any case).
+    fn letters(a: u8, b: u8) -> Option<i64> {
+        (a.is_ascii_alphabetic() && b.is_ascii_alphabetic()).then(|| {
+            i64::from(a.to_ascii_lowercase() - b'a') * 26
+                + i64::from(b.to_ascii_lowercase() - b'a')
+                + 1
+        })
+    }
+
+    /// `en-US`, the default request language code.
+    const TMDB_LANGUAGE: i64 = (4 * 26 + 13 + 1) * 1000 + 20 * 26 + 18 + 1;
+
+    /// `TmdbClient::requestPlanBatch()` over
+    /// `endpoint\tid\tsource\tquery\tyear\tlanguage\timage_path\timage_size\trequests\twindow_started\tnow`:
+    /// `[endpoint_code, id, source_code, query_len, year, language, image_kind, size_code, allowed,
+    /// rate_wait, flags]`. Endpoints are 1 search_movie, 2 movie, 3 find, 4 search_tv, 5 tv, 6
+    /// tv_season, 7 tv_episode, 8 credits, 9 external_ids, 10 alternative_titles; sources 1 imdb_id, 2
+    /// tvdb_id, 3 tmdb (trimmed, ASCII case-insensitive, 0 empty, -1 unknown). The trimmed id is an
+    /// ASCII case-insensitive `tt` plus 6-10 digits for imdb_id, else 1-10 digits, with a positive
+    /// value; endpoints 2-3 and 5-10 require one. The query length joins its ASCII whitespace words
+    /// with single spaces; search endpoints require one. The year is four digits in 1874..=2100 (empty
+    /// 0). The language is `ll` or `ll-RR`/`ll_RR` letters as `lang * 1000 + region` (letter pairs
+    /// `(a-z) * 26 + (a-z) + 1`, region 0 when absent; empty or invalid en-US). The trimmed image path
+    /// is 0 empty, 1 rooted, 2 absolute `http(s)://`, 3 relative; it is unsafe with `..`, control,
+    /// space or DEL bytes. Sizes are 1 w92, 2 w154, 3 w185, 4 w300, 5 w342, 6 w500, 7 w780, 8 w1280,
+    /// 9 h632, 10 original (empty or unknown w500). The rate window allows 40 requests (1-6 digits) per
+    /// 10 seconds between 1-12 digit Unix seconds (empty 0) and reports the seconds until it reopens.
+    /// Flags: 1 empty endpoint, 2 unknown endpoint, 4 unknown source, 8 invalid id, 16 missing id, 32
+    /// missing query, 64 invalid year, 128 invalid language, 256 unsafe image path, 512 unknown image
+    /// size, 1024 invalid rate number, 2048 window starting in the future, 4096 not exactly eleven
+    /// fields.
+    fn tmdb_plan(record: &[u8], words: &mut [i64]) {
+        let (
+            [
+                endpoint,
+                id,
+                source,
+                query,
+                year,
+                language,
+                path,
+                size,
+                requests,
+                window,
+                now,
+            ],
+            total,
+        ) = fields::<11>(record, b'\t');
+        let mut flags = if total == 11 { 0 } else { 4096 };
+        let endpoint = code(endpoint, &TMDB_ENDPOINTS, 2, &mut flags);
+        if endpoint == 0 {
+            flags |= 1;
+        }
+        let source = code(source, &TMDB_SOURCES, 4, &mut flags);
+        let id = trim(id);
+        let id = if id.is_empty() {
+            if matches!(endpoint, 2 | 3 | 5..=10) {
+                flags |= 16;
+            }
+            0
+        } else {
+            let value = if source == 1 {
+                if starts_with_ci(id, b"tt") && id.len() >= 8 {
+                    digits(&id[2..], 10)
+                } else {
+                    None
+                }
+            } else {
+                digits(id, 10)
+            };
+            match value {
+                Some(value) if value > 0 => value,
+                _ => {
+                    flags |= 8;
+                    0
+                }
+            }
+        };
+        let (query_len, query_words) = joined_len(whitespace_words(query));
+        if matches!(endpoint, 1 | 4) && query_words == 0 {
+            flags |= 32;
+        }
+        let year = match trim(year) {
+            b"" => 0,
+            text => match digits(text, 4) {
+                Some(value) if text.len() == 4 && (1874..=2100).contains(&value) => value,
+                _ => {
+                    flags |= 64;
+                    0
+                }
+            },
+        };
+        let language = match trim(language) {
+            b"" => TMDB_LANGUAGE,
+            text => {
+                let parsed = match *text {
+                    [a, b] => letters(a, b).map(|lang| lang * 1000),
+                    [a, b, b'-' | b'_', c, d] => letters(a, b)
+                        .and_then(|lang| letters(c, d).map(|region| lang * 1000 + region)),
+                    _ => None,
+                };
+                parsed.unwrap_or_else(|| {
+                    flags |= 128;
+                    TMDB_LANGUAGE
+                })
+            }
+        };
+        let path = trim(path);
+        let image_kind = if path.is_empty() {
+            0
+        } else if path.starts_with(b"https://") || path.starts_with(b"http://") {
+            2
+        } else if path[0] == b'/' {
+            1
+        } else {
+            3
+        };
+        if image_kind != 0
+            && (path.windows(2).any(|w| w == b"..") || path.iter().any(|&b| b <= 0x20 || b == 0x7f))
+        {
+            flags |= 256;
+        }
+        let size = match code(size, &TMDB_SIZES, 512, &mut flags) {
+            code if code > 0 => code,
+            _ => 6,
+        };
+        let requests = number(requests, 6, 0, 1024, &mut flags);
+        let window = number(window, 12, 0, 1024, &mut flags);
+        let now = number(now, 12, 0, 1024, &mut flags);
+        let (allowed, wait) = if window == 0 {
+            (1, 0)
+        } else {
+            let elapsed = if now < window {
+                flags |= 2048;
+                0
+            } else {
+                now - window
+            };
+            if elapsed >= 10 || requests < 40 {
+                (1, 0)
+            } else {
+                (0, 10 - elapsed)
+            }
+        };
+        words.copy_from_slice(&[
+            endpoint, id, source, query_len, year, language, image_kind, size, allowed, wait, flags,
+        ]);
+    }
+
+    /// `TraktService::SEARCH_TYPES`, `ID_TYPES` plus `slug`, and the extended levels in code order.
+    const TRAKT_MEDIA: [&[u8]; 5] = [b"movie", b"show", b"episode", b"person", b"list"];
+    const TRAKT_ID_TYPES: [&[u8]; 5] = [b"imdb", b"tmdb", b"trakt", b"tvdb", b"slug"];
+    const TRAKT_EXTENDED: [&[u8]; 4] = [b"min", b"full", b"metadata", b"episodes"];
+
+    /// `TraktService::lookupPlanBatch()` over `media_type\tid\tid_type\tseason\tepisode\textended\tlimit`:
+    /// `[media_code, id_type_code, id_value, slug_len, season, episode, extended_code, limit, flags]`.
+    /// Media are 1 movie, 2 show, 3 episode, 4 person, 5 list; id types 1 imdb, 2 tmdb, 3 trakt, 4
+    /// tvdb, 5 slug (trimmed, ASCII case-insensitive, 0 empty, -1 unknown). An empty id type is
+    /// inferred from the trimmed id: imdb with an ASCII case-insensitive `tt` prefix, trakt for 1-18
+    /// digits, else slug. IMDb ids keep all their digits (`formatImdbIdPhp()`) when there are 6-18;
+    /// tmdb, trakt and tvdb ids are 1-18 digits with a positive value; slugs join lowercased ASCII
+    /// alphanumeric runs with `-` and report that length. Season and episode are trimmed 1-4 digits
+    /// (empty -1); episode lookups need a season and a positive episode. Extended levels are 1 min, 2
+    /// full, 3 metadata, 4 episodes (empty or unknown min). The limit (empty 10) is 1-6 digits clamped
+    /// to 1..100 (`normalizeLimit()`). Flags: 1 empty id, 2 unknown media, 4 unknown id type, 8 invalid
+    /// id, 16 invalid season or episode, 32 incomplete episode lookup, 64 unknown extended, 128 clamped
+    /// limit, 256 invalid limit, 512 non-ASCII id, 1024 not exactly seven fields.
+    fn trakt_plan(record: &[u8], words: &mut [i64]) {
+        let ([media, id, id_type, season, episode, extended, limit], total) =
+            fields::<7>(record, b'\t');
+        let mut flags = if total == 7 { 0 } else { 1024 };
+        let media = code(media, &TRAKT_MEDIA, 2, &mut flags);
+        let id = trim(id);
+        if id.iter().any(|&b| b >= 0x80) {
+            flags |= 512;
+        }
+        let id_type = match code(id_type, &TRAKT_ID_TYPES, 4, &mut flags) {
+            0 if id.is_empty() => 0,
+            0 if starts_with_ci(id, b"tt") => 1,
+            0 if digits(id, 18).is_some() => 3,
+            0 => 5,
+            code => code,
+        };
+        let (value, slug_len) = if id.is_empty() {
+            flags |= 1;
+            (0, 0)
+        } else {
+            match id_type {
+                1 => {
+                    let mut count = 0usize;
+                    let mut value = 0i64;
+                    for &b in id {
+                        if b.is_ascii_digit() {
+                            count += 1;
+                            if count <= 18 {
+                                value = value * 10 + i64::from(b - b'0');
+                            }
+                        }
+                    }
+                    if (6..=18).contains(&count) {
+                        (value, 0)
+                    } else {
+                        flags |= 8;
+                        (0, 0)
+                    }
+                }
+                2..=4 => match digits(id, 18) {
+                    Some(value) if value > 0 => (value, 0),
+                    _ => {
+                        flags |= 8;
+                        (0, 0)
+                    }
+                },
+                5 => {
+                    let (len, _) = joined_len(
+                        id.split(|b| !b.is_ascii_alphanumeric())
+                            .filter(|run| !run.is_empty()),
+                    );
+                    if len == 0 {
+                        flags |= 8;
+                    }
+                    (0, len)
+                }
+                _ => (0, 0),
+            }
+        };
+        let season = number(season, 4, -1, 16, &mut flags);
+        let episode = number(episode, 4, -1, 16, &mut flags);
+        if media == 3 && (season < 0 || episode < 1) {
+            flags |= 32;
+        }
+        let extended = match code(extended, &TRAKT_EXTENDED, 64, &mut flags) {
+            code if code > 0 => code,
+            _ => 1,
+        };
+        let limit = clamped(limit, 6, (10, 1, 100), (128, 256), &mut flags);
+        words.copy_from_slice(&[
+            media, id_type, value, slug_len, season, episode, extended, limit, flags,
+        ]);
+    }
+
+    /// `TurnstileService::W48_TOKEN_CHARS` membership.
+    fn is_token_char(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+    }
+
+    /// Cloudflare's always-pass, always-fail and token-spent test secrets.
+    const TURNSTILE_TEST_SECRETS: [&[u8]; 3] = [
+        b"1x0000000000000000000000000000000AA",
+        b"2x0000000000000000000000000000000AA",
+        b"3x0000000000000000000000000000000AA",
+    ];
+
+    /// `TurnstileService::W48_ERROR_CODES` (bit indexes in code order).
+    const TURNSTILE_ERRORS: [&[u8]; 7] = [
+        b"missing-input-secret",
+        b"invalid-input-secret",
+        b"missing-input-response",
+        b"invalid-input-response",
+        b"bad-request",
+        b"timeout-or-duplicate",
+        b"internal-error",
+    ];
+
+    /// Dotted quad with 1-3 digit octets up to 255 (no leading zeros) as its four octets.
+    fn ipv4(text: &[u8]) -> Option<[i64; 4]> {
+        let mut octets = [0i64; 4];
+        let mut count = 0usize;
+        for part in text.split(|&b| b == b'.') {
+            if count == 4 || (part.len() > 1 && part[0] == b'0') {
+                return None;
+            }
+            octets[count] = digits(part, 3).filter(|&value| value <= 255)?;
+            count += 1;
+        }
+        (count == 4).then_some(octets)
+    }
+
+    /// 2-45 bytes of hex digits, `:` and `.` with at least two colons, no `:::`, at most one `::`, at
+    /// most eight groups of up to four hex digits; only the last group may be a dotted quad.
+    fn ipv6(text: &[u8]) -> bool {
+        if !(2..=45).contains(&text.len())
+            || !text
+                .iter()
+                .all(|&b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+            || text.iter().filter(|&&b| b == b':').count() < 2
+            || text.windows(3).any(|w| w == b":::")
+            || text.windows(2).filter(|w| *w == b"::").count() > 1
+        {
+            return false;
+        }
+        let groups: Vec<&[u8]> = text.split(|&b| b == b':').collect();
+        if groups.len() > 8 {
+            return false;
+        }
+        let last = groups.len() - 1;
+        groups.iter().enumerate().all(|(index, group)| {
+            if index == last && group.contains(&b'.') {
+                ipv4(group).is_some()
+            } else {
+                group.len() <= 4 && group.iter().all(u8::is_ascii_hexdigit)
+            }
+        })
+    }
+
+    /// 8-4-4-4-12 hex digits.
+    fn uuid(text: &[u8]) -> bool {
+        text.len() == 36
+            && text.iter().enumerate().all(|(index, &b)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    b == b'-'
+                } else {
+                    b.is_ascii_hexdigit()
+                }
+            })
+    }
+
+    /// `TurnstileService::verificationPlanBatch()` over
+    /// `token\tsecret\tremote_ip\tidempotency_key\terror_codes\tsuccess\thostname\texpected_hostname`:
+    /// `[token_len, token_state, secret_state, ip_kind, idempotency_state, error_mask, outcome,
+    /// retryable, flags]`. Fields are trimmed. The token is 0 empty, 1 valid (`W48_TOKEN_CHARS`), 2
+    /// over 2048 bytes, 3 invalid bytes. The secret is 0 empty, 1 `0x` plus 1-64 `[A-Za-z0-9_-]`, 2-4
+    /// Cloudflare's always-pass, always-fail and token-spent test secrets, 5 invalid. The remote IP is
+    /// 0 empty, 1 IPv4 (dotted quad without leading zeros), 2 IPv6 (see [`ipv6`]), 3 invalid; private
+    /// means IPv4 10/8, 127/8, 169.254/16, 172.16/12 or 192.168/16, or IPv6 `::1` and `fc`/`fd`
+    /// prefixes (ASCII case-insensitive). The idempotency key is 0 empty, 1 UUID, 2 invalid. Error
+    /// codes are trimmed, non-empty comma-separated items mapped to `W48_ERROR_CODES` bits; others set
+    /// bit 7. Success is `1`/`true` or empty/`0`/`false` (ASCII case-insensitive). Outcome: 2 skipped
+    /// for an empty or invalid secret, 3 rejected locally for a token that is not valid, 1 passed on
+    /// success without error codes or hostname mismatch, else 0. Failures with `internal-error` are
+    /// retryable. Flags: 1 invalid token, 2 invalid secret, 4 invalid IP, 8 private IP, 16 invalid
+    /// idempotency key, 32 unknown error code, 64 invalid success, 128 hostname mismatch against a
+    /// non-empty expected hostname (ASCII case-insensitive), 256 success with error codes, 512 not
+    /// exactly eight fields.
+    fn turnstile_plan(record: &[u8], words: &mut [i64]) {
+        let ([token, secret, ip, key, errors, success, hostname, expected], total) =
+            fields::<8>(record, b'\t');
+        let mut flags = if total == 8 { 0 } else { 512 };
+        let token = trim(token);
+        let token_state = if token.is_empty() {
+            0
+        } else if token.len() > 2048 {
+            flags |= 1;
+            2
+        } else if !token.iter().all(|&b| is_token_char(b)) {
+            flags |= 1;
+            3
+        } else {
+            1
+        };
+        let secret = trim(secret);
+        let secret_state = if secret.is_empty() {
+            0
+        } else if let Some(at) = TURNSTILE_TEST_SECRETS
+            .iter()
+            .position(|test| secret == *test)
+        {
+            at as i64 + 2
+        } else if secret.starts_with(b"0x")
+            && (3..=66).contains(&secret.len())
+            && secret[2..]
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            1
+        } else {
+            flags |= 2;
+            5
+        };
+        let ip = trim(ip);
+        let ip_kind = if ip.is_empty() {
+            0
+        } else if let Some([a, b, _, _]) = ipv4(ip) {
+            if a == 10
+                || a == 127
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+            {
+                flags |= 8;
+            }
+            1
+        } else if ipv6(ip) {
+            if ip == b"::1" || starts_with_ci(ip, b"fc") || starts_with_ci(ip, b"fd") {
+                flags |= 8;
+            }
+            2
+        } else {
+            flags |= 4;
+            3
+        };
+        let key = trim(key);
+        let key_state = if key.is_empty() {
+            0
+        } else if uuid(key) {
+            1
+        } else {
+            flags |= 16;
+            2
+        };
+        let mut mask = 0i64;
+        for item in errors.split(|&b| b == b',') {
+            let item = trim(item);
+            if item.is_empty() {
+                continue;
+            }
+            match TURNSTILE_ERRORS.iter().position(|name| item == *name) {
+                Some(bit) => mask |= 1 << bit,
+                None => {
+                    mask |= 128;
+                    flags |= 32;
+                }
+            }
+        }
+        let success = match trim(success) {
+            b"1" => 1,
+            b"" | b"0" => 0,
+            text if text.eq_ignore_ascii_case(b"true") => 1,
+            text if text.eq_ignore_ascii_case(b"false") => 0,
+            _ => {
+                flags |= 64;
+                0
+            }
+        };
+        let expected = trim(expected);
+        if !expected.is_empty() && !trim(hostname).eq_ignore_ascii_case(expected) {
+            flags |= 128;
+        }
+        if success == 1 && mask != 0 {
+            flags |= 256;
+        }
+        let outcome = if secret_state == 0 || secret_state == 5 {
+            2
+        } else if token_state != 1 {
+            3
+        } else if success == 1 && mask == 0 && flags & 128 == 0 {
+            1
+        } else {
+            0
+        };
+        let retryable = i64::from(outcome == 0 && mask & 64 != 0);
+        words.copy_from_slice(&[
+            token.len() as i64,
+            token_state,
+            secret_state,
+            ip_kind,
+            key_state,
+            mask,
+            outcome,
+            retryable,
+            flags,
+        ]);
+    }
+
+    /// `ReleaseSearchService::W48_SIZE_BYTES` (bucket 1-11; 0 no bound).
+    const SIZE_BYTES: [i64; 12] = [
+        0,
+        104_857_600,
+        209_715_200,
+        524_288_000,
+        1_048_576_000,
+        2_097_152_000,
+        3_145_728_000,
+        4_194_304_000,
+        8_388_608_000,
+        16_777_216_000,
+        33_554_432_000,
+        67_108_864_000,
+    ];
+
+    /// `ReleaseSearchService::W48_MAX_DAYS`.
+    const MAX_DAYS: i64 = 36_500;
+
+    /// Trimmed 1-10 digit positive external id (empty -1; invalid sets 256 and yields -1), after an
+    /// optional ASCII case-insensitive `tt` when `imdb`.
+    fn external_id(field: &[u8], imdb: bool, flags: &mut i64) -> i64 {
+        let field = trim(field);
+        if field.is_empty() {
+            return -1;
+        }
+        let body = if imdb && starts_with_ci(field, b"tt") {
+            &field[2..]
+        } else {
+            field
+        };
+        match digits(body, 10) {
+            Some(value) if value > 0 => value,
+            _ => {
+                *flags |= 256;
+                -1
+            }
+        }
+    }
+
+    /// `ReleaseSearchService::searchPlanBatch()` over
+    /// `searchname\tusenetname\tfromname\tgroup\tcategories\tsize_min\tsize_max\tmax_age\timdb\ttmdb\ttvdb\toffset\tlimit`:
+    /// `[search_terms, search_len, usenet_terms, fromname_len, group_kind, category_count,
+    /// size_min_bytes, size_max_bytes, max_age, imdb, tmdb, tvdb, offset, limit, flags]`. Search and
+    /// usenet names split into ASCII alphanumeric or non-ASCII runs; the search length joins them with
+    /// single spaces. The trimmed group is 0 empty, 1 `alt.binaries.`, 2 `a.b.` (ASCII
+    /// case-insensitive prefixes), 3 other `[A-Za-z0-9._+-]` names, 4 invalid. Categories are trimmed,
+    /// non-empty comma-separated 1-4 digit ids counted once each, or -1 when any item is `-1`. Sizes
+    /// are `W48_SIZE_BYTES` buckets 0-11 (empty 0) swapped when the minimum exceeds the maximum. The
+    /// age is 1-6 digit days capped at `W48_MAX_DAYS` (empty or 0: -1). IMDb (optional `tt`), TMDB and
+    /// TVDB ids are 1-10 digits with a positive value (empty -1). The offset is 1-9 digits (empty 0);
+    /// the limit (empty 100) is 1-6 digits clamped to 1..1000. Flags: 1 empty search (no terms, poster
+    /// or external ids), 2 invalid group, 4 invalid category, 8 duplicate category, 16 invalid size, 32
+    /// swapped sizes, 64 invalid age, 128 capped age, 256 invalid external id, 512 invalid offset, 1024
+    /// clamped limit, 2048 invalid limit, 4096 poster email, 8192 not exactly thirteen fields.
+    fn release_search_plan(record: &[u8], words: &mut [i64]) {
+        let (
+            [
+                search,
+                usenet,
+                from,
+                group,
+                categories,
+                size_min,
+                size_max,
+                age,
+                imdb,
+                tmdb,
+                tvdb,
+                offset,
+                limit,
+            ],
+            total,
+        ) = fields::<13>(record, b'\t');
+        let mut flags = if total == 13 { 0 } else { 8192 };
+        let (search_len, search_terms) = joined_len(tokens(search));
+        let usenet_terms = tokens(usenet).count() as i64;
+        let from = trim(from);
+        if from.contains(&b'@') {
+            flags |= 4096;
+        }
+        let group = trim(group);
+        let group_kind = if group.is_empty() {
+            0
+        } else if !group
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+        {
+            flags |= 2;
+            4
+        } else if starts_with_ci(group, b"alt.binaries.") {
+            1
+        } else if starts_with_ci(group, b"a.b.") {
+            2
+        } else {
+            3
+        };
+        let mut all = false;
+        let mut seen: Vec<i64> = Vec::new();
+        for item in categories.split(|&b| b == b',') {
+            let item = trim(item);
+            if item.is_empty() {
+                continue;
+            }
+            if item == b"-1" {
+                all = true;
+                continue;
+            }
+            match digits(item, 4) {
+                Some(value) if seen.contains(&value) => flags |= 8,
+                Some(value) => seen.push(value),
+                None => flags |= 4,
+            }
+        }
+        let category_count = if all { -1 } else { seen.len() as i64 };
+        let bucket = |field: &[u8], flags: &mut i64| match trim(field) {
+            b"" => 0,
+            text => match digits(text, 2) {
+                Some(value) if value <= 11 => SIZE_BYTES[value as usize],
+                _ => {
+                    *flags |= 16;
+                    0
+                }
+            },
+        };
+        let mut low = bucket(size_min, &mut flags);
+        let mut high = bucket(size_max, &mut flags);
+        if low > 0 && high > 0 && low > high {
+            std::mem::swap(&mut low, &mut high);
+            flags |= 32;
+        }
+        let age = match number(age, 6, -1, 64, &mut flags) {
+            0 => -1,
+            value if value > MAX_DAYS => {
+                flags |= 128;
+                MAX_DAYS
+            }
+            value => value,
+        };
+        let imdb = external_id(imdb, true, &mut flags);
+        let tmdb = external_id(tmdb, false, &mut flags);
+        let tvdb = external_id(tvdb, false, &mut flags);
+        let offset = number(offset, 9, 0, 512, &mut flags);
+        let limit = clamped(limit, 6, (100, 1, 1000), (1024, 2048), &mut flags);
+        if search_terms == 0
+            && usenet_terms == 0
+            && from.is_empty()
+            && imdb < 0
+            && tmdb < 0
+            && tvdb < 0
+        {
+            flags |= 1;
+        }
+        words.copy_from_slice(&[
+            search_terms,
+            search_len,
+            usenet_terms,
+            from.len() as i64,
+            group_kind,
+            category_count,
+            low,
+            high,
+            age,
+            imdb,
+            tmdb,
+            tvdb,
+            offset,
+            limit,
+            flags,
+        ]);
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes the
+            /// helper's fixed words per record and returns the words written, `-needed` when
+            /// `out_cap` is too small (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(
+                        count, flags, data, data_len, ints, ints_len, out, out_cap, $width, $plan,
+                    )
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `SteamService::lookupPlanBatch()` (see [`steam_plan`]).
+        nntmux_w625_steam_lookup_plan, 10, steam_plan
+    );
+    entry!(
+        /// `TmdbClient::requestPlanBatch()` (see [`tmdb_plan`]).
+        nntmux_w625_tmdb_request_plan, 11, tmdb_plan
+    );
+    entry!(
+        /// `TraktService::lookupPlanBatch()` (see [`trakt_plan`]).
+        nntmux_w625_trakt_lookup_plan, 9, trakt_plan
+    );
+    entry!(
+        /// `TurnstileService::verificationPlanBatch()` (see [`turnstile_plan`]).
+        nntmux_w625_turnstile_verification_plan, 9, turnstile_plan
+    );
+    entry!(
+        /// `ReleaseSearchService::searchPlanBatch()` (see [`release_search_plan`]).
+        nntmux_w625_release_search_plan, 15, release_search_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [(Entry, usize); 5] = [
+            (nntmux_w625_steam_lookup_plan, 10),
+            (nntmux_w625_tmdb_request_plan, 11),
+            (nntmux_w625_trakt_lookup_plan, 9),
+            (nntmux_w625_turnstile_verification_plan, 9),
+            (nntmux_w625_release_search_plan, 15),
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Vec<i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        #[test]
+        fn w625_steam_plans_clean_titles_and_score() {
+            assert_eq!(
+                call(
+                    nntmux_w625_steam_lookup_plan,
+                    &[
+                        b" 292030 \tThe.Witcher.3.Wild.Hunt.Game.of.the.Year.Edition-GOG\tThe Witcher 3: Wild Hunt\tgame",
+                        b"",
+                        b"https://store.steampowered.com/app/570/Dota_2/\tDota 2 REPACK-FitGirl\tdota 2\tdlc",
+                    ]
+                ),
+                vec![
+                    292030, 1, 11, 31, 6, 2, 3, 90, 2, 40, //
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 577, //
+                    570, 2, 4, 6, 2, 0, 23, 100, 2, 284,
+                ]
+            );
+        }
+
+        #[test]
+        fn w625_tmdb_plans_validate_requests() {
+            assert_eq!(
+                call(
+                    nntmux_w625_tmdb_request_plan,
+                    &[
+                        b"find\ttt0111161\timdb_id\t\t\tfr-CA\t/abc.jpg\tw780\t40\t1000\t1004",
+                        b"",
+                        b"SEARCH_MOVIE\t\t\t  The   Matrix \t1999\tde\thttps://x/../y\tw9\t\t\t",
+                    ]
+                ),
+                vec![
+                    3,
+                    111161,
+                    1,
+                    0,
+                    0,
+                    148_053,
+                    1,
+                    7,
+                    0,
+                    6,
+                    0, //
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    TMDB_LANGUAGE,
+                    0,
+                    6,
+                    1,
+                    0,
+                    4097, //
+                    1,
+                    0,
+                    0,
+                    10,
+                    1999,
+                    83_000,
+                    2,
+                    6,
+                    1,
+                    0,
+                    768,
+                ]
+            );
+        }
+
+        #[test]
+        fn w625_trakt_plans_resolve_ids() {
+            assert_eq!(
+                call(
+                    nntmux_w625_trakt_lookup_plan,
+                    &[
+                        b"episode\ttt0903747\t\t1\t2\tfull\t500",
+                        b"",
+                        b"SHOW\tBreaking Bad!\t\t\t\tbogus\tx\textra",
+                    ]
+                ),
+                vec![
+                    3, 1, 903747, 0, 1, 2, 2, 100, 128, //
+                    0, 0, 0, 0, -1, -1, 1, 10, 1025, //
+                    2, 5, 0, 12, -1, -1, 1, 10, 1344,
+                ]
+            );
+        }
+
+        #[test]
+        fn w625_turnstile_plans_verify() {
+            assert_eq!(
+                call(
+                    nntmux_w625_turnstile_verification_plan,
+                    &[
+                        b"abc.DEF_1-2\t0x4AAAAAAAB\t203.0.113.7\t123e4567-e89b-12d3-a456-426614174000\t\ttrue\texample.com\tEXAMPLE.com",
+                        b"",
+                        b"tok en\t1x0000000000000000000000000000000AA\t192.168.1.1\tnope\tinternal-error, bogus\tyes\ta\tb",
+                    ]
+                ),
+                vec![
+                    11, 1, 1, 1, 1, 0, 1, 0, 0, //
+                    0, 0, 0, 0, 0, 0, 2, 0, 512, //
+                    6, 3, 2, 1, 2, 192, 3, 0, 249,
+                ]
+            );
+        }
+
+        #[test]
+        fn w625_release_search_plans_normalize_filters() {
+            assert_eq!(
+                call(
+                    nntmux_w625_release_search_plan,
+                    &[
+                        b"The.Matrix 1999\t\tposter@example.com\talt.binaries.movies\t2000,2040,2000\t5\t3\t40000\ttt0133093\t603\t\t50\t5000",
+                        b"",
+                        b"x\t\t\tbad group\t-1,abc\t12\t\t0\ttt\t-5\t7\tx\t0",
+                    ]
+                ),
+                vec![
+                    3, 15, 0, 18, 1, 2, 524_288_000, 2_097_152_000, 36_500, 133_093, 603, -1, 50, 1000, 5288, //
+                    0, 0, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1, 0, 100, 8193, //
+                    1, 1, 0, 0, 4, -1, 0, 0, -1, -1, -1, 7, 0, 1, 1814,
+                ]
+            );
+        }
+
+        #[test]
+        fn w625_entries_validate_the_abi() {
+            for (entry, width) in ENTRIES {
+                let data = b"a\0b\0c";
+                let mut out = [7i64; 64];
+                let call = |count: usize, flags: i64, len: usize, cap: usize, out: *mut i64| unsafe {
+                    entry(
+                        count,
+                        flags,
+                        data.as_ptr(),
+                        len,
+                        std::ptr::null(),
+                        0,
+                        out,
+                        cap,
+                    )
+                };
+                let needed = (3 * width) as i64;
+                assert_eq!(call(3, 0, 5, 64, out.as_mut_ptr()), needed);
+                assert_eq!(call(3, 0, 5, 3 * width - 1, out.as_mut_ptr()), -needed);
+                assert_eq!(call(3, 1, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(4, 0, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(2, 0, 5, 64, out.as_mut_ptr()), -1);
+                assert_eq!(call(0, 0, 0, 0, std::ptr::null_mut()), 0);
+                assert_eq!(call(3, 0, 5, 4, std::ptr::null_mut()), -1);
+                let overlapping = unsafe {
+                    entry(
+                        1,
+                        0,
+                        out.as_ptr().cast(),
+                        8,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        64,
+                    )
+                };
+                assert_eq!(overlapping, -1);
+            }
+        }
+    }
+}

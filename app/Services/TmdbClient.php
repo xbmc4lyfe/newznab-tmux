@@ -1044,4 +1044,296 @@ class TmdbClient
             return null;
         }
     }
+
+    /** C signature of the Wave 62.5 {@see self::requestPlanBatch()} helper. */
+    private const string W62_TMDB_PLAN_FFI_CDEF = 'int64_t nntmux_w625_tmdb_request_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 62.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 7.65/5.41/6.67/6.80x); see tests/Unit/RustSteamTmdbClientTraktTurnstileReleaseSearchW62ParityTest.php.
+     */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 62.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w62_5', self::W62_TMDB_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W62_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW62RustFfi(): bool
+    {
+        return self::w62RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with requestPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 62.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w62Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w62RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w625_tmdb_request_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch TMDB request plan over
+     * `endpoint\tid\tsource\tquery\tyear\tlanguage\timage_path\timage_size\trequests\twindow_started\tnow`. Eleven
+     * words per record: `[endpoint_code, id, source_code, query_len, year, language, image_kind, size_code,
+     * allowed, rate_wait, flags]`. Endpoints are 1 search_movie, 2 movie, 3 find, 4 search_tv, 5 tv, 6 tv_season,
+     * 7 tv_episode, 8 credits, 9 external_ids, 10 alternative_titles; sources 1 imdb_id, 2 tvdb_id, 3 tmdb
+     * (trimmed, ASCII case-insensitive, 0 empty, -1 unknown). The trimmed id is an ASCII case-insensitive `tt`
+     * plus 6-10 digits for imdb_id, else 1-10 digits, with a positive value; endpoints 2-3 and 5-10 require one.
+     * The query length joins its ASCII whitespace words with single spaces; search endpoints require one. The
+     * year is four digits in 1874..2100 (empty 0). The language is `ll` or `ll-RR`/`ll_RR` letters as
+     * `lang * 1000 + region` (letter pairs `(a-z) * 26 + (a-z) + 1`, region 0 when absent; empty or invalid
+     * en-US). The trimmed image path is 0 empty, 1 rooted, 2 absolute `http(s)://`, 3 relative; it is unsafe with
+     * `..`, control, space or DEL bytes. Sizes are 1 w92, 2 w154, 3 w185, 4 w300, 5 w342, 6 w500, 7 w780, 8
+     * w1280, 9 h632, 10 original (empty or unknown w500). The rate window allows 40 requests (1-6 digits) per 10
+     * seconds between 1-12 digit Unix seconds (empty 0) and reports the seconds until it reopens. Flags: 1 empty
+     * endpoint, 2 unknown endpoint, 4 unknown source, 8 invalid id, 16 missing id, 32 missing query, 64 invalid
+     * year, 128 invalid language, 256 unsafe image path, 512 unknown image size, 1024 invalid rate number, 2048
+     * window starting in the future, 4096 not exactly eleven fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function requestPlanBatch(array $records): array
+    {
+        return self::usesW62RustFfi() ? self::requestPlanBatchNative($records) : self::requestPlanBatchPhp($records);
+    }
+
+    /** Wave 62.5 endpoints, external-id sources and image sizes in code order (1-based). */
+    private const array W62_ENDPOINTS = ['search_movie', 'movie', 'find', 'search_tv', 'tv', 'tv_season', 'tv_episode', 'credits', 'external_ids', 'alternative_titles'];
+
+    private const array W62_SOURCES = ['imdb_id', 'tvdb_id', 'tmdb'];
+
+    private const array W62_IMAGE_SIZES = ['w92', 'w154', 'w185', 'w300', 'w342', 'w500', 'w780', 'w1280', 'h632', 'original'];
+
+    /** `en-US` as `lang * 1000 + region`. */
+    private const int W62_DEFAULT_LANGUAGE = 118_539;
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function requestPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 11 ? 0 : 4096;
+            $endpoint = self::w62Code($fields[0], self::W62_ENDPOINTS, 2, $flags);
+            if ($endpoint === 0) {
+                $flags |= 1;
+            }
+            $source = self::w62Code($fields[2] ?? '', self::W62_SOURCES, 4, $flags);
+            $id = trim($fields[1] ?? '');
+            $idValue = 0;
+            if ($id === '') {
+                if ($endpoint === 2 || $endpoint === 3 || $endpoint >= 5) {
+                    $flags |= 16;
+                }
+            } else {
+                $value = $source === 1
+                    ? (\strlen($id) >= 8 && strncasecmp($id, 'tt', 2) === 0 ? self::w62Digits(substr($id, 2), 10) : null)
+                    : self::w62Digits($id, 10);
+                if ($value !== null && $value > 0) {
+                    $idValue = $value;
+                } else {
+                    $flags |= 8;
+                }
+            }
+            $words = preg_split('/[ \t\n\r\x0b\x0c]+/', $fields[3] ?? '', -1, PREG_SPLIT_NO_EMPTY);
+            $words = \is_array($words) ? $words : [];
+            if (($endpoint === 1 || $endpoint === 4) && $words === []) {
+                $flags |= 32;
+            }
+            $year = 0;
+            $text = trim($fields[4] ?? '');
+            if ($text !== '') {
+                $value = self::w62Digits($text, 4);
+                if ($value !== null && \strlen($text) === 4 && $value >= 1874 && $value <= 2100) {
+                    $year = $value;
+                } else {
+                    $flags |= 64;
+                }
+            }
+            $language = self::W62_DEFAULT_LANGUAGE;
+            $text = trim($fields[5] ?? '');
+            if ($text !== '') {
+                if (preg_match('/^([A-Za-z]{2})(?:[-_]([A-Za-z]{2}))?$/D', $text, $match) === 1) {
+                    $language = self::w62Letters($match[1]) * 1000 + (isset($match[2]) ? self::w62Letters($match[2]) : 0);
+                } else {
+                    $flags |= 128;
+                }
+            }
+            $path = trim($fields[6] ?? '');
+            $imageKind = $path === '' ? 0 : (str_starts_with($path, 'https://') || str_starts_with($path, 'http://') ? 2 : ($path[0] === '/' ? 1 : 3));
+            if ($imageKind !== 0 && (str_contains($path, '..') || preg_match('/[\x00-\x20\x7f]/', $path) === 1)) {
+                $flags |= 256;
+            }
+            $size = self::w62Code($fields[7] ?? '', self::W62_IMAGE_SIZES, 512, $flags);
+            $requests = self::w62Number($fields[8] ?? '', 6, 0, 1024, $flags);
+            $window = self::w62Number($fields[9] ?? '', 12, 0, 1024, $flags);
+            $now = self::w62Number($fields[10] ?? '', 12, 0, 1024, $flags);
+            [$allowed, $wait] = [1, 0];
+            if ($window !== 0) {
+                $elapsed = $now - $window;
+                if ($now < $window) {
+                    $flags |= 2048;
+                    $elapsed = 0;
+                }
+                if ($elapsed < 10 && $requests >= 40) {
+                    [$allowed, $wait] = [0, 10 - $elapsed];
+                }
+            }
+            array_push($out, $endpoint, $idValue, $source, $words === [] ? 0 : \strlen(implode(' ', $words)), $year, $language, $imageKind, $size > 0 ? $size : 6, $allowed, $wait, $flags);
+        }
+
+        return $out;
+    }
+
+    /** 1-$max ASCII digits as an integer, else null. */
+    private static function w62Digits(string $text, int $max): ?int
+    {
+        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
+    }
+
+    /**
+     * Trimmed, ASCII case-insensitive 1-based position of $field in the lowercase $names; 0 empty, -1 unknown
+     * (sets $flag).
+     *
+     * @param  list<string>  $names
+     */
+    private static function w62Code(string $field, array $names, int $flag, int &$flags): int
+    {
+        $field = trim($field);
+        if ($field === '') {
+            return 0;
+        }
+        $at = array_search(strtolower($field), $names, true);
+        if ($at === false) {
+            $flags |= $flag;
+
+            return -1;
+        }
+
+        return (int) $at + 1;
+    }
+
+    /** Trimmed 1-$max digits (empty $default); anything else sets $flag and yields $default. */
+    private static function w62Number(string $field, int $max, int $default, int $flag, int &$flags): int
+    {
+        $field = trim($field);
+        if ($field === '') {
+            return $default;
+        }
+        $value = self::w62Digits($field, $max);
+        if ($value === null) {
+            $flags |= $flag;
+
+            return $default;
+        }
+
+        return $value;
+    }
+
+    /** `(a-z) * 26 + (a-z) + 1` for two ASCII letters (any case). */
+    private static function w62Letters(string $pair): int
+    {
+        $pair = strtolower($pair);
+
+        return (\ord($pair[0]) - 97) * 26 + (\ord($pair[1]) - 97) + 1;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function requestPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w62Words($count, implode("\0", $records), 11 * $count) ?? self::requestPlanBatchPhp($records);
+    }
 }
