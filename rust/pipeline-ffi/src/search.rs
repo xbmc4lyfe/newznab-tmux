@@ -46725,3 +46725,979 @@ mod wave59_5_manticore_client_registry_schema_release_index_tmux_task_runner {
         }
     }
 }
+
+/// Wave 60.5 batch helpers for `ApiInputCanonicalizer`, `ApiQueryParameters`,
+/// `ReleaseItemPayloadBuilder`, `ApiV2Presenter` and `LogIndexQuery`. Each entry reads `count`
+/// NUL-joined, tab-separated records in place and writes a fixed number of words per record.
+mod wave60_5_api_canonicalizer_query_params_v1_builder_v2_presenter_log_query {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Plan callback: record bytes and its output words.
+    type Plan = fn(&[u8], &mut [i64]);
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// 1-`max` ASCII digits as an integer (PHP `ctype_digit()` plus `(int)`); `max` is at most 18.
+    fn digits(field: &[u8], max: usize) -> Option<i64> {
+        if field.is_empty() || field.len() > max {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// An optional `+`/`-` sign followed by 1-18 ASCII digits.
+    fn integer(field: &[u8]) -> Option<i64> {
+        match field.first() {
+            Some(b'-') => digits(&field[1..], 18).map(|value| -value),
+            Some(b'+') => digits(&field[1..], 18),
+            _ => digits(field, 18),
+        }
+    }
+
+    /// Trimmed switch: `1`/`true`/`yes`/`on` and empty/`0`/`false`/`no`/`off` (ASCII
+    /// case-insensitive); anything else is `None`.
+    fn switch(field: &[u8]) -> Option<bool> {
+        let field = trim(field);
+        if [&b"1"[..], b"true", b"yes", b"on"]
+            .iter()
+            .any(|word| field.eq_ignore_ascii_case(word))
+        {
+            Some(true)
+        } else if [&b""[..], b"0", b"false", b"no", b"off"]
+            .iter()
+            .any(|word| field.eq_ignore_ascii_case(word))
+        {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Up to `N` fields split on `separator` (missing fields empty) and the total field count.
+    fn fields<const N: usize>(record: &[u8], separator: u8) -> ([&[u8]; N], usize) {
+        let mut fields: [&[u8]; N] = [b""; N];
+        let mut total = 0usize;
+        for field in record.split(|&b| b == separator) {
+            if total < N {
+                fields[total] = field;
+            }
+            total += 1;
+        }
+        (fields, total)
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records, writing
+    /// `width` words per record straight into `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        width: usize,
+        plan: Plan,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(records) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = records.len() * width;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            for (record, slot) in records.iter().zip(words.chunks_exact_mut(width)) {
+                plan(record, slot);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// API functions (`t`) and their codes, matched ASCII case-insensitively.
+    const FUNCTIONS: [(&[u8], i64); 15] = [
+        (b"search", 1),
+        (b"s", 1),
+        (b"tvsearch", 2),
+        (b"tv", 2),
+        (b"movie", 3),
+        (b"m", 3),
+        (b"music", 4),
+        (b"book", 5),
+        (b"caps", 6),
+        (b"c", 6),
+        (b"details", 7),
+        (b"d", 7),
+        (b"get", 8),
+        (b"g", 8),
+        (b"info", 9),
+    ];
+
+    /// Trimmed season/episode number with one optional ASCII case-insensitive `marker` prefix.
+    fn numbered(field: &[u8], marker: u8) -> Option<i64> {
+        let body = match field.first() {
+            Some(&b) if b.eq_ignore_ascii_case(&marker) => &field[1..],
+            _ => field,
+        };
+        digits(body, 4)
+    }
+
+    /// `ApiInputCanonicalizer::inputPlanBatch()` over
+    /// `t\tcat\tid\trid\timdbid\ttmdbid\ttraktid\tseason\tep`: `[function, cat_count, cat_first,
+    /// id_kind, id_mask, season, episode, flags]`. Function codes: 1 search/s, 2 tvsearch/tv, 3
+    /// movie/m, 4 music, 5 book, 6 caps/c, 7 details/d, 8 get/g, 9 info (trimmed, ASCII
+    /// case-insensitive), else 0. Categories split on commas, trimmed, empties dropped; the first
+    /// kept item reads as 1-6 digits or -1 (0 with none). The trimmed id is 0 empty, 1 forty hex
+    /// digits, 2 other. The id mask sets 1 rid, 2 imdbid (optional `tt`, 1-8 digits), 4 tmdbid and
+    /// 8 traktid (1-10 digits) for positive values. Season (`S` optional) and episode (`E`
+    /// optional) are 1-4 digits, -1 when empty or invalid. Flags: 1 empty function, 2 unknown
+    /// function, 4 non-numeric category, 8 dropped empty category, 16 invalid external id, 32
+    /// invalid season, 64 invalid episode, 128 episode without season, 256 not exactly nine fields.
+    fn input_plan(record: &[u8], words: &mut [i64]) {
+        let ([t, cat, id, rid, imdb, tmdb, trakt, season, episode], total) =
+            fields::<9>(record, b'\t');
+        let mut flags = if total == 9 { 0 } else { 256 };
+        let t = trim(t);
+        let function = if t.is_empty() {
+            flags |= 1;
+            0
+        } else {
+            match FUNCTIONS
+                .iter()
+                .find(|(name, _)| t.eq_ignore_ascii_case(name))
+            {
+                Some(&(_, code)) => code,
+                None => {
+                    flags |= 2;
+                    0
+                }
+            }
+        };
+        let (mut parts, mut kept, mut first) = (0usize, 0i64, 0i64);
+        for part in cat.split(|&b| b == b',') {
+            parts += 1;
+            let item = trim(part);
+            if item.is_empty() {
+                continue;
+            }
+            let value = digits(item, 6);
+            if value.is_none() {
+                flags |= 4;
+            }
+            if kept == 0 {
+                first = value.unwrap_or(-1);
+            }
+            kept += 1;
+        }
+        if !cat.is_empty() && (kept as usize) < parts {
+            flags |= 8;
+        }
+        let id = trim(id);
+        let id_kind = if id.is_empty() {
+            0
+        } else if id.len() == 40 && id.iter().all(u8::is_ascii_hexdigit) {
+            1
+        } else {
+            2
+        };
+        let mut mask = 0i64;
+        for (field, bit) in [(rid, 1), (imdb, 2), (tmdb, 4), (trakt, 8)] {
+            let field = trim(field);
+            if field.is_empty() {
+                continue;
+            }
+            let value = if bit == 2 {
+                let body = if field.len() >= 2 && field[..2].eq_ignore_ascii_case(b"tt") {
+                    &field[2..]
+                } else {
+                    field
+                };
+                digits(body, 8)
+            } else {
+                digits(field, 10)
+            };
+            match value {
+                Some(value) if value > 0 => mask |= bit,
+                _ => flags |= 16,
+            }
+        }
+        let season = match trim(season) {
+            b"" => -1,
+            text => numbered(text, b's').unwrap_or_else(|| {
+                flags |= 32;
+                -1
+            }),
+        };
+        let episode = match trim(episode) {
+            b"" => -1,
+            text => numbered(text, b'e').unwrap_or_else(|| {
+                flags |= 64;
+                -1
+            }),
+        };
+        if episode >= 0 && season < 0 {
+            flags |= 128;
+        }
+        words.copy_from_slice(&[function, kept, first, id_kind, mask, season, episode, flags]);
+    }
+
+    /// `ApiQueryParameters::queryPlanBatch()` over
+    /// `limit\toffset\tmaxage\tminsize\tmaxsize\textended\tdel\tmax_limit\tdefault_limit`: `[limit,
+    /// offset, maxage, minsize, maxsize, extended, del, flags]`. Integers are trimmed, optionally
+    /// signed 1-18 digit strings. Max limit (empty 500) is at least 1; default limit (empty 250) is
+    /// clamped to 1..max. Limit (empty: default) is clamped to 1..max; offset (empty 0) and sizes
+    /// (empty 0) floor at 0; maxage (empty -1) reads negatives as -1 and caps at 36500 days.
+    /// Extended and del are 1 only for the integer 1. Flags: 1 clamped limit, 2 invalid limit, 4
+    /// negative offset, 8 invalid offset, 16 capped maxage, 32 invalid maxage, 64 invalid size, 128
+    /// minsize above a positive maxsize, 256 invalid max or default limit, 512 not exactly nine
+    /// fields.
+    fn query_plan(record: &[u8], words: &mut [i64]) {
+        let (
+            [
+                limit,
+                offset,
+                maxage,
+                minsize,
+                maxsize,
+                extended,
+                del,
+                max_limit,
+                default_limit,
+            ],
+            total,
+        ) = fields::<9>(record, b'\t');
+        let mut flags = if total == 9 { 0 } else { 512 };
+        let max = match trim(max_limit) {
+            b"" => 500,
+            text => match integer(text) {
+                Some(value) => value.max(1),
+                None => {
+                    flags |= 256;
+                    500
+                }
+            },
+        };
+        let default = match trim(default_limit) {
+            b"" => 250,
+            text => integer(text).unwrap_or_else(|| {
+                flags |= 256;
+                250
+            }),
+        }
+        .min(max)
+        .max(1);
+        let limit = match trim(limit) {
+            b"" => default,
+            text => match integer(text) {
+                Some(value) if value < 1 => {
+                    flags |= 1;
+                    1
+                }
+                Some(value) if value > max => {
+                    flags |= 1;
+                    max
+                }
+                Some(value) => value,
+                None => {
+                    flags |= 2;
+                    default
+                }
+            },
+        };
+        let offset = match trim(offset) {
+            b"" => 0,
+            text => match integer(text) {
+                Some(value) if value < 0 => {
+                    flags |= 4;
+                    0
+                }
+                Some(value) => value,
+                None => {
+                    flags |= 8;
+                    0
+                }
+            },
+        };
+        let maxage = match trim(maxage) {
+            b"" => -1,
+            text => match integer(text) {
+                Some(value) if value < 0 => -1,
+                Some(value) if value > 36_500 => {
+                    flags |= 16;
+                    36_500
+                }
+                Some(value) => value,
+                None => {
+                    flags |= 32;
+                    -1
+                }
+            },
+        };
+        let mut size = |field: &[u8]| match trim(field) {
+            b"" => 0,
+            text => match integer(text) {
+                Some(value) => value.max(0),
+                None => {
+                    flags |= 64;
+                    0
+                }
+            },
+        };
+        let minsize = size(minsize);
+        let maxsize = size(maxsize);
+        if maxsize > 0 && minsize > maxsize {
+            flags |= 128;
+        }
+        let extended = i64::from(integer(trim(extended)) == Some(1));
+        let del = i64::from(integer(trim(del)) == Some(1));
+        words.copy_from_slice(&[
+            limit, offset, maxage, minsize, maxsize, extended, del, flags,
+        ]);
+    }
+
+    /// `ReleaseItemPayloadBuilder::payloadPlanBatch()` over
+    /// `server_url\ttoken\tguid\tsize\tgrabs\tcategories_id\tcoverurl\tnfostatus\tdl\textended\tdel`:
+    /// `[link_len, details_len, size, grabs, category, parent, attr_count, enclosure, flags]`.
+    /// Lengths follow `build()`: the download link `{url}/getnzb?id={guid}.nzb&r={token}[&del=1]`
+    /// and the details URL `{url}/details/{guid}` over the raw fields. Size and grabs (empty 0) are
+    /// trimmed 1-18 digits, the category 1-9 digits with its thousand parent. Attributes count
+    /// category, size, a non-empty cover and, when extended, files, grabs, comments, password and
+    /// info for nfostatus 1. Extended, del and dl are 1 only for the trimmed integer 1; an empty dl
+    /// keeps the enclosure. Flags: 1 empty guid, 2 guid not forty hex digits, 4 invalid size, 8
+    /// invalid grabs, 16 invalid category, 32 server URL ending in `/`, 64 empty token, 128 not
+    /// exactly eleven fields.
+    fn payload_plan(record: &[u8], words: &mut [i64]) {
+        let (
+            [
+                server,
+                token,
+                guid,
+                size,
+                grabs,
+                category,
+                cover,
+                nfo,
+                dl,
+                extended,
+                del,
+            ],
+            total,
+        ) = fields::<11>(record, b'\t');
+        let mut flags = if total == 11 { 0 } else { 128 };
+        let del = integer(trim(del)) == Some(1);
+        let extended = integer(trim(extended)) == Some(1);
+        let dl = trim(dl);
+        let enclosure = dl.is_empty() || integer(dl) == Some(1);
+        let link = server.len() + 11 + guid.len() + 7 + token.len() + if del { 6 } else { 0 };
+        let details = server.len() + 9 + guid.len();
+        if guid.is_empty() {
+            flags |= 1;
+        } else if guid.len() != 40 || !guid.iter().all(u8::is_ascii_hexdigit) {
+            flags |= 2;
+        }
+        let size = digits(trim(size), 18).unwrap_or_else(|| {
+            flags |= 4;
+            0
+        });
+        let grabs = match trim(grabs) {
+            b"" => 0,
+            text => digits(text, 18).unwrap_or_else(|| {
+                flags |= 8;
+                0
+            }),
+        };
+        let (category, parent) = match digits(trim(category), 9) {
+            Some(value) => (value, value - value % 1000),
+            None => {
+                flags |= 16;
+                (0, 0)
+            }
+        };
+        let attributes = 2
+            + i64::from(!trim(cover).is_empty())
+            + if extended {
+                4 + i64::from(integer(trim(nfo)) == Some(1))
+            } else {
+                0
+            };
+        if server.last() == Some(&b'/') {
+            flags |= 32;
+        }
+        if token.is_empty() {
+            flags |= 64;
+        }
+        words.copy_from_slice(&[
+            link as i64,
+            details as i64,
+            size,
+            grabs,
+            category,
+            parent,
+            attributes,
+            i64::from(enclosure),
+            flags,
+        ]);
+    }
+
+    fn days_in_month(year: i64, month: i64) -> i64 {
+        match month {
+            2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        }
+    }
+
+    /// Days since 1970-01-01 of a proleptic Gregorian date with a positive year.
+    fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+        let year = if month <= 2 { year - 1 } else { year };
+        let era = year / 400;
+        let yoe = year - era * 400;
+        let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    /// Strict UTC `Y-m-d` or `Y-m-d H:i:s` (`T` also separates) with a year of 1000-9999 and a
+    /// valid calendar date and clock, as Unix seconds.
+    fn timestamp(text: &[u8]) -> Option<i64> {
+        let long = text.len() == 19 && matches!(text[10], b' ' | b'T');
+        if (text.len() != 10 && !long) || text[4] != b'-' || text[7] != b'-' {
+            return None;
+        }
+        let year = digits(&text[..4], 4)?;
+        let month = digits(&text[5..7], 2)?;
+        let day = digits(&text[8..10], 2)?;
+        if year < 1000 || !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month)
+        {
+            return None;
+        }
+        let mut seconds = 0;
+        if long {
+            if text[13] != b':' || text[16] != b':' {
+                return None;
+            }
+            let hour = digits(&text[11..13], 2)?;
+            let minute = digits(&text[14..16], 2)?;
+            let second = digits(&text[17..19], 2)?;
+            if hour > 23 || minute > 59 || second > 59 {
+                return None;
+            }
+            seconds = hour * 3600 + minute * 60 + second;
+        }
+        Some(days_from_civil(year, month, day) * 86_400 + seconds)
+    }
+
+    /// `ApiV2Presenter::presenterPlanBatch()` over `id\tsize\tadddate\tpostdate\tcategories_id\tnow`:
+    /// `[id, size, size_unit, added_ts, posted_ts, age, parent, flags]`. Id and size are trimmed
+    /// 1-18 digits; the unit counts 1024 divisions up to 4 (B, KB, MB, GB, TB). Dates are strict UTC
+    /// `Y-m-d[ H:i:s]`; an empty or invalid posted date falls back to the added one. Now is 1-12
+    /// digits and the age is now minus posted when both are positive and now is later. The parent is
+    /// the 1-9 digit category minus its remainder by 1000. Flags: 1 invalid id, 2 invalid size, 4
+    /// invalid added date, 8 invalid posted date, 16 empty posted date, 32 invalid now, 64 invalid
+    /// category, 128 not exactly six fields.
+    fn presenter_plan(record: &[u8], words: &mut [i64]) {
+        let ([id, size, added, posted, category, now], total) = fields::<6>(record, b'\t');
+        let mut flags = if total == 6 { 0 } else { 128 };
+        let id = digits(trim(id), 18).unwrap_or_else(|| {
+            flags |= 1;
+            0
+        });
+        let size = digits(trim(size), 18).unwrap_or_else(|| {
+            flags |= 2;
+            0
+        });
+        let (mut unit, mut scaled) = (0i64, size);
+        while scaled >= 1024 && unit < 4 {
+            scaled /= 1024;
+            unit += 1;
+        }
+        let added = timestamp(trim(added)).unwrap_or_else(|| {
+            flags |= 4;
+            0
+        });
+        let posted = match trim(posted) {
+            b"" => {
+                flags |= 16;
+                added
+            }
+            text => timestamp(text).unwrap_or_else(|| {
+                flags |= 8;
+                added
+            }),
+        };
+        let now = digits(trim(now), 12).unwrap_or_else(|| {
+            flags |= 32;
+            0
+        });
+        let age = if now > 0 && posted > 0 && now > posted {
+            now - posted
+        } else {
+            0
+        };
+        let parent = match digits(trim(category), 9) {
+            Some(value) => value - value % 1000,
+            None => {
+                flags |= 64;
+                0
+            }
+        };
+        words.copy_from_slice(&[id, size, unit, added, posted, age, parent, flags]);
+    }
+
+    /// Log levels in mask bit order.
+    const LEVELS: [&[u8]; 8] = [
+        b"debug",
+        b"info",
+        b"notice",
+        b"warning",
+        b"error",
+        b"critical",
+        b"alert",
+        b"emergency",
+    ];
+
+    /// `LogIndexQuery::queryPlanBatch()` over `term\tlevels\tfrom\tto\tregex\toffset\tlimit`:
+    /// `[mode, level_mask, from, to, offset, limit, direction, day_span, flags]`. Mode: 0 empty
+    /// trimmed term, 2 regex, 1 indexable (holds an ASCII alphanumeric, `_` or non-ASCII byte), 3
+    /// grep only. Levels split on commas, trimmed, ASCII case-insensitive, set bits in
+    /// debug..emergency order. From and to are 1-12 digit Unix seconds (empty 0), swapped when
+    /// reversed. Offset (empty 0) is 1-9 digits capped at 100000; limit (empty 50) is 1-9 digits
+    /// clamped to 1..500. Direction is 2 (oldest first) with only a lower bound, else 1; the day span
+    /// counts UTC days touched by a closed range. Flags: 1 unknown level, 2 invalid bound, 4 swapped
+    /// range, 8 invalid offset, 16 capped offset, 32 clamped limit, 64 invalid limit, 128 invalid
+    /// regex switch, 256 not exactly seven fields.
+    fn log_query_plan(record: &[u8], words: &mut [i64]) {
+        let ([term, levels, from, to, regex, offset, limit], total) = fields::<7>(record, b'\t');
+        let mut flags = if total == 7 { 0 } else { 256 };
+        let regex = switch(regex).unwrap_or_else(|| {
+            flags |= 128;
+            false
+        });
+        let term = trim(term);
+        let mode = if term.is_empty() {
+            0
+        } else if regex {
+            2
+        } else if term
+            .iter()
+            .any(|&b| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80)
+        {
+            1
+        } else {
+            3
+        };
+        let mut mask = 0i64;
+        for part in levels.split(|&b| b == b',') {
+            let level = trim(part);
+            if level.is_empty() {
+                continue;
+            }
+            match LEVELS
+                .iter()
+                .position(|name| level.eq_ignore_ascii_case(name))
+            {
+                Some(bit) => mask |= 1 << bit,
+                None => flags |= 1,
+            }
+        }
+        let mut bound = |field: &[u8]| match trim(field) {
+            b"" => 0,
+            text => digits(text, 12).unwrap_or_else(|| {
+                flags |= 2;
+                0
+            }),
+        };
+        let (mut from, mut to) = (bound(from), bound(to));
+        if from > 0 && to > 0 && from > to {
+            std::mem::swap(&mut from, &mut to);
+            flags |= 4;
+        }
+        let offset = match trim(offset) {
+            b"" => 0,
+            text => match digits(text, 9) {
+                Some(value) if value > 100_000 => {
+                    flags |= 16;
+                    100_000
+                }
+                Some(value) => value,
+                None => {
+                    flags |= 8;
+                    0
+                }
+            },
+        };
+        let limit = match trim(limit) {
+            b"" => 50,
+            text => match digits(text, 9) {
+                Some(value) if value < 1 => {
+                    flags |= 32;
+                    1
+                }
+                Some(value) if value > 500 => {
+                    flags |= 32;
+                    500
+                }
+                Some(value) => value,
+                None => {
+                    flags |= 64;
+                    50
+                }
+            },
+        };
+        let direction = if from > 0 && to == 0 { 2 } else { 1 };
+        let span = if from > 0 && to > 0 {
+            to / 86_400 - from / 86_400 + 1
+        } else {
+            0
+        };
+        words.copy_from_slice(&[mode, mask, from, to, offset, limit, direction, span, flags]);
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes the
+            /// helper's fixed words per record and returns the words written, `-needed` when
+            /// `out_cap` is too small (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(
+                        count, flags, data, data_len, ints, ints_len, out, out_cap, $width, $plan,
+                    )
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `ApiInputCanonicalizer::inputPlanBatch()` (see [`input_plan`]).
+        nntmux_w605_api_input_plan, 8, input_plan
+    );
+    entry!(
+        /// `ApiQueryParameters::queryPlanBatch()` (see [`query_plan`]).
+        nntmux_w605_api_query_plan, 8, query_plan
+    );
+    entry!(
+        /// `ReleaseItemPayloadBuilder::payloadPlanBatch()` (see [`payload_plan`]).
+        nntmux_w605_v1_payload_plan, 9, payload_plan
+    );
+    entry!(
+        /// `ApiV2Presenter::presenterPlanBatch()` (see [`presenter_plan`]).
+        nntmux_w605_v2_presenter_plan, 8, presenter_plan
+    );
+    entry!(
+        /// `LogIndexQuery::queryPlanBatch()` (see [`log_query_plan`]).
+        nntmux_w605_log_query_plan, 9, log_query_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [(Entry, usize); 5] = [
+            (nntmux_w605_api_input_plan, 8),
+            (nntmux_w605_api_query_plan, 8),
+            (nntmux_w605_v1_payload_plan, 9),
+            (nntmux_w605_v2_presenter_plan, 8),
+            (nntmux_w605_log_query_plan, 9),
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Vec<i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        #[test]
+        fn w605_input_plans_canonicalize_parameters() {
+            let guid = [b'a'; 40];
+            let mut record = b"TVSearch\t5030, ,5040\t".to_vec();
+            record.extend_from_slice(&guid);
+            record.extend_from_slice(b"\t12\ttt0111161\t0\tx\tS02\tE05");
+            assert_eq!(
+                call(
+                    nntmux_w605_api_input_plan,
+                    &[&record, b"", b"bogus\t,\t\t\t\t\t\t\t3"]
+                ),
+                vec![
+                    2, 2, 5030, 1, 3, 2, 5, 24, //
+                    0, 0, 0, 0, 0, -1, -1, 257, //
+                    0, 0, 0, 0, 0, -1, 3, 138,
+                ]
+            );
+        }
+
+        #[test]
+        fn w605_query_plans_clamp_parameters() {
+            assert_eq!(
+                call(
+                    nntmux_w605_api_query_plan,
+                    &[
+                        b"9999\t-5\t40000\t10\t5\t1\t0\t\t",
+                        b"",
+                        b"x\tx\tx\tx\t\t+1\t1\t0\t900"
+                    ]
+                ),
+                vec![
+                    500, 0, 36500, 10, 5, 1, 0, 149, //
+                    250, 0, -1, 0, 0, 0, 0, 512, //
+                    1, 0, -1, 0, 0, 1, 1, 106,
+                ]
+            );
+        }
+
+        #[test]
+        fn w605_payload_plans_measure_links() {
+            let mut record = b"https://idx\ttok\t".to_vec();
+            record.extend_from_slice(&[b'f'; 40]);
+            record.extend_from_slice(b"\t2048\t3\t5030\tc.jpg\t1\t\t1\t1");
+            assert_eq!(
+                call(nntmux_w605_v1_payload_plan, &[&record, b""]),
+                vec![
+                    11 + 11 + 40 + 7 + 3 + 6,
+                    11 + 9 + 40,
+                    2048,
+                    3,
+                    5030,
+                    5000,
+                    8,
+                    1,
+                    0, //
+                    18,
+                    9,
+                    0,
+                    0,
+                    0,
+                    0,
+                    2,
+                    1,
+                    213,
+                ]
+            );
+        }
+
+        #[test]
+        fn w605_presenter_plans_normalize_dates() {
+            assert_eq!(
+                call(
+                    nntmux_w605_v2_presenter_plan,
+                    &[
+                        b"7\t1073741824\t2024-02-29 12:00:00\t\t5040\t1709208000",
+                        b"x\t\t2023-02-29\t1970-01-01T00:00:01\tx\t",
+                    ]
+                ),
+                vec![
+                    7, 1073741824, 3, 1709208000, 1709208000, 0, 5000, 16, //
+                    0, 0, 0, 0, 1, 0, 0, 103,
+                ]
+            );
+        }
+
+        #[test]
+        fn w605_log_query_plans_select_scans() {
+            assert_eq!(
+                call(
+                    nntmux_w605_log_query_plan,
+                    &[
+                        b"Jobs\\Reindex\tError, info ,bogus\t200000\t100000\t\t\t",
+                        b"",
+                        b"--\t\t86400\t\tmaybe\t200000\t0",
+                        b"a.*b\t\t\t\tYES\tx\tx\textra",
+                    ]
+                ),
+                vec![
+                    1, 18, 100000, 200000, 0, 50, 1, 2, 5, //
+                    0, 0, 0, 0, 0, 50, 1, 0, 256, //
+                    3, 0, 86400, 0, 100000, 1, 2, 0, 176, //
+                    2, 0, 0, 0, 0, 50, 1, 0, 328,
+                ]
+            );
+        }
+
+        #[test]
+        fn w605_entries_validate_the_abi() {
+            for (entry, width) in ENTRIES {
+                let data = b"a\0b\0c";
+                let mut out = [7i64; 32];
+                let call = |count: usize, flags: i64, len: usize, cap: usize, out: *mut i64| unsafe {
+                    entry(
+                        count,
+                        flags,
+                        data.as_ptr(),
+                        len,
+                        std::ptr::null(),
+                        0,
+                        out,
+                        cap,
+                    )
+                };
+                let needed = (3 * width) as i64;
+                assert_eq!(call(3, 0, 5, 32, out.as_mut_ptr()), needed);
+                assert_eq!(call(3, 0, 5, 3 * width - 1, out.as_mut_ptr()), -needed);
+                assert_eq!(call(3, 1, 5, 32, out.as_mut_ptr()), -1);
+                assert_eq!(call(4, 0, 5, 32, out.as_mut_ptr()), -1);
+                assert_eq!(call(2, 0, 5, 32, out.as_mut_ptr()), -1);
+                assert_eq!(call(0, 0, 0, 0, std::ptr::null_mut()), 0);
+                assert_eq!(call(3, 0, 5, 4, std::ptr::null_mut()), -1);
+                let overlapping = unsafe {
+                    entry(
+                        1,
+                        0,
+                        out.as_ptr().cast(),
+                        8,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        32,
+                    )
+                };
+                assert_eq!(overlapping, -1);
+            }
+        }
+    }
+}
