@@ -3111,4 +3111,319 @@ class ReleaseSearchService
             return 0;
         }
     }
+
+    /** C signature of the Wave 62.5 {@see self::searchPlanBatch()} helper. */
+    private const string W62_RELEASE_SEARCH_PLAN_FFI_CDEF = 'int64_t nntmux_w625_release_search_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 62.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 6.54/5.06/5.75/4.75x); see tests/Unit/RustSteamTmdbClientTraktTurnstileReleaseSearchW62ParityTest.php.
+     */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 62.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w62_5', self::W62_RELEASE_SEARCH_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W62_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW62RustFfi(): bool
+    {
+        return self::w62RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with searchPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 62.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w62Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w62RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w625_release_search_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch release search plan over
+     * `searchname\tusenetname\tfromname\tgroup\tcategories\tsize_min\tsize_max\tmax_age\timdb\ttmdb\ttvdb\toffset\tlimit`.
+     * Fifteen words per record: `[search_terms, search_len, usenet_terms, fromname_len, group_kind,
+     * category_count, size_min_bytes, size_max_bytes, max_age, imdb, tmdb, tvdb, offset, limit, flags]`. Search
+     * and usenet names split into ASCII alphanumeric or non-ASCII runs; the search length joins them with single
+     * spaces. The trimmed group is 0 empty, 1 `alt.binaries.`, 2 `a.b.` (ASCII case-insensitive prefixes), 3
+     * other `[A-Za-z0-9._+-]` names, 4 invalid. Categories are trimmed, non-empty comma-separated 1-4 digit ids
+     * counted once each, or -1 when any item is `-1`. Sizes are W48_SIZE_BYTES buckets 0-11 (empty 0) swapped
+     * when the minimum exceeds the maximum. The age is 1-6 digit days capped at W48_MAX_DAYS (empty or 0: -1).
+     * IMDb (optional `tt`), TMDB and TVDB ids are 1-10 digits with a positive value (empty -1). The offset is 1-9
+     * digits (empty 0); the limit (empty 100) is 1-6 digits clamped to 1..1000. Flags: 1 empty search (no terms,
+     * poster or external ids), 2 invalid group, 4 invalid category, 8 duplicate category, 16 invalid size, 32
+     * swapped sizes, 64 invalid age, 128 capped age, 256 invalid external id, 512 invalid offset, 1024 clamped
+     * limit, 2048 invalid limit, 4096 poster email, 8192 not exactly thirteen fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function searchPlanBatch(array $records): array
+    {
+        return self::usesW62RustFfi() ? self::searchPlanBatchNative($records) : self::searchPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function searchPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 13 ? 0 : 8192;
+            $terms = self::w62Tokens($fields[0]);
+            $usenetTerms = \count(self::w62Tokens($fields[1] ?? ''));
+            $from = trim($fields[2] ?? '');
+            if (str_contains($from, '@')) {
+                $flags |= 4096;
+            }
+            $group = trim($fields[3] ?? '');
+            if ($group === '') {
+                $groupKind = 0;
+            } elseif (strspn($group, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-') !== \strlen($group)) {
+                [$groupKind, $flags] = [4, $flags | 2];
+            } elseif (strncasecmp($group, 'alt.binaries.', 13) === 0) {
+                $groupKind = 1;
+            } else {
+                $groupKind = strncasecmp($group, 'a.b.', 4) === 0 ? 2 : 3;
+            }
+            $all = false;
+            $seen = [];
+            foreach (explode(',', $fields[4] ?? '') as $item) {
+                $item = trim($item);
+                if ($item === '') {
+                    continue;
+                }
+                if ($item === '-1') {
+                    $all = true;
+
+                    continue;
+                }
+                $value = self::w62Digits($item, 4);
+                if ($value === null) {
+                    $flags |= 4;
+                } elseif (isset($seen[$value])) {
+                    $flags |= 8;
+                } else {
+                    $seen[$value] = true;
+                }
+            }
+            $low = self::w62SizeBucket($fields[5] ?? '', $flags);
+            $high = self::w62SizeBucket($fields[6] ?? '', $flags);
+            if ($low > 0 && $high > 0 && $low > $high) {
+                [$low, $high] = [$high, $low];
+                $flags |= 32;
+            }
+            $age = self::w62Number($fields[7] ?? '', 6, -1, 64, $flags);
+            if ($age === 0) {
+                $age = -1;
+            } elseif ($age > self::W48_MAX_DAYS) {
+                [$age, $flags] = [self::W48_MAX_DAYS, $flags | 128];
+            }
+            $imdb = self::w62ExternalId($fields[8] ?? '', true, $flags);
+            $tmdb = self::w62ExternalId($fields[9] ?? '', false, $flags);
+            $tvdb = self::w62ExternalId($fields[10] ?? '', false, $flags);
+            $offset = self::w62Number($fields[11] ?? '', 9, 0, 512, $flags);
+            $limit = self::w62Clamped($fields[12] ?? '', 6, 100, 1, 1000, 1024, 2048, $flags);
+            if ($terms === [] && $usenetTerms === 0 && $from === '' && $imdb < 0 && $tmdb < 0 && $tvdb < 0) {
+                $flags |= 1;
+            }
+            array_push($out, \count($terms), $terms === [] ? 0 : \strlen(implode(' ', $terms)), $usenetTerms, \strlen($from), $groupKind, $all ? -1 : \count($seen), $low, $high, $age, $imdb, $tmdb, $tvdb, $offset, $limit, $flags);
+        }
+
+        return $out;
+    }
+
+    /** 1-$max ASCII digits as an integer, else null. */
+    private static function w62Digits(string $text, int $max): ?int
+    {
+        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
+    }
+
+    /**
+     * Runs of ASCII alphanumeric or non-ASCII bytes.
+     *
+     * @return list<string>
+     */
+    private static function w62Tokens(string $text): array
+    {
+        $tokens = preg_split('/[^A-Za-z0-9\x80-\xff]+/', $text, -1, PREG_SPLIT_NO_EMPTY);
+
+        return \is_array($tokens) ? $tokens : [];
+    }
+
+    /** Trimmed 1-$max digits (empty $default); anything else sets $flag and yields $default. */
+    private static function w62Number(string $field, int $max, int $default, int $flag, int &$flags): int
+    {
+        $field = trim($field);
+        if ($field === '') {
+            return $default;
+        }
+        $value = self::w62Digits($field, $max);
+        if ($value === null) {
+            $flags |= $flag;
+
+            return $default;
+        }
+
+        return $value;
+    }
+
+    /**
+     * Trimmed 1-$max digits clamped to $low..$high (empty $default); clamping sets $clamped, other input sets
+     * $invalid and yields $default.
+     */
+    private static function w62Clamped(string $field, int $max, int $default, int $low, int $high, int $clamped, int $invalid, int &$flags): int
+    {
+        $field = trim($field);
+        if ($field === '') {
+            return $default;
+        }
+        $value = self::w62Digits($field, $max);
+        if ($value === null) {
+            $flags |= $invalid;
+
+            return $default;
+        }
+        if ($value < $low || $value > $high) {
+            $flags |= $clamped;
+
+            return max($low, min($high, $value));
+        }
+
+        return $value;
+    }
+
+    /** Trimmed W48_SIZE_BYTES bucket 0-11 in bytes (empty or 0: 0); anything else sets 16. */
+    private static function w62SizeBucket(string $field, int &$flags): int
+    {
+        $field = trim($field);
+        if ($field === '') {
+            return 0;
+        }
+        $value = self::w62Digits($field, 2);
+        if ($value === null || $value > 11) {
+            $flags |= 16;
+
+            return 0;
+        }
+
+        return $value === 0 ? 0 : self::W48_SIZE_BYTES[$value];
+    }
+
+    /**
+     * Trimmed 1-10 digit positive external id after an optional ASCII case-insensitive `tt` when $imdb (empty
+     * -1); anything else sets 256 and yields -1.
+     */
+    private static function w62ExternalId(string $field, bool $imdb, int &$flags): int
+    {
+        $field = trim($field);
+        if ($field === '') {
+            return -1;
+        }
+        $value = self::w62Digits($imdb && strncasecmp($field, 'tt', 2) === 0 ? substr($field, 2) : $field, 10);
+        if ($value === null || $value < 1) {
+            $flags |= 256;
+
+            return -1;
+        }
+
+        return $value;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function searchPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w62Words($count, implode("\0", $records), 15 * $count) ?? self::searchPlanBatchPhp($records);
+    }
 }

@@ -427,4 +427,312 @@ class TurnstileService
 
         return self::$w48Ffi === false ? null : self::$w48Ffi;
     }
+
+    /** C signature of the Wave 62.5 {@see self::verificationPlanBatch()} helper. */
+    private const string W62_TURNSTILE_PLAN_FFI_CDEF = 'int64_t nntmux_w625_turnstile_verification_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 62.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 1.92/1.85/3.05/2.46x); see tests/Unit/RustSteamTmdbClientTraktTurnstileReleaseSearchW62ParityTest.php.
+     */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 62.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w62_5', self::W62_TURNSTILE_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W62_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW62RustFfi(): bool
+    {
+        return self::w62RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with verificationPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 62.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w62Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w62RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w625_turnstile_verification_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch Turnstile verification plan over
+     * `token\tsecret\tremote_ip\tidempotency_key\terror_codes\tsuccess\thostname\texpected_hostname`. Nine words
+     * per record: `[token_len, token_state, secret_state, ip_kind, idempotency_state, error_mask, outcome,
+     * retryable, flags]`. Fields are trimmed. The token is 0 empty, 1 valid (W48_TOKEN_CHARS), 2 over 2048 bytes,
+     * 3 invalid bytes. The secret is 0 empty, 1 `0x` plus 1-64 `[A-Za-z0-9_-]`, 2-4 Cloudflare's always-pass,
+     * always-fail and token-spent test secrets, 5 invalid. The remote IP is 0 empty, 1 IPv4 (dotted quad without
+     * leading zeros), 2 IPv6 (2-45 hex digit, colon and dot bytes with at least two colons, no `:::`, at most one
+     * `::` and eight groups of up to four hex digits; only the last group may be a dotted quad), 3 invalid;
+     * private means IPv4 10/8, 127/8, 169.254/16, 172.16/12 or 192.168/16, or IPv6 `::1` and `fc`/`fd` prefixes
+     * (ASCII case-insensitive). The idempotency key is 0 empty, 1 UUID, 2 invalid. Error codes are trimmed,
+     * non-empty comma-separated items mapped to W48_ERROR_CODES bits; others set bit 7. Success is `1`/`true` or
+     * empty/`0`/`false` (ASCII case-insensitive). Outcome: 2 skipped for an empty or invalid secret, 3 rejected
+     * locally for a token that is not valid, 1 passed on success without error codes or hostname mismatch, else
+     * 0. Failures with `internal-error` are retryable. Flags: 1 invalid token, 2 invalid secret, 4 invalid IP, 8
+     * private IP, 16 invalid idempotency key, 32 unknown error code, 64 invalid success, 128 hostname mismatch
+     * against a non-empty expected hostname (ASCII case-insensitive), 256 success with error codes, 512 not
+     * exactly eight fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function verificationPlanBatch(array $records): array
+    {
+        return self::usesW62RustFfi() ? self::verificationPlanBatchNative($records) : self::verificationPlanBatchPhp($records);
+    }
+
+    /** Cloudflare's always-pass, always-fail and token-spent test secrets (secret states 2-4). */
+    private const array W62_TEST_SECRETS = ['1x0000000000000000000000000000000AA', '2x0000000000000000000000000000000AA', '3x0000000000000000000000000000000AA'];
+
+    private const string W62_HEX = '0123456789abcdefABCDEF';
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function verificationPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 8 ? 0 : 512;
+            $token = trim($fields[0]);
+            $tokenLength = \strlen($token);
+            if ($token === '') {
+                $tokenState = 0;
+            } elseif ($tokenLength > 2048) {
+                [$tokenState, $flags] = [2, $flags | 1];
+            } elseif (strspn($token, self::W48_TOKEN_CHARS) !== $tokenLength) {
+                [$tokenState, $flags] = [3, $flags | 1];
+            } else {
+                $tokenState = 1;
+            }
+            $secret = trim($fields[1] ?? '');
+            $test = array_search($secret, self::W62_TEST_SECRETS, true);
+            if ($secret === '') {
+                $secretState = 0;
+            } elseif ($test !== false) {
+                $secretState = $test + 2;
+            } elseif (\strlen($secret) >= 3 && \strlen($secret) <= 66 && str_starts_with($secret, '0x') && strspn($secret, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-', 2) === \strlen($secret) - 2) {
+                $secretState = 1;
+            } else {
+                [$secretState, $flags] = [5, $flags | 2];
+            }
+            $ip = trim($fields[2] ?? '');
+            if ($ip === '') {
+                $ipKind = 0;
+            } elseif (($octets = self::w62Ipv4($ip)) !== null) {
+                [$a, $b] = $octets;
+                if ($a === 10 || $a === 127 || ($a === 169 && $b === 254) || ($a === 172 && $b >= 16 && $b <= 31) || ($a === 192 && $b === 168)) {
+                    $flags |= 8;
+                }
+                $ipKind = 1;
+            } elseif (self::w62Ipv6($ip)) {
+                if ($ip === '::1' || strncasecmp($ip, 'fc', 2) === 0 || strncasecmp($ip, 'fd', 2) === 0) {
+                    $flags |= 8;
+                }
+                $ipKind = 2;
+            } else {
+                [$ipKind, $flags] = [3, $flags | 4];
+            }
+            $key = trim($fields[3] ?? '');
+            if ($key === '') {
+                $keyState = 0;
+            } elseif (preg_match('/^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/D', $key) === 1) {
+                $keyState = 1;
+            } else {
+                [$keyState, $flags] = [2, $flags | 16];
+            }
+            $mask = 0;
+            foreach (explode(',', $fields[4] ?? '') as $item) {
+                $item = trim($item);
+                if ($item === '') {
+                    continue;
+                }
+                if (isset(self::W48_ERROR_CODES[$item])) {
+                    $mask |= 1 << self::W48_ERROR_CODES[$item];
+                } else {
+                    $mask |= 128;
+                    $flags |= 32;
+                }
+            }
+            $success = match (strtolower(trim($fields[5] ?? ''))) {
+                '1', 'true' => 1,
+                '', '0', 'false' => 0,
+                default => -1,
+            };
+            if ($success < 0) {
+                [$success, $flags] = [0, $flags | 64];
+            }
+            $expected = trim($fields[7] ?? '');
+            if ($expected !== '' && strtolower(trim($fields[6] ?? '')) !== strtolower($expected)) {
+                $flags |= 128;
+            }
+            if ($success === 1 && $mask !== 0) {
+                $flags |= 256;
+            }
+            if ($secretState === 0 || $secretState === 5) {
+                $outcome = 2;
+            } elseif ($tokenState !== 1) {
+                $outcome = 3;
+            } else {
+                $outcome = $success === 1 && $mask === 0 && ($flags & 128) === 0 ? 1 : 0;
+            }
+            array_push($out, $tokenLength, $tokenState, $secretState, $ipKind, $keyState, $mask, $outcome, $outcome === 0 && ($mask & 64) !== 0 ? 1 : 0, $flags);
+        }
+
+        return $out;
+    }
+
+    /** 1-$max ASCII digits as an integer, else null. */
+    private static function w62Digits(string $text, int $max): ?int
+    {
+        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
+    }
+
+    /**
+     * Dotted quad with 1-3 digit octets up to 255 (no leading zeros) as its octets, else null.
+     *
+     * @return list<int>|null
+     */
+    private static function w62Ipv4(string $text): ?array
+    {
+        $parts = explode('.', $text);
+        if (\count($parts) !== 4) {
+            return null;
+        }
+        $octets = [];
+        foreach ($parts as $part) {
+            if (\strlen($part) > 1 && $part[0] === '0') {
+                return null;
+            }
+            $value = self::w62Digits($part, 3);
+            if ($value === null || $value > 255) {
+                return null;
+            }
+            $octets[] = $value;
+        }
+
+        return $octets;
+    }
+
+    /** The Wave 62.5 IPv6 shape (see verificationPlanBatch()). */
+    private static function w62Ipv6(string $text): bool
+    {
+        $length = \strlen($text);
+        if ($length < 2 || $length > 45 || strspn($text, self::W62_HEX.':.') !== $length || substr_count($text, ':') < 2 || str_contains($text, ':::') || substr_count($text, '::') > 1) {
+            return false;
+        }
+        $groups = explode(':', $text);
+        if (\count($groups) > 8) {
+            return false;
+        }
+        $last = \count($groups) - 1;
+        foreach ($groups as $index => $group) {
+            if ($index === $last && str_contains($group, '.')) {
+                if (self::w62Ipv4($group) === null) {
+                    return false;
+                }
+            } elseif (\strlen($group) > 4 || strspn($group, self::W62_HEX) !== \strlen($group)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function verificationPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w62Words($count, implode("\0", $records), 9 * $count) ?? self::verificationPlanBatchPhp($records);
+    }
 }

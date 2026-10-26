@@ -1073,4 +1073,277 @@ class TraktService
             return null;
         }
     }
+
+    /** C signature of the Wave 62.5 {@see self::lookupPlanBatch()} helper. */
+    private const string W62_TRAKT_PLAN_FFI_CDEF = 'int64_t nntmux_w625_trakt_lookup_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 62.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 6.92/5.60/6.64/5.75x); see tests/Unit/RustSteamTmdbClientTraktTurnstileReleaseSearchW62ParityTest.php.
+     */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 62.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w62_5', self::W62_TRAKT_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W62_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW62RustFfi(): bool
+    {
+        return self::w62RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with lookupPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 62.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w62Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w62RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w625_trakt_lookup_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch Trakt lookup plan over `media_type\tid\tid_type\tseason\tepisode\textended\tlimit`. Nine words per
+     * record: `[media_code, id_type_code, id_value, slug_len, season, episode, extended_code, limit, flags]`. Media
+     * follow SEARCH_TYPES (1 movie, 2 show, 3 episode, 4 person, 5 list) and id types ID_TYPES plus slug (1 imdb,
+     * 2 tmdb, 3 trakt, 4 tvdb, 5 slug), trimmed and ASCII case-insensitive (0 empty, -1 unknown). An empty id type
+     * is inferred from the trimmed id: imdb with an ASCII case-insensitive `tt` prefix, trakt for 1-18 digits,
+     * else slug. IMDb ids keep all their digits (formatImdbIdPhp()) when there are 6-18; tmdb, trakt and tvdb ids
+     * are 1-18 digits with a positive value; slugs join lowercased ASCII alphanumeric runs with `-` and report
+     * that length. Season and episode are trimmed 1-4 digits (empty -1); episode lookups need a season and a
+     * positive episode. Extended levels are 1 min, 2 full, 3 metadata, 4 episodes (empty or unknown min). The
+     * limit (empty 10) is 1-6 digits clamped to 1..100 (normalizeLimit()). Flags: 1 empty id, 2 unknown media, 4
+     * unknown id type, 8 invalid id, 16 invalid season or episode, 32 incomplete episode lookup, 64 unknown
+     * extended, 128 clamped limit, 256 invalid limit, 512 non-ASCII id, 1024 not exactly seven fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatch(array $records): array
+    {
+        return self::usesW62RustFfi() ? self::lookupPlanBatchNative($records) : self::lookupPlanBatchPhp($records);
+    }
+
+    /** Wave 62.5 extended levels in code order (1-based). */
+    private const array W62_EXTENDED = ['min', 'full', 'metadata', 'episodes'];
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatchPhp(array $records): array
+    {
+        $idTypes = [...self::ID_TYPES, 'slug'];
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 7 ? 0 : 1024;
+            $media = self::w62Code($fields[0], self::SEARCH_TYPES, 2, $flags);
+            $id = trim($fields[1] ?? '');
+            if (preg_match('/[\x80-\xff]/', $id) === 1) {
+                $flags |= 512;
+            }
+            $idType = self::w62Code($fields[2] ?? '', $idTypes, 4, $flags);
+            if ($idType === 0 && $id !== '') {
+                $idType = strncasecmp($id, 'tt', 2) === 0 ? 1 : (self::w62Digits($id, 18) !== null ? 3 : 5);
+            }
+            [$value, $slugLength] = [0, 0];
+            if ($id === '') {
+                $flags |= 1;
+            } elseif ($idType === 1) {
+                $digits = (string) preg_replace('/[^0-9]+/', '', $id);
+                if (\strlen($digits) >= 6 && \strlen($digits) <= 18) {
+                    $value = (int) $digits;
+                } else {
+                    $flags |= 8;
+                }
+            } elseif ($idType >= 2 && $idType <= 4) {
+                $number = self::w62Digits($id, 18);
+                if ($number !== null && $number > 0) {
+                    $value = $number;
+                } else {
+                    $flags |= 8;
+                }
+            } elseif ($idType === 5) {
+                $runs = preg_split('/[^A-Za-z0-9]+/', $id, -1, PREG_SPLIT_NO_EMPTY);
+                $slugLength = \is_array($runs) && $runs !== [] ? \strlen(implode('-', $runs)) : 0;
+                if ($slugLength === 0) {
+                    $flags |= 8;
+                }
+            }
+            $season = self::w62Number($fields[3] ?? '', 4, -1, 16, $flags);
+            $episode = self::w62Number($fields[4] ?? '', 4, -1, 16, $flags);
+            if ($media === 3 && ($season < 0 || $episode < 1)) {
+                $flags |= 32;
+            }
+            $extended = self::w62Code($fields[5] ?? '', self::W62_EXTENDED, 64, $flags);
+            $limit = self::w62Clamped($fields[6] ?? '', 6, 10, 1, 100, 128, 256, $flags);
+            array_push($out, $media, $idType, $value, $slugLength, $season, $episode, $extended > 0 ? $extended : 1, $limit, $flags);
+        }
+
+        return $out;
+    }
+
+    /** 1-$max ASCII digits as an integer, else null. */
+    private static function w62Digits(string $text, int $max): ?int
+    {
+        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
+    }
+
+    /**
+     * Trimmed, ASCII case-insensitive 1-based position of $field in the lowercase $names; 0 empty, -1 unknown
+     * (sets $flag).
+     *
+     * @param  list<string>  $names
+     */
+    private static function w62Code(string $field, array $names, int $flag, int &$flags): int
+    {
+        $field = trim($field);
+        if ($field === '') {
+            return 0;
+        }
+        $at = array_search(strtolower($field), $names, true);
+        if ($at === false) {
+            $flags |= $flag;
+
+            return -1;
+        }
+
+        return (int) $at + 1;
+    }
+
+    /** Trimmed 1-$max digits (empty $default); anything else sets $flag and yields $default. */
+    private static function w62Number(string $field, int $max, int $default, int $flag, int &$flags): int
+    {
+        $field = trim($field);
+        if ($field === '') {
+            return $default;
+        }
+        $value = self::w62Digits($field, $max);
+        if ($value === null) {
+            $flags |= $flag;
+
+            return $default;
+        }
+
+        return $value;
+    }
+
+    /**
+     * Trimmed 1-$max digits clamped to $low..$high (empty $default); clamping sets $clamped, other input sets
+     * $invalid and yields $default.
+     */
+    private static function w62Clamped(string $field, int $max, int $default, int $low, int $high, int $clamped, int $invalid, int &$flags): int
+    {
+        $field = trim($field);
+        if ($field === '') {
+            return $default;
+        }
+        $value = self::w62Digits($field, $max);
+        if ($value === null) {
+            $flags |= $invalid;
+
+            return $default;
+        }
+        if ($value < $low || $value > $high) {
+            $flags |= $clamped;
+
+            return max($low, min($high, $value));
+        }
+
+        return $value;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w62Words($count, implode("\0", $records), 9 * $count) ?? self::lookupPlanBatchPhp($records);
+    }
 }
