@@ -883,4 +883,317 @@ final class BinaryHandler
 
         return \is_array($values) ? array_values($values) : self::planBinaryKeysPhp($hashes, $collectionIds, $fileNumbers, $totalParts);
     }
+
+    // ========================================================================
+    // WAVE 66.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 3.47x, p99 2.77x; uncommon mean 3.75x, p99 3.12x); see RustBackfillBinariesConfigServiceHandlerW66ParityTest. */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    public const string W66_BINARY_HANDLER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w661_binary_handler_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w66BinaryHandlerPlanBatch(). */
+    public const int W66_BINARY_HANDLER_TRAILER = 21;
+
+    public static function usesW66RustFfi(): bool
+    {
+        $override = self::w66RustFfiState();
+
+        return \is_bool($override) ? $override : self::W66_RUST_FFI_DEFAULT;
+    }
+
+    /** Forces the BinaryHandler Wave 66 Rust path on until reset. */
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', true);
+    }
+
+    /** Forces the BinaryHandler Wave 66 PHP path until reset. */
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', false);
+    }
+
+    /** Restores the benchmark default and drops the cached library handle and scratch buffers; earlier toggles are untouched. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('reset');
+    }
+
+    /**
+     * Runs $callback with the BinaryHandler Wave 66 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 66.1 binary header plans, one per `subject|poster|group|part|total|file_number` row. Subject and poster collapse
+     * ASCII whitespace runs, trim and lowercase; the group trims and lowercases. A trailing `(part/total)` counter (1-9 digits
+     * each) is split off the subject and fills empty part and total fields. Numbers are 1-15 digits, empty 0. The identity is
+     * `fnv1a32('file:'.file_number)` for a positive file number, else `fnv1a32("subject:{base}\0poster:{poster}")`; the
+     * collection key is `fnv1a32("collection:{base}\0{poster}\0{group}")`. Decision: 0 empty row, 1 malformed number,
+     * 2 empty subject, 3 empty or invalid group (a dotted `[a-z0-9.+_-]` name), 4 part above total, 5 unknown part or total,
+     * 6 identity and part repeated in the batch, 7 new part. Flags: 1 part counter, 2 counter disagrees with the fields,
+     * 4 whitespace collapsed, 8 uppercase, 16 non-ASCII, 32 control byte, 64 file-number identity, 128 empty poster. Per item
+     * `decision | flags << 3 | (identity & 0xFFFFF) << 11 | (collection & 0xFFFFF) << 31 | min(part, 2047) << 51`; then 8
+     * decision and 8 flag counts, the new-part sum, the largest total, and the distinct identities, collections (rows from
+     * decision 4) and valid groups.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66BinaryHandlerPlanBatch(array $items): array
+    {
+        return self::usesW66RustFfi() ? self::w66BinaryHandlerPlanBatchNative($items) : self::w66BinaryHandlerPlanBatchPhp($items);
+    }
+
+    /**
+     * Rust plan; falls back to the PHP reference when the library is missing or the call declines.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66BinaryHandlerPlanBatchNative(array $items): array
+    {
+        return self::w66Invoke($items, \count($items) + self::W66_BINARY_HANDLER_TRAILER) ?? self::w66BinaryHandlerPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66BinaryHandlerPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W66_BINARY_HANDLER_TRAILER, 0);
+        $parts = $identities = $collections = $groups = [];
+        foreach ($items as $item) {
+            $item = (string) $item;
+            [$rawSubject, $rawPoster, $rawGroup, $rawPart, $rawTotal, $rawFile] = explode('|', $item, 6) + ['', '', '', '', '', ''];
+            $subject = self::w66Normalize($rawSubject);
+            $poster = self::w66Normalize($rawPoster);
+            $group = strtolower(trim($rawGroup));
+            $fieldPart = self::w66Uint($rawPart, 0);
+            $fieldTotal = self::w66Uint($rawTotal, 0);
+            $file = self::w66Uint($rawFile, 0);
+            $part = $fieldPart;
+            $total = $fieldTotal;
+            $base = $subject;
+            $marker = false;
+            $disagree = false;
+            if (preg_match('/\((\d{1,9})\/(\d{1,9})\)\z/', $subject, $match, PREG_OFFSET_CAPTURE) === 1) {
+                $marker = true;
+                $markerPart = (int) $match[1][0];
+                $markerTotal = (int) $match[2][0];
+                $part = $part === 0 ? $markerPart : $part;
+                $total = $total === 0 ? $markerTotal : $total;
+                $disagree = ($fieldPart > 0 && $fieldPart !== $markerPart) || ($fieldTotal > 0 && $fieldTotal !== $markerTotal);
+                $base = trim(substr($subject, 0, $match[0][1]));
+            }
+            $identity = $file > 0 ? self::w66Fnv('file:'.$file) : self::w66Fnv('subject:'.$base."\0poster:".$poster);
+            $collection = self::w66Fnv('collection:'.$base."\0".$poster."\0".$group);
+            $groupOk = self::w66GroupValid($group);
+            $partKey = $identity.':'.$part;
+            $decision = match (true) {
+                trim($item) === '' => 0,
+                $part < 0 || $total < 0 || $file < 0 => 1,
+                $base === '' => 2,
+                ! $groupOk => 3,
+                $total > 0 && $part > $total => 4,
+                $part === 0 || $total === 0 => 5,
+                isset($parts[$partKey]) => 6,
+                default => 7,
+            };
+            if ($decision === 7) {
+                $parts[$partKey] = true;
+            }
+            if ($decision >= 4) {
+                $identities[$identity] = true;
+                $collections[$collection] = true;
+            }
+            if ($groupOk) {
+                $groups[$group] = true;
+            }
+            $flags = ($marker ? 1 : 0) | ($disagree ? 2 : 0) | (strtolower(trim($rawSubject)) !== $subject ? 4 : 0)
+                | (strpbrk($rawSubject.$rawPoster, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') !== false ? 8 : 0) | (preg_match('/[\x80-\xff]/', $item) === 1 ? 16 : 0)
+                | (strcspn($item, self::W66_CONTROL_BYTES) !== \strlen($item) ? 32 : 0) | ($file > 0 ? 64 : 0) | ($poster === '' ? 128 : 0);
+            $tail[$decision]++;
+            for ($b = 0; $b < 8; $b++) {
+                $tail[8 + $b] += $flags >> $b & 1;
+            }
+            if ($decision === 7) {
+                $tail[16] += min($part, 1 << 40);
+            }
+            $tail[17] = max($tail[17], $total);
+            $out[] = $decision | $flags << 3 | ($identity & 0xFFFFF) << 11 | ($collection & 0xFFFFF) << 31 | max(0, min($part, 2047)) << 51;
+        }
+        $tail[18] = \count($identities);
+        $tail[19] = \count($collections);
+        $tail[20] = \count($groups);
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    private const string W66_DIGITS = '0123456789';
+
+    private const string W66_CONTROL_BYTES = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F";
+
+    /** A trimmed field of 1-15 digits; empty is $empty, anything else -1. */
+    private static function w66Uint(string $raw, int $empty): int
+    {
+        $value = trim($raw);
+        if ($value === '') {
+            return $empty;
+        }
+        $length = \strlen($value);
+
+        return $length <= 15 && strspn($value, self::W66_DIGITS) === $length ? (int) $value : -1;
+    }
+
+    /** `strtolower(trim())` after collapsing runs of ASCII whitespace (space, tab, LF, CR, VT, FF) to one space. */
+    private static function w66Normalize(string $raw): string
+    {
+        return strtolower(trim((string) preg_replace('/[ \t\n\r\x0B\x0C]+/', ' ', $raw)));
+    }
+
+    /** `hexdec(hash('fnv1a32', $value))`. */
+    private static function w66Fnv(string $value): int
+    {
+        return (int) hexdec(hash('fnv1a32', $value));
+    }
+
+    /** A non-empty dotted `[a-z0-9.+_-]` group name without leading, trailing or doubled dots. */
+    private static function w66GroupValid(string $group): bool
+    {
+        $length = \strlen($group);
+
+        return $length > 0 && strspn($group, 'abcdefghijklmnopqrstuvwxyz0123456789.+_-') === $length && str_contains($group, '.')
+            && $group[0] !== '.' && $group[$length - 1] !== '.' && ! str_contains($group, '..');
+    }
+
+    /**
+     * Wave 66 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'reset' clears the override, library handle and buffers, 'ffi'
+     * resolves the library (null when unavailable) and 'out' and 'lens' return `int64_t` output and
+     * length-column buffers of at least $val words.
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var \FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('binary_handler_w661', self::W66_BINARY_HANDLER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w66RustFfiState('ffi');
+                if (! $handle instanceof \FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w66RustFfiState('ffi');
+                if (! $handle instanceof \FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 66.1 BinaryHandler export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w66Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w66RustFfiState('ffi');
+            $out = self::w66RustFfiState('out', $words);
+            if (! $ffi instanceof \FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w66RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                \FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = \FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W66_BINARY_HANDLER_FFI_CDEF.)
+            $written = $ffi->nntmux_w661_binary_handler_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', \FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
 }
