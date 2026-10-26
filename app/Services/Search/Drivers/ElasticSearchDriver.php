@@ -3818,4 +3818,169 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
 
         return \is_array($result) && \is_int($result['status'] ?? null) ? $result['status'] : null;
     }
+
+    public const string W56_FFI_CDEF = 'int64_t nntmux_w565_elastic_query_string_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W56.5 parity test's QUALIFICATION). */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    /** Lucene query string reserved characters, counted by {@see self::queryStringPlanBatch()}. */
+    private const array W56_LUCENE_RESERVED = ['+', '-', '=', '&', '|', '>', '<', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '\\', '/'];
+
+    /**
+     * Wave 56.5 routing and FFI cache, kept in function-local statics. Without $op it reports
+     * the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[],
+     * capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w56_5', self::W56_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof \FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W56_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        return self::w56RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with queryStringPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 56.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w56Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w56RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w565_elastic_query_string_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', \FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch plan of {@see self::escapeStringPhp()}-style normalization: dots become spaces, the text is
+     * trimmed and whitespace runs collapse to one space. Four words per query: `[normalized length,
+     * terms, reserved, flags]`; `''`, `'0'` and `'*'` report `[0, 0, 0, 1]`. Terms are runs of non-space
+     * bytes and reserved counts Lucene reserved bytes. Flags: 2 non-ASCII, 4 had a dot, 8 collapsing
+     * changed the text.
+     *
+     * @param  list<string>  $queries
+     * @return list<int>
+     */
+    public static function queryStringPlanBatch(array $queries): array
+    {
+        return self::usesW56RustFfi() ? self::queryStringPlanBatchNative($queries) : self::queryStringPlanBatchPhp($queries);
+    }
+
+    /**
+     * @param  list<string>  $queries
+     * @return list<int>
+     */
+    public static function queryStringPlanBatchPhp(array $queries): array
+    {
+        $out = [];
+        foreach ($queries as $query) {
+            if ($query === '' || $query === '0' || $query === '*') {
+                array_push($out, 0, 0, 0, 1);
+
+                continue;
+            }
+            $trimmed = trim(str_replace('.', ' ', $query));
+            $normalized = preg_replace('/\s+/', ' ', $trimmed) ?? $trimmed;
+            $flags = (preg_match('/[\x80-\xff]/', $normalized) === 1 ? 2 : 0)
+                | (str_contains($query, '.') ? 4 : 0)
+                | ($normalized !== $trimmed ? 8 : 0);
+            array_push(
+                $out,
+                \strlen($normalized),
+                (int) preg_match_all('/[^ ]+/', $normalized),
+                \strlen($normalized) - \strlen(str_replace(self::W56_LUCENE_RESERVED, '', $normalized)),
+                $flags,
+            );
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds
+     * a NUL.
+     *
+     * @param  list<string>  $queries
+     * @return list<int>
+     */
+    public static function queryStringPlanBatchNative(array $queries): array
+    {
+        $count = \count($queries);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w56Words($count, implode("\0", $queries), 4 * $count) ?? self::queryStringPlanBatchPhp($queries);
+    }
 }
