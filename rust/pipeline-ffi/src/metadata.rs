@@ -53293,3 +53293,695 @@ mod w544_tests {
         assert_eq!(out, vec![1, 6, 200_000, -1]);
     }
 }
+
+/// Wave 55.4 batch exports: MoviesProcessor and MusicProcessor title tag rows, MusicService
+/// lookup rows, PostProcessService TV lookup mode rows and TvMazeClient AKA name rows. Every
+/// export shares the W50.4 runner: NUL-joined text columns (column after column), a packed
+/// int64 header, and `words` int64 output words per record.
+pub mod w554_batch {
+    use super::w504_batch::{Batch, Shape, run, span_word, trim};
+
+    /// Maximal ASCII alphanumeric runs (preg_split('/[^A-Za-z0-9]+/', ..., NO_EMPTY)).
+    fn tokens(s: &[u8]) -> impl Iterator<Item = &[u8]> {
+        s.split(|c| !c.is_ascii_alphanumeric())
+            .filter(|t| !t.is_empty())
+    }
+
+    const TOKEN_MAX: usize = 11;
+
+    /// The uppercased token when it is short enough to hold a known tag.
+    #[inline(always)]
+    fn upper(token: &[u8], buf: &mut [u8; TOKEN_MAX]) -> Option<usize> {
+        if token.len() > TOKEN_MAX {
+            return None;
+        }
+        for (dst, src) in buf.iter_mut().zip(token) {
+            *dst = src.to_ascii_uppercase();
+        }
+        Some(token.len())
+    }
+
+    /// Four ASCII digits as an integer when `token` is exactly that.
+    #[inline(always)]
+    fn four_digits(token: &[u8]) -> Option<i64> {
+        if token.len() != 4 || !token.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            token
+                .iter()
+                .fold(0i64, |acc, d| acc * 10 + i64::from(d - b'0')),
+        )
+    }
+
+    /// 19xx or 20xx.
+    #[inline(always)]
+    fn modern_year(token: &[u8]) -> Option<i64> {
+        four_digits(token).filter(|y| (1900..=2099).contains(y))
+    }
+
+    /// MoviesProcessor::W414_* token classes as flag bits.
+    fn movie_tag(token: &[u8]) -> i64 {
+        match token {
+            b"480P" | b"576P" | b"720P" | b"1080P" | b"1080I" | b"2160P" | b"4K" | b"UHD" => 1,
+            b"BLURAY" | b"BDRIP" | b"BRRIP" | b"WEBDL" | b"WEBRIP" | b"WEB" | b"HDTV"
+            | b"DVDRIP" | b"DVD" | b"REMUX" | b"HDRIP" => 2,
+            b"X264" | b"X265" | b"H264" | b"H265" | b"HEVC" | b"AVC" | b"XVID" | b"DIVX"
+            | b"AV1" | b"VP9" => 4,
+            b"HDR" | b"HDR10" | b"HDR10PLUS" | b"DV" | b"DOVI" | b"DOLBYVISION" | b"HLG" => 8,
+            _ => 0,
+        }
+    }
+
+    /// [flags, token count, first 19xx/20xx year or -1, trimmed span]; flags: resolution 1,
+    /// source 2, codec 4, HDR 8, year 16, complete (all but HDR) 32, empty 64.
+    fn movie_title_row(b: &Batch<'_>, out: &mut [i64]) {
+        let mut buf = [0u8; TOKEN_MAX];
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (lead, title) = trim(b.text(0, i));
+            if title.is_empty() {
+                *slot = [64, 0, -1, span_word(lead, 0)];
+                continue;
+            }
+            let (mut flags, mut count, mut year) = (0i64, 0i64, -1i64);
+            for token in tokens(title) {
+                count += 1;
+                if let Some(len) = upper(token, &mut buf) {
+                    flags |= movie_tag(&buf[..len]);
+                }
+                if let Some(value) = modern_year(token) {
+                    flags |= 16;
+                    if year < 0 {
+                        year = value;
+                    }
+                }
+            }
+            if (flags & 23) == 23 {
+                flags |= 32;
+            }
+            *slot = [flags, count, year, span_word(lead, title.len())];
+        }
+    }
+
+    /// MusicProcessor::W424_MUSIC_TOKENS.
+    fn music_tag(token: &[u8]) -> i64 {
+        match token {
+            b"FLAC" | b"ALAC" | b"WAV" | b"APE" | b"WV" | b"DSD" | b"DSF" | b"AIFF" => 1,
+            b"MP3" | b"AAC" | b"OGG" | b"OPUS" | b"M4A" | b"WMA" => 2,
+            b"CBR" | b"VBR" => 4,
+            b"CD" | b"CDDA" | b"CDM" | b"CDS" | b"CDR" | b"WEB" | b"VINYL" | b"LP" | b"VLS"
+            | b"SACD" | b"DVDA" | b"TAPE" => 8,
+            b"VA" | b"OST" | b"SOUNDTRACK" | b"DISCOGRAPHY" | b"COMPILATION" | b"ANTHOLOGY" => 16,
+            _ => 0,
+        }
+    }
+
+    /// /^(?:\d{2,3}K(?:BPS)?|V[0-2])\z/ on an uppercased token.
+    fn bitrate(token: &[u8]) -> bool {
+        if let [b'V', b'0'..=b'2'] = token {
+            return true;
+        }
+        let digits = token.iter().take_while(|c| c.is_ascii_digit()).count();
+        (2..=3).contains(&digits) && matches!(&token[digits..], b"K" | b"KBPS")
+    }
+
+    /// [flags, token count, first 19xx/20xx year or -1, trimmed span]; flags: lossless 1,
+    /// lossy 2, bitrate 4, source 8, compilation 16, year 32, empty 64.
+    fn music_title_row(b: &Batch<'_>, out: &mut [i64]) {
+        let mut buf = [0u8; TOKEN_MAX];
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (lead, title) = trim(b.text(0, i));
+            if title.is_empty() {
+                *slot = [64, 0, -1, span_word(lead, 0)];
+                continue;
+            }
+            let (mut flags, mut count, mut year) = (0i64, 0i64, -1i64);
+            for token in tokens(title) {
+                count += 1;
+                if let Some(len) = upper(token, &mut buf) {
+                    let token = &buf[..len];
+                    flags |= music_tag(token);
+                    if bitrate(token) {
+                        flags |= 4;
+                    }
+                }
+                if let Some(value) = modern_year(token) {
+                    flags |= 32;
+                    if year < 0 {
+                        year = value;
+                    }
+                }
+            }
+            *slot = [flags, count, year, span_word(lead, title.len())];
+        }
+    }
+
+    /// /\A[12][0-9]{3}\z/.
+    #[inline(always)]
+    fn lookup_year(token: &[u8]) -> Option<i64> {
+        four_digits(token).filter(|y| (1000..=2999).contains(y))
+    }
+
+    /// [flags, token count, year or -1, first hyphen offset or -1] of the trimmed title and
+    /// year; flags: FLAC 1, MP3/bitrate 2, year 4, splittable 8, valid year field 16. The year
+    /// word is the year field when valid, else the first title year token.
+    fn music_lookup_row(b: &Batch<'_>, out: &mut [i64]) {
+        let mut buf = [0u8; TOKEN_MAX];
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (_, title) = trim(b.text(0, i));
+            let (_, year_field) = trim(b.text(1, i));
+            let (mut flags, mut count, mut year) = (0i64, 0i64, -1i64);
+            if let Some(value) = lookup_year(year_field) {
+                flags |= 4 | 16;
+                year = value;
+            }
+            for token in tokens(title) {
+                count += 1;
+                if let Some(len) = upper(token, &mut buf) {
+                    match &buf[..len] {
+                        b"FLAC" => flags |= 1,
+                        b"MP3" | b"128" | b"192" | b"256" | b"320" => flags |= 2,
+                        _ => {}
+                    }
+                }
+                if let Some(value) = lookup_year(token) {
+                    flags |= 4;
+                    if year < 0 {
+                        year = value;
+                    }
+                }
+            }
+            let hyphen = title.iter().position(|c| *c == b'-');
+            if let Some(at) = hyphen
+                && !trim(&title[..at]).1.is_empty()
+                && !trim(&title[at + 1..]).1.is_empty()
+            {
+                flags |= 8;
+            }
+            *slot = [flags, count, year, hyphen.map_or(-1, |at| at as i64)];
+        }
+    }
+
+    /// is_numeric() whitespace.
+    #[inline(always)]
+    fn php_space(c: u8) -> bool {
+        matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+    }
+
+    /// [resolved mode, flags] with the header default; flags: numeric 1, renamed only 2,
+    /// bucket (skip 0, all 1, renamed 2, other 3) << 2, integer literal 16, padded 32,
+    /// blank (null or '') 64.
+    fn tv_lookup_mode_row(b: &Batch<'_>, out: &mut [i64]) {
+        let default = b.head[0];
+        for (i, slot) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let value = b.text(0, i);
+            let numeric = crate::additional::w466_php_numeric_int(value);
+            let resolved = numeric.unwrap_or(default);
+            let bucket = match resolved {
+                0..=2 => resolved,
+                _ => 3,
+            };
+            let mut flags = bucket << 2 | i64::from(resolved == 2) << 1;
+            if numeric.is_some() {
+                flags |= 1;
+                if !value.iter().any(|c| matches!(c, b'.' | b'e' | b'E')) {
+                    flags |= 16;
+                }
+                if php_space(value[0]) || php_space(value[value.len() - 1]) {
+                    flags |= 32;
+                }
+            } else if value.is_empty() {
+                flags |= 64;
+            }
+            *slot = [resolved, flags];
+        }
+    }
+
+    const COUNTRIES: [&[u8; 2]; 7] = [b"US", b"UK", b"AU", b"CA", b"NZ", b"JP", b"KR"];
+
+    /// The W464 pattern whitespace [ \t\n\r\x0b\f].
+    #[inline(always)]
+    fn pattern_space(c: u8) -> bool {
+        php_space(c)
+    }
+
+    /// [flags, trimmed span, (dddd) suffix year or -1, (CC) suffix index or -1]; flags: empty 1,
+    /// blank 2, padded 4, article prefix 8, year suffix 16, country suffix 32, punctuation 64,
+    /// digit 128, non-ASCII 256, whitespace pair 512.
+    fn aka_name_row(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let entry = b.text(0, i);
+            if entry.is_empty() {
+                *slot = [1, 0, -1, -1];
+                continue;
+            }
+            let (lead, name) = trim(entry);
+            let mut flags = 0i64;
+            if name.is_empty() {
+                flags |= 2;
+            }
+            if name.len() != entry.len() {
+                flags |= 4;
+            }
+            let article = match name {
+                [b't' | b'T', b'h' | b'H', b'e' | b'E', c, ..] => pattern_space(*c),
+                [b'a' | b'A', b'n' | b'N', c, ..] if pattern_space(*c) => true,
+                [b'a' | b'A', c, ..] => pattern_space(*c),
+                _ => false,
+            };
+            if article {
+                flags |= 8;
+            }
+            let (mut year, mut country) = (-1i64, -1i64);
+            if let [.., b'(', y0, y1, y2, y3, b')'] = name
+                && let Some(value) = four_digits(&[*y0, *y1, *y2, *y3])
+            {
+                flags |= 16;
+                year = value;
+            } else if let [.., b'(', c0, c1, b')'] = name
+                && let Some(k) = COUNTRIES.iter().position(|cc| **cc == [*c0, *c1])
+            {
+                flags |= 32;
+                country = k as i64;
+            }
+            let mut prev_space = false;
+            for c in name {
+                flags |= match c {
+                    b':' | b'!' | b'?' | b'&' => 64,
+                    b'0'..=b'9' => 128,
+                    0x80.. => 256,
+                    _ => 0,
+                };
+                let space = pattern_space(*c);
+                if space && prev_space {
+                    flags |= 512;
+                }
+                prev_space = space;
+            }
+            *slot = [flags, span_word(lead, name.len()), year, country];
+        }
+    }
+
+    macro_rules! export {
+        ($name:ident, $cols:literal, $head:literal, $words:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `text` must point to `text_len` readable bytes, `ints` to `ints_len` readable
+            /// bytes and `out` to `out_cap` writable, aligned int64 words that overlap neither
+            /// input; null pointers are accepted only with zero lengths. The runner rejects a
+            /// null or misaligned output, null inputs with non-zero lengths, overlapping
+            /// buffers and field/int counts that do not match `count` before slicing, reports
+            /// `-needed` for a short output without writing, and maps panics to -1.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                text: *const u8,
+                text_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let shape = Shape {
+                    cols: $cols,
+                    head: $head,
+                    per: 0,
+                    words: $words,
+                };
+                unsafe {
+                    run(
+                        text, text_len, ints, ints_len, count, out, out_cap, shape, $body,
+                    )
+                }
+            }
+        };
+    }
+
+    export!(
+        nntmux_w554_movie_title_tag_row_batch,
+        1,
+        0,
+        4,
+        movie_title_row
+    );
+    export!(
+        nntmux_w554_music_title_tag_row_batch,
+        1,
+        0,
+        4,
+        music_title_row
+    );
+    export!(nntmux_w554_music_lookup_row_batch, 2, 0, 4, music_lookup_row);
+    export!(
+        nntmux_w554_tv_lookup_mode_row_batch,
+        1,
+        1,
+        2,
+        tv_lookup_mode_row
+    );
+    export!(nntmux_w554_tvmaze_aka_name_row_batch, 1, 0, 4, aka_name_row);
+}
+
+#[cfg(test)]
+mod w554_tests {
+    use super::w554_batch::*;
+
+    type Export =
+        unsafe extern "C" fn(*const u8, usize, *const u8, usize, usize, *mut i64, usize) -> isize;
+
+    fn call(export: Export, text: &[u8], ints: &[u8], count: usize, out: &mut [i64]) -> isize {
+        unsafe {
+            export(
+                text.as_ptr(),
+                text.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    fn pack(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// Column-major text fields and header ints for `count` records.
+    fn rows(
+        export: Export,
+        fields: &[&[u8]],
+        head: &[i64],
+        count: usize,
+        words: usize,
+    ) -> Vec<i64> {
+        let text = fields.join(&0u8);
+        let mut out = vec![i64::MIN; count * words];
+        assert_eq!(
+            call(export, &text, &pack(head), count, &mut out),
+            (count * words) as isize
+        );
+        out
+    }
+
+    fn span(offset: i64, len: i64) -> i64 {
+        (offset << 32) | len
+    }
+
+    #[test]
+    fn w554_movie_title_hand_cases() {
+        let titles: [&[u8]; 6] = [
+            b"The.Matrix.1999.1080p.BluRay.x264-GROUP",
+            b"  Dune 2021 2160p HDR10 WEB-DL  ",
+            b"",
+            b" \t ",
+            b"Movie.1899.2100.DV.HEVC",
+            b"x264x265",
+        ];
+        let out = rows(nntmux_w554_movie_title_tag_row_batch, &titles, &[], 6, 4);
+        assert_eq!(
+            out,
+            vec![
+                55,
+                7,
+                1999,
+                span(0, 39), //
+                27,
+                6,
+                2021,
+                span(2, 28), //
+                64,
+                0,
+                -1,
+                0, //
+                64,
+                0,
+                -1,
+                span(3, 0), //
+                12,
+                5,
+                -1,
+                span(0, 23), //
+                0,
+                1,
+                -1,
+                span(0, 8),
+            ]
+        );
+    }
+
+    #[test]
+    fn w554_music_title_hand_cases() {
+        let titles: [&[u8]; 4] = [
+            b"Artist-Album-2019-FLAC-WEB-320K",
+            b"VA - Hits (CD) MP3 V0 192kbps 1999",
+            b"1K 1234K V3 2100",
+            b"\n",
+        ];
+        let out = rows(nntmux_w554_music_title_tag_row_batch, &titles, &[], 4, 4);
+        assert_eq!(
+            out,
+            vec![
+                45,
+                6,
+                2019,
+                span(0, 31), //
+                62,
+                7,
+                1999,
+                span(0, 34), //
+                0,
+                4,
+                -1,
+                span(0, 16), //
+                64,
+                0,
+                -1,
+                span(1, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn w554_music_lookup_hand_cases() {
+        let fields: [&[u8]; 12] = [
+            b"Artist - Album (2019) FLAC",
+            b"Album MP3 320",
+            b"- Album",
+            b"  ",
+            b"Band -  ",
+            b"x-y 2500",
+            b"",
+            b" 1998 ",
+            b"3000",
+            b"",
+            b"0999",
+            b"abcd",
+        ];
+        let out = rows(nntmux_w554_music_lookup_row_batch, &fields, &[], 6, 4);
+        assert_eq!(
+            out,
+            vec![
+                13, 4, 2019, 7, //
+                22, 3, 1998, -1, //
+                0, 1, -1, 0, //
+                0, 0, -1, -1, //
+                0, 1, -1, 5, //
+                12, 3, 2500, 1,
+            ]
+        );
+    }
+
+    #[test]
+    fn w554_tv_lookup_mode_hand_cases() {
+        let values: [&[u8]; 9] = [
+            b"0", b"1", b"2", b"", b" 2 ", b"abc", b"1e999", b"9.5", b"-3",
+        ];
+        let out = rows(nntmux_w554_tv_lookup_mode_row_batch, &values, &[1], 9, 2);
+        assert_eq!(
+            out,
+            vec![
+                0, 17, 1, 21, 2, 27, 1, 68, 2, 59, 1, 4, 0, 1, 9, 13, -3, 29
+            ]
+        );
+        let out = rows(
+            nntmux_w554_tv_lookup_mode_row_batch,
+            &[b"x", b"\x0c7\n"],
+            &[2],
+            2,
+            2,
+        );
+        assert_eq!(out, vec![2, 10, 7, 1 | 12 | 16 | 32]);
+    }
+
+    #[test]
+    fn w554_aka_name_hand_cases() {
+        let names: [&[u8]; 8] = [
+            b"The Office (US)",
+            b"  An Example (2019)  ",
+            b"",
+            b" \t",
+            "Amélie: Le  Film!".as_bytes(),
+            b"A\x0cB (JP)",
+            b"Show (20a1)",
+            b"(uk)",
+        ];
+        let out = rows(nntmux_w554_tvmaze_aka_name_row_batch, &names, &[], 8, 4);
+        assert_eq!(
+            out,
+            vec![
+                40,
+                span(0, 15),
+                -1,
+                0, //
+                156,
+                span(2, 17),
+                2019,
+                -1, //
+                1,
+                0,
+                -1,
+                -1, //
+                6,
+                span(2, 0),
+                -1,
+                -1, //
+                832,
+                span(0, 18),
+                -1,
+                -1, //
+                40,
+                span(0, 8),
+                -1,
+                5, //
+                128,
+                span(0, 11),
+                -1,
+                -1, //
+                0,
+                span(0, 4),
+                -1,
+                -1,
+            ]
+        );
+    }
+
+    /// (export, text columns, header ints, words per record).
+    const EXPORTS: [(Export, usize, usize, usize); 5] = [
+        (nntmux_w554_movie_title_tag_row_batch, 1, 0, 4),
+        (nntmux_w554_music_title_tag_row_batch, 1, 0, 4),
+        (nntmux_w554_music_lookup_row_batch, 2, 0, 4),
+        (nntmux_w554_tv_lookup_mode_row_batch, 1, 1, 2),
+        (nntmux_w554_tvmaze_aka_name_row_batch, 1, 0, 4),
+    ];
+
+    #[test]
+    fn w554_raw_export_contract() {
+        for (export, cols, head, words) in EXPORTS {
+            let text = vec![&b"a"[..]; 2 * cols].join(&0u8);
+            let ints = pack(&vec![7i64; head]);
+            let mut out = vec![i64::MIN; 2 * words];
+            unsafe {
+                assert_eq!(
+                    export(
+                        text.as_ptr(),
+                        text.len(),
+                        ints.as_ptr(),
+                        ints.len(),
+                        2,
+                        std::ptr::null_mut(),
+                        64
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        text.len(),
+                        ints.as_ptr(),
+                        ints.len(),
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                if head > 0 {
+                    assert_eq!(
+                        export(
+                            text.as_ptr(),
+                            text.len(),
+                            std::ptr::null(),
+                            ints.len(),
+                            2,
+                            out.as_mut_ptr(),
+                            out.len()
+                        ),
+                        -1
+                    );
+                } else {
+                    assert_eq!(
+                        export(
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null(),
+                            0,
+                            0,
+                            out.as_mut_ptr(),
+                            out.len()
+                        ),
+                        0
+                    );
+                }
+                let mut shared = vec![0i64; 64];
+                let base = shared.as_mut_ptr();
+                assert_eq!(
+                    export(base.cast(), 8, ints.as_ptr(), ints.len(), 2, base, 64),
+                    -1
+                );
+            }
+            assert!(out.iter().all(|w| *w == i64::MIN));
+            let mut extra = text.clone();
+            extra.extend_from_slice(b"\0b");
+            assert_eq!(call(export, &extra, &ints, 2, &mut out), -1);
+            assert_eq!(
+                call(export, &text[..text.len() - 2], &ints, 2, &mut out),
+                -1
+            );
+            let mut wrong = ints.clone();
+            wrong.extend_from_slice(&[0; 8]);
+            assert_eq!(call(export, &text, &wrong, 2, &mut out), -1);
+            let mut short = vec![i64::MIN; 2 * words - 1];
+            assert_eq!(
+                call(export, &text, &ints, 2, &mut short),
+                -((2 * words) as isize)
+            );
+            assert!(short.iter().all(|w| *w == i64::MIN));
+            assert_eq!(
+                call(export, &text, &ints, 2, &mut out),
+                (2 * words) as isize
+            );
+            assert!(out.iter().all(|w| *w != i64::MIN));
+        }
+    }
+
+    #[test]
+    fn w554_long_and_binary_inputs_stay_bounded() {
+        let long: Vec<u8> = [b' '; 200_000]
+            .iter()
+            .chain(b"The 1080p FLAC (2019)".iter())
+            .copied()
+            .collect();
+        let binary: Vec<u8> = (1u8..=255).collect();
+        for (export, cols, head, words) in EXPORTS {
+            for value in [&long[..], &binary[..]] {
+                let text = vec![value; cols].join(&0u8);
+                let ints = pack(&vec![i64::MIN; head]);
+                let mut out = vec![i64::MIN; words];
+                assert_eq!(call(export, &text, &ints, 1, &mut out), words as isize);
+            }
+        }
+        let out = rows(nntmux_w554_tvmaze_aka_name_row_batch, &[&long], &[], 1, 4);
+        assert_eq!(out, vec![4 | 8 | 16 | 128, span(200_000, 21), 2019, -1]);
+    }
+}
