@@ -475,4 +475,246 @@ final class FingerprintProviderBreaker
 
         return self::$w47BreakerRustFfiHandle === false ? null : self::$w47BreakerRustFfiHandle;
     }
+
+    // ---- Wave 62.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 7.76x/6.83x, uncommon 8.52x/7.71x); see RustFingerprintQueueDispatchBreakerAnalyzerPar2ParserW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    private const string W62_FINGERPRINT_PROVIDER_BREAKER_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w622_breaker_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W62_FINGERPRINT_PROVIDER_BREAKER_TAIL = 16;
+
+    /**
+     * Wave 62 routing, binding and output buffer, kept in function-local statics (no static
+     * properties). Operations: null reads the routing override, 'set' replaces it (returning the
+     * previous one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]`
+     * with room for at least $val words (null without the library).
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w62', self::W62_FINGERPRINT_PROVIDER_BREAKER_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof FFI\CData || $capacity < $words) {
+                    $resolved = self::w62RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof FFI\CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW62RustFfi(): bool
+    {
+        $enabled = self::w62RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w62BreakerPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62BreakerPlanBatch(array $rows): array
+    {
+        return self::usesW62RustFfi() ? self::w62BreakerPlanBatchNative($rows) : self::w62BreakerPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62BreakerPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W62_FINGERPRINT_PROVIDER_BREAKER_TAIL;
+        /** @var array{FFI, FFI\CData, int}|null $state */
+        $state = $count === 0 ? null : self::w62RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w62BreakerPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W62_FINGERPRINT_PROVIDER_BREAKER_FFI_CDEF.)
+            $written = $ffi->nntmux_w622_breaker_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w62BreakerPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w62Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** Seconds a half-open probe claim lasts in w62BreakerPlanBatch() (the collector job timeout). */
+    public const int W62_BREAKER_PROBE_SECONDS = 1800;
+
+    /**
+     * Wave 62.2 provider circuit-breaker plan. Per `name\tport\ttls\tfailures\tlast_failure_at\t
+     * opened_at\tprobe_at\tnow\twindow\tthreshold` row (unix seconds) `state | tls << 3 | skew << 4 |
+     * duplicate << 5 | min(failures, 255) << 6 | min(remaining, 2^20 - 1) << 14 | port << 34 |
+     * (crc32(key) & 0x1FFF) << 50`, where the key is `lowercase name:port:tls`. Numbers are
+     * w62Int() fields (port 5, failures 9, times 12, window 7 and threshold 4 digits); a row without
+     * a trimmed name, a 1-65535 port and a `now`, or with a malformed number, is invalid (word 0,
+     * state 0). Failures default to 0, the window to 900 seconds and the threshold to 3 (at least
+     * 1); the suspect span is `max(3600, window * 4)` as in suspectSecondsPhp(). States: 1 closed
+     * (also any row with a zero window), 2 suspect (failures below the threshold, the last failure
+     * inside the window), 3 tripping (failures at the threshold inside the window; remaining is the
+     * window left), 4 open (remaining = opened_at + window - now), 5 probe in progress (a probe_at
+     * within W62_BREAKER_PROBE_SECONDS, remaining its rest, or a half-open probe already granted to
+     * an earlier row of the provider), 6 half-open probe granted (the first such row per provider),
+     * 7 generation expired after the suspect span. Skew marks a time after `now`; a duplicate
+     * repeats an earlier valid row's key. Then eight state counts, the distinct providers, the
+     * skipped (4, 5) and allowed (1-3, 6, 7) rows, the distinct tripping providers, the skewed and
+     * TLS rows, the largest failure count and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w62BreakerPlanBatchPhp(array $rows): array
+    {
+        $out = $providers = $probing = $tripping = [];
+        $states = array_fill(0, 8, 0);
+        $skewRows = $tlsRows = $maxFailures = 0;
+        foreach ($rows as $row) {
+            [$name, $port, $tls, $failures, $lastFailure, $opened, $probe, $now, $window, $threshold] = explode("\t", (string) $row, 10) + array_fill(0, 10, '');
+            $name = trim($name);
+            $port = self::w62Int($port, 5);
+            $failures = self::w62Int($failures, 9);
+            $lastFailure = self::w62Int($lastFailure, 12);
+            $opened = self::w62Int($opened, 12);
+            $probe = self::w62Int($probe, 12);
+            $now = self::w62Int($now, 12);
+            $window = self::w62Int($window, 7);
+            $threshold = self::w62Int($threshold, 4);
+            if (! \is_int($port) || ! \is_int($now) || $failures === false || $lastFailure === false || $opened === false || $probe === false
+                || $window === false || $threshold === false || $name === '' || $port < 1 || $port > 65535) {
+                $states[0]++;
+                $out[] = 0;
+
+                continue;
+            }
+            $tls = self::w62Truthy($tls);
+            $failures ??= 0;
+            $window ??= 900;
+            $threshold = max(1, $threshold ?? 3);
+            $suspect = max(3600, $window * 4);
+            $key = strtolower($name).':'.$port.':'.(int) $tls;
+            $crc = crc32($key);
+            $dup = isset($providers[$key]);
+            $providers[$key] = true;
+            if ($window === 0) {
+                [$state, $remaining] = [1, 0];
+            } elseif ($opened !== null) {
+                if ($now < $opened + $window) {
+                    [$state, $remaining] = [4, $opened + $window - $now];
+                } elseif ($now < $opened + $suspect) {
+                    if ($probe !== null && $now < $probe + self::W62_BREAKER_PROBE_SECONDS) {
+                        [$state, $remaining] = [5, $probe + self::W62_BREAKER_PROBE_SECONDS - $now];
+                    } elseif (isset($probing[$crc])) {
+                        [$state, $remaining] = [5, 0];
+                    } else {
+                        [$state, $remaining] = [6, 0];
+                        $probing[$crc] = true;
+                    }
+                } else {
+                    [$state, $remaining] = [7, 0];
+                }
+            } elseif ($lastFailure !== null && $failures > 0 && $lastFailure <= $now && $now - $lastFailure < $window) {
+                [$state, $remaining] = [$failures >= $threshold ? 3 : 2, $window - ($now - $lastFailure)];
+            } else {
+                [$state, $remaining] = [1, 0];
+            }
+            $skew = ($lastFailure !== null && $lastFailure > $now) || ($opened !== null && $opened > $now) || ($probe !== null && $probe > $now);
+            if ($state === 3) {
+                $tripping[$crc] = true;
+            }
+            $states[$state]++;
+            $skewRows += (int) $skew;
+            $tlsRows += (int) $tls;
+            $maxFailures = max($maxFailures, $failures);
+            $out[] = $state | (int) $tls << 3 | (int) $skew << 4 | (int) $dup << 5 | min($failures, 255) << 6 | min($remaining, 0xFFFFF) << 14 | $port << 34
+                | ($crc & 0x1FFF) << 50;
+        }
+        $out = [...$out, ...$states];
+        array_push($out, \count($providers), $states[4] + $states[5], $states[1] + $states[2] + $states[3] + $states[6] + $states[7], \count($tripping),
+            $skewRows, $tlsRows, $maxFailures);
+        $out[] = self::w62Digest($out);
+
+        return $out;
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w62Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /** A trimmed `1`, `true`, `yes` or `on` in any case. */
+    private static function w62Truthy(string $value): bool
+    {
+        return \in_array(strtolower(trim($value)), ['1', 'true', 'yes', 'on'], true);
+    }
 }
