@@ -482,4 +482,255 @@ final class ApiQueryParameters
             return null;
         }
     }
+
+    /** C signature of the Wave 60.5 {@see self::queryPlanBatch()} helper. */
+    private const string W60_QUERY_PLAN_FFI_CDEF = 'int64_t nntmux_w605_api_query_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 60.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 9.00/6.36/8.48/5.57x); see
+     * tests/Unit/RustApiCanonicalizerQueryParamsV1BuilderV2PresenterLogQueryW60ParityTest.php.
+     */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 60.5 routing and FFI cache, kept in function-local statics (no static properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w60_5', self::W60_QUERY_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W60_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        return self::w60RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with queryPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 60.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w60Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w60RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w605_api_query_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch paging/filter plan over `limit\toffset\tmaxage\tminsize\tmaxsize\textended\tdel\tmax_limit\tdefault_limit`.
+     * Eight words per record: `[limit, offset, maxage, minsize, maxsize, extended, del, flags]`. Integers are trimmed,
+     * optionally signed 1-18 digit strings. Max limit (empty 500) is at least 1; default limit (empty 250) is clamped
+     * to 1..max, as {@see defaultLimit()}. Limit (empty: default) is clamped to 1..max as {@see limit()}; offset
+     * (empty 0) and sizes (empty 0) floor at 0; maxage (empty -1) reads negatives as -1 and caps at 36500 days.
+     * Extended and del are 1 only for the integer 1. Flags: 1 clamped limit, 2 invalid limit, 4 negative offset,
+     * 8 invalid offset, 16 capped maxage, 32 invalid maxage, 64 invalid size, 128 minsize above a positive maxsize,
+     * 256 invalid max or default limit, 512 not exactly nine fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function queryPlanBatch(array $records): array
+    {
+        return self::usesW60RustFfi() ? self::queryPlanBatchNative($records) : self::queryPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function queryPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 9 ? 0 : 512;
+            $max = 500;
+            $text = trim($fields[7] ?? '');
+            if ($text !== '') {
+                $value = self::w60Integer($text);
+                if ($value === null) {
+                    $flags |= 256;
+                } else {
+                    $max = max(1, $value);
+                }
+            }
+            $default = 250;
+            $text = trim($fields[8] ?? '');
+            if ($text !== '') {
+                $value = self::w60Integer($text);
+                if ($value === null) {
+                    $flags |= 256;
+                } else {
+                    $default = $value;
+                }
+            }
+            $default = max(1, min($max, $default));
+            $limit = $default;
+            $text = trim($fields[0]);
+            if ($text !== '') {
+                $value = self::w60Integer($text);
+                if ($value === null) {
+                    $flags |= 2;
+                } elseif ($value < 1 || $value > $max) {
+                    $limit = max(1, min($max, $value));
+                    $flags |= 1;
+                } else {
+                    $limit = $value;
+                }
+            }
+            $offset = 0;
+            $text = trim($fields[1] ?? '');
+            if ($text !== '') {
+                $value = self::w60Integer($text);
+                if ($value === null) {
+                    $flags |= 8;
+                } elseif ($value < 0) {
+                    $flags |= 4;
+                } else {
+                    $offset = $value;
+                }
+            }
+            $maxage = -1;
+            $text = trim($fields[2] ?? '');
+            if ($text !== '') {
+                $value = self::w60Integer($text);
+                if ($value === null) {
+                    $flags |= 32;
+                } elseif ($value > 36500) {
+                    $maxage = 36500;
+                    $flags |= 16;
+                } elseif ($value >= 0) {
+                    $maxage = $value;
+                }
+            }
+            $minsize = self::w60Size($fields[3] ?? '', $flags);
+            $maxsize = self::w60Size($fields[4] ?? '', $flags);
+            if ($maxsize > 0 && $minsize > $maxsize) {
+                $flags |= 128;
+            }
+            $extended = self::w60Integer(trim($fields[5] ?? '')) === 1 ? 1 : 0;
+            $del = self::w60Integer(trim($fields[6] ?? '')) === 1 ? 1 : 0;
+            array_push($out, $limit, $offset, $maxage, $minsize, $maxsize, $extended, $del, $flags);
+        }
+
+        return $out;
+    }
+
+    /** Trimmed size floored at 0 (empty 0); an invalid integer sets flag 64. */
+    private static function w60Size(string $field, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return 0;
+        }
+        $value = self::w60Integer($text);
+        if ($value === null) {
+            $flags |= 64;
+
+            return 0;
+        }
+
+        return max(0, $value);
+    }
+
+    /** An optional `+`/`-` sign followed by 1-18 ASCII digits, else null. */
+    private static function w60Integer(string $text): ?int
+    {
+        $sign = $text[0] ?? '';
+        $body = $sign === '-' || $sign === '+' ? substr($text, 1) : $text;
+        if ($body === '' || \strlen($body) > 18 || ! ctype_digit($body)) {
+            return null;
+        }
+
+        return $sign === '-' ? -(int) $body : (int) $body;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function queryPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w60Words($count, implode("\0", $records), 8 * $count) ?? self::queryPlanBatchPhp($records);
+    }
 }

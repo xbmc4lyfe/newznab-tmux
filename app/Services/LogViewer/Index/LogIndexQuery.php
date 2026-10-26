@@ -252,4 +252,256 @@ final class LogIndexQuery
             array_values($values),
         )]];
     }
+
+    /** C signature of the Wave 60.5 {@see self::queryPlanBatch()} helper. */
+    private const string W60_LOG_QUERY_PLAN_FFI_CDEF = 'int64_t nntmux_w605_log_query_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 60.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 5.53/3.60/5.79/3.47x); see
+     * tests/Unit/RustApiCanonicalizerQueryParamsV1BuilderV2PresenterLogQueryW60ParityTest.php.
+     */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    /** Log levels and their {@see self::queryPlanBatch()} mask bits. */
+    private const array W60_LEVELS = ['debug' => 1, 'info' => 2, 'notice' => 4, 'warning' => 8, 'error' => 16, 'critical' => 32, 'alert' => 64, 'emergency' => 128];
+
+    /**
+     * Wave 60.5 routing and FFI cache, kept in function-local statics (no static properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w60_5', self::W60_LOG_QUERY_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W60_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        return self::w60RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with queryPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 60.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w60Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w60RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w605_log_query_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch log index query plan over `term\tlevels\tfrom\tto\tregex\toffset\tlimit`. Nine words per record:
+     * `[mode, level_mask, from, to, offset, limit, direction, day_span, flags]`. Mode: 0 empty trimmed term, 2 regex,
+     * 1 indexable (holds an ASCII alphanumeric, `_` or non-ASCII byte), 3 grep only. Levels split on commas, trimmed,
+     * ASCII case-insensitive, set bits in debug..emergency order. From and to are 1-12 digit Unix seconds (empty 0),
+     * swapped when reversed. Offset (empty 0) is 1-9 digits capped at 100000; limit (empty 50) is 1-9 digits clamped
+     * to 1..500. Direction is 2 (oldest first) with only a lower bound, else 1; the day span counts UTC days touched
+     * by a closed range. The regex switch accepts `1`/`true`/`yes`/`on` and empty/`0`/`false`/`no`/`off`. Flags:
+     * 1 unknown level, 2 invalid bound, 4 swapped range, 8 invalid offset, 16 capped offset, 32 clamped limit,
+     * 64 invalid limit, 128 invalid regex switch, 256 not exactly seven fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function queryPlanBatch(array $records): array
+    {
+        return self::usesW60RustFfi() ? self::queryPlanBatchNative($records) : self::queryPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function queryPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 7 ? 0 : 256;
+            $regex = self::w60Switch($fields[4] ?? '');
+            if ($regex === null) {
+                $regex = false;
+                $flags |= 128;
+            }
+            $term = trim($fields[0]);
+            $mode = match (true) {
+                $term === '' => 0,
+                $regex => 2,
+                preg_match('/[A-Za-z0-9_\x80-\xff]/', $term) === 1 => 1,
+                default => 3,
+            };
+            $mask = 0;
+            foreach (explode(',', $fields[1] ?? '') as $part) {
+                $level = strtolower(trim($part));
+                if ($level === '') {
+                    continue;
+                }
+                $bit = self::W60_LEVELS[$level] ?? 0;
+                if ($bit === 0) {
+                    $flags |= 1;
+                } else {
+                    $mask |= $bit;
+                }
+            }
+            $from = self::w60Bound($fields[2] ?? '', $flags);
+            $to = self::w60Bound($fields[3] ?? '', $flags);
+            if ($from > 0 && $to > 0 && $from > $to) {
+                [$from, $to] = [$to, $from];
+                $flags |= 4;
+            }
+            $offset = 0;
+            $text = trim($fields[5] ?? '');
+            if ($text !== '') {
+                $value = self::w60Digits($text, 9);
+                if ($value === null) {
+                    $flags |= 8;
+                } elseif ($value > 100000) {
+                    $offset = 100000;
+                    $flags |= 16;
+                } else {
+                    $offset = $value;
+                }
+            }
+            $limit = 50;
+            $text = trim($fields[6] ?? '');
+            if ($text !== '') {
+                $value = self::w60Digits($text, 9);
+                if ($value === null) {
+                    $flags |= 64;
+                } elseif ($value < 1 || $value > 500) {
+                    $limit = max(1, min(500, $value));
+                    $flags |= 32;
+                } else {
+                    $limit = $value;
+                }
+            }
+            $direction = $from > 0 && $to === 0 ? 2 : 1;
+            $span = $from > 0 && $to > 0 ? intdiv($to, 86400) - intdiv($from, 86400) + 1 : 0;
+            array_push($out, $mode, $mask, $from, $to, $offset, $limit, $direction, $span, $flags);
+        }
+
+        return $out;
+    }
+
+    /** Trimmed 1-12 digit Unix seconds (empty 0); anything else sets flag 2. */
+    private static function w60Bound(string $field, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return 0;
+        }
+        $value = self::w60Digits($text, 12);
+        if ($value === null) {
+            $flags |= 2;
+
+            return 0;
+        }
+
+        return $value;
+    }
+
+    /** Trimmed ASCII case-insensitive switch; null when unrecognized. */
+    private static function w60Switch(string $field): ?bool
+    {
+        return match (strtolower(trim($field))) {
+            '1', 'true', 'yes', 'on' => true,
+            '', '0', 'false', 'no', 'off' => false,
+            default => null,
+        };
+    }
+
+    /** 1-$max ASCII digits as an integer, else null. */
+    private static function w60Digits(string $text, int $max): ?int
+    {
+        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function queryPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w60Words($count, implode("\0", $records), 9 * $count) ?? self::queryPlanBatchPhp($records);
+    }
 }

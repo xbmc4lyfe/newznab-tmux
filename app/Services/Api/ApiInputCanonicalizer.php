@@ -405,4 +405,240 @@ final class ApiInputCanonicalizer
             return null;
         }
     }
+
+    /** C signature of the Wave 60.5 {@see self::inputPlanBatch()} helper. */
+    private const string W60_INPUT_PLAN_FFI_CDEF = 'int64_t nntmux_w605_api_input_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 60.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 5.93/4.50/6.99/4.94x); see
+     * tests/Unit/RustApiCanonicalizerQueryParamsV1BuilderV2PresenterLogQueryW60ParityTest.php.
+     */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    /** API functions (`t`, lowercased) and their {@see self::inputPlanBatch()} codes. */
+    private const array W60_FUNCTIONS = ['search' => 1, 's' => 1, 'tvsearch' => 2, 'tv' => 2, 'movie' => 3, 'm' => 3, 'music' => 4, 'book' => 5, 'caps' => 6, 'c' => 6, 'details' => 7, 'd' => 7, 'get' => 8, 'g' => 8, 'info' => 9];
+
+    /**
+     * Wave 60.5 routing and FFI cache, kept in function-local statics (no static properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w60_5', self::W60_INPUT_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W60_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        return self::w60RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with inputPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 60.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w60Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w60RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w605_api_input_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch Newznab input plan over `t\tcat\tid\trid\timdbid\ttmdbid\ttraktid\tseason\tep`. Eight words per record:
+     * `[function, cat_count, cat_first, id_kind, id_mask, season, episode, flags]`. Function codes (trimmed, ASCII
+     * case-insensitive): 1 search/s, 2 tvsearch/tv, 3 movie/m, 4 music, 5 book, 6 caps/c, 7 details/d, 8 get/g,
+     * 9 info, else 0. Categories split on commas as {@see canonicalizeListCsvPhp()} does (trimmed, empties dropped);
+     * the first kept item reads as 1-6 digits or -1 (0 with none). The trimmed id is 0 empty, 1 forty hex digits,
+     * 2 other. The id mask sets 1 rid, 2 imdbid (optional `tt`, 1-8 digits), 4 tmdbid and 8 traktid (1-10 digits)
+     * for positive values. Season (optional `S`) and episode (optional `E`) are 1-4 digits, -1 when empty or
+     * invalid. Flags: 1 empty function, 2 unknown function, 4 non-numeric category, 8 dropped empty category,
+     * 16 invalid external id, 32 invalid season, 64 invalid episode, 128 episode without season, 256 not exactly
+     * nine fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function inputPlanBatch(array $records): array
+    {
+        return self::usesW60RustFfi() ? self::inputPlanBatchNative($records) : self::inputPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function inputPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 9 ? 0 : 256;
+            $t = strtolower(trim($fields[0]));
+            $function = self::W60_FUNCTIONS[$t] ?? 0;
+            if ($t === '') {
+                $flags |= 1;
+            } elseif ($function === 0) {
+                $flags |= 2;
+            }
+            $cat = $fields[1] ?? '';
+            $parts = explode(',', $cat);
+            $kept = $first = 0;
+            foreach ($parts as $part) {
+                $item = trim($part);
+                if ($item === '') {
+                    continue;
+                }
+                $value = self::w60Digits($item, 6);
+                if ($value === null) {
+                    $flags |= 4;
+                }
+                if ($kept === 0) {
+                    $first = $value ?? -1;
+                }
+                $kept++;
+            }
+            if ($cat !== '' && $kept < \count($parts)) {
+                $flags |= 8;
+            }
+            $id = trim($fields[2] ?? '');
+            $idKind = $id === '' ? 0 : (\strlen($id) === 40 && ctype_xdigit($id) ? 1 : 2);
+            $mask = 0;
+            foreach ([3 => 1, 4 => 2, 5 => 4, 6 => 8] as $index => $bit) {
+                $field = trim($fields[$index] ?? '');
+                if ($field === '') {
+                    continue;
+                }
+                if ($bit === 2 && strncasecmp($field, 'tt', 2) === 0) {
+                    $field = substr($field, 2);
+                }
+                $value = self::w60Digits($field, $bit === 2 ? 8 : 10);
+                if ($value !== null && $value > 0) {
+                    $mask |= $bit;
+                } else {
+                    $flags |= 16;
+                }
+            }
+            $season = self::w60Numbered(trim($fields[7] ?? ''), 's', 32, $flags);
+            $episode = self::w60Numbered(trim($fields[8] ?? ''), 'e', 64, $flags);
+            if ($episode >= 0 && $season < 0) {
+                $flags |= 128;
+            }
+            array_push($out, $function, $kept, $first, $idKind, $mask, $season, $episode, $flags);
+        }
+
+        return $out;
+    }
+
+    /** Season/episode number: one optional ASCII case-insensitive $marker, then 1-4 digits; -1 when empty or invalid. */
+    private static function w60Numbered(string $text, string $marker, int $flag, int &$flags): int
+    {
+        if ($text === '') {
+            return -1;
+        }
+        if (strtolower($text[0]) === $marker) {
+            $text = substr($text, 1);
+        }
+        $value = self::w60Digits($text, 4);
+        if ($value === null) {
+            $flags |= $flag;
+
+            return -1;
+        }
+
+        return $value;
+    }
+
+    /** 1-$max ASCII digits as an integer, else null. */
+    private static function w60Digits(string $text, int $max): ?int
+    {
+        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function inputPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w60Words($count, implode("\0", $records), 8 * $count) ?? self::inputPlanBatchPhp($records);
+    }
 }
