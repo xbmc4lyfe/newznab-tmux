@@ -740,4 +740,181 @@ class CollectionsCleaningService
 
         return $summary;
     }
+
+    /**
+     * Enabled: the paired benchmark in the W54 parity test measures 4.44x common mean, 3.90x common
+     * p99, 3.18x uncommon mean and 2.25x uncommon p99 (per-metric minimum of three runs), above the
+     * 1.5x rule.
+     */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    private const string W54_FFI_CDEF = 'ssize_t nntmux_w541_subject_feature_mask_batch(const char *subjects, size_t subjects_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW54RustFfi(): bool
+    {
+        $enabled = self::w54RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 54 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    public const int W54_FEATURE_YENC_SUFFIX = 1;
+
+    public const int W54_FEATURE_SIZE_TAG = 2;
+
+    public const int W54_FEATURE_FILE_COUNTER = 4;
+
+    public const int W54_FEATURE_QUOTED_NAME = 8;
+
+    public const int W54_FEATURE_PAR2 = 16;
+
+    public const int W54_FEATURE_RAR_PART = 32;
+
+    public const int W54_FEATURE_PART_COUNTER = 64;
+
+    /**
+     * One `W54_FEATURE_*` mask per collection subject: a `yEnc` suffix, a size tag
+     * ({@see REGEX_SUBJECT_SIZE}), a `[n/m]` file counter, a quoted file name, a PAR2 file
+     * (`.par2` or `.volN+M`), a `.partN.rar` volume and a `(n/m)` part counter. Byte patterns,
+     * ASCII case-insensitive.
+     *
+     * @param  array<array-key, string>  $subjects
+     * @return list<int>
+     */
+    public static function subjectFeatureMasks(array $subjects): array
+    {
+        return self::usesW54RustFfi() ? self::subjectFeatureMasksNative($subjects) : self::subjectFeatureMasksPhp($subjects);
+    }
+
+    /**
+     * @param  array<array-key, string>  $subjects
+     * @return list<int>
+     */
+    public static function subjectFeatureMasksPhp(array $subjects): array
+    {
+        $masks = [];
+        foreach ($subjects as $subject) {
+            $mask = 0;
+            if (preg_match('/yEnc\z/i', $subject) === 1) {
+                $mask |= self::W54_FEATURE_YENC_SUFFIX;
+            }
+            if (preg_match('/\d+(?:[.,]\d+)? [kmg]b/i', $subject) === 1) {
+                $mask |= self::W54_FEATURE_SIZE_TAG;
+            }
+            if (preg_match('/\[\d+\/\d+\]/', $subject) === 1) {
+                $mask |= self::W54_FEATURE_FILE_COUNTER;
+            }
+            if (preg_match('/"[^"]+"/', $subject) === 1) {
+                $mask |= self::W54_FEATURE_QUOTED_NAME;
+            }
+            if (preg_match('/\.(?:par2|vol\d+\+\d+)/i', $subject) === 1) {
+                $mask |= self::W54_FEATURE_PAR2;
+            }
+            if (preg_match('/\.part\d+\.rar/i', $subject) === 1) {
+                $mask |= self::W54_FEATURE_RAR_PART;
+            }
+            if (preg_match('/\(\d+\/\d+\)/', $subject) === 1) {
+                $mask |= self::W54_FEATURE_PART_COUNTER;
+            }
+            $masks[] = $mask;
+        }
+
+        return $masks;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a subject
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $subjects
+     * @return list<int>
+     */
+    public static function subjectFeatureMasksNative(array $subjects): array
+    {
+        $count = \count($subjects);
+        $buffer = $count === 0 ? null : self::w54Buffer($count);
+        if ($buffer === null) {
+            return self::subjectFeatureMasksPhp($subjects);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $subjects);
+        try {
+            // @phpstan-ignore method.notFound
+            $masks = self::w54Decode($out, $ffi->nntmux_w541_subject_feature_mask_batch($joined, \strlen($joined), $count, $out, $cap), $count);
+        } catch (Throwable) {
+            $masks = null;
+        }
+
+        return $masks !== null && \count($masks) === $count ? $masks : self::subjectFeatureMasksPhp($subjects);
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: FFI\CData, 2: int}|null
+     */
+    private static function w54Buffer(int $words): ?array
+    {
+        $buffer = self::w54RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w54Decode(FFI\CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 54 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('collections_cleaning_w54', self::W54_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof FFI\CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
+    }
 }

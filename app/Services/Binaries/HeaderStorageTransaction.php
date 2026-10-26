@@ -495,4 +495,170 @@ final class HeaderStorageTransaction
             return null;
         }
     }
+
+    /**
+     * Enabled: the paired benchmark in the W54 parity test measures 3.04x common mean, 2.04x common
+     * p99, 2.26x uncommon mean and 1.82x uncommon p99 (per-metric minimum of three runs), above the
+     * 1.5x rule.
+     */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    private const string W54_FFI_CDEF = 'ssize_t nntmux_w541_cleanup_hash_summary_batch(const char *hashes, size_t hashes_len, size_t count, int64_t max_rows, int64_t *out, size_t out_cap);';
+
+    public static function usesW54RustFfi(): bool
+    {
+        $enabled = self::w54RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 54 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    /** {@see summarizeCleanupHashes()} keys, in the order the Rust export writes them. */
+    private const array W54_HASH_SUMMARY_KEYS = ['hashes', 'sha1', 'md5', 'mixed_case', 'invalid', 'distinct', 'statements'];
+
+    /**
+     * Summarizes rollback cleanup collection hashes: lowercase 40-hex (SHA-1) and 32-hex (MD5)
+     * hashes, 32/40-hex hashes holding uppercase digits (mixed case), everything else (invalid),
+     * distinct lowercase hashes and the DELETE statements the `hashes` strategy issues for them
+     * (three per `max(1, $maxRows)` distinct hashes).
+     *
+     * @param  array<array-key, string>  $hashes
+     * @return array{hashes: int, sha1: int, md5: int, mixed_case: int, invalid: int, distinct: int, statements: int}
+     */
+    public static function summarizeCleanupHashes(array $hashes, int $maxRows = self::MAX_SQL_ROWS_PER_STATEMENT): array
+    {
+        return self::usesW54RustFfi() ? self::summarizeCleanupHashesNative($hashes, $maxRows) : self::summarizeCleanupHashesPhp($hashes, $maxRows);
+    }
+
+    /**
+     * @param  array<array-key, string>  $hashes
+     * @return array{hashes: int, sha1: int, md5: int, mixed_case: int, invalid: int, distinct: int, statements: int}
+     */
+    public static function summarizeCleanupHashesPhp(array $hashes, int $maxRows = self::MAX_SQL_ROWS_PER_STATEMENT): array
+    {
+        $sha1 = $md5 = $mixed = $invalid = 0;
+        $seen = [];
+        foreach ($hashes as $hash) {
+            $length = \strlen($hash);
+            if (($length !== 32 && $length !== 40) || ! ctype_xdigit($hash)) {
+                $invalid++;
+
+                continue;
+            }
+            if (strtolower($hash) !== $hash) {
+                $mixed++;
+
+                continue;
+            }
+            if ($length === 40) {
+                $sha1++;
+            } else {
+                $md5++;
+            }
+            $seen[$hash] = true;
+        }
+        $distinct = \count($seen);
+
+        return ['hashes' => \count($hashes), 'sha1' => $sha1, 'md5' => $md5, 'mixed_case' => $mixed, 'invalid' => $invalid, 'distinct' => $distinct, 'statements' => self::w421Chunks($distinct, max(1, $maxRows)) * 3];
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a hash
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $hashes
+     * @return array{hashes: int, sha1: int, md5: int, mixed_case: int, invalid: int, distinct: int, statements: int}
+     */
+    public static function summarizeCleanupHashesNative(array $hashes, int $maxRows = self::MAX_SQL_ROWS_PER_STATEMENT): array
+    {
+        $count = \count($hashes);
+        $buffer = $count === 0 ? null : self::w54Buffer(7);
+        if ($buffer === null) {
+            return self::summarizeCleanupHashesPhp($hashes, $maxRows);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $hashes);
+        try {
+            // @phpstan-ignore method.notFound
+            $words = self::w54Decode($out, $ffi->nntmux_w541_cleanup_hash_summary_batch($joined, \strlen($joined), $count, $maxRows, $out, $cap), 7);
+        } catch (\Throwable) {
+            $words = null;
+        }
+        if ($words === null || \count($words) !== 7) {
+            return self::summarizeCleanupHashesPhp($hashes, $maxRows);
+        }
+
+        /** @var array{hashes: int, sha1: int, md5: int, mixed_case: int, invalid: int, distinct: int, statements: int} */
+        return array_combine(self::W54_HASH_SUMMARY_KEYS, $words);
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: FFI\CData, 2: int}|null
+     */
+    private static function w54Buffer(int $words): ?array
+    {
+        $buffer = self::w54RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w54Decode(FFI\CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 54 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('header_storage_w54', self::W54_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof FFI\CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
+    }
 }

@@ -1196,4 +1196,177 @@ class CollectionCleanupService
             return null;
         }
     }
+
+    /**
+     * Enabled: the paired benchmark in the W54 parity test measures 3.17x common mean, 2.09x common
+     * p99, 2.50x uncommon mean and 2.59x uncommon p99 (per-metric minimum of three runs), above the
+     * 1.5x rule.
+     */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    private const string W54_FFI_CDEF = 'ssize_t nntmux_w541_deletion_id_plan_batch(const char *ids, size_t ids_len, size_t count, int64_t chunk_size, int64_t *out, size_t out_cap);';
+
+    public static function usesW54RustFfi(): bool
+    {
+        $enabled = self::w54RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 54 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    /** {@see planDeletionIds()} keys, in the order the Rust export writes them. */
+    private const array W54_ID_PLAN_KEYS = ['ids', 'invalid', 'distinct', 'duplicates', 'runs', 'chunks', 'min_id', 'max_id'];
+
+    /**
+     * Plans a collection deletion id batch: ids at or below 0 are invalid, repeated valid ids are
+     * duplicates, runs counts the maximal consecutive ranges of the sorted distinct ids, chunks is
+     * the number of `max(1, $chunkSize)` id chunks deleteCollectionsAndDescendants() would issue,
+     * and min/max are 0 without a valid id.
+     *
+     * @param  array<array-key, int>  $ids
+     * @return array{ids: int, invalid: int, distinct: int, duplicates: int, runs: int, chunks: int, min_id: int, max_id: int}
+     */
+    public static function planDeletionIds(array $ids, int $chunkSize = 500): array
+    {
+        return self::usesW54RustFfi() ? self::planDeletionIdsNative($ids, $chunkSize) : self::planDeletionIdsPhp($ids, $chunkSize);
+    }
+
+    /**
+     * @param  array<array-key, int>  $ids
+     * @return array{ids: int, invalid: int, distinct: int, duplicates: int, runs: int, chunks: int, min_id: int, max_id: int}
+     */
+    public static function planDeletionIdsPhp(array $ids, int $chunkSize = 500): array
+    {
+        $invalid = 0;
+        $seen = [];
+        foreach ($ids as $id) {
+            if ($id > 0) {
+                $seen[$id] = true;
+            } else {
+                $invalid++;
+            }
+        }
+        $sorted = array_keys($seen);
+        sort($sorted);
+        $runs = 0;
+        $previous = null;
+        foreach ($sorted as $id) {
+            if ($previous === null || $id - 1 !== $previous) {
+                $runs++;
+            }
+            $previous = $id;
+        }
+        $distinct = \count($sorted);
+        $size = max(1, $chunkSize);
+
+        return [
+            'ids' => \count($ids),
+            'invalid' => $invalid,
+            'distinct' => $distinct,
+            'duplicates' => \count($ids) - $invalid - $distinct,
+            'runs' => $runs,
+            'chunks' => intdiv($distinct, $size) + (int) ($distinct % $size !== 0),
+            'min_id' => $sorted[0] ?? 0,
+            'max_id' => $distinct === 0 ? 0 : $sorted[$distinct - 1],
+        ];
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch.
+     *
+     * @param  array<array-key, int>  $ids
+     * @return array{ids: int, invalid: int, distinct: int, duplicates: int, runs: int, chunks: int, min_id: int, max_id: int}
+     */
+    public static function planDeletionIdsNative(array $ids, int $chunkSize = 500): array
+    {
+        $count = \count($ids);
+        $buffer = $count === 0 ? null : self::w54Buffer(8);
+        if ($buffer === null) {
+            return self::planDeletionIdsPhp($ids, $chunkSize);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        try {
+            $packed = pack('P*', ...(array_is_list($ids) ? $ids : array_values($ids)));
+            // @phpstan-ignore method.notFound
+            $words = self::w54Decode($out, $ffi->nntmux_w541_deletion_id_plan_batch($packed, \strlen($packed), $count, $chunkSize, $out, $cap), 8);
+        } catch (Throwable) {
+            $words = null;
+        }
+        if ($words === null || \count($words) !== 8) {
+            return self::planDeletionIdsPhp($ids, $chunkSize);
+        }
+
+        /** @var array{ids: int, invalid: int, distinct: int, duplicates: int, runs: int, chunks: int, min_id: int, max_id: int} */
+        return array_combine(self::W54_ID_PLAN_KEYS, $words);
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: FFI\CData, 2: int}|null
+     */
+    private static function w54Buffer(int $words): ?array
+    {
+        $buffer = self::w54RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w54Decode(FFI\CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 54 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('collection_cleanup_w54', self::W54_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof FFI\CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
+    }
 }
