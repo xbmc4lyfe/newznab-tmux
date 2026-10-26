@@ -229,4 +229,187 @@ final class SpotCheckPlanner
 
         return self::$ffi;
     }
+
+    public const string W58_FFI_CDEF = 'int64_t nntmux_w585_spot_check_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Most samples one Wave 58.5 spot-check plan selects. */
+    private const int W58_MAX_SAMPLES = 64;
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W58.5 parity test's QUALIFICATION). */
+    private const bool W58_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 58.5 routing and FFI cache, kept in function-local statics (readonly verification classes cannot declare
+     * static properties, so every W58 class follows the same shape). Without $op it reports the routing; 'set' swaps
+     * the override for $val and returns the previous one; 'reset' replaces the cached handle with $val (null
+     * re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]` with room for at least $val words,
+     * or null without the library.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w58_5', self::W58_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W58_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        return self::w58RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with spotCheckPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 58.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w58Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w58RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w585_spot_check_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch spot-check plan over comma-separated `parts, samples` (trimmed, each 1-12 digits). Eight words per record:
+     * `[selected, stride, first, middle, last, index_sum, coverage, flags]`. Selected is `min(samples, parts)` with
+     * samples capped at 64; the strided 1-based indices are `1 + i * stride` with stride `(parts - 1) / (selected -
+     * 1)` (0 for one sample). First is 1, middle `(parts + 1) / 2` and last the final selected index; coverage is
+     * `last * 1000 / parts` (permille). Without a selection every word but flags is 0. Flags: 1 parts invalid, 2
+     * samples invalid (each read as 0), 4 samples capped, 8 not exactly two fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function spotCheckPlanBatch(array $records): array
+    {
+        return self::usesW58RustFfi() ? self::spotCheckPlanBatchNative($records) : self::spotCheckPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function spotCheckPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode(',', $record);
+            $flags = \count($fields) === 2 ? 0 : 8;
+            $parts = trim($fields[0]);
+            if (\strlen($parts) <= 12 && ctype_digit($parts)) {
+                $parts = (int) $parts;
+            } else {
+                $flags |= 1;
+                $parts = 0;
+            }
+            $samples = trim($fields[1] ?? '');
+            if (\strlen($samples) <= 12 && ctype_digit($samples)) {
+                $samples = (int) $samples;
+            } else {
+                $flags |= 2;
+                $samples = 0;
+            }
+            if ($samples > self::W58_MAX_SAMPLES) {
+                $samples = self::W58_MAX_SAMPLES;
+                $flags |= 4;
+            }
+            $selected = min($samples, $parts);
+            if ($selected === 0) {
+                array_push($out, 0, 0, 0, 0, 0, 0, 0, $flags);
+
+                continue;
+            }
+            $stride = $selected > 1 ? intdiv($parts - 1, $selected - 1) : 0;
+            $indices = [];
+            for ($i = 0; $i < $selected; $i++) {
+                $indices[] = 1 + $i * $stride;
+            }
+            $last = $indices[$selected - 1];
+            array_push($out, $selected, $stride, 1, intdiv($parts + 1, 2), $last, array_sum($indices), intdiv($last * 1000, $parts), $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function spotCheckPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w58Words($count, implode("\0", $records), 8 * $count) ?? self::spotCheckPlanBatchPhp($records);
+    }
 }
