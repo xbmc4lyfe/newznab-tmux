@@ -12,6 +12,7 @@ use App\Services\LogViewer\LogReader;
 use App\Services\LogViewer\LogSearcher;
 use App\Services\LogViewer\SearchQuery;
 use App\Support\RustPipelineLibrary;
+use FFI;
 use Throwable;
 
 /**
@@ -411,5 +412,157 @@ class ManticoreLogSearcher
     private function below(int $offset): array
     {
         return ['range' => ['byte_offset' => ['lt' => $offset]]];
+    }
+
+    public const string W55_FFI_CDEF = 'int64_t nntmux_w555_manticore_hit_text_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W55.5 parity test's QUALIFICATION). */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 55.5 routing and FFI cache, kept in function-local statics. Without $op it reports the
+     * routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the cached
+     * handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w55_5', self::W55_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W55_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        return self::w55RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with hitTextPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 55.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w55Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w55RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w555_manticore_hit_text_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch summary of index hit texts (the first line, then "\n" and the body when present). Four words per
+     * text: `[lines (0 when empty), first line length, stack frames (lines starting `#\d+ `), flags]`. Flags:
+     * 1 non-ASCII byte, 2 first line ends (ignoring trailing spaces, tabs and "\r") with `}` or `]` (JSON
+     * context), 4 holds `[stacktrace]`, 8 holds "\r".
+     *
+     * @param  list<string>  $texts
+     * @return list<int>
+     */
+    public static function hitTextPlanBatch(array $texts): array
+    {
+        return self::usesW55RustFfi() ? self::hitTextPlanBatchNative($texts) : self::hitTextPlanBatchPhp($texts);
+    }
+
+    /**
+     * @param  list<string>  $texts
+     * @return list<int>
+     */
+    public static function hitTextPlanBatchPhp(array $texts): array
+    {
+        $out = [];
+        foreach ($texts as $text) {
+            $first = strcspn($text, "\n");
+            $head = rtrim(substr($text, 0, $first), " \t\r");
+            $last = $head === '' ? '' : $head[-1];
+            $flags = (preg_match('/[\x80-\xff]/', $text) === 1 ? 1 : 0)
+                | ($last === '}' || $last === ']' ? 2 : 0)
+                | (str_contains($text, '[stacktrace]') ? 4 : 0)
+                | (str_contains($text, "\r") ? 8 : 0);
+            array_push($out, $text === '' ? 0 : substr_count($text, "\n") + 1, $first, (int) preg_match_all('/(?:^|\n)#\d+ /', $text), $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds
+     * a NUL.
+     *
+     * @param  list<string>  $texts
+     * @return list<int>
+     */
+    public static function hitTextPlanBatchNative(array $texts): array
+    {
+        $count = \count($texts);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w55Words($count, implode("\0", $texts), 4 * $count) ?? self::hitTextPlanBatchPhp($texts);
     }
 }

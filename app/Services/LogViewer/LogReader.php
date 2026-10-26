@@ -947,4 +947,165 @@ class LogReader
 
         return $stat === false ? 0 : (int) $stat['size'];
     }
+
+    public const string W55_FFI_CDEF = 'int64_t nntmux_w555_log_reader_line_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W55.5 parity test's QUALIFICATION). */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 55.5 routing and FFI cache, kept in function-local statics. Without $op it reports the
+     * routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the cached
+     * handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w55_5', self::W55_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W55_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        return self::w55RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with linePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 55.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w55Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w55RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w555_log_reader_line_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch classification of physical lines without their trailing "\r" bytes. Four words per line:
+     * `[kind, content length, indent, flags]`. Kind: 0 blank (spaces and tabs only), 1 header
+     * ({@see LogEntry::W48_HEADER_PATTERN}), 2 stack frame (`#\d+ `), 3 `[stacktrace]` marker, 4 other.
+     * Indent counts leading spaces and tabs. Flags: 1 trailing "\r", 2 non-ASCII, 4 invalid UTF-8, 8
+     * control byte other than tab.
+     *
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function linePlanBatch(array $lines): array
+    {
+        return self::usesW55RustFfi() ? self::linePlanBatchNative($lines) : self::linePlanBatchPhp($lines);
+    }
+
+    /**
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function linePlanBatchPhp(array $lines): array
+    {
+        $out = [];
+        foreach ($lines as $line) {
+            $content = rtrim($line, "\r");
+            $length = \strlen($content);
+            $indent = strspn($content, " \t");
+            $kind = match (true) {
+                $indent === $length => 0,
+                preg_match(LogEntry::W48_HEADER_PATTERN, $content) === 1 => 1,
+                str_starts_with($content, '[stacktrace]') => 3,
+                preg_match('/^#\d+ /', $content) === 1 => 2,
+                default => 4,
+            };
+            $ascii = preg_match('/[\x80-\xff]/', $content) !== 1;
+            $flags = ($length < \strlen($line) ? 1 : 0)
+                | ($ascii ? 0 : 2)
+                | (! $ascii && preg_match('//u', $content) !== 1 ? 4 : 0)
+                | (preg_match('/[\x00-\x08\x0a-\x1f\x7f]/', $content) === 1 ? 8 : 0);
+            array_push($out, $kind, $length, $indent, $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds
+     * a NUL.
+     *
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function linePlanBatchNative(array $lines): array
+    {
+        $count = \count($lines);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w55Words($count, implode("\0", $lines), 4 * $count) ?? self::linePlanBatchPhp($lines);
+    }
 }
