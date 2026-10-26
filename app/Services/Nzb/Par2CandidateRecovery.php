@@ -16,6 +16,7 @@ use App\Support\Par2CandidateProgress;
 use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use LengthException;
@@ -466,5 +467,232 @@ final class Par2CandidateRecovery
         $end = $part['end'] ?? null;
 
         return \is_int($begin) && \is_int($end) ? [1, $begin, $end] : [0, 0, 0];
+    }
+
+    // ---- Wave 60.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 6.26x/5.63x, uncommon 6.44x/6.59x); see RustNzbUploadStagingXmlElementsPar2RecoveryResultFingerprintStoreW60ParityTest. */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    private const string W60_CANDIDATE_RECOVERY_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w602_par2_candidate_recovery_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W60_CANDIDATE_RECOVERY_TAIL = 10;
+
+    /**
+     * Wave 60 routing, binding and output buffer, kept in function-local statics (no new static properties).
+     * Operations: null reads the routing override, 'set' replaces it (returning the previous
+     * one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]` with room
+     * for at least $val words (null without the library).
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w60', self::W60_CANDIDATE_RECOVERY_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w60RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        $enabled = self::w60RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planCandidateRecoveryBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w60Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w60Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /** 1 to $max ASCII digits as an integer, otherwise null. */
+    private static function w60Digits(string $value, int $max): ?int
+    {
+        $length = \strlen($value);
+
+        return $length > 0 && $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : null;
+    }
+
+    /** PAR2 packet type => coverage bit. */
+    private const array W60_PACKETS = ['main' => 1, 'filedesc' => 2, 'ifsc' => 4, 'recvslice' => 8, 'creator' => 16];
+
+    /** Status => base recovery priority. */
+    private const array W60_STATUS_BASE = [0, 100, 80, 10, 30];
+
+    /**
+     * Per `set_id\tfiles\tpackets\tneeded\tavailable\tname` row `status | coverage << 3 | null_set << 8 |
+     * volume << 9 | par2 << 10 | min(unknown, 15) << 11 | score << 15 | min(files, 0xFFFF) << 23 |
+     * (crc32(lower(set_id)) & 0xFFFFFF) << 39`. Status: 0 invalid (a set id that is not 32 hex
+     * digits or is all zero, files not 1-32768 or block counts not 1-9 digits), 4 incomplete (no
+     * main or file description packet), 1 complete (no blocks needed), 2 repairable (needed <=
+     * available and a recovery slice packet), 3 insufficient. Coverage is the bitmask of the
+     * comma-separated packet types (main, filedesc, ifsc, recvslice, creator; any case, trimmed of
+     * spaces and tabs, empty tokens skipped), unknown the count of other tokens. Volume: the name
+     * holds `.vol`; par2: it ends in `.par2` (both any case). Score: 0 when invalid, otherwise the
+     * status base plus 5 per covered type, minus 2 per unknown token (at most 10), plus 7 for an
+     * index (non-volume) and 3 for a `.par2` name, within 0-255. Then the per-status counts, the
+     * distinct set ids, needed and available block totals of the valid rows, the highest score and
+     * the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function planCandidateRecoveryBatchPhp(array $rows): array
+    {
+        $out = $seen = [];
+        $statuses = [0, 0, 0, 0, 0];
+        $neededTotal = $availableTotal = $maxScore = 0;
+        foreach ($rows as $row) {
+            [$set, $files, $packets, $needed, $available, $name] = explode("\t", (string) $row, 6) + ['', '', '', '', '', ''];
+            $setLower = strtolower($set);
+            $setValid = \strlen($set) === 32 && strspn($setLower, '0123456789abcdef') === 32;
+            $nullSet = $setValid && $set === '00000000000000000000000000000000';
+            $fileCount = self::w60Digits($files, 6);
+            $need = self::w60Digits($needed, 9);
+            $have = self::w60Digits($available, 9);
+            $coverage = $unknown = 0;
+            foreach (explode(',', $packets) as $token) {
+                $token = strtolower(trim($token, " \t"));
+                if ($token === '') {
+                    continue;
+                }
+                if (isset(self::W60_PACKETS[$token])) {
+                    $coverage |= self::W60_PACKETS[$token];
+                } else {
+                    $unknown++;
+                }
+            }
+            $lowerName = strtolower($name);
+            $par2 = str_ends_with($lowerName, '.par2');
+            $volume = str_contains($lowerName, '.vol');
+            if (! $setValid || $nullSet || $fileCount === null || $fileCount < 1 || $fileCount > 32768 || $need === null || $have === null) {
+                $status = 0;
+            } elseif (($coverage & 3) !== 3) {
+                $status = 4;
+            } elseif ($need === 0) {
+                $status = 1;
+            } elseif ($need <= $have && ($coverage & 8) !== 0) {
+                $status = 2;
+            } else {
+                $status = 3;
+            }
+            $score = $status === 0 ? 0 : max(0, min(255, self::W60_STATUS_BASE[$status] + substr_count(decbin($coverage), '1') * 5
+                - min($unknown, 10) * 2 + ($volume ? 0 : 7) + ($par2 ? 3 : 0)));
+            $statuses[$status]++;
+            if ($status !== 0) {
+                $seen[$setLower] = true;
+                $neededTotal += (int) $need;
+                $availableTotal += (int) $have;
+                $maxScore = max($maxScore, $score);
+            }
+            $out[] = $status | $coverage << 3 | (int) $nullSet << 8 | (int) $volume << 9 | (int) $par2 << 10 | min($unknown, 15) << 11 | $score << 15
+                | min($fileCount ?? 0, 0xFFFF) << 23 | (crc32($setLower) & 0xFFFFFF) << 39;
+        }
+        array_push($out, ...$statuses);
+        array_push($out, \count($seen), $neededTotal, $availableTotal, $maxScore);
+        $out[] = self::w60Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function planCandidateRecoveryBatch(array $rows): array
+    {
+        return self::usesW60RustFfi() ? self::planCandidateRecoveryBatchNative($rows) : self::planCandidateRecoveryBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function planCandidateRecoveryBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W60_CANDIDATE_RECOVERY_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w60RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::planCandidateRecoveryBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W60_CANDIDATE_RECOVERY_FFI_CDEF.)
+            $written = $ffi->nntmux_w602_par2_candidate_recovery_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w60Words($written, $out, $words) ?? self::planCandidateRecoveryBatchPhp($rows);
     }
 }
