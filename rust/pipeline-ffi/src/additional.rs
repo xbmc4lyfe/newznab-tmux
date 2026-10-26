@@ -43401,3 +43401,831 @@ mod w586_spot_ledger_lock_result_diagnostics_tests {
         assert_eq!(status, -2);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 59.6: proxy detection, request context, verdict rollup, row-count plan
+// and book candidate ranking batches (`nntmux_w596_*`) for IndexerProxyDetector,
+// ProxyRequestContext, ProxyVerdict, ApproximateRowCount and BookMatchScorer.
+// Same contract as Wave 58.6: strings are NUL-joined column after column (with
+// a 0x01-joined twin when one holds a NUL), integer columns are machine-order
+// `int64_t`, and the result is fixed-width `int64_t` words. Every export
+// returns 1, -1 for invalid input (PHP then computes the batch) or -2 when
+// `out` is null, misaligned or too small, and leaves `out` untouched unless it
+// returns 1.
+// ---------------------------------------------------------------------------
+
+/// PHP `trim($value, " \t")`.
+#[inline]
+fn w596_trim_blank(value: &[u8]) -> &[u8] {
+    let blank = |b: &u8| *b == b' ' || *b == b'\t';
+    let start = value.iter().position(|b| !blank(b)).unwrap_or(value.len());
+    let end = value.iter().rposition(|b| !blank(b)).map_or(start, |at| at + 1);
+    &value[start..end]
+}
+
+/// Comma-separated entries that are not blank after `trim(" \t")`.
+#[inline]
+fn w596_hops(header: &[u8]) -> i64 {
+    header
+        .split(|&b| b == b',')
+        .filter(|entry| entry.iter().any(|&b| b != b' ' && b != b'\t'))
+        .count() as i64
+}
+
+// --- IndexerProxyDetector::detectProxyBatch ----------------------------------
+
+pub(crate) const W596_DETECT_HEADER: usize = 22;
+
+/// Indexer proxy and *arr fragments (bits 0-7), then download clients (8-11).
+const W596_SIGNATURES: [&[u8]; 12] = [
+    b"nzbhydra", b"prowlarr", b"jackett", b"sonarr", b"radarr", b"lidarr", b"readarr", b"mylar", b"sabnzbd", b"nzbget",
+    b"nzbvortex", b"nzbunity",
+];
+
+/// Signature bits by first byte (one pass instead of a `str_contains()` per signature).
+const W596_SIGNATURE_FIRST: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut at = 0;
+    while at < W596_SIGNATURES.len() {
+        table[W596_SIGNATURES[at][0] as usize] |= 1 << at;
+        at += 1;
+    }
+    table
+};
+
+/// Bits of the signatures (those in `wanted`) that occur in `lower`; stops once all are found,
+/// or at the first one when `any`.
+#[inline]
+fn w596_signature_mask(lower: &[u8], wanted: u16, any: bool) -> i64 {
+    let mut mask = 0u16;
+    for (at, &byte) in lower.iter().enumerate() {
+        let mut candidates = W596_SIGNATURE_FIRST[byte as usize] & wanted & !mask;
+        while candidates != 0 {
+            let bit = candidates.trailing_zeros() as usize;
+            candidates &= candidates - 1;
+            if lower[at..].starts_with(W596_SIGNATURES[bit]) {
+                mask |= 1 << bit;
+            }
+        }
+        if mask == wanted || (any && mask != 0) {
+            break;
+        }
+    }
+    i64::from(mask)
+}
+
+/// User-Agent, Via and X-Forwarded-For columns. Score: +40 indexer UA, -20
+/// downloader-only UA, +15 empty UA, +10 per Via hop (3 max), +5 per forwarded
+/// hop (4 max), +20 when Via names an indexer; clamped to 0..100. `[0]` count,
+/// `[1]` blocked, `[2]` indexer, `[3]` downloader, `[4]` empty UA, `[5]` Via
+/// hops, `[6]` forwarded hops, `[7]` max score, `[8]` first blocked index (-1),
+/// `[9..21]` per-signature hits, `[21]` FNV-1a digest; then per request `score |
+/// blocked << 7 | first signature + 1 << 8 | signatures << 12 | min(via, 255)
+/// << 24 | min(xff, 255) << 32 | via indexer << 40 | empty UA << 41 |
+/// min(UA bytes, 65535) << 42`.
+pub(crate) fn w596_detect_batch(fields: &[&[u8]], count: usize, threshold: i64) -> Vec<i64> {
+    let mut out = vec![0i64; W596_DETECT_HEADER + count];
+    out[0] = count as i64;
+    out[8] = -1;
+    let (mut agent, mut via) = (Vec::new(), Vec::new());
+    for at in 0..count {
+        w47_lower_into(fields[at], &mut agent);
+        w47_lower_into(fields[count + at], &mut via);
+        let mask = w596_signature_mask(&agent, 0xFFF, false);
+        let first = if mask == 0 { 0 } else { i64::from(mask.trailing_zeros()) + 1 };
+        for bit in 0..W596_SIGNATURES.len() {
+            out[9 + bit] += mask >> bit & 1;
+        }
+        let (indexer, downloader, empty) = (mask & 0xFF != 0, mask & 0xF00 != 0, agent.is_empty());
+        let via_hops = w596_hops(&via);
+        let xff_hops = w596_hops(fields[2 * count + at]);
+        let via_indexer = w596_signature_mask(&via, 0xFF, true) != 0;
+        let mut score = if indexer {
+            40
+        } else if downloader {
+            -20
+        } else {
+            0
+        };
+        if empty {
+            score += 15;
+        }
+        score += via_hops.min(3) * 10 + xff_hops.min(4) * 5;
+        if via_indexer {
+            score += 20;
+        }
+        let score = score.clamp(0, 100);
+        let blocked = score >= threshold;
+        out[1] += i64::from(blocked);
+        out[2] += i64::from(indexer);
+        out[3] += i64::from(downloader);
+        out[4] += i64::from(empty);
+        out[5] += via_hops.min(255);
+        out[6] += xff_hops.min(255);
+        out[7] = out[7].max(score);
+        if blocked {
+            w586_first(&mut out[8], at);
+        }
+        out[W596_DETECT_HEADER + at] = score
+            | i64::from(blocked) << 7
+            | first << 8
+            | mask << 12
+            | via_hops.min(255) << 24
+            | xff_hops.min(255) << 32
+            | i64::from(via_indexer) << 40
+            | i64::from(empty) << 41
+            | (fields[at].len().min(65_535) as i64) << 42;
+    }
+    out[21] = w526_digest(&out[W596_DETECT_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w596_proxy_detect_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    count: usize,
+    threshold: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let fields = w566_columns(w15_input(strings, strings_len)?, w15_input(twin, twin_len)?, 3, count)?;
+            Some(w596_detect_batch(&fields, count, threshold))
+        })
+    }
+}
+
+// --- ProxyRequestContext::summarizeContextBatch ------------------------------
+
+pub(crate) const W596_CONTEXT_HEADER: usize = 16;
+
+/// `/24` IPv4 (`1 << 48 | a.b.c`) or `/48` IPv6 (`2 << 48 | first six bytes`) key.
+#[inline]
+fn w596_subnet(ip: crate::cleaning::w47_irc_stream_cloudflare_proxy::Ip) -> i64 {
+    use crate::cleaning::w47_irc_stream_cloudflare_proxy::Ip;
+    match ip {
+        Ip::V4(b) => 1 << 48 | i64::from(b[0]) << 16 | i64::from(b[1]) << 8 | i64::from(b[2]),
+        Ip::V6(b) => 2 << 48 | b[..6].iter().fold(0i64, |value, &byte| value << 8 | i64::from(byte)),
+    }
+}
+
+/// API key class after `trim(" \t")`: 0 absent, 1 32 lowercase hex, 2 other
+/// alphanumeric up to 64 bytes, 3 other bytes, 4 longer than 64 bytes.
+#[inline]
+fn w596_key_class(key: &[u8]) -> i64 {
+    if key.is_empty() {
+        0
+    } else if key.len() > 64 {
+        4
+    } else if !key.iter().all(u8::is_ascii_alphanumeric) {
+        3
+    } else if key.len() == 32 && key.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)) {
+        1
+    } else {
+        2
+    }
+}
+
+/// Remote address, X-Forwarded-For and API key columns resolved against the
+/// trusted proxies with `ProxyRequestContext::resolveForwardedChainsPhp()`.
+/// Client source 0 untrusted remote, 1 forwarded hop, 2 trusted remote without
+/// a header, 3 malformed chain, 4 invalid remote. `[0]` count, `[1..6]` per
+/// source, `[6..11]` per key class, `[11]` hops, `[12]` trusted hops skipped,
+/// `[13]` distinct client subnets, `[14]` first malformed index (-1), `[15]`
+/// FNV-1a digest; then per request the chain flags `| source << 32 | key class
+/// << 35 | trimmed << 38 | min(key bytes, 255) << 39 | min(client + 3, 65535)
+/// << 47` and the client subnet key (-1 when none).
+pub(crate) fn w596_context_batch(
+    fields: &[&[u8]],
+    count: usize,
+    table: &[crate::cleaning::w47_irc_stream_cloudflare_proxy::Range],
+) -> Vec<i64> {
+    use crate::cleaning::w47_irc_stream_cloudflare_proxy::{chain, php_ip};
+    let mut out = vec![0i64; W596_CONTEXT_HEADER + 2 * count];
+    out[0] = count as i64;
+    out[14] = -1;
+    let mut hops = Vec::new();
+    let mut subnets = Vec::with_capacity(count);
+    for at in 0..count {
+        let remote = fields[at];
+        let (client, flags) = chain(remote, fields[count + at], table, &mut hops);
+        let (source, ip) = match client {
+            -1 if flags & 1 << 18 != 0 => (0i64, php_ip(remote)),
+            -1 => (4, None),
+            -3 => (2, php_ip(remote)),
+            -2 => (3, None),
+            index => (1, hops.get(index as usize).copied()),
+        };
+        let raw = fields[2 * count + at];
+        let key = w596_trim_blank(raw);
+        let class = w596_key_class(key);
+        let subnet = ip.map_or(-1, w596_subnet);
+        if subnet >= 0 {
+            subnets.push(subnet);
+        }
+        out[1 + source as usize] += 1;
+        out[6 + class as usize] += 1;
+        out[11] += flags & 0xFF;
+        out[12] += flags >> 8 & 0xFF;
+        if source == 3 {
+            w586_first(&mut out[14], at);
+        }
+        out[W596_CONTEXT_HEADER + 2 * at] = flags
+            | source << 32
+            | class << 35
+            | i64::from(key.len() != raw.len()) << 38
+            | (key.len().min(255) as i64) << 39
+            | (client + 3).min(65_535) << 47;
+        out[W596_CONTEXT_HEADER + 2 * at + 1] = subnet;
+    }
+    subnets.sort_unstable();
+    subnets.dedup();
+    out[13] = subnets.len() as i64;
+    out[15] = w526_digest(&out[W596_CONTEXT_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w596_proxy_context_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    count: usize,
+    trusted: *const u8,
+    trusted_len: usize,
+    trusted_count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let fields = w566_columns(w15_input(strings, strings_len)?, w15_input(twin, twin_len)?, 3, count)?;
+            let trusted = w15_input(trusted, trusted_len)?;
+            if trusted_count > W47_MAX_ITEMS {
+                return None;
+            }
+            let table = crate::cleaning::w47_irc_stream_cloudflare_proxy::trusted_table(trusted, trusted_count)?;
+            Some(w596_context_batch(&fields, count, &table))
+        })
+    }
+}
+
+// --- ProxyVerdict::rollupVerdictBatch ----------------------------------------
+
+pub(crate) const W596_VERDICT_HEADER: usize = 18;
+
+const W596_REASONS: [&[u8]; 8] = [
+    b"referer", b"ua_pair", b"download_ratio", b"ip_correlation", b"indexer_ua", b"empty_ua", b"private_ip", b"local_referer",
+];
+
+/// Scores with comma-separated reason names. The score clamps to 0..1000;
+/// class 0 allow, 1 suspicious (twice the score reaches the threshold), 2
+/// block; confidence is the score's percent of a positive threshold (100
+/// otherwise). `[0]` count, `[1..4]` per class, `[4..12]` per known reason,
+/// `[12]` max score, `[13]` score sum, `[14]` first blocked index (-1), `[15]`
+/// mean confidence, `[16]` out-of-range scores, `[17]` FNV-1a digest; then per
+/// verdict `score | class << 10 | confidence << 12 | reasons << 19 |
+/// min(unknown, 255) << 27 | min(duplicates, 255) << 35 | min(names, 255) << 43
+/// | out of range << 51`.
+pub(crate) fn w596_verdict_batch(specs: &[&[u8]], scores: &[i64], threshold: i64) -> Vec<i64> {
+    let count = specs.len();
+    let mut out = vec![0i64; W596_VERDICT_HEADER + count];
+    out[0] = count as i64;
+    out[14] = -1;
+    let mut confidence_sum = 0i64;
+    for (at, spec) in specs.iter().enumerate() {
+        let raw = scores[at];
+        let score = raw.clamp(0, 1_000);
+        let class: i64 = if score >= threshold {
+            2
+        } else if score * 2 >= threshold {
+            1
+        } else {
+            0
+        };
+        let confidence = if threshold > 0 {
+            (score * 100 / threshold).min(100)
+        } else {
+            100
+        };
+        let (mut mask, mut unknown, mut duplicates, mut names) = (0i64, 0i64, 0i64, 0i64);
+        for part in spec.split(|&b| b == b',') {
+            let name = w596_trim_blank(part);
+            if name.is_empty() {
+                continue;
+            }
+            names += 1;
+            match W596_REASONS.iter().position(|known| *known == name) {
+                Some(bit) if mask & 1 << bit != 0 => duplicates += 1,
+                Some(bit) => mask |= 1 << bit,
+                None => unknown += 1,
+            }
+        }
+        out[1 + class as usize] += 1;
+        for bit in 0..8 {
+            out[4 + bit] += mask >> bit & 1;
+        }
+        out[12] = out[12].max(score);
+        out[13] += score;
+        if class == 2 {
+            w586_first(&mut out[14], at);
+        }
+        confidence_sum += confidence;
+        out[16] += i64::from(raw != score);
+        out[W596_VERDICT_HEADER + at] = score
+            | class << 10
+            | confidence << 12
+            | mask << 19
+            | unknown.min(255) << 27
+            | duplicates.min(255) << 35
+            | names.min(255) << 43
+            | i64::from(raw != score) << 51;
+    }
+    if count > 0 {
+        out[15] = confidence_sum / count as i64;
+    }
+    out[17] = w526_digest(&out[W596_VERDICT_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w596_proxy_verdict_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    threshold: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let specs = w566_columns(w15_input(strings, strings_len)?, w15_input(twin, twin_len)?, 1, count)?;
+            let scores = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+            Some(w596_verdict_batch(&specs, &scores, threshold))
+        })
+    }
+}
+
+// --- ApproximateRowCount::planRowCountBatch ----------------------------------
+
+pub(crate) const W596_ROWS_HEADER: usize = 16;
+const W596_ROWS_CAP: i64 = (1 << 40) - 1;
+const W596_ROWS_SUM_CAP: i64 = 1 << 62;
+
+/// Estimate class after PHP `trim()`: 0 missing (empty or `NULL`), 1 positive,
+/// 2 zero, 3 negative, 4 not an optionally signed digit string, 5 more than 18
+/// significant digits; with the positive value (0 otherwise).
+#[inline]
+fn w596_estimate(raw: &[u8]) -> (i64, i64) {
+    let value = w566_trim(raw);
+    if value.is_empty() || value.eq_ignore_ascii_case(b"null") {
+        return (0, 0);
+    }
+    let (negative, digits) = match value[0] {
+        b'-' => (true, &value[1..]),
+        b'+' => (false, &value[1..]),
+        _ => (false, value),
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return (4, 0);
+    }
+    let significant = &digits[digits.iter().position(|&b| b != b'0').unwrap_or(digits.len())..];
+    if negative && !significant.is_empty() {
+        (3, 0)
+    } else if significant.is_empty() {
+        (2, 0)
+    } else if significant.len() > 18 {
+        (5, 0)
+    } else {
+        (1, significant.iter().fold(0i64, |total, &b| total * 10 + i64::from(b - b'0')))
+    }
+}
+
+/// Driver class: 0 mysql, 1 mariadb, 2 sqlite, 3 pgsql, 4 sqlsrv, 5 other.
+#[inline]
+fn w596_driver(driver: &[u8]) -> i64 {
+    match driver {
+        b"mysql" => 0,
+        b"mariadb" => 1,
+        b"sqlite" => 2,
+        b"pgsql" => 3,
+        b"sqlsrv" => 4,
+        _ => 5,
+    }
+}
+
+/// `information_schema.TABLES`/`EXPLAIN` estimates with their drivers. Decision
+/// 0 approximate, 1 exact (no usable estimate), 2 exact (driver without
+/// `information_schema`), 3 exact (estimate below `min_approx`); expensive marks
+/// an exact count above `max_exact` rows. `[0]` count, `[1..5]` per decision,
+/// `[5..11]` per estimate class, `[11]` approximate row sum (capped at 2^62),
+/// `[12]` largest positive estimate, `[13]` first exact index (-1), `[14]`
+/// expensive, `[15]` FNV-1a digest; then per table `decision | driver << 2 |
+/// class << 5 | min(estimate, 2^40-1) << 8 | expensive << 48 | min(bytes, 255)
+/// << 49`.
+pub(crate) fn w596_rows_batch(fields: &[&[u8]], count: usize, min_approx: i64, max_exact: i64) -> Vec<i64> {
+    let mut out = vec![0i64; W596_ROWS_HEADER + count];
+    out[0] = count as i64;
+    out[13] = -1;
+    for at in 0..count {
+        let raw = fields[at];
+        let (class, value) = w596_estimate(raw);
+        let driver = w596_driver(fields[count + at]);
+        let decision: i64 = if driver > 1 {
+            2
+        } else if class != 1 {
+            1
+        } else if value < min_approx {
+            3
+        } else {
+            0
+        };
+        let expensive = decision != 0 && class == 1 && value > max_exact;
+        out[1 + decision as usize] += 1;
+        out[5 + class as usize] += 1;
+        if decision == 0 {
+            out[11] = (out[11] + value).min(W596_ROWS_SUM_CAP);
+        } else {
+            w586_first(&mut out[13], at);
+        }
+        out[12] = out[12].max(value);
+        out[14] += i64::from(expensive);
+        out[W596_ROWS_HEADER + at] = decision
+            | driver << 2
+            | class << 5
+            | value.min(W596_ROWS_CAP) << 8
+            | i64::from(expensive) << 48
+            | (raw.len().min(255) as i64) << 49;
+    }
+    out[15] = w526_digest(&out[W596_ROWS_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w596_row_count_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    count: usize,
+    min_approx: i64,
+    max_exact: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let fields = w566_columns(w15_input(strings, strings_len)?, w15_input(twin, twin_len)?, 2, count)?;
+            Some(w596_rows_batch(&fields, count, min_approx, max_exact))
+        })
+    }
+}
+
+// --- BookMatchScorer::rankCandidateBatch -------------------------------------
+
+pub(crate) const W596_BOOK_HEADER: usize = 9;
+
+const W596_BOOK_DROP: [&[u8]; 27] = [
+    b"an", b"and", b"the", b"of", b"to", b"in", b"on", b"for", b"by", b"with", b"or", b"edition", b"ed", b"revised",
+    b"unabridged", b"abridged", b"illustrated", b"annotated", b"anniversary", b"deluxe", b"expanded", b"retail", b"ebook",
+    b"epub", b"mobi", b"pdf", b"azw3",
+];
+
+/// Lowercased tokens: runs of ASCII letters, digits and bytes 0x80-0xFF.
+fn w596_book_tokens(lower: &[u8]) -> impl Iterator<Item = &[u8]> {
+    lower
+        .split(|b| !(b.is_ascii_lowercase() || b.is_ascii_digit() || *b >= 0x80))
+        .filter(|token| !token.is_empty())
+}
+
+/// First-seen unique tokens.
+fn w596_unique<'a>(tokens: impl Iterator<Item = &'a [u8]>) -> Vec<&'a [u8]> {
+    let mut out: Vec<&[u8]> = Vec::new();
+    let mut seen: Option<std::collections::HashSet<&[u8]>> = None;
+    for token in tokens {
+        if out.len() < 24 {
+            if !out.contains(&token) {
+                out.push(token);
+            }
+            continue;
+        }
+        if seen.get_or_insert_with(|| out.iter().copied().collect()).insert(token) {
+            out.push(token);
+        }
+    }
+    out
+}
+
+/// Title tokens: longer than one byte, not a stop or edition word, and not an
+/// ordinal (`2nd`).
+#[inline]
+fn w596_title_token(token: &[u8]) -> bool {
+    let ordinal = token.len() > 2
+        && matches!(&token[token.len() - 2..], b"st" | b"nd" | b"rd" | b"th")
+        && token[..token.len() - 2].iter().all(u8::is_ascii_digit);
+    token.len() > 1 && !ordinal && !W596_BOOK_DROP.contains(&token)
+}
+
+/// Raw title up to its first `:`, `(`, `[` or ` - `, when there is one.
+#[inline]
+fn w596_main_title(title: &[u8]) -> Option<&[u8]> {
+    let mut cut = title.iter().position(|b| matches!(b, b':' | b'(' | b'[')).unwrap_or(title.len());
+    if let Some(dash) = title.windows(3).position(|w| w == b" - ") {
+        cut = cut.min(dash);
+    }
+    (cut < title.len()).then(|| &title[..cut])
+}
+
+struct W596Title {
+    full: Vec<u8>,
+    main: Vec<u8>,
+    full_key: Vec<u8>,
+    main_key: Vec<u8>,
+}
+
+impl W596Title {
+    fn new(title: &[u8]) -> Self {
+        let full = title.to_ascii_lowercase();
+        let main_title = w596_main_title(title);
+        let has_main = main_title.is_some();
+        let main = main_title.map(<[u8]>::to_ascii_lowercase).unwrap_or_default();
+        let mut parsed = W596Title {
+            full,
+            main,
+            full_key: Vec::new(),
+            main_key: Vec::new(),
+        };
+        parsed.full_key = parsed.tokens(false).join(&b' ');
+        parsed.main_key = if has_main {
+            parsed.tokens(true).join(&b' ')
+        } else {
+            parsed.full_key.clone()
+        };
+        parsed
+    }
+
+    fn tokens(&self, main: bool) -> Vec<&[u8]> {
+        w596_unique(w596_book_tokens(if main { &self.main } else { &self.full }).filter(|t| w596_title_token(t)))
+    }
+}
+
+/// Author token coverage of `needles` in `haystack` in permille; a one-byte
+/// token matches as an initial.
+fn w596_coverage(needles: &[&[u8]], haystack: &[&[u8]]) -> i64 {
+    let matched = needles
+        .iter()
+        .filter(|needle| {
+            haystack.iter().any(|candidate| {
+                needle == &candidate
+                    || (needle.len() == 1 && candidate.starts_with(needle))
+                    || (candidate.len() == 1 && needle.starts_with(candidate))
+            })
+        })
+        .count();
+    matched as i64 * 1_000 / needles.len() as i64
+}
+
+/// Candidate titles and authors scored against the query in permille. Title:
+/// 1000 for equal token keys, 970 when a subtitle-stripped key matches, else
+/// the Dice coefficient of the unique title tokens. Author: mean two-way
+/// coverage. Composite: `(650 title + 350 author) / 1000` with a query author,
+/// else the title score. `[0]` count, `[1]` best index (-1), `[2]` best and
+/// `[3]` runner-up composite (-1), `[4]` composites of at least 800, `[5]` query
+/// title, `[6]` author and `[7]` main-title tokens, `[8]` FNV-1a digest; then
+/// per candidate `composite | title << 10 | author << 20 | rank << 30 | flags
+/// << 50` (flags: 1 exact, 2 main title, 4 no author, 8 no title tokens).
+pub(crate) fn w596_book_batch(title: &[u8], author: &[u8], fields: &[&[u8]], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W596_BOOK_HEADER + count];
+    out[0] = count as i64;
+    let query = W596Title::new(title);
+    let query_tokens = query.tokens(false);
+    let query_main = if w596_main_title(title).is_some() {
+        query.tokens(true).len()
+    } else {
+        query_tokens.len()
+    };
+    let author_lower = author.to_ascii_lowercase();
+    let query_authors = w596_unique(w596_book_tokens(&author_lower));
+    let mut scores = Vec::with_capacity(count);
+    let mut flags = Vec::with_capacity(count);
+    for at in 0..count {
+        let candidate = W596Title::new(fields[at]);
+        let candidate_tokens = candidate.tokens(false);
+        let (mut title_score, mut flag) = (0i64, 0i64);
+        if !query.full_key.is_empty() && query.full_key == candidate.full_key {
+            title_score = 1_000;
+            flag |= 1;
+        } else if (!query.main_key.is_empty() && (query.main_key == candidate.main_key || query.main_key == candidate.full_key))
+            || (!query.full_key.is_empty() && query.full_key == candidate.main_key)
+        {
+            title_score = 970;
+            flag |= 2;
+        } else if !query_tokens.is_empty() && !candidate_tokens.is_empty() {
+            let shared = if query_tokens.len() > 24 && candidate_tokens.len() > 24 {
+                let set: std::collections::HashSet<&[u8]> = candidate_tokens.iter().copied().collect();
+                query_tokens.iter().filter(|t| set.contains(*t)).count()
+            } else {
+                query_tokens.iter().filter(|t| candidate_tokens.contains(t)).count()
+            };
+            title_score = 2_000 * shared as i64 / (query_tokens.len() + candidate_tokens.len()) as i64;
+        }
+        let candidate_lower = fields[count + at].to_ascii_lowercase();
+        let candidate_authors = w596_unique(w596_book_tokens(&candidate_lower));
+        let author_score = if query_authors.is_empty() || candidate_authors.is_empty() {
+            0
+        } else {
+            (w596_coverage(&query_authors, &candidate_authors) + w596_coverage(&candidate_authors, &query_authors)) / 2
+        };
+        let composite = if query_authors.is_empty() {
+            title_score
+        } else {
+            (650 * title_score + 350 * author_score) / 1_000
+        };
+        if candidate_authors.is_empty() {
+            flag |= 4;
+        }
+        if candidate_tokens.is_empty() {
+            flag |= 8;
+        }
+        out[4] += i64::from(composite >= 800);
+        scores.push(composite);
+        flags.push(title_score << 10 | author_score << 20 | flag << 50);
+    }
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_unstable_by(|&a, &b| scores[b].cmp(&scores[a]).then(a.cmp(&b)));
+    for (rank, &index) in order.iter().enumerate() {
+        out[W596_BOOK_HEADER + index] = scores[index] | flags[index] | (rank as i64) << 30;
+    }
+    out[1] = order.first().map_or(-1, |&index| index as i64);
+    out[2] = order.first().map_or(-1, |&index| scores[index]);
+    out[3] = order.get(1).map_or(-1, |&index| scores[index]);
+    out[5] = query_tokens.len() as i64;
+    out[6] = query_authors.len() as i64;
+    out[7] = query_main as i64;
+    out[8] = w526_digest(&out[W596_BOOK_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w596_book_rank_batch(
+    title: *const u8,
+    title_len: usize,
+    author: *const u8,
+    author_len: usize,
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let title = w15_input(title, title_len)?;
+            let author = w15_input(author, author_len)?;
+            let fields = w566_columns(w15_input(strings, strings_len)?, w15_input(twin, twin_len)?, 2, count)?;
+            Some(w596_book_batch(title, author, &fields, count))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w596_proxy_context_verdict_rows_book_tests {
+    use super::*;
+    use std::ptr::null;
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_ne_bytes()).collect()
+    }
+
+    #[test]
+    fn w596_detect_batch_scores_signatures_and_hops() {
+        let fields: [&[u8]; 9] = [b"NZBHydra2/5.0", b"SABnzbd/4.0", b"", b"1.1 prowlarr, 1.1 x", b"", b"", b"a, b", b" , ", b"1,2,3,4,5"];
+        let out = w596_detect_batch(&fields, 3, 50);
+        assert_eq!(&out[..9], &[3, 1, 1, 1, 1, 2, 7, 90, 0]);
+        assert_eq!(out[W596_DETECT_HEADER] & 0x7F, 90);
+        assert_eq!(out[W596_DETECT_HEADER] >> 8 & 0xF, 1);
+        assert_eq!(out[W596_DETECT_HEADER + 1] & 0x7F, 0);
+        assert_eq!(out[W596_DETECT_HEADER + 2] & 0x7F, 35);
+        assert_eq!(w596_hops(b""), 0);
+        assert_eq!(w596_hops(b"a,,\t,b"), 2);
+    }
+
+    #[test]
+    fn w596_context_batch_resolves_clients_and_keys() {
+        use crate::cleaning::w47_irc_stream_cloudflare_proxy::trusted_table;
+        let table = trusted_table(b"10.0.0.0/8\x00::1", 2).unwrap();
+        let key = [b'a'; 32];
+        let fields: [&[u8]; 12] = [
+            b"10.0.0.1", b"203.0.113.9", b"bogus", b"::1", b"198.51.100.7, 10.0.0.2", b"", b"", b"x, 1.2.3.4", &key, b" k1 ", b"bad key!",
+            &[b'z'; 65],
+        ];
+        let out = w596_context_batch(&fields, 4, &table);
+        assert_eq!(&out[..6], &[4, 1, 1, 0, 1, 1]);
+        assert_eq!(&out[6..11], &[0, 1, 1, 1, 1]);
+        assert_eq!(out[13], 2);
+        assert_eq!(out[14], 3);
+        assert_eq!(out[W596_CONTEXT_HEADER + 1], 1 << 48 | 198 << 16 | 51 << 8 | 100);
+        assert_eq!(out[W596_CONTEXT_HEADER + 7], -1);
+        assert_eq!(w596_key_class(b"ABCdef"), 2);
+    }
+
+    #[test]
+    fn w596_verdict_batch_rolls_up_reasons() {
+        let specs: [&[u8]; 3] = [b"referer, ua_pair,referer,bogus", b"", b"download_ratio"];
+        let out = w596_verdict_batch(&specs, &[60, -5, 30], 50);
+        assert_eq!(&out[..5], &[3, 1, 1, 1, 1]);
+        assert_eq!((out[12], out[13], out[14], out[15], out[16]), (60, 90, 0, 53, 1));
+        assert_eq!(out[W596_VERDICT_HEADER], 60 | 2 << 10 | 100 << 12 | 3 << 19 | 1 << 27 | 1 << 35 | 4 << 43);
+    }
+
+    #[test]
+    fn w596_rows_batch_plans_counts() {
+        assert_eq!(w596_estimate(b" 0012 "), (1, 12));
+        assert_eq!(w596_estimate(b"NuLl"), (0, 0));
+        assert_eq!(w596_estimate(b"-0"), (2, 0));
+        assert_eq!(w596_estimate(b"-3"), (3, 0));
+        assert_eq!(w596_estimate(b"1e5"), (4, 0));
+        assert_eq!(w596_estimate(b"1234567890123456789"), (5, 0));
+        let fields: [&[u8]; 6] = [b"5000", b"10", b"", b"mysql", b"mariadb", b"sqlite"];
+        let out = w596_rows_batch(&fields, 3, 100, 1);
+        assert_eq!(&out[..5], &[3, 1, 0, 1, 1]);
+        assert_eq!((out[11], out[12], out[13], out[14]), (5000, 5000, 1, 1));
+    }
+
+    #[test]
+    fn w596_book_batch_ranks_candidates() {
+        let fields: [&[u8]; 6] = [
+            b"The Hobbit: There and Back Again",
+            b"Hobbit",
+            b"Silmarillion",
+            b"J. R. R. Tolkien",
+            b"Tolkien",
+            b"",
+        ];
+        let out = w596_book_batch(b"The Hobbit", b"J.R.R. Tolkien", &fields, 3);
+        assert_eq!((out[1], out[5], out[6], out[7]), (0, 1, 3, 1));
+        assert_eq!(out[W596_BOOK_HEADER] >> 50, 2);
+        assert_eq!(out[W596_BOOK_HEADER + 1] >> 50, 1);
+        assert_eq!(out[W596_BOOK_HEADER + 2] >> 50, 4);
+        assert!(w596_title_token(b"hobbit") && !w596_title_token(b"2nd") && !w596_title_token(b"the"));
+        assert_eq!(w596_main_title(b"A - B: C"), Some(&b"A"[..]));
+    }
+
+    #[test]
+    fn w596_exports_validate_buffers() {
+        let mut out = vec![0i64; 64];
+        for status in unsafe {
+            [
+                nntmux_w596_proxy_detect_batch(null(), 0, null(), 0, 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w596_proxy_context_batch(null(), 0, null(), 0, 0, null(), 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w596_proxy_verdict_batch(null(), 0, null(), 0, null(), 0, 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w596_row_count_batch(null(), 0, null(), 0, 0, 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w596_book_rank_batch(null(), 0, null(), 0, null(), 0, null(), 0, 0, out.as_mut_ptr(), 64),
+            ]
+        } {
+            assert_eq!(status, 1);
+        }
+        let ints = packed(&[1]);
+        let status = unsafe {
+            nntmux_w596_proxy_verdict_batch(b"x".as_ptr(), 1, null(), 0, ints.as_ptr(), ints.len(), 1, 0, out.as_mut_ptr(), 4)
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w596_proxy_verdict_batch(b"x".as_ptr(), 1, null(), 0, ints.as_ptr(), ints.len() - 1, 1, 0, out.as_mut_ptr(), 64)
+        };
+        assert_eq!(status, -1);
+        let status = unsafe { nntmux_w596_row_count_batch(null(), 0, null(), 0, 0, 0, 0, null::<i64>().cast_mut(), 64) };
+        assert_eq!(status, -2);
+    }
+}
