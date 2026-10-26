@@ -82,7 +82,7 @@ fn uncommon(fixture: &str) -> bool {
 const NATIVE_CLASS_SHA256: &str =
     "d43ccd3c5528d56be1c93791745243fc057f514fbdde85877259cf0679627374";
 const NATIVE_WORKER_SHA256: &str =
-    "e557cd759977a6ad4258b7fb0d1f90ab2bd51b00606f89fc155a1aceb5011c7f";
+    "241a70dd956ff2f23fea70c57ea7b3bd85be22784ef31ce8f967eee628f423c5";
 const NATIVE_ASSERTIONS: &str = r#"
 function assertFingerprintSource(string $class,string $source,string $expectedHash): void {
     $resolved=realpath($source);
