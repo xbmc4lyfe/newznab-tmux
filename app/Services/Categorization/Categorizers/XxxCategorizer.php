@@ -9,6 +9,7 @@ use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -819,5 +820,293 @@ CDEF;
         }
 
         return self::$w433RustFfiHandle === false ? null : self::$w433RustFfiHandle;
+    }
+
+    // ---- Wave 61.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 9.10x/6.78x, uncommon 9.57x/7.55x); see RustCategorizersTvXxxConsoleGamesServiceTitleParserW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    private const string W61_XXX_CATEGORIZER_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w612_xxx_categorize_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W61_XXX_CATEGORIZER_TAIL = 35;
+
+    /** Category id per w61XxxCategorizePlanBatch() category index (0: not adult). */
+    public const array W61_XXX_CATEGORIES = [0, Category::XXX_ONLYFANS, Category::XXX_VR, Category::XXX_IMAGESET, Category::XXX_PACK, Category::XXX_UHD,
+        Category::XXX_CLIPSD, Category::XXX_SD, Category::XXX_WMV, Category::XXX_DVD, Category::XXX_XVID, Category::XXX_CLIPHD, Category::XXX_X264,
+        Category::XXX_OTHER];
+
+    /** Case-insensitive poster substrings of the SD clip uploaders. */
+    private const array W61_XXX_POSTERS = ['anon@y.com', 'md-hobbys.com', 'oz@lot.com'];
+
+    /** Lowercase token => `res | codec << 2 | container << 6 | flags << 10`. */
+    private const array W61_XXX_TOKENS = [
+        '2160p' => 3, '4k' => 3, 'uhd' => 3, '1080p' => 2, '1080i' => 2, '720p' => 2, 'hd' => 2, '480p' => 1, '360p' => 1, '576p' => 1, 'sd' => 1,
+        'x264' => 1 << 2, 'h264' => 1 << 2, 'avc' => 1 << 2, 'x265' => 2 << 2, 'h265' => 2 << 2, 'hevc' => 2 << 2,
+        'xvid' => 4 << 2, 'divx' => 4 << 2, 'dvdrip' => 4 << 2, 'bdrip' => 4 << 2, 'brrip' => 4 << 2, 'wmv' => 8 << 2,
+        'mp4' => 1 << 6, 'mkv' => 2 << 6, 'avi' => 4 << 6, 'mov' => 8 << 6,
+        'xxx' => 1 << 10,
+        'brazzers' => 1 << 11, 'naughtyamerica' => 1 << 11, 'realitykings' => 1 << 11, 'bangbros' => 1 << 11, 'vixen' => 1 << 11, 'blacked' => 1 << 11,
+        'tushy' => 1 << 11, 'deeper' => 1 << 11, 'nubiles' => 1 << 11, 'sexart' => 1 << 11, 'metart' => 1 << 11, 'metartx' => 1 << 11,
+        'evilangel' => 1 << 11, 'private' => 1 << 11, 'hustler' => 1 << 11, 'penthouse' => 1 << 11, 'playboy' => 1 << 11, 'kink' => 1 << 11,
+        'teamskeet' => 1 << 11, 'mofos' => 1 << 11, 'twistys' => 1 << 11, 'babes' => 1 << 11, 'digitalplayground' => 1 << 11, 'wicked' => 1 << 11,
+        'julesjordan' => 1 << 11, 'pornpros' => 1 << 11, 'familystrokes' => 1 << 11, 'tiny4k' => 1 << 11, 'povd' => 1 << 11, 'holed' => 1 << 11,
+        'lubed' => 1 << 11, 'fakehub' => 1 << 11, 'faketaxi' => 1 << 11, 'publicagent' => 1 << 11, 'hegre' => 1 << 11, 'femjoy' => 1 << 11,
+        'wowgirls' => 1 << 11, 'legalporno' => 1 << 11, 'dorcelclub' => 1 << 11, 'newsensations' => 1 << 11,
+        'anal' => 1 << 12, 'milf' => 1 << 12, 'porn' => 1 << 12, 'sex' => 1 << 12, 'hardcore' => 1 << 12, 'lesbian' => 1 << 12, 'creampie' => 1 << 12,
+        'pov' => 1 << 12, 'teen' => 1 << 12, 'interracial' => 1 << 12, 'bbw' => 1 << 12, 'bdsm' => 1 << 12, 'fetish' => 1 << 12, 'blowjob' => 1 << 12,
+        'threesome' => 1 << 12, 'pornstar' => 1 << 12, 'squirt' => 1 << 12, 'facial' => 1 << 12, 'hentai' => 1 << 12, 'jav' => 1 << 12,
+        'adult' => 1 << 12,
+        'onlyfans' => 1 << 13, 'fansly' => 1 << 13, 'manyvids' => 1 << 13, 'clips4sale' => 1 << 13, 'justforfans' => 1 << 13,
+        'imageset' => 1 << 14, 'imagesets' => 1 << 14, 'pictureset' => 1 << 14, 'imgset' => 1 << 14, 'photoset' => 1 << 14, 'photosets' => 1 << 14,
+        'pics' => 1 << 14, 'photos' => 1 << 14, 'images' => 1 << 14, 'wallpapers' => 1 << 14, 'abpea' => 1 << 14,
+        'pack' => 1 << 15, 'siterip' => 1 << 15, 'collection' => 1 << 15, 'complete' => 1 << 15, 'megapack' => 1 << 15,
+        'dvdr' => 1 << 16, 'dvd5' => 1 << 16, 'dvd9' => 1 << 16, 'dvd' => 1 << 16,
+        'vr' => 1 << 17, 'vr180' => 1 << 17, 'vr360' => 1 << 17, 'oculus' => 1 << 17, 'gearvr' => 1 << 17, 'quest' => 1 << 17, 'quest2' => 1 << 17,
+        'quest3' => 1 << 17, 'psvr' => 1 << 17, 'vive' => 1 << 17,
+        'web' => 1 << 18, 'webdl' => 1 << 18, 'webrip' => 1 << 18,
+        'sdx264xxx' => 1 << 21, 'sdporn' => 1 << 21,
+    ];
+
+    /**
+     * Wave 61 routing, binding and output buffer, kept in function-local statics (no static
+     * properties). Operations: null reads the routing override, 'set' replaces it (returning the
+     * previous one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]`
+     * with room for at least $val words (null without the library).
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w61', self::W61_XXX_CATEGORIZER_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w61RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW61RustFfi(): bool
+    {
+        $enabled = self::w61RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w61XxxCategorizePlanBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61XxxCategorizePlanBatch(array $rows): array
+    {
+        return self::usesW61RustFfi() ? self::w61XxxCategorizePlanBatchNative($rows) : self::w61XxxCategorizePlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61XxxCategorizePlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W61_XXX_CATEGORIZER_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w61RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w61XxxCategorizePlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W61_XXX_CATEGORIZER_FFI_CDEF.)
+            $written = $ffi->nntmux_w612_xxx_categorize_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w61XxxCategorizePlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w61Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** $min to $max ASCII digits as an integer, otherwise null. */
+    private static function w61Digits(string $value, int $min, int $max): ?int
+    {
+        $length = \strlen($value);
+
+        return $length >= $min && $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : null;
+    }
+
+    /**
+     * The maximal `[a-z0-9]` runs of the ASCII-lowercased value.
+     *
+     * @return list<string>
+     */
+    private static function w61Tokens(string $value): array
+    {
+        $tokens = $value === '' ? false : preg_split('/[^a-z0-9]+/', strtolower($value), -1, PREG_SPLIT_NO_EMPTY);
+
+        return $tokens === false ? [] : $tokens;
+    }
+
+    /**
+     * Wave 61.2 adult release token classification and categorization plan. Per `name\tposter`
+     * row `res | codec << 2 | container << 6 | flags << 10 | min(keywords, 15) << 23 | category
+     * << 27 | min(tokens, 255) << 31 | min(len(name), 0xFFFF) << 39` over the w61Tokens() of the
+     * name: res is the highest W61_XXX_TOKENS resolution (3 UHD, 2 HD, 1 SD); codec (1 x264, 2
+     * x265, 4 XviD or a DVD/BD rip, 8 WMV), container (1 mp4, 2 mkv, 4 avi, 8 mov) and flags (1
+     * xxx, 2 studio, 4 keyword, 8 OnlyFans-style site, 16 imageset, 32 pack, 64 DVD, 128 VR, also
+     * any token of five or more bytes starting with a letter and ending in `vr`, 256 web, 512 a
+     * date: a 1900-2099 year or two digits followed by 01-12 and 01-31 tokens, 1024 an `s` + 1-2
+     * digits + `e` + 1-2 digits episode token, 2048 an SD release tag, 4096 an SD clip poster
+     * from W61_XXX_POSTERS) OR their tokens; keywords counts keyword tokens. Adult rows carry
+     * xxx, studio, keyword, site, SD tag or poster flags. Category indexes W61_XXX_CATEGORIES:
+     * non-adult 0, then site 1, VR 2, an imageset without codec or container 3, pack 4, UHD 5,
+     * poster 6, SD tag 7, WMV 8, DVD 9, XviD 10, x264/x265 or HD 11 with a date or studio else
+     * 12, SD 6, else 13. Then fourteen category, four resolution and thirteen flag counts, the
+     * adult rows, the keyword tokens, the distinct lowercase trimmed non-empty posters of adult
+     * rows (by crc32) and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61XxxCategorizePlanBatchPhp(array $rows): array
+    {
+        $out = $posters = [];
+        $categories = array_fill(0, 14, 0);
+        $resolutions = [0, 0, 0, 0];
+        $flagCounts = array_fill(0, 13, 0);
+        $adultRows = $keywordTotal = 0;
+        foreach ($rows as $row) {
+            [$name, $poster] = explode("\t", (string) $row, 2) + ['', ''];
+            $tokens = self::w61Tokens($name);
+            $res = $codec = $container = $flags = $keywords = 0;
+            foreach ($tokens as $i => $token) {
+                $code = self::W61_XXX_TOKENS[$token] ?? 0;
+                $res = max($res, $code & 3);
+                $codec |= $code >> 2 & 15;
+                $container |= $code >> 6 & 15;
+                $flags |= $code >> 10;
+                if (($code & 1 << 12) !== 0) {
+                    $keywords++;
+                }
+                if (\strlen($token) >= 5 && str_ends_with($token, 'vr') && $token[0] >= 'a' && $token[0] <= 'z') {
+                    $flags |= 1 << 7;
+                }
+                if (($flags & 1 << 10) === 0 && $token[0] === 's' && ($e = strpos($token, 'e', 1)) !== false
+                    && self::w61Digits(substr($token, 1, $e - 1), 1, 2) !== null && self::w61Digits(substr($token, $e + 1), 1, 2) !== null) {
+                    $flags |= 1 << 10;
+                }
+                if (($flags & 1 << 9) === 0) {
+                    $year = self::w61Digits($token, 4, 4);
+                    if (($year !== null && $year >= 1900 && $year <= 2099) || self::w61Digits($token, 2, 2) !== null) {
+                        $month = self::w61Digits($tokens[$i + 1] ?? '', 2, 2);
+                        $day = self::w61Digits($tokens[$i + 2] ?? '', 2, 2);
+                        if ($month !== null && $month >= 1 && $month <= 12 && $day !== null && $day >= 1 && $day <= 31) {
+                            $flags |= 1 << 9;
+                        }
+                    }
+                }
+            }
+            foreach (self::W61_XXX_POSTERS as $needle) {
+                if (stripos($poster, $needle) !== false) {
+                    $flags |= 1 << 12;
+                    break;
+                }
+            }
+            $adult = ($flags & (1 | 2 | 4 | 8 | 1 << 11 | 1 << 12)) !== 0;
+            $category = match (true) {
+                ! $adult => 0,
+                ($flags & 8) !== 0 => 1,
+                ($flags & 1 << 7) !== 0 => 2,
+                ($flags & 1 << 4) !== 0 && $codec === 0 && $container === 0 => 3,
+                ($flags & 1 << 5) !== 0 => 4,
+                $res === 3 => 5,
+                ($flags & 1 << 12) !== 0 => 6,
+                ($flags & 1 << 11) !== 0 => 7,
+                ($codec & 8) !== 0 => 8,
+                ($flags & 1 << 6) !== 0 => 9,
+                ($codec & 4) !== 0 => 10,
+                ($codec & 3) !== 0 || $res === 2 => ($flags & (1 << 9 | 2)) !== 0 ? 11 : 12,
+                $res === 1 => 6,
+                default => 13,
+            };
+            $categories[$category]++;
+            $resolutions[$res]++;
+            for ($k = 0; $k < 13; $k++) {
+                $flagCounts[$k] += $flags >> $k & 1;
+            }
+            $keywordTotal += $keywords;
+            if ($adult) {
+                $adultRows++;
+                $trimmed = trim($poster);
+                if ($trimmed !== '') {
+                    $posters[crc32(strtolower($trimmed))] = true;
+                }
+            }
+            $out[] = $res | $codec << 2 | $container << 6 | $flags << 10 | min($keywords, 15) << 23 | $category << 27 | min(\count($tokens), 255) << 31
+                | min(\strlen($name), 0xFFFF) << 39;
+        }
+        array_push($out, ...$categories, ...$resolutions, ...$flagCounts);
+        array_push($out, $adultRows, $keywordTotal, \count($posters));
+        $out[] = self::w61Digest($out);
+
+        return $out;
     }
 }

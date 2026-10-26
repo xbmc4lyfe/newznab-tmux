@@ -16,6 +16,7 @@ use App\Services\IGDB\Exceptions\IgdbHttpException;
 use App\Support\MetadataSearchLookup;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -1042,5 +1043,259 @@ class ConsoleService
         return Release::query()->where('id', $releaseId)
             ->when($searchname !== null, static fn ($q) => $q->where('searchname', $searchname))
             ->update(['consoleinfo_id' => $gameId]);
+    }
+
+    // ---- Wave 61.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 7.81x/5.41x, uncommon 6.88x/6.46x); see RustCategorizersTvXxxConsoleGamesServiceTitleParserW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    private const string W61_CONSOLE_SERVICE_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w612_console_lookup_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W61_CONSOLE_SERVICE_TAIL = 30;
+
+    /** Lowercase token => `platform | region << 5 | flags << 11`. */
+    private const array W61_CONSOLE_TOKENS = [
+        'xbla' => 1, 'wiiware' => 2, 'n64' => 3, 'snes' => 4, 'nes' => 5, 'ps2' => 6, 'ps3' => 7, 'ps4' => 8, 'ps5' => 9, 'psx' => 10, 'psx2psp' => 11,
+        'psp' => 12, 'psvita' => 13, 'vita' => 14, 'wiiu' => 15, 'wii' => 16, 'xbox360' => 17, 'xboxone' => 18, 'xbox' => 19, 'x360' => 20, '3ds' => 21,
+        'nds' => 22, 'ngc' => 23, 'gc' => 24, 'switch' => 25, 'nsw' => 26,
+        'pal' => 1 << 5, 'eur' => 1 << 5, 'eu' => 1 << 5, 'euro' => 1 << 5, 'ntsc' => 2 << 5, 'usa' => 2 << 5,
+        'jpn' => 4 << 5, 'jap' => 4 << 5, 'jp' => 4 << 5, 'japan' => 4 << 5, 'ntscj' => 4 << 5, 'asia' => 8 << 5, 'kor' => 8 << 5, 'aus' => 16 << 5,
+        'regionfree' => 32 << 5, 'rf' => 32 << 5, 'rfree' => 32 << 5,
+        'proper' => 2 << 11, 'repack' => 4 << 11, 'retail' => 8 << 11, 'demo' => 16 << 11, 'dlc' => 32 << 11, 'patched' => 64 << 11,
+        'nfofix' => 128 << 11, 'readnfo' => 128 << 11, 'dvd5' => 256 << 11, 'dvd9' => 256 << 11, 'fulldvd' => 256 << 11, 'dvdrip' => 256 << 11,
+        'update' => 1024 << 11, 'patch' => 1024 << 11, 'iso' => 2048 << 11,
+    ];
+
+    /** replacePlatform() target (NATIVE_PLATFORM_NAMES index + 1, 0 unmapped) per W61_CONSOLE_TOKENS platform. */
+    public const array W61_CONSOLE_LOOKUP = [0, 0, 0, 14, 16, 15, 5, 6, 7, 0, 10, 10, 8, 9, 9, 11, 12, 1, 2, 0, 1, 4, 3, 13, 13, 0, 0];
+
+    /** Platform family (1 Xbox, 2 PlayStation, 3 Nintendo) per W61_CONSOLE_TOKENS platform. */
+    public const array W61_CONSOLE_FAMILY = [0, 1, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3];
+
+    /**
+     * Wave 61 routing, binding and output buffer, kept in function-local statics (no static
+     * properties). Operations: null reads the routing override, 'set' replaces it (returning the
+     * previous one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]`
+     * with room for at least $val words (null without the library).
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w61', self::W61_CONSOLE_SERVICE_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w61RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW61RustFfi(): bool
+    {
+        $enabled = self::w61RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w61ConsoleLookupPlanBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61ConsoleLookupPlanBatch(array $rows): array
+    {
+        return self::usesW61RustFfi() ? self::w61ConsoleLookupPlanBatchNative($rows) : self::w61ConsoleLookupPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61ConsoleLookupPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W61_CONSOLE_SERVICE_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w61RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w61ConsoleLookupPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W61_CONSOLE_SERVICE_FFI_CDEF.)
+            $written = $ffi->nntmux_w612_console_lookup_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w61ConsoleLookupPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w61Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** $min to $max ASCII digits as an integer, otherwise null. */
+    private static function w61Digits(string $value, int $min, int $max): ?int
+    {
+        $length = \strlen($value);
+
+        return $length >= $min && $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : null;
+    }
+
+    /**
+     * The maximal `[a-z0-9]` runs of the ASCII-lowercased value.
+     *
+     * @return list<string>
+     */
+    private static function w61Tokens(string $value): array
+    {
+        $tokens = $value === '' ? false : preg_split('/[^a-z0-9]+/', strtolower($value), -1, PREG_SPLIT_NO_EMPTY);
+
+        return $tokens === false ? [] : $tokens;
+    }
+
+    /**
+     * Wave 61.2 console title, platform, region, group and lookup query plan. Per release-name
+     * row `platform | family << 5 | lookup << 7 | region << 12 | flags << 18 | decision << 30 |
+     * min(title tokens, 31) << 32 | min(len(query), 255) << 37 | group << 45 | (crc32(query) &
+     * 0x1FFFF) << 46` over the w61Tokens() of the row: platform is the first W61_CONSOLE_TOKENS
+     * platform (or 19 for an `x` token followed by `box`), with its W61_CONSOLE_FAMILY and
+     * W61_CONSOLE_LOOKUP (1, Xbox 360, for XBLA DLC); region (1 PAL/EU, 2 NTSC/USA, 4 Japan, 8
+     * Asia, 16 Australia, 32 region free) and flags (1 `multi` + 0-2 digits, 2 proper, 4 repack,
+     * 8 retail, 16 demo, 32 DLC, 64 patched, 128 NFO fix, 256 DVD, 512 `v` + 1-7 digits, 1024
+     * update, 2048 ISO) OR their tokens. The title is the tokens before the first platform,
+     * region or flag token, the query those tokens joined by single spaces. Group: the suffix
+     * after the last `-` is 1-20 bytes of `[A-Za-z0-9_]`. Decision: 0 no title, 1 no platform,
+     * 3 DLC, else 2. Then four decision, four family, six region and twelve flag counts, the
+     * distinct queries of rows deciding 2 or 3 and the distinct lowercase groups (by crc32),
+     * the title tokens and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61ConsoleLookupPlanBatchPhp(array $rows): array
+    {
+        $out = $queries = $groups = [];
+        $decisions = $families = [0, 0, 0, 0];
+        $regions = array_fill(0, 6, 0);
+        $flagCounts = array_fill(0, 12, 0);
+        $titleTotal = 0;
+        foreach ($rows as $row) {
+            $row = (string) $row;
+            $group = 0;
+            $dash = strrpos($row, '-');
+            if ($dash !== false) {
+                $suffix = substr($row, $dash + 1);
+                $length = \strlen($suffix);
+                if ($length >= 1 && $length <= 20 && strspn($suffix, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_') === $length) {
+                    $group = 1;
+                    $groups[crc32(strtolower($suffix))] = true;
+                }
+            }
+            $tokens = self::w61Tokens($row);
+            $count = \count($tokens);
+            $platform = $region = $flags = 0;
+            $stop = $count;
+            foreach ($tokens as $i => $token) {
+                $code = self::W61_CONSOLE_TOKENS[$token] ?? 0;
+                $id = $token === 'x' && ($tokens[$i + 1] ?? '') === 'box' ? 19 : $code & 31;
+                $f = $code >> 11;
+                if (str_starts_with($token, 'multi') && (\strlen($token) === 5 || self::w61Digits(substr($token, 5), 1, 2) !== null)) {
+                    $f |= 1;
+                }
+                if ($token[0] === 'v' && self::w61Digits(substr($token, 1), 1, 7) !== null) {
+                    $f |= 512;
+                }
+                $region |= $code >> 5 & 63;
+                $flags |= $f;
+                if ($platform === 0) {
+                    $platform = $id;
+                }
+                if ($stop === $count && ($id !== 0 || $code !== 0 || $f !== 0)) {
+                    $stop = $i;
+                }
+            }
+            $query = implode(' ', \array_slice($tokens, 0, $stop));
+            $dlc = ($flags & 32) !== 0;
+            $lookup = $platform === 1 && $dlc ? 1 : self::W61_CONSOLE_LOOKUP[$platform];
+            $family = self::W61_CONSOLE_FAMILY[$platform];
+            $decision = $stop === 0 ? 0 : ($platform === 0 ? 1 : ($dlc ? 3 : 2));
+            $crc = crc32($query);
+            $decisions[$decision]++;
+            $families[$family]++;
+            for ($k = 0; $k < 6; $k++) {
+                $regions[$k] += $region >> $k & 1;
+            }
+            for ($k = 0; $k < 12; $k++) {
+                $flagCounts[$k] += $flags >> $k & 1;
+            }
+            if ($decision >= 2) {
+                $queries[$crc] = true;
+            }
+            $titleTotal += $stop;
+            $out[] = $platform | $family << 5 | $lookup << 7 | $region << 12 | $flags << 18 | $decision << 30 | min($stop, 31) << 32
+                | min(\strlen($query), 255) << 37 | $group << 45 | ($crc & 0x1FFFF) << 46;
+        }
+        array_push($out, ...$decisions, ...$families, ...$regions, ...$flagCounts);
+        array_push($out, \count($queries), \count($groups), $titleTotal);
+        $out[] = self::w61Digest($out);
+
+        return $out;
     }
 }

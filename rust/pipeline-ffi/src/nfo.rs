@@ -47088,3 +47088,1241 @@ pub mod wave60_2_nzb_upload_staging_xml_elements_par2_recovery_fingerprint_store
         }
     }
 }
+
+pub mod wave61_2_categorizers_tv_xxx_console_games_service_title_parser {
+    //! Wave 61.2 batch kernels for TvCategorizer, XxxCategorizer, ConsoleService, GamesService
+    //! and GamesTitleParser in the Wave 49.2 framing: one NUL-joined string column (exactly
+    //! `count` tab-separated rows) in, one `i64` word per row, a few summary words and one XXH64
+    //! digest of the preceding words out. Each export returns the word count, `-needed` when
+    //! `out_cap` (in words) is short, or -1 for a null output, a malformed batch, an output
+    //! overlapping the input or a panic. Rows are borrowed from the input; names are split into
+    //! the maximal `[a-z0-9]` runs of their ASCII-lowercased bytes (PHP `preg_split('/[^a-z0-9]+/',
+    //! strtolower($name), -1, PREG_SPLIT_NO_EMPTY)`), so the PHP twins agree under any
+    //! `setlocale()`.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, span,
+    };
+    use std::collections::HashSet;
+
+    type Set<T> = HashSet<T, FoldState>;
+
+    fn set<T>(n: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// PHP `explode("\t", $row, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(row: &[u8]) -> [&[u8]; N] {
+        let mut out = [&row[..0]; N];
+        let mut rest = row;
+        for (k, slot) in out.iter_mut().enumerate() {
+            if k + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'\t') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// PHP `trim()` with its default character set.
+    fn trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// `min` to `max` ASCII digits as an integer (PHP `(int)` of a digit string).
+    #[inline]
+    fn digits(v: &[u8], min: usize, max: usize) -> Option<i64> {
+        if v.len() < min || v.len() > max || !v.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            v.iter()
+                .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0')),
+        )
+    }
+
+    /// A four-digit token worth `lo..=hi`.
+    #[inline]
+    fn year(t: &[u8], lo: i64, hi: i64) -> Option<i64> {
+        if t.len() != 4 {
+            return None;
+        }
+        digits(t, 4, 4).filter(|y| (lo..=hi).contains(y))
+    }
+
+    /// `multi` followed by nothing or one or two digits.
+    #[inline]
+    fn multi(t: &[u8]) -> bool {
+        t.starts_with(b"multi") && (t.len() == 5 || digits(&t[5..], 1, 2).is_some())
+    }
+
+    fn lower_into(s: &[u8], buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.extend(s.iter().map(u8::to_ascii_lowercase));
+    }
+
+    /// The maximal `[a-z0-9]` runs of an already lowercased buffer.
+    fn tokenize(lower: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::with_capacity(16);
+        let mut start = usize::MAX;
+        for (i, &b) in lower.iter().enumerate() {
+            let alnum = b.is_ascii_lowercase() || b.is_ascii_digit();
+            if alnum {
+                if start == usize::MAX {
+                    start = i;
+                }
+            } else if start != usize::MAX {
+                out.push(&lower[start..i]);
+                start = usize::MAX;
+            }
+        }
+        if start != usize::MAX {
+            out.push(&lower[start..]);
+        }
+        out
+    }
+
+    /// PHP `stripos($hay, $needle) !== false` for a lowercase ASCII needle.
+    fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+        hay.len() >= needle.len()
+            && hay
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle))
+    }
+
+    /// Splits at the last `-` when the suffix is 1-20 bytes of `[A-Za-z0-9_]`.
+    fn group_split(s: &[u8]) -> Option<(&[u8], &[u8])> {
+        let dash = s.iter().rposition(|&b| b == b'-')?;
+        let suffix = &s[dash + 1..];
+        (!suffix.is_empty()
+            && suffix.len() <= 20
+            && suffix
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'_'))
+        .then(|| (&s[..dash], suffix))
+    }
+
+    /// Distinct tokens, sorted.
+    fn distinct(mut v: Vec<&[u8]>) -> Vec<&[u8]> {
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Size of the intersection of two sorted distinct lists.
+    fn common(a: &[&[u8]], b: &[&[u8]]) -> i64 {
+        let (mut i, mut j, mut n) = (0, 0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    n += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        n
+    }
+
+    // ---- TvCategorizer -----------------------------------------------------------------------
+
+    /// `res | source << 2 | codec << 6 | content << 9 | webdl << 15` per lowercase token.
+    fn tv_code(t: &[u8]) -> i64 {
+        match t {
+            b"2160p" | b"4k" | b"uhd" => 3,
+            b"1080p" | b"1080i" | b"720p" => 2,
+            b"480p" | b"576p" | b"360p" | b"sdtv" | b"sd" => 1,
+            b"hdtv" | b"pdtv" | b"dsr" | b"tvrip" | b"satrip" | b"dthrip" => 1 << 2,
+            b"web" | b"amzn" | b"nf" | b"dsnp" | b"hmax" | b"atvp" | b"hulu" => 2 << 2,
+            b"webdl" | b"webrip" => 2 << 2 | 1 << 15,
+            b"bluray" | b"bdrip" | b"bd" | b"brrip" | b"remux" => 4 << 2,
+            b"dvdrip" | b"dvdr" | b"dvd5" | b"dvd9" | b"dvd" => 8 << 2,
+            b"x264" | b"h264" | b"avc" => 1 << 6,
+            b"x265" | b"h265" | b"hevc" => 2 << 6,
+            b"xvid" | b"divx" => 4 << 6,
+            b"anime" | b"subsplease" | b"horriblesubs" | b"erai" | b"judas" | b"ember" | b"asw"
+            | b"commie" => 1 << 9,
+            b"nfl" | b"nba" | b"nhl" | b"mlb" | b"mls" | b"epl" | b"ufc" | b"wwe" | b"boxing"
+            | b"f1" | b"formula1" | b"nascar" | b"pga" | b"tennis" | b"golf" | b"soccer"
+            | b"football" | b"cricket" | b"rugby" | b"olympics" | b"olympic" | b"paralympics" => {
+                2 << 9
+            }
+            b"documentary" | b"docu" | b"docuseries" => 4 << 9,
+            b"danish" | b"flemish" | b"deutsch" | b"dutch" | b"french" | b"german" | b"hebrew"
+            | b"nlsub" | b"dubbed" | b"dub" | b"dubs" | b"norwegian" | b"swedish" | b"swesub"
+            | b"spanish" | b"staffel" | b"multisub" => 8 << 9,
+            b"complete" => 16 << 9,
+            b"proper" | b"repack" | b"rerip" => 32 << 9,
+            _ => 0,
+        }
+    }
+
+    /// `(kind, season, episode)` of the episode marker starting at token `i`, kind 0 for none.
+    fn tv_episode(toks: &[&[u8]], i: usize) -> (i64, i64, i64) {
+        let t = toks[i];
+        let next = |k: usize| -> &[u8] { toks.get(i + k).copied().unwrap_or(b"") };
+        if t[0] == b's' {
+            match t[1..].iter().position(|&b| b == b'e') {
+                None => {
+                    if let Some(season) = digits(&t[1..], 1, 3) {
+                        let n = next(1);
+                        let ep = if n.first() == Some(&b'e') {
+                            digits(&n[1..], 1, 4)
+                        } else {
+                            None
+                        };
+                        return match ep {
+                            Some(e) => (1, season, e),
+                            None => (2, season, 0),
+                        };
+                    }
+                }
+                Some(p) => {
+                    let e = p + 1;
+                    if let (Some(s), Some(ep)) = (digits(&t[1..e], 1, 3), digits(&t[e + 1..], 1, 4))
+                    {
+                        return (1, s, ep);
+                    }
+                }
+            }
+        }
+        if let Some(x) = t.iter().position(|&b| b == b'x')
+            && x > 0
+            && let (Some(a), Some(b)) = (digits(&t[..x], 1, 2), digits(&t[x + 1..], 2, 3))
+        {
+            return (3, a, b);
+        }
+        if let Some(y) = year(t, 1900, 2099)
+            && let Some(m) = digits(next(1), 2, 2)
+            && (1..=12).contains(&m)
+            && let Some(d) = digits(next(2), 2, 2)
+            && (1..=31).contains(&d)
+        {
+            return (4, y - 1900, m * 32 + d);
+        }
+        if t[0] == b'e' {
+            let ep = if t.starts_with(b"ep") {
+                digits(&t[2..], 1, 4)
+            } else {
+                None
+            }
+            .or_else(|| digits(&t[1..], 1, 4));
+            if let Some(e) = ep {
+                return (5, 0, e);
+            }
+            if (t == b"ep" || t == b"episode")
+                && let Some(e) = digits(next(1), 1, 4)
+            {
+                return (5, 0, e);
+            }
+        }
+        (0, 0, 0)
+    }
+
+    /// Per `name\tgroup` row `res | source << 2 | codec << 6 | content << 9 | webdl << 16 | kind
+    /// << 17 | season << 20 | episode << 30 | category << 44 | min(tokens, 255) << 48 |
+    /// min(len(name), 127) << 56`. Then ten category, four resolution, six kind and eight flag
+    /// counts, the TV-like rows, the distinct lowercase trimmed groups of TV-like rows and the
+    /// largest season of kinds 1-3.
+    pub fn tv_categorize_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 32);
+        let mut categories = [0i64; 10];
+        let mut resolutions = [0i64; 4];
+        let mut kinds = [0i64; 6];
+        let mut flags = [0i64; 8];
+        let (mut tv_rows, mut max_season) = (0i64, 0i64);
+        let mut groups: Set<u32> = set(16);
+        let (mut buf, mut scratch) = (Vec::new(), Vec::new());
+        for row in rows {
+            let [name, group] = fields::<2>(row);
+            lower_into(name, &mut buf);
+            let toks = tokenize(&buf);
+            let (mut res, mut source, mut codec, mut content, mut webdl) = (0i64, 0, 0, 0, 0);
+            let (mut kind, mut season, mut episode) = (0i64, 0i64, 0i64);
+            for (i, t) in toks.iter().enumerate() {
+                let code = tv_code(t);
+                if code != 0 {
+                    res = res.max(code & 3);
+                    source |= code >> 2 & 15;
+                    codec |= code >> 6 & 7;
+                    content |= code >> 9 & 63;
+                    webdl |= code >> 15 & 1;
+                }
+                if *t == b"web" {
+                    let n = toks.get(i + 1).copied().unwrap_or(b"");
+                    if n == b"dl" || n == b"rip" {
+                        webdl = 1;
+                    }
+                }
+                if year(t, 1900, 2099).is_some() {
+                    content |= 64;
+                }
+                if kind == 0 {
+                    (kind, season, episode) = tv_episode(&toks, i);
+                }
+            }
+            if contains_ci(group, b"anime") {
+                content |= 1;
+            }
+            let tv = kind != 0 || source & 1 != 0;
+            let category = if content & 1 != 0 {
+                7
+            } else if content & 2 != 0 && (tv || content & 64 != 0) {
+                6
+            } else if !tv {
+                0
+            } else if content & 4 != 0 {
+                8
+            } else if content & 8 != 0 {
+                2
+            } else if res == 3 {
+                5
+            } else if webdl == 1 {
+                1
+            } else if res == 2 || source & 4 != 0 {
+                4
+            } else if res == 1 || source & 9 != 0 || codec & 4 != 0 {
+                3
+            } else {
+                9
+            };
+            categories[category as usize] += 1;
+            resolutions[res as usize] += 1;
+            kinds[kind as usize] += 1;
+            for (k, slot) in flags.iter_mut().enumerate().take(7) {
+                *slot += content >> k & 1;
+            }
+            flags[7] += webdl;
+            if tv {
+                tv_rows += 1;
+                let g = trim(group);
+                if !g.is_empty() {
+                    lower_into(g, &mut scratch);
+                    groups.insert(crc32(&scratch));
+                }
+            }
+            if (1..=3).contains(&kind) {
+                max_season = max_season.max(season);
+            }
+            out.push(
+                res | source << 2
+                    | codec << 6
+                    | content << 9
+                    | webdl << 16
+                    | kind << 17
+                    | season << 20
+                    | episode << 30
+                    | category << 44
+                    | (toks.len().min(255) as i64) << 48
+                    | (name.len().min(127) as i64) << 56,
+            );
+        }
+        out.extend(categories);
+        out.extend(resolutions);
+        out.extend(kinds);
+        out.extend(flags);
+        out.extend([tv_rows, groups.len() as i64, max_season]);
+        out
+    }
+
+    // ---- XxxCategorizer ----------------------------------------------------------------------
+
+    /// `res | codec << 2 | container << 6 | flags << 10` per lowercase token.
+    fn xxx_code(t: &[u8]) -> i64 {
+        match t {
+            b"2160p" | b"4k" | b"uhd" => 3,
+            b"1080p" | b"1080i" | b"720p" | b"hd" => 2,
+            b"480p" | b"360p" | b"576p" | b"sd" => 1,
+            b"x264" | b"h264" | b"avc" => 1 << 2,
+            b"x265" | b"h265" | b"hevc" => 2 << 2,
+            b"xvid" | b"divx" | b"dvdrip" | b"bdrip" | b"brrip" => 4 << 2,
+            b"wmv" => 8 << 2,
+            b"mp4" => 1 << 6,
+            b"mkv" => 2 << 6,
+            b"avi" => 4 << 6,
+            b"mov" => 8 << 6,
+            b"xxx" => 1 << 10,
+            b"brazzers" | b"naughtyamerica" | b"realitykings" | b"bangbros" | b"vixen"
+            | b"blacked" | b"tushy" | b"deeper" | b"nubiles" | b"sexart" | b"metart"
+            | b"metartx" | b"evilangel" | b"private" | b"hustler" | b"penthouse" | b"playboy"
+            | b"kink" | b"teamskeet" | b"mofos" | b"twistys" | b"babes" | b"digitalplayground"
+            | b"wicked" | b"julesjordan" | b"pornpros" | b"familystrokes" | b"tiny4k" | b"povd"
+            | b"holed" | b"lubed" | b"fakehub" | b"faketaxi" | b"publicagent" | b"hegre"
+            | b"femjoy" | b"wowgirls" | b"legalporno" | b"dorcelclub" | b"newsensations" => 1 << 11,
+            b"anal" | b"milf" | b"porn" | b"sex" | b"hardcore" | b"lesbian" | b"creampie"
+            | b"pov" | b"teen" | b"interracial" | b"bbw" | b"bdsm" | b"fetish" | b"blowjob"
+            | b"threesome" | b"pornstar" | b"squirt" | b"facial" | b"hentai" | b"jav"
+            | b"adult" => 1 << 12,
+            b"onlyfans" | b"fansly" | b"manyvids" | b"clips4sale" | b"justforfans" => 1 << 13,
+            b"imageset" | b"imagesets" | b"pictureset" | b"imgset" | b"photoset" | b"photosets"
+            | b"pics" | b"photos" | b"images" | b"wallpapers" | b"abpea" => 1 << 14,
+            b"pack" | b"siterip" | b"collection" | b"complete" | b"megapack" => 1 << 15,
+            b"dvdr" | b"dvd5" | b"dvd9" | b"dvd" => 1 << 16,
+            b"vr" | b"vr180" | b"vr360" | b"oculus" | b"gearvr" | b"quest" | b"quest2"
+            | b"quest3" | b"psvr" | b"vive" => 1 << 17,
+            b"web" | b"webdl" | b"webrip" => 1 << 18,
+            b"sdx264xxx" | b"sdporn" => 1 << 21,
+            _ => 0,
+        }
+    }
+
+    const XXX_POSTERS: [&[u8]; 3] = [b"anon@y.com", b"md-hobbys.com", b"oz@lot.com"];
+
+    /// Per `name\tposter` row `res | codec << 2 | container << 6 | flags << 10 | min(keywords,
+    /// 15) << 23 | category << 27 | min(tokens, 255) << 31 | min(len(name), 0xFFFF) << 39`. Then
+    /// fourteen category, four resolution and thirteen flag counts, the adult rows, the keyword
+    /// tokens and the distinct lowercase trimmed posters of adult rows.
+    pub fn xxx_categorize_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 35);
+        let mut categories = [0i64; 14];
+        let mut resolutions = [0i64; 4];
+        let mut flag_counts = [0i64; 13];
+        let (mut adult_rows, mut keyword_total) = (0i64, 0i64);
+        let mut posters: Set<u32> = set(16);
+        let (mut buf, mut scratch) = (Vec::new(), Vec::new());
+        for row in rows {
+            let [name, poster] = fields::<2>(row);
+            lower_into(name, &mut buf);
+            let toks = tokenize(&buf);
+            let (mut res, mut codec, mut container, mut flags, mut keywords) =
+                (0i64, 0i64, 0i64, 0i64, 0i64);
+            for (i, t) in toks.iter().enumerate() {
+                let code = xxx_code(t);
+                res = res.max(code & 3);
+                codec |= code >> 2 & 15;
+                container |= code >> 6 & 15;
+                flags |= code >> 10;
+                if code & 1 << 12 != 0 {
+                    keywords += 1;
+                }
+                if t.len() >= 5 && t.ends_with(b"vr") && t[0].is_ascii_lowercase() {
+                    flags |= 1 << 7;
+                }
+                if flags & 1 << 10 == 0
+                    && t[0] == b's'
+                    && let Some(p) = t[1..].iter().position(|&b| b == b'e')
+                    && digits(&t[1..p + 1], 1, 2).is_some()
+                    && digits(&t[p + 2..], 1, 2).is_some()
+                {
+                    flags |= 1 << 10;
+                }
+                if flags & 1 << 9 == 0
+                    && (year(t, 1900, 2099).is_some() || digits(t, 2, 2).is_some())
+                    && let Some(m) = digits(toks.get(i + 1).copied().unwrap_or(b""), 2, 2)
+                    && (1..=12).contains(&m)
+                    && let Some(d) = digits(toks.get(i + 2).copied().unwrap_or(b""), 2, 2)
+                    && (1..=31).contains(&d)
+                {
+                    flags |= 1 << 9;
+                }
+            }
+            if XXX_POSTERS.iter().any(|p| contains_ci(poster, p)) {
+                flags |= 1 << 12;
+            }
+            let adult = flags & (1 | 2 | 4 | 8 | 1 << 11 | 1 << 12) != 0;
+            let category = if !adult {
+                0
+            } else if flags & 8 != 0 {
+                1
+            } else if flags & 1 << 7 != 0 {
+                2
+            } else if flags & 1 << 4 != 0 && codec == 0 && container == 0 {
+                3
+            } else if flags & 1 << 5 != 0 {
+                4
+            } else if res == 3 {
+                5
+            } else if flags & 1 << 12 != 0 {
+                6
+            } else if flags & 1 << 11 != 0 {
+                7
+            } else if codec & 8 != 0 {
+                8
+            } else if flags & 1 << 6 != 0 {
+                9
+            } else if codec & 4 != 0 {
+                10
+            } else if codec & 3 != 0 || res == 2 {
+                if flags & (1 << 9 | 2) != 0 { 11 } else { 12 }
+            } else if res == 1 {
+                6
+            } else {
+                13
+            };
+            categories[category as usize] += 1;
+            resolutions[res as usize] += 1;
+            for (k, slot) in flag_counts.iter_mut().enumerate() {
+                *slot += flags >> k & 1;
+            }
+            keyword_total += keywords;
+            if adult {
+                adult_rows += 1;
+                let p = trim(poster);
+                if !p.is_empty() {
+                    lower_into(p, &mut scratch);
+                    posters.insert(crc32(&scratch));
+                }
+            }
+            out.push(
+                res | codec << 2
+                    | container << 6
+                    | flags << 10
+                    | keywords.min(15) << 23
+                    | category << 27
+                    | (toks.len().min(255) as i64) << 31
+                    | (name.len().min(0xFFFF) as i64) << 39,
+            );
+        }
+        out.extend(categories);
+        out.extend(resolutions);
+        out.extend(flag_counts);
+        out.extend([adult_rows, keyword_total, posters.len() as i64]);
+        out
+    }
+
+    // ---- ConsoleService ----------------------------------------------------------------------
+
+    /// `platform | region << 5 | flags << 11` per lowercase token.
+    fn console_code(t: &[u8]) -> i64 {
+        match t {
+            b"xbla" => 1,
+            b"wiiware" => 2,
+            b"n64" => 3,
+            b"snes" => 4,
+            b"nes" => 5,
+            b"ps2" => 6,
+            b"ps3" => 7,
+            b"ps4" => 8,
+            b"ps5" => 9,
+            b"psx" => 10,
+            b"psx2psp" => 11,
+            b"psp" => 12,
+            b"psvita" => 13,
+            b"vita" => 14,
+            b"wiiu" => 15,
+            b"wii" => 16,
+            b"xbox360" => 17,
+            b"xboxone" => 18,
+            b"xbox" => 19,
+            b"x360" => 20,
+            b"3ds" => 21,
+            b"nds" => 22,
+            b"ngc" => 23,
+            b"gc" => 24,
+            b"switch" => 25,
+            b"nsw" => 26,
+            b"pal" | b"eur" | b"eu" | b"euro" => 1 << 5,
+            b"ntsc" | b"usa" => 2 << 5,
+            b"jpn" | b"jap" | b"jp" | b"japan" | b"ntscj" => 4 << 5,
+            b"asia" | b"kor" => 8 << 5,
+            b"aus" => 16 << 5,
+            b"regionfree" | b"rf" | b"rfree" => 32 << 5,
+            b"proper" => 2 << 11,
+            b"repack" => 4 << 11,
+            b"retail" => 8 << 11,
+            b"demo" => 16 << 11,
+            b"dlc" => 32 << 11,
+            b"patched" => 64 << 11,
+            b"nfofix" | b"readnfo" => 128 << 11,
+            b"dvd5" | b"dvd9" | b"fulldvd" | b"dvdrip" => 256 << 11,
+            b"update" | b"patch" => 1024 << 11,
+            b"iso" => 2048 << 11,
+            _ => 0,
+        }
+    }
+
+    /// ConsoleService::replacePlatform() target index (NATIVE_PLATFORM_NAMES + 1) per platform.
+    const CONSOLE_LOOKUP: [i64; 27] = [
+        0, 0, 0, 14, 16, 15, 5, 6, 7, 0, 10, 10, 8, 9, 9, 11, 12, 1, 2, 0, 1, 4, 3, 13, 13, 0, 0,
+    ];
+
+    /// 1 Xbox, 2 PlayStation, 3 Nintendo per platform.
+    const CONSOLE_FAMILY: [i64; 27] = [
+        0, 1, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 1, 1, 1, 1, 3, 3, 3, 3, 3, 3,
+    ];
+
+    /// Per release-name row `platform | family << 5 | lookup << 7 | region << 12 | flags << 18 |
+    /// decision << 30 | min(title tokens, 31) << 32 | min(len(query), 255) << 37 | group << 45
+    /// | (crc32(query) & 0x1FFFF) << 46`. Then four decision, four family, six region and twelve
+    /// flag counts, the distinct queries of lookup rows, the distinct lowercase groups and the
+    /// title tokens.
+    pub fn console_lookup_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 30);
+        let mut decisions = [0i64; 4];
+        let mut families = [0i64; 4];
+        let mut regions = [0i64; 6];
+        let mut flag_counts = [0i64; 12];
+        let mut queries: Set<u32> = set(64);
+        let mut groups: Set<u32> = set(16);
+        let mut title_total = 0i64;
+        let mut buf = Vec::new();
+        let mut query = Vec::new();
+        for row in rows {
+            let (mut platform, mut region, mut flags) = (0i64, 0i64, 0i64);
+            let mut group = 0i64;
+            if let Some((_, suffix)) = group_split(row) {
+                group = 1;
+                lower_into(suffix, &mut buf);
+                groups.insert(crc32(&buf));
+            }
+            lower_into(row, &mut buf);
+            let toks = tokenize(&buf);
+            let mut stop = toks.len();
+            for (i, t) in toks.iter().enumerate() {
+                let code = console_code(t);
+                let mut id = code & 31;
+                if *t == b"x" && toks.get(i + 1).copied() == Some(b"box".as_slice()) {
+                    id = 19;
+                }
+                let mut f = code >> 11;
+                if multi(t) {
+                    f |= 1;
+                }
+                if t[0] == b'v' && digits(&t[1..], 1, 7).is_some() {
+                    f |= 512;
+                }
+                region |= code >> 5 & 63;
+                flags |= f;
+                if platform == 0 {
+                    platform = id;
+                }
+                if stop == toks.len() && (id != 0 || code != 0 || f != 0) {
+                    stop = i;
+                }
+            }
+            query.clear();
+            for (k, t) in toks[..stop].iter().enumerate() {
+                if k > 0 {
+                    query.push(b' ');
+                }
+                query.extend_from_slice(t);
+            }
+            let dlc = flags & 32 != 0;
+            let mut lookup = CONSOLE_LOOKUP[platform as usize];
+            if platform == 1 && dlc {
+                lookup = 1;
+            }
+            let family = CONSOLE_FAMILY[platform as usize];
+            let decision = if stop == 0 {
+                0
+            } else if platform == 0 {
+                1
+            } else if dlc {
+                3
+            } else {
+                2
+            };
+            let crc = crc32(&query);
+            decisions[decision as usize] += 1;
+            families[family as usize] += 1;
+            for (k, slot) in regions.iter_mut().enumerate() {
+                *slot += region >> k & 1;
+            }
+            for (k, slot) in flag_counts.iter_mut().enumerate() {
+                *slot += flags >> k & 1;
+            }
+            if decision >= 2 {
+                queries.insert(crc);
+            }
+            title_total += stop as i64;
+            out.push(
+                platform
+                    | family << 5
+                    | lookup << 7
+                    | region << 12
+                    | flags << 18
+                    | decision << 30
+                    | (stop.min(31) as i64) << 32
+                    | (query.len().min(255) as i64) << 37
+                    | group << 45
+                    | (i64::from(crc) & 0x1FFFF) << 46,
+            );
+        }
+        out.extend(decisions);
+        out.extend(families);
+        out.extend(regions);
+        out.extend(flag_counts);
+        out.extend([queries.len() as i64, groups.len() as i64, title_total]);
+        out
+    }
+
+    // ---- GamesService / GamesTitleParser -----------------------------------------------------
+
+    /// GamesService::SCENE_GROUPS (identical in GamesTitleParser), lowercased, without
+    /// `gog-games` and `i_know` (which no `[a-z0-9]` token can equal).
+    fn scene_token(t: &[u8]) -> bool {
+        matches!(
+            t,
+            b"codex"
+                | b"plaza"
+                | b"gog"
+                | b"cpy"
+                | b"hoodlum"
+                | b"empress"
+                | b"rune"
+                | b"tenoke"
+                | b"flt"
+                | b"reloaded"
+                | b"skidrow"
+                | b"prophet"
+                | b"razor1911"
+                | b"core"
+                | b"reflex"
+                | b"p2p"
+                | b"goldberg"
+                | b"darksiders"
+                | b"tinyiso"
+                | b"doge"
+                | b"anomaly"
+                | b"elamigos"
+                | b"fitgirl"
+                | b"dodi"
+                | b"xatab"
+                | b"blg"
+                | b"rargb"
+                | b"chronos"
+                | b"fckdrm"
+                | b"steam"
+                | b"sptgames"
+                | b"kaos"
+                | b"simplex"
+                | b"ali213"
+                | b"fltdox"
+                | b"3dmgame"
+                | b"postmortem"
+                | b"vace"
+                | b"rogue"
+                | b"outlaws"
+        )
+    }
+
+    /// A lowercase group suffix naming a known scene group.
+    fn scene_group(lower: &[u8]) -> bool {
+        scene_token(lower) || lower == b"i_know"
+    }
+
+    /// `edition 1 | dlc 2 | update 4 | crack 8 | repack 16 | iso 64 | os 256 | scene 1024`.
+    fn games_code(t: &[u8]) -> i64 {
+        match t {
+            b"deluxe" | b"gold" | b"goty" | b"ultimate" | b"definitive" | b"enhanced"
+            | b"remastered" | b"collectors" | b"premium" | b"anniversary" | b"complete"
+            | b"edition" => 1,
+            b"dlc" | b"dlcs" | b"unlocker" | b"soundtrack" | b"ost" | b"expansion" => 2,
+            b"update" | b"patch" | b"hotfix" => 4,
+            b"crack" | b"crackfix" | b"crackonly" | b"cracked" => 8,
+            b"repack" | b"proper" | b"rerip" | b"rip" => 16,
+            b"iso" => 64,
+            b"linux" | b"macos" | b"mac" | b"osx" => 256,
+            t if scene_token(t) => 1024,
+            _ => 0,
+        }
+    }
+
+    /// Per `release\tcandidate\tcandidateYear` row `group | flags << 2 | yearState << 13 |
+    /// decision << 15 | score << 17 | min(common, 63) << 24 | min(title, 63) << 30 |
+    /// min(candidate, 63) << 36 | releaseYear - 1900 << 42 | min(len(release), 8191) << 50`.
+    /// Then four decision, three group, eleven flag and four year-state counts, the score sum of
+    /// rows deciding 2 or 3 and the distinct known groups.
+    pub fn games_lookup_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 25);
+        let mut decisions = [0i64; 4];
+        let mut group_states = [0i64; 3];
+        let mut flag_counts = [0i64; 11];
+        let mut year_states = [0i64; 4];
+        let mut score_sum = 0i64;
+        let mut known: Set<u32> = set(16);
+        let (mut buf, mut cbuf) = (Vec::new(), Vec::new());
+        for row in rows {
+            let [release, candidate, cyear] = fields::<3>(row);
+            let mut body = release;
+            let mut group_state = 0i64;
+            if let Some((head, suffix)) = group_split(release) {
+                lower_into(suffix, &mut buf);
+                group_state = if scene_group(&buf) { 1 } else { 2 };
+                if group_state == 1 {
+                    known.insert(crc32(&buf));
+                }
+                body = head;
+            }
+            lower_into(body, &mut buf);
+            let toks = tokenize(&buf);
+            let (mut flags, mut release_year) = (0i64, 0i64);
+            let mut in_title = true;
+            let mut title = Vec::with_capacity(toks.len());
+            for t in &toks {
+                let mut f = games_code(t);
+                if multi(t) {
+                    f |= 32;
+                }
+                if (t[0] == b'v' && digits(&t[1..], 1, 7).is_some())
+                    || *t == b"build"
+                    || (t.starts_with(b"build") && digits(&t[5..], 1, 9).is_some())
+                {
+                    f |= 128;
+                }
+                if let Some(y) = year(t, 1970, 2099) {
+                    f |= 512;
+                    if release_year == 0 {
+                        release_year = y;
+                    }
+                }
+                flags |= f;
+                if f != 0 {
+                    in_title = false;
+                } else if in_title {
+                    title.push(*t);
+                }
+            }
+            let title = distinct(title);
+            lower_into(candidate, &mut cbuf);
+            let cand = distinct(tokenize(&cbuf));
+            let shared = common(&title, &cand);
+            let sum = (title.len() + cand.len()) as i64;
+            let score = if sum > 0 { 200 * shared / sum } else { 0 };
+            let cy = digits(trim(cyear), 4, 4)
+                .filter(|y| (1970..=2099).contains(y))
+                .unwrap_or(0);
+            let year_state = if cy == 0 || release_year == 0 {
+                0
+            } else if cy == release_year {
+                1
+            } else if (cy - release_year).abs() == 1 {
+                3
+            } else {
+                2
+            };
+            let decision = if title.is_empty() || cand.is_empty() {
+                0
+            } else if score >= 85 && year_state != 2 {
+                3
+            } else if score >= 60 && year_state != 2 {
+                2
+            } else {
+                1
+            };
+            decisions[decision as usize] += 1;
+            group_states[group_state as usize] += 1;
+            for (k, slot) in flag_counts.iter_mut().enumerate() {
+                *slot += flags >> k & 1;
+            }
+            year_states[year_state as usize] += 1;
+            if decision >= 2 {
+                score_sum += score;
+            }
+            out.push(
+                group_state
+                    | flags << 2
+                    | year_state << 13
+                    | decision << 15
+                    | score << 17
+                    | shared.min(63) << 24
+                    | (title.len().min(63) as i64) << 30
+                    | (cand.len().min(63) as i64) << 36
+                    | (if release_year > 0 {
+                        release_year - 1900
+                    } else {
+                        0
+                    }) << 42
+                    | (release.len().min(8191) as i64) << 50,
+            );
+        }
+        out.extend(decisions);
+        out.extend(group_states);
+        out.extend(flag_counts);
+        out.extend(year_states);
+        out.extend([score_sum, known.len() as i64]);
+        out
+    }
+
+    /// Extension index of GamesTitleParser::cleanReleaseNamePhp()'s stripped extensions.
+    fn title_extension(lower: &[u8]) -> i64 {
+        match lower {
+            b"zip" => 1,
+            b"rar" => 2,
+            b"7z" => 3,
+            b"iso" => 4,
+            b"nfo" => 5,
+            b"sfv" => 6,
+            b"exe" => 7,
+            b"mkv" => 8,
+            b"mp4" => 9,
+            b"avi" => 10,
+            _ => 0,
+        }
+    }
+
+    /// Dropped-token flags: `repack 128 | crack 512 | noise 2048 | dlc 4096`.
+    fn title_code(t: &[u8]) -> i64 {
+        match t {
+            b"repack" | b"proper" | b"rip" | b"rerip" => 1 << 7,
+            b"crack" | b"crackfix" | b"crackonly" | b"cracked" => 1 << 9,
+            b"dlc" | b"dlcs" => 1 << 12,
+            b"iso" | b"x64" | b"x86" | b"win" | b"win64" | b"win32" | b"pc" | b"incl"
+            | b"readnfo" | b"nfofix" | b"retail" => 1 << 11,
+            t if scene_token(t) => 1 << 11,
+            _ => 0,
+        }
+    }
+
+    /// Per `release\tcompare` row `extension | flags << 4 | state << 17 | exact << 19 | prefix
+    /// << 20 | dice << 21 | min(kept, 63) << 28 | min(len(clean), 255) << 34 | (crc32(clean) &
+    /// 0x1FFFFF) << 42`. Then eleven extension, thirteen flag and four state counts, the exact
+    /// rows, the distinct clean titles of rows in state 1-3 and the dice sum.
+    pub fn game_title_parse_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 32);
+        let mut extensions = [0i64; 11];
+        let mut flag_counts = [0i64; 13];
+        let mut states = [0i64; 4];
+        let (mut exact_rows, mut dice_sum) = (0i64, 0i64);
+        let mut cleans: Set<u32> = set(64);
+        let (mut buf, mut cbuf) = (Vec::new(), Vec::new());
+        let (mut clean, mut joined) = (Vec::new(), Vec::new());
+        for row in rows {
+            let [release, compare] = fields::<2>(row);
+            let mut s = release;
+            let (mut ext, mut flags) = (0i64, 0i64);
+            if let Some(dot) = s.iter().rposition(|&b| b == b'.') {
+                lower_into(&s[dot + 1..], &mut buf);
+                ext = title_extension(&buf);
+                if ext != 0 {
+                    s = &s[..dot];
+                    flags |= 1;
+                }
+            }
+            if s.first() == Some(&b'[')
+                && let Some(close) = s[1..].iter().position(|&b| b == b']')
+            {
+                s = &s[close + 2..];
+                flags |= 2;
+            }
+            if let Some((head, suffix)) = group_split(s) {
+                flags |= 4;
+                lower_into(suffix, &mut buf);
+                if scene_group(&buf) {
+                    flags |= 8;
+                }
+                s = head;
+            }
+            lower_into(s, &mut buf);
+            let toks = tokenize(&buf);
+            let mut kept: Vec<&[u8]> = Vec::with_capacity(toks.len());
+            let mut chain = false;
+            for t in &toks {
+                if chain && t.iter().all(u8::is_ascii_digit) {
+                    continue;
+                }
+                chain = false;
+                let mut f = title_code(t);
+                if t[0] == b'v' && digits(&t[1..], 1, 9).is_some() {
+                    f |= 16;
+                    chain = true;
+                } else if *t == b"build"
+                    || (t.starts_with(b"build") && digits(&t[5..], 1, 9).is_some())
+                {
+                    f |= 32;
+                    chain = true;
+                } else if *t == b"update"
+                    || *t == b"patch"
+                    || *t == b"hotfix"
+                    || (t.starts_with(b"update") && digits(&t[6..], 1, 9).is_some())
+                {
+                    f |= 64;
+                    chain = true;
+                } else if multi(t) {
+                    f |= 256;
+                } else if year(t, 1970, 2099).is_some() {
+                    f |= 1024;
+                }
+                flags |= f;
+                if f == 0 {
+                    kept.push(t);
+                }
+            }
+            clean.clear();
+            for (k, t) in kept.iter().enumerate() {
+                if k > 0 {
+                    clean.push(b' ');
+                }
+                clean.extend_from_slice(t);
+            }
+            lower_into(compare, &mut cbuf);
+            let ctoks = tokenize(&cbuf);
+            joined.clear();
+            for (k, t) in ctoks.iter().enumerate() {
+                if k > 0 {
+                    joined.push(b' ');
+                }
+                joined.extend_from_slice(t);
+            }
+            let exact = !clean.is_empty() && clean == joined;
+            let prefix = !kept.is_empty() && !ctoks.is_empty() && kept[0] == ctoks[0];
+            let kept_len = kept.len();
+            let ks = distinct(kept);
+            let cs = distinct(ctoks);
+            let shared = common(&ks, &cs);
+            let sum = (ks.len() + cs.len()) as i64;
+            let dice = if sum > 0 { 200 * shared / sum } else { 0 };
+            let state = if clean.is_empty() {
+                0
+            } else if cs.is_empty() {
+                1
+            } else if exact || dice >= 70 {
+                3
+            } else {
+                2
+            };
+            let crc = crc32(&clean);
+            extensions[ext as usize] += 1;
+            for (k, slot) in flag_counts.iter_mut().enumerate() {
+                *slot += flags >> k & 1;
+            }
+            states[state as usize] += 1;
+            exact_rows += i64::from(exact);
+            dice_sum += dice;
+            if state >= 1 {
+                cleans.insert(crc);
+            }
+            out.push(
+                ext | flags << 4
+                    | state << 17
+                    | i64::from(exact) << 19
+                    | i64::from(prefix) << 20
+                    | dice << 21
+                    | (kept_len.min(63) as i64) << 28
+                    | (clean.len().min(255) as i64) << 34
+                    | (i64::from(crc) & 0x1F_FFFF) << 42,
+            );
+        }
+        out.extend(extensions);
+        out.extend(flag_counts);
+        out.extend(states);
+        out.extend([exact_rows, cleans.len() as i64, dice_sum]);
+        out
+    }
+
+    // ---- Exports -----------------------------------------------------------------------------
+
+    macro_rules! export {
+        ($name:ident, $plan:ident) => {
+            /// # Safety
+            /// `items` must be readable for `items_len` bytes and `out` writable for `out_cap`
+            /// words.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                items: *const u8,
+                items_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let inputs = [(items, items_len)];
+                unsafe {
+                    emit(out, out_cap, count, &inputs, || {
+                        Some($plan(&column(span(items, items_len)?, count)?))
+                    })
+                }
+            }
+        };
+    }
+
+    export!(nntmux_w612_tv_categorize_plan_batch, tv_categorize_plan);
+    export!(nntmux_w612_xxx_categorize_plan_batch, xxx_categorize_plan);
+    export!(nntmux_w612_console_lookup_plan_batch, console_lookup_plan);
+    export!(nntmux_w612_games_lookup_plan_batch, games_lookup_plan);
+    export!(
+        nntmux_w612_game_title_parse_plan_batch,
+        game_title_parse_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn refs<'a>(v: &[&'a str]) -> Vec<&'a [u8]> {
+            v.iter().map(|s| s.as_bytes()).collect()
+        }
+
+        #[test]
+        fn tokens_split_lowercased_ascii_alnum_runs() {
+            let mut buf = Vec::new();
+            lower_into(b"[Sub] Show.S01E02-\xC9GRP x", &mut buf);
+            assert_eq!(
+                tokenize(&buf),
+                [b"sub".as_slice(), b"show", b"s01e02", b"grp", b"x"]
+            );
+            assert!(tokenize(b"").is_empty());
+            assert_eq!(fields::<3>(b"a\tb\tc\td"), [b"a".as_slice(), b"b", b"c\td"]);
+            assert_eq!(
+                group_split(b"Game-I_KnoW"),
+                Some((b"Game".as_slice(), b"I_KnoW".as_slice()))
+            );
+            assert_eq!(group_split(b"Game-A.B"), None);
+            assert_eq!(group_split(b"Game-"), None);
+        }
+
+        #[test]
+        fn tv_episode_markers_follow_the_documented_order() {
+            let toks: Vec<&[u8]> =
+                vec![b"s01", b"e03", b"1x02", b"2023", b"09", b"10", b"ep", b"7"];
+            assert_eq!(tv_episode(&toks, 0), (1, 1, 3));
+            assert_eq!(tv_episode(&toks, 2), (3, 1, 2));
+            assert_eq!(tv_episode(&toks, 3), (4, 123, 298));
+            assert_eq!(tv_episode(&toks, 6), (5, 0, 7));
+            assert_eq!(tv_episode(&[b"series".as_slice()], 0), (0, 0, 0));
+            assert_eq!(tv_episode(&[b"s03".as_slice()], 0), (2, 3, 0));
+        }
+
+        #[test]
+        fn tv_rows_classify_and_categorize() {
+            let words = tv_categorize_plan(&refs(&[
+                "Some.Show.S01E02.720p.HDTV.x264-GRP\talt.binaries.teevee",
+                "Show.1x02.WEB-DL\t",
+                "Movie.2019.1080p",
+                "x\tAnime",
+            ]));
+            let mask = 0xFFFF_FFFF_FFFF;
+            assert_eq!(
+                words[0] & mask,
+                2 | 1 << 2 | 1 << 6 | 1 << 17 | 1 << 20 | 2 << 30 | 4 << 44
+            );
+            assert_eq!(
+                words[1] & mask,
+                2 << 2 | 1 << 16 | 3 << 17 | 1 << 20 | 2 << 30 | 1 << 44
+            );
+            assert_eq!(words[2] & mask, 2 | 64 << 9);
+            assert_eq!(words[3] & mask, 1 << 9 | 7 << 44);
+            assert_eq!(
+                words[4..],
+                [
+                    1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 2, 0, 2, 0, 2, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0,
+                    1, 1, 2, 1, 1
+                ]
+            );
+        }
+
+        #[test]
+        fn xxx_rows_classify_and_categorize() {
+            let words = xxx_categorize_plan(&refs(&[
+                "Brazzers.23.05.12.Name.XXX.1080p.MP4-KTR\t",
+                "WankzVR.Name.Oculus\t",
+                "Clip.wmv\tanon@Y.com",
+            ]));
+            assert_eq!(words[0] & 0x7FFF_FFFF, 2 | 1 << 6 | 515 << 10 | 11 << 27);
+            assert_eq!(words[1] & 0x7FFF_FFFF, 128 << 10);
+            assert_eq!(words[2] & 0x7FFF_FFFF, 8 << 2 | 4096 << 10 | 6 << 27);
+            assert_eq!(words[3 + 14 + 4 + 13..], [2, 0, 1]);
+        }
+
+        #[test]
+        fn console_rows_plan_lookups() {
+            let words = console_lookup_plan(&refs(&[
+                "Halo.3.PAL.XBOX360-GRP",
+                "Rock.Band.DLC.XBLA-XYZ",
+                "PS3.Only",
+            ]));
+            let mask = (1 << 37) - 1;
+            assert_eq!(
+                words[0] & mask,
+                17 | 1 << 5 | 1 << 7 | 1 << 12 | 2 << 30 | 2 << 32
+            );
+            assert_eq!(
+                words[1] & mask,
+                1 | 1 << 5 | 1 << 7 | 32 << 18 | 3 << 30 | 2 << 32
+            );
+            assert_eq!(words[2] & mask, 7 | 2 << 5 | 6 << 7);
+            assert_eq!(
+                words[0] >> 46 & 0x1FFFF,
+                i64::from(crc32(b"halo 3")) & 0x1FFFF
+            );
+        }
+
+        #[test]
+        fn games_rows_score_candidates() {
+            let words = games_lookup_plan(&refs(&[
+                "Cyberpunk.2077.Ultimate.Edition-CODEX\tCyberpunk 2077\t2020",
+                "Portal.2.v1.0-XYZ\tPortal 2\t",
+            ]));
+            let mask = (1 << 42) - 1;
+            assert_eq!(
+                words[0] & mask,
+                1 | 513 << 2 | 2 << 13 | 1 << 15 | 66 << 17 | 1 << 24 | 1 << 30 | 2 << 36
+            );
+            assert_eq!(
+                words[1] & mask,
+                2 | 128 << 2 | 3 << 15 | 100 << 17 | 2 << 24 | 2 << 30 | 2 << 36
+            );
+        }
+
+        #[test]
+        fn title_rows_clean_and_compare() {
+            let words = game_title_parse_plan(&refs(&[
+                "The.Witcher.3.Wild.Hunt.v1.32.1.MULTi12-CODEX.iso\tThe Witcher 3 Wild Hunt",
+                "Game.Update.5.Build.1234-PLAZA\tGame",
+                "\tx",
+            ]));
+            let mask = (1 << 34) - 1;
+            assert_eq!(
+                words[0] & mask,
+                4 | 285 << 4 | 3 << 17 | 1 << 19 | 1 << 20 | 100 << 21 | 5 << 28
+            );
+            assert_eq!(
+                words[1] & mask,
+                108 << 4 | 3 << 17 | 1 << 19 | 1 << 20 | 100 << 21 | 1 << 28
+            );
+            assert_eq!(words[2], 0);
+        }
+
+        #[test]
+        fn exports_guard_null_short_and_malformed_batches() {
+            let mut out = [0i64; 64];
+            let o = out.as_mut_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w612_tv_categorize_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    33
+                );
+                assert_eq!(
+                    nntmux_w612_tv_categorize_plan_batch(b"a".as_ptr(), 1, 1, o, 32),
+                    -33
+                );
+                assert_eq!(
+                    nntmux_w612_xxx_categorize_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w612_console_lookup_plan_batch(std::ptr::null(), 0, 0, o, 64),
+                    30
+                );
+                assert_eq!(
+                    nntmux_w612_games_lookup_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        64
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w612_game_title_parse_plan_batch(std::ptr::null(), 1, 1, o, 64),
+                    -1
+                );
+            }
+        }
+    }
+}
