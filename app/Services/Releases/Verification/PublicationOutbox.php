@@ -6,8 +6,10 @@ namespace App\Services\Releases\Verification;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\File;
 use RuntimeException;
+use Throwable;
 
 /**
  * A remote worker host's queue of verified candidates waiting to be published, as files under
@@ -821,5 +823,266 @@ final class PublicationOutbox
                 @unlink($temporary);
             }
         }
+    }
+
+    // Rust is the default only while the paired W57.6 benchmark clears 1.5x on all four metrics.
+    private const bool W57_RUST_FFI_DEFAULT = true;
+
+    public const string W57_FFI_CDEF = <<<'C'
+        int32_t nntmux_w576_outbox_window_batch(const char *floats, size_t floats_len, const char *ints, size_t ints_len, size_t count, double now, double max_age, double margin, double max_backoff, int64_t cap, int64_t *out, size_t out_cap);
+        C;
+
+    private const int W57_MAX_ITEMS = 1_048_576;
+
+    public const int W57_WINDOW_HEADER = 14;
+
+    public const int W57_WINDOW_WIDTH = 2;
+
+    private const int W57_COUNT_CAP = 2_147_483_647;
+
+    private const float W57_MS_CAP = 4.5e15;
+
+    /**
+     * Classify pending entries the way {@see survey()} and {@see claim()} see them, given their
+     * enqueued-at and not-before times, attempts and deferrals (each clamped to 0..2^31-1). State bits
+     * as `entryStatePhp()`: due 1, expired 2, retried 4. Class 0 waiting (not due), 1 fresh, 2 expired,
+     * 3 retried; expired entries are always taken, due ones while fewer than `$cap` were.
+     *
+     * Layout: `[0]` count, `[1]` due, `[2]` expired, `[3]` retried, `[4]` fresh, `[5]` waiting, `[6]`
+     * taken, `[7]` first expired and `[8]` first retried index, `[9]` oldest due unexpired index, `[10]`
+     * earliest wake index (-1 when none), `[11]` earliest wake in ms from `$now` (0 when none), `[12]`
+     * failures, `[13]` FNV-1a digest; then two words per entry: `state | class << 3 | taken << 5 |
+     * min(failures, 2^20-1) << 6 | backoff_ms << 26` (the next backoff `min($maxBackoff, 2 ** (failures
+     * + 1))` in ms, clamped to 0..2^36-1) and the wake in ms (`enqueued + maxAge - margin`, or the
+     * earlier not-before, minus `$now`; 0 when expired).
+     *
+     * @param  array<array-key, float>  $enqueuedAt
+     * @param  array<array-key, float>  $notBefore
+     * @param  array<array-key, int>  $attempts
+     * @param  array<array-key, int>  $deferrals
+     * @return list<int>
+     */
+    public static function classifyEntryWindowBatch(array $enqueuedAt, array $notBefore, array $attempts, array $deferrals,
+        float $now, float $maxAge, float $margin = 0.0, float $maxBackoff = 30.0, int $cap = PHP_INT_MAX): array
+    {
+        return (self::usesW57RustFfi() ? self::classifyEntryWindowBatchNative($enqueuedAt, $notBefore, $attempts, $deferrals, $now, $maxAge, $margin, $maxBackoff, $cap) : null)
+            ?? self::classifyEntryWindowBatchPhp($enqueuedAt, $notBefore, $attempts, $deferrals, $now, $maxAge, $margin, $maxBackoff, $cap);
+    }
+
+    /**
+     * @param  array<array-key, float>  $enqueuedAt
+     * @param  array<array-key, float>  $notBefore
+     * @param  array<array-key, int>  $attempts
+     * @param  array<array-key, int>  $deferrals
+     * @return list<int>
+     */
+    public static function classifyEntryWindowBatchPhp(array $enqueuedAt, array $notBefore, array $attempts, array $deferrals,
+        float $now, float $maxAge, float $margin = 0.0, float $maxBackoff = 30.0, int $cap = PHP_INT_MAX): array
+    {
+        $enqueuedAt = array_values($enqueuedAt);
+        $notBefore = array_values($notBefore);
+        $attempts = array_values($attempts);
+        $deferrals = array_values($deferrals);
+        $count = \count($enqueuedAt);
+        $out = array_fill(0, self::W57_WINDOW_HEADER, 0);
+        $out[0] = $count;
+        $out[7] = $out[8] = $out[9] = $out[10] = -1;
+        $claimed = $wake = 0;
+        $oldest = 0.0;
+        $digest = 2_166_136_261;
+        $rows = [];
+        for ($at = 0; $at < $count; $at++) {
+            $enqueued = (float) $enqueuedAt[$at];
+            $waitUntil = (float) ($notBefore[$at] ?? 0.0);
+            $tried = (int) ($attempts[$at] ?? 0);
+            $tried = $tried < 0 ? 0 : ($tried > self::W57_COUNT_CAP ? self::W57_COUNT_CAP : $tried);
+            $deferred = (int) ($deferrals[$at] ?? 0);
+            $deferred = $deferred < 0 ? 0 : ($deferred > self::W57_COUNT_CAP ? self::W57_COUNT_CAP : $deferred);
+            $due = $waitUntil <= $now;
+            $expired = $now - $enqueued > $maxAge;
+            $retried = $tried > 0 || $deferred > 0;
+            $state = (int) $due | (int) $expired << 1 | (int) $retried << 2;
+            if ($expired) {
+                $out[2]++;
+                if ($out[7] < 0) {
+                    $out[7] = $at;
+                }
+                [$class, $taken] = [2, 1];
+            } elseif ($due) {
+                $taken = $claimed < $cap ? 1 : 0;
+                $claimed += $taken;
+                if ($retried) {
+                    $out[3]++;
+                    if ($out[8] < 0) {
+                        $out[8] = $at;
+                    }
+                } else {
+                    $out[4]++;
+                }
+                if ($out[9] < 0 || $enqueued < $oldest) {
+                    $out[9] = $at;
+                    $oldest = $enqueued;
+                }
+                $class = $retried ? 3 : 1;
+            } else {
+                $out[5]++;
+                [$class, $taken] = [0, 0];
+            }
+            $out[1] += (int) $due;
+            $out[6] += $taken;
+            $wakeMs = 0;
+            if (! $expired) {
+                $needs = $enqueued + $maxAge - $margin;
+                if (! $due && $waitUntil < $needs) {
+                    $needs = $waitUntil;
+                }
+                $wakeMs = self::w57Ms($needs - $now);
+                if ($out[10] < 0 || $wakeMs < $wake) {
+                    $out[10] = $at;
+                    $wake = $wakeMs;
+                }
+            }
+            $failures = $tried + $deferred;
+            $out[12] += $failures;
+            $power = 2.0 ** ($failures + 1);
+            $backoffMs = self::w57Ms($power < $maxBackoff ? $power : $maxBackoff);
+            $backoffMs = $backoffMs < 0 ? 0 : min($backoffMs, 68_719_476_735);
+            $row = $state | $class << 3 | $taken << 5 | min($failures, 1_048_575) << 6 | $backoffMs << 26;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+            $row = $wakeMs;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[11] = $wake;
+        $out[13] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust classification, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, float>  $enqueuedAt
+     * @param  array<array-key, float>  $notBefore
+     * @param  array<array-key, int>  $attempts
+     * @param  array<array-key, int>  $deferrals
+     * @return list<int>|null
+     */
+    public static function classifyEntryWindowBatchNative(array $enqueuedAt, array $notBefore, array $attempts, array $deferrals,
+        float $now, float $maxAge, float $margin = 0.0, float $maxBackoff = 30.0, int $cap = PHP_INT_MAX): ?array
+    {
+        $count = \count($enqueuedAt);
+        if ($count > self::W57_MAX_ITEMS || \count($notBefore) !== $count || \count($attempts) !== $count || \count($deferrals) !== $count) {
+            return null;
+        }
+        $floats = pack('e*', ...array_values($enqueuedAt), ...array_values($notBefore));
+        $ints = pack('q*', ...array_values($attempts), ...array_values($deferrals));
+        $fields = self::W57_WINDOW_HEADER + self::W57_WINDOW_WIDTH * $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w57Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w576_outbox_window_batch($floats, \strlen($floats), $ints, \strlen($ints), $count, $now, $maxAge, $margin, $maxBackoff, $cap, $out, $fields));
+    }
+
+    /** `$seconds * 1000.0` truncated toward zero, NaN as 0, clamped to ±4.5e15. */
+    private static function w57Ms(float $seconds): int
+    {
+        $ms = $seconds * 1000.0;
+        if (is_nan($ms)) {
+            return 0;
+        }
+
+        return (int) ($ms < -self::W57_MS_CAP ? -self::W57_MS_CAP : ($ms > self::W57_MS_CAP ? self::W57_MS_CAP : $ms));
+    }
+
+    /**
+     * Run `$callback` with the Wave 57.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW57RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w57RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w57RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW57RustFfi(): bool
+    {
+        $forced = self::w57RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W57_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 57.6 routing and binding in function statics (shared by every Wave 57.6 target, including readonly classes and enums).
+     * No `$op` returns the forced routing (null for the default); `'set'` replaces it with `$val`
+     * and returns the previous value; `'binding'` returns the cached `additional_w57` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w57RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w57', self::W57_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 57.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w57Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w57RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
     }
 }
