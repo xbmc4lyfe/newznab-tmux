@@ -1748,4 +1748,302 @@ class BinariesService
                 return $enabled;
         }
     }
+
+    // ========================================================================
+    // WAVE 66.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 8.03x, p99 6.40x; uncommon mean 7.08x, p99 5.39x); see RustBackfillBinariesConfigServiceHandlerW66ParityTest. */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    public const string W66_BINARIES_SERVICE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w661_binaries_service_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w66BinariesServicePlanBatch(). */
+    public const int W66_BINARIES_SERVICE_TRAILER = 21;
+
+    public static function usesW66RustFfi(): bool
+    {
+        $override = self::w66RustFfiState();
+
+        return \is_bool($override) ? $override : self::W66_RUST_FFI_DEFAULT;
+    }
+
+    /** Forces the BinariesService Wave 66 Rust path on until reset. */
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', true);
+    }
+
+    /** Forces the BinariesService Wave 66 PHP path until reset. */
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', false);
+    }
+
+    /** Restores the benchmark default and drops the cached library handle and scratch buffers; earlier toggles are untouched. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('reset');
+    }
+
+    /**
+     * Runs $callback with the BinariesService Wave 66 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 66.1 group scan plans, one per `last_record|server_first|server_last|max_headers|buffer|messages_to_scan|
+     * missing_parts|repair_limit` row (trimmed fields of 1-15 digits; empty numbers 0, buffer empty or 0 is 20000, messages
+     * empty 50000, repair limit empty 15000). A new group (no last record) scans from `max(server_first, server_last -
+     * (messages + buffer))` to `server_last - buffer`; an existing group leaves `count % buffer + buffer` (or `count / 2` for
+     * at most two buffers) of the `server_last - last_record` new articles. A positive header cap shortens the range. Decision:
+     * 0 empty row, 1 malformed number, 2 server range inverted, 3 nothing to scan, 4 new group, 5 capped, 6 existing group.
+     * Ranges split into `ceil(total / buffer)` chunks and part repair takes `min(missing, limit)` parts. Flags: 1 new group,
+     * 2 capped, 4 buffer defaulted, 8 repair truncated, 16 last record beyond the server's newest, 32 last record below its
+     * oldest, 64 non-ASCII, 128 control byte. Per item `decision | flags << 3 | min(chunks, 65535) << 11 | min(total, 1048575)
+     * << 27 | min(repair, 32767) << 47`; then 7 decision and 8 flag counts, the article and chunk sums, the largest range, the
+     * leave-over and repair sums and the largest chunk count.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66BinariesServicePlanBatch(array $items): array
+    {
+        return self::usesW66RustFfi() ? self::w66BinariesServicePlanBatchNative($items) : self::w66BinariesServicePlanBatchPhp($items);
+    }
+
+    /**
+     * Rust plan; falls back to the PHP reference when the library is missing or the call declines.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66BinariesServicePlanBatchNative(array $items): array
+    {
+        return self::w66Invoke($items, \count($items) + self::W66_BINARIES_SERVICE_TRAILER) ?? self::w66BinariesServicePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w66BinariesServicePlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W66_BINARIES_SERVICE_TRAILER, 0);
+        foreach ($items as $item) {
+            $item = (string) $item;
+            [$rawLast, $rawOldest, $rawNewest, $rawMax, $rawBuffer, $rawMessages, $rawMissing, $rawLimit] = explode('|', $item, 8)
+                + ['', '', '', '', '', '', '', ''];
+            $lastRecord = self::w66Uint($rawLast, 0);
+            $oldest = self::w66Uint($rawOldest, 0);
+            $newest = self::w66Uint($rawNewest, 0);
+            $maxHeaders = self::w66Uint($rawMax, 0);
+            $buffer = self::w66Uint($rawBuffer, 20_000);
+            $messages = self::w66Uint($rawMessages, 50_000);
+            $missing = self::w66Uint($rawMissing, 0);
+            $limit = self::w66Uint($rawLimit, 15_000);
+            $malformed = $lastRecord < 0 || $oldest < 0 || $newest < 0 || $maxHeaders < 0 || $buffer < 0 || $messages < 0 || $missing < 0 || $limit < 0;
+            $defaulted = $buffer === 0;
+            if ($defaulted) {
+                $buffer = 20_000;
+            }
+            $isNew = $lastRecord === 0;
+            $decision = match (true) {
+                trim($item) === '' => 0,
+                $malformed => 1,
+                $newest < $oldest => 2,
+                default => 3,
+            };
+            $total = $leave = 0;
+            $capped = false;
+            if ($decision === 3) {
+                if ($isNew) {
+                    $first = max($oldest, $newest - ($messages + $buffer));
+                    $last = max($newest - $buffer, $first);
+                    $leave = $buffer;
+                    if ($maxHeaders > 0 && $last - $first > $maxHeaders) {
+                        $last = $first + $maxHeaders;
+                        $capped = true;
+                    }
+                } else {
+                    $first = $lastRecord;
+                    $count = $newest - $first;
+                    $leave = $count > $buffer * 2 ? $count % $buffer + $buffer : intdiv($count, 2);
+                    $last = max($newest - $leave, $first);
+                    if ($maxHeaders > 0 && $maxHeaders < $last - $first) {
+                        $last = $first + $maxHeaders;
+                        $capped = true;
+                    }
+                }
+                $total = $last - $first;
+                $decision = match (true) {
+                    $total <= 0 => 3,
+                    $capped => 5,
+                    $isNew => 4,
+                    default => 6,
+                };
+            }
+            $chunks = $total > 0 ? intdiv($total + $buffer - 1, $buffer) : 0;
+            $repair = $malformed ? 0 : min($missing, $limit);
+            $flags = ($decision >= 3 && $isNew ? 1 : 0) | ($capped ? 2 : 0) | ($defaulted ? 4 : 0) | (! $malformed && $missing > $limit ? 8 : 0)
+                | (! $malformed && $lastRecord > $newest ? 16 : 0) | (! $malformed && $lastRecord > 0 && $lastRecord < $oldest ? 32 : 0)
+                | (preg_match('/[\x80-\xff]/', $item) === 1 ? 64 : 0) | (strcspn($item, self::W66_CONTROL_BYTES) !== \strlen($item) ? 128 : 0);
+            $tail[$decision]++;
+            for ($b = 0; $b < 8; $b++) {
+                $tail[7 + $b] += $flags >> $b & 1;
+            }
+            $tail[15] += min($total, 1 << 40);
+            $tail[16] += min($chunks, 1 << 40);
+            $tail[17] = max($tail[17], $total);
+            $tail[18] += max(0, min($leave, 1 << 40));
+            $tail[19] += min($repair, 1 << 40);
+            $tail[20] = max($tail[20], $chunks);
+            $out[] = $decision | $flags << 3 | min($chunks, 65_535) << 11 | min($total, 1_048_575) << 27 | min($repair, 32_767) << 47;
+        }
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    private const string W66_DIGITS = '0123456789';
+
+    private const string W66_CONTROL_BYTES = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F";
+
+    /** A trimmed field of 1-15 digits; empty is $empty, anything else -1. */
+    private static function w66Uint(string $raw, int $empty): int
+    {
+        $value = trim($raw);
+        if ($value === '') {
+            return $empty;
+        }
+        $length = \strlen($value);
+
+        return $length <= 15 && strspn($value, self::W66_DIGITS) === $length ? (int) $value : -1;
+    }
+
+    /**
+     * Wave 66 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'reset' clears the override, library handle and buffers, 'ffi'
+     * resolves the library (null when unavailable) and 'out' and 'lens' return `int64_t` output and
+     * length-column buffers of at least $val words.
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('binaries_service_w661', self::W66_BINARIES_SERVICE_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w66RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w66RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 66.1 BinariesService export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w66Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w66RustFfiState('ffi');
+            $out = self::w66RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w66RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W66_BINARIES_SERVICE_FFI_CDEF.)
+            $written = $ffi->nntmux_w661_binaries_service_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
