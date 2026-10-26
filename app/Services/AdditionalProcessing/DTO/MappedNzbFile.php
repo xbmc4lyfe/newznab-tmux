@@ -640,4 +640,351 @@ final class MappedNzbFile
 
         return $values === false ? null : array_values($values);
     }
+
+    // ========================================================================
+    // WAVE 64.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 4.41x, p99 3.48x; uncommon mean 4.65x, p99 4.17x); see RustAdditionalDownloadMetricsArchiveImageMappedNzbSourceHintsW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    public const string W64_MAPPED_NZB_FILE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w643_mapped_nzb_file_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 64.3 batch. */
+    public const int W64_MAPPED_NZB_FILE_TRAILER = 18;
+
+    /** Cap for the Wave 64.3 running totals. */
+    private const int W64_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    private const array W64_MEDIA_EXTENSIONS = ['mkv' => true, 'mp4' => true, 'avi' => true, 'm4v' => true, 'ts' => true, 'wmv' => true, 'mov' => true, 'mpg' => true, 'mpeg' => true];
+
+    private const array W64_ARCHIVE_EXTENSIONS = ['rar' => true, 'zip' => true, '7z' => true];
+
+    private const array W64_SIDECAR_EXTENSIONS = ['nfo' => true, 'sfv' => true, 'txt' => true, 'srr' => true, 'jpg' => true, 'png' => true];
+
+    /** Lower-cased MappingConfidence value => code (empty 0, anything else 3). */
+    private const array W64_CONFIDENCES = ['verified' => 1, 'unique-size' => 2];
+
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restores W64_RUST_FFI_DEFAULT and drops the cached library handle and scratch buffers. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $override = self::w64RustFfiState();
+
+        return \is_bool($override) ? $override : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the MappedNzbFile Wave 64 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 64.3 PAR2-to-NZB mapped file confidence, segment completeness and role plans. Each item is `par2Name|subject|
+     * par2Size|nzbSize|segmentsPresent|segmentsTotal|confidence`. The subject name is its first `"`-quoted part, else the
+     * subject, trimmed; the name match against the trimmed PAR2 name is 0 when either is empty, 1 equal, 2 equal ignoring
+     * case, 3 equal non-empty stems (text before the last `.`) ignoring case, else 4. Sizes (up to 12 digits) and segment
+     * counts (up to 6) are 0 empty, 1 trimmed digits, 2 other; the size match is 0 unless both sizes are valid, then 1
+     * equal, 2 an NZB size above the PAR2 size by at most 10% (yEnc overhead), else 3. Completeness is present segments per
+     * mille of the total (capped at 1000, 0 without a total), missing segments the shortfall. The trimmed confidence is 0
+     * empty, 1 `verified`, 2 `unique-size` (any case), else 3. The role of the PAR2 name is 2 a `.par2` index or 3 one
+     * holding `.vol`, 1 media (mkv/mp4/avi/m4v/ts/wmv/mov/mpg/mpeg) or 6 media with a `sample` token, 4 an archive (rar/zip/
+     * 7z/rNN/NNN), 5 a sidecar (nfo/sfv/txt/srr/jpg/png), else 0. The score is 60/40 for confidence 1/2 + 30/25/15 for
+     * name matches 1/2/3 + 10/5/-20 for size matches 1/2/3 - 20 for a name mismatch, clamped to 0-100; the status is 0
+     * ready (score 60+, complete with a total), 1 repairable (score 60+, some segments), 2 weak (score 30+), else 3 reject.
+     * Per item `role | nameMatch << 3 | par2SizeState << 6 | nzbSizeState << 8 | sizeMatch << 10 | presentState << 12 |
+     * totalState << 14 | confidence << 16 | status << 18 | score << 20 | completeness << 27 | min(missing, 65535) << 37 |
+     * min(subjectNameLength, 255) << 53`. Then the seven role counts, the four confidence counts, the four status counts,
+     * the missing segments, the ready PAR2 bytes (capped at 2^62) and the distinct PAR2 names (case-insensitive).
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64MappedNzbFilePlanBatch(array $items): array
+    {
+        return self::usesW64RustFfi() ? self::w64MappedNzbFilePlanBatchNative($items) : self::w64MappedNzbFilePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64MappedNzbFilePlanBatchNative(array $items): array
+    {
+        return self::w64Invoke($items, \count($items) + self::W64_MAPPED_NZB_FILE_TRAILER) ?? self::w64MappedNzbFilePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64MappedNzbFilePlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $roles = [0, 0, 0, 0, 0, 0, 0];
+        $confidences = [0, 0, 0, 0];
+        $statuses = [0, 0, 0, 0];
+        $missingSum = $readyBytes = 0;
+        $names = [];
+        foreach ($items as $item) {
+            [$rawPar2, $rawSubject, $rawPar2Size, $rawNzbSize, $rawPresent, $rawTotal, $rawConfidence]
+                = explode('|', (string) $item, 7) + ['', '', '', '', '', '', ''];
+            $par2 = trim($rawPar2);
+            $lower = strtolower($par2);
+            $subject = self::w64SubjectName($rawSubject);
+            if ($par2 === '' || $subject === '') {
+                $nameMatch = 0;
+            } elseif ($par2 === $subject) {
+                $nameMatch = 1;
+            } elseif ($lower === strtolower($subject)) {
+                $nameMatch = 2;
+            } else {
+                $stem = self::w64Stem($lower);
+                $nameMatch = $stem !== '' && $stem === strtolower(self::w64Stem($subject)) ? 3 : 4;
+            }
+            [$par2SizeState, $par2Size] = self::w64Count($rawPar2Size, 12);
+            [$nzbSizeState, $nzbSize] = self::w64Count($rawNzbSize, 12);
+            if ($par2SizeState !== 1 || $nzbSizeState !== 1) {
+                $sizeMatch = 0;
+            } elseif ($par2Size === $nzbSize) {
+                $sizeMatch = 1;
+            } else {
+                $sizeMatch = $nzbSize > $par2Size && $nzbSize * 10 <= $par2Size * 11 ? 2 : 3;
+            }
+            [$presentState, $present] = self::w64Count($rawPresent, 6);
+            [$totalState, $total] = self::w64Count($rawTotal, 6);
+            $completeness = $total > 0 ? min(intdiv($present * 1000, $total), 1000) : 0;
+            $missing = max($total - $present, 0);
+            $confidenceText = strtolower(trim($rawConfidence));
+            $confidence = $confidenceText === '' ? 0 : (self::W64_CONFIDENCES[$confidenceText] ?? 3);
+            $role = self::w64Role($lower);
+            $score = max(0, min(100, [0, 60, 40, 0][$confidence] + [0, 30, 25, 15, 0][$nameMatch] + [0, 10, 5, -20][$sizeMatch]
+                - ($nameMatch === 4 ? 20 : 0)));
+            if ($score >= 60 && $completeness === 1000 && $total > 0) {
+                $status = 0;
+            } elseif ($score >= 60 && $completeness > 0) {
+                $status = 1;
+            } else {
+                $status = $score >= 30 ? 2 : 3;
+            }
+            $roles[$role]++;
+            $confidences[$confidence]++;
+            $statuses[$status]++;
+            $missingSum += $missing;
+            if ($status === 0) {
+                $readyBytes = min($readyBytes + $par2Size, self::W64_TOTAL_CAP);
+            }
+            if ($par2 !== '') {
+                $names[$lower] = true;
+            }
+            $out[] = $role | $nameMatch << 3 | $par2SizeState << 6 | $nzbSizeState << 8 | $sizeMatch << 10 | $presentState << 12
+                | $totalState << 14 | $confidence << 16 | $status << 18 | $score << 20 | $completeness << 27 | min($missing, 65_535) << 37
+                | min(\strlen($subject), 255) << 53;
+        }
+        array_push($out, ...$roles, ...$confidences, ...$statuses);
+        array_push($out, $missingSum, $readyBytes, \count($names));
+
+        return $out;
+    }
+
+    /** The first `"`-quoted part of a subject, else the subject; trimmed. */
+    private static function w64SubjectName(string $subject): string
+    {
+        $open = strpos($subject, '"');
+        if ($open !== false && ($close = strpos($subject, '"', $open + 1)) !== false) {
+            return trim(substr($subject, $open + 1, $close - $open - 1));
+        }
+
+        return trim($subject);
+    }
+
+    /** The text before the last `.` (all of it without one). */
+    private static function w64Stem(string $name): string
+    {
+        $dot = strrpos($name, '.');
+
+        return $dot === false ? $name : substr($name, 0, $dot);
+    }
+
+    /** Role of a lower-cased PAR2 name, as w64MappedNzbFilePlanBatch() documents. */
+    private static function w64Role(string $lower): int
+    {
+        $dot = strrpos($lower, '.');
+        $extension = $dot === false ? '' : substr($lower, $dot + 1);
+        if ($extension === 'par2') {
+            return str_contains($lower, '.vol') ? 3 : 2;
+        }
+        if (isset(self::W64_MEDIA_EXTENSIONS[$extension])) {
+            return preg_match('/(?:^|[^a-z0-9])sample(?:[^a-z0-9]|$)/', $lower) === 1 ? 6 : 1;
+        }
+        if (isset(self::W64_ARCHIVE_EXTENSIONS[$extension]) || (\strlen($extension) === 3 && $extension[0] === 'r' && self::w64Digits(substr($extension, 1), 2, 2) !== null)
+            || self::w64Digits($extension, 3, 3) !== null) {
+            return 4;
+        }
+
+        return isset(self::W64_SIDECAR_EXTENSIONS[$extension]) ? 5 : 0;
+    }
+
+    /**
+     * (0 empty, 1 one to $max ASCII digits, 2 other; the value) for the trimmed field.
+     *
+     * @return array{int, int}
+     */
+    private static function w64Count(string $text, int $max): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $value = self::w64Digits($text, 1, $max);
+
+        return $value === null ? [2, 0] : [1, $value];
+    }
+
+    /** $min to $max ASCII digits as their value, else null. */
+    private static function w64Digits(string $text, int $min, int $max): ?int
+    {
+        $length = \strlen($text);
+
+        return $length >= $min && $length <= $max && strspn($text, '0123456789') === $length ? (int) $text : null;
+    }
+
+    /**
+     * Wave 64 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and returns the
+     * previous override, 'reset' clears the override, library handle and buffers, 'ffi' resolves the library
+     * (null when unavailable) and 'out' and 'lens' return `int64_t` output and length-column buffers of at least
+     * $val words.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w643', self::W64_MAPPED_NZB_FILE_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 64.3 MappedNzbFile export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call declines
+     * or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w64Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w64RustFfiState('ffi');
+            $out = self::w64RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w64RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W64_MAPPED_NZB_FILE_FFI_CDEF.)
+            $written = $ffi->nntmux_w643_mapped_nzb_file_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
