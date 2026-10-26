@@ -20,10 +20,12 @@ use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Support\NzbPasswordMetadata;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 use RuntimeException;
 use Throwable;
 
@@ -865,5 +867,264 @@ final class VerifiedReleasePublisher
         DB::afterCommit(function () use ($candidate): void {
             app(ManifestStore::class)->deleteIfUnreferenced($candidate->manifest_path);
         });
+    }
+
+    // ========================================================================
+    // WAVE 59.4 BATCH HELPER
+    // ========================================================================
+
+    /** Disabled: the minimum of four paired runs reached only 1.20x common mean, 0.91x common p99, 0.98x uncommon mean and 0.99x uncommon p99, since validating, extracting and packing sixteen fields per record costs about as much as the PHP gates; see RustVerificationLockWorkerLocksVerifiedArticleNzbWriterPublisherW59ParityTest. */
+    public const bool W59_RUST_FFI_DEFAULT = false;
+
+    public const string W59_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w594_publication_row_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** int64 words per publicationPlanRowBatch() record. */
+    public const int W59_ROW_WORDS = 7;
+
+    /** int64 summary words after the publicationPlanRowBatch() records (none for an empty batch). */
+    public const int W59_TRAILER_WORDS = 8;
+
+    private const string W59_CONTROL = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f";
+
+    private const string W59_HEX = '0123456789abcdefABCDEF';
+
+    /**
+     * Publication plan rows for [name, candidate manifest hash, claim manifest hash, candidate
+     * lease token, claim lease token, lease until, now, candidate version, claim version,
+     * category id, size, minimum size, maximum size (0 unlimited), found files, expected files,
+     * minimum completion (basis points)] items. Guard bits follow publicationGuardPhp(): 1
+     * versions match, 2 manifest hashes match, 4 lease tokens match, 8 lease present (non-empty),
+     * 16 lease current (`strcmp(lease, now) >= 0`); all five (31) keep the claim. A name is
+     * publishable at 1-255 bytes of UTF-8 without control bytes and not only spaces; 16, 32, 40
+     * or 64 hex digits mark it obfuscated. Category 0 regular, 1 parent (x000, rejected), 2
+     * other (x999, 10 or 20), 3 unknown (rejected); size 0 ok, 1 below the minimum, 2 above the
+     * maximum, 3 empty. Completion is min(10000, found * 10000 / expected) basis points with
+     * counts clamped to 0..2^40 (0 without expected files), complete at the clamped minimum.
+     *
+     * Outcome 0 publish, 1 lost claim, 2 incomplete, 3 size rejected, 4 category rejected, 5
+     * name rejected, checked in the order 1, 5, 4, 3, 2. Rows [outcome, guard bits, category |
+     * size << 2, completion, name flags (1 publishable, 2 obfuscated, 4 invalid UTF-8, 8 control
+     * bytes, 16 blank), name length, score (completion / 100, +50 unless obfuscated, +25 regular
+     * or +10 other category, 0 unless published)], then the trailer [per outcome 0-5,
+     * publishable bytes (saturating), FNV-1a digest of `outcome | guard << 3 | completion << 8 |
+     * name flags << 22`].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: string, 6: string, 7: int, 8: int, 9: int, 10: int, 11: int, 12: int, 13: int, 14: int, 15: int}>  $items
+     * @return list<int>
+     */
+    public static function publicationPlanRowBatch(array $items): array
+    {
+        return self::usesW59RustFfi() ? self::publicationPlanRowBatchNative($items) : self::publicationPlanRowBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: string, 6: string, 7: int, 8: int, 9: int, 10: int, 11: int, 12: int, 13: int, 14: int, 15: int}>  $items
+     * @return list<int>
+     */
+    public static function publicationPlanRowBatchPhp(array $items): array
+    {
+        self::w59Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $summary = [0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        foreach ($items as [$name, $candidateHash, $claimHash, $candidateToken, $claimToken, $leaseUntil, $now, $candidateVersion, $claimVersion,
+            $category, $size, $minSize, $maxSize, $found, $expected, $minCompletion]) {
+            $guard = ($candidateVersion === $claimVersion ? 1 : 0) | ($candidateHash === $claimHash ? 2 : 0) | ($candidateToken === $claimToken ? 4 : 0)
+                | ($leaseUntil !== '' ? 8 : 0) | ($leaseUntil !== '' && strcmp($leaseUntil, $now) >= 0 ? 16 : 0);
+            $length = \strlen($name);
+            $utf8 = mb_check_encoding($name, 'UTF-8');
+            $control = strcspn($name, self::W59_CONTROL) !== $length;
+            $blank = strspn($name, ' ') === $length;
+            $nameOk = $length <= 255 && $utf8 && ! $control && ! $blank;
+            $obfuscated = ($length === 16 || $length === 32 || $length === 40 || $length === 64) && strspn($name, self::W59_HEX) === $length;
+            $categoryClass = $category === 10 || $category === 20 ? 2
+                : ($category >= 1000 && $category <= 9999 ? match ($category % 1000) {
+                    0 => 1,
+                    999 => 2,
+                    default => 0,
+                } : 3);
+            $sizeClass = $size < 1 ? 3 : ($size < $minSize ? 1 : ($maxSize > 0 && $size > $maxSize ? 2 : 0));
+            $found = max(0, min($found, 1 << 40));
+            $expected = max(0, min($expected, 1 << 40));
+            $basis = $expected === 0 ? 0 : min(10_000, intdiv($found * 10_000, $expected));
+            $complete = $expected > 0 && $basis >= max(0, min($minCompletion, 10_000));
+            $outcome = match (true) {
+                $guard !== 31 => 1,
+                ! $nameOk => 5,
+                $categoryClass === 1 || $categoryClass === 3 => 4,
+                $sizeClass !== 0 => 3,
+                ! $complete => 2,
+                default => 0,
+            };
+            $score = $outcome === 0 ? intdiv($basis, 100) + ($obfuscated ? 0 : 50) + ($categoryClass === 0 ? 25 : 10) : 0;
+            $nameFlags = ($nameOk ? 1 : 0) | ($obfuscated ? 2 : 0) | ($utf8 ? 0 : 4) | ($control ? 8 : 0) | ($blank ? 16 : 0);
+            array_push($out, $outcome, $guard, $categoryClass | $sizeClass << 2, $basis, $nameFlags, $length, $score);
+            $summary[$outcome]++;
+            if ($outcome === 0) {
+                $summary[6] = $size > PHP_INT_MAX - $summary[6] ? PHP_INT_MAX : $summary[6] + $size;
+            }
+            $value = $outcome | $guard << 3 | $basis << 8 | $nameFlags << 22;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $summary[7] = $digest;
+
+        return [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: string, 6: string, 7: int, 8: int, 9: int, 10: int, 11: int, 12: int, 13: int, 14: int, 15: int}>  $items
+     * @return list<int>
+     */
+    public static function publicationPlanRowBatchNative(array $items): array
+    {
+        self::w59Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w59Join(array_map(static fn (int $field): array => array_column($items, $field), range(0, 6)), $count);
+        $ints = pack('P*', ...array_column($items, 7), ...array_column($items, 8), ...array_column($items, 9), ...array_column($items, 10), ...array_column($items, 11), ...array_column($items, 12), ...array_column($items, 13), ...array_column($items, 14), ...array_column($items, 15));
+
+        return self::w59Call($blob, $twin, $ints, $count, $count * self::W59_ROW_WORDS + self::W59_TRAILER_WORDS)
+            ?? self::publicationPlanRowBatchPhp($items);
+    }
+
+    public static function usesW59RustFfi(): bool
+    {
+        $enabled = self::w59RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W59_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W59 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW59RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w59RustFfiState('enabled');
+        self::w59RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w59RustFfiState('enabled', $previous);
+        }
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w59Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W59 publication plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 16 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1])
+                || ! \is_string($item[2]) || ! \is_string($item[3]) || ! \is_string($item[4]) || ! \is_string($item[5])
+                || ! \is_string($item[6]) || ! \is_int($item[7]) || ! \is_int($item[8]) || ! \is_int($item[9]) || ! \is_int($item[10])
+                || ! \is_int($item[11]) || ! \is_int($item[12]) || ! \is_int($item[13]) || ! \is_int($item[14]) || ! \is_int($item[15])) {
+                throw new InvalidArgumentException('W59 publication plan batch items must be [7 strings (name, candidate hash, claim hash, candidate token, claim token, lease until, now) then 9 ints (candidate version, claim version, category, size, min size, max size, found, expected, min completion)] lists.');
+            }
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w59Join(array $columns, int $count): array
+    {
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\0", $column);
+        }
+        $joined = implode("\0", $parts);
+        if (substr_count($joined, "\0") === \count($columns) * $count - 1) {
+            return [$joined, ''];
+        }
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\x01", $column);
+        }
+
+        return [$joined, implode("\x01", $parts)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w59Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w59RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w59', self::W59_FFI_CDEF) ?? false;
+            self::w59RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w59RustFfiState('out', $out);
+                self::w59RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W59_FFI_CDEF.)
+            $written = $ffi->nntmux_w594_publication_row_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w59RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W59 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static: no arguments returns the state, one argument reads a key ('reset'
+     * clears everything) and two arguments write a key.
+     */
+    private static function w59RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
     }
 }
