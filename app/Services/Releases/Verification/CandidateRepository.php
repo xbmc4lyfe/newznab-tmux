@@ -2234,7 +2234,7 @@ final class CandidateRepository
             }
         }
         if ($positions !== []) {
-            array_multisort($nexts, SORT_ASC, SORT_NUMERIC, $windowIds, SORT_ASC, SORT_NUMERIC, $positions);
+            array_multisort($nexts, SORT_ASC, SORT_REGULAR, $windowIds, SORT_ASC, SORT_REGULAR, $positions);
             foreach ($positions as $rank => $i) {
                 $out[5 * $i + 3] = $rank;
                 if ($rank < self::W63_CLAIM_WINDOW) {
