@@ -615,4 +615,173 @@ class RedisProbe implements ServiceProbeInterface
             return null;
         }
     }
+
+    /**
+     * Enabled: the paired benchmark in the W56 parity test measures 4.365x common mean, 3.336x
+     * common p99, 2.838x uncommon mean and 3.355x uncommon p99 (per-metric minimum of three runs),
+     * above the 1.5x rule.
+     */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    private const string W56_FFI_CDEF = 'ssize_t nntmux_w561_redis_info_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** Integer `INFO` fields, in output order. */
+    public const array W56_INFO_INT_KEYS = ['used_memory', 'maxmemory', 'connected_clients', 'instantaneous_ops_per_sec', 'keyspace_hits', 'keyspace_misses'];
+
+    /** Words per `INFO` payload in infoWords(). */
+    public const int W56_INFO_WORDS = 9;
+
+    /** Memory use (permille of maxmemory) at which a payload is degraded. */
+    public const int W56_INFO_DEGRADED_PERMILLE = 900;
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 56 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Parses Redis `INFO` payloads (`/\r?\n/` lines, `#` section headers skipped, `key:value`
+     * fields, the last duplicate winning). Nine words per payload: the W56_INFO_INT_KEYS values
+     * (-1 when missing or not 1-15 digits), `role | link << 2 | health << 4` (role: missing 0,
+     * master 1, slave 2, other 3; master_link_status: missing 0, up 1, down 2, other 3; health:
+     * 0 healthy, 1 degraded for a replica whose link is not up or memory use at
+     * W56_INFO_DEGRADED_PERMILLE, 2 unhealthy without used_memory or connected_clients), the
+     * keyspace hit rate and the used/max memory ratio in permille (-1 when undefined).
+     *
+     * @param  array<array-key, string>  $payloads
+     * @return list<int>
+     */
+    public static function infoWords(array $payloads): array
+    {
+        return self::usesW56RustFfi() ? self::infoWordsNative($payloads) : self::infoWordsPhp($payloads);
+    }
+
+    /**
+     * @param  array<array-key, string>  $payloads
+     * @return list<int>
+     */
+    public static function infoWordsPhp(array $payloads): array
+    {
+        $words = [];
+        foreach ($payloads as $payload) {
+            $fields = [];
+            foreach (preg_split('/\r?\n/', $payload) ?: [] as $line) {
+                if ($line === '' || $line[0] === '#') {
+                    continue;
+                }
+                $colon = strpos($line, ':');
+                if ($colon !== false) {
+                    $fields[substr($line, 0, $colon)] = substr($line, $colon + 1);
+                }
+            }
+            $ints = [];
+            foreach (self::W56_INFO_INT_KEYS as $key) {
+                $value = $fields[$key] ?? null;
+                $ints[] = $value !== null && preg_match('/\A\d{1,15}\z/', $value) === 1 ? (int) $value : -1;
+            }
+            [$used, $max, $clients, , $hits, $misses] = $ints;
+            $role = match ($fields['role'] ?? null) {
+                null => 0,
+                'master' => 1,
+                'slave' => 2,
+                default => 3,
+            };
+            $link = match ($fields['master_link_status'] ?? null) {
+                null => 0,
+                'up' => 1,
+                'down' => 2,
+                default => 3,
+            };
+            $hitRate = $hits >= 0 && $misses >= 0 && $hits + $misses > 0 ? intdiv($hits * 1000, $hits + $misses) : -1;
+            $memory = $used >= 0 && $max > 0 ? intdiv($used * 1000, $max) : -1;
+            $health = match (true) {
+                $used < 0 || $clients < 0 => 2,
+                ($role === 2 && $link !== 1) || $memory >= self::W56_INFO_DEGRADED_PERMILLE => 1,
+                default => 0,
+            };
+            array_push($words, ...$ints);
+            array_push($words, $role | $link << 2 | $health << 4, $hitRate, $memory);
+        }
+
+        return $words;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $payloads
+     * @return list<int>
+     */
+    public static function infoWordsNative(array $payloads): array
+    {
+        $count = \count($payloads);
+        $words = 9 * $count;
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w56RustFfiState('out', $words);
+        if ($buffer === null) {
+            return self::infoWordsPhp($payloads);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $payloads);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w561_redis_info_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', FFI::string($out, $words * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::infoWordsPhp($payloads);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 56 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('redis_probe_w56', self::W56_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
+    }
 }

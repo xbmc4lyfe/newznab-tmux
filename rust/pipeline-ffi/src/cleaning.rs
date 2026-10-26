@@ -41936,3 +41936,535 @@ pub mod w551_regex_release_cleaning_remover_nntp_framer {
         }
     }
 }
+
+pub mod w561_prometheus_tmux_snapshot_probe_result_redis_registry {
+    //! Wave 56.1 per-row batch kernels for Prometheus exposition tokens, tmux snapshot lags,
+    //! probe result details, Redis `INFO` payloads and service probe identifiers. Every export
+    //! reads `count` NUL-joined rows, writes a fixed number of `i64` words per row into `out` and
+    //! returns `count`, `SHORT_CAPACITY` when `out_cap` (in words) is too small, or -1 for a
+    //! malformed batch (a row holding a NUL byte splits into extra rows and is malformed, so PHP
+    //! falls back to its own implementation).
+
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+    pub const SHORT_CAPACITY: isize = -2;
+
+    /// TextFormatter token word: flags plus the escaped label value length `<< TOKEN_LENGTH_SHIFT`.
+    pub const TOKEN_METRIC_NAME: i64 = 1;
+    pub const TOKEN_LABEL_NAME: i64 = 2;
+    pub const TOKEN_RESERVED_LABEL: i64 = 4;
+    pub const TOKEN_LABEL_ESCAPE: i64 = 8;
+    pub const TOKEN_HELP_ESCAPE: i64 = 16;
+    pub const TOKEN_LENGTH_SHIFT: u32 = 8;
+
+    /// TmuxMetricsSnapshot lag: `$now` is clamped to `0..=MAX_NOW`; unparseable stamps give -1.
+    pub const MAX_NOW: i64 = 1 << 62;
+
+    /// ProbeResult detail word: `class | long << 2 | non_ascii << 3 | length << DETAIL_LENGTH_SHIFT`.
+    pub const DETAIL_HEALTHY: i64 = 0;
+    pub const DETAIL_DEGRADED: i64 = 1;
+    pub const DETAIL_UNHEALTHY: i64 = 2;
+    pub const DETAIL_LONG: i64 = 4;
+    pub const DETAIL_NON_ASCII: i64 = 8;
+    pub const DETAIL_LENGTH_SHIFT: u32 = 8;
+    pub const DETAIL_LONG_BYTES: usize = 120;
+    pub const UNHEALTHY_WORDS: [&[u8]; 6] = [b"unreachable", b"refused", b"failed", b"error", b"timed out", b"timeout"];
+    pub const DEGRADED_WORDS: [&[u8]; 6] = [b"slow", b"degraded", b"lagging", b"behind", b"warning", b"skipping"];
+
+    /// RedisProbe INFO words per payload: used_memory, maxmemory, connected_clients,
+    /// instantaneous_ops_per_sec, keyspace_hits, keyspace_misses (each -1 when missing or not
+    /// 1-15 digits), `role | link << 2 | health << 4`, hit-rate and memory permille (-1 when
+    /// undefined).
+    pub const INFO_WORDS: usize = 9;
+    pub const INFO_INT_KEYS: [&[u8]; 6] = [
+        b"used_memory",
+        b"maxmemory",
+        b"connected_clients",
+        b"instantaneous_ops_per_sec",
+        b"keyspace_hits",
+        b"keyspace_misses",
+    ];
+    pub const INFO_DEGRADED_PERMILLE: i64 = 900;
+
+    /// ServiceProbeRegistry identifier word: `valid | normalized << 1 | (known index + 1) << 4 |
+    /// normalized length << IDENTIFIER_LENGTH_SHIFT`.
+    pub const IDENTIFIER_VALID: i64 = 1;
+    pub const IDENTIFIER_NORMALIZED: i64 = 2;
+    pub const IDENTIFIER_KNOWN_SHIFT: u32 = 4;
+    pub const IDENTIFIER_LENGTH_SHIFT: u32 = 8;
+    pub const PROBE_IDENTIFIERS: [&[u8]; 6] = [b"database", b"redis", b"search", b"nntp", b"queue", b"disk"];
+
+    fn overlaps(input: *const u8, len: usize, out: *mut i64, words: usize) -> bool {
+        let (a, b, b_len) = (input as usize, out as usize, words.saturating_mul(8));
+        len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(len)
+    }
+
+    /// Validates the batch and output window, then writes `per_row` words from `row(entry, dst)`
+    /// for each of exactly `count` NUL-separated rows straight into `out`.
+    unsafe fn run(
+        input: *const u8,
+        len: usize,
+        count: usize,
+        per_row: usize,
+        out: *mut i64,
+        out_cap: usize,
+        mut row: impl FnMut(&[u8], &mut [i64]),
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+                || len > MAX_INPUT
+                || (len != 0 && input.is_null())
+            {
+                return -1;
+            }
+            let words = count * per_row;
+            if words > out_cap {
+                return SHORT_CAPACITY;
+            }
+            if overlaps(input, len, out, words) {
+                return -1;
+            }
+            // A null pointer is never sliced, even for an empty batch.
+            let bytes: &[u8] = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(input, len) } };
+            if count == 0 {
+                return if bytes.is_empty() { 0 } else { -1 };
+            }
+            // `words` words, checked against `out_cap` above; disjoint from the input.
+            let dst = unsafe { std::slice::from_raw_parts_mut(out, words) };
+            let mut n = 0;
+            for entry in bytes.split(|&b| b == 0) {
+                if n < count {
+                    row(entry, &mut dst[n * per_row..(n + 1) * per_row]);
+                }
+                n += 1;
+            }
+            if n == count { n as isize } else { -1 }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// PHP `trim()` without a character list (NUL never reaches a row).
+    fn php_trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    /// PCRE `\s` outside UTF mode: space, tab, LF, VT, FF and CR.
+    fn pcre_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    fn name_ok(body: &[u8], colon: bool) -> bool {
+        let Some((&first, rest)) = body.split_first() else {
+            return false;
+        };
+        (first.is_ascii_alphabetic() || first == b'_' || (colon && first == b':'))
+            && rest.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_' || (colon && c == b':'))
+    }
+
+    /// TextFormatter token word: MetricFamily's `^...$` name checks (`$` also matches before a
+    /// final LF), the reserved `__` prefix, label/help escape needs and the escaped label length.
+    pub fn token_code(s: &[u8]) -> i64 {
+        let body = s.strip_suffix(b"\n").unwrap_or(s);
+        let (mut slashes, mut quotes, mut newlines) = (0usize, 0usize, 0usize);
+        for &c in s {
+            slashes += usize::from(c == b'\\');
+            quotes += usize::from(c == b'"');
+            newlines += usize::from(c == b'\n');
+        }
+        TOKEN_METRIC_NAME * i64::from(name_ok(body, true))
+            | TOKEN_LABEL_NAME * i64::from(name_ok(body, false))
+            | TOKEN_RESERVED_LABEL * i64::from(s.starts_with(b"__"))
+            | TOKEN_LABEL_ESCAPE * i64::from(slashes + quotes + newlines > 0)
+            | TOKEN_HELP_ESCAPE * i64::from(slashes + newlines > 0)
+            | (((s.len() + slashes + quotes + newlines) as i64) << TOKEN_LENGTH_SHIFT)
+    }
+
+    fn digits(s: &[u8]) -> Option<i64> {
+        if s.is_empty() || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(s.iter().fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0')))
+    }
+
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let mp = (m + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    fn days_in_month(y: i64, m: i64) -> i64 {
+        match m {
+            2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        }
+    }
+
+    /// Unix timestamp of a 1-12 digit stamp or a valid UTC `YYYY-MM-DD[ T]HH:MM:SS`.
+    pub fn stamp_seconds(s: &[u8]) -> Option<i64> {
+        if s.len() <= 12 && !s.is_empty() && s.iter().all(u8::is_ascii_digit) {
+            return digits(s);
+        }
+        if s.len() != 19 || s[4] != b'-' || s[7] != b'-' || !matches!(s[10], b' ' | b'T') || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        let (y, mo, d) = (digits(&s[0..4])?, digits(&s[5..7])?, digits(&s[8..10])?);
+        let (h, mi, se) = (digits(&s[11..13])?, digits(&s[14..16])?, digits(&s[17..19])?);
+        if y < 1 || !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || se > 59 {
+            return None;
+        }
+        Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se)
+    }
+
+    /// TmuxMetricsSnapshot lag: `max(0, now - stamp)` with `now` clamped, or -1.
+    pub fn lag_seconds(s: &[u8], now: i64) -> i64 {
+        stamp_seconds(s).map_or(-1, |ts| (now.clamp(0, MAX_NOW) - ts).max(0))
+    }
+
+    /// Collapses PCRE `\s` runs of the PHP-trimmed `s` to one space, ASCII-lowercased into `buf`.
+    fn normalize_detail(s: &[u8], buf: &mut Vec<u8>) {
+        buf.clear();
+        let mut in_run = false;
+        for &b in php_trim(s) {
+            if pcre_space(b) {
+                if !in_run {
+                    buf.push(b' ');
+                }
+                in_run = true;
+            } else {
+                buf.push(b.to_ascii_lowercase());
+                in_run = false;
+            }
+        }
+    }
+
+    /// The detail class of lowercased `hay` in one pass, dispatching on each byte that can start
+    /// one of the [`UNHEALTHY_WORDS`] or [`DEGRADED_WORDS`].
+    fn detail_class(hay: &[u8]) -> i64 {
+        let mut degraded = false;
+        for (i, &b) in hay.iter().enumerate() {
+            let rest = &hay[i..];
+            match b {
+                b'u' if rest.starts_with(b"unreachable") => return DETAIL_UNHEALTHY,
+                b'r' if rest.starts_with(b"refused") => return DETAIL_UNHEALTHY,
+                b'f' if rest.starts_with(b"failed") => return DETAIL_UNHEALTHY,
+                b'e' if rest.starts_with(b"error") => return DETAIL_UNHEALTHY,
+                b't' if rest.starts_with(b"timed out") || rest.starts_with(b"timeout") => return DETAIL_UNHEALTHY,
+                b's' => degraded |= rest.starts_with(b"slow") || rest.starts_with(b"skipping"),
+                b'd' => degraded |= rest.starts_with(b"degraded"),
+                b'l' => degraded |= rest.starts_with(b"lagging"),
+                b'b' => degraded |= rest.starts_with(b"behind"),
+                b'w' => degraded |= rest.starts_with(b"warning"),
+                _ => {}
+            }
+        }
+        if degraded { DETAIL_DEGRADED } else { DETAIL_HEALTHY }
+    }
+
+    /// ProbeResult detail word over the whitespace-normalized reason.
+    pub fn detail_code(s: &[u8], buf: &mut Vec<u8>) -> i64 {
+        normalize_detail(s, buf);
+        detail_class(buf)
+            | DETAIL_LONG * i64::from(buf.len() > DETAIL_LONG_BYTES)
+            | DETAIL_NON_ASCII * i64::from(!buf.is_ascii())
+            | ((buf.len() as i64) << DETAIL_LENGTH_SHIFT)
+    }
+
+    /// RedisProbe INFO words (see [`INFO_WORDS`]); `/\r?\n/` lines, last duplicate key wins.
+    pub fn info_words(s: &[u8], dst: &mut [i64]) {
+        let mut ints: [Option<&[u8]>; 6] = [None; 6];
+        let (mut role, mut link): (Option<&[u8]>, Option<&[u8]>) = (None, None);
+        let mut lines = s.split(|&b| b == b'\n').peekable();
+        while let Some(raw) = lines.next() {
+            let line = if lines.peek().is_some() { raw.strip_suffix(b"\r").unwrap_or(raw) } else { raw };
+            if line.is_empty() || line[0] == b'#' {
+                continue;
+            }
+            let Some(colon) = line.iter().position(|&b| b == b':') else {
+                continue;
+            };
+            let (key, value) = (&line[..colon], &line[colon + 1..]);
+            if let Some(i) = INFO_INT_KEYS.iter().position(|k| *k == key) {
+                ints[i] = Some(value);
+            } else if key == b"role" {
+                role = Some(value);
+            } else if key == b"master_link_status" {
+                link = Some(value);
+            }
+        }
+        let mut v = [-1i64; 6];
+        for (slot, value) in v.iter_mut().zip(ints) {
+            if let Some(value) = value.filter(|value| value.len() <= 15) {
+                *slot = digits(value).unwrap_or(-1);
+            }
+        }
+        let role = match role {
+            None => 0,
+            Some(b"master") => 1,
+            Some(b"slave") => 2,
+            Some(_) => 3,
+        };
+        let link = match link {
+            None => 0,
+            Some(b"up") => 1,
+            Some(b"down") => 2,
+            Some(_) => 3,
+        };
+        let [used, max, clients, ops, hits, misses] = v;
+        let hit = if hits >= 0 && misses >= 0 && hits + misses > 0 { hits * 1000 / (hits + misses) } else { -1 };
+        let mem = if used >= 0 && max > 0 { used * 1000 / max } else { -1 };
+        let health = if used < 0 || clients < 0 {
+            2
+        } else if (role == 2 && link != 1) || mem >= INFO_DEGRADED_PERMILLE {
+            1
+        } else {
+            0
+        };
+        dst.copy_from_slice(&[used, max, clients, ops, hits, misses, role | link << 2 | health << 4, hit, mem]);
+    }
+
+    /// ServiceProbeRegistry identifier word over `strtolower(trim($identifier))`.
+    pub fn identifier_code(s: &[u8], buf: &mut Vec<u8>) -> i64 {
+        let trimmed = php_trim(s);
+        buf.clear();
+        buf.extend(trimmed.iter().map(u8::to_ascii_lowercase));
+        let valid = buf.len() <= 64
+            && buf.first().is_some_and(u8::is_ascii_lowercase)
+            && buf[1..].iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-');
+        let known = PROBE_IDENTIFIERS.iter().position(|id| *id == buf.as_slice()).map_or(0, |i| i as i64 + 1);
+        IDENTIFIER_VALID * i64::from(valid)
+            | IDENTIFIER_NORMALIZED * i64::from(buf.as_slice() != s)
+            | known << IDENTIFIER_KNOWN_SHIFT
+            | ((buf.len() as i64) << IDENTIFIER_LENGTH_SHIFT)
+    }
+
+    /// Writes one TextFormatter token word per NUL-joined token.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w561_prometheus_token_code_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, 1, out, out_cap, |s, d| d[0] = token_code(s)) }
+    }
+
+    /// Writes one lag (or -1) per NUL-joined snapshot stamp.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w561_tmux_snapshot_lag_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        now: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, 1, out, out_cap, |s, d| d[0] = lag_seconds(s, now)) }
+    }
+
+    /// Writes one ProbeResult detail word per NUL-joined reason.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w561_probe_detail_code_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let mut buf = Vec::with_capacity(256);
+        unsafe { run(rows, rows_len, count, 1, out, out_cap, |s, d| d[0] = detail_code(s, &mut buf)) }
+    }
+
+    /// Writes [`INFO_WORDS`] words per NUL-joined Redis `INFO` payload.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w561_redis_info_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, INFO_WORDS, out, out_cap, info_words) }
+    }
+
+    /// Writes one ServiceProbeRegistry identifier word per NUL-joined identifier.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w561_probe_identifier_code_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let mut buf = Vec::with_capacity(64);
+        unsafe { run(rows, rows_len, count, 1, out, out_cap, |s, d| d[0] = identifier_code(s, &mut buf)) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, usize, *mut i64, usize) -> isize;
+
+        fn call(export: Export, rows: &[&[u8]], per_row: usize) -> (isize, Vec<i64>) {
+            let joined = rows.join(&0u8);
+            let mut out = vec![0i64; (rows.len() * per_row).max(1)];
+            let written = unsafe { export(joined.as_ptr(), joined.len(), rows.len(), out.as_mut_ptr(), out.len()) };
+            out.truncate(rows.len() * per_row);
+            (written, out)
+        }
+
+        #[test]
+        fn w561_token_codes_follow_prometheus_rules() {
+            let len = |n: i64| n << TOKEN_LENGTH_SHIFT;
+            assert_eq!(token_code(b"nntmux_up"), TOKEN_METRIC_NAME | TOKEN_LABEL_NAME | len(9));
+            assert_eq!(token_code(b"a:b"), TOKEN_METRIC_NAME | len(3));
+            assert_eq!(token_code(b"__name"), TOKEN_METRIC_NAME | TOKEN_LABEL_NAME | TOKEN_RESERVED_LABEL | len(6));
+            assert_eq!(token_code(b"ab\n"), TOKEN_METRIC_NAME | TOKEN_LABEL_NAME | TOKEN_LABEL_ESCAPE | TOKEN_HELP_ESCAPE | len(4));
+            assert_eq!(token_code(b"a\"b"), TOKEN_LABEL_ESCAPE | len(4));
+            assert_eq!(token_code(b"a\\"), TOKEN_LABEL_ESCAPE | TOKEN_HELP_ESCAPE | len(3));
+            assert_eq!(token_code(b"9a"), len(2));
+            assert_eq!(token_code(b""), 0);
+            assert_eq!(token_code(b"\n"), TOKEN_LABEL_ESCAPE | TOKEN_HELP_ESCAPE | len(2));
+        }
+
+        #[test]
+        fn w561_lag_parses_digits_and_utc_datetimes() {
+            assert_eq!(stamp_seconds(b"1970-01-01 00:00:00"), Some(0));
+            assert_eq!(stamp_seconds(b"0001-01-01T00:00:00"), Some(-62_135_596_800));
+            assert_eq!(stamp_seconds(b"9999-12-31 23:59:59"), Some(253_402_300_799));
+            assert_eq!(stamp_seconds(b"2024-02-29 12:00:00"), Some(1_709_208_000));
+            assert_eq!(stamp_seconds(b"2023-02-29 12:00:00"), None);
+            assert_eq!(stamp_seconds(b"2023-01-01 24:00:00"), None);
+            assert_eq!(stamp_seconds(b"0000-01-01 00:00:00"), None);
+            assert_eq!(stamp_seconds(b"999999999999"), Some(999_999_999_999));
+            assert_eq!(stamp_seconds(b"9999999999999"), None);
+            assert_eq!(stamp_seconds(b""), None);
+            assert_eq!(lag_seconds(b"100", 50), 0);
+            assert_eq!(lag_seconds(b"100", 150), 50);
+            assert_eq!(lag_seconds(b"100", -5), 0);
+            assert_eq!(lag_seconds(b"0001-01-01 00:00:00", i64::MAX), MAX_NOW + 62_135_596_800);
+            assert_eq!(lag_seconds(b"x", 5), -1);
+        }
+
+        #[test]
+        fn w561_detail_codes_normalize_and_classify() {
+            let mut buf = Vec::new();
+            let len = |n: i64| n << DETAIL_LENGTH_SHIFT;
+            assert_eq!(detail_code(b"  Connected ", &mut buf), len(9));
+            assert_eq!(detail_code(b"Connection\t\nREFUSED", &mut buf), DETAIL_UNHEALTHY | len(18));
+            assert_eq!(detail_code(b"timed  out", &mut buf), DETAIL_UNHEALTHY | len(9));
+            assert_eq!(detail_code(b"\x0cslow", &mut buf), DETAIL_DEGRADED | len(5));
+            assert_eq!(detail_code("caf\u{e9}".as_bytes(), &mut buf), DETAIL_NON_ASCII | len(5));
+            assert_eq!(detail_code(&[b'a'; 121], &mut buf), DETAIL_LONG | len(121));
+            assert_eq!(detail_code(b"", &mut buf), 0);
+        }
+
+        #[test]
+        fn w561_detail_class_matches_word_lists() {
+            let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+            let oracle = |hay: &[u8]| {
+                if UNHEALTHY_WORDS.iter().any(|w| contains(hay, w)) {
+                    DETAIL_UNHEALTHY
+                } else if DEGRADED_WORDS.iter().any(|w| contains(hay, w)) {
+                    DETAIL_DEGRADED
+                } else {
+                    DETAIL_HEALTHY
+                }
+            };
+            let words: Vec<&[u8]> = UNHEALTHY_WORDS.iter().chain(DEGRADED_WORDS.iter()).copied().chain([&b"ok"[..], b"tim", b"slo", b" "]).collect();
+            for a in &words {
+                for b in &words {
+                    for hay in [[*a, *b].concat(), [*a, b" x ", *b].concat(), a[..a.len() - 1].to_vec()] {
+                        assert_eq!(detail_class(&hay), oracle(&hay), "{}", String::from_utf8_lossy(&hay));
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn w561_info_words_parse_fields_and_health() {
+            let mut d = [0i64; INFO_WORDS];
+            info_words(b"# Memory\r\nused_memory:900\r\nmaxmemory:1000\r\nconnected_clients:3\r\nrole:slave\r\nmaster_link_status:up\r\nkeyspace_hits:3\r\nkeyspace_misses:1\r\n", &mut d);
+            assert_eq!(d, [900, 1000, 3, -1, 3, 1, 2 | 1 << 2 | 1 << 4, 750, 900]);
+            info_words(b"used_memory:5\nconnected_clients:1\r", &mut d);
+            assert_eq!(d, [5, -1, -1, -1, -1, -1, 2 << 4, -1, -1]);
+            info_words(b"used_memory:5\nused_memory:7\nconnected_clients:1\nrole:master", &mut d);
+            assert_eq!(d, [7, -1, 1, -1, -1, -1, 1, -1, -1]);
+            info_words(b"used_memory:1234567890123456\nconnected_clients:+1", &mut d);
+            assert_eq!(d[..3], [-1, -1, -1]);
+        }
+
+        #[test]
+        fn w561_identifier_codes_trim_lower_and_resolve() {
+            let mut buf = Vec::new();
+            let known = |i: i64| i << IDENTIFIER_KNOWN_SHIFT;
+            let len = |n: i64| n << IDENTIFIER_LENGTH_SHIFT;
+            assert_eq!(identifier_code(b"redis", &mut buf), IDENTIFIER_VALID | known(2) | len(5));
+            assert_eq!(identifier_code(b" Disk\n", &mut buf), IDENTIFIER_VALID | IDENTIFIER_NORMALIZED | known(6) | len(4));
+            assert_eq!(identifier_code(b"9x", &mut buf), len(2));
+            assert_eq!(identifier_code(b"", &mut buf), 0);
+            assert_eq!(identifier_code(&[b'a'; 65], &mut buf), len(65));
+            assert_eq!(identifier_code(b"\x0cdisk", &mut buf), len(5));
+        }
+
+        #[test]
+        fn w561_exports_guard_counts_and_capacity() {
+            let rows: [&[u8]; 2] = [b"redis", b"x y"];
+            let exports: [(Export, usize); 4] = [
+                (nntmux_w561_prometheus_token_code_batch, 1),
+                (nntmux_w561_probe_detail_code_batch, 1),
+                (nntmux_w561_redis_info_batch, INFO_WORDS),
+                (nntmux_w561_probe_identifier_code_batch, 1),
+            ];
+            for (export, per_row) in exports {
+                let (n, out) = call(export, &rows, per_row);
+                assert_eq!((n, out.len()), (2, 2 * per_row));
+                let mut short = vec![0i64; 2 * per_row - 1];
+                let joined = rows.join(&0u8);
+                unsafe {
+                    assert_eq!(export(joined.as_ptr(), joined.len(), 2, short.as_mut_ptr(), short.len()), SHORT_CAPACITY);
+                    let mut out = vec![0i64; 8 * per_row];
+                    assert_eq!(export(joined.as_ptr(), joined.len(), 3, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(export(std::ptr::null(), 0, 0, out.as_mut_ptr(), out.len()), 0);
+                    assert_eq!(export(std::ptr::null(), 0, 1, out.as_mut_ptr(), out.len()), 1);
+                    assert_eq!(export(std::ptr::null(), 2, 1, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(export(joined.as_ptr(), joined.len(), 2, std::ptr::null_mut(), 8), -1);
+                }
+            }
+            let joined = b"100\0x";
+            let mut out = [0i64; 2];
+            let n = unsafe { nntmux_w561_tmux_snapshot_lag_batch(joined.as_ptr(), joined.len(), 2, 150, out.as_mut_ptr(), 2) };
+            assert_eq!((n, out), (2, [50, -1]));
+        }
+    }
+}

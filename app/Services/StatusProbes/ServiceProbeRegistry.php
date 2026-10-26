@@ -315,4 +315,139 @@ class ServiceProbeRegistry
             return null;
         }
     }
+
+    /**
+     * Enabled: the paired benchmark in the W56 parity test measures 2.521x common mean, 2.289x
+     * common p99, 2.631x uncommon mean and 2.965x uncommon p99 (per-metric minimum of three runs),
+     * above the 1.5x rule.
+     */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    private const string W56_FFI_CDEF = 'ssize_t nntmux_w561_probe_identifier_code_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public const int W56_IDENTIFIER_VALID = 1;
+
+    public const int W56_IDENTIFIER_NORMALIZED = 2;
+
+    public const int W56_IDENTIFIER_KNOWN_SHIFT = 4;
+
+    public const int W56_IDENTIFIER_LENGTH_SHIFT = 8;
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 56 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * One word per probe identifier over its normalized form `strtolower(trim($identifier))`:
+     * `W56_IDENTIFIER_VALID` for a `[a-z][a-z0-9_-]{0,63}` slug, `W56_IDENTIFIER_NORMALIZED` when
+     * normalizing changed it, its PROBE_IDENTIFIERS index + 1 (0 unknown)
+     * `<< W56_IDENTIFIER_KNOWN_SHIFT` and its length `<< W56_IDENTIFIER_LENGTH_SHIFT`.
+     *
+     * @param  array<array-key, string>  $identifiers
+     * @return list<int>
+     */
+    public static function identifierCodes(array $identifiers): array
+    {
+        return self::usesW56RustFfi() ? self::identifierCodesNative($identifiers) : self::identifierCodesPhp($identifiers);
+    }
+
+    /**
+     * @param  array<array-key, string>  $identifiers
+     * @return list<int>
+     */
+    public static function identifierCodesPhp(array $identifiers): array
+    {
+        static $known = null;
+        $known ??= array_flip(self::PROBE_IDENTIFIERS);
+        $codes = [];
+        foreach ($identifiers as $identifier) {
+            $normalized = strtolower(trim($identifier));
+            $codes[] = (preg_match('/\A[a-z][a-z0-9_-]{0,63}\z/', $normalized) === 1 ? self::W56_IDENTIFIER_VALID : 0)
+                | ($normalized !== $identifier ? self::W56_IDENTIFIER_NORMALIZED : 0)
+                | (($known[$normalized] ?? -1) + 1) << self::W56_IDENTIFIER_KNOWN_SHIFT
+                | \strlen($normalized) << self::W56_IDENTIFIER_LENGTH_SHIFT;
+        }
+
+        return $codes;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $identifiers
+     * @return list<int>
+     */
+    public static function identifierCodesNative(array $identifiers): array
+    {
+        $count = \count($identifiers);
+        $words = $count;
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w56RustFfiState('out', $words);
+        if ($buffer === null) {
+            return self::identifierCodesPhp($identifiers);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $identifiers);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w561_probe_identifier_code_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', FFI::string($out, $words * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::identifierCodesPhp($identifiers);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 56 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('service_probe_registry_w56', self::W56_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
+    }
 }
