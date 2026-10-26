@@ -323,4 +323,202 @@ final class PreparationRunDiagnostics
             'manifest_sizes' => $this->manifestSizes,
         ];
     }
+
+    public const string W57_FFI_CDEF = 'int64_t nntmux_w575_run_diagnostics_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W57.5 parity test's QUALIFICATION). */
+    private const bool W57_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 57.5 routing and FFI cache, kept in function-local statics (readonly classes cannot declare static properties). Without $op it reports
+     * the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[],
+     * capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w57RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w57_5', self::W57_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W57_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW57RustFfi(): bool
+    {
+        return self::w57RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with runDiagnosticsPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW57RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w57RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w57RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 57.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w57Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w57RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w575_run_diagnostics_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch normalization of eleven comma-separated run fields (`limit, inspected, ready, waiting_upload,
+     * unknown, header_rejected, read_failures, selection_us, read_assessment_us, update_us, stop_reason`,
+     * each trimmed). Four words per run: `[stop reason, bottleneck, assessed, flags]`. Stop reason: 0
+     * empty, 1 `error`, 2 `limit_and_deadline`, 3 `limit`, 4 `deadline`, 5 `exhausted`, 6 other.
+     * Bottleneck: the phase with the largest positive duration, first wins ties (0 none, 1 selection, 2
+     * read_assessment, 3 update). Assessed sums the four assessment counters; empty counters read 0. Flags:
+     * 1 counter that is not 1-18 digits (read as 0), 2 fewer than eleven fields, 4 more, 8 inspected above
+     * limit, 16 assessed above inspected, 32 read failures, 64 unknown stop reason, 128 a limit stop below
+     * the limit.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function runDiagnosticsPlanBatch(array $records): array
+    {
+        return self::usesW57RustFfi() ? self::runDiagnosticsPlanBatchNative($records) : self::runDiagnosticsPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function runDiagnosticsPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode(',', $record);
+            $total = \count($fields);
+            $flags = $total < 11 ? 2 : ($total > 11 ? 4 : 0);
+            $values = [];
+            for ($i = 0; $i < 10; $i++) {
+                $field = trim($fields[$i] ?? '');
+                if ($field === '') {
+                    $values[] = 0;
+                } elseif (\strlen($field) <= 18 && ctype_digit($field)) {
+                    $values[] = (int) $field;
+                } else {
+                    $values[] = 0;
+                    $flags |= 1;
+                }
+            }
+            $stop = match (trim($fields[10] ?? '')) {
+                '' => 0,
+                'error' => 1,
+                'limit_and_deadline' => 2,
+                'limit' => 3,
+                'deadline' => 4,
+                'exhausted' => 5,
+                default => 6,
+            };
+            [$limit, $inspected, $ready, $waiting, $unknown, $rejected, $failures] = $values;
+            $assessed = $ready + $waiting + $unknown + $rejected;
+            if ($stop === 6) {
+                $flags |= 64;
+            }
+            if ($inspected > $limit) {
+                $flags |= 8;
+            }
+            if ($assessed > $inspected) {
+                $flags |= 16;
+            }
+            if ($failures > 0) {
+                $flags |= 32;
+            }
+            if (($stop === 2 || $stop === 3) && $inspected < $limit) {
+                $flags |= 128;
+            }
+            $bottleneck = $best = 0;
+            foreach ([1 => $values[7], 2 => $values[8], 3 => $values[9]] as $code => $duration) {
+                if ($duration > $best) {
+                    $best = $duration;
+                    $bottleneck = $code;
+                }
+            }
+            array_push($out, $stop, $bottleneck, $assessed, $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function runDiagnosticsPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w57Words($count, implode("\0", $records), 4 * $count) ?? self::runDiagnosticsPlanBatchPhp($records);
+    }
 }
