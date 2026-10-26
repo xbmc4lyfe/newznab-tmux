@@ -594,4 +594,290 @@ class InvitationService
             throw new InvalidArgumentException('W50 invitation batches need list columns and three scalars per invitation.');
         }
     }
+
+    // ========================================================================
+    // WAVE 67.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of four 1000-round paired runs reached 2.09x common mean, 1.78x common p99, 1.78x uncommon mean and 1.64x uncommon p99; see RustIgdbCompanyGamePlatformInvitationIsbnDbW67ParityTest. */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    private const string W67_FFI_CDEF = 'ssize_t nntmux_w674_invitation_service_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w67InvitationServicePlanBatch() record. */
+    public const int W67_ROW_WORDS = 3;
+
+    /** int64 summary words after the w67InvitationServicePlanBatch() records (none for an empty batch). */
+    public const int W67_TRAILER_WORDS = 10;
+
+    /** Trimmed, lower-cased inviter role => [code, invite quota (-1 unlimited)]. */
+    private const array W67_ROLES = ['admin' => [1, -1], 'moderator' => [2, 25], 'friend' => [3, 10], 'user' => [4, 3], 'disabled' => [5, 0]];
+
+    /** Clocks clamp to [0, 2^40] seconds so differences cannot overflow. */
+    private const int W67_CLOCK_MAX = 1 << 40;
+
+    private const string W67_ALNUM = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+    private const string W67_CONTROL = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x20\x7F";
+
+    /**
+     * Invitation plan rows for [token, email, inviter role, now, created at, expires at, used
+     * at, active flag, inviter ID, inviter invite balance] items (clocks in Unix seconds).
+     *
+     * Token: 0 empty, 1 64 ASCII alphanumerics (Str::random(64)), 2 wrong length, 3 bad
+     * character. Role (trimmed, case-insensitive): 1 admin (unlimited), 2 moderator (25), 3
+     * friend (10), 4 user (3), 5 disabled (0), 0 unknown (0); the available invites are the role
+     * quota capped by the non-negative balance (-1 unlimited). Expiry: 0 none, 1 expired, 2 under
+     * a day left, 3 later. Statuses: 3 used, 4 inactive, 2 expired, 5 bad token, then pending
+     * invitations take per-inviter ordinals: 6 over the available invites, 1 sendable. The
+     * trimmed email is plausible with one '@' after a non-empty local part, a domain that neither
+     * starts nor ends with '.' and holds a later '.', and no control bytes or spaces; it is
+     * unnormalized when trimming or lower-casing changes it.
+     *
+     * Rows [status | token << 3 | expiry << 5 | created after expiry << 7 | lifetime over 30
+     * days << 8 | role << 9 | plausible << 12 | unnormalized << 13 | hours left << 14 | lifetime
+     * days << 30 | available + 1 << 46, fnv1a32(strtolower(email)), inviter ordinal (-1 unless
+     * pending)], then the trailer [records, the six status counts, plausible emails, distinct
+     * pending inviters, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int, 9: int}>  $items
+     * @return list<int>
+     */
+    public static function w67InvitationServicePlanBatch(array $items): array
+    {
+        return self::usesW67RustFfi() ? self::w67InvitationServicePlanBatchNative($items) : self::w67InvitationServicePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int, 9: int}>  $items
+     * @return list<int>
+     */
+    public static function w67InvitationServicePlanBatchPhp(array $items): array
+    {
+        self::w67Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $t = [\count($items), 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        $sent = [];
+        foreach ($items as [$token, $raw, $inviterRole, $now, $created, $expires, $used, $active, $inviter, $invites]) {
+            $length = \strlen($token);
+            $tokenCode = $length === 0 ? 0 : ($length !== 64 ? 2 : (strspn($token, self::W67_ALNUM) === 64 ? 1 : 3));
+            $email = trim($raw);
+            [$role, $quota] = self::W67_ROLES[strtolower(trim($inviterRole))] ?? [0, 0];
+            $now = max(0, min($now, self::W67_CLOCK_MAX));
+            $created = max(0, min($created, self::W67_CLOCK_MAX));
+            $expires = max(0, min($expires, self::W67_CLOCK_MAX));
+            $used = max(0, min($used, self::W67_CLOCK_MAX));
+            $expiry = $expires === 0 ? 0 : ($expires < $now ? 1 : ($expires - $now < 86_400 ? 2 : 3));
+            $hours = $expires > $now ? min(intdiv($expires - $now, 3600), 0xFFFF) : 0;
+            $inconsistent = $created > 0 && $expires > 0 && $created > $expires;
+            $days = $created > 0 && $expires >= $created ? intdiv($expires - $created, 86_400) : 0;
+            $available = $quota < 0 ? -1 : min($quota, max($invites, 0));
+            $ordinal = -1;
+            if ($used > 0) {
+                $status = 3;
+            } elseif ($active === 0) {
+                $status = 4;
+            } elseif ($expiry === 1) {
+                $status = 2;
+            } elseif ($tokenCode !== 1) {
+                $status = 5;
+            } else {
+                $ordinal = $sent[$inviter] ?? 0;
+                $sent[$inviter] = $ordinal + 1;
+                $status = $available >= 0 && $ordinal >= $available ? 6 : 1;
+            }
+            $lower = strtolower($email);
+            $emailLength = \strlen($email);
+            $sign = strpos($email, '@');
+            $plausible = $sign !== false && $sign > 0 && $emailLength - $sign > 3 && strpos($email, '@', $sign + 1) === false && $email[$sign + 1] !== '.'
+                && $email[$emailLength - 1] !== '.' && strpos($email, '.', $sign + 2) !== false && strcspn($email, self::W67_CONTROL) === $emailLength;
+            $unnormalized = $emailLength !== \strlen($raw) || $lower !== $email;
+            $word = $status | $tokenCode << 3 | $expiry << 5 | (int) $inconsistent << 7 | (int) ($days > 30) << 8 | $role << 9 | (int) $plausible << 12
+                | (int) $unnormalized << 13 | $hours << 14 | min($days, 0xFFFF) << 30 | ($available + 1) << 46;
+            $emailHash = self::w67Fnv($lower);
+            array_push($out, $word, $emailHash, $ordinal);
+            $t[$status]++;
+            $t[7] += (int) $plausible;
+            $value = $word ^ $emailHash << 8 ^ $ordinal;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $t[8] = \count($sent);
+        $t[9] = $digest;
+
+        return [...$out, ...$t];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int, 9: int}>  $items
+     * @return list<int>
+     */
+    public static function w67InvitationServicePlanBatchNative(array $items): array
+    {
+        self::w67Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w67Join([array_column($items, 0), array_column($items, 1), array_column($items, 2)]);
+        $ints = pack('P*', ...array_column($items, 3), ...array_column($items, 4), ...array_column($items, 5), ...array_column($items, 6),
+            ...array_column($items, 7), ...array_column($items, 8), ...array_column($items, 9));
+
+        return self::w67Call($blob, $twin, $ints, $count, $count * self::W67_ROW_WORDS + self::W67_TRAILER_WORDS)
+            ?? self::w67InvitationServicePlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w67Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W67 invitation service plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 10 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_string($item[2])
+                || ! \is_int($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5]) || ! \is_int($item[6]) || ! \is_int($item[7]) || ! \is_int($item[8])
+                || ! \is_int($item[9])) {
+                throw new InvalidArgumentException('W67 invitation service plan batch items must be [string token, string email, string inviter role, int now, int created at, int expires at, int used at, int active, int inviter ID, int invite balance] lists.');
+            }
+        }
+    }
+
+    public static function usesW67RustFfi(): bool
+    {
+        $enabled = self::w67RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W67_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('enabled', true);
+    }
+
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('enabled', false);
+    }
+
+    /** Drop the W67 override, binding, output buffer and declined-call count; routing returns to W67_RUST_FFI_DEFAULT. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W67 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('enabled');
+        self::w67RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w67Join(array $columns): array
+    {
+        $values = array_merge(...$columns);
+        $joined = implode("\0", $values);
+
+        return substr_count($joined, "\0") === \count($values) - 1 ? [$joined, ''] : [$joined, implode("\x01", $values)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w67Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w67RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w67', self::W67_FFI_CDEF) ?? false;
+            self::w67RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w67RustFfiState('out', $out);
+                self::w67RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W67_FFI_CDEF.)
+            $written = $ffi->nntmux_w674_invitation_service_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w67RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W67 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int, 0 for an empty string. */
+    private static function w67Fnv(string $bytes): int
+    {
+        if ($bytes === '') {
+            return 0;
+        }
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
+    }
 }
