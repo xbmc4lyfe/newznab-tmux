@@ -21,8 +21,9 @@ use RuntimeException;
 
 /**
  * Paired randomized benchmark (`test_paired_randomized_benchmark_gates_rust_default`, run with
- * `RUN_RUST_FFI_BENCHMARKS=1`): per helper, 100 interleaved samples per workload after 20 warmup rounds,
- * per-sample random PHP/Rust order, each side the fastest of three back-to-back calls, release dylib.
+ * `RUN_RUST_FFI_BENCHMARKS=1`): per helper, 400 interleaved samples per workload after 20 warmup rounds,
+ * per-sample random PHP/Rust order, three back-to-back calls per side, every call timed individually
+ * (1,200 observations per side, so p99 is a per-call tail), release dylib.
  * Common workloads hold 320 records and uncommon ones 384 records with edge cases. Timings include
  * PHP-side packing, the FFI call and output decoding; each run prints its ratios to STDERR.
  *
@@ -81,11 +82,11 @@ class RustLogViewerRepoReaderSearcherQueryMcpProcessRunnerW67ParityTest extends 
      * @var array<class-string, array{float, float, float, float}>
      */
     private const QUALIFICATION = [
-        LogFileRepository::class => [5.43, 4.46, 4.36, 4.59],
-        LogReader::class => [4.69, 4.83, 4.50, 4.63],
-        LogSearcher::class => [4.64, 4.74, 1.87, 1.86],
-        SearchQuery::class => [8.23, 8.14, 8.10, 8.65],
-        ProcessRunner::class => [5.50, 5.98, 4.35, 4.09],
+        LogFileRepository::class => [5.43, 4.25, 4.29, 3.94],
+        LogReader::class => [4.83, 4.31, 4.37, 3.74],
+        LogSearcher::class => [4.65, 4.34, 1.86, 1.93],
+        SearchQuery::class => [8.01, 7.51, 8.29, 7.58],
+        ProcessRunner::class => [5.10, 4.83, 4.43, 4.04],
     ];
 
     /**
@@ -101,12 +102,12 @@ class RustLogViewerRepoReaderSearcherQueryMcpProcessRunnerW67ParityTest extends 
         ProcessRunner::class => ['useRustFfi', 'redactor'],
     ];
 
-    /** Back-to-back calls per side of a sample; the fastest is kept (drops preemption spikes). */
+    /** Back-to-back calls per side of a sample; each call is recorded so p99 is an individual-call latency. */
     private const REPEATS = 3;
 
     private const RANDOM_ROUNDS = 400;
 
-    private const BENCH_SAMPLES = 100;
+    private const BENCH_SAMPLES = 400;
 
     private const BYTES = ['a', 'Z', 'x', 'g', 'z', 'E', 'r', 'l', 'o', '0', '1', '2', '7', '9', ' ', "\t", "\n", "\r", "\x0b", "\x0c", "\x01", "\x7f", '-', '_', '.', ',', ':', '|', '/', '\\', '"', '[', ']', ';', '$', "\xc3\xa9", "\xc3", "\xff", "\xa0", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\xe2\x80\xa8", "\0"];
 
@@ -681,13 +682,11 @@ class RustLogViewerRepoReaderSearcherQueryMcpProcessRunnerW67ParityTest extends 
                 $times = ['php' => [], 'rust' => []];
                 for ($s = 0; $s < self::BENCH_SAMPLES; $s++) {
                     foreach (mt_rand(0, 1) === 1 ? [true, false] : [false, true] as $rust) {
-                        $best = PHP_INT_MAX;
                         for ($r = 0; $r < self::REPEATS; $r++) {
                             $t0 = hrtime(true);
                             $workload($rust);
-                            $best = min($best, hrtime(true) - $t0);
+                            $times[$rust ? 'rust' : 'php'][] = (hrtime(true) - $t0) / 1000;
                         }
-                        $times[$rust ? 'rust' : 'php'][] = $best / 1000;
                     }
                 }
 
