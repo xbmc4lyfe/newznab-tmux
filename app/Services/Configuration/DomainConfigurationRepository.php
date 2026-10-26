@@ -455,4 +455,311 @@ final readonly class DomainConfigurationRepository
                 return $enabled;
         }
     }
+
+    // ========================================================================
+    // WAVE 67.1 BATCH HELPER
+    // ========================================================================
+
+    /** Benchmark-gated default; see RustXxxPipeCollectionCleanupCleaningConfigProviderRepoW67ParityTest. */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    public const string W67_DOMAIN_CONFIG_REPO_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w671_domain_config_repo_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w67DomainConfigRepoPlanBatch(). */
+    public const int W67_DOMAIN_CONFIG_REPO_TRAILER = 31;
+
+    public static function usesW67RustFfi(): bool
+    {
+        $override = self::w67RustFfiState();
+
+        return \is_bool($override) ? $override : self::W67_RUST_FFI_DEFAULT;
+    }
+
+    /** Forces the DomainConfigurationRepository Wave 67 Rust path on until reset. */
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', true);
+    }
+
+    /** Forces the DomainConfigurationRepository Wave 67 PHP path until reset. */
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', false);
+    }
+
+    /** Restores the benchmark default and drops the cached library handle and scratch buffers; earlier toggles are untouched. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('reset');
+    }
+
+    /**
+     * Runs $callback with the DomainConfigurationRepository Wave 67 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 67.1 domain setting plans, one per `section|setting|stored|override|ttl` row (trimmed). The section is lowercased
+     * with `_` and spaces read as `-` (`postprocessing` is post-processing): 0 empty, 1-6 the ConfigurationDomain values,
+     * 7 unknown. The setting key is lowercased with `-`, spaces and dots read as `_` and must match `[a-z][a-z0-9_]*`. The
+     * TTL is 1-15 digits (empty 300) clamped to 0-86400. Source: 2 a non-empty override, 1 a non-empty stored value, 0 the
+     * default. Decision: 0 empty row, 1 unknown section, 2 invalid key, 3 malformed TTL, 4 override changes the stored
+     * value, 5 override equals it, 6 stored, 7 default. Flags: 1 key normalized, 2 section normalized, 4 TTL clamped, 8 no
+     * cache (TTL 0), 16 multi-line value, 32 JSON-looking effective value, 64 non-ASCII, 128 control byte, 256 repeated
+     * section key. Per item `decision | section << 3 | source << 6 | flags << 8 | ttl << 17 |
+     * (fnv1a32('configuration:' . domain . '.' . key) & 0xFFFFF) << 34 | min(effectiveLength, 511) << 54` (no hash below
+     * decision 4); then 8 decision, 8 section, 3 source and 9 flag counts, the TTL sum and maximum and the distinct keys.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67DomainConfigRepoPlanBatch(array $items): array
+    {
+        return self::usesW67RustFfi() ? self::w67DomainConfigRepoPlanBatchNative($items) : self::w67DomainConfigRepoPlanBatchPhp($items);
+    }
+
+    /**
+     * Rust plan; falls back to the PHP reference when the library is missing or the call declines.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67DomainConfigRepoPlanBatchNative(array $items): array
+    {
+        return self::w67Invoke($items, \count($items) + self::W67_DOMAIN_CONFIG_REPO_TRAILER) ?? self::w67DomainConfigRepoPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67DomainConfigRepoPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W67_DOMAIN_CONFIG_REPO_TRAILER, 0);
+        $keys = [];
+        foreach ($items as $item) {
+            $item = (string) $item;
+            [$rawSection, $rawSetting, $rawStored, $rawOverride, $rawTtl] = explode('|', $item, 5) + ['', '', '', '', ''];
+            $sectionLower = strtolower(trim($rawSection));
+            $sectionName = strtr($sectionLower, '_ ', '--');
+            $section = match (true) {
+                $sectionName === '' => 0,
+                $sectionName === 'postprocessing' => 4,
+                default => self::W67_DOMAINS[$sectionName] ?? 7,
+            };
+            $setting = trim($rawSetting);
+            $key = strtr(strtolower($setting), '- .', '___');
+            $keyValid = preg_match('/\A[a-z][a-z0-9_]*\z/', $key) === 1;
+            $stored = trim($rawStored);
+            $override = trim($rawOverride);
+            $ttl = self::w67Uint($rawTtl, 300);
+            [$ttlValue, $clamped] = self::w67Clamp($ttl, 0, 86_400);
+            $source = $override !== '' ? 2 : ($stored !== '' ? 1 : 0);
+            $effective = match ($source) {
+                2 => $override,
+                1 => $stored,
+                default => '',
+            };
+            $json = $effective !== '' && (($effective[0] === '{' && $effective[-1] === '}') || ($effective[0] === '[' && $effective[-1] === ']'));
+            $flags = ($key !== $setting ? 1 : 0) | ($sectionName !== $sectionLower ? 2 : 0) | ($clamped ? 4 : 0) | ($ttl === 0 ? 8 : 0)
+                | (str_contains($rawStored, "\n") || str_contains($rawOverride, "\n") ? 16 : 0) | ($json ? 32 : 0)
+                | (preg_match('/[\x80-\xff]/', $item) === 1 ? 64 : 0) | (strcspn($item, self::W67_CONTROL_BYTES) !== \strlen($item) ? 128 : 0);
+            $decision = match (true) {
+                trim($item) === '' => 0,
+                $section === 0 || $section === 7 => 1,
+                ! $keyValid => 2,
+                $ttl < 0 => 3,
+                $source === 2 && $override !== $stored => 4,
+                $source === 2 => 5,
+                $source === 1 => 6,
+                default => 7,
+            };
+            $hash = 0;
+            if ($decision >= 4) {
+                $hash = (int) hexdec(hash('fnv1a32', 'configuration:'.self::W67_DOMAIN_NAMES[$section].'.'.$key)) & 0xFFFFF;
+                $seen = $section.':'.$key;
+                if (isset($keys[$seen])) {
+                    $flags |= 256;
+                } else {
+                    $keys[$seen] = true;
+                }
+            }
+            $tail[$decision]++;
+            $tail[8 + $section]++;
+            $tail[16 + $source]++;
+            for ($b = 0; $b < 9; $b++) {
+                $tail[19 + $b] += $flags >> $b & 1;
+            }
+            $tail[28] += $ttlValue;
+            $tail[29] = max($tail[29], $ttlValue);
+            $out[] = $decision | $section << 3 | $source << 6 | $flags << 8 | $ttlValue << 17 | $hash << 34 | min(\strlen($effective), 511) << 54;
+        }
+        $tail[30] = \count($keys);
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    private const string W67_CONTROL_BYTES = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F";
+
+    /** ConfigurationDomain value => case position + 1. */
+    private const array W67_DOMAINS = ['site' => 1, 'registration' => 2, 'ingestion' => 3, 'post-processing' => 4, 'metadata' => 5, 'tmux' => 6];
+
+    /** ConfigurationDomain values by W67_DOMAINS code. */
+    private const array W67_DOMAIN_NAMES = [1 => 'site', 2 => 'registration', 3 => 'ingestion', 4 => 'post-processing', 5 => 'metadata', 6 => 'tmux'];
+
+    private const string W67_DIGITS = '0123456789';
+
+    /** A trimmed field of 1-15 digits; empty is $empty, anything else -1. */
+    private static function w67Uint(string $raw, int $empty): int
+    {
+        $value = trim($raw);
+        if ($value === '') {
+            return $empty;
+        }
+        $length = \strlen($value);
+
+        return $length <= 15 && strspn($value, self::W67_DIGITS) === $length ? (int) $value : -1;
+    }
+
+    /**
+     * $value clamped to $min..$max and whether clamping changed it; malformed (-1) is 0, unchanged.
+     *
+     * @return array{0: int, 1: bool}
+     */
+    private static function w67Clamp(int $value, int $min, int $max): array
+    {
+        if ($value < 0) {
+            return [0, false];
+        }
+        $clamped = max($min, min($max, $value));
+
+        return [$clamped, $clamped !== $value];
+    }
+
+    /**
+     * Wave 67 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'reset' clears the override, library handle and buffers, 'ffi'
+     * resolves the library (null when unavailable) and 'out' and 'lens' return `int64_t` output and
+     * length-column buffers of at least $val words.
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('domain_config_repo_w671', self::W67_DOMAIN_CONFIG_REPO_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w67RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w67RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 67.1 DomainConfigurationRepository export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w67Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w67RustFfiState('ffi');
+            $out = self::w67RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w67RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W67_DOMAIN_CONFIG_REPO_FFI_CDEF.)
+            $written = $ffi->nntmux_w671_domain_config_repo_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
