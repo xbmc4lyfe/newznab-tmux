@@ -317,4 +317,166 @@ final class ProbeResult
         /** @var list<int>|null */
         return \is_array($decoded) ? array_values($decoded) : null;
     }
+
+    /**
+     * Enabled: the paired benchmark in the W56 parity test measures 4.587x common mean, 4.465x
+     * common p99, 2.638x uncommon mean and 2.484x uncommon p99 (per-metric minimum of three runs),
+     * above the 1.5x rule.
+     */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    private const string W56_FFI_CDEF = 'ssize_t nntmux_w561_probe_detail_code_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public const int W56_DETAIL_HEALTHY = 0;
+
+    public const int W56_DETAIL_DEGRADED = 1;
+
+    public const int W56_DETAIL_UNHEALTHY = 2;
+
+    public const int W56_DETAIL_LONG = 4;
+
+    public const int W56_DETAIL_NON_ASCII = 8;
+
+    public const int W56_DETAIL_LENGTH_SHIFT = 8;
+
+    /** Reason words (matched ASCII case-insensitively) that classify a detail as unhealthy. */
+    public const array W56_UNHEALTHY_WORDS = ['unreachable', 'refused', 'failed', 'error', 'timed out', 'timeout'];
+
+    /** Reason words that classify a detail as degraded when no unhealthy word matches. */
+    public const array W56_DEGRADED_WORDS = ['slow', 'degraded', 'lagging', 'behind', 'warning', 'skipping'];
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 56 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * One word per probe reason, over its detail `preg_replace('/\s+/', ' ', trim($reason))`:
+     * the `W56_DETAIL_HEALTHY` / `_DEGRADED` / `_UNHEALTHY` class from the reason words, then
+     * `W56_DETAIL_LONG` (over 120 bytes) and `W56_DETAIL_NON_ASCII` flags and the detail length
+     * `<< W56_DETAIL_LENGTH_SHIFT`.
+     *
+     * @param  array<array-key, string>  $reasons
+     * @return list<int>
+     */
+    public static function detailCodes(array $reasons): array
+    {
+        return self::usesW56RustFfi() ? self::detailCodesNative($reasons) : self::detailCodesPhp($reasons);
+    }
+
+    /**
+     * @param  array<array-key, string>  $reasons
+     * @return list<int>
+     */
+    public static function detailCodesPhp(array $reasons): array
+    {
+        $codes = [];
+        foreach ($reasons as $reason) {
+            $detail = (string) preg_replace('/\s+/', ' ', trim($reason));
+            $lower = strtolower($detail);
+            $class = self::W56_DETAIL_HEALTHY;
+            foreach (self::W56_UNHEALTHY_WORDS as $word) {
+                if (str_contains($lower, $word)) {
+                    $class = self::W56_DETAIL_UNHEALTHY;
+
+                    break;
+                }
+            }
+            if ($class === self::W56_DETAIL_HEALTHY) {
+                foreach (self::W56_DEGRADED_WORDS as $word) {
+                    if (str_contains($lower, $word)) {
+                        $class = self::W56_DETAIL_DEGRADED;
+
+                        break;
+                    }
+                }
+            }
+            $length = \strlen($detail);
+            $codes[] = $class
+                | ($length > 120 ? self::W56_DETAIL_LONG : 0)
+                | (preg_match('/[\x80-\xff]/', $detail) === 1 ? self::W56_DETAIL_NON_ASCII : 0)
+                | $length << self::W56_DETAIL_LENGTH_SHIFT;
+        }
+
+        return $codes;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $reasons
+     * @return list<int>
+     */
+    public static function detailCodesNative(array $reasons): array
+    {
+        $count = \count($reasons);
+        $words = $count;
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w56RustFfiState('out', $words);
+        if ($buffer === null) {
+            return self::detailCodesPhp($reasons);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $reasons);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w561_probe_detail_code_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', FFI::string($out, $words * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::detailCodesPhp($reasons);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 56 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('probe_result_w56', self::W56_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
+    }
 }
