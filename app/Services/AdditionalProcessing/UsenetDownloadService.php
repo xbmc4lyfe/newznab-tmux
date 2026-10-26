@@ -953,4 +953,294 @@ class UsenetDownloadService
             return null;
         }
     }
+
+    // ========================================================================
+    // WAVE 65.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 1000-round paired runs reached 2.53x common mean, 2.43x common p99, 2.25x uncommon mean and 2.25x uncommon p99; see RustUsenetDownloadAdminSnapshotAnidbArchiveBlacklistW65ParityTest. */
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    private const string W65_FFI_CDEF = 'ssize_t nntmux_w654_usenet_download_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w65UsenetDownloadPlanBatch() record. */
+    public const int W65_ROW_WORDS = 5;
+
+    /** int64 summary words after the w65UsenetDownloadPlanBatch() records (none for an empty batch). */
+    public const int W65_TRAILER_WORDS = 13;
+
+    private const string W65_ID_SEPARATORS = '/[ \t\r\n,]+/';
+
+    private const string W65_MESSAGE_ID = '/\A[^@\x00-\x20\x7f]+@[^@\x00-\x20\x7f]+\z/';
+
+    private const int W65_MESSAGE_ID_MAX = 250;
+
+    private const int W65_BATCH_ARTICLES = 20;
+
+    private const int W65_VALUE_CAP = (1 << 40) - 1;
+
+    private const int W65_TOTAL_CAP = 1 << 62;
+
+    private const int W65_DEFAULT_PART = 716_800;
+
+    private const int W65_PART_CAP = 1 << 30;
+
+    /**
+     * Usenet download plan rows for [message IDs, group, last error, decoded bytes per article,
+     * byte budget, attempts so far, alternate NNTP available] items.
+     *
+     * Message IDs split on runs of spaces, tabs, CR, LF and commas; each token is trimmed of `<>`
+     * and is valid when it has at most 250 bytes and matches `local@domain` without control
+     * bytes, spaces, DEL or a second `@`. Repeated valid IDs count once. A part size of 0 or less
+     * is 716,800 bytes (capped at 2^30); budgets clamp to [0, 2^40) and 0 means unbounded. The
+     * trimmed error picks the decision: 5 no valid IDs, 1 fetch (no error), 2 alternate NNTP (a
+     * group-unavailable error with an alternate server), 3 retry (another error, fewer than 3
+     * attempts), 4 give up. Fetch, alternate and retry plan `min(unique, budget / part)`
+     * articles in BODY batches of 20; the yEnc assembly estimate adds 2 bytes per 128-byte line
+     * and 96 header/trailer bytes per article.
+     *
+     * Rows [decision | flags << 4 (1 budget capped, 2 invalid IDs, 4 duplicate IDs, 8 group
+     * unavailable, 16 alternate NNTP, 32 error) | IDs << 12 | unique IDs << 28 | batches << 44
+     * (each clamped to 2^16 - 1), fnv1a32(strtolower(trim(group))) (0 when empty), articles to
+     * fetch, decoded bytes, yEnc bytes], then the trailer [records, fetch, alternate, retry,
+     * give up, no IDs, IDs, unique IDs, invalid IDs, duplicate IDs, decoded bytes, yEnc bytes
+     * (both saturating at 2^62), FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int}>  $items
+     * @return list<int>
+     */
+    public static function w65UsenetDownloadPlanBatch(array $items): array
+    {
+        return self::usesW65RustFfi() ? self::w65UsenetDownloadPlanBatchNative($items) : self::w65UsenetDownloadPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int}>  $items
+     * @return list<int>
+     */
+    public static function w65UsenetDownloadPlanBatchPhp(array $items): array
+    {
+        self::w65Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $t = [\count($items), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        foreach ($items as [$ids, $group, $error, $part, $budget, $attempts, $alternate]) {
+            $part = $part > 0 ? min($part, self::W65_PART_CAP) : self::W65_DEFAULT_PART;
+            $budget = max(0, min($budget, self::W65_VALUE_CAP));
+            $error = trim($error);
+            $seen = [];
+            $total = $invalid = $duplicates = 0;
+            foreach (preg_split(self::W65_ID_SEPARATORS, $ids, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                $total++;
+                $id = trim($token, '<>');
+                if (\strlen($id) > self::W65_MESSAGE_ID_MAX || preg_match(self::W65_MESSAGE_ID, $id) !== 1) {
+                    $invalid++;
+                } elseif (isset($seen[$id])) {
+                    $duplicates++;
+                } else {
+                    $seen[$id] = true;
+                }
+            }
+            $unique = \count($seen);
+            $unavailable = self::isGroupUnavailableMessagePhp($error);
+            $decision = match (true) {
+                $unique === 0 => 5,
+                $error === '' => 1,
+                $unavailable => $alternate !== 0 ? 2 : 4,
+                $attempts < 3 => 3,
+                default => 4,
+            };
+            $fetch = $decision <= 3 ? ($budget > 0 ? min($unique, intdiv($budget, $part)) : $unique) : 0;
+            $decoded = $fetch * $part;
+            $encoded = $fetch === 0 ? 0 : $decoded + 2 * intdiv($decoded + 127, 128) + 96 * $fetch;
+            $flags = ($decision <= 3 && $fetch < $unique ? 1 : 0) | ($invalid > 0 ? 2 : 0) | ($duplicates > 0 ? 4 : 0)
+                | ($unavailable ? 8 : 0) | ($alternate !== 0 ? 16 : 0) | ($error !== '' ? 32 : 0);
+            $hash = self::w65Fnv(strtolower(trim($group)));
+            $batches = intdiv($fetch + self::W65_BATCH_ARTICLES - 1, self::W65_BATCH_ARTICLES);
+            $word = $decision | $flags << 4 | min($total, 0xFFFF) << 12 | min($unique, 0xFFFF) << 28 | min($batches, 0xFFFF) << 44;
+            array_push($out, $word, $hash, $fetch, $decoded, $encoded);
+            $t[$decision]++;
+            $t[6] += $total;
+            $t[7] += $unique;
+            $t[8] += $invalid;
+            $t[9] += $duplicates;
+            $t[10] = min($t[10] + $decoded, self::W65_TOTAL_CAP);
+            $t[11] = min($t[11] + $encoded, self::W65_TOTAL_CAP);
+            $value = $word ^ $hash << 16 ^ $decoded;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $t[12] = $digest;
+
+        return [...$out, ...$t];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int}>  $items
+     * @return list<int>
+     */
+    public static function w65UsenetDownloadPlanBatchNative(array $items): array
+    {
+        self::w65Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w65Join([array_column($items, 0), array_column($items, 1), array_column($items, 2)]);
+        $ints = pack('P*', ...array_column($items, 3), ...array_column($items, 4), ...array_column($items, 5), ...array_column($items, 6));
+
+        return self::w65Call($blob, $twin, $ints, $count, $count * self::W65_ROW_WORDS + self::W65_TRAILER_WORDS)
+            ?? self::w65UsenetDownloadPlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w65Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new \InvalidArgumentException('W65 usenet download plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 7 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_string($item[2]) || ! \is_int($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5]) || ! \is_int($item[6])) {
+                throw new \InvalidArgumentException('W65 usenet download plan batch items must be [string message IDs, string group, string error, int part size, int byte budget, int attempts, int alternate NNTP] lists.');
+            }
+        }
+    }
+
+    public static function usesW65RustFfi(): bool
+    {
+        $enabled = self::w65RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W65_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('enabled', true);
+    }
+
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('enabled', false);
+    }
+
+    /** Drop the W65 override, binding, output buffer and declined-call count; routing returns to W65_RUST_FFI_DEFAULT. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W65 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('enabled');
+        self::w65RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w65Join(array $columns): array
+    {
+        $values = array_merge(...$columns);
+        $joined = implode("\0", $values);
+
+        return substr_count($joined, "\0") === \count($values) - 1 ? [$joined, ''] : [$joined, implode("\x01", $values)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w65Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w65RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w65', self::W65_FFI_CDEF) ?? false;
+            self::w65RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w65RustFfiState('out', $out);
+                self::w65RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W65_FFI_CDEF.)
+            $written = $ffi->nntmux_w654_usenet_download_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (\Throwable) {
+        }
+        self::w65RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W65 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int, 0 for an empty string. */
+    private static function w65Fnv(string $bytes): int
+    {
+        if ($bytes === '') {
+            return 0;
+        }
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
+    }
 }

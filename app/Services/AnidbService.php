@@ -885,4 +885,350 @@ class AnidbService
 
         return $state[$op] ?? null;
     }
+
+    // ========================================================================
+    // WAVE 65.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 1000-round paired runs reached 2.45x common mean, 2.70x common p99, 2.37x uncommon mean and 2.37x uncommon p99; see RustUsenetDownloadAdminSnapshotAnidbArchiveBlacklistW65ParityTest. */
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    private const string W65_FFI_CDEF = 'ssize_t nntmux_w654_anidb_match_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w65AnidbMatchPlanBatch() record. */
+    public const int W65_ROW_WORDS = 5;
+
+    /** int64 summary words after the w65AnidbMatchPlanBatch() records (none for an empty batch). */
+    public const int W65_TRAILER_WORDS = 12;
+
+    private const string W65_BRACKETS = '/\[[^\]]*\]|\([^)]*\)/';
+
+    private const string W65_NON_WORD = '/[^a-z0-9\x80-\xff]+/';
+
+    private const string W65_EPISODE = '/^(?:s\d{1,2})?ep?(\d{1,4})\z/';
+
+    /** Tokens that end the base title. */
+    private const array W65_QUALITY = ['480p' => true, '720p' => true, '1080p' => true, '2160p' => true, '4k' => true, 'bd' => true, 'bdrip' => true,
+        'bluray' => true, 'hevc' => true, 'x264' => true, 'x265' => true, 'h264' => true, 'h265' => true, 'web' => true, 'webrip' => true, 'webdl' => true,
+        'dvdrip' => true, 'tvrip' => true, 'aac' => true, 'flac' => true, '10bit' => true, '8bit' => true, 'multi' => true, 'dual' => true];
+
+    /**
+     * AniDB match rows for [release name, romaji title, english title, kanji title, release
+     * year, anime start year, episode count] items.
+     *
+     * Names and titles normalize the same way: `[...]` and `(...)` groups become spaces, ASCII
+     * letters lower-case, runs of bytes other than a-z, 0-9 and 0x80-0xFF (UTF-8 kanji and
+     * kana stay intact) become one space, and the ends are trimmed. The base title is the
+     * release's tokens before the first all-digit, episode (`/^(?:s\d{1,2})?ep?\d{1,4}$/`) or
+     * quality token; the first 1-4 digit token that is not a 1900-2099 year (or the first
+     * episode token) is the episode and the first such year is the name year. Each non-empty
+     * title scores `intdiv((longest - levenshtein) * 10000, longest)` against the base (0 when
+     * the base is empty, -1 for an empty title); the best score wins with ties to the earlier
+     * title. The release year is the positive column (capped at 9999), else the name year;
+     * years match within one. Decisions: 1 matched (an exact title or 9000+), 2 probable (7500+
+     * without a year mismatch), 3 weak (5000+), 4 none.
+     *
+     * Rows [decision | best source (1 romaji, 2 english, 3 kanji, 0 none) << 4 | year status
+     * (0 unknown, 1 match, 2 mismatch) << 8 | episode status (0 none, 1 no count, 2 in range, 3
+     * out of range) << 10 | flags << 12 (1 exact, 2 base starts with a title, 4 empty base, 8
+     * episode, 16 year from the name) | base length << 20 (clamped to 2^16 - 1) | episode << 36
+     * (0xFFFF when none), best score, scores (0xFFFF for an empty title) at bits 0/16/32,
+     * fnv1a32(base) (0 when empty), release year], then the trailer [records, matched,
+     * probable, weak, none, romaji, english and kanji best sources, year mismatches, episodes
+     * out of range, best score total, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: int, 5: int, 6: int}>  $items
+     * @return list<int>
+     */
+    public static function w65AnidbMatchPlanBatch(array $items): array
+    {
+        return self::usesW65RustFfi() ? self::w65AnidbMatchPlanBatchNative($items) : self::w65AnidbMatchPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: int, 5: int, 6: int}>  $items
+     * @return list<int>
+     */
+    public static function w65AnidbMatchPlanBatchPhp(array $items): array
+    {
+        self::w65Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $t = [\count($items), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        foreach ($items as [$release, $romaji, $english, $kanji, $releaseYear, $animeYear, $episodes]) {
+            $norm = self::w65AnidbNormalize($release);
+            $tokens = $norm === '' ? [] : explode(' ', $norm);
+            $stop = null;
+            $episode = -1;
+            $nameYear = 0;
+            foreach ($tokens as $k => $token) {
+                if (ctype_digit($token)) {
+                    if (\strlen($token) <= 4) {
+                        $n = (int) $token;
+                        if (\strlen($token) === 4 && $n >= 1900 && $n <= 2099) {
+                            if ($nameYear === 0) {
+                                $nameYear = $n;
+                            }
+                        } elseif ($episode < 0) {
+                            $episode = $n;
+                        }
+                    }
+                    $isStop = true;
+                } elseif (preg_match(self::W65_EPISODE, $token, $m) === 1) {
+                    if ($episode < 0) {
+                        $episode = (int) $m[1];
+                    }
+                    $isStop = true;
+                } else {
+                    $isStop = isset(self::W65_QUALITY[$token]);
+                }
+                if ($isStop && $stop === null) {
+                    $stop = $k;
+                }
+            }
+            $base = $stop === null ? $norm : implode(' ', \array_slice($tokens, 0, $stop));
+            $sims = [-1, -1, -1];
+            $exact = $prefix = false;
+            foreach ([$romaji, $english, $kanji] as $k => $raw) {
+                $title = self::w65AnidbNormalize($raw);
+                if ($title === '') {
+                    continue;
+                }
+                if ($base === '') {
+                    $sims[$k] = 0;
+
+                    continue;
+                }
+                $exact = $exact || $title === $base;
+                $prefix = $prefix || str_starts_with($base, $title);
+                $longest = max(\strlen($base), \strlen($title));
+                $sims[$k] = intdiv(($longest - levenshtein($base, $title)) * 10_000, $longest);
+            }
+            $best = -1;
+            $source = 0;
+            foreach ($sims as $k => $sim) {
+                if ($sim > $best) {
+                    $best = $sim;
+                    $source = $k + 1;
+                }
+            }
+            $fromName = $releaseYear <= 0 && $nameYear > 0;
+            $releaseYear = $releaseYear > 0 ? min($releaseYear, 9999) : $nameYear;
+            $animeYear = max(0, min($animeYear, 9999));
+            $episodes = max(0, min($episodes, 0xFFFF));
+            $yearStatus = $releaseYear === 0 || $animeYear === 0 ? 0 : (abs($releaseYear - $animeYear) <= 1 ? 1 : 2);
+            $episodeStatus = match (true) {
+                $episode < 0 => 0,
+                $episodes === 0 => 1,
+                $episode >= 1 && $episode <= $episodes => 2,
+                default => 3,
+            };
+            $decision = match (true) {
+                $exact || $best >= 9000 => 1,
+                $best >= 7500 && $yearStatus !== 2 => 2,
+                $best >= 5000 => 3,
+                default => 4,
+            };
+            $flags = ($exact ? 1 : 0) | ($prefix ? 2 : 0) | ($base === '' ? 4 : 0) | ($episode >= 0 ? 8 : 0) | ($fromName ? 16 : 0);
+            $word = $decision | $source << 4 | $yearStatus << 8 | $episodeStatus << 10 | $flags << 12 | min(\strlen($base), 0xFFFF) << 20
+                | ($episode < 0 ? 0xFFFF : $episode) << 36;
+            $packed = ($sims[0] < 0 ? 0xFFFF : $sims[0]) | ($sims[1] < 0 ? 0xFFFF : $sims[1]) << 16 | ($sims[2] < 0 ? 0xFFFF : $sims[2]) << 32;
+            $hash = self::w65Fnv($base);
+            array_push($out, $word, $best, $packed, $hash, $releaseYear);
+            $t[$decision]++;
+            if ($source > 0) {
+                $t[4 + $source]++;
+            }
+            if ($yearStatus === 2) {
+                $t[8]++;
+            }
+            if ($episodeStatus === 3) {
+                $t[9]++;
+            }
+            $t[10] += max($best, 0);
+            $value = $word ^ $packed ^ $hash << 8;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $t[11] = $digest;
+
+        return [...$out, ...$t];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: int, 5: int, 6: int}>  $items
+     * @return list<int>
+     */
+    public static function w65AnidbMatchPlanBatchNative(array $items): array
+    {
+        self::w65Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w65Join([array_column($items, 0), array_column($items, 1), array_column($items, 2), array_column($items, 3)]);
+        $ints = pack('P*', ...array_column($items, 4), ...array_column($items, 5), ...array_column($items, 6));
+
+        return self::w65Call($blob, $twin, $ints, $count, $count * self::W65_ROW_WORDS + self::W65_TRAILER_WORDS)
+            ?? self::w65AnidbMatchPlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w65Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new \InvalidArgumentException('W65 AniDB match plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 7 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_string($item[2]) || ! \is_string($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5]) || ! \is_int($item[6])) {
+                throw new \InvalidArgumentException('W65 AniDB match plan batch items must be [string release name, string romaji title, string english title, string kanji title, int release year, int anime year, int episodes] lists.');
+            }
+        }
+    }
+
+    public static function usesW65RustFfi(): bool
+    {
+        $enabled = self::w65RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W65_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('enabled', true);
+    }
+
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('enabled', false);
+    }
+
+    /** Drop the W65 override, binding, output buffer and declined-call count; routing returns to W65_RUST_FFI_DEFAULT. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W65 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('enabled');
+        self::w65RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w65Join(array $columns): array
+    {
+        $values = array_merge(...$columns);
+        $joined = implode("\0", $values);
+
+        return substr_count($joined, "\0") === \count($values) - 1 ? [$joined, ''] : [$joined, implode("\x01", $values)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w65Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w65RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w65', self::W65_FFI_CDEF) ?? false;
+            self::w65RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w65RustFfiState('out', $out);
+                self::w65RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W65_FFI_CDEF.)
+            $written = $ffi->nntmux_w654_anidb_match_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w65RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W65 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** Bracket groups to spaces, ASCII lower-case, other non-word byte runs to one space, trimmed. */
+    private static function w65AnidbNormalize(string $value): string
+    {
+        $value = strtolower((string) preg_replace(self::W65_BRACKETS, ' ', $value));
+
+        return trim((string) preg_replace(self::W65_NON_WORD, ' ', $value), ' ');
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int, 0 for an empty string. */
+    private static function w65Fnv(string $bytes): int
+    {
+        if ($bytes === '') {
+            return 0;
+        }
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
+    }
 }
