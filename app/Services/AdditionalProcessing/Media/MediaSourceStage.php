@@ -630,4 +630,338 @@ class MediaSourceStage
 
         return [self::$w52Ffi, self::$w52Out];
     }
+
+    // ========================================================================
+    // WAVE 65.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 5.42x, p99 4.69x; uncommon mean 6.10x, p99 4.28x); see RustAdditionalMediaStageToolPar2MapperThumbExtractionW65ParityTest. */
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    public const string W65_MEDIA_SOURCE_STAGE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w651_media_source_stage_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w65MediaSourceStagePlanBatch(). */
+    public const int W65_MEDIA_SOURCE_STAGE_TRAILER = 43;
+
+    public static function usesW65RustFfi(): bool
+    {
+        $override = self::w65RustFfiState();
+
+        return \is_bool($override) ? $override : self::W65_RUST_FFI_DEFAULT;
+    }
+
+    /** Forces the MediaSourceStage Wave 65 Rust path on until reset. */
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', true);
+    }
+
+    /** Forces the MediaSourceStage Wave 65 PHP path until reset. */
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', false);
+    }
+
+    /** Restores the benchmark default and drops the cached library handle and scratch buffers; earlier toggles are untouched. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('reset');
+    }
+
+    /**
+     * Runs $callback with the MediaSourceStage Wave 65 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 65.1 media source stage plans, one per candidate source `kind|size|segments|position|container|budget|attempts|name`
+     * (trimmed fields; numbers are 1-15 digits, empty 0, budget empty 5 MiB). Kind (lowercased): 0 empty, 1 video, 2 sample,
+     * 3 archive, 4 audio, 5 image, 7 other. Position: 0 empty, 1 head, 2 mid/middle, 3 complete, 7 other. Container: 0 empty,
+     * 1-8 mkv, mp4, avi, ts, mov, wmv, mpg, m2ts, 15 other. Decision: 0 empty row, 1 malformed (bad number, other kind or
+     * position), 2 no segments, 3 three or more attempts, 4 video/sample/audio under 64 KiB, 5 video or sample in an unknown
+     * container, 6 segment larger than the budget, 8 archive extraction, 7 direct. Fallback chain: 1 sample, 2 head, 4 middle,
+     * 8 archive, 16 audio. Eligible rows read `min(segments, max(1, budget / ceil(size / segments)))` segments, centred for the
+     * middle position. Flags: 1 sample name, 2 non-ASCII, 4 control byte, 8 empty name, 16 extension differs from the
+     * container, 32 name repeated in the batch (case-insensitive), 64 truncated read, 128 4 GiB or larger. Per item
+     * `decision | kind << 4 | position << 7 | container << 10 | chain << 14 | flags << 19 | min(needed, 4095) << 27 |
+     * min(start, 4095) << 39 | bitLength(size) << 51 | min(attempts, 15) << 57`; then 10 decision, 8 kind, 8 position, 8 flag
+     * and 5 chain counts, the segment sum, the planned byte sum, the largest segment and the distinct names.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65MediaSourceStagePlanBatch(array $items): array
+    {
+        return self::usesW65RustFfi() ? self::w65MediaSourceStagePlanBatchNative($items) : self::w65MediaSourceStagePlanBatchPhp($items);
+    }
+
+    /**
+     * Rust plan; falls back to the PHP reference when the library is missing or the call declines.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65MediaSourceStagePlanBatchNative(array $items): array
+    {
+        return self::w65Invoke($items, \count($items) + self::W65_MEDIA_SOURCE_STAGE_TRAILER) ?? self::w65MediaSourceStagePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65MediaSourceStagePlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W65_MEDIA_SOURCE_STAGE_TRAILER, 0);
+        $names = [];
+        foreach ($items as $item) {
+            $item = (string) $item;
+            [$rawKind, $rawSize, $rawSegments, $rawPosition, $rawContainer, $rawBudget, $rawAttempts, $rawName] = explode('|', $item, 8)
+                + ['', '', '', '', '', '', '', ''];
+            $kindName = strtolower(trim($rawKind));
+            $kind = $kindName === '' ? 0 : (self::W65_SOURCE_KINDS[$kindName] ?? 7);
+            $size = self::w65Uint($rawSize, 0);
+            $segments = self::w65Uint($rawSegments, 0);
+            $positionName = strtolower(trim($rawPosition));
+            $position = $positionName === '' ? 0 : (self::W65_SOURCE_POSITIONS[$positionName] ?? 7);
+            $containerName = strtolower(trim($rawContainer));
+            $container = $containerName === '' ? 0 : (self::W65_SOURCE_CONTAINERS[$containerName] ?? 15);
+            $budget = self::w65Uint($rawBudget, 5_242_880);
+            $attempts = self::w65Uint($rawAttempts, 0);
+            $name = trim($rawName);
+            $lower = strtolower($name);
+            $malformed = $size < 0 || $segments < 0 || $budget < 0 || $attempts < 0 || $kind === 7 || $position === 7;
+            $perSegment = $size > 0 && $segments > 0 ? intdiv($size + $segments - 1, $segments) : 0;
+            $decision = match (true) {
+                trim($item) === '' => 0,
+                $malformed => 1,
+                $segments === 0 => 2,
+                $attempts >= 3 => 3,
+                ($kind === 1 || $kind === 2 || $kind === 4) && $size < 65_536 => 4,
+                ($kind === 1 || $kind === 2) && $container === 15 => 5,
+                $budget > 0 && $perSegment > $budget => 6,
+                $kind === 3 => 8,
+                default => 7,
+            };
+            $sample = str_contains($lower, 'sample');
+            $chain = ($kind === 2 || $sample ? 1 : 0) | ($position === 0 || $position === 1 || $position === 3 ? 2 : 0)
+                | ($position === 2 || $position === 3 ? 4 : 0) | ($kind === 3 ? 8 : 0) | ($kind === 4 ? 16 : 0);
+            $eligible = $decision >= 7;
+            $needed = $eligible && $perSegment > 0 ? min($segments, max(1, intdiv($budget, $perSegment))) : 0;
+            $start = $eligible && $position === 2 ? intdiv($segments - $needed, 2) : 0;
+            [, $extension] = self::w65SplitExtension($lower);
+            $flags = ($sample ? 1 : 0) | (preg_match('/[\x80-\xff]/', $item) === 1 ? 2 : 0)
+                | (strcspn($item, self::W65_CONTROL_BYTES) !== \strlen($item) ? 4 : 0) | ($name === '' ? 8 : 0)
+                | ($container >= 1 && $container <= 8 && $extension !== '' && (self::W65_SOURCE_CONTAINERS[$extension] ?? 0) !== $container ? 16 : 0)
+                | ($needed > 0 && $needed < $segments ? 64 : 0) | ($size >= 1 << 32 ? 128 : 0);
+            if ($lower !== '') {
+                if (isset($names[$lower])) {
+                    $flags |= 32;
+                } else {
+                    $names[$lower] = true;
+                }
+            }
+            $tail[$decision]++;
+            $tail[10 + $kind]++;
+            $tail[18 + $position]++;
+            for ($b = 0; $b < 8; $b++) {
+                $tail[26 + $b] += $flags >> $b & 1;
+            }
+            for ($b = 0; $b < 5; $b++) {
+                $tail[34 + $b] += $chain >> $b & 1;
+            }
+            $tail[39] += min($needed, 1 << 40);
+            if ($eligible) {
+                $tail[40] += min($needed * $perSegment, 1 << 40);
+            }
+            $tail[41] = max($tail[41], $perSegment);
+            $out[] = $decision | $kind << 4 | $position << 7 | $container << 10 | $chain << 14 | $flags << 19 | min($needed, 4095) << 27
+                | min($start, 4095) << 39 | self::w65BitLength($size) << 51 | max(0, min($attempts, 15)) << 57;
+        }
+        $tail[42] = \count($names);
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    /** @var array<string, int> */
+    private const array W65_SOURCE_KINDS = ['video' => 1, 'sample' => 2, 'archive' => 3, 'audio' => 4, 'image' => 5];
+
+    /** @var array<string, int> */
+    private const array W65_SOURCE_POSITIONS = ['head' => 1, 'mid' => 2, 'middle' => 2, 'complete' => 3];
+
+    /** @var array<string, int> */
+    private const array W65_SOURCE_CONTAINERS = ['mkv' => 1, 'mp4' => 2, 'avi' => 3, 'ts' => 4, 'mov' => 5, 'wmv' => 6, 'mpg' => 7, 'm2ts' => 8];
+
+    private const string W65_DIGITS = '0123456789';
+
+    private const string W65_CONTROL_BYTES = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F";
+
+    /** A trimmed field of 1-15 digits; empty is $empty, anything else -1. */
+    private static function w65Uint(string $raw, int $empty): int
+    {
+        $value = trim($raw);
+        if ($value === '') {
+            return $empty;
+        }
+        $length = \strlen($value);
+
+        return $length <= 15 && strspn($value, self::W65_DIGITS) === $length ? (int) $value : -1;
+    }
+
+    private static function w65BitLength(int $value): int
+    {
+        $bits = 0;
+        for (; $value > 0; $value >>= 1) {
+            $bits++;
+        }
+
+        return $bits;
+    }
+
+    /**
+     * Splits a lowercased name at its last `.` when the extension is 1-5 `[a-z0-9]` bytes.
+     *
+     * @return array{0: string, 1: string}
+     */
+    private static function w65SplitExtension(string $name): array
+    {
+        $dot = strrpos($name, '.');
+        if ($dot === false) {
+            return [$name, ''];
+        }
+        $extension = substr($name, $dot + 1);
+        $length = \strlen($extension);
+        if ($length === 0 || $length > 5 || strspn($extension, 'abcdefghijklmnopqrstuvwxyz0123456789') !== $length) {
+            return [$name, ''];
+        }
+
+        return [substr($name, 0, $dot), $extension];
+    }
+
+    /**
+     * Wave 65 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'reset' clears the override, library handle and buffers, 'ffi'
+     * resolves the library (null when unavailable) and 'out' and 'lens' return `int64_t` output and
+     * length-column buffers of at least $val words.
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('media_source_stage_w651', self::W65_MEDIA_SOURCE_STAGE_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w65RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w65RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 65.1 MediaSourceStage export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w65Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w65RustFfiState('ffi');
+            $out = self::w65RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w65RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W65_MEDIA_SOURCE_STAGE_FFI_CDEF.)
+            $written = $ffi->nntmux_w651_media_source_stage_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

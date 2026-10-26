@@ -50291,3 +50291,1223 @@ pub mod w641_additional_query_diagnostics_orchestrator_planner_extraction {
         }
     }
 }
+
+pub mod w651_additional_media_stage_tool_par2_thumb_extraction {
+    //! Wave 65.1 per-item plans for MediaSourceStage, MediaToolFactory, Par2FileMapper,
+    //! ThumbnailFrameSelector and MediaExtractionService. Every export follows the Wave 62.1
+    //! contract: items are NUL-joined in `blob`, or concatenated with their byte lengths in `lens`
+    //! when it is non-null; one `i64` word per item is written, then a fixed rollup trailer.
+    //! Returns the word count, `-needed` when `out_cap` (in words) is too small, or -1 when it
+    //! declines (null or misaligned `out`, null `blob` with a length, `count` other than the number
+    //! of NUL-separated items, `lens` that do not tile `blob`, or overlapping buffers). Item fields
+    //! are `|`-separated as PHP `explode('|', $item, N)` padded with empty strings, and every
+    //! helper matches its PHP reference bit for bit.
+
+    use std::collections::{HashMap, HashSet};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_ITEMS: usize = 1 << 22;
+    const DECLINE: isize = -1;
+    const SUM_CAP: i64 = 1 << 40;
+
+    pub const MEDIA_SOURCE_STAGE_TRAILER: usize = 43;
+    pub const MEDIA_TOOL_FACTORY_TRAILER: usize = 35;
+    pub const PAR2_FILE_MAPPER_TRAILER: usize = 37;
+    pub const THUMBNAIL_SELECTOR_TRAILER: usize = 26;
+    pub const MEDIA_EXTRACTION_TRAILER: usize = 53;
+
+    #[inline]
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    /// PHP `trim()` without a character list.
+    fn trim(s: &[u8]) -> &[u8] {
+        let start = s.iter().position(|&b| !is_ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|&b| !is_ws(b)).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    /// PHP `explode('|', $item, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(item: &[u8]) -> [&[u8]; N] {
+        let mut out = [&item[..0]; N];
+        let mut rest = item;
+        for slot in out.iter_mut().take(N - 1) {
+            match rest.iter().position(|&b| b == b'|') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    return out;
+                }
+            }
+        }
+        out[N - 1] = rest;
+        out
+    }
+
+    #[inline]
+    fn non_ascii(s: &[u8]) -> bool {
+        s.iter().any(|&b| b >= 0x80)
+    }
+
+    #[inline]
+    fn has_control(s: &[u8]) -> bool {
+        s.iter().any(|&b| b < 0x20 || b == 0x7f)
+    }
+
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    fn digits_value(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |a, &d| a * 10 + i64::from(d - b'0'))
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// An unsigned field of 1-15 digits after trimming; empty is `empty`, anything else -1.
+    fn uint_field(raw: &[u8], empty: i64) -> i64 {
+        let t = trim(raw);
+        if t.is_empty() {
+            return empty;
+        }
+        if t.len() <= 15 && all_digits(t) { digits_value(t) } else { -1 }
+    }
+
+    fn bit_length(v: i64) -> i64 {
+        if v <= 0 { 0 } else { i64::from(64 - v.leading_zeros()) }
+    }
+
+    /// `hexdec(hash('fnv1a32', $s))`.
+    fn fnv1a32(s: &[u8]) -> i64 {
+        let mut h: u32 = 0x811c_9dc5;
+        for &b in s {
+            h ^= u32::from(b);
+            h = h.wrapping_mul(16_777_619);
+        }
+        i64::from(h)
+    }
+
+    /// Splits a lowercased name at its last `.` when the extension is 1-5 `[a-z0-9]` bytes.
+    fn split_ext(name: &[u8]) -> (&[u8], &[u8]) {
+        if let Some(dot) = name.iter().rposition(|&b| b == b'.') {
+            let ext = &name[dot + 1..];
+            if !ext.is_empty() && ext.len() <= 5 && ext.iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+                return (&name[..dot], ext);
+            }
+        }
+        (name, &name[..0])
+    }
+
+    /// 0 for an empty value, its 1-based table position, or `unknown`.
+    fn lookup(table: &[&[u8]], value: &[u8], unknown: i64) -> i64 {
+        if value.is_empty() {
+            return 0;
+        }
+        table.iter().position(|e| *e == value).map_or(unknown, |p| p as i64 + 1)
+    }
+
+    fn add_flags(tail: &mut [i64], flags: i64) {
+        for (b, slot) in tail.iter_mut().enumerate() {
+            *slot += flags >> b & 1;
+        }
+    }
+
+    trait Plan {
+        const TRAILER: usize;
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64;
+        fn finish(&mut self, tail: &mut [i64]);
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+    /// `out_cap` `i64`s).
+    unsafe fn run<P: Plan>(
+        mut plan: P,
+        blob: *const u8,
+        blob_len: usize,
+        lens: *const i64,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || (blob.is_null() && blob_len != 0)
+                || blob_len > isize::MAX as usize
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+                || (!lens.is_null() && !(lens as usize).is_multiple_of(std::mem::align_of::<i64>()))
+            {
+                return DECLINE;
+            }
+            let words = count + P::TRAILER;
+            if words > out_cap {
+                return -(words as isize);
+            }
+            if overlaps(blob as usize, blob_len, out as usize, words * 8)
+                || (!lens.is_null() && overlaps(lens as usize, count * 8, out as usize, words * 8))
+            {
+                return DECLINE;
+            }
+            // A null pointer is never sliced, even for an empty batch.
+            let bytes: &[u8] = if blob_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(blob, blob_len) } };
+            // `words` words, checked against `out_cap` above; disjoint from the inputs.
+            let dst = unsafe { std::slice::from_raw_parts_mut(out, words) };
+            let (rows, tail) = dst.split_at_mut(count);
+            tail.fill(0);
+            if lens.is_null() {
+                if count == 0 {
+                    if !bytes.is_empty() {
+                        return DECLINE;
+                    }
+                } else {
+                    let mut n = 0;
+                    for entry in bytes.split(|&b| b == 0) {
+                        if n >= count {
+                            return DECLINE;
+                        }
+                        rows[n] = plan.item(entry, tail);
+                        n += 1;
+                    }
+                    if n != count {
+                        return DECLINE;
+                    }
+                }
+            } else {
+                let lens: &[i64] = if count == 0 { &[] } else { unsafe { std::slice::from_raw_parts(lens, count) } };
+                let mut total = 0usize;
+                for &len in lens {
+                    let Some(next) = usize::try_from(len).ok().and_then(|l| total.checked_add(l)) else {
+                        return DECLINE;
+                    };
+                    total = next;
+                }
+                if total != bytes.len() {
+                    return DECLINE;
+                }
+                let mut offset = 0usize;
+                for (slot, &len) in rows.iter_mut().zip(lens) {
+                    let end = offset + len as usize;
+                    *slot = plan.item(&bytes[offset..end], tail);
+                    offset = end;
+                }
+            }
+            plan.finish(tail);
+            words as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // ---- MediaSourceStage ----
+
+    const SOURCE_KINDS: [&[u8]; 5] = [b"video", b"sample", b"archive", b"audio", b"image"];
+    const SOURCE_POSITIONS: [&[u8]; 3] = [b"head", b"mid", b"complete"];
+    const SOURCE_CONTAINERS: [&[u8]; 8] = [b"mkv", b"mp4", b"avi", b"ts", b"mov", b"wmv", b"mpg", b"m2ts"];
+    const DEFAULT_SEGMENT_BUDGET: i64 = 5_242_880;
+    const MIN_MEDIA_BYTES: i64 = 65_536;
+    const MAX_SOURCE_ATTEMPTS: i64 = 3;
+    const LARGE_SOURCE_BYTES: i64 = 1 << 32;
+
+    #[derive(Default)]
+    struct MediaSourceStage {
+        names: HashSet<Vec<u8>>,
+    }
+
+    impl Plan for MediaSourceStage {
+        const TRAILER: usize = MEDIA_SOURCE_STAGE_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_kind, raw_size, raw_segments, raw_position, raw_container, raw_budget, raw_attempts, raw_name] = fields::<8>(item);
+            let kind = lookup(&SOURCE_KINDS, &trim(raw_kind).to_ascii_lowercase(), 7);
+            let size = uint_field(raw_size, 0);
+            let segments = uint_field(raw_segments, 0);
+            let position_name = trim(raw_position).to_ascii_lowercase();
+            let position = if position_name == b"middle" { 2 } else { lookup(&SOURCE_POSITIONS, &position_name, 7) };
+            let container = lookup(&SOURCE_CONTAINERS, &trim(raw_container).to_ascii_lowercase(), 15);
+            let budget = uint_field(raw_budget, DEFAULT_SEGMENT_BUDGET);
+            let attempts = uint_field(raw_attempts, 0);
+            let name = trim(raw_name);
+            let lower = name.to_ascii_lowercase();
+            let malformed = size < 0 || segments < 0 || budget < 0 || attempts < 0 || kind == 7 || position == 7;
+            let per_segment = if size > 0 && segments > 0 { (size + segments - 1) / segments } else { 0 };
+            let decision = if trim(item).is_empty() {
+                0
+            } else if malformed {
+                1
+            } else if segments == 0 {
+                2
+            } else if attempts >= MAX_SOURCE_ATTEMPTS {
+                3
+            } else if matches!(kind, 1 | 2 | 4) && size < MIN_MEDIA_BYTES {
+                4
+            } else if (kind == 1 || kind == 2) && container == 15 {
+                5
+            } else if budget > 0 && per_segment > budget {
+                6
+            } else if kind == 3 {
+                8
+            } else {
+                7
+            };
+            let sample = contains(&lower, b"sample");
+            let mut chain = 0i64;
+            if kind == 2 || sample {
+                chain |= 1;
+            }
+            if matches!(position, 0 | 1 | 3) {
+                chain |= 2;
+            }
+            if matches!(position, 2 | 3) {
+                chain |= 4;
+            }
+            if kind == 3 {
+                chain |= 8;
+            }
+            if kind == 4 {
+                chain |= 16;
+            }
+            let eligible = decision >= 7;
+            let needed = if eligible && per_segment > 0 { segments.min((budget / per_segment).max(1)) } else { 0 };
+            let start = if eligible && position == 2 { (segments - needed) / 2 } else { 0 };
+            let (_, ext) = split_ext(&lower);
+            let mut flags = 0i64;
+            if sample {
+                flags |= 1;
+            }
+            if non_ascii(item) {
+                flags |= 2;
+            }
+            if has_control(item) {
+                flags |= 4;
+            }
+            if name.is_empty() {
+                flags |= 8;
+            }
+            if (1..=8).contains(&container) && !ext.is_empty() && ext != SOURCE_CONTAINERS[container as usize - 1] {
+                flags |= 16;
+            }
+            if !lower.is_empty() && !self.names.insert(lower.clone()) {
+                flags |= 32;
+            }
+            if needed > 0 && needed < segments {
+                flags |= 64;
+            }
+            if size >= LARGE_SOURCE_BYTES {
+                flags |= 128;
+            }
+            tail[decision as usize] += 1;
+            tail[10 + kind as usize] += 1;
+            tail[18 + position as usize] += 1;
+            add_flags(&mut tail[26..34], flags);
+            add_flags(&mut tail[34..39], chain);
+            tail[39] += needed.min(SUM_CAP);
+            if eligible {
+                tail[40] += (needed * per_segment).min(SUM_CAP);
+            }
+            tail[41] = tail[41].max(per_segment);
+            decision
+                | kind << 4
+                | position << 7
+                | container << 10
+                | chain << 14
+                | flags << 19
+                | needed.min(4095) << 27
+                | start.min(4095) << 39
+                | bit_length(size) << 51
+                | attempts.clamp(0, 15) << 57
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[42] = self.names.len() as i64;
+        }
+    }
+
+    // ---- MediaToolFactory ----
+
+    const TOOLS: [&[u8]; 6] = [b"ffmpeg", b"ffprobe", b"mediainfo", b"unrar", b"7z", b"par2"];
+    const TOOL_PLACEHOLDERS: [i64; 6] = [3, 1, 1, 3, 3, 1];
+    const TOOL_MIN_MAJOR: [i64; 6] = [4, 4, 20, 5, 16, 0];
+    const DEFAULT_TOOL_TIMEOUT: i64 = 60;
+    const MAX_TOOL_TIMEOUT: i64 = 3600;
+    const SHELL_META: &[u8] = b";&$`<>";
+
+    /// The leading 1-4 digit major of a lowercased version after an optional `n`/`v` prefix.
+    fn version_major(v: &[u8]) -> Option<i64> {
+        let d = match v.first() {
+            Some(b'n' | b'v') => &v[1..],
+            _ => v,
+        };
+        let run = d.iter().take_while(|b| b.is_ascii_digit()).count();
+        if run == 0 || run > 4 { None } else { Some(digits_value(&d[..run])) }
+    }
+
+    #[derive(Default)]
+    struct MediaToolFactory {
+        paths: HashSet<Vec<u8>>,
+    }
+
+    impl Plan for MediaToolFactory {
+        const TRAILER: usize = MEDIA_TOOL_FACTORY_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_tool, raw_path, raw_timeout, raw_threads, raw_args, raw_version] = fields::<6>(item);
+            let tool = lookup(&TOOLS, &trim(raw_tool).to_ascii_lowercase(), 7);
+            let path = trim(raw_path);
+            let timeout = uint_field(raw_timeout, 0);
+            let threads = uint_field(raw_threads, 0);
+            let args = trim(raw_args);
+            let version = trim(raw_version).to_ascii_lowercase();
+            let path_state = if path.is_empty() {
+                0
+            } else if path[0] == b'/' {
+                1
+            } else if !path.contains(&b'/') {
+                2
+            } else {
+                3
+            };
+            let traversal = path.split(|&b| b == b'/').any(|s| s == b"..");
+            let unsafe_path = traversal || path.iter().any(|b| SHELL_META.contains(b)) || has_control(path);
+            let mut placeholders = 0i64;
+            if contains(args, b"{input}") {
+                placeholders |= 1;
+            }
+            if contains(args, b"{output}") {
+                placeholders |= 2;
+            }
+            if contains(args, b"{timeout}") {
+                placeholders |= 4;
+            }
+            let major = version_major(&version);
+            let known = (1..=6).contains(&tool);
+            let required = if known { TOOL_PLACEHOLDERS[tool as usize - 1] } else { 0 };
+            let min_major = if known { TOOL_MIN_MAJOR[tool as usize - 1] } else { 0 };
+            let effective_timeout = if timeout <= 0 { DEFAULT_TOOL_TIMEOUT } else { timeout.min(MAX_TOOL_TIMEOUT) };
+            let decision = if trim(item).is_empty() {
+                0
+            } else if timeout < 0 || threads < 0 || !known {
+                1
+            } else if path.is_empty() {
+                2
+            } else if unsafe_path {
+                3
+            } else if placeholders & required != required {
+                4
+            } else if major.is_some_and(|m| m < min_major) {
+                5
+            } else if major.is_none() {
+                6
+            } else {
+                7
+            };
+            let mut flags = 0i64;
+            if timeout > MAX_TOOL_TIMEOUT {
+                flags |= 1;
+            }
+            if timeout == 0 {
+                flags |= 2;
+            }
+            if path.contains(&b' ') {
+                flags |= 4;
+            }
+            if non_ascii(item) {
+                flags |= 8;
+            }
+            if !path.is_empty() && !self.paths.insert(path.to_vec()) {
+                flags |= 16;
+            }
+            if args.iter().filter(|&&b| b == b'{').count() != args.iter().filter(|&&b| b == b'}').count() {
+                flags |= 32;
+            }
+            if !version.is_empty() && major.is_none() {
+                flags |= 64;
+            }
+            if path_state >= 2 {
+                flags |= 128;
+            }
+            tail[decision as usize] += 1;
+            tail[8 + tool as usize] += 1;
+            tail[16 + path_state as usize] += 1;
+            add_flags(&mut tail[20..23], placeholders);
+            add_flags(&mut tail[23..31], flags);
+            tail[31] += effective_timeout;
+            tail[32] = tail[32].max(effective_timeout);
+            if decision == 7 {
+                tail[34] |= 1 << tool;
+            }
+            decision
+                | tool << 3
+                | path_state << 6
+                | placeholders << 8
+                | flags << 11
+                | effective_timeout.min(4095) << 19
+                | threads.clamp(0, 255) << 31
+                | major.unwrap_or(0).min(1023) << 39
+                | (path.len() as i64).min(1023) << 49
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[33] = self.paths.len() as i64;
+        }
+    }
+
+    // ---- Par2FileMapper ----
+
+    const PAR2_VIDEO: [&[u8]; 12] = [b"avi", b"m2ts", b"m4v", b"mkv", b"mov", b"mp4", b"mpeg", b"mpg", b"ts", b"vob", b"webm", b"wmv"];
+    const PAR2_AUDIO: [&[u8]; 10] = [b"aac", b"ac3", b"dts", b"flac", b"m4a", b"mp3", b"ogg", b"opus", b"wav", b"wma"];
+    const PAR2_IMAGE: [&[u8]; 6] = [b"bmp", b"gif", b"jpeg", b"jpg", b"png", b"webp"];
+    const PAR2_SUBTITLE: [&[u8]; 5] = [b"ass", b"idx", b"srt", b"ssa", b"sub"];
+
+    /// The first non-empty `"..."` run of a subject, else the whole subject.
+    fn quoted_name(subject: &[u8]) -> (&[u8], bool) {
+        if let Some(q1) = subject.iter().position(|&b| b == b'"')
+            && let Some(off) = subject[q1 + 1..].iter().position(|&b| b == b'"')
+            && off > 0
+        {
+            return (&subject[q1 + 1..q1 + 1 + off], true);
+        }
+        (subject, false)
+    }
+
+    fn media_role(lower: &[u8]) -> i64 {
+        if lower.is_empty() {
+            return 0;
+        }
+        let (_, ext) = split_ext(lower);
+        if PAR2_VIDEO.contains(&ext) {
+            1
+        } else if PAR2_AUDIO.contains(&ext) {
+            2
+        } else if PAR2_IMAGE.contains(&ext) {
+            3
+        } else if ext == b"rar"
+            || ext == b"7z"
+            || ext == b"zip"
+            || (ext.len() == 3 && ext[0] == b'r' && all_digits(&ext[1..]))
+            || (ext.len() == 3 && all_digits(ext))
+        {
+            4
+        } else if ext == b"par2" {
+            5
+        } else if ext == b"nfo" || ext == b"diz" {
+            6
+        } else if PAR2_SUBTITLE.contains(&ext) {
+            7
+        } else {
+            8
+        }
+    }
+
+    #[derive(Default)]
+    struct Par2FileMapper {
+        hashes: HashSet<Vec<u8>>,
+        names: HashSet<Vec<u8>>,
+    }
+
+    impl Plan for Par2FileMapper {
+        const TRAILER: usize = PAR2_FILE_MAPPER_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_hash, raw_name, raw_size, raw_subject, raw_bytes, raw_segments] = fields::<6>(item);
+            let hash_raw = trim(raw_hash);
+            let hash = hash_raw.to_ascii_lowercase();
+            let valid_hash = hash.len() == 32 && hash.iter().all(u8::is_ascii_hexdigit);
+            let name = trim(raw_name);
+            let size = uint_field(raw_size, 0);
+            let (target, quoted) = quoted_name(trim(raw_subject));
+            let bytes = uint_field(raw_bytes, 0);
+            let segments = uint_field(raw_segments, 0);
+            let lower = name.to_ascii_lowercase();
+            let target_lower = target.to_ascii_lowercase();
+            let confidence = if name.is_empty() || target.is_empty() {
+                0
+            } else if name == target {
+                3
+            } else if lower == target_lower {
+                2
+            } else if split_ext(&lower).0 == split_ext(&target_lower).0 {
+                1
+            } else {
+                0
+            };
+            let size_state = if size <= 0 || bytes <= 0 {
+                0
+            } else if bytes < size {
+                2
+            } else if bytes <= size + size / 20 + 4096 {
+                1
+            } else {
+                3
+            };
+            let role = media_role(&lower);
+            let decision = if trim(item).is_empty() {
+                0
+            } else if size < 0 || bytes < 0 || segments < 0 || name.is_empty() {
+                1
+            } else if !valid_hash {
+                2
+            } else if !self.hashes.insert(hash) {
+                3
+            } else if confidence == 0 {
+                4
+            } else if size_state >= 2 {
+                5
+            } else if confidence == 1 {
+                6
+            } else {
+                7
+            };
+            let mut flags = 0i64;
+            if quoted {
+                flags |= 1;
+            }
+            if non_ascii(name) {
+                flags |= 2;
+            }
+            if has_control(name) {
+                flags |= 4;
+            }
+            if name.iter().any(|&b| b == b'/' || b == b'\\') {
+                flags |= 8;
+            }
+            if hash_raw.iter().any(u8::is_ascii_uppercase) {
+                flags |= 16;
+            }
+            if contains(&lower, b"sample") {
+                flags |= 32;
+            }
+            let digest = fnv1a32(&lower);
+            if !lower.is_empty() && !self.names.insert(lower) {
+                flags |= 64;
+            }
+            if segments == 0 {
+                flags |= 128;
+            }
+            tail[decision as usize] += 1;
+            tail[8 + confidence as usize] += 1;
+            tail[12 + size_state as usize] += 1;
+            tail[16 + role as usize] += 1;
+            add_flags(&mut tail[25..33], flags);
+            if decision >= 6 {
+                tail[33] += size.clamp(0, SUM_CAP);
+                tail[34] += segments.clamp(0, SUM_CAP);
+            }
+            decision
+                | confidence << 3
+                | size_state << 5
+                | role << 7
+                | flags << 11
+                | bit_length(size) << 19
+                | bit_length(bytes) << 25
+                | segments.clamp(0, 4095) << 31
+                | (digest & 0xfff) << 43
+                | (name.len() as i64).min(255) << 55
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[35] = self.hashes.len() as i64;
+            tail[36] = self.names.len() as i64;
+        }
+    }
+
+    // ---- ThumbnailFrameSelector ----
+
+    const MIN_FRAME_DIMENSION: i64 = 64;
+    const DARK_FRAME: i64 = 16;
+    const BRIGHT_FRAME: i64 = 240;
+    const FLAT_FRAME: i64 = 12;
+    const FRAME_GAP_MS: i64 = 1000;
+
+    struct ThumbnailSelector {
+        accepted: HashMap<i64, i64>,
+        index: i64,
+        best_index: i64,
+        best_score: i64,
+        best_ts: i64,
+    }
+
+    impl Default for ThumbnailSelector {
+        fn default() -> Self {
+            Self { accepted: HashMap::new(), index: 0, best_index: 0, best_score: -1, best_ts: 0 }
+        }
+    }
+
+    impl Plan for ThumbnailSelector {
+        const TRAILER: usize = THUMBNAIL_SELECTOR_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            self.index += 1;
+            let [raw_ts, raw_duration, raw_brightness, raw_contrast, raw_sharpness, raw_width, raw_height] = fields::<7>(item);
+            let ts = uint_field(raw_ts, 0);
+            let duration = uint_field(raw_duration, 0);
+            let brightness = uint_field(raw_brightness, 0);
+            let contrast = uint_field(raw_contrast, 0);
+            let sharpness = uint_field(raw_sharpness, 0);
+            let width = uint_field(raw_width, 0);
+            let height = uint_field(raw_height, 0);
+            let malformed = ts < 0
+                || duration < 0
+                || !(0..=255).contains(&brightness)
+                || !(0..=255).contains(&contrast)
+                || !(0..=1000).contains(&sharpness)
+                || width < 0
+                || height < 0;
+            let ts = ts.max(0);
+            let duration = duration.max(0);
+            let brightness = brightness.clamp(0, 255);
+            let contrast = contrast.clamp(0, 255);
+            let sharpness = sharpness.clamp(0, 1000);
+            let width = width.max(0);
+            let height = height.max(0);
+            let position = if duration > 0 { (ts * 100 / duration).min(100) } else { 0 };
+            let bucket = ts / FRAME_GAP_MS;
+            let near = (bucket - 1..=bucket + 1).any(|b| self.accepted.get(&b).is_some_and(|&a| (ts - a).abs() < FRAME_GAP_MS));
+            let gate = if trim(item).is_empty() {
+                0
+            } else if malformed {
+                1
+            } else if duration > 0 && ts > duration {
+                2
+            } else if width < MIN_FRAME_DIMENSION || height < MIN_FRAME_DIMENSION {
+                3
+            } else if brightness < DARK_FRAME {
+                4
+            } else if brightness > BRIGHT_FRAME {
+                5
+            } else if contrast < FLAT_FRAME {
+                6
+            } else if near {
+                7
+            } else {
+                8
+            };
+            let bonus = if duration > 0 && (20..=80).contains(&position) {
+                200
+            } else if duration > 0 && (10..=90).contains(&position) {
+                100
+            } else {
+                0
+            };
+            let score = if gate <= 1 {
+                0
+            } else {
+                sharpness + contrast * 2 + (128 - (brightness - 128).abs()) * 2 + bonus + (width.min(65535) * height.min(65535) / 10_000).min(300)
+            };
+            if gate == 8 {
+                self.accepted.insert(bucket, ts);
+                if score > self.best_score {
+                    self.best_score = score;
+                    self.best_index = self.index;
+                    self.best_ts = ts;
+                }
+            }
+            let mut flags = 0i64;
+            if duration > 0 && position < 5 {
+                flags |= 1;
+            }
+            if duration > 0 && position > 95 {
+                flags |= 2;
+            }
+            if duration == 0 {
+                flags |= 4;
+            }
+            if height > width {
+                flags |= 8;
+            }
+            if non_ascii(item) {
+                flags |= 16;
+            }
+            if has_control(item) {
+                flags |= 32;
+            }
+            if sharpness >= 500 {
+                flags |= 64;
+            }
+            if raw_height.contains(&b'|') {
+                flags |= 128;
+            }
+            tail[gate as usize] += 1;
+            add_flags(&mut tail[9..17], flags);
+            if gate == 8 {
+                tail[17 + (score / 600).min(3) as usize] += 1;
+                tail[24] += score;
+            }
+            tail[25] = tail[25].max(ts);
+            gate | flags << 4
+                | score << 12
+                | position << 24
+                | brightness << 31
+                | contrast << 39
+                | bit_length(ts) << 47
+                | bit_length(width) << 53
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[21] = self.best_index;
+            tail[22] = self.best_score.max(0);
+            tail[23] = self.best_ts;
+        }
+    }
+
+    // ---- MediaExtractionService ----
+
+    const CODECS: [&[u8]; 14] =
+        [b"h264", b"hevc", b"h265", b"av1", b"mpeg2", b"mpeg4", b"vc1", b"vp9", b"aac", b"mp3", b"flac", b"ac3", b"dts", b"opus"];
+    const OVERSIZED_MEDIA_BYTES: i64 = 50 << 30;
+    const LONG_MEDIA_MS: i64 = 10_800_000;
+    const STAGE_ORDER: [i64; 6] = [1, 8, 16, 32, 2, 4];
+
+    #[derive(Default)]
+    struct MediaExtraction {
+        codecs: HashSet<Vec<u8>>,
+    }
+
+    impl Plan for MediaExtraction {
+        const TRAILER: usize = MEDIA_EXTRACTION_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_category, raw_kinds, raw_duration, raw_width, raw_height, raw_codec, raw_done, raw_bytes] = fields::<8>(item);
+            let category = uint_field(raw_category, 0);
+            let mut kinds = 0i64;
+            let mut bad_kind = false;
+            for &b in trim(raw_kinds) {
+                match b.to_ascii_lowercase() {
+                    b'v' => kinds |= 1,
+                    b'a' => kinds |= 2,
+                    b's' => kinds |= 4,
+                    b'j' => kinds |= 8,
+                    b'm' => kinds |= 16,
+                    _ => bad_kind = true,
+                }
+            }
+            let duration = uint_field(raw_duration, 0);
+            let width = uint_field(raw_width, 0);
+            let height = uint_field(raw_height, 0);
+            let codec_name = trim(raw_codec).to_ascii_lowercase();
+            let codec = lookup(&CODECS, &codec_name, 15);
+            let done = uint_field(raw_done, 0);
+            let bytes = uint_field(raw_bytes, 0);
+            let malformed = category < 0 || bad_kind || duration < 0 || width < 0 || height < 0 || !(0..=63).contains(&done) || bytes < 0;
+            let group = if category > 0 { category / 1000 } else { 0 };
+            let video = kinds & 1 != 0;
+            let mut requested = 0i64;
+            if video {
+                if matches!(group, 2 | 5 | 6) {
+                    requested |= 1;
+                }
+                requested |= 4;
+                if kinds & 8 == 0 {
+                    requested |= 32;
+                }
+            }
+            if kinds & 2 != 0 {
+                if group == 3 || !video {
+                    requested |= 2;
+                }
+                requested |= 4;
+            }
+            if kinds & 4 != 0 {
+                requested |= 8;
+            }
+            if kinds & 8 != 0 {
+                requested |= 16;
+            }
+            if kinds & 16 != 0 {
+                requested |= 4;
+            }
+            let done_mask = if (0..=63).contains(&done) { done } else { 0 };
+            let pending = requested & !done_mask;
+            let outcome = if trim(item).is_empty() {
+                0
+            } else if malformed {
+                1
+            } else if requested == 0 {
+                2
+            } else if pending == 0 {
+                3
+            } else if pending & (1 | 32) != 0 && duration == 0 {
+                4
+            } else if duration > 0 && duration < 1000 && pending & (1 | 2 | 32) != 0 {
+                5
+            } else if bytes > OVERSIZED_MEDIA_BYTES {
+                6
+            } else {
+                7
+            };
+            let width = width.max(0);
+            let height = height.max(0);
+            let tier = if width == 0 || height == 0 {
+                0
+            } else if height < 720 {
+                1
+            } else if height < 1080 {
+                2
+            } else if height < 2160 {
+                3
+            } else {
+                4
+            };
+            let first = STAGE_ORDER.iter().position(|&s| pending & s != 0).map_or(0, |p| p as i64 + 1);
+            let mut flags = 0i64;
+            if codec == 15 {
+                flags |= 1;
+            }
+            if video && (9..=14).contains(&codec) {
+                flags |= 2;
+            }
+            if height > width {
+                flags |= 4;
+            }
+            if non_ascii(item) {
+                flags |= 8;
+            }
+            if has_control(item) {
+                flags |= 16;
+            }
+            if duration >= LONG_MEDIA_MS {
+                flags |= 32;
+            }
+            if (width > 0 && width < 64) || (height > 0 && height < 64) {
+                flags |= 64;
+            }
+            if category == 0 {
+                flags |= 128;
+            }
+            tail[outcome as usize] += 1;
+            add_flags(&mut tail[8..14], requested);
+            add_flags(&mut tail[14..20], pending);
+            tail[20 + tier as usize] += 1;
+            add_flags(&mut tail[25..33], flags);
+            tail[33 + codec as usize] += 1;
+            if outcome == 7 {
+                tail[49] += duration.clamp(0, SUM_CAP);
+                tail[50] += bytes.clamp(0, SUM_CAP);
+            }
+            tail[51] = tail[51].max(duration);
+            if !codec_name.is_empty() {
+                self.codecs.insert(codec_name);
+            }
+            outcome
+                | requested << 3
+                | pending << 9
+                | group.clamp(0, 15) << 15
+                | codec << 19
+                | tier << 23
+                | first << 26
+                | flags << 29
+                | bit_length(duration) << 37
+                | bit_length(bytes) << 43
+                | i64::from(pending.count_ones()) << 49
+                | done_mask << 52
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[52] = self.codecs.len() as i64;
+        }
+    }
+
+    macro_rules! w651_export {
+        ($(#[$doc:meta])* $name:ident => $plan:ident) => {
+            $(#[$doc])*
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out`
+            /// for `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run($plan::default(), blob, blob_len, lens, count, out, out_cap) }
+            }
+        };
+    }
+
+    w651_export!(
+        /// `MediaSourceStage::w65MediaSourceStagePlanBatch()`.
+        nntmux_w651_media_source_stage_plan_batch => MediaSourceStage
+    );
+    w651_export!(
+        /// `MediaToolFactory::w65MediaToolFactoryPlanBatch()`.
+        nntmux_w651_media_tool_factory_plan_batch => MediaToolFactory
+    );
+    w651_export!(
+        /// `Par2FileMapper::w65Par2FileMapperPlanBatch()`.
+        nntmux_w651_par2_file_mapper_plan_batch => Par2FileMapper
+    );
+    w651_export!(
+        /// `ThumbnailFrameSelector::w65ThumbnailSelectorPlanBatch()`.
+        nntmux_w651_thumbnail_selector_plan_batch => ThumbnailSelector
+    );
+    w651_export!(
+        /// `MediaExtractionService::w65MediaExtractionPlanBatch()`.
+        nntmux_w651_media_extraction_plan_batch => MediaExtraction
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        const EXPORTS: [(Export, usize); 5] = [
+            (nntmux_w651_media_source_stage_plan_batch, MEDIA_SOURCE_STAGE_TRAILER),
+            (nntmux_w651_media_tool_factory_plan_batch, MEDIA_TOOL_FACTORY_TRAILER),
+            (nntmux_w651_par2_file_mapper_plan_batch, PAR2_FILE_MAPPER_TRAILER),
+            (nntmux_w651_thumbnail_selector_plan_batch, THUMBNAIL_SELECTOR_TRAILER),
+            (nntmux_w651_media_extraction_plan_batch, MEDIA_EXTRACTION_TRAILER),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe { f(blob.as_ptr(), blob.len(), lens.as_ptr(), items.len(), out.as_mut_ptr(), out.len()) };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            if items.iter().all(|i| !i.contains(&0)) {
+                let joined = items.join(&0u8);
+                let mut nul = vec![0i64; 4096];
+                let w = unsafe { f(joined.as_ptr(), joined.len(), ptr::null(), items.len(), nul.as_mut_ptr(), nul.len()) };
+                nul.truncate(w.max(0) as usize);
+                assert_eq!(nul, out, "NUL-joined and length-column calls differ");
+            }
+            out
+        }
+
+        #[test]
+        fn w651_helpers() {
+            assert_eq!(trim(b" \t a b\0\x0b"), b"a b");
+            assert_eq!(fields::<3>(b"a|b|c|d"), [&b"a"[..], b"b", b"c|d"]);
+            assert_eq!(uint_field(b" 42 ", -1), 42);
+            assert_eq!(uint_field(b"", 10), 10);
+            assert_eq!(uint_field(b"1234567890123456", 0), -1);
+            assert_eq!(fnv1a32(b"abc"), 0x1a47_e90b);
+            assert_eq!(split_ext(b"movie.part01.rar"), (&b"movie.part01"[..], &b"rar"[..]));
+            assert_eq!(split_ext(b"noext"), (&b"noext"[..], &b""[..]));
+            assert_eq!(lookup(&TOOLS, b"7z", 7), 5);
+            assert_eq!(lookup(&TOOLS, b"", 7), 0);
+            assert_eq!(lookup(&TOOLS, b"x", 7), 7);
+            assert_eq!(version_major(b"n7.0.1"), Some(7));
+            assert_eq!(version_major(b"6.1"), Some(6));
+            assert_eq!(version_major(b"12345"), None);
+            assert_eq!(version_major(b"git-2024"), None);
+            assert_eq!(quoted_name(b"[1/9] \"a.mkv\" yEnc"), (&b"a.mkv"[..], true));
+            assert_eq!(quoted_name(b"\"\" x"), (&b"\"\" x"[..], false));
+            assert_eq!(media_role(b"movie.mkv"), 1);
+            assert_eq!(media_role(b"x.r07"), 4);
+            assert_eq!(media_role(b"x.001"), 4);
+            assert_eq!(media_role(b"x.srt"), 7);
+        }
+
+        #[test]
+        fn w651_known_words() {
+            let stage = call(nntmux_w651_media_source_stage_plan_batch, &[
+                b"video|10000000|10|head|mkv||0|show.mkv",
+                b"sample|1000000|4|mid|mp4|300000|0|Show.Sample.mp4",
+                b"archive|50000000|50|complete||||show.part01.rar",
+                b"video|10000000|0|head|mkv|||x.mkv",
+                b"video|10000000|10|head|mkv||3|y.mkv",
+                b"audio|100|1|head||||a.flac",
+                b"video|10000000|10|head|flv|||z.flv",
+                b"video|10000000|1|head|mkv|1000||big.mkv",
+                b"bogus|1|1",
+                b"",
+                b"video|10000000|10|head|mkv||0|SHOW.MKV",
+            ]);
+            assert_eq!(stage[0] & 15, 7);
+            assert_eq!(stage[0] >> 14 & 31, 2);
+            assert_eq!(stage[0] >> 27 & 4095, 5);
+            assert_eq!(stage[0] >> 19 & 255, 64);
+            assert_eq!(stage[1] & 15, 7);
+            assert_eq!(stage[1] >> 14 & 31, 1 | 4);
+            assert_eq!(stage[1] >> 27 & 4095, 1);
+            assert_eq!(stage[1] >> 39 & 4095, 1);
+            assert_eq!(stage[2] & 15, 8);
+            assert_eq!(stage[2] >> 14 & 31, 2 | 4 | 8);
+            assert_eq!(stage[3] & 15, 2);
+            assert_eq!(stage[4] & 15, 3);
+            assert_eq!(stage[5] & 15, 4);
+            assert_eq!(stage[6] & 15, 5);
+            assert_eq!(stage[7] & 15, 6);
+            assert_eq!(stage[8] & 15, 1);
+            assert_eq!(stage[9] & 15, 0);
+            assert_eq!(stage[10] >> 19 & 32, 32);
+            assert_eq!(stage[11 + 42], 8);
+
+            let tool = call(nntmux_w651_media_tool_factory_plan_batch, &[
+                b"ffmpeg|/usr/bin/ffmpeg|120|4|-i {input} {output}|6.1.1",
+                b"ffprobe|/usr/bin/ffprobe||0|{input}|n7.0",
+                b"ffmpeg||60|1|{input} {output}|6",
+                b"ffmpeg|/usr/bin/../ffmpeg|60|1|{input} {output}|6",
+                b"ffmpeg|/usr/bin/ffmpeg|60|1|{input}|6",
+                b"mediainfo|mediainfo|60|1|{input}|19.09",
+                b"unrar|/usr/bin/unrar|9999|1|x {input} {output}|",
+                b"curl|/usr/bin/curl|1|1|x|1",
+                b"",
+            ]);
+            assert_eq!(tool[0] & 7, 7);
+            assert_eq!(tool[0] >> 19 & 4095, 120);
+            assert_eq!(tool[0] >> 39 & 1023, 6);
+            assert_eq!(tool[1] & 7, 7);
+            assert_eq!(tool[1] >> 11 & 255, 2);
+            assert_eq!(tool[1] >> 19 & 4095, 60);
+            assert_eq!(tool[2] & 7, 2);
+            assert_eq!(tool[3] & 7, 3);
+            assert_eq!(tool[4] & 7, 4);
+            assert_eq!(tool[5] & 7, 5);
+            assert_eq!(tool[5] >> 6 & 3, 2);
+            assert_eq!(tool[6] & 7, 6);
+            assert_eq!(tool[6] >> 19 & 4095, 3600);
+            assert_eq!(tool[7] & 7, 1);
+            assert_eq!(tool[9 + 34], 1 << 1 | 1 << 2);
+
+            let hash = b"0123456789abcdef0123456789abcdef";
+            let par2 = call(nntmux_w651_par2_file_mapper_plan_batch, &[
+                &[&hash[..], b"|movie.mkv|1000000|[1/3] \"movie.mkv\" yEnc|1030000|10"].concat(),
+                b"0123456789abcdef0123456789abcdef|movie.mkv|1|x|1|1",
+                b"zz|movie.mkv|1|x|1|1",
+                b"00000000000000000000000000000001|Movie.MKV|100|\"movie.mkv\"|100|1",
+                b"00000000000000000000000000000002|movie.nfo|100|\"movie.mkv\"|100|1",
+                b"00000000000000000000000000000003|other.srt|100|\"movie.mkv\"|100|1",
+                b"00000000000000000000000000000004|movie.mkv|1000|\"movie.mkv\"|10|1",
+                b"|||",
+                b"",
+            ]);
+            assert_eq!(par2[0] & 7, 7);
+            assert_eq!(par2[0] >> 3 & 3, 3);
+            assert_eq!(par2[0] >> 5 & 3, 1);
+            assert_eq!(par2[0] >> 7 & 15, 1);
+            assert_eq!(par2[0] >> 11 & 255, 1);
+            assert_eq!(par2[1] & 7, 3);
+            assert_eq!(par2[1] >> 11 & 255, 64);
+            assert_eq!(par2[2] & 7, 2);
+            assert_eq!(par2[3] & 7, 7);
+            assert_eq!(par2[3] >> 3 & 3, 2);
+            assert_eq!(par2[4] & 7, 6);
+            assert_eq!(par2[4] >> 7 & 15, 6);
+            assert_eq!(par2[5] & 7, 4);
+            assert_eq!(par2[6] & 7, 5);
+            assert_eq!(par2[7] & 7, 1);
+            assert_eq!(par2[8], (fnv1a32(b"") & 0xfff) << 43 | 128 << 11);
+            assert_eq!(par2[9 + 35], 5);
+
+            let thumb = call(nntmux_w651_thumbnail_selector_plan_batch, &[
+                b"50000|100000|128|60|400|1920|1080",
+                b"50500|100000|128|80|900|1920|1080",
+                b"5000|100000|128|60|400|1920|1080",
+                b"200000|100000|128|60|400|1920|1080",
+                b"30000|100000|5|60|400|1920|1080",
+                b"30000|100000|250|60|400|1920|1080",
+                b"30000|100000|128|5|400|1920|1080",
+                b"30000|100000|128|60|400|32|32",
+                b"x|1",
+                b"",
+                b"70000|100000|120|90|800|1280|720",
+            ]);
+            assert_eq!(thumb[0] & 15, 8);
+            assert_eq!(thumb[0] >> 12 & 4095, 400 + 120 + 256 + 200 + 207);
+            assert_eq!(thumb[0] >> 24 & 127, 50);
+            assert_eq!(thumb[1] & 15, 7);
+            assert_eq!(thumb[2] & 15, 8);
+            assert_eq!(thumb[2] >> 4 & 255, 0);
+            assert_eq!(thumb[3] & 15, 2);
+            assert_eq!(thumb[4] & 15, 4);
+            assert_eq!(thumb[5] & 15, 5);
+            assert_eq!(thumb[6] & 15, 6);
+            assert_eq!(thumb[7] & 15, 3);
+            assert_eq!(thumb[8] & 15, 1);
+            assert_eq!(thumb[9] & 15, 0);
+            assert_eq!(thumb[10] & 15, 8);
+            assert_eq!(thumb[11 + 21], 11);
+            assert_eq!(thumb[11 + 22], 800 + 180 + 240 + 200 + 92);
+            assert_eq!(thumb[11 + 23], 70000);
+
+            let media = call(nntmux_w651_media_extraction_plan_batch, &[
+                b"2040|v|5400000|1920|1080|h264|0|4000000000",
+                b"5030|vj|2400000|1280|720|hevc|4|1",
+                b"3010|a|200000|0|0|flac|0|1",
+                b"7020||0|0|0||0|0",
+                b"2040|v|5400000|1920|1080|h264|63|1",
+                b"2040|v|0|1920|1080|h264|0|1",
+                b"2040|v|500|1920|1080|h264|0|1",
+                b"2040|v|5400000|1920|1080|h264|0|99999999999999",
+                b"2040|x|1",
+                b"",
+            ]);
+            assert_eq!(media[0] & 7, 7);
+            assert_eq!(media[0] >> 3 & 63, 1 | 4 | 32);
+            assert_eq!(media[0] >> 15 & 15, 2);
+            assert_eq!(media[0] >> 19 & 15, 1);
+            assert_eq!(media[0] >> 23 & 7, 3);
+            assert_eq!(media[0] >> 26 & 7, 1);
+            assert_eq!(media[1] >> 3 & 63, 1 | 4 | 16);
+            assert_eq!(media[1] >> 9 & 63, 1 | 16);
+            assert_eq!(media[1] >> 23 & 7, 2);
+            assert_eq!(media[2] >> 3 & 63, 2 | 4);
+            assert_eq!(media[2] >> 26 & 7, 5);
+            assert_eq!(media[3] & 7, 2);
+            assert_eq!(media[4] & 7, 3);
+            assert_eq!(media[5] & 7, 4);
+            assert_eq!(media[6] & 7, 5);
+            assert_eq!(media[7] & 7, 6);
+            assert_eq!(media[8] & 7, 1);
+            assert_eq!(media[9] & 7, 0);
+            assert_eq!(media[10 + 52], 3);
+        }
+
+        #[test]
+        fn w651_exports_guard_counts_capacity_and_tail() {
+            let blob = b"a|1\0b";
+            for (export, trailer) in EXPORTS {
+                let mut out = vec![7i64; 128];
+                unsafe {
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, out.as_mut_ptr(), 128), (trailer + 2) as isize);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, out.as_mut_ptr(), trailer + 1), -((trailer + 2) as isize));
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 3, out.as_mut_ptr(), 128), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 1, out.as_mut_ptr(), 128), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 0, out.as_mut_ptr(), 128), -1);
+                    out.fill(7);
+                    assert_eq!(export(ptr::null(), 0, ptr::null(), 0, out.as_mut_ptr(), 128), trailer as isize);
+                    assert!(out[..trailer].iter().all(|&w| w == 0));
+                    assert_eq!(export(ptr::null(), 0, ptr::null(), 1, out.as_mut_ptr(), 128), (trailer + 1) as isize);
+                    assert_eq!(export(ptr::null(), 2, ptr::null(), 1, out.as_mut_ptr(), 128), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, ptr::null_mut(), 8), -1);
+                    let misaligned = (out.as_mut_ptr() as *mut u8).add(1) as *mut i64;
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, misaligned, 100), -1);
+                    let lens = [3i64, 2];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), lens.as_ptr(), 2, out.as_mut_ptr(), 128), (trailer + 2) as isize);
+                    let bad = [3i64, 3];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), bad.as_ptr(), 2, out.as_mut_ptr(), 128), -1);
+                    let negative = [-1i64, 6];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), negative.as_ptr(), 2, out.as_mut_ptr(), 128), -1);
+                    let misaligned_lens = (lens.as_ptr() as *const u8).add(1) as *const i64;
+                    assert_eq!(export(blob.as_ptr(), blob.len(), misaligned_lens, 2, out.as_mut_ptr(), 128), -1);
+                    let alias = out.as_mut_ptr() as *const u8;
+                    assert_eq!(export(alias, 16, ptr::null(), 1, out.as_mut_ptr(), 128), -1);
+                    let lens_alias = out.as_ptr();
+                    assert_eq!(export(blob.as_ptr(), 0, lens_alias, 1, out.as_mut_ptr(), 128), -1);
+                }
+                let nul = call(export, &[b"a\0b", b"", b"\0"]);
+                assert_eq!(nul.len(), trailer + 3);
+                assert!(nul.iter().all(|&w| w >= 0));
+            }
+        }
+    }
+}
