@@ -478,4 +478,291 @@ final class ApiV1Presenter
 
         return self::w54Words($count, implode("\0", $values), 4 * $count) ?? self::parameterPlanBatchPhp($values);
     }
+
+    /** C signature of the Wave 65.5 {@see self::w65ApiV1PresenterPlanBatch()} helper. */
+    private const string W65_API_V1_PRESENTER_PLAN_FFI_CDEF = 'int64_t nntmux_w655_api_v1_presenter_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 65.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 26.61/15.71/8.68/7.95x); see tests/Unit/RustApiCapabilitiesCacheUsageUserResolverV1PresenterW65ParityTest.php.
+     */
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 65.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w65_5', self::W65_API_V1_PRESENTER_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W65_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 65.5 plan batch to Rust until disabled or reset. */
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', true);
+    }
+
+    /** Route the Wave 65.5 plan batch to PHP until enabled or reset. */
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', false);
+    }
+
+    /** Restore W65_RUST_FFI_DEFAULT routing and drop the cached Wave 65.5 handle and buffer. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', null);
+        self::w65RustFfiState('reset', null);
+    }
+
+    public static function usesW65RustFfi(): bool
+    {
+        return self::w65RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w65ApiV1PresenterPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 65.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w65Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w65RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w655_api_v1_presenter_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w65Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /**
+     * Batch v1 item presentation plan over `format\ttype\tguid\ttitle\tsize\tcategory\tattrs`. Ten words per record:
+     * `[format, type, guid_valid, title_xml, title_json, attrs, known_attrs, xml_bytes, json_bytes, flags]`. Format:
+     * trimmed case-insensitive empty or `xml` 0, `json` 1. Type: trimmed exact caps 1, search 2 (also empty),
+     * tvsearch 3, movie 4, music 5, book 6, details 7, else 0. The guid is valid as 32 or 40 lowercase hex bytes.
+     * Title lengths count XML (`& < > " '`) and JSON (quote, backslash, control bytes) escapes; invalid UTF-8 makes
+     * the JSON length -1. Attrs are `|`-separated `name=value` items (a missing `=` or name is skipped); known names
+     * are the standard newznab attributes. Item sizes estimate the `<item>` and JSON element bytes (0 for caps, -1
+     * JSON for invalid UTF-8). Numbers are trimmed 1-15 ASCII digits. Flags: 1 invalid number or attribute, 2 not
+     * exactly seven fields, 4 unknown format, 8 unknown type, 16 invalid guid, 32 invalid UTF-8 title.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w65ApiV1PresenterPlanBatch(array $records): array
+    {
+        return self::usesW65RustFfi() ? self::w65ApiV1PresenterPlanBatchNative($records) : self::w65ApiV1PresenterPlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w65ApiV1PresenterPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w65Words($count, implode("\0", $records), 10 * $count) ?? self::w65ApiV1PresenterPlanBatchPhp($records);
+    }
+
+    /** Bytes that XML or JSON escaping lengthens: `& < > " ' \` and the C0 controls. */
+    private const string W65_ESCAPED = "&<>\"'\\\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f";
+
+    /** Types after caps (1) in plan order; search (2) is also the default. */
+    private const array W65_TYPES = ['caps' => 1, 'search' => 2, 'tvsearch' => 3, 'movie' => 4, 'music' => 5, 'book' => 6, 'details' => 7];
+
+    /** Standard newznab attribute names. */
+    private const array W65_KNOWN_ATTRS = ['size' => true, 'category' => true, 'guid' => true, 'files' => true, 'poster' => true, 'group' => true, 'grabs' => true, 'comments' => true, 'password' => true, 'usenetdate' => true, 'tvdbid' => true, 'imdb' => true, 'season' => true, 'episode' => true];
+
+    /**
+     * XML (`htmlspecialchars()` with quotes) and JSON (unescaped slashes and Unicode) escaped lengths of $text.
+     *
+     * @return array{int, int}
+     */
+    private static function w65Escaped(string $text): array
+    {
+        $length = \strlen($text);
+        if (strcspn($text, self::W65_ESCAPED) === $length) {
+            return [$length, $length];
+        }
+        $xml = $json = $length;
+        foreach (count_chars($text, 1) as $byte => $seen) {
+            $xml += $seen * match ($byte) {
+                38 => 4,
+                60, 62 => 3,
+                34, 39 => 5,
+                default => 0,
+            };
+            $json += $seen * match (true) {
+                $byte === 34 || $byte === 92 || $byte === 8 || $byte === 9 || $byte === 10 || $byte === 12 || $byte === 13 => 1,
+                $byte < 32 => 5,
+                default => 0,
+            };
+        }
+
+        return [$xml, $json];
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w65ApiV1PresenterPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 7 ? 0 : 2;
+            $format = match (strtolower(trim($fields[0]))) {
+                '', 'xml' => 0,
+                'json' => 1,
+                default => -1,
+            };
+            if ($format < 0) {
+                $flags |= 4;
+                $format = 0;
+            }
+            $type = trim($fields[1] ?? '');
+            if ($type === '') {
+                $type = 2;
+            } elseif (isset(self::W65_TYPES[$type])) {
+                $type = self::W65_TYPES[$type];
+            } else {
+                $flags |= 8;
+                $type = 0;
+            }
+            $guid = $fields[2] ?? '';
+            $guidLength = \strlen($guid);
+            $guidValid = ($guidLength === 32 || $guidLength === 40) && strspn($guid, '0123456789abcdef') === $guidLength;
+            if (! $guidValid && $guid !== '') {
+                $flags |= 16;
+            }
+            $title = $fields[3] ?? '';
+            [$titleXml, $titleJson] = self::w65Escaped($title);
+            if (! mb_check_encoding($title, 'UTF-8')) {
+                $flags |= 32;
+                $titleJson = -1;
+            }
+            $size = self::w65Number($fields[4] ?? '', 0, $flags);
+            $category = self::w65Number($fields[5] ?? '', 0, $flags);
+            $attrs = $known = $attrsXml = $attrsJson = 0;
+            if (($fields[6] ?? '') !== '') {
+                foreach (explode('|', $fields[6]) as $item) {
+                    $eq = strpos($item, '=');
+                    if ($eq === false || $eq === 0) {
+                        $flags |= 1;
+
+                        continue;
+                    }
+                    $name = substr($item, 0, $eq);
+                    $attrs++;
+                    if (isset(self::W65_KNOWN_ATTRS[$name])) {
+                        $known++;
+                    }
+                    [$nameXml, $nameJson] = self::w65Escaped($name);
+                    [$valueXml, $valueJson] = self::w65Escaped(substr($item, $eq + 1));
+                    $attrsXml += 32 + $nameXml + $valueXml;
+                    $attrsJson += 38 + $nameJson + $valueJson;
+                }
+            }
+            $shared = 2 * $guidLength + \strlen((string) $size) + \strlen((string) $category);
+            if ($type === 1) {
+                $xmlBytes = $jsonBytes = 0;
+            } else {
+                $xmlBytes = 256 + $titleXml + $shared + $attrsXml;
+                $jsonBytes = $titleJson < 0 ? -1 : 192 + $titleJson + $shared + $attrsJson + max(0, $attrs - 1);
+            }
+            array_push($out, $format, $type, (int) $guidValid, $titleXml, $titleJson, $attrs, $known, $xmlBytes, $jsonBytes, $flags);
+        }
+
+        return $out;
+    }
 }
