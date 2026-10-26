@@ -629,4 +629,217 @@ class LogIndexer
     {
         return $file->size >= $row->head_length && $this->head($file, $row->head_length)['head_hash'] === $row->head_hash;
     }
+
+    /** C signature of the Wave 61.5 {@see self::checkpointPlanBatch()} helper. */
+    private const string W61_LOG_INDEXER_PLAN_FFI_CDEF = 'int64_t nntmux_w615_log_indexer_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 61.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 5.72/3.61/5.83/5.04x); see tests/Unit/RustGoogleBooksIgdbImdbScraperItunesLogIndexerW61ParityTest.php.
+     */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 61.5 routing and FFI cache, kept in function-local statics (no static properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w61_5', self::W61_LOG_INDEXER_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W61_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW61RustFfi(): bool
+    {
+        return self::w61RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with checkpointPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 61.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w61Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w61RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w615_log_indexer_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch log indexer checkpoint plan over `size\tindexed_offset\tindexed_line\thead_length\tstored_inode\tinode\tmtime\tnow
+     * \tpending_bytes\tpending_entries\tbatch_size\tlag_tolerance`. Ten words per record: `[action, resume_offset, remaining,
+     * flush, chunk_bytes, state, active, head_refresh, chunks, flags]`. Fields are trimmed 1-18 digits; empty or invalid
+     * ones take their default (0, batch size 1000 floored at 1, lag tolerance 1048576). Action: 3 new (no stored inode),
+     * 2 reset (inode changed or truncated below the offset), 1 index the unread tail, 0 caught up; resets resume at 0.
+     * The remaining bytes are read in MAX_BATCH_BYTES chunks; the pending batch flushes at the batch size or
+     * MAX_BATCH_BYTES. State is 0 none after a reset, 1 indexed within the lag tolerance, 2 partial. Active means
+     * modified within TAIL_FLUSH_MINUTES; the head refreshes after a reset or while shorter than HEAD_BYTES of a longer
+     * file. Flags: 1 invalid number, 2 truncated, 4 inode changed, 8 modified in the future, 16 offset without a line,
+     * 32 byte flush, 64 entry flush, 128 not exactly twelve fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function checkpointPlanBatch(array $records): array
+    {
+        return self::usesW61RustFfi() ? self::checkpointPlanBatchNative($records) : self::checkpointPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function checkpointPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        $defaults = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, 1_048_576];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 12 ? 0 : 128;
+            $values = $defaults;
+            foreach ($defaults as $index => $default) {
+                $text = trim($fields[$index] ?? '');
+                if ($text === '') {
+                    continue;
+                }
+                if (\strlen($text) <= 18 && ctype_digit($text)) {
+                    $values[$index] = (int) $text;
+                } else {
+                    $flags |= 1;
+                }
+            }
+            [$size, $offset, $line, $head, $stored, $inode, $mtime, $now, $bytes, $entries, $batch, $lag] = $values;
+            $batch = max(1, $batch);
+            if ($size < $offset) {
+                $flags |= 2;
+            }
+            if ($stored > 0 && $inode > 0 && $inode !== $stored) {
+                $flags |= 4;
+            }
+            $action = match (true) {
+                $stored === 0 => 3,
+                ($flags & 6) !== 0 => 2,
+                $offset < $size => 1,
+                default => 0,
+            };
+            $resume = $action >= 2 ? 0 : $offset;
+            $remaining = $size - $resume;
+            if ($entries >= $batch) {
+                $flags |= 64;
+            }
+            if ($bytes >= self::MAX_BATCH_BYTES) {
+                $flags |= 32;
+            }
+            $state = $action >= 2 ? 0 : ($remaining <= $lag ? 1 : 2);
+            if ($now > 0 && $mtime > $now) {
+                $flags |= 8;
+            }
+            $active = $mtime > 0 && $now >= $mtime && $now - $mtime < self::TAIL_FLUSH_MINUTES * 60 ? 1 : 0;
+            $refresh = $action >= 2 || ($head < self::HEAD_BYTES && $size > $head) ? 1 : 0;
+            if ($offset > 0 && $line === 0) {
+                $flags |= 16;
+            }
+            array_push(
+                $out,
+                $action,
+                $resume,
+                $remaining,
+                ($flags & 96) !== 0 ? 1 : 0,
+                min($remaining, self::MAX_BATCH_BYTES),
+                $state,
+                $active,
+                $refresh,
+                intdiv($remaining + self::MAX_BATCH_BYTES - 1, self::MAX_BATCH_BYTES),
+                $flags,
+            );
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function checkpointPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w61Words($count, implode("\0", $records), 10 * $count) ?? self::checkpointPlanBatchPhp($records);
+    }
 }
