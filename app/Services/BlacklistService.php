@@ -583,4 +583,337 @@ class BlacklistService
                 return $enabled;
         }
     }
+
+    // ========================================================================
+    // WAVE 65.4 BATCH HELPER
+    // ========================================================================
+
+    /** PHP retained: the minimum of three 1000-round paired runs reached 1.80x common mean, 1.80x common p99, 0.93x uncommon mean and 0.94x uncommon p99, below the 1.5x gate; see RustUsenetDownloadAdminSnapshotAnidbArchiveBlacklistW65ParityTest. */
+    public const bool W65_RUST_FFI_DEFAULT = false;
+
+    private const string W65_FFI_CDEF = 'ssize_t nntmux_w654_blacklist_eval_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w65BlacklistEvalPlanBatch() record. */
+    public const int W65_ROW_WORDS = 3;
+
+    /** int64 summary words after the w65BlacklistEvalPlanBatch() records (none for an empty batch). */
+    public const int W65_TRAILER_WORDS = 12;
+
+    private const string W65_METACHARACTERS = '.[]()*+?{}^$';
+
+    private const string W65_ALNUM = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+    /**
+     * Blacklist rule evaluation rows for [subject, poster, message ID, group, rule pattern, rule
+     * group, message column, operation type, status, rule ID] items (one article/rule pair each).
+     *
+     * Decisions in order: 1 disabled (status other than BLACKLIST_ENABLED), 2 group skip (the
+     * trimmed rule group is empty or `*`, a case-insensitive `prefix*`, else a case-insensitive
+     * equal of the trimmed group), 3 invalid column or operation type, 4 empty pattern, 5 needs
+     * PCRE, then 6 blacklist hit, 7 whitelist hit, 8 blacklist miss, 9 whitelist miss. A literal
+     * pattern is an optional leading `^`, `|`-separated non-empty alternatives of plain bytes or
+     * backslash-escaped non-alphanumeric bytes, and an optional final `$`; anchors only combine
+     * with a single alternative. Any other metacharacter, `\` before an alphanumeric or at the
+     * end, or an empty alternative needs PCRE. Alternatives match the column case-insensitively
+     * (ASCII) in order: equal with both anchors, prefix, suffix, else substring; the first hit
+     * gives the offset. The first hit of each rule ID asks for a usage counter update.
+     *
+     * Rows [decision | column (0 when invalid) << 4 | flags << 8 (1 start anchor, 2 end anchor,
+     * 4 first hit of the rule, 8 escapes, 16 empty column) | alternatives << 16 | matched
+     * alternative (1-based) << 24 (both clamped to 255) | pattern length << 32 (clamped to
+     * 2^16 - 1), match offset (-1 when none), rule ID], then the trailer [records, the nine
+     * decision counts, distinct hit rule IDs, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: string, 6: int, 7: int, 8: int, 9: int}>  $items
+     * @return list<int>
+     */
+    public static function w65BlacklistEvalPlanBatch(array $items): array
+    {
+        return self::usesW65RustFfi() ? self::w65BlacklistEvalPlanBatchNative($items) : self::w65BlacklistEvalPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: string, 6: int, 7: int, 8: int, 9: int}>  $items
+     * @return list<int>
+     */
+    public static function w65BlacklistEvalPlanBatchPhp(array $items): array
+    {
+        self::w65Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $t = [\count($items), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $hits = [];
+        $digest = 2_166_136_261;
+        foreach ($items as [$subject, $poster, $messageId, $group, $pattern, $ruleGroup, $column, $opType, $status, $ruleId]) {
+            $field = match ($column) {
+                BlacklistConstants::BLACKLIST_FIELD_SUBJECT => $subject,
+                BlacklistConstants::BLACKLIST_FIELD_FROM => $poster,
+                BlacklistConstants::BLACKLIST_FIELD_MESSAGEID => $messageId,
+                default => null,
+            };
+            $flags = $field === '' ? 16 : 0;
+            $alternatives = $matched = 0;
+            $offset = -1;
+            if ($status !== BlacklistConstants::BLACKLIST_ENABLED) {
+                $decision = 1;
+            } elseif (! self::w65GroupMatches($group, $ruleGroup)) {
+                $decision = 2;
+            } elseif ($field === null || ($opType !== BlacklistConstants::OPTYPE_BLACKLIST && $opType !== BlacklistConstants::OPTYPE_WHITELIST)) {
+                $decision = 3;
+            } elseif ($pattern === '') {
+                $decision = 4;
+            } elseif (($rule = self::w65ParseRule($pattern)) === null) {
+                $decision = 5;
+            } else {
+                [$start, $end, $escaped, $literals] = $rule;
+                $alternatives = \count($literals);
+                $flags |= ($start ? 1 : 0) | ($end ? 2 : 0) | ($escaped ? 8 : 0);
+                $hay = strtolower($field);
+                foreach ($literals as $k => $literal) {
+                    $found = match (true) {
+                        $start && $end => $hay === $literal ? 0 : false,
+                        $start => str_starts_with($hay, $literal) ? 0 : false,
+                        $end => str_ends_with($hay, $literal) ? \strlen($hay) - \strlen($literal) : false,
+                        default => strpos($hay, $literal),
+                    };
+                    if ($found !== false) {
+                        $matched = $k + 1;
+                        $offset = $found;
+                        break;
+                    }
+                }
+                $black = $opType === BlacklistConstants::OPTYPE_BLACKLIST;
+                if ($matched > 0) {
+                    if (! isset($hits[$ruleId])) {
+                        $hits[$ruleId] = true;
+                        $flags |= 4;
+                    }
+                    $decision = $black ? 6 : 7;
+                } else {
+                    $decision = $black ? 8 : 9;
+                }
+            }
+            $word = $decision | ($field === null ? 0 : $column) << 4 | $flags << 8 | min($alternatives, 255) << 16 | min($matched, 255) << 24
+                | min(\strlen($pattern), 0xFFFF) << 32;
+            array_push($out, $word, $offset, $ruleId);
+            $t[$decision]++;
+            $value = $word ^ $offset << 20 ^ $ruleId;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $t[10] = \count($hits);
+        $t[11] = $digest;
+
+        return [...$out, ...$t];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: string, 6: int, 7: int, 8: int, 9: int}>  $items
+     * @return list<int>
+     */
+    public static function w65BlacklistEvalPlanBatchNative(array $items): array
+    {
+        self::w65Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w65Join([array_column($items, 0), array_column($items, 1), array_column($items, 2), array_column($items, 3), array_column($items, 4), array_column($items, 5)]);
+        $ints = pack('P*', ...array_column($items, 6), ...array_column($items, 7), ...array_column($items, 8), ...array_column($items, 9));
+
+        return self::w65Call($blob, $twin, $ints, $count, $count * self::W65_ROW_WORDS + self::W65_TRAILER_WORDS)
+            ?? self::w65BlacklistEvalPlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w65Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new \InvalidArgumentException('W65 blacklist evaluation plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 10 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_string($item[2]) || ! \is_string($item[3]) || ! \is_string($item[4]) || ! \is_string($item[5]) || ! \is_int($item[6]) || ! \is_int($item[7]) || ! \is_int($item[8]) || ! \is_int($item[9])) {
+                throw new \InvalidArgumentException('W65 blacklist evaluation plan batch items must be [string subject, string poster, string message ID, string group, string rule pattern, string rule group, int message column, int operation type, int status, int rule ID] lists.');
+            }
+        }
+    }
+
+    public static function usesW65RustFfi(): bool
+    {
+        $enabled = self::w65RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W65_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('enabled', true);
+    }
+
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('enabled', false);
+    }
+
+    /** Drop the W65 override, binding, output buffer and declined-call count; routing returns to W65_RUST_FFI_DEFAULT. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W65 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('enabled');
+        self::w65RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w65Join(array $columns): array
+    {
+        $values = array_merge(...$columns);
+        $joined = implode("\0", $values);
+
+        return substr_count($joined, "\0") === \count($values) - 1 ? [$joined, ''] : [$joined, implode("\x01", $values)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w65Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w65RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w65', self::W65_FFI_CDEF) ?? false;
+            self::w65RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w65RustFfiState('out', $out);
+                self::w65RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W65_FFI_CDEF.)
+            $written = $ffi->nntmux_w654_blacklist_eval_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (\Throwable) {
+        }
+        self::w65RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W65 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /**
+     * A literal rule as [start anchor, end anchor, escapes, lower-cased alternatives], or null
+     * when it needs PCRE.
+     *
+     * @return array{0: bool, 1: bool, 2: bool, 3: list<string>}|null
+     */
+    private static function w65ParseRule(string $pattern): ?array
+    {
+        $length = \strlen($pattern);
+        $start = $length > 0 && $pattern[0] === '^';
+        $end = $escaped = false;
+        $literals = [];
+        $current = '';
+        for ($i = $start ? 1 : 0; $i < $length; $i++) {
+            $c = $pattern[$i];
+            if ($c === '\\') {
+                if ($i + 1 >= $length || str_contains(self::W65_ALNUM, $pattern[$i + 1])) {
+                    return null;
+                }
+                $current .= $pattern[++$i];
+                $escaped = true;
+            } elseif ($c === '|') {
+                $literals[] = strtolower($current);
+                $current = '';
+            } elseif ($c === '$' && $i === $length - 1) {
+                $end = true;
+            } elseif (str_contains(self::W65_METACHARACTERS, $c)) {
+                return null;
+            } else {
+                $current .= $c;
+            }
+        }
+        $literals[] = strtolower($current);
+        if (\in_array('', $literals, true) || (($start || $end) && \count($literals) > 1)) {
+            return null;
+        }
+
+        return [$start, $end, $escaped, $literals];
+    }
+
+    private static function w65GroupMatches(string $group, string $ruleGroup): bool
+    {
+        $ruleGroup = trim($ruleGroup);
+        if ($ruleGroup === '' || $ruleGroup === '*') {
+            return true;
+        }
+        $group = strtolower(trim($group));
+        if (str_ends_with($ruleGroup, '*')) {
+            return str_starts_with($group, strtolower(substr($ruleGroup, 0, -1)));
+        }
+
+        return $group === strtolower($ruleGroup);
+    }
 }
