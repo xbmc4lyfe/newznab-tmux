@@ -334,4 +334,255 @@ final class CollectionReleasePolicy
             return null;
         }
     }
+
+    /** C signature of the Wave 63.5 {@see self::w63CollectionPolicyPlanBatch()} helper. */
+    private const string W63_COLLECTION_POLICY_PLAN_FFI_CDEF = 'int64_t nntmux_w635_collection_policy_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 63.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 6.90/7.46/4.16/3.60x); see tests/Unit/RustVerificationPolicyPar2ProofPayloadUpdateResetW63ParityTest.php.
+     */
+    public const bool W63_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 63.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w63RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w63_5', self::W63_COLLECTION_POLICY_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W63_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 63.5 plan batch to Rust until disabled or reset. */
+    public static function enableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', true);
+    }
+
+    /** Route the Wave 63.5 plan batch to PHP until enabled or reset. */
+    public static function disableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', false);
+    }
+
+    /** Restore W63_RUST_FFI_DEFAULT routing and drop the cached Wave 63.5 handle and buffer. */
+    public static function resetW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', null);
+        self::w63RustFfiState('reset', null);
+    }
+
+    public static function usesW63RustFfi(): bool
+    {
+        return self::w63RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w63CollectionPolicyPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW63RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w63RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w63RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 63.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w63Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w63RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w635_collection_policy_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w63Number(string $field, ?int $default, int &$flags): ?int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /**
+     * Batch collection release policy plan over
+     * `total_parts\tavailable_parts\tage\tmin_age\tmax_age\tmin_completion_permille\tverified_bytes\tmin_size\tmax_size\tmin_files\tnames\tmetadata_source\tverification_mode`.
+     * Twelve words per record: `[total_parts, available_parts, completion_permille, age_state, completion_met, action,
+     * files, par2_files, gate, rejection, publishable, flags]`. Numbers are trimmed 1-15 ASCII digits (empty is 0, or 950
+     * for the completion threshold; anything else sets flag 1 and uses that default). Available parts are clamped to the
+     * total; the age state, completion and action follow summarizeEligibilityWindowPhp() (age 0 too young, 1 eligible,
+     * 2 expired; action 0 wait, 1 release, 2 discard). Names are `|`-separated and counted once each (exact bytes);
+     * PAR2 files end in `.par2` (ASCII case-insensitive). The gate is 0 skipped for an `import` metadata source, 1 spot
+     * check, else 2 full verification (both trimmed, ASCII case-insensitive). Rejections: 0 none, 1 below the minimum
+     * size, 2 above a positive maximum size, 3 below the minimum file count, 4 only PAR2 files, and for a full
+     * verification 5 an empty or invalid inventory (checked first). Publishable means release without rejection.
+     * Flags: 1 invalid number, 2 not exactly thirteen fields, 4 available parts clamped, 8 unknown verification mode
+     * (not empty, `full` or `spot_check`), 16 duplicate name, 32 empty name, 64 positive maximum age below the minimum.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w63CollectionPolicyPlanBatch(array $records): array
+    {
+        return self::usesW63RustFfi() ? self::w63CollectionPolicyPlanBatchNative($records) : self::w63CollectionPolicyPlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w63CollectionPolicyPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w63Words($count, implode("\0", $records), 12 * $count) ?? self::w63CollectionPolicyPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w63CollectionPolicyPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 13 ? 0 : 2;
+            $total = (int) self::w63Number($fields[0], 0, $flags);
+            $available = (int) self::w63Number($fields[1] ?? '', 0, $flags);
+            $age = (int) self::w63Number($fields[2] ?? '', 0, $flags);
+            $minAge = (int) self::w63Number($fields[3] ?? '', 0, $flags);
+            $maxAge = (int) self::w63Number($fields[4] ?? '', 0, $flags);
+            $minCompletion = (int) self::w63Number($fields[5] ?? '', 950, $flags);
+            $bytes = (int) self::w63Number($fields[6] ?? '', 0, $flags);
+            $minSize = (int) self::w63Number($fields[7] ?? '', 0, $flags);
+            $maxSize = (int) self::w63Number($fields[8] ?? '', 0, $flags);
+            $minFiles = (int) self::w63Number($fields[9] ?? '', 0, $flags);
+            if ($available > $total) {
+                [$available, $flags] = [$total, $flags | 4];
+            }
+            $permille = $total > 0 ? intdiv($available * 1000, $total) : 0;
+            $ageState = $age < $minAge ? 0 : ($maxAge > 0 && $age > $maxAge ? 2 : 1);
+            if ($maxAge > 0 && $maxAge < $minAge) {
+                $flags |= 64;
+            }
+            $met = $total > 0 && $permille >= min($minCompletion, 1000);
+            $action = $ageState === 0 ? 0 : ($met ? 1 : ($ageState === 1 ? 0 : 2));
+
+            $files = $par2 = 0;
+            $emptyName = false;
+            $seen = [];
+            $names = $fields[10] ?? '';
+            if ($names !== '') {
+                foreach (explode('|', $names) as $name) {
+                    if ($name === '') {
+                        $emptyName = true;
+                    } elseif (isset($seen[$name])) {
+                        $flags |= 16;
+                    } else {
+                        $seen[$name] = true;
+                        $files++;
+                        if (\strlen($name) >= 5 && strcasecmp(substr($name, -5), '.par2') === 0) {
+                            $par2++;
+                        }
+                    }
+                }
+            }
+            if ($emptyName) {
+                $flags |= 32;
+            }
+            $mode = strtolower(trim($fields[12] ?? ''));
+            if ($mode !== '' && $mode !== 'full' && $mode !== 'spot_check') {
+                $flags |= 8;
+            }
+            $gate = strtolower(trim($fields[11] ?? '')) === 'import' ? 0 : ($mode === 'spot_check' ? 1 : 2);
+            $rejection = match (true) {
+                $gate === 0 => 0,
+                $gate === 2 && ($files === 0 || $emptyName) => 5,
+                $bytes < $minSize => 1,
+                $maxSize > 0 && $bytes > $maxSize => 2,
+                $files < $minFiles => 3,
+                $files > 0 && $par2 === $files => 4,
+                default => 0,
+            };
+            array_push($out, $total, $available, $permille, $ageState, $met ? 1 : 0, $action, $files, $par2, $gate, $rejection, $action === 1 && $rejection === 0 ? 1 : 0, $flags);
+        }
+
+        return $out;
+    }
 }
