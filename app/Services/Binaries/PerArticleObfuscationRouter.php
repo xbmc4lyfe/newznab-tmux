@@ -7,6 +7,7 @@ namespace App\Services\Binaries;
 use App\Support\IrcChannelList;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -372,5 +373,314 @@ final class PerArticleObfuscationRouter
         }
 
         return $summary;
+    }
+
+    // ========================================================================
+    // WAVE 62.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 5.28x, p99 3.85x; uncommon mean 4.36x, p99 3.69x); see RustObfuscationRouterReleaseCreationExtraProcessingXrefW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    public const string W62_OBFUSCATION_ROUTER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w621_article_route_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w62ArticleRoutePlanBatch(). */
+    public const int W62_OBFUSCATION_ROUTER_TRAILER = 31;
+
+    public static function usesW62RustFfi(): bool
+    {
+        $override = self::w62RustFfiState();
+
+        return \is_bool($override) ? $override : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the PerArticleObfuscationRouter Wave 62 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 62.1 per-article routing plans. Each item is an article subject (trimmed). The filename is the text
+     * between the first two `"` (flag 32), else the whole subject; its extension (after the last `.`, 1-5
+     * alphanumerics, case-insensitive) is W62_ROUTE_EXTENSIONS' class, 6 for `rNN` or a three-digit split, 9 for
+     * any other and 0 for none. Flags: 1 yEnc (case-insensitive), 2 PAR2 volume (`.vol` in a `.par2` filename),
+     * 4 `(n/m)` part counter, 8 `[n/m]` file counter (each the first such counter; values saturate at 999999),
+     * 16 over MAX_SUBJECT_LENGTH, 64 a 16+ alphanumeric run with a digit and a letter, 128 non-ASCII. The split
+     * class (both counters) is 1 when 1 <= file <= files, else 2; 0 without both. The rule, in order: 0 empty,
+     * 1 `Usenet Index Post` prefix, 2 PAR2/SRR/SFV verification file, 3 obfuscated candidate (part total 2+
+     * and flag 64), 4 yEnc part, 5 part counter only, 6 none. Per item `rule | ext << 3 | flags << 7 |
+     * split << 15 | min(longestRun, 63) << 17 | min(part, 1023) << 23 | min(parts, 1023) << 33 |
+     * min(file, 1023) << 43 | min(files, 1023) << 53`; then 7 rule, 10 extension, 8 flag and 3 split
+     * counts, the subject length sum, the largest part total and the distinct case-insensitive filenames.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62ArticleRoutePlanBatch(array $items): array
+    {
+        return self::usesW62RustFfi() ? self::w62ArticleRoutePlanBatchNative($items) : self::w62ArticleRoutePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62ArticleRoutePlanBatchNative(array $items): array
+    {
+        return self::w62Invoke($items, \count($items) + self::W62_OBFUSCATION_ROUTER_TRAILER) ?? self::w62ArticleRoutePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62ArticleRoutePlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W62_OBFUSCATION_ROUTER_TRAILER, 0);
+        $names = [];
+        foreach ($items as $item) {
+            $s = trim((string) $item);
+            $len = \strlen($s);
+            $flags = 0;
+            $filename = $s;
+            $q1 = strpos($s, '"');
+            if ($q1 !== false && ($q2 = strpos($s, '"', $q1 + 1)) !== false) {
+                $filename = substr($s, $q1 + 1, $q2 - $q1 - 1);
+                $flags |= 32;
+            }
+            $ext = self::w62RouteExtension($filename);
+            if (stripos($s, 'yenc') !== false) {
+                $flags |= 1;
+            }
+            if ($ext === 1 && stripos($filename, '.vol') !== false) {
+                $flags |= 2;
+            }
+            $part = self::w62Counter($s, '(', ')');
+            $file = self::w62Counter($s, '[', ']');
+            $flags |= ($part !== null ? 4 : 0) | ($file !== null ? 8 : 0) | ($len > self::MAX_SUBJECT_LENGTH ? 16 : 0);
+            $longest = 0;
+            $at = strcspn($s, self::ALNUM);
+            while ($at < $len) {
+                $run = strspn($s, self::ALNUM, $at);
+                $longest = max($longest, $run);
+                if ($run >= 16 && ($flags & 64) === 0) {
+                    $token = substr($s, $at, $run);
+                    if (strpbrk($token, self::DIGITS) !== false && strpbrk($token, self::W62_LETTERS) !== false) {
+                        $flags |= 64;
+                    }
+                }
+                $at += $run;
+                $at += strcspn($s, self::ALNUM, $at);
+            }
+            if (preg_match('/[\x80-\xff]/', $s) === 1) {
+                $flags |= 128;
+            }
+            [$p, $parts] = $part ?? [0, 0];
+            [$f, $files] = $file ?? [0, 0];
+            $split = $part !== null && $file !== null ? ($f >= 1 && $f <= $files ? 1 : 2) : 0;
+            $rule = match (true) {
+                $len === 0 => 0,
+                str_starts_with($s, 'Usenet Index Post') => 1,
+                $ext >= 1 && $ext <= 3 => 2,
+                $parts >= 2 && ($flags & 64) !== 0 => 3,
+                ($flags & 1) !== 0 && $part !== null => 4,
+                $part !== null => 5,
+                default => 6,
+            };
+            if ($filename !== '') {
+                $names[strtolower($filename)] = true;
+            }
+            $tail[$rule]++;
+            $tail[7 + $ext]++;
+            for ($b = 0; $b < 8; $b++) {
+                $tail[17 + $b] += $flags >> $b & 1;
+            }
+            $tail[25 + $split]++;
+            $tail[28] += $len;
+            $tail[29] = max($tail[29], $parts);
+            $out[] = $rule | $ext << 3 | $flags << 7 | $split << 15 | min($longest, 63) << 17 | min($p, 1023) << 23
+                | min($parts, 1023) << 33 | min($f, 1023) << 43 | min($files, 1023) << 53;
+        }
+        $tail[30] = \count($names);
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    private const string W62_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+    /**
+     * Extension classes: 1 PAR2, 2 SRR, 3 SFV, 4 NFO, 5 NZB, 6 RAR, 7 ZIP/7z and 8 media.
+     *
+     * @var array<string, int>
+     */
+    public const array W62_ROUTE_EXTENSIONS = ['par2' => 1, 'srr' => 2, 'sfv' => 3, 'nfo' => 4, 'nzb' => 5, 'rar' => 6, 'zip' => 7, '7z' => 7,
+        'mkv' => 8, 'mp4' => 8, 'avi' => 8, 'mp3' => 8, 'flac' => 8, 'iso' => 8, 'm2ts' => 8, 'wmv' => 8];
+
+    /** The W62_ROUTE_EXTENSIONS class of $filename's extension (see w62ArticleRoutePlanBatch()). */
+    private static function w62RouteExtension(string $filename): int
+    {
+        $dot = strrpos($filename, '.');
+        if ($dot === false) {
+            return 0;
+        }
+        $ext = strtolower(substr($filename, $dot + 1));
+        $length = \strlen($ext);
+        if ($length === 0 || $length > 5 || strspn($ext, 'abcdefghijklmnopqrstuvwxyz0123456789') !== $length) {
+            return 0;
+        }
+
+        return self::W62_ROUTE_EXTENSIONS[$ext]
+            ?? ($length === 3 && (($ext[0] === 'r' && strspn($ext, self::DIGITS, 1) === 2) || strspn($ext, self::DIGITS) === 3) ? 6 : 9);
+    }
+
+    /**
+     * The first `$open digits / digits $close` counter in $s as [n, m], each saturating at 999999.
+     *
+     * @return array{int, int}|null
+     */
+    private static function w62Counter(string $s, string $open, string $close): ?array
+    {
+        for ($at = strpos($s, $open); $at !== false; $at = strpos($s, $open, $at + 1)) {
+            $d1 = strspn($s, self::DIGITS, $at + 1);
+            $slash = $at + 1 + $d1;
+            if ($d1 === 0 || ($s[$slash] ?? '') !== '/') {
+                continue;
+            }
+            $d2 = strspn($s, self::DIGITS, $slash + 1);
+            if ($d2 === 0 || ($s[$slash + 1 + $d2] ?? '') !== $close) {
+                continue;
+            }
+
+            return [self::w62Saturate(substr($s, $at + 1, $d1)), self::w62Saturate(substr($s, $slash + 1, $d2))];
+        }
+
+        return null;
+    }
+
+    private static function w62Saturate(string $digits): int
+    {
+        $significant = ltrim($digits, '0');
+
+        return \strlen($significant) > 6 ? 999999 : (int) $significant;
+    }
+
+    /**
+     * Wave 62 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('obfuscation_router_w621', self::W62_OBFUSCATION_ROUTER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w62RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w62RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 62.1 PerArticleObfuscationRouter export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w62Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w62RustFfiState('ffi');
+            $out = self::w62RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w62RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W62_OBFUSCATION_ROUTER_FFI_CDEF.)
+            $written = $ffi->nntmux_w621_article_route_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

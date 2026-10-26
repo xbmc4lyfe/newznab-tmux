@@ -31,6 +31,7 @@ use App\Support\ReleaseSearchIndexSync;
 use App\Support\RustPipelineLibrary;
 use DateTimeInterface;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -2382,5 +2383,277 @@ final class ReleaseProcessingService
         $summary['par2_only'] = (int) ($named > 0 && $summary['par2_count'] === $named);
 
         return $summary;
+    }
+
+    // ========================================================================
+    // WAVE 62.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 12.81x, p99 10.88x; uncommon mean 8.02x, p99 5.26x); see RustObfuscationRouterReleaseCreationExtraProcessingXrefW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    public const string W62_RELEASE_PROCESSING_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w621_release_processing_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w62ReleaseProcessingPlanBatch(). */
+    public const int W62_RELEASE_PROCESSING_TRAILER = 21;
+
+    public static function usesW62RustFfi(): bool
+    {
+        $override = self::w62RustFfiState();
+
+        return \is_bool($override) ? $override : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the ReleaseProcessingService Wave 62 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 62.1 post-processing stage dispatch and budget plans. Each item is
+     * `categoryId|nfostatus|passwordstatus|size|doneStages|budget`: the category is required (1-15 digits, at most
+     * 9999), nfostatus and passwordstatus are optional signed integers and size, doneStages and budget optional
+     * unsigned integers (empty is 0). Stage bits (W62_STAGE_COSTS order): 1 nfo (nfostatus -5..-1), 2 movies,
+     * 4 tv, 8 music, 16 console, 32 games, 64 books, 128 anime, 256 xxx (the category's primary stage: 1xxx
+     * console, 2xxx movies, 3030 books, other 3xxx music, 4050 games, 5070 anime, other 5xxx tv, 6xxx xxx, 7xxx
+     * books) and 512 additional (passwordstatus -5..-1 with a size). Needed stages exclude doneStages; their
+     * cost sums W62_STAGE_COSTS, with min(size >> 30, 20) more for additional. The decision is 3 malformed,
+     * 0 nothing needed, 2 deferred when a budget is set and the batch's running cost plus this cost exceeds it,
+     * else 1 dispatched (adding the cost to the running total). Flags: 1 last NFO retry (-5), 2 additional
+     * skipped for a zero size, 4 zero size, 8 every stage already done. Per item `decision | needed << 2 |
+     * primary << 12 | min(cost, 1023) << 16 | min(running, 2^24 - 1) << 26 | min(category / 1000, 15) << 50 |
+     * neededCount << 54 | flags << 58` (a malformed item is `3 | running << 26`); then 4 decision, 10 stage and
+     * 4 flag counts, the dispatched and deferred cost sums and the largest cost.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62ReleaseProcessingPlanBatch(array $items): array
+    {
+        return self::usesW62RustFfi() ? self::w62ReleaseProcessingPlanBatchNative($items) : self::w62ReleaseProcessingPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62ReleaseProcessingPlanBatchNative(array $items): array
+    {
+        return self::w62Invoke($items, \count($items) + self::W62_RELEASE_PROCESSING_TRAILER) ?? self::w62ReleaseProcessingPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62ReleaseProcessingPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W62_RELEASE_PROCESSING_TRAILER, 0);
+        $running = 0;
+        foreach ($items as $item) {
+            [$category, $nfo, $password, $size, $done, $budget] = explode('|', (string) $item, 6) + ['', '', '', '', '', ''];
+            $category = self::w62Uint($category, -1);
+            $nfo = self::w62Sint($nfo);
+            $password = self::w62Sint($password);
+            $size = self::w62Uint($size, 0);
+            $done = self::w62Uint($done, 0);
+            $budget = self::w62Uint($budget, 0);
+            if ($nfo === null || $password === null || $category < 0 || $category > 9999 || min($size, $done, $budget) < 0) {
+                $tail[3]++;
+                $out[] = 3 | min($running, (1 << 24) - 1) << 26;
+
+                continue;
+            }
+            $primary = match ($category) {
+                3030 => 7,
+                4050 => 6,
+                5070 => 8,
+                default => self::W62_PRIMARY_STAGES[intdiv($category, 1000)],
+            };
+            $passwordPending = $password >= -5 && $password <= -1;
+            $stages = ($primary === 0 ? 0 : 1 << ($primary - 1)) | ($nfo >= -5 && $nfo <= -1 ? 1 : 0) | ($passwordPending && $size > 0 ? 512 : 0);
+            $needed = $stages & ~($done & 1023);
+            $cost = $count = 0;
+            for ($b = 0; $b < 10; $b++) {
+                if (($needed >> $b & 1) === 1) {
+                    $cost += self::W62_STAGE_COSTS[$b] + ($b === 9 ? min($size >> 30, 20) : 0);
+                    $count++;
+                    $tail[4 + $b]++;
+                }
+            }
+            $flags = ($nfo === -5 ? 1 : 0) | ($passwordPending && $size === 0 ? 2 : 0) | ($size === 0 ? 4 : 0) | ($stages !== 0 && $needed === 0 ? 8 : 0);
+            if ($needed === 0) {
+                $decision = 0;
+            } elseif ($budget > 0 && $running + $cost > $budget) {
+                $decision = 2;
+                $tail[19] += $cost;
+            } else {
+                $decision = 1;
+                $running += $cost;
+            }
+            $tail[$decision]++;
+            for ($b = 0; $b < 4; $b++) {
+                $tail[14 + $b] += $flags >> $b & 1;
+            }
+            $tail[20] = max($tail[20], $cost);
+            $out[] = $decision | $needed << 2 | $primary << 12 | min($cost, 1023) << 16 | min($running, (1 << 24) - 1) << 26
+                | min(intdiv($category, 1000), 15) << 50 | $count << 54 | $flags << 58;
+        }
+        $tail[18] = $running;
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    /** Stage costs by stage bit: nfo, movies, tv, music, console, games, books, anime, xxx and additional. */
+    public const array W62_STAGE_COSTS = [2, 3, 3, 2, 2, 3, 2, 2, 2, 5];
+
+    /** Primary stage (1-based stage bit, 0 none) by category thousand. */
+    private const array W62_PRIMARY_STAGES = [0, 5, 2, 4, 0, 3, 9, 7, 0, 0];
+
+    /** A field of 1-15 digits after trimming as its value, $empty when empty, else -1. */
+    private static function w62Uint(string $raw, int $empty): int
+    {
+        $value = trim($raw);
+        if ($value === '') {
+            return $empty;
+        }
+
+        return \strlen($value) <= 15 && strspn($value, '0123456789') === \strlen($value) ? (int) $value : -1;
+    }
+
+    /** An optional `-` and 1-15 digits after trimming as its value, 0 when empty, else null. */
+    private static function w62Sint(string $raw): ?int
+    {
+        $value = trim($raw);
+        if ($value === '') {
+            return 0;
+        }
+        $negative = $value[0] === '-';
+        $digits = $negative ? substr($value, 1) : $value;
+        if ($digits === '' || \strlen($digits) > 15 || strspn($digits, '0123456789') !== \strlen($digits)) {
+            return null;
+        }
+
+        return $negative ? -(int) $digits : (int) $digits;
+    }
+
+    /**
+     * Wave 62 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('release_processing_w621', self::W62_RELEASE_PROCESSING_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w62RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w62RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 62.1 ReleaseProcessingService export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w62Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w62RustFfiState('ffi');
+            $out = self::w62RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w62RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W62_RELEASE_PROCESSING_FFI_CDEF.)
+            $written = $ffi->nntmux_w621_release_processing_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
