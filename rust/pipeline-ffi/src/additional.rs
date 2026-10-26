@@ -51268,3 +51268,994 @@ mod w666_categorization_pipe_plans {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 67.6: batch log viewer and MCP process plans for `LogFileRepository`,
+// `LogReader`, `LogSearcher`, `SearchQuery` and `ProcessRunner`. Every entry
+// point takes `count` NUL-joined records and writes eight `int64_t` words per
+// record. The module is self-contained.
+// ---------------------------------------------------------------------------
+
+mod w676_log_viewer_mcp_plans {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Output words per record for every Wave 67.6 helper.
+    const WIDTH: usize = 8;
+
+    /// Plan callback: record bytes and its output words.
+    type Plan = fn(&[u8], &mut [i64]);
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// 1-15 ASCII digits as an integer.
+    fn digits(field: &[u8]) -> Option<i64> {
+        if field.is_empty() || field.len() > 15 {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// Trimmed 1-15 digits; empty yields `default`, anything else sets bit 1 and yields `default`.
+    fn number(field: &[u8], default: i64, flags: &mut i64) -> i64 {
+        match trim(field) {
+            b"" => default,
+            text => digits(text).unwrap_or_else(|| {
+                *flags |= 1;
+                default
+            }),
+        }
+    }
+
+    /// PHP `explode("\t", $record)`: the first `N` fields (missing ones empty) and the field count.
+    fn fields<const N: usize>(record: &[u8]) -> ([&[u8]; N], usize) {
+        let mut out: [&[u8]; N] = [b""; N];
+        let mut total = 0usize;
+        for field in record.split(|&b| b == b'\t') {
+            if total < N {
+                out[total] = field;
+            }
+            total += 1;
+        }
+        (out, total)
+    }
+
+    /// PHP `explode("\t", $record, N)`: at most `N` fields, the last holding the rest.
+    fn explode_limit<const N: usize>(record: &[u8]) -> ([&[u8]; N], usize) {
+        let mut out: [&[u8]; N] = [b""; N];
+        let mut total = 0usize;
+        for field in record.splitn(N, |&b| b == b'\t') {
+            out[total] = field;
+            total += 1;
+        }
+        (out, total)
+    }
+
+    fn is_control(byte: u8) -> bool {
+        byte < 0x20 || byte == 0x7f
+    }
+
+    fn ends_with_ci(text: &[u8], suffix: &[u8]) -> bool {
+        text.len() >= suffix.len() && text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+
+    fn starts_with_ci(text: &[u8], prefix: &[u8]) -> bool {
+        text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
+
+    /// `YYYYMMDD` of a `\d{4}-\d{2}-\d{2}` at the start of `text` with month 1-12 and day 1-31,
+    /// `Some(0)` for an out-of-range month or day, and None when the shape does not match.
+    fn date_at(text: &[u8]) -> Option<i64> {
+        let window = text.get(..10)?;
+        if window[4] != b'-' || window[7] != b'-' {
+            return None;
+        }
+        let year = digits(&window[..4])?;
+        let month = digits(&window[5..7])?;
+        let day = digits(&window[8..10])?;
+        Some(if (1..=12).contains(&month) && (1..=31).contains(&day) {
+            year * 10_000 + month * 100 + day
+        } else {
+            0
+        })
+    }
+
+    /// The leftmost `\d{4}-\d{2}-\d{2}` of `text` as `YYYYMMDD`, 0 when none or out of range.
+    fn first_date(text: &[u8]) -> i64 {
+        let mut at = 0;
+        while at + 10 <= text.len() {
+            if let Some(date) = date_at(&text[at..]) {
+                return date;
+            }
+            at += 1;
+        }
+        0
+    }
+
+    /// `LogFileRepository::w67LogFileRepositoryPlanBatch()` over `path\tsize`:
+    /// `[normalized_len, flags, depth, date, rotation, kind, size_class, errors]`.
+    fn repository_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total) = fields::<2>(record);
+        let mut errors = if total == 2 { 0 } else { 2 };
+        let trimmed = trim(f[0]);
+        let is_sep = |b: &u8| *b == b'/' || *b == b'\\';
+        let mut flags = match trimmed {
+            [b'/' | b'\\', ..] => 4,
+            [first, b':', ..] if first.is_ascii_alphabetic() => 4,
+            _ => 0,
+        };
+        let start = trimmed
+            .iter()
+            .position(|b| !is_sep(b))
+            .unwrap_or(trimmed.len());
+        let normalized = &trimmed[start..];
+        let mut depth = 0i64;
+        if normalized.is_empty() {
+            flags |= 8;
+        } else {
+            for segment in normalized.split(is_sep) {
+                match segment {
+                    b".." => flags |= 1,
+                    b"" | b"." => flags |= 2,
+                    _ => {}
+                }
+            }
+            depth = normalized.iter().filter(|b| is_sep(b)).count() as i64;
+            if normalized.iter().any(|&b| is_control(b)) {
+                flags |= 32;
+            }
+        }
+        let base = normalized
+            .iter()
+            .rposition(is_sep)
+            .map_or(normalized, |at| &normalized[at + 1..]);
+        if base.first() == Some(&b'.') {
+            flags |= 16;
+        }
+        let mut stem = base;
+        if ends_with_ci(stem, b".gz") {
+            flags |= 64;
+            stem = &stem[..stem.len() - 3];
+        }
+        let mut rotation = 0;
+        if let Some(dot) = stem.iter().rposition(|&b| b == b'.') {
+            let suffix = &stem[dot + 1..];
+            if suffix.len() <= 9 {
+                if let Some(value) = digits(suffix) {
+                    rotation = value;
+                    stem = &stem[..dot];
+                }
+            }
+        }
+        let kind = if ends_with_ci(stem, b".log") {
+            1
+        } else if ends_with_ci(stem, b".txt") {
+            2
+        } else if ends_with_ci(stem, b".json") {
+            3
+        } else {
+            0
+        };
+        let date = first_date(base);
+        if date != 0 {
+            flags |= 128;
+        }
+        if flags & 63 == 0 && kind != 0 {
+            flags |= 256;
+        }
+        let size_class = match number(f[1], 0, &mut errors) {
+            0 => 0,
+            1..=1_048_575 => 1,
+            1_048_576..=67_108_863 => 2,
+            _ => 3,
+        };
+        out.copy_from_slice(&[
+            normalized.len() as i64,
+            flags,
+            depth,
+            date,
+            rotation,
+            kind,
+            size_class,
+            errors,
+        ]);
+    }
+
+    /// `LogReader::w67LogReaderPlanBatch()` over `size\tbefore\tchunkSize\tbudget\tchunk`:
+    /// `[end, window_start, chunks, read_from, read_len, aligned_start, lines, flags]`.
+    fn reader_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total) = explode_limit::<5>(record);
+        let mut flags = if total == 5 { 0 } else { 2 };
+        let size = number(f[0], 0, &mut flags);
+        let before = number(f[1], -1, &mut flags);
+        let chunk = number(f[2], 65_536, &mut flags).max(1);
+        let budget = number(f[3], 33_554_432, &mut flags);
+        let text = f[4];
+        let end = if before < 0 { size } else { before.min(size) };
+        let window_start = (end - budget).max(0);
+        let chunks = (end - window_start + chunk - 1) / chunk;
+        let read_from = window_start.max(end - chunk);
+        let read_len = end - read_from;
+        let newline = memchr(b'\n', text);
+        let lines = text.iter().filter(|&&b| b == b'\n').count() as i64;
+        let aligned = if read_from == 0 {
+            0
+        } else {
+            newline.map_or(-1, |at| read_from + at as i64 + 1)
+        };
+        if before > size {
+            flags |= 4;
+        }
+        if text.last().is_some_and(|&b| b != b'\n') {
+            flags |= 8;
+        }
+        if newline.is_none() {
+            flags |= 16;
+        }
+        if window_start > 0 {
+            flags |= 32;
+        }
+        if text.len() as i64 > read_len {
+            flags |= 64;
+        }
+        out.copy_from_slice(&[
+            end,
+            window_start,
+            chunks,
+            read_from,
+            read_len,
+            aligned,
+            lines,
+            flags,
+        ]);
+    }
+
+    /// Monolog level bits (`SearchQuery::W55_LEVEL_BITS`).
+    const LEVELS: [(&[u8], i64); 8] = [
+        (b"debug", 1),
+        (b"info", 2),
+        (b"notice", 4),
+        (b"warning", 8),
+        (b"error", 16),
+        (b"critical", 32),
+        (b"alert", 64),
+        (b"emergency", 128),
+    ];
+
+    /// Case-insensitive level name bit, or 0.
+    fn level_bit(name: &[u8]) -> i64 {
+        LEVELS
+            .iter()
+            .find(|(level, _)| level.eq_ignore_ascii_case(name))
+            .map_or(0, |&(_, bit)| bit)
+    }
+
+    /// PCRE `\s` without UTF.
+    fn is_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+    }
+
+    /// Level bit of a `\A\[[^\]]*\]\s+[\w.\-]+\.(level):` header (case-insensitive), or 0.
+    fn header_level(line: &[u8]) -> i64 {
+        let Some((&b'[', rest)) = line.split_first() else {
+            return 0;
+        };
+        let Some(close) = memchr(b']', rest) else {
+            return 0;
+        };
+        let after = &rest[close + 1..];
+        let spaces = after.iter().take_while(|&&b| is_space(b)).count();
+        if spaces == 0 {
+            return 0;
+        }
+        let after = &after[spaces..];
+        let run = after
+            .iter()
+            .take_while(|&&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+            .count();
+        if after.get(run) != Some(&b':') {
+            return 0;
+        }
+        let channel = &after[..run];
+        match channel.iter().rposition(|&b| b == b'.') {
+            Some(dot) if dot > 0 => level_bit(&channel[dot + 1..]),
+            _ => 0,
+        }
+    }
+
+    /// First offset >= `from` of a non-empty `needle`, ASCII case-insensitively when `fold`.
+    fn find(hay: &[u8], needle: &[u8], from: usize, fold: bool) -> Option<usize> {
+        let (&first, _) = needle.split_first()?;
+        let last = hay.len().checked_sub(needle.len())?;
+        let fold_first = fold && first.is_ascii_alphabetic();
+        let mut at = from;
+        while at <= last {
+            let window = &hay[at..=last];
+            let offset = if fold_first {
+                window.iter().position(|b| b.eq_ignore_ascii_case(&first))
+            } else {
+                memchr(first, window)
+            }?;
+            let candidate = at + offset;
+            let slice = &hay[candidate..candidate + needle.len()];
+            if (fold && slice.eq_ignore_ascii_case(needle)) || (!fold && slice == needle) {
+                return Some(candidate);
+            }
+            at = candidate + 1;
+        }
+        None
+    }
+
+    /// Highlight cap (`LogSearcher::W47_MAX_HIGHLIGHTS`).
+    const MAX_HITS: i64 = 200;
+
+    /// `LogSearcher::w67LogSearcherPlanBatch()` over `term\tcase\tlevelMask\tcontext\tline`:
+    /// `[line_len, level, first_hit, hits, window_start, window_end, mask, errors]`.
+    fn searcher_plan(record: &[u8], out: &mut [i64]) {
+        let (f, total) = explode_limit::<5>(record);
+        let mut errors = if total == 5 { 0 } else { 2 };
+        let term = f[0];
+        let fold = number(f[1], 0, &mut errors) == 0;
+        let level_mask = number(f[2], 0, &mut errors) & 255;
+        let context = number(f[3], 0, &mut errors).min(1000);
+        let line = f[4];
+        let level = header_level(line);
+        let (first, mut hits, matched) = if term.is_empty() {
+            (-1, 0, level != 0)
+        } else {
+            match find(line, term, 0, fold) {
+                None => (-1, 0, false),
+                Some(at) => {
+                    let mut hits = 1i64;
+                    let mut next = at + term.len();
+                    while hits <= MAX_HITS {
+                        match find(line, term, next, fold) {
+                            Some(found) => {
+                                hits += 1;
+                                next = found + term.len();
+                            }
+                            None => break,
+                        }
+                    }
+                    (at as i64, hits, true)
+                }
+            }
+        };
+        let capped = hits > MAX_HITS;
+        hits = hits.min(MAX_HITS);
+        let (window_start, window_end) = if first >= 0 {
+            (
+                (first - context).max(0),
+                (first + term.len() as i64 + context).min(line.len() as i64),
+            )
+        } else {
+            (-1, -1)
+        };
+        let passes = level_mask == 0 || level & level_mask != 0;
+        let mask = i64::from(matched)
+            | i64::from(passes) << 1
+            | i64::from(matched && passes) << 2
+            | i64::from(capped) << 3
+            | i64::from(level != 0) << 4;
+        out.copy_from_slice(&[
+            line.len() as i64,
+            level,
+            first,
+            hits,
+            window_start,
+            window_end,
+            mask,
+            errors,
+        ]);
+    }
+
+    /// `YYYYMMDD` of an exact `\d{4}-\d{2}-\d{2}` value with month 1-12 and day 1-31.
+    fn exact_date(value: &[u8]) -> Option<i64> {
+        if value.len() != 10 {
+            return None;
+        }
+        date_at(value).filter(|&date| date != 0)
+    }
+
+    /// `SearchQuery::w67SearchQueryPlanBatch()` over a raw query:
+    /// `[tokens, terms, level_mask, from, to, flags, cost, errors]`.
+    fn query_plan(record: &[u8], out: &mut [i64]) {
+        let n = record.len();
+        let (mut tokens, mut terms, mut term_bytes) = (0i64, 0i64, 0i64);
+        let (mut mask, mut from, mut to, mut flags, mut errors) = (0i64, 0i64, 0i64, 0i64, 0i64);
+        let mut at = 0usize;
+        loop {
+            while at < n && is_space(record[at]) {
+                at += 1;
+            }
+            if at >= n {
+                break;
+            }
+            tokens += 1;
+            if record[at] == b'"' {
+                let rest = &record[at + 1..];
+                let phrase = match memchr(b'"', rest) {
+                    Some(close) => {
+                        at += close + 2;
+                        &rest[..close]
+                    }
+                    None => {
+                        errors |= 4;
+                        at = n;
+                        rest
+                    }
+                };
+                if !phrase.is_empty() {
+                    terms += 1;
+                    term_bytes += phrase.len() as i64;
+                    flags |= 512;
+                }
+                continue;
+            }
+            let len = record[at..]
+                .iter()
+                .position(|&b| is_space(b))
+                .unwrap_or(n - at);
+            let token = &record[at..at + len];
+            at += len;
+            match token {
+                b"OR" => flags |= 1,
+                b"AND" => flags |= 2,
+                b"NOT" => flags |= 4,
+                _ if starts_with_ci(token, b"level:") => {
+                    for name in token[6..].split(|&b| b == b',') {
+                        if name.is_empty() {
+                            continue;
+                        }
+                        match level_bit(name) {
+                            0 => errors |= 8,
+                            bit => mask |= bit,
+                        }
+                    }
+                }
+                _ if starts_with_ci(token, b"from:") => match exact_date(&token[5..]) {
+                    Some(date) => from = date,
+                    None => errors |= 16,
+                },
+                _ if starts_with_ci(token, b"to:") => match exact_date(&token[3..]) {
+                    Some(date) => to = date,
+                    None => errors |= 16,
+                },
+                _ if starts_with_ci(token, b"is:") => {
+                    let value = &token[3..];
+                    if value.eq_ignore_ascii_case(b"regex") {
+                        flags |= 16;
+                    } else if value.eq_ignore_ascii_case(b"case") {
+                        flags |= 32;
+                    } else {
+                        errors |= 8;
+                    }
+                }
+                [b'-', rest @ ..] if !rest.is_empty() => {
+                    flags |= 8;
+                    terms += 1;
+                    term_bytes += rest.len() as i64;
+                }
+                _ => {
+                    terms += 1;
+                    term_bytes += token.len() as i64;
+                    if token.len() < 2 {
+                        flags |= 64;
+                    }
+                }
+            }
+        }
+        if from != 0 && to != 0 && from > to {
+            errors |= 32;
+        }
+        let cost = 10 * terms
+            + term_bytes
+            + if flags & 16 != 0 { 50 * terms } else { 0 }
+            + if terms == 0 { 100 } else { 0 };
+        if cost > 1000 {
+            flags |= 128;
+        }
+        if tokens == 0 {
+            flags |= 256;
+        }
+        out.copy_from_slice(&[tokens, terms, mask, from, to, flags, cost, errors]);
+    }
+
+    /// `ProcessRunner::W67_PROGRAMS` id of an allowlisted program basename, or 0.
+    fn program_id(name: &[u8]) -> i64 {
+        match name {
+            b"php" => 1,
+            b"composer" => 2,
+            b"git" => 3,
+            b"npm" => 4,
+            b"node" => 5,
+            b"phpunit" => 6,
+            b"pint" => 7,
+            b"phpstan" => 8,
+            _ => 0,
+        }
+    }
+
+    /// `ProcessRunner::w67ProcessRunnerPlanBatch()` over `timeout\tmaxOutput\tcwd\targv...`:
+    /// `[argc, argv_bytes, program, timeout, output_cap, cwd_flags, flags, errors]`.
+    fn runner_plan(record: &[u8], out: &mut [i64]) {
+        let mut parts = record.split(|&b| b == b'\t');
+        let mut errors = 0i64;
+        let timeout_field = parts.next().unwrap_or(b"");
+        let cap_field = parts.next().unwrap_or(b"");
+        let cwd = parts.next().unwrap_or(b"");
+        let requested_timeout = number(timeout_field, 60, &mut errors);
+        let requested_cap = number(cap_field, 32_768, &mut errors);
+        let mut flags = 0i64;
+        let (mut argc, mut bytes) = (0i64, 0i64);
+        let (mut argv0, mut argv1): (&[u8], &[u8]) = (b"", b"");
+        for arg in parts {
+            match argc {
+                0 => argv0 = arg,
+                1 => argv1 = arg,
+                _ => {}
+            }
+            argc += 1;
+            bytes += arg.len() as i64;
+            if arg.is_empty() {
+                flags |= 16;
+            }
+            if arg
+                .iter()
+                .any(|&b| matches!(b, b';' | b'|' | b'&' | b'$' | b'`' | b'<' | b'>' | b'\n'))
+            {
+                flags |= 8;
+            }
+        }
+        if argc == 0 {
+            errors |= 2;
+        }
+        let name = match argv0.iter().rposition(|&b| b == b'/') {
+            Some(slash) => {
+                if !argv0.starts_with(b"vendor/bin/") || argv0.windows(2).any(|w| w == b"..") {
+                    flags |= 2;
+                }
+                &argv0[slash + 1..]
+            }
+            None => argv0,
+        };
+        let program = program_id(name);
+        if program == 0 {
+            flags |= 1;
+        }
+        if program == 1 && argv1 == b"artisan" {
+            flags |= 4;
+        }
+        let timeout = requested_timeout.clamp(1, 3600);
+        if timeout != requested_timeout {
+            flags |= 32;
+        }
+        let cap = requested_cap.clamp(1024, 67_108_864);
+        if cap != requested_cap {
+            flags |= 64;
+        }
+        let cwd_flags = if cwd.is_empty() {
+            0
+        } else {
+            let mut cwd_flags = if cwd[0] == b'/' { 1 } else { 8 };
+            if cwd.split(|&b| b == b'/').any(|segment| segment == b"..") {
+                cwd_flags |= 2;
+            }
+            if cwd.iter().any(|&b| is_control(b)) {
+                cwd_flags |= 4;
+            }
+            cwd_flags
+        };
+        if program != 0 && flags & (2 | 8 | 16) == 0 && cwd_flags & (2 | 4) == 0 && errors == 0 {
+            flags |= 128;
+        }
+        out.copy_from_slice(&[argc, bytes, program, timeout, cap, cwd_flags, flags, errors]);
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records,
+    /// writing [`WIDTH`] words per record straight into `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        plan: Plan,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                // SAFETY: the caller guarantees `data_len` readable bytes at `data`.
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(records) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = records.len() * WIDTH;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            // SAFETY: `out` is non-null, aligned, disjoint from `data` and holds `out_cap >= needed` words.
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            for (record, slot) in records.iter().zip(words.chunks_exact_mut(WIDTH)) {
+                plan(record, slot);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes
+            /// eight words per record and returns the words written, `-needed` when `out_cap` is
+            /// too small (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                // SAFETY: forwarded caller contract.
+                unsafe { run(count, flags, data, data_len, ints, ints_len, out, out_cap, $plan) }
+            }
+        };
+    }
+
+    entry!(
+        /// `LogFileRepository::w67LogFileRepositoryPlanBatch()` (see [`repository_plan`]).
+        nntmux_w676_log_file_repository_plan, repository_plan
+    );
+    entry!(
+        /// `LogReader::w67LogReaderPlanBatch()` (see [`reader_plan`]).
+        nntmux_w676_log_reader_plan, reader_plan
+    );
+    entry!(
+        /// `LogSearcher::w67LogSearcherPlanBatch()` (see [`searcher_plan`]).
+        nntmux_w676_log_searcher_plan, searcher_plan
+    );
+    entry!(
+        /// `SearchQuery::w67SearchQueryPlanBatch()` (see [`query_plan`]).
+        nntmux_w676_search_query_plan, query_plan
+    );
+    entry!(
+        /// `ProcessRunner::w67ProcessRunnerPlanBatch()` (see [`runner_plan`]).
+        nntmux_w676_process_runner_plan, runner_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [Entry; 5] = [
+            nntmux_w676_log_file_repository_plan,
+            nntmux_w676_log_reader_plan,
+            nntmux_w676_log_searcher_plan,
+            nntmux_w676_search_query_plan,
+            nntmux_w676_process_runner_plan,
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Vec<i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        #[test]
+        fn w676_helpers() {
+            assert_eq!(first_date(b"laravel-2026-10-26.log"), 20261026);
+            assert_eq!(first_date(b"12345-01-02"), 23450102);
+            assert_eq!(first_date(b"2026-13-01.2026-01-01"), 0);
+            assert_eq!(first_date(b"2026-1-01"), 0);
+            assert_eq!(exact_date(b"2026-02-31"), Some(20260231));
+            assert_eq!(exact_date(b"2026-00-01"), None);
+            assert_eq!(exact_date(b"2026-01-011"), None);
+            assert_eq!(header_level(b"[2026-01-01 00:00:00] local.ERROR: boom"), 16);
+            assert_eq!(header_level(b"[x]\t a.b-c_d.Warning:"), 8);
+            assert_eq!(header_level(b"[x] .error:"), 0);
+            assert_eq!(header_level(b"[x]local.error:"), 0);
+            assert_eq!(header_level(b"[x] local.error :"), 0);
+            assert_eq!(find(b"aXbxc", b"X", 2, true), Some(3));
+            assert_eq!(find(b"aXbxc", b"X", 2, false), None);
+            assert_eq!(find(b"ab", b"abc", 0, false), None);
+            assert_eq!(
+                explode_limit::<3>(b"a\tb\tc\td"),
+                ([&b"a"[..], b"b", b"c\td"], 3)
+            );
+            assert_eq!(fields::<2>(b"a\tb\tc").1, 3);
+        }
+
+        #[test]
+        fn w676_examples() {
+            assert_eq!(
+                call(
+                    nntmux_w676_log_file_repository_plan,
+                    &[
+                        b" /logs\\laravel-2026-10-26.log.2.gz \t2048",
+                        b"",
+                        b"../.env\tx"
+                    ],
+                ),
+                [
+                    [32, 4 | 64 | 128, 1, 20261026, 2, 1, 1, 0],
+                    [0, 8, 0, 0, 0, 0, 0, 2],
+                    [7, 1 | 16, 1, 0, 0, 0, 0, 1],
+                ]
+                .concat()
+            );
+            assert_eq!(
+                call(
+                    nntmux_w676_log_reader_plan,
+                    &[b"1000\t\t100\t500\tpartial\nline\n", b"50\t80\t\t\tab"],
+                ),
+                [
+                    [1000, 500, 5, 900, 100, 908, 2, 32],
+                    [50, 0, 1, 0, 50, 0, 0, 4 | 8 | 16],
+                ]
+                .concat()
+            );
+            assert_eq!(
+                call(
+                    nntmux_w676_log_searcher_plan,
+                    &[b"boom\t0\t16\t3\t[t] local.ERROR: BOOM boom"],
+                ),
+                vec![26, 16, 17, 2, 14, 24, 1 | 2 | 4 | 16, 0]
+            );
+            assert_eq!(
+                call(
+                    nntmux_w676_search_query_plan,
+                    &[b"timeout level:error,Warning from:2026-01-02 to:2026-01-01 -foo \"a b\" OR is:regex"],
+                ),
+                vec![8, 3, 24, 20260102, 20260101, 1 | 8 | 16 | 512, 3 * 60 + 13, 32]
+            );
+            assert_eq!(
+                call(
+                    nntmux_w676_process_runner_plan,
+                    &[
+                        b"0\t\t\tphp\tartisan\ttest",
+                        b"9000\t1\t/a/../b\tvendor/bin/pint\t$x"
+                    ],
+                ),
+                [
+                    [3, 14, 1, 1, 32768, 0, 4 | 32 | 128, 0],
+                    [2, 17, 7, 3600, 1024, 1 | 2, 8 | 32 | 64, 0],
+                ]
+                .concat()
+            );
+        }
+
+        #[test]
+        fn w676_abi_validation() {
+            let data = b"a\0b";
+            let mut out = [7i64; 32];
+            for entry in ENTRIES {
+                let call =
+                    |count: usize, flags: i64, ints_len: usize, out: *mut i64, cap: usize| unsafe {
+                        entry(
+                            count,
+                            flags,
+                            data.as_ptr(),
+                            data.len(),
+                            data.as_ptr(),
+                            ints_len,
+                            out,
+                            cap,
+                        )
+                    };
+                assert_eq!(call(2, 0, 0, out.as_mut_ptr(), 32), 16);
+                out[0] = 7;
+                assert_eq!(call(2, 0, 0, out.as_mut_ptr(), 15), -16);
+                assert_eq!(out[0], 7);
+                assert_eq!(call(2, 0, 0, std::ptr::null_mut(), 0), -16);
+                assert_eq!(call(2, 0, 0, std::ptr::null_mut(), 4), -1);
+                assert_eq!(call(2, 1, 0, out.as_mut_ptr(), 32), -1);
+                assert_eq!(call(2, 0, 1, out.as_mut_ptr(), 32), -1);
+                assert_eq!(call(1, 0, 0, out.as_mut_ptr(), 32), -1);
+                assert_eq!(call(3, 0, 0, out.as_mut_ptr(), 32), -1);
+                assert_eq!(call(0, 0, 0, out.as_mut_ptr(), 32), -1);
+                assert_eq!(call(MAX_RECORDS + 1, 0, 0, out.as_mut_ptr(), 32), -1);
+                let misaligned = unsafe { out.as_mut_ptr().cast::<u8>().add(1).cast::<i64>() };
+                assert_eq!(call(2, 0, 0, misaligned, 8), -1);
+                let empty = unsafe {
+                    entry(
+                        0,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(empty, 0);
+                let null_data = unsafe {
+                    entry(
+                        1,
+                        0,
+                        std::ptr::null(),
+                        3,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        32,
+                    )
+                };
+                assert_eq!(null_data, -1);
+                // Input bytes aliasing the output range are rejected.
+                let alias = out.as_ptr().cast::<u8>();
+                let aliased =
+                    unsafe { entry(1, 0, alias, 8, std::ptr::null(), 0, out.as_mut_ptr(), 32) };
+                assert_eq!(aliased, -1);
+                // A single empty record still yields a full row.
+                let mut row = [0i64; 8];
+                let one = unsafe {
+                    entry(
+                        1,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        row.as_mut_ptr(),
+                        8,
+                    )
+                };
+                assert_eq!(one, 8);
+            }
+        }
+
+        #[test]
+        fn w676_unicode_and_long_records_never_panic() {
+            let mut long = vec![b'a'; 100_000];
+            long.extend_from_slice("\t\u{e9}\t\u{ff}\t\t".as_bytes());
+            for entry in ENTRIES {
+                let out = call(
+                    entry,
+                    &[
+                        &long,
+                        "Caf\u{e9}/\u{c9}.log\t1\t2\t3\t[\u{e9}] a.error: \u{e9}".as_bytes(),
+                        b"\xff\xfe\t\t",
+                        b"\"",
+                    ],
+                );
+                assert_eq!(out.len(), 32);
+            }
+        }
+    }
+}

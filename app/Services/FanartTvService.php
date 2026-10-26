@@ -926,4 +926,302 @@ class FanartTvService
             }
         }
     }
+
+    // ---- Wave 67.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 5.084x/5.232x, uncommon 5.667x/5.263x); see RustRuntimeStateConsolesEpisodeHydrationFanartForkingW67ParityTest. */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    private const string W67_FANART_TV_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w672_fanart_tv_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W67_FANART_TV_TAIL = 20;
+
+    /**
+     * Wave 67 routing, binding and output buffer, kept in function-local statics (no static or
+     * instance properties). Operations: null reads the routing override, 'set' replaces it
+     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
+     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
+     * (null without the library).
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'reset':
+                $previous = $enabled;
+                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w67', self::W67_FANART_TV_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w67RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    /** Routes w67FanartTvPlanBatch() to Rust until reset. */
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', true);
+    }
+
+    /** Routes w67FanartTvPlanBatch() to PHP until reset. */
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', false);
+    }
+
+    /** Restores W67_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('reset');
+    }
+
+    public static function usesW67RustFfi(): bool
+    {
+        $enabled = self::w67RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W67_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w67FanartTvPlanBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w67FanartTvPlanBatch(array $rows): array
+    {
+        return self::usesW67RustFfi() ? self::w67FanartTvPlanBatchNative($rows) : self::w67FanartTvPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w67FanartTvPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W67_FANART_TV_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w67RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w67FanartTvPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W67_FANART_TV_FFI_CDEF.)
+            $written = $ffi->nntmux_w672_fanart_tv_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w67FanartTvPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w67Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w67Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /** Lower-cased Fanart.tv image kind => class (1 poster, 2 backdrop, 3 banner). */
+    private const array W67_FANART_CLASSES = ['movieposter' => 1, 'tvposter' => 1, 'seasonposter' => 1, 'poster' => 1, 'moviebackground' => 2, 'showbackground' => 2,
+        'artistbackground' => 2, 'background' => 2, 'moviebanner' => 3, 'tvbanner' => 3, 'seasonbanner' => 3, 'banner' => 3];
+
+    /** Minimum HD width and height per class. */
+    private const array W67_FANART_HD = [[0, 0], [1000, 1426], [1920, 1080], [1000, 185]];
+
+    /** Bytes that make a URL invalid (controls, space and DEL). */
+    private const string W67_FANART_URL_CONTROLS = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x20\x7F";
+
+    /** 3 English, 2 language-neutral (empty or `00`), 1 another two-letter code, 0 other (trimmed). */
+    private static function w67FanartLang(string $lang): int
+    {
+        $lang = trim($lang);
+
+        return match (true) {
+            strtolower($lang) === 'en' => 3,
+            $lang === '' || $lang === '00' => 2,
+            \strlen($lang) === 2 && strspn($lang, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz') === 2 => 1,
+            default => 0,
+        };
+    }
+
+    /**
+     * `[https, fanart_host, preview, ext]` for an absolute http(s) URL without blanks or control
+     * bytes (ext 0 other, 1 jpg/jpeg, 2 png, on the path before `?`), otherwise null.
+     *
+     * @return array{bool, bool, bool, int}|null
+     */
+    private static function w67FanartUrl(string $url): ?array
+    {
+        $length = \strlen($url);
+        $https = $length > 8 && strncasecmp($url, 'https://', 8) === 0;
+        if ((! $https && ! ($length > 7 && strncasecmp($url, 'http://', 7) === 0)) || strcspn($url, self::W67_FANART_URL_CONTROLS) !== $length) {
+            return null;
+        }
+        $rest = strtolower(substr($url, $https ? 8 : 7));
+        $slash = strpos($rest, '/');
+        $host = $slash === false ? $rest : substr($rest, 0, $slash);
+        $query = strpos($rest, '?');
+        $path = $query === false ? $rest : substr($rest, 0, $query);
+        $ext = match (true) {
+            str_ends_with($path, '.jpg') || str_ends_with($path, '.jpeg') => 1,
+            str_ends_with($path, '.png') => 2,
+            default => 0,
+        };
+
+        return [$https, $host === 'fanart.tv' || (\strlen($host) > 10 && str_ends_with($host, '.fanart.tv')), str_contains($rest, '/preview/'), $ext];
+    }
+
+    /**
+     * Wave 67.2 Fanart.tv image plan. Per `group\tkind\tlang\tlikes\turl\twidth\theight` row
+     * `action | class << 2 | lang << 4 | https << 6 | fanart_host << 7 | preview << 8 | ext << 9 |
+     * hd << 11 | min(likes, 2^20 - 1) << 12 | min(slot, 2^20 - 1) << 32 | (crc32(url) & 0x7FF) <<
+     * 52`. The group is trimmed and lower-cased, the kind a W67_FANART_CLASSES class (0 other),
+     * the language a w67FanartLang() priority, likes, width and height w67Int() fields of 9, 5 and
+     * 5 digits and the trimmed URL a w67FanartUrl(); hd needs the class's W67_FANART_HD size. An
+     * empty group, unparsable likes, width or height or an invalid URL is malformed (0); another
+     * kind is ignored (1). Each poster, backdrop or banner is a candidate (2) of its
+     * `(group, class)` slot, numbered in first-seen order, scored `lang << 51 | !preview << 50 |
+     * min(likes, 2^20 - 1) << 30 | (min(width, 9999) * min(height, 9999)) >> 10`; the first row
+     * with the highest score is the slot's best (3). Then four action, four class and four
+     * language counts, distinct groups and slots, total and highest candidate likes, https,
+     * preview and HD rows (well-formed rows) and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w67FanartTvPlanBatchPhp(array $rows): array
+    {
+        $out = [];
+        $actions = array_fill(0, 4, 0);
+        $classes = array_fill(0, 4, 0);
+        $langs = array_fill(0, 4, 0);
+        $groups = $slots = [];
+        $totalLikes = $maxLikes = $httpsRows = $previewRows = $hdRows = 0;
+        $index = 0;
+        foreach ($rows as $row) {
+            [$group, $kind, $lang, $likes, $url, $width, $height] = explode("\t", (string) $row, 7) + ['', '', '', '', '', '', ''];
+            $group = strtolower(trim($group));
+            $class = self::W67_FANART_CLASSES[strtolower(trim($kind))] ?? 0;
+            $lang = self::w67FanartLang($lang);
+            $likes = self::w67Int($likes, 9);
+            $width = self::w67Int($width, 5);
+            $height = self::w67Int($height, 5);
+            $url = trim($url);
+            $parsed = self::w67FanartUrl($url);
+            $malformed = $group === '' || $likes === false || $width === false || $height === false || $parsed === null;
+            [$https, $fanart, $preview, $ext] = $parsed ?? [false, false, false, 0];
+            $l = \is_int($likes) ? $likes : 0;
+            $w = \is_int($width) ? $width : 0;
+            $h = \is_int($height) ? $height : 0;
+            $hd = $class !== 0 && $w >= self::W67_FANART_HD[$class][0] && $h >= self::W67_FANART_HD[$class][1];
+            $slot = $hash = 0;
+            if ($malformed) {
+                $action = 0;
+            } else {
+                $hash = crc32($url) & 0x7FF;
+                $httpsRows += (int) $https;
+                $previewRows += (int) $preview;
+                $hdRows += (int) $hd;
+                $groups[$group] = true;
+                if ($class === 0) {
+                    $action = 1;
+                } else {
+                    $score = $lang << 51 | (int) ! $preview << 50 | min($l, 0xFFFFF) << 30 | (min($w, 9999) * min($h, 9999)) >> 10;
+                    $key = $class."\t".$group;
+                    $slots[$key] ??= [\count($slots), $index, PHP_INT_MIN];
+                    if ($score > $slots[$key][2]) {
+                        [$slots[$key][1], $slots[$key][2]] = [$index, $score];
+                    }
+                    $slot = $slots[$key][0];
+                    $totalLikes += $l;
+                    $maxLikes = max($maxLikes, $l);
+                    $action = 2;
+                }
+            }
+            $actions[$action]++;
+            $classes[$class]++;
+            $langs[$lang]++;
+            $out[] = $action | $class << 2 | $lang << 4 | (int) $https << 6 | (int) $fanart << 7 | (int) $preview << 8 | $ext << 9 | (int) $hd << 11
+                | min($l, 0xFFFFF) << 12 | min($slot, 0xFFFFF) << 32 | $hash << 52;
+            $index++;
+        }
+        foreach ($slots as [, $best]) {
+            $out[$best] |= 3;
+        }
+        $actions[2] -= \count($slots);
+        $actions[3] = \count($slots);
+        array_push($out, ...$actions, ...$classes, ...$langs);
+        array_push($out, \count($groups), \count($slots), $totalLikes, $maxLikes, $httpsRows, $previewRows, $hdRows);
+        $out[] = self::w67Digest($out);
+
+        return $out;
+    }
 }

@@ -52631,3 +52631,1354 @@ pub mod w661_backfill_binaries_config_service_handler {
         }
     }
 }
+
+pub mod w671_xxx_pipe_collection_cleanup_cleaning_config_provider_repo {
+    //! Wave 67.1 per-item plans for XxxPipe, CollectionCleanupService, CollectionsCleaningService,
+    //! ConfigurationProvider and DomainConfigurationRepository. Every export follows the Wave 62.1
+    //! contract: items are NUL-joined in `blob`, or concatenated with their byte lengths in `lens`
+    //! when it is non-null; one `i64` word per item is written, then a fixed rollup trailer. Returns
+    //! the word count, `-needed` when `out_cap` (in words) is too small, or -1 when it declines (null
+    //! or misaligned `out`, null `blob` with a length, `count` other than the number of
+    //! NUL-separated items, `lens` that do not tile `blob`, or overlapping buffers). Item fields are
+    //! `|`-separated as PHP `explode('|', $item, N)` padded with empty strings, and every helper
+    //! matches its PHP reference bit for bit.
+
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::OnceLock;
+
+    const MAX_ITEMS: usize = 1 << 22;
+    const DECLINE: isize = -1;
+    const SUM_CAP: i64 = 1 << 40;
+
+    pub const XXX_PIPE_TRAILER: usize = 28;
+    pub const COLLECTION_CLEANUP_TRAILER: usize = 21;
+    pub const COLLECTIONS_CLEANING_TRAILER: usize = 34;
+    pub const CONFIGURATION_PROVIDER_TRAILER: usize = 36;
+    pub const DOMAIN_CONFIG_REPO_TRAILER: usize = 31;
+
+    /// `ConfigurationDomain` values in case order.
+    const DOMAINS: [&[u8]; 6] = [b"site", b"registration", b"ingestion", b"post-processing", b"metadata", b"tmux"];
+
+    #[inline]
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    /// PHP `trim()` without a character list.
+    fn trim(s: &[u8]) -> &[u8] {
+        let start = s.iter().position(|&b| !is_ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|&b| !is_ws(b)).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    /// PHP `rtrim($s, $chars)`.
+    fn rtrim_chars<'a>(s: &'a [u8], chars: &[u8]) -> &'a [u8] {
+        let end = s.iter().rposition(|b| !chars.contains(b)).map_or(0, |e| e + 1);
+        &s[..end]
+    }
+
+    /// PHP `explode('|', $item, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(item: &[u8]) -> [&[u8]; N] {
+        let mut out = [&item[..0]; N];
+        let mut rest = item;
+        for slot in out.iter_mut().take(N - 1) {
+            match rest.iter().position(|&b| b == b'|') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    return out;
+                }
+            }
+        }
+        out[N - 1] = rest;
+        out
+    }
+
+    /// Branch-free per 32-byte chunk so long items vectorize.
+    #[inline]
+    fn non_ascii(s: &[u8]) -> bool {
+        s.chunks(32).any(|c| c.iter().fold(0u8, |a, &b| a | b) >= 0x80)
+    }
+
+    #[inline]
+    fn has_control(s: &[u8]) -> bool {
+        s.chunks(32).any(|c| c.iter().fold(false, |a, &b| a | (b < 0x20) | (b == 0x7f)))
+    }
+
+    /// The first index of `byte`, through libc's vectorized `memchr`.
+    #[inline]
+    fn find_byte(s: &[u8], byte: u8) -> Option<usize> {
+        let found = unsafe { super::memchr(s.as_ptr(), byte.into(), s.len()) };
+        if found.is_null() { None } else { Some(found as usize - s.as_ptr() as usize) }
+    }
+
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    fn digits_value(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |a, &d| a * 10 + i64::from(d - b'0'))
+    }
+
+    /// PHP `str_contains()`: `memchr` for the first needle byte, then a compare.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        let Some((&first, tail)) = needle.split_first() else {
+            return true;
+        };
+        let mut from = 0;
+        while haystack.len() - from >= needle.len() {
+            let window = &haystack[from..=haystack.len() - needle.len()];
+            let Some(at) = find_byte(window, first) else {
+                return false;
+            };
+            let start = from + at;
+            if haystack[start + 1..start + needle.len()] == *tail {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
+    }
+
+    /// A word-at-a-time multiplicative hasher for the batch-local distinct-key sets.
+    #[derive(Default)]
+    struct FxHasher(u64);
+
+    impl FxHasher {
+        #[inline]
+        fn mix(&mut self, word: u64) {
+            self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7cc1_b727_220a_95);
+        }
+    }
+
+    impl Hasher for FxHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            let mut chunks = bytes.chunks_exact(8);
+            for chunk in &mut chunks {
+                self.mix(u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])));
+            }
+            for &b in chunks.remainder() {
+                self.mix(u64::from(b));
+            }
+        }
+
+        fn write_u64(&mut self, value: u64) {
+            self.mix(value);
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.mix(value as u64);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+
+    type FastSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
+
+    /// Inserts a copy of `key`; whether it was new.
+    fn insert_new(set: &mut FastSet<Vec<u8>>, key: &[u8]) -> bool {
+        set.insert(key.to_vec())
+    }
+
+    /// `strtolower($s)` into a reused buffer.
+    fn lower_into(buf: &mut Vec<u8>, s: &[u8]) {
+        buf.clear();
+        buf.extend(s.iter().map(u8::to_ascii_lowercase));
+    }
+
+    fn contains_any(haystack: &[u8], needles: &[&[u8]]) -> bool {
+        needles.iter().any(|n| contains(haystack, n))
+    }
+
+    /// An unsigned field of 1-15 digits after trimming; empty is `empty`, anything else -1.
+    fn uint_field(raw: &[u8], empty: i64) -> i64 {
+        let t = trim(raw);
+        if t.is_empty() {
+            return empty;
+        }
+        if t.len() <= 15 && all_digits(t) { digits_value(t) } else { -1 }
+    }
+
+    /// The value clamped to `lo..=hi` and whether clamping changed it; malformed (-1) is 0, unchanged.
+    fn clamp_field(v: i64, lo: i64, hi: i64) -> (i64, bool) {
+        if v < 0 {
+            return (0, false);
+        }
+        let e = v.clamp(lo, hi);
+        (e, e != v)
+    }
+
+    /// `hexdec(hash('fnv1a32', implode('', $parts)))`.
+    fn fnv1a32(parts: &[&[u8]]) -> i64 {
+        let mut h: u32 = 0x811c_9dc5;
+        for part in parts {
+            for &b in *part {
+                h ^= u32::from(b);
+                h = h.wrapping_mul(16_777_619);
+            }
+        }
+        i64::from(h)
+    }
+
+    fn add_flags(tail: &mut [i64], flags: i64) {
+        for (b, slot) in tail.iter_mut().enumerate() {
+            *slot += flags >> b & 1;
+        }
+    }
+
+    fn is_json(s: &[u8]) -> bool {
+        matches!((s.first(), s.last()), (Some(b'{'), Some(b'}')) | (Some(b'['), Some(b']')))
+    }
+
+    trait Plan {
+        const TRAILER: usize;
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64;
+        fn finish(&mut self, tail: &mut [i64]);
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+    /// `out_cap` `i64`s).
+    unsafe fn run<P: Plan>(
+        mut plan: P,
+        blob: *const u8,
+        blob_len: usize,
+        lens: *const i64,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || (blob.is_null() && blob_len != 0)
+                || blob_len > isize::MAX as usize
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+                || (!lens.is_null() && !(lens as usize).is_multiple_of(std::mem::align_of::<i64>()))
+            {
+                return DECLINE;
+            }
+            let words = count + P::TRAILER;
+            if words > out_cap {
+                return -(words as isize);
+            }
+            if overlaps(blob as usize, blob_len, out as usize, words * 8)
+                || (!lens.is_null() && overlaps(lens as usize, count * 8, out as usize, words * 8))
+            {
+                return DECLINE;
+            }
+            // A null pointer is never sliced, even for an empty batch.
+            let bytes: &[u8] = if blob_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(blob, blob_len) } };
+            // `words` words, checked against `out_cap` above; disjoint from the inputs.
+            let dst = unsafe { std::slice::from_raw_parts_mut(out, words) };
+            let (rows, tail) = dst.split_at_mut(count);
+            tail.fill(0);
+            if lens.is_null() {
+                if count == 0 {
+                    if !bytes.is_empty() {
+                        return DECLINE;
+                    }
+                } else {
+                    let mut n = 0;
+                    for entry in bytes.split(|&b| b == 0) {
+                        if n >= count {
+                            return DECLINE;
+                        }
+                        rows[n] = plan.item(entry, tail);
+                        n += 1;
+                    }
+                    if n != count {
+                        return DECLINE;
+                    }
+                }
+            } else {
+                let lens: &[i64] = if count == 0 { &[] } else { unsafe { std::slice::from_raw_parts(lens, count) } };
+                let mut total = 0usize;
+                for &len in lens {
+                    let Some(next) = usize::try_from(len).ok().and_then(|l| total.checked_add(l)) else {
+                        return DECLINE;
+                    };
+                    total = next;
+                }
+                if total != bytes.len() {
+                    return DECLINE;
+                }
+                let mut offset = 0usize;
+                for (slot, &len) in rows.iter_mut().zip(lens) {
+                    let end = offset + len as usize;
+                    *slot = plan.item(&bytes[offset..end], tail);
+                    offset = end;
+                }
+            }
+            plan.finish(tail);
+            words as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // ---- XxxPipe ----
+
+    const XXX_STUDIOS: [&[u8]; 10] =
+        [b"brazzers", b"realitykings", b"naughtyamerica", b"bangbros", b"vixen", b"blacked", b"tushy", b"evilangel", b"teamskeet", b"mofos"];
+    const XXX_JAV: [&[u8]; 6] = [b"1pondo", b"caribbeancom", b"heyzo", b"tokyohot", b"10musume", b"fc2-ppv"];
+    const XXX_KEYWORDS: [&[u8]; 7] = [b"porn", b"milf", b"hardcore", b"lesbian", b"creampie", b"blowjob", b"threesome"];
+    const XXX_GROUPS: [&[u8]; 3] = [b"xxx", b"erotica", b"porn"];
+    const XXX_VETO: [&[u8]; 8] = [b"hdtv", b"documentary", b"ebook", b"epub", b"flac", b"mp3", b"linux", b"season"];
+    const XXX_POSTERS: [&[u8]; 3] = [b"anon@y.com", b"@md-hobbys.com", b"oz@lot.com"];
+    /// Category ids by subcategory: Other, UHD, Imageset, Pack, DVD, WMV, XviD, x264, ClipHD.
+    const XXX_CATEGORIES: [i64; 9] = [6999, 6045, 6060, 6050, 6010, 6020, 6030, 6040, 6041];
+    const XXX_SUBCATEGORIES: [&[&'static [u8]]; 8] = [
+        &[b"2160p", b"uhd", b"4k"],
+        &[b"imageset", b"pictureset", b"imgset"],
+        &[b".pack.", b" pack ", b"_pack_", b"-pack-"],
+        &[],
+        &[b"wmv"],
+        &[b"xvid", b"divx", b"dvdrip", b"bdrip", b"brrip"],
+        &[b"x264", b"h264", b"h.264", b"x265", b"hevc", b"1080p", b"720p"],
+        &[b"clip", b"siterip", b"mp4"],
+    ];
+
+    /// `preg_match('/s[0-9]{2}e[0-9]{2}/', $lower)`.
+    #[cfg(test)]
+    fn episode_tag(s: &[u8]) -> bool {
+        xxx_scan(s) & XXX_EPISODE != 0
+    }
+
+    /// `preg_match('/dvdr[^i]|dvd[59]/', $lower)`.
+    #[cfg(test)]
+    fn dvd_tag(s: &[u8]) -> bool {
+        xxx_scan(s) & XXX_DVD != 0
+    }
+
+    const XXX_TAG: u32 = 1;
+    const XXX_STUDIO: u32 = 2;
+    const XXX_JAV_MARK: u32 = 4;
+    const XXX_KEYWORD: u32 = 8;
+    const XXX_VETO_WORD: u32 = 16;
+    /// Subcategory `n` (1-8) is bit `n + 4`; DVD (4) is the pattern bit below.
+    const XXX_SUB_SHIFT: u32 = 4;
+    const XXX_EPISODE: u32 = 1 << 13;
+    const XXX_DVD: u32 = 1 << (4 + XXX_SUB_SHIFT);
+
+    /// Title markers by first byte, each with its signal bit.
+    type NeedleIndex = Vec<Vec<(&'static [u8], u32)>>;
+
+    fn xxx_index() -> &'static NeedleIndex {
+        static INDEX: OnceLock<NeedleIndex> = OnceLock::new();
+        INDEX.get_or_init(|| {
+            let mut index: NeedleIndex = vec![Vec::new(); 256];
+            let mut add = |needles: &[&'static [u8]], bit: u32| {
+                for needle in needles {
+                    index[usize::from(needle[0])].push((needle, bit));
+                }
+            };
+            add(&[b"xxx"], XXX_TAG);
+            add(&XXX_STUDIOS, XXX_STUDIO);
+            add(&XXX_JAV, XXX_JAV_MARK);
+            add(&XXX_KEYWORDS, XXX_KEYWORD);
+            add(&XXX_VETO, XXX_VETO_WORD);
+            for (i, needles) in XXX_SUBCATEGORIES.iter().enumerate() {
+                add(needles, 1 << (i as u32 + 1 + XXX_SUB_SHIFT));
+            }
+            index
+        })
+    }
+
+    /// Every title signal of a lowercased title in one pass: which marker groups occur, plus the
+    /// `sNNeNN` and `dvdr[^i]|dvd[59]` patterns.
+    fn xxx_scan(lower: &[u8]) -> u32 {
+        let index = xxx_index();
+        let mut mask = 0u32;
+        for (i, &b) in lower.iter().enumerate() {
+            let rest = &lower[i..];
+            for &(needle, bit) in &index[usize::from(b)] {
+                if mask & bit == 0 && rest.len() >= needle.len() && rest[1] == needle[1] && rest[..needle.len()] == *needle {
+                    mask |= bit;
+                }
+            }
+            if b == b's'
+                && mask & XXX_EPISODE == 0
+                && rest.len() >= 6
+                && rest[1].is_ascii_digit()
+                && rest[2].is_ascii_digit()
+                && rest[3] == b'e'
+                && rest[4].is_ascii_digit()
+                && rest[5].is_ascii_digit()
+            {
+                mask |= XXX_EPISODE;
+            }
+            if b == b'd'
+                && mask & XXX_DVD == 0
+                && rest.len() >= 4
+                && rest[1] == b'v'
+                && rest[2] == b'd'
+                && (rest[3] == b'5' || rest[3] == b'9' || (rest[3] == b'r' && rest.len() >= 5 && rest[4] != b'i'))
+            {
+                mask |= XXX_DVD;
+            }
+        }
+        mask
+    }
+
+    /// The first matching subcategory (1-8) of a scan mask, else 0.
+    fn xxx_subcategory(mask: u32) -> usize {
+        let subs = mask >> (1 + XXX_SUB_SHIFT) & 0xff;
+        if subs == 0 { 0 } else { subs.trailing_zeros() as usize + 1 }
+    }
+
+    #[derive(Default)]
+    struct XxxPipe {
+        titles: FastSet<Vec<u8>>,
+        groups: FastSet<Vec<u8>>,
+        lower: Vec<u8>,
+        group: Vec<u8>,
+        poster: Vec<u8>,
+    }
+
+    impl Plan for XxxPipe {
+        const TRAILER: usize = XXX_PIPE_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_title, raw_group, raw_poster] = fields::<3>(item);
+            let title = trim(raw_title);
+            lower_into(&mut self.lower, title);
+            lower_into(&mut self.group, trim(raw_group));
+            lower_into(&mut self.poster, trim(raw_poster));
+            let mask = xxx_scan(&self.lower);
+            let mut flags = i64::from(mask & (XXX_TAG | XXX_STUDIO | XXX_JAV_MARK | XXX_KEYWORD));
+            if contains_any(&self.group, &XXX_GROUPS) {
+                flags |= 16;
+            }
+            let veto = mask & (XXX_VETO_WORD | XXX_EPISODE) != 0;
+            if veto {
+                flags |= 32;
+            }
+            if contains_any(&self.poster, &XXX_POSTERS) {
+                flags |= 64;
+            }
+            let score = 40 * (flags & 1) + 30 * (flags >> 1 & 1) + 25 * (flags >> 2 & 1) + 20 * (flags >> 3 & 1) + 15 * (flags >> 4 & 1)
+                + 10 * (flags >> 6 & 1);
+            if non_ascii(item) {
+                flags |= 256;
+            }
+            if has_control(item) {
+                flags |= 512;
+            }
+            let sub = xxx_subcategory(mask);
+            let decision: i64 = if title.is_empty() {
+                0
+            } else if veto && flags & 1 == 0 {
+                1
+            } else if score == 0 {
+                2
+            } else if score < 40 {
+                3
+            } else {
+                4
+            };
+            let length = title.len().min(65_535) as i64;
+            if !title.is_empty() && !insert_new(&mut self.titles, &self.lower) {
+                flags |= 128;
+            }
+            if !self.group.is_empty() {
+                insert_new(&mut self.groups, &self.group);
+            }
+            let category = if decision >= 3 { XXX_CATEGORIES[sub] } else { 0 };
+            tail[decision as usize] += 1;
+            tail[5 + sub] += 1;
+            add_flags(&mut tail[14..24], flags);
+            tail[24] += score;
+            tail[25] = tail[25].max(score);
+            decision | (sub as i64) << 3 | flags << 7 | score << 17 | category << 25 | length << 38
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[26] = self.titles.len() as i64;
+            tail[27] = self.groups.len() as i64;
+        }
+    }
+
+    // ---- CollectionCleanupService ----
+
+    /// Filecheck statuses the retention band keeps (see `W401_READY_STATUSES`).
+    const READY_STATUSES: [i64; 7] = [0, 1, 2, 15, 16, 3, 10];
+
+    #[derive(Default)]
+    struct CollectionCleanup {
+        min_cutoff: Option<i64>,
+    }
+
+    impl Plan for CollectionCleanup {
+        const TRAILER: usize = COLLECTION_CLEANUP_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_added, raw_now, raw_hours, raw_binaries, raw_parts, raw_check, raw_chunk] = fields::<7>(item);
+            let added = uint_field(raw_added, 0);
+            let now = uint_field(raw_now, 0);
+            let hours = uint_field(raw_hours, 72);
+            let binaries = uint_field(raw_binaries, 0);
+            let parts = uint_field(raw_parts, 0);
+            let check = uint_field(raw_check, 0);
+            let chunk = uint_field(raw_chunk, 1000);
+            let malformed = added < 0 || now < 0 || hours < 0 || binaries < 0 || parts < 0 || check < 0 || chunk < 0;
+            let (hours, clamped_hours) = clamp_field(hours, 1, 8760);
+            let (chunk, clamped_chunk) = clamp_field(chunk, 100, 10_000);
+            let cutoff = now - hours * 3600;
+            let ready_cutoff = now - 2 * hours * 3600;
+            let age = if added > 0 && now >= added { (now - added) / 3600 } else { 0 };
+            let orphan = binaries == 0;
+            let part_orphan = binaries > 0 && parts == 0;
+            let ready = READY_STATUSES.contains(&check);
+            let decision: i64 = if trim(item).is_empty() {
+                0
+            } else if malformed {
+                1
+            } else if added == 0 {
+                2
+            } else if added >= cutoff {
+                3
+            } else if orphan {
+                4
+            } else if added >= ready_cutoff && ready {
+                5
+            } else {
+                6
+            };
+            let mut flags = 0i64;
+            if added > now {
+                flags |= 1;
+            }
+            if orphan {
+                flags |= 2;
+            }
+            if part_orphan {
+                flags |= 4;
+            }
+            if ready {
+                flags |= 8;
+            }
+            if clamped_hours {
+                flags |= 16;
+            }
+            if clamped_chunk {
+                flags |= 32;
+            }
+            if non_ascii(item) {
+                flags |= 64;
+            }
+            if has_control(item) {
+                flags |= 128;
+            }
+            let rows = (1 + binaries + parts).min(SUM_CAP);
+            let mut chunks = 0;
+            if decision == 4 || decision == 6 {
+                chunks = (rows + chunk.max(1) - 1) / chunk.max(1);
+                tail[15] += rows;
+            } else if decision == 3 || decision == 5 {
+                tail[16] += rows;
+            }
+            if decision >= 2 {
+                let c = cutoff.max(0);
+                self.min_cutoff = Some(self.min_cutoff.map_or(c, |m| m.min(c)));
+                tail[20] = tail[20].max(c);
+            }
+            tail[decision as usize] += 1;
+            add_flags(&mut tail[7..15], flags);
+            tail[17] += chunks;
+            tail[18] = tail[18].max(age);
+            decision | flags << 3 | age.min(0xf_ffff) << 11 | hours << 31 | chunks.min(0xffff) << 45
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[19] = self.min_cutoff.unwrap_or(0);
+        }
+    }
+
+    // ---- CollectionsCleaningService ----
+
+    const MUSIC_GROUPS: [&[u8]; 3] = [b"sounds", b"mp3", b"music"];
+    const EXTENSIONS: [&[u8]; 13] = [b"rar", b"par2", b"nfo", b"sfv", b"nzb", b"mkv", b"mp4", b"avi", b"7z", b"zip", b"jpg", b"mp3", b"flac"];
+
+    /// `trim(preg_replace('/[ \t\n\r\x0B\x0C]+/', ' ', strtolower($s)), ' ')` into a reused buffer.
+    fn normalize_into(out: &mut Vec<u8>, s: &[u8]) {
+        let is_space = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+        out.clear();
+        let mut rest = s;
+        while let Some(start) = rest.iter().position(|b| !is_space(b)) {
+            rest = &rest[start..];
+            let end = rest.iter().position(is_space).unwrap_or(rest.len());
+            if !out.is_empty() {
+                out.push(b' ');
+            }
+            out.extend_from_slice(&rest[..end]);
+            rest = &rest[end..];
+        }
+        out.make_ascii_lowercase();
+    }
+
+    #[cfg(test)]
+    fn normalize(s: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        normalize_into(&mut out, s);
+        out
+    }
+
+    /// The subject without a trailing yEnc tag and up to three separators before it, if it has one.
+    fn strip_yenc(s: &[u8]) -> Option<&[u8]> {
+        let t = rtrim_chars(s, b" \t\n\r\0\x0b");
+        if t.len() < 4 || !t[t.len() - 4..].eq_ignore_ascii_case(b"yenc") {
+            return None;
+        }
+        let mut s = &t[..t.len() - 4];
+        for _ in 0..3 {
+            match s.last() {
+                Some(b'-' | b'_' | b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) => s = &s[..s.len() - 1],
+                _ => break,
+            }
+        }
+        Some(s)
+    }
+
+    /// `(subject before, part, total)` of a trailing `(part/total)` counter of 1-10 digit numbers.
+    fn strip_counter(s: &[u8]) -> Option<(&[u8], i64, i64)> {
+        let t = rtrim_chars(s, b" \t");
+        if t.last() != Some(&b')') {
+            return None;
+        }
+        let open = t[..t.len() - 1].iter().rposition(|&b| b == b'(')?;
+        let inner = &t[open + 1..t.len() - 1];
+        let slash = inner.iter().position(|&b| b == b'/')?;
+        let (a, b) = (&inner[..slash], &inner[slash + 1..]);
+        if (1..=10).contains(&a.len()) && (1..=10).contains(&b.len()) && all_digits(a) && all_digits(b) {
+            Some((rtrim_chars(&t[..open], b" \t-_"), digits_value(a), digits_value(b)))
+        } else {
+            None
+        }
+    }
+
+    /// `(subject without the yEnc tag and part counter, part, total, flags)`: the yEnc tag is
+    /// stripped before and, when it was not, after the counter.
+    fn strip_subject(subject: &[u8]) -> (&[u8], i64, i64, i64) {
+        let mut s = subject;
+        let mut flags = 0;
+        if let Some(rest) = strip_yenc(s) {
+            s = rest;
+            flags |= 1;
+        }
+        let (mut part, mut total) = (0, 0);
+        if let Some((rest, p, t)) = strip_counter(s) {
+            (s, part, total) = (rest, p, t);
+            flags |= 2;
+        }
+        if flags & 1 == 0
+            && let Some(rest) = strip_yenc(s)
+        {
+            s = rest;
+            flags |= 1;
+        }
+        (s, part, total, flags)
+    }
+
+    /// `preg_match('/[0-9] [kmgKMG][bB]/', $subject)`, checked around each space.
+    fn size_tag(s: &[u8]) -> bool {
+        let mut from = 1;
+        while from < s.len() {
+            let Some(at) = find_byte(&s[from..], b' ') else {
+                return false;
+            };
+            let i = from + at;
+            if i + 2 < s.len() && s[i - 1].is_ascii_digit() && matches!(s[i + 1] | 0x20, b'k' | b'm' | b'g') && s[i + 2] | 0x20 == b'b' {
+                return true;
+            }
+            from = i + 1;
+        }
+        false
+    }
+
+    #[derive(Default)]
+    struct CollectionsCleaning {
+        keys: FastSet<Vec<u8>>,
+        groups: FastSet<Vec<u8>>,
+        group: Vec<u8>,
+        lower: Vec<u8>,
+        cleaned: Vec<u8>,
+        key: Vec<u8>,
+    }
+
+    impl Plan for CollectionsCleaning {
+        const TRAILER: usize = COLLECTIONS_CLEANING_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [subject, raw_group] = fields::<2>(item);
+            lower_into(&mut self.group, trim(raw_group));
+            let (stripped, part, total, mut flags) = strip_subject(subject);
+            lower_into(&mut self.lower, subject);
+            let (group, lower) = (&self.group, &self.lower);
+            if contains(&lower, b".par2") {
+                flags |= 4;
+            }
+            if contains(&lower, b".vol") && lower.contains(&b'+') {
+                flags |= 8;
+            }
+            let mut ext = 0usize;
+            if let Some(q1) = find_byte(subject, b'"')
+                && let Some(len) = find_byte(&subject[q1 + 1..], b'"')
+            {
+                flags |= 16;
+                let file = &lower[q1 + 1..q1 + 1 + len];
+                ext = 14;
+                if let Some(dot) = file.iter().rposition(|&b| b == b'.')
+                    && let Some(i) = EXTENSIONS.iter().position(|e| *e == &file[dot + 1..])
+                {
+                    ext = i + 1;
+                }
+                if file.windows(6).any(|w| &w[..5] == b".part" && w[5].is_ascii_digit()) {
+                    flags |= 32;
+                }
+            }
+            let music = contains_any(group, &MUSIC_GROUPS);
+            if music {
+                flags |= 64;
+            }
+            if size_tag(subject) {
+                flags |= 128;
+            }
+            if non_ascii(item) {
+                flags |= 256;
+            }
+            if has_control(item) {
+                flags |= 512;
+            }
+            // The stripped subject is a prefix of the subject, so its lowercase form is a prefix of `lower`.
+            normalize_into(&mut self.cleaned, &lower[..stripped.len()]);
+            let cleaned = &self.cleaned;
+            let decision: i64 = if trim(subject).is_empty() {
+                0
+            } else if cleaned.is_empty() {
+                1
+            } else if music {
+                2
+            } else if flags & 16 != 0 {
+                3
+            } else {
+                4
+            };
+            let mut hash = 0;
+            if decision >= 2 {
+                let prefix: &[u8] = if music { b"music:" } else { b"generic:" };
+                hash = fnv1a32(&[prefix, cleaned, b"\0", group]) & 0xf_ffff;
+                self.key.clear();
+                self.key.extend_from_slice(prefix);
+                self.key.extend_from_slice(cleaned);
+                self.key.push(0);
+                self.key.extend_from_slice(group);
+                insert_new(&mut self.keys, &self.key);
+            }
+            if !group.is_empty() {
+                insert_new(&mut self.groups, group);
+            }
+            tail[decision as usize] += 1;
+            add_flags(&mut tail[5..15], flags);
+            tail[15 + ext] += 1;
+            tail[30] += part.min(SUM_CAP);
+            tail[31] = tail[31].max(total);
+            decision | flags << 3 | (ext as i64) << 13 | part.min(4095) << 17 | total.min(4095) << 29 | hash << 41
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[32] = self.keys.len() as i64;
+            tail[33] = self.groups.len() as i64;
+        }
+    }
+
+    // ---- ConfigurationProvider ----
+
+    /// `preg_match('/\A[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\z/', $key)`.
+    fn valid_key(key: &[u8]) -> bool {
+        !key.is_empty()
+            && key.split(|&b| b == b'.').all(|seg| {
+                !seg.is_empty() && seg[0].is_ascii_lowercase() && seg[1..].iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+    }
+
+    fn split_sign(s: &[u8]) -> (&[u8], bool) {
+        match s.first() {
+            Some(b'+') => (&s[1..], false),
+            Some(b'-') => (&s[1..], true),
+            _ => (s, false),
+        }
+    }
+
+    /// `/\A[+-]?[0-9]{1,18}\z/`.
+    fn is_int(s: &[u8]) -> bool {
+        let (d, _) = split_sign(s);
+        (1..=18).contains(&d.len()) && all_digits(d)
+    }
+
+    /// `/\A[+-]?(?:[0-9]{1,15}\.[0-9]{0,15}|\.[0-9]{1,15})\z/`.
+    fn is_float(s: &[u8]) -> bool {
+        let (d, _) = split_sign(s);
+        let Some(dot) = d.iter().position(|&b| b == b'.') else {
+            return false;
+        };
+        let (int, frac) = (&d[..dot], &d[dot + 1..]);
+        all_digits(int) && all_digits(frac) && int.len() <= 15 && frac.len() <= 15 && (!int.is_empty() || !frac.is_empty())
+    }
+
+    /// `(kind, negative, magnitude)` of a trimmed value coerced to `ty`: kinds 1 int, 2 bool, 3 float, 4 string.
+    fn coerce(s: &[u8], ty: i64) -> Option<(i64, bool, i64)> {
+        let lower = s.to_ascii_lowercase();
+        let boolean = |strict: bool| match lower.as_slice() {
+            b"true" | b"yes" | b"on" => Some((2, false, 1)),
+            b"false" | b"no" | b"off" => Some((2, false, 0)),
+            b"1" if strict => Some((2, false, 1)),
+            b"0" if strict => Some((2, false, 0)),
+            _ => None,
+        };
+        let int = || {
+            let (d, neg) = split_sign(s);
+            let v = digits_value(d);
+            (1, neg && v != 0, v)
+        };
+        let float = || {
+            let (d, neg) = split_sign(s);
+            let end = d.iter().position(|&b| b == b'.').unwrap_or(d.len());
+            (3, neg, digits_value(&d[..end]))
+        };
+        match ty {
+            0 if s.is_empty() => None,
+            0 if is_int(s) => Some(int()),
+            0 if is_float(s) => Some(float()),
+            0 => boolean(false).or(Some((4, false, 0))),
+            1 => is_int(s).then(int),
+            2 => boolean(true),
+            3 => (is_int(s) || is_float(s)).then(float),
+            4 => Some((4, false, 0)),
+            _ => None,
+        }
+    }
+
+    #[derive(Default)]
+    struct ConfigurationProvider {
+        keys: FastSet<(i64, Vec<u8>)>,
+    }
+
+    impl Plan for ConfigurationProvider {
+        const TRAILER: usize = CONFIGURATION_PROVIDER_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_domain, raw_key, raw_type, raw_value, raw_default] = fields::<5>(item);
+            let domain_name = trim(raw_domain).to_ascii_lowercase();
+            let domain = if domain_name.is_empty() {
+                0
+            } else {
+                DOMAINS.iter().position(|d| *d == domain_name.as_slice()).map_or(7, |i| i as i64 + 1)
+            };
+            let key = trim(raw_key);
+            let key_valid = valid_key(key);
+            let ty = match trim(raw_type).to_ascii_lowercase().as_slice() {
+                b"" => 0,
+                b"int" | b"integer" => 1,
+                b"bool" | b"boolean" => 2,
+                b"float" | b"double" => 3,
+                b"string" => 4,
+                _ => 5,
+            };
+            let value = trim(raw_value);
+            let fallback = trim(raw_default);
+            let mut flags = 0i64;
+            if value != raw_value {
+                flags |= 2;
+            }
+            if key_valid {
+                flags |= 4;
+            }
+            let (mut kind, mut negative, mut magnitude, mut length) = (0, false, 0, 0);
+            let decision: i64 = if trim(item).is_empty() {
+                0
+            } else if domain == 7 {
+                1
+            } else if !key_valid {
+                2
+            } else if ty == 5 {
+                3
+            } else if let Some(c) = (!value.is_empty()).then(|| coerce(value, ty)).flatten() {
+                (kind, negative, magnitude) = c;
+                length = value.len();
+                4
+            } else {
+                if !value.is_empty() {
+                    flags |= 16;
+                }
+                match coerce(fallback, ty) {
+                    Some(c) => {
+                        (kind, negative, magnitude) = c;
+                        length = fallback.len();
+                        flags |= 8;
+                        5
+                    }
+                    None => 6,
+                }
+            };
+            if negative {
+                flags |= 1;
+            }
+            if non_ascii(item) {
+                flags |= 32;
+            }
+            if has_control(item) {
+                flags |= 64;
+            }
+            if key_valid && !self.keys.insert((domain, key.to_vec())) {
+                flags |= 128;
+            }
+            tail[decision as usize] += 1;
+            tail[7 + domain as usize] += 1;
+            tail[15 + ty as usize] += 1;
+            tail[21 + kind as usize] += 1;
+            add_flags(&mut tail[26..34], flags);
+            tail[34] += magnitude.min(SUM_CAP);
+            decision
+                | domain << 3
+                | ty << 6
+                | kind << 9
+                | flags << 12
+                | magnitude.min(0x7fff_ffff) << 20
+                | (length.min(2047) as i64) << 51
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[35] = self.keys.len() as i64;
+        }
+    }
+
+    // ---- DomainConfigurationRepository ----
+
+    #[derive(Default)]
+    struct DomainConfigRepo {
+        keys: FastSet<(i64, Vec<u8>)>,
+    }
+
+    impl Plan for DomainConfigRepo {
+        const TRAILER: usize = DOMAIN_CONFIG_REPO_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [raw_section, raw_setting, raw_stored, raw_override, raw_ttl] = fields::<5>(item);
+            let section_lower = trim(raw_section).to_ascii_lowercase();
+            let section_name: Vec<u8> = section_lower.iter().map(|&b| if b == b'_' || b == b' ' { b'-' } else { b }).collect();
+            let section = if section_name.is_empty() {
+                0
+            } else if section_name == b"postprocessing" {
+                4
+            } else {
+                DOMAINS.iter().position(|d| *d == section_name.as_slice()).map_or(7, |i| i as i64 + 1)
+            };
+            let setting = trim(raw_setting);
+            let key: Vec<u8> = setting
+                .iter()
+                .map(|&b| match b {
+                    b'-' | b' ' | b'.' => b'_',
+                    _ => b.to_ascii_lowercase(),
+                })
+                .collect();
+            let key_valid = !key.is_empty()
+                && key[0].is_ascii_lowercase()
+                && key.iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            let stored = trim(raw_stored);
+            let over = trim(raw_override);
+            let ttl = uint_field(raw_ttl, 300);
+            let (ttl_value, clamped) = clamp_field(ttl, 0, 86_400);
+            let source: i64 = if !over.is_empty() {
+                2
+            } else if !stored.is_empty() {
+                1
+            } else {
+                0
+            };
+            let effective: &[u8] = match source {
+                2 => over,
+                1 => stored,
+                _ => b"",
+            };
+            let mut flags = 0i64;
+            if key.as_slice() != setting {
+                flags |= 1;
+            }
+            if section_name != section_lower {
+                flags |= 2;
+            }
+            if clamped {
+                flags |= 4;
+            }
+            if ttl == 0 {
+                flags |= 8;
+            }
+            if raw_stored.contains(&b'\n') || raw_override.contains(&b'\n') {
+                flags |= 16;
+            }
+            if is_json(effective) {
+                flags |= 32;
+            }
+            if non_ascii(item) {
+                flags |= 64;
+            }
+            if has_control(item) {
+                flags |= 128;
+            }
+            let decision: i64 = if trim(item).is_empty() {
+                0
+            } else if section == 0 || section == 7 {
+                1
+            } else if !key_valid {
+                2
+            } else if ttl < 0 {
+                3
+            } else if source == 2 && over != stored {
+                4
+            } else if source == 2 {
+                5
+            } else if source == 1 {
+                6
+            } else {
+                7
+            };
+            let mut hash = 0;
+            if decision >= 4 {
+                hash = fnv1a32(&[b"configuration:", DOMAINS[section as usize - 1], b".", &key]) & 0xf_ffff;
+                if !self.keys.insert((section, key)) {
+                    flags |= 256;
+                }
+            }
+            tail[decision as usize] += 1;
+            tail[8 + section as usize] += 1;
+            tail[16 + source as usize] += 1;
+            add_flags(&mut tail[19..28], flags);
+            tail[28] += ttl_value;
+            tail[29] = tail[29].max(ttl_value);
+            decision | section << 3 | source << 6 | flags << 8 | ttl_value << 17 | hash << 34 | (effective.len().min(511) as i64) << 54
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[30] = self.keys.len() as i64;
+        }
+    }
+
+    macro_rules! w671_export {
+        ($(#[$doc:meta])* $name:ident => $plan:ident) => {
+            $(#[$doc])*
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out`
+            /// for `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run($plan::default(), blob, blob_len, lens, count, out, out_cap) }
+            }
+        };
+    }
+
+    w671_export!(
+        /// `XxxPipe::w67XxxPipePlanBatch()`.
+        nntmux_w671_xxx_pipe_plan_batch => XxxPipe
+    );
+    w671_export!(
+        /// `CollectionCleanupService::w67CollectionCleanupPlanBatch()`.
+        nntmux_w671_collection_cleanup_plan_batch => CollectionCleanup
+    );
+    w671_export!(
+        /// `CollectionsCleaningService::w67CollectionsCleaningPlanBatch()`.
+        nntmux_w671_collections_cleaning_plan_batch => CollectionsCleaning
+    );
+    w671_export!(
+        /// `ConfigurationProvider::w67ConfigurationProviderPlanBatch()`.
+        nntmux_w671_configuration_provider_plan_batch => ConfigurationProvider
+    );
+    w671_export!(
+        /// `DomainConfigurationRepository::w67DomainConfigRepoPlanBatch()`.
+        nntmux_w671_domain_config_repo_plan_batch => DomainConfigRepo
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        const EXPORTS: [(Export, usize); 5] = [
+            (nntmux_w671_xxx_pipe_plan_batch, XXX_PIPE_TRAILER),
+            (nntmux_w671_collection_cleanup_plan_batch, COLLECTION_CLEANUP_TRAILER),
+            (nntmux_w671_collections_cleaning_plan_batch, COLLECTIONS_CLEANING_TRAILER),
+            (nntmux_w671_configuration_provider_plan_batch, CONFIGURATION_PROVIDER_TRAILER),
+            (nntmux_w671_domain_config_repo_plan_batch, DOMAIN_CONFIG_REPO_TRAILER),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe { f(blob.as_ptr(), blob.len(), lens.as_ptr(), items.len(), out.as_mut_ptr(), out.len()) };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            if items.iter().all(|i| !i.contains(&0)) {
+                let joined = items.join(&0u8);
+                let mut nul = vec![0i64; 4096];
+                let w = unsafe { f(joined.as_ptr(), joined.len(), ptr::null(), items.len(), nul.as_mut_ptr(), nul.len()) };
+                nul.truncate(w.max(0) as usize);
+                assert_eq!(nul, out, "NUL-joined and length-column calls differ");
+            }
+            out
+        }
+
+        fn bits(word: i64, shift: u32, width: u32) -> i64 {
+            word >> shift & ((1 << width) - 1)
+        }
+
+        #[test]
+        fn w671_helpers() {
+            assert_eq!(trim(b" \t a b\0\x0b"), b"a b");
+            assert_eq!(rtrim_chars(b"ab -_", b" -_"), b"ab");
+            assert_eq!(rtrim_chars(b"---", b"-"), b"");
+            assert_eq!(fields::<3>(b"a|b|c|d"), [&b"a"[..], b"b", b"c|d"]);
+            assert_eq!(fields::<3>(b"a"), [&b"a"[..], b"", b""]);
+            assert_eq!(uint_field(b" 42 ", -1), 42);
+            assert_eq!(uint_field(b"", 10), 10);
+            assert_eq!(uint_field(b"1234567890123456", 0), -1);
+            assert_eq!(clamp_field(5, 10, 20), (10, true));
+            assert_eq!(fnv1a32(&[b"a", b"bc"]), 0x1a47_e90b);
+            assert!(episode_tag(b"show.s01e02.720p"));
+            assert!(!episode_tag(b"s1e02"));
+            assert!(dvd_tag(b"movie.dvdr.x"));
+            assert!(!dvd_tag(b"movie.dvdrip"));
+            assert!(!dvd_tag(b"dvdr"));
+            assert!(dvd_tag(b"x.dvd9"));
+            assert_eq!(normalize(b"  Some\t\tSubject \x0c X "), b"some subject x");
+            assert_eq!(normalize(b"\x0c\x0c"), b"");
+            assert_eq!(strip_subject(b"Some File (01/20) yEnc"), (&b"Some File"[..], 1, 20, 3));
+            assert_eq!(strip_subject(b"x - yenc  "), (&b"x"[..], 0, 0, 1));
+            assert_eq!(strip_subject(b"x (1/)"), (&b"x (1/)"[..], 0, 0, 0));
+            assert_eq!(strip_subject(b"(1/2)"), (&b""[..], 1, 2, 2));
+            assert!(valid_key(b"app.name_2"));
+            assert!(!valid_key(b"app."));
+            assert!(!valid_key(b"App"));
+            assert!(!valid_key(b"1a"));
+            assert!(is_int(b"-123") && !is_int(b"+") && !is_int(b"1234567890123456789"));
+            assert!(is_float(b"1.") && is_float(b".5") && is_float(b"-1.25") && !is_float(b".") && !is_float(b"1"));
+            assert_eq!(coerce(b"-42", 1), Some((1, true, 42)));
+            assert_eq!(coerce(b"-0", 1), Some((1, false, 0)));
+            assert_eq!(coerce(b"1", 2), Some((2, false, 1)));
+            assert_eq!(coerce(b"1", 0), Some((1, false, 1)));
+            assert_eq!(coerce(b"Yes", 0), Some((2, false, 1)));
+            assert_eq!(coerce(b"-7.9", 3), Some((3, true, 7)));
+            assert_eq!(coerce(b"7", 3), Some((3, false, 7)));
+            assert_eq!(coerce(b"x", 1), None);
+            assert_eq!(coerce(b"", 4), Some((4, false, 0)));
+            assert_eq!(coerce(b"", 0), None);
+        }
+
+        #[test]
+        fn w671_known_words() {
+            let xxx = call(nntmux_w671_xxx_pipe_plan_batch, &[
+                b"Brazzers.21.01.01.Some.Name.XXX.1080p.MP4|alt.binaries.erotica|poster",
+                b"Show.S01E02.HDTV.x264|alt.binaries.teevee|p",
+                b"Linux.Distro.ISO|a.b|p",
+                b"Some.Clip.MILF|a.b|anon@y.com",
+                b"",
+                b"Some.XXX.DVDR-GRP|alt.binaries.erotica|p",
+                b"some.xxx.dvdr-grp|a.b|p",
+            ]);
+            assert_eq!(bits(xxx[0], 0, 3), 4);
+            assert_eq!(bits(xxx[0], 3, 4), 7);
+            assert_eq!(bits(xxx[0], 7, 10), 1 | 2 | 16);
+            assert_eq!(bits(xxx[0], 17, 8), 85);
+            assert_eq!(bits(xxx[0], 25, 13), 6040);
+            assert_eq!(bits(xxx[1], 0, 3), 1);
+            assert_eq!(bits(xxx[2], 0, 3), 1);
+            assert_eq!(bits(xxx[3], 0, 3), 3);
+            assert_eq!(bits(xxx[3], 17, 8), 30);
+            assert_eq!(bits(xxx[3], 25, 13), 6041);
+            assert_eq!(bits(xxx[4], 0, 3), 0);
+            assert_eq!(bits(xxx[5], 3, 4), 4);
+            assert_eq!(bits(xxx[5], 25, 13), 6010);
+            assert_eq!(bits(xxx[6], 7, 10) & 128, 128);
+            assert_eq!(xxx[7 + 26], 5);
+            assert_eq!(xxx[7 + 27], 3);
+
+            let cleanup = call(nntmux_w671_collection_cleanup_plan_batch, &[
+                b"1000000|1036000|10|5|50|3|1000",
+                b"1000000|1036000|10|0|0|3|1000",
+                b"980000|1036000|10|5|50|3|1000",
+                b"900000|1036000|10|5|50|5|1000",
+                b"900000|1036000|10|5|50|5|10",
+                b"x",
+                b"|1036000",
+                b"",
+                b"2000000|1036000|99999|5|0|5|99999",
+            ]);
+            assert_eq!(bits(cleanup[0], 0, 3), 3);
+            assert_eq!(bits(cleanup[0], 11, 20), 10);
+            assert_eq!(bits(cleanup[0], 31, 14), 10);
+            assert_eq!(bits(cleanup[1], 0, 3), 3);
+            assert_eq!(bits(cleanup[2], 0, 3), 5);
+            assert_eq!(bits(cleanup[3], 0, 3), 6);
+            assert_eq!(bits(cleanup[3], 45, 16), 1);
+            assert_eq!(bits(cleanup[4], 0, 3), 6);
+            assert_eq!(bits(cleanup[4], 3, 8), 32);
+            assert_eq!(bits(cleanup[5], 0, 3), 1);
+            assert_eq!(bits(cleanup[6], 0, 3), 2);
+            assert_eq!(bits(cleanup[7], 0, 3), 0);
+            assert_eq!(bits(cleanup[8], 0, 3), 3);
+            assert_eq!(bits(cleanup[8], 3, 8), 1 | 4 | 16 | 32);
+            assert_eq!(cleanup[9 + 15], 112);
+            assert_eq!(cleanup[9 + 17], 2);
+
+            let cleaning = call(nntmux_w671_collections_cleaning_plan_batch, &[
+                b"[01/20] - \"Some.File.part01.rar\" yEnc (01/50)|alt.binaries.teevee",
+                b"Artist - Album (1/9) yEnc|alt.binaries.sounds.mp3",
+                b"(1/2) yEnc|a.b",
+                b"plain subject 10 MB|a.b",
+                b"",
+                b"\"x.par2\" yEnc|a.b",
+            ]);
+            assert_eq!(bits(cleaning[0], 0, 3), 3);
+            assert_eq!(bits(cleaning[0], 3, 10), 1 | 2 | 16 | 32);
+            assert_eq!(bits(cleaning[0], 13, 4), 1);
+            assert_eq!(bits(cleaning[0], 17, 12), 1);
+            assert_eq!(bits(cleaning[0], 29, 12), 50);
+            assert_eq!(
+                bits(cleaning[0], 41, 20),
+                fnv1a32(&[b"generic:", b"[01/20] - \"some.file.part01.rar\"", b"\0", b"alt.binaries.teevee"]) & 0xf_ffff
+            );
+            assert_eq!(bits(cleaning[1], 0, 3), 2);
+            assert_eq!(bits(cleaning[1], 3, 10), 1 | 2 | 64);
+            assert_eq!(bits(cleaning[2], 0, 3), 1);
+            assert_eq!(bits(cleaning[3], 0, 3), 4);
+            assert_eq!(bits(cleaning[3], 3, 10), 128);
+            assert_eq!(bits(cleaning[4], 0, 3), 0);
+            assert_eq!(bits(cleaning[5], 3, 10), 1 | 4 | 16);
+            assert_eq!(bits(cleaning[5], 13, 4), 2);
+            assert_eq!(cleaning[6 + 32], 4);
+
+            let provider = call(nntmux_w671_configuration_provider_plan_batch, &[
+                b"site|app.name|string|NNTmux|",
+                b"ingestion|max_messages|int| -20000 |",
+                b"ingestion|max_messages|int|abc|500",
+                b"tmux|enabled|bool|nope|maybe",
+                b"bogus|a|int|1|",
+                b"site|Bad Key|int|1|",
+                b"site|a|weird|1|",
+                b"|ratio||1.5|",
+                b"",
+            ]);
+            assert_eq!(bits(provider[0], 0, 3), 4);
+            assert_eq!(bits(provider[0], 3, 3), 1);
+            assert_eq!(bits(provider[0], 9, 3), 4);
+            assert_eq!(bits(provider[0], 51, 11), 6);
+            assert_eq!(bits(provider[1], 0, 3), 4);
+            assert_eq!(bits(provider[1], 12, 8), 1 | 2 | 4);
+            assert_eq!(bits(provider[1], 20, 31), 20_000);
+            assert_eq!(bits(provider[2], 0, 3), 5);
+            assert_eq!(bits(provider[2], 12, 8), 4 | 8 | 16 | 128);
+            assert_eq!(bits(provider[2], 20, 31), 500);
+            assert_eq!(bits(provider[3], 0, 3), 6);
+            assert_eq!(bits(provider[4], 0, 3), 1);
+            assert_eq!(bits(provider[5], 0, 3), 2);
+            assert_eq!(bits(provider[6], 0, 3), 3);
+            assert_eq!(bits(provider[7], 0, 3), 4);
+            assert_eq!(bits(provider[7], 9, 3), 3);
+            assert_eq!(bits(provider[7], 20, 31), 1);
+            assert_eq!(bits(provider[8], 0, 3), 0);
+            assert_eq!(provider[9 + 34], 20_000 + 500 + 1);
+
+            let repo = call(nntmux_w671_domain_config_repo_plan_batch, &[
+                b"site|Site-Name|old|new|300",
+                b"Post_Processing|max.items|5|5|",
+                b"tmux|colors|stored||0",
+                b"metadata|key|||99999999",
+                b"nope|key|a|b|1",
+                b"site|9bad|a|b|1",
+                b"site|key|a|b|x",
+                b"",
+                b"site|site_name|a|{\"x\":1}|1",
+            ]);
+            assert_eq!(bits(repo[0], 0, 3), 4);
+            assert_eq!(bits(repo[0], 3, 3), 1);
+            assert_eq!(bits(repo[0], 6, 2), 2);
+            assert_eq!(bits(repo[0], 8, 9), 1);
+            assert_eq!(bits(repo[0], 17, 17), 300);
+            assert_eq!(bits(repo[0], 34, 20), fnv1a32(&[b"configuration:", b"site", b".", b"site_name"]) & 0xf_ffff);
+            assert_eq!(bits(repo[1], 0, 3), 5);
+            assert_eq!(bits(repo[1], 3, 3), 4);
+            assert_eq!(bits(repo[1], 8, 9), 1 | 2);
+            assert_eq!(bits(repo[2], 0, 3), 6);
+            assert_eq!(bits(repo[2], 8, 9), 8);
+            assert_eq!(bits(repo[3], 0, 3), 7);
+            assert_eq!(bits(repo[3], 17, 17), 86_400);
+            assert_eq!(bits(repo[4], 0, 3), 1);
+            assert_eq!(bits(repo[5], 0, 3), 2);
+            assert_eq!(bits(repo[6], 0, 3), 3);
+            assert_eq!(bits(repo[7], 0, 3), 0);
+            assert_eq!(bits(repo[8], 8, 9), 32 | 256);
+            assert_eq!(repo[9 + 30], 4);
+        }
+
+        #[test]
+        fn w671_exports_guard_counts_capacity_and_tail() {
+            let blob = b"a|1\0b";
+            for (export, trailer) in EXPORTS {
+                let mut out = vec![7i64; 128];
+                unsafe {
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, out.as_mut_ptr(), 128), (trailer + 2) as isize);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, out.as_mut_ptr(), trailer + 1), -((trailer + 2) as isize));
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 3, out.as_mut_ptr(), 128), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 1, out.as_mut_ptr(), 128), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 0, out.as_mut_ptr(), 128), -1);
+                    out.fill(7);
+                    assert_eq!(export(ptr::null(), 0, ptr::null(), 0, out.as_mut_ptr(), 128), trailer as isize);
+                    assert!(out[..trailer].iter().all(|&w| w == 0));
+                    assert_eq!(export(ptr::null(), 0, ptr::null(), 1, out.as_mut_ptr(), 128), (trailer + 1) as isize);
+                    assert_eq!(export(ptr::null(), 2, ptr::null(), 1, out.as_mut_ptr(), 128), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, ptr::null_mut(), 8), -1);
+                    let misaligned = (out.as_mut_ptr() as *mut u8).add(1) as *mut i64;
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, misaligned, 100), -1);
+                    let lens = [3i64, 2];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), lens.as_ptr(), 2, out.as_mut_ptr(), 128), (trailer + 2) as isize);
+                    let bad = [3i64, 3];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), bad.as_ptr(), 2, out.as_mut_ptr(), 128), -1);
+                    let negative = [-1i64, 6];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), negative.as_ptr(), 2, out.as_mut_ptr(), 128), -1);
+                    let misaligned_lens = (lens.as_ptr() as *const u8).add(1) as *const i64;
+                    assert_eq!(export(blob.as_ptr(), blob.len(), misaligned_lens, 2, out.as_mut_ptr(), 128), -1);
+                    let alias = out.as_mut_ptr() as *const u8;
+                    assert_eq!(export(alias, 16, ptr::null(), 1, out.as_mut_ptr(), 128), -1);
+                    let lens_alias = out.as_ptr();
+                    assert_eq!(export(blob.as_ptr(), 0, lens_alias, 1, out.as_mut_ptr(), 128), -1);
+                }
+                let nul = call(export, &[b"a\0b", b"", b"\0"]);
+                assert_eq!(nul.len(), trailer + 3);
+                assert!(nul.iter().all(|&w| w >= 0));
+                let soup = call(export, &[b"\xff|\x01|9999999999999999|-|+|..|||||", b"|||||||", "caf\u{e9}|x".as_bytes()]);
+                assert!(soup.iter().all(|&w| w >= 0));
+            }
+        }
+    }
+}

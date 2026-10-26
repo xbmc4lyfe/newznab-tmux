@@ -565,4 +565,261 @@ class ManticoreLogSearcher
 
         return self::w55Words($count, implode("\0", $texts), 4 * $count) ?? self::hitTextPlanBatchPhp($texts);
     }
+
+    /** C signature of the Wave 67.5 {@see self::w67ManticoreLogSearcherPlanBatch()} helper. */
+    private const string W67_MANTICORE_LOG_SEARCHER_PLAN_FFI_CDEF = 'int64_t nntmux_w675_manticore_log_searcher_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 67.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 5.85/4.41/5.36/3.64x); see tests/Unit/RustLogViewerIndexCoordinatorManticoreEntryParserW67ParityTest.php.
+     */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 67.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w67_5', self::W67_MANTICORE_LOG_SEARCHER_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W67_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 67.5 plan batch to Rust until disabled or reset. */
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', true);
+    }
+
+    /** Route the Wave 67.5 plan batch to PHP until enabled or reset. */
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', false);
+    }
+
+    /** Restore W67_RUST_FFI_DEFAULT routing and drop the cached Wave 67.5 handle and buffer. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', null);
+        self::w67RustFfiState('reset', null);
+    }
+
+    public static function usesW67RustFfi(): bool
+    {
+        return self::w67RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w67ManticoreLogSearcherPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 67.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w67Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w67RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w675_manticore_log_searcher_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w67Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /**
+     * Batch index hit plan over `term\tcase_sensitive\tlevels\tchannels\tfrom\tto\tbefore\tbyte_offset\tlogged_at\tlevel\tchannel\ttext`
+     * (levels and channels comma-separated; the text keeps any further tabs). Eight words per record: `[parts,
+     * expression_crc, accepted, matched, occurrences, sort_key, below, flags]`. Parts and the crc32() describe the
+     * {@see LogIndexQuery::matchExpression()} phrase with word tokens of ASCII alphanumerics, `_` and non-ASCII bytes,
+     * ASCII lowercasing and a byte-length infix minimum (0 and 0 without one). Numbers are trimmed 1-15 ASCII digits;
+     * empty or invalid ones take their default (0, from/to/before/logged_at -1). Accepted: the level and channel are in
+     * their non-empty filter items (empty filters accept all) and logged_at lies within the set bounds. Occurrences
+     * counts non-overlapping term matches in the text (ASCII case folding unless case_sensitive, capped at 200);
+     * matched is 1 for an empty term. Below: no cursor or byte_offset before it. The newest-first sort key is the
+     * byte offset of accepted, matched hits below the cursor, else -1. Flags: 1 invalid number, 2 fewer than twelve
+     * fields, 4 term without a match expression.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67ManticoreLogSearcherPlanBatch(array $records): array
+    {
+        return self::usesW67RustFfi() ? self::w67ManticoreLogSearcherPlanBatchNative($records) : self::w67ManticoreLogSearcherPlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67ManticoreLogSearcherPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w67Words($count, implode("\0", $records), 8 * $count) ?? self::w67ManticoreLogSearcherPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67ManticoreLogSearcherPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record, 12);
+            $flags = \count($fields) === 12 ? 0 : 2;
+            $term = $fields[0];
+            $caseSensitive = self::w67Number($fields[1] ?? '', 0, $flags) !== 0;
+            $from = self::w67Number($fields[4] ?? '', -1, $flags);
+            $to = self::w67Number($fields[5] ?? '', -1, $flags);
+            $before = self::w67Number($fields[6] ?? '', -1, $flags);
+            $offset = self::w67Number($fields[7] ?? '', 0, $flags);
+            $loggedAt = self::w67Number($fields[8] ?? '', -1, $flags);
+            $levels = array_diff(explode(',', $fields[2] ?? ''), ['']);
+            $channels = array_diff(explode(',', $fields[3] ?? ''), ['']);
+            $accepted = ($levels === [] || \in_array($fields[9] ?? '', $levels, true))
+                && ($channels === [] || \in_array($fields[10] ?? '', $channels, true))
+                && (($from < 0 && $to < 0) || ($loggedAt >= 0 && ($from < 0 || $loggedAt >= $from) && ($to < 0 || $loggedAt <= $to)));
+            $parts = [];
+            if ($term !== '') {
+                $tokens = preg_split('/[^A-Za-z0-9_\x80-\xff]+/', $term, -1, PREG_SPLIT_NO_EMPTY | PREG_SPLIT_OFFSET_CAPTURE) ?: [];
+                $last = \count($tokens) - 1;
+                foreach ($tokens as $index => [$token, $at]) {
+                    $prefix = $index === 0 && $at === 0;
+                    $suffix = $index === $last && $at + \strlen($token) === \strlen($term);
+                    if (($prefix || $suffix) && \strlen($token) < LogIndexQuery::MIN_INFIX_LENGTH) {
+                        continue;
+                    }
+                    $parts[] = ($prefix ? '*' : '').strtolower($token).($suffix ? '*' : '');
+                }
+                if ($parts === []) {
+                    $flags |= 4;
+                }
+            }
+            $found = $term === '' ? 0 : self::w67Occurrences($fields[11] ?? '', $term, $caseSensitive);
+            $matched = $term === '' || $found > 0;
+            $below = $before < 0 || $offset < $before;
+            array_push(
+                $out,
+                \count($parts),
+                match (\count($parts)) {
+                    0 => 0,
+                    1 => crc32($parts[0]),
+                    default => crc32('"'.implode(' ', $parts).'"'),
+                },
+                $accepted ? 1 : 0,
+                $matched ? 1 : 0,
+                $found,
+                $accepted && $matched && $below ? $offset : -1,
+                $below ? 1 : 0,
+                $flags,
+            );
+        }
+
+        return $out;
+    }
+
+    /**
+     * Non-overlapping occurrences of a non-empty term, capped at {@see W47_MAX_OCCURRENCES}.
+     */
+    private static function w67Occurrences(string $text, string $term, bool $caseSensitive): int
+    {
+        $found = 0;
+        $offset = 0;
+        $length = \strlen($term);
+        while ($found < self::W47_MAX_OCCURRENCES) {
+            $position = $caseSensitive ? strpos($text, $term, $offset) : stripos($text, $term, $offset);
+            if ($position === false) {
+                break;
+            }
+            $found++;
+            $offset = $position + $length;
+        }
+
+        return $found;
+    }
 }

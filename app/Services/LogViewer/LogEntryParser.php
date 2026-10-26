@@ -469,4 +469,220 @@ class LogEntryParser
             truncated: $truncated,
         );
     }
+
+    /** C signature of the Wave 67.5 {@see self::w67LogEntryParserPlanBatch()} helper. */
+    private const string W67_LOG_ENTRY_PARSER_PLAN_FFI_CDEF = 'int64_t nntmux_w675_log_entry_parser_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 67.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 5.99/4.53/5.97/4.10x); see tests/Unit/RustLogViewerIndexCoordinatorManticoreEntryParserW67ParityTest.php.
+     */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 67.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w67_5', self::W67_LOG_ENTRY_PARSER_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W67_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 67.5 plan batch to Rust until disabled or reset. */
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', true);
+    }
+
+    /** Route the Wave 67.5 plan batch to PHP until enabled or reset. */
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', false);
+    }
+
+    /** Restore W67_RUST_FFI_DEFAULT routing and drop the cached Wave 67.5 handle and buffer. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', null);
+        self::w67RustFfiState('reset', null);
+    }
+
+    public static function usesW67RustFfi(): bool
+    {
+        return self::w67RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w67LogEntryParserPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 67.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w67Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w67RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w675_log_entry_parser_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Wave 67.5 header level bits, in LEVELS order. */
+    private const array W67_LEVEL_BITS = ['DEBUG' => 1, 'INFO' => 2, 'NOTICE' => 4, 'WARNING' => 8, 'ERROR' => 16, 'CRITICAL' => 32, 'ALERT' => 64, 'EMERGENCY' => 128];
+
+    /**
+     * Batch block parsing plan over raw log blocks, split into lines like {@see parseEntriesBlockPhp()} (a final
+     * newline ends the last line; each line loses trailing "\r"). Nine words per block: `[lines, entries, headers,
+     * continuations, max_entry_lines, json_contexts, context_bytes, level_mask, flags]`. Headers match HEADER_PATTERN;
+     * continuations are the non-header lines after the first header, and the lines before it form one leading
+     * entry. Max entry lines counts a header with its continuations (or the leading lines). JSON contexts are headers
+     * whose right-trimmed line ends with `}` after a ` {`, context bytes their total length from the brace. The level
+     * mask ORs W67_LEVEL_BITS of the header levels (256 for others). Flags: 1 "\r" line ending, 2 non-ASCII byte,
+     * 4 leading lines without a header, 8 `[stacktrace]` line, 16 header timestamp with a fraction or zone.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67LogEntryParserPlanBatch(array $records): array
+    {
+        return self::usesW67RustFfi() ? self::w67LogEntryParserPlanBatchNative($records) : self::w67LogEntryParserPlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67LogEntryParserPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w67Words($count, implode("\0", $records), 9 * $count) ?? self::w67LogEntryParserPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67LogEntryParserPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $block) {
+            $lines = $headers = $continuations = $leading = $current = $maxLines = $json = $context = $mask = $flags = 0;
+            if ($block !== '') {
+                foreach (explode("\n", str_ends_with($block, "\n") ? substr($block, 0, -1) : $block) as $line) {
+                    $lines++;
+                    $text = rtrim($line, "\r");
+                    if ($text !== $line) {
+                        $flags |= 1;
+                    }
+                    if (str_starts_with($text, '[') && preg_match(self::HEADER_PATTERN, $text, $m) === 1) {
+                        $headers++;
+                        $maxLines = max($maxLines, $current);
+                        $current = 1;
+                        $mask |= self::W67_LEVEL_BITS[$m[3]] ?? 256;
+                        if (\strlen($m[1]) > 19) {
+                            $flags |= 16;
+                        }
+                        $trimmed = rtrim($text, " \t\r");
+                        if (str_ends_with($trimmed, '}') && ($at = strrpos($trimmed, ' {')) !== false) {
+                            $json++;
+                            $context += \strlen($trimmed) - $at - 1;
+                        }
+                    } else {
+                        $current++;
+                        if ($headers === 0) {
+                            $leading++;
+                        } else {
+                            $continuations++;
+                        }
+                        if (rtrim($text, " \t") === '[stacktrace]') {
+                            $flags |= 8;
+                        }
+                    }
+                }
+                $maxLines = max($maxLines, $current);
+                if (preg_match('/[\x80-\xff]/', $block) === 1) {
+                    $flags |= 2;
+                }
+            }
+            if ($leading > 0) {
+                $flags |= 4;
+            }
+            array_push($out, $lines, $headers + ($leading > 0 ? 1 : 0), $headers, $continuations, $maxLines, $json, $context, $mask, $flags);
+        }
+
+        return $out;
+    }
 }
