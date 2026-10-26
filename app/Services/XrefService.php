@@ -6,6 +6,7 @@ namespace App\Services;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 class XrefService
@@ -395,5 +396,272 @@ class XrefService
         }
 
         return $summary;
+    }
+
+    // ========================================================================
+    // WAVE 62.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 3.44x, p99 2.82x; uncommon mean 3.35x, p99 2.79x); see RustObfuscationRouterReleaseCreationExtraProcessingXrefW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    public const string W62_XREF_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w621_xref_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w62XrefPlanBatch(). */
+    public const int W62_XREF_TRAILER = 17;
+
+    public static function usesW62RustFfi(): bool
+    {
+        $override = self::w62RustFfiState();
+
+        return \is_bool($override) ? $override : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the XrefService Wave 62 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 62.1 `Xref:` header plans. Each item is a header value (trimmed; a case-insensitive `Xref:` prefix is
+     * dropped with the spaces and tabs after it). Tokens are separated by runs of spaces and tabs; a first token
+     * without `:` is the server. Every other token is `group:article` split at its last `:`, valid when the
+     * article is 1-18 digits and the group starts with an ASCII alphanumeric and holds only alphanumerics and
+     * `+_.-`; otherwise it is rejected. Groups are deduplicated case-insensitively (dupes = valid - distinct);
+     * binary groups start with `alt.binaries.` or `a.b.`. The status is 0 empty, 3 any rejected token, 2 no valid
+     * token, else 1. Flags: 1 non-ASCII, 2 tab separator, 4 article 0, 8 an uppercase group. Per item `status |
+     * server << 2 | prefix << 3 | min(valid, 63) << 4 | min(distinct, 63) << 10 | min(dupes, 63) << 16 |
+     * min(rejected, 63) << 22 | min(binary, 63) << 28 | bitLength(maxArticle) << 34 | min(longestGroup, 255) << 40
+     * | min(length, 1023) << 48 | flags << 58`; then 4 status counts, the server and prefix counts, the valid,
+     * distinct, dupe, rejected and binary sums, 4 flag counts, the distinct groups across the batch and the
+     * largest per-header distinct count.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62XrefPlanBatch(array $items): array
+    {
+        return self::usesW62RustFfi() ? self::w62XrefPlanBatchNative($items) : self::w62XrefPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62XrefPlanBatchNative(array $items): array
+    {
+        return self::w62Invoke($items, \count($items) + self::W62_XREF_TRAILER) ?? self::w62XrefPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62XrefPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W62_XREF_TRAILER, 0);
+        $groups = [];
+        foreach ($items as $item) {
+            $s = trim((string) $item);
+            $prefix = 0;
+            if (strncasecmp($s, 'xref:', 5) === 0) {
+                $prefix = 1;
+                $s = ltrim(substr($s, 5), " \t");
+            }
+            $flags = (preg_match('/[\x80-\xff]/', $s) === 1 ? 1 : 0) | (str_contains($s, "\t") ? 2 : 0);
+            $local = [];
+            $server = $valid = $rejected = $binary = $maxArticle = $longest = 0;
+            $first = true;
+            foreach (preg_split('/[ \t]+/', $s, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                $colon = strrpos($token, ':');
+                if ($first) {
+                    $first = false;
+                    if ($colon === false) {
+                        $server = 1;
+
+                        continue;
+                    }
+                }
+                if ($colon === false) {
+                    $rejected++;
+
+                    continue;
+                }
+                $group = substr($token, 0, $colon);
+                $article = substr($token, $colon + 1);
+                $articleLength = \strlen($article);
+                $groupLength = \strlen($group);
+                if ($articleLength === 0 || $articleLength > 18 || strspn($article, '0123456789') !== $articleLength || $groupLength === 0
+                    || strspn($group, self::W62_ALNUM, 0, 1) !== 1 || strspn($group, self::W62_GROUP_CHARS) !== $groupLength) {
+                    $rejected++;
+
+                    continue;
+                }
+                $valid++;
+                $value = (int) $article;
+                $flags |= ($value === 0 ? 4 : 0) | (strpbrk($group, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') !== false ? 8 : 0);
+                $maxArticle = max($maxArticle, $value);
+                $longest = max($longest, $groupLength);
+                $lower = strtolower($group);
+                if (str_starts_with($lower, 'alt.binaries.') || str_starts_with($lower, 'a.b.')) {
+                    $binary++;
+                }
+                $local[$lower] = true;
+                $groups[$lower] = true;
+            }
+            $distinct = \count($local);
+            $dupes = $valid - $distinct;
+            $status = match (true) {
+                $s === '' => 0,
+                $rejected > 0 => 3,
+                $valid === 0 => 2,
+                default => 1,
+            };
+            $bits = 0;
+            for ($v = $maxArticle; $v > 0; $v >>= 1) {
+                $bits++;
+            }
+            $tail[$status]++;
+            $tail[4] += $server;
+            $tail[5] += $prefix;
+            $tail[6] += $valid;
+            $tail[7] += $distinct;
+            $tail[8] += $dupes;
+            $tail[9] += $rejected;
+            $tail[10] += $binary;
+            for ($b = 0; $b < 4; $b++) {
+                $tail[11 + $b] += $flags >> $b & 1;
+            }
+            $tail[16] = max($tail[16], $distinct);
+            $out[] = $status | $server << 2 | $prefix << 3 | min($valid, 63) << 4 | min($distinct, 63) << 10 | min($dupes, 63) << 16
+                | min($rejected, 63) << 22 | min($binary, 63) << 28 | $bits << 34 | min($longest, 255) << 40 | min(\strlen($s), 1023) << 48 | $flags << 58;
+        }
+        $tail[15] = \count($groups);
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    private const string W62_ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+    private const string W62_GROUP_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+_.-';
+
+    /**
+     * Wave 62 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('xref_w621', self::W62_XREF_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w62RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w62RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 62.1 XrefService export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w62Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w62RustFfiState('ffi');
+            $out = self::w62RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w62RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W62_XREF_FFI_CDEF.)
+            $written = $ffi->nntmux_w621_xref_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
