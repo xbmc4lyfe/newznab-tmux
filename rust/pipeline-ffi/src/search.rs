@@ -44991,3 +44991,739 @@ mod wave57_5_verification_audit_prep_manifest_prereq_forwarder {
         }
     }
 }
+
+/// Wave 58.5 batch helpers for `RemotePublicationService`, `RemoteReleasePublisher`,
+/// `ScratchBudget`, `ScratchInventory` and `SpotCheckPlanner`. Each entry reads `count`
+/// NUL-joined records in place and writes a fixed number of words per record.
+mod wave58_5_verification_remote_scratch_spotcheck {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Plan callback: record bytes and its output words.
+    type Plan = fn(&[u8], &mut [i64]);
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// 1-`max` ASCII digits as an integer (PHP `ctype_digit()` plus `(int)`); `max` is at most 18.
+    fn number(field: &[u8], max: usize) -> Option<i64> {
+        if field.is_empty() || field.len() > max {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// Exactly 64 lowercase hex bytes.
+    fn is_hash(field: &[u8]) -> bool {
+        field.len() == 64
+            && field
+                .iter()
+                .all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    /// Three ASCII digits as an HTTP status code.
+    fn status_code(field: &[u8]) -> Option<i64> {
+        (field.len() == 3 && field.iter().all(u8::is_ascii_digit)).then(|| {
+            field
+                .iter()
+                .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// 32-bit FNV-1a over several byte runs (PHP `hash('fnv1a32')` of their concatenation).
+    fn fnv1a32(parts: &[&[u8]]) -> u32 {
+        parts.iter().fold(0x811c_9dc5u32, |hash, part| {
+            part.iter().fold(hash, |hash, &b| {
+                (hash ^ u32::from(b)).wrapping_mul(0x0100_0193)
+            })
+        })
+    }
+
+    /// Up to `N` fields split on `separator` (missing fields empty) and the total field count.
+    fn fields<const N: usize>(record: &[u8], separator: u8) -> ([&[u8]; N], usize) {
+        let mut fields: [&[u8]; N] = [b""; N];
+        let mut total = 0usize;
+        for field in record.split(|&b| b == separator) {
+            if total < N {
+                fields[total] = field;
+            }
+            total += 1;
+        }
+        (fields, total)
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records, writing
+    /// `width` words per record straight into `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        width: usize,
+        plan: Plan,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(records) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = count * width;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            for (record, slot) in records.iter().zip(words.chunks_exact_mut(width)) {
+                plan(record, slot);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `RemotePublicationService::publicationPlanBatch()` over `id\tversion\tmanifest_hash\t
+    /// lease_token\tstatus`: `[id, version, flags, outcome, class]`. Id and version are 1-18 digits
+    /// (0 when invalid). Flags: 1 id invalid or zero, 2 version invalid, 4 hash not 64 lowercase hex,
+    /// 8 lease token empty or over 64 bytes, 16 not exactly five fields. Outcome: a three-digit
+    /// status is its code; labels `published` 1, `filtered` 2, `metadata_review` 3, `deferred` 4,
+    /// `paused` 5, `retry` 6, `stale` 7, `error` 8, `transport` 9, `invalid` 10, `no_release` 11;
+    /// anything else 0. Class: 3 settled (the first three labels, `no_release` and 2xx), 1 retry
+    /// (`deferred`, `paused`, `retry`, `transport`, 408, 429, 503, 504), 2 batch fallback (404, 405,
+    /// 413), 0 final.
+    fn publication_plan(record: &[u8], words: &mut [i64]) {
+        let ([id, version, hash, lease, status], total) = fields::<5>(record, b'\t');
+        let mut flags = if total == 5 { 0 } else { 16 };
+        let id = match number(id, 18) {
+            Some(value) if value > 0 => value,
+            _ => {
+                flags |= 1;
+                0
+            }
+        };
+        let version = number(version, 18).unwrap_or_else(|| {
+            flags |= 2;
+            0
+        });
+        if !is_hash(hash) {
+            flags |= 4;
+        }
+        if lease.is_empty() || lease.len() > 64 {
+            flags |= 8;
+        }
+        let (outcome, class) = match status_code(status) {
+            Some(code) => (
+                code,
+                match code {
+                    200..=299 => 3,
+                    408 | 429 | 503 | 504 => 1,
+                    404 | 405 | 413 => 2,
+                    _ => 0,
+                },
+            ),
+            None => match status {
+                b"published" => (1, 3),
+                b"filtered" => (2, 3),
+                b"metadata_review" => (3, 3),
+                b"deferred" => (4, 1),
+                b"paused" => (5, 1),
+                b"retry" => (6, 1),
+                b"stale" => (7, 0),
+                b"error" => (8, 0),
+                b"transport" => (9, 1),
+                b"invalid" => (10, 0),
+                b"no_release" => (11, 3),
+                _ => (0, 0),
+            },
+        };
+        words.copy_from_slice(&[id, version, flags, outcome, class]);
+    }
+
+    /// `RemoteReleasePublisher::publisherPlanBatch()` over `passed\tverdict\tid\tversion\t
+    /// manifest_hash\thttp_status`: `[guard, key, fallback, flags]`. Guard follows
+    /// `publicationGuard()` (0 not passed, 1 `sampled`, 2 other verdicts). Key is the FNV-1a 32
+    /// idempotency hash of `id:version:manifest_hash` (raw fields). Fallback: 1 for 404, 405 and
+    /// 413, 2 for a conditional 422, else 0. Flags: 1 passed not `0`/`1` (read as not passed), 2 id
+    /// not 1-18 digits or zero, 4 version not 1-18 digits, 8 hash not 64 lowercase hex, 16 non-empty
+    /// status that is not three digits, 32 not exactly six fields.
+    fn publisher_plan(record: &[u8], words: &mut [i64]) {
+        let ([passed, verdict, id, version, hash, status], total) = fields::<6>(record, b'\t');
+        let mut flags = if total == 6 { 0 } else { 32 };
+        let passed = match passed {
+            b"1" => true,
+            b"0" => false,
+            _ => {
+                flags |= 1;
+                false
+            }
+        };
+        let guard = if !passed {
+            0
+        } else if verdict == b"sampled" {
+            1
+        } else {
+            2
+        };
+        if !matches!(number(id, 18), Some(value) if value > 0) {
+            flags |= 2;
+        }
+        if number(version, 18).is_none() {
+            flags |= 4;
+        }
+        if !is_hash(hash) {
+            flags |= 8;
+        }
+        let fallback = match status_code(status) {
+            Some(404 | 405 | 413) => 1,
+            Some(422) => 2,
+            Some(_) => 0,
+            None => {
+                if !status.is_empty() {
+                    flags |= 16;
+                }
+                0
+            }
+        };
+        let key = i64::from(fnv1a32(&[id, b":", version, b":", hash]));
+        words.copy_from_slice(&[guard, key, fallback, flags]);
+    }
+
+    /// `ScratchBudget::budgetPlanBatch()` over six comma-separated, PHP-trimmed fields
+    /// (`scratch_bytes, free_bytes, free_reserve, reserved_total, entry_reserved, request_bytes`;
+    /// empty reads 0): `[cap, delta, admitted, after, flags]`. Cap is `reservationCap()`, delta
+    /// `reservationDelta()`; admitted is 1 when the host total plus delta fits the cap, and after is
+    /// the admitted total floored at zero (`adjustedBudget()`) or the unchanged total. Flags: 1 field
+    /// that is not 1-18 digits (read as 0), 2 not exactly six fields, 4 negative cap (free space
+    /// below its reserve), 8 reclaiming delta.
+    fn budget_plan(record: &[u8], words: &mut [i64]) {
+        let (fields, total) = fields::<6>(record, b',');
+        let mut flags = if total == 6 { 0 } else { 2 };
+        let mut values = [0i64; 6];
+        for (value, field) in values.iter_mut().zip(fields) {
+            let field = trim(field);
+            if field.is_empty() {
+                continue;
+            }
+            match number(field, 18) {
+                Some(parsed) => *value = parsed,
+                None => flags |= 1,
+            }
+        }
+        let [scratch, free, reserve, reserved, entry, request] = values;
+        let cap = scratch.min(free - reserve);
+        if cap < 0 {
+            flags |= 4;
+        }
+        let delta = request - entry;
+        if delta < 0 {
+            flags |= 8;
+        }
+        let admitted = reserved + delta <= cap;
+        let after = if admitted {
+            (reserved + delta).max(0)
+        } else {
+            reserved
+        };
+        words.copy_from_slice(&[cap, delta, i64::from(admitted), after, flags]);
+    }
+
+    /// One or more ASCII digits.
+    fn digits(bytes: &[u8]) -> bool {
+        !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit)
+    }
+
+    /// `^[0-9]+-[0-9]+$`.
+    fn digits_pair(name: &[u8]) -> bool {
+        memchr(b'-', name).is_some_and(|at| digits(&name[..at]) && digits(&name[at + 1..]))
+    }
+
+    /// `ScratchInventory::inventoryPlanBatch()` over newline-separated lines: a `now\tmax_age`
+    /// header, then `filename\tmodified\tbytes` entries (empty lines skipped): `[candidate, audit,
+    /// unknown, expired, bytes, flags]`. Names classify as `filenameClass()`; an entry is expired as
+    /// `expired()` decides and bytes saturate at `i64::MAX`. Flags: 1 header not two 1-18 digit
+    /// fields (unparsed values read 0), 2 malformed entry (not three fields or modified/bytes not
+    /// 1-18 digits; skipped), 4 expired unknown (orphan) entry.
+    fn inventory_plan(record: &[u8], words: &mut [i64]) {
+        let mut lines = record.split(|&b| b == b'\n');
+        let header = lines.next().unwrap_or_default();
+        let ([now, max_age], total) = fields::<2>(header, b'\t');
+        let mut flags = 0i64;
+        let (now, max_age) = match (number(now, 18), number(max_age, 18)) {
+            (Some(now), Some(max_age)) if total == 2 => (now, max_age),
+            (now, max_age) => {
+                flags |= 1;
+                (now.unwrap_or(0), max_age.unwrap_or(0))
+            }
+        };
+        let (mut candidate, mut audit, mut unknown, mut expired, mut bytes) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let ([name, modified, size], total) = fields::<3>(line, b'\t');
+            let (Some(modified), Some(size), 3) = (number(modified, 18), number(size, 18), total)
+            else {
+                flags |= 2;
+                continue;
+            };
+            let orphan = if name.starts_with(b"audit-") && digits_pair(&name[6..]) {
+                audit += 1;
+                false
+            } else if digits_pair(name) {
+                candidate += 1;
+                false
+            } else {
+                unknown += 1;
+                true
+            };
+            if now - modified > max_age {
+                expired += 1;
+                if orphan {
+                    flags |= 4;
+                }
+            }
+            bytes = bytes.saturating_add(size);
+        }
+        words.copy_from_slice(&[candidate, audit, unknown, expired, bytes, flags]);
+    }
+
+    /// Most samples one spot-check plan selects.
+    const MAX_SAMPLES: i64 = 64;
+
+    /// `SpotCheckPlanner::spotCheckPlanBatch()` over `parts,samples` (PHP-trimmed, each 1-12
+    /// digits): `[selected, stride, first, middle, last, index_sum, coverage, flags]`. Selected is
+    /// `min(samples, parts)` with samples capped at 64; the strided 1-based indices are `1 + i *
+    /// stride` with stride `(parts - 1) / (selected - 1)` (0 for one sample). First is 1, middle
+    /// `(parts + 1) / 2` and last the final selected index; coverage is `last * 1000 / parts`
+    /// (permille). Without a selection every word but flags is 0. Flags: 1 parts invalid, 2 samples
+    /// invalid (each read as 0), 4 samples capped, 8 not exactly two fields.
+    fn spot_check_plan(record: &[u8], words: &mut [i64]) {
+        let ([parts, samples], total) = fields::<2>(record, b',');
+        let mut flags = if total == 2 { 0 } else { 8 };
+        let parts = number(trim(parts), 12).unwrap_or_else(|| {
+            flags |= 1;
+            0
+        });
+        let mut samples = number(trim(samples), 12).unwrap_or_else(|| {
+            flags |= 2;
+            0
+        });
+        if samples > MAX_SAMPLES {
+            samples = MAX_SAMPLES;
+            flags |= 4;
+        }
+        let selected = samples.min(parts);
+        if selected == 0 {
+            words.copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, flags]);
+            return;
+        }
+        let stride = if selected > 1 {
+            (parts - 1) / (selected - 1)
+        } else {
+            0
+        };
+        let (mut last, mut sum) = (0i64, 0i64);
+        for i in 0..selected {
+            last = 1 + i * stride;
+            sum += last;
+        }
+        words.copy_from_slice(&[
+            selected,
+            stride,
+            1,
+            (parts + 1) / 2,
+            last,
+            sum,
+            last * 1000 / parts,
+            flags,
+        ]);
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes the
+            /// helper's fixed words per record and returns the words written, `-needed` when
+            /// `out_cap` is too small (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(
+                        count, flags, data, data_len, ints, ints_len, out, out_cap, $width, $plan,
+                    )
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `RemotePublicationService::publicationPlanBatch()` (see [`publication_plan`]).
+        nntmux_w585_publication_plan, 5, publication_plan
+    );
+    entry!(
+        /// `RemoteReleasePublisher::publisherPlanBatch()` (see [`publisher_plan`]).
+        nntmux_w585_publisher_plan, 4, publisher_plan
+    );
+    entry!(
+        /// `ScratchBudget::budgetPlanBatch()` (see [`budget_plan`]).
+        nntmux_w585_budget_plan, 5, budget_plan
+    );
+    entry!(
+        /// `ScratchInventory::inventoryPlanBatch()` (see [`inventory_plan`]).
+        nntmux_w585_inventory_plan, 6, inventory_plan
+    );
+    entry!(
+        /// `SpotCheckPlanner::spotCheckPlanBatch()` (see [`spot_check_plan`]).
+        nntmux_w585_spot_check_plan, 8, spot_check_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [(Entry, usize); 5] = [
+            (nntmux_w585_publication_plan, 5),
+            (nntmux_w585_publisher_plan, 4),
+            (nntmux_w585_budget_plan, 5),
+            (nntmux_w585_inventory_plan, 6),
+            (nntmux_w585_spot_check_plan, 8),
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Vec<i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        #[test]
+        fn w585_publication_plans_classify_items() {
+            let ok = format!("12\t3\t{HASH}\ttoken\tpublished");
+            let words = call(
+                nntmux_w585_publication_plan,
+                &[
+                    ok.as_bytes(),
+                    b"",
+                    b"0\tx\tABC\t\t429",
+                    b"7\t0\tzz\tt\t404\textra",
+                    b"1234567890123456789\t1\tzz\tt\ttransport",
+                    b"5\t5\tzz\tt\tbogus",
+                ],
+            );
+            assert_eq!(
+                words,
+                [
+                    12, 3, 0, 1, 3, //
+                    0, 0, 31, 0, 0, //
+                    0, 0, 15, 429, 1, //
+                    7, 0, 20, 404, 2, //
+                    0, 1, 5, 9, 1, //
+                    5, 5, 4, 0, 0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w585_publisher_plans_guard_and_key_results() {
+            let ok = format!("1\tsampled\t12\t3\t{HASH}\t");
+            let key = i64::from(fnv1a32(&[format!("12:3:{HASH}").as_bytes()]));
+            let words = call(
+                nntmux_w585_publisher_plan,
+                &[
+                    ok.as_bytes(),
+                    b"",
+                    b"1\tfull\t0\tx\tzz\t413",
+                    b"yes\tsampled\t1\t1\tzz\t422\textra",
+                    b"0\tsampled\t1\t1\tzz\tHTTP",
+                ],
+            );
+            assert_eq!(fnv1a32(&[b"", b""]), 0x811c_9dc5);
+            assert_eq!(fnv1a32(&[b"a"]), 0xe40c_292c);
+            assert_eq!(
+                words,
+                [
+                    1,
+                    key,
+                    0,
+                    0, //
+                    0,
+                    i64::from(fnv1a32(&[b"::"])),
+                    0,
+                    47, //
+                    2,
+                    i64::from(fnv1a32(&[b"0:x:zz"])),
+                    1,
+                    14, //
+                    0,
+                    i64::from(fnv1a32(&[b"1:1:zz"])),
+                    2,
+                    41, //
+                    0,
+                    i64::from(fnv1a32(&[b"1:1:zz"])),
+                    0,
+                    24,
+                ]
+            );
+        }
+
+        #[test]
+        fn w585_budget_plans_admit_and_reclaim() {
+            let words = call(
+                nntmux_w585_budget_plan,
+                &[
+                    b"1000,5000,100,200,50,150",
+                    b"",
+                    b" 1000 ,500,600,0,0,10",
+                    b"100,1000,0,90,50,0,extra",
+                    b"100,1000,0,95,0,10",
+                    b"x,1000,-1,0,0,0",
+                ],
+            );
+            assert_eq!(
+                words,
+                [
+                    1000, 100, 1, 300, 0, //
+                    0, 0, 1, 0, 2, //
+                    -100, 10, 0, 0, 4, //
+                    100, -50, 1, 40, 10, //
+                    100, 10, 0, 95, 0, //
+                    0, 0, 1, 0, 1,
+                ]
+            );
+        }
+
+        #[test]
+        fn w585_inventory_plans_roll_up_entries() {
+            let words = call(
+                nntmux_w585_inventory_plan,
+                &[
+                    b"1000\t100\n12-3\t950\t10\naudit-4-5\t800\t20\nlost+found\t10\t5\n\n",
+                    b"",
+                    b"x\t1\n12-\t1\t1\naudit-1-2-3\t1\t1\n1-2\tx\t1\nbad\n-1\t1\t2",
+                    b"0\t0\t0\n1-1\t0\t999999999999999999\n1-1\t0\t999999999999999999\n1-1\t0\t999999999999999999\n1-1\t0\t999999999999999999\n1-1\t0\t999999999999999999\n1-1\t0\t999999999999999999\n1-1\t0\t999999999999999999\n1-1\t0\t999999999999999999\n1-1\t0\t999999999999999999\n1-1\t0\t999999999999999999",
+                ],
+            );
+            let max = i64::MAX;
+            assert_eq!(
+                words,
+                [
+                    1, 1, 1, 2, 35, 4, //
+                    0, 0, 0, 0, 0, 1, //
+                    0, 0, 3, 0, 4, 3, //
+                    10, 0, 0, 0, max, 1,
+                ]
+            );
+        }
+
+        #[test]
+        fn w585_spot_check_plans_stride_samples() {
+            let words = call(
+                nntmux_w585_spot_check_plan,
+                &[
+                    b"100,4",
+                    b"",
+                    b" 7 , 1 ",
+                    b"3,10",
+                    b"1000,500",
+                    b"1234567890123,2,9",
+                    b"10,x",
+                ],
+            );
+            let sum: i64 = (0..64).map(|i| 1 + i * 15).sum();
+            assert_eq!(
+                words,
+                [
+                    4, 33, 1, 50, 100, 202, 1000, 0, //
+                    0, 0, 0, 0, 0, 0, 0, 11, //
+                    1, 0, 1, 4, 1, 1, 142, 0, //
+                    3, 1, 1, 2, 3, 6, 1000, 0, //
+                    64, 15, 1, 500, 946, sum, 946, 4, //
+                    0, 0, 0, 0, 0, 0, 0, 9, //
+                    0, 0, 0, 0, 0, 0, 0, 2,
+                ]
+            );
+        }
+
+        #[test]
+        fn w585_entries_validate_the_abi() {
+            for (entry, width) in ENTRIES {
+                let data = b"a\0b";
+                let mut out = [7i64; 16];
+                let call = |count: usize, flags: i64, len: usize, cap: usize, out: *mut i64| unsafe {
+                    entry(
+                        count,
+                        flags,
+                        data.as_ptr(),
+                        len,
+                        std::ptr::null(),
+                        0,
+                        out,
+                        cap,
+                    )
+                };
+                let needed = (2 * width) as i64;
+                assert_eq!(call(2, 0, 3, 16, out.as_mut_ptr()), needed);
+                assert_eq!(call(2, 0, 3, 2 * width - 1, out.as_mut_ptr()), -needed);
+                assert_eq!(call(2, 1, 3, 16, out.as_mut_ptr()), -1);
+                assert_eq!(call(3, 0, 3, 16, out.as_mut_ptr()), -1);
+                assert_eq!(call(1, 0, 3, 16, out.as_mut_ptr()), -1);
+                assert_eq!(call(0, 0, 0, 0, std::ptr::null_mut()), 0);
+                assert_eq!(call(2, 0, 3, 4, std::ptr::null_mut()), -1);
+                let overlapping = unsafe {
+                    entry(
+                        1,
+                        0,
+                        out.as_ptr().cast(),
+                        8,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        16,
+                    )
+                };
+                assert_eq!(overlapping, -1);
+            }
+        }
+    }
+}

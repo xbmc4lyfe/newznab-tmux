@@ -427,4 +427,193 @@ final class RemotePublicationService
 
         return is_string($status) ? $status : null;
     }
+
+    public const string W58_FFI_CDEF = 'int64_t nntmux_w585_publication_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Wave 58.5 `[outcome, class]` codes per item status label. */
+    private const array W58_OUTCOMES = [
+        PublicationOutcome::PUBLISHED => [1, 3], PublicationOutcome::FILTERED => [2, 3], PublicationOutcome::METADATA_REVIEW => [3, 3],
+        PublicationOutcome::DEFERRED => [4, 1], PublicationOutcome::PAUSED => [5, 1], PublicationOutcome::RETRY => [6, 1],
+        PublicationOutcome::STALE => [7, 0], PublicationOutcome::ERROR => [8, 0], PublicationOutcome::TRANSPORT => [9, 1],
+        PublicationOutcome::INVALID => [10, 0], PublicationOutcome::NO_RELEASE => [11, 3],
+    ];
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W58.5 parity test's QUALIFICATION). */
+    private const bool W58_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 58.5 routing and FFI cache, kept in function-local statics (readonly verification classes cannot declare
+     * static properties, so every W58 class follows the same shape). Without $op it reports the routing; 'set' swaps
+     * the override for $val and returns the previous one; 'reset' replaces the cached handle with $val (null
+     * re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]` with room for at least $val words,
+     * or null without the library.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w58_5', self::W58_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W58_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        return self::w58RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with publicationPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 58.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w58Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w58RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w585_publication_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch plan over tab-separated `id, version, manifest_hash, lease_token, status` publication items. Five words per
+     * record: `[id, version, flags, outcome, class]`. Id and version are 1-18 digits (0 when invalid). Flags: 1 id
+     * invalid or zero, 2 version invalid, 4 hash not 64 lowercase hex, 8 lease token empty or over 64 bytes, 16 not
+     * exactly five fields. Outcome: a three-digit status is its code; labels map through W58_OUTCOMES; anything else
+     * 0. Class: 3 settled (published, filtered, metadata_review, no_release, 2xx), 1 retry (deferred, paused, retry,
+     * transport, 408, 429, 503, 504), 2 batch fallback (404, 405, 413), 0 final.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function publicationPlanBatch(array $records): array
+    {
+        return self::usesW58RustFfi() ? self::publicationPlanBatchNative($records) : self::publicationPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function publicationPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 5 ? 0 : 16;
+            $id = \strlen($fields[0]) <= 18 && ctype_digit($fields[0]) ? (int) $fields[0] : 0;
+            if ($id === 0) {
+                $flags |= 1;
+            }
+            $version = $fields[1] ?? '';
+            if (\strlen($version) <= 18 && ctype_digit($version)) {
+                $version = (int) $version;
+            } else {
+                $flags |= 2;
+                $version = 0;
+            }
+            $hash = $fields[2] ?? '';
+            if (\strlen($hash) !== 64 || strspn($hash, '0123456789abcdef') !== 64) {
+                $flags |= 4;
+            }
+            $lease = $fields[3] ?? '';
+            if ($lease === '' || \strlen($lease) > 64) {
+                $flags |= 8;
+            }
+            $status = $fields[4] ?? '';
+            if (\strlen($status) === 3 && ctype_digit($status)) {
+                $outcome = (int) $status;
+                $class = match (true) {
+                    $outcome >= 200 && $outcome <= 299 => 3,
+                    $outcome === 408 || $outcome === 429 || $outcome === 503 || $outcome === 504 => 1,
+                    $outcome === 404 || $outcome === 405 || $outcome === 413 => 2,
+                    default => 0,
+                };
+            } else {
+                [$outcome, $class] = self::W58_OUTCOMES[$status] ?? [0, 0];
+            }
+            array_push($out, $id, $version, $flags, $outcome, $class);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function publicationPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w58Words($count, implode("\0", $records), 5 * $count) ?? self::publicationPlanBatchPhp($records);
+    }
 }

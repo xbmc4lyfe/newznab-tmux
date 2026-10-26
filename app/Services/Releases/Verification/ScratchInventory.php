@@ -231,4 +231,184 @@ final class ScratchInventory
             DB::table('release_verification_scratch')->where('id', $id)->delete();
         }
     }
+
+    public const string W58_FFI_CDEF = 'int64_t nntmux_w585_inventory_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W58.5 parity test's QUALIFICATION). */
+    private const bool W58_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 58.5 routing and FFI cache, kept in function-local statics (readonly verification classes cannot declare
+     * static properties, so every W58 class follows the same shape). Without $op it reports the routing; 'set' swaps
+     * the override for $val and returns the previous one; 'reset' replaces the cached handle with $val (null
+     * re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]` with room for at least $val words,
+     * or null without the library.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w58_5', self::W58_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W58_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        return self::w58RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with inventoryPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 58.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w58Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w58RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w585_inventory_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch inventory rollup over newline-separated lines: a `now<TAB>max_age` header, then
+     * `filename<TAB>modified<TAB>bytes` entries (empty lines skipped). Six words per record: `[candidate, audit,
+     * unknown, expired, bytes, flags]`. Names classify as filenameClassPhp(), entries expire as expiredPhp() decides
+     * and bytes saturate at PHP_INT_MAX. Flags: 1 header not two 1-18 digit fields (unparsed values read 0), 2
+     * malformed entry (not three fields or modified/bytes not 1-18 digits; skipped), 4 expired unknown (orphan) entry.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function inventoryPlanBatch(array $records): array
+    {
+        return self::usesW58RustFfi() ? self::inventoryPlanBatchNative($records) : self::inventoryPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function inventoryPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $lines = explode("\n", $record);
+            $header = explode("\t", $lines[0]);
+            $now = $header[0];
+            $maxAge = $header[1] ?? '';
+            $nowValid = \strlen($now) <= 18 && ctype_digit($now);
+            $maxAgeValid = \strlen($maxAge) <= 18 && ctype_digit($maxAge);
+            $flags = $nowValid && $maxAgeValid && \count($header) === 2 ? 0 : 1;
+            $now = $nowValid ? (int) $now : 0;
+            $maxAge = $maxAgeValid ? (int) $maxAge : 0;
+            $totals = ['candidate' => 0, 'audit' => 0, 'unknown' => 0];
+            $expired = $bytes = 0;
+            for ($i = 1, $n = \count($lines); $i < $n; $i++) {
+                if ($lines[$i] === '') {
+                    continue;
+                }
+                $parts = explode("\t", $lines[$i]);
+                if (\count($parts) !== 3 || \strlen($parts[1]) > 18 || ! ctype_digit($parts[1])
+                    || \strlen($parts[2]) > 18 || ! ctype_digit($parts[2])) {
+                    $flags |= 2;
+
+                    continue;
+                }
+                $class = self::filenameClassPhp($parts[0]);
+                $totals[$class]++;
+                if (self::expiredPhp((int) $parts[1], $now, $maxAge)) {
+                    $expired++;
+                    if ($class === 'unknown') {
+                        $flags |= 4;
+                    }
+                }
+                $size = (int) $parts[2];
+                $bytes = $bytes > PHP_INT_MAX - $size ? PHP_INT_MAX : $bytes + $size;
+            }
+            array_push($out, $totals['candidate'], $totals['audit'], $totals['unknown'], $expired, $bytes, $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function inventoryPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w58Words($count, implode("\0", $records), 6 * $count) ?? self::inventoryPlanBatchPhp($records);
+    }
 }
