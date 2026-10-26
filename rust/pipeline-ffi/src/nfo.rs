@@ -41555,3 +41555,1128 @@ pub mod wave54_2_mcp_process_probe_verification_planner_runner_db_fp_collector {
         }
     }
 }
+
+pub mod wave55_2_nfo_service_db_nzb_store_nfo_import_nzb_contents_parser {
+    //! Wave 55.2 batch kernels for NfoService, DatabaseNzbStore, NfoImportService,
+    //! NzbContentsService and NzbParserService, in the Wave 49.2 framing: NUL-joined label
+    //! columns (exactly `count` entries) or a length-framed blob, little-endian `i64` tables
+    //! (whole columns back to back), fixed `i64` words per item, a few summary words and one
+    //! XXH64 digest of the preceding words. Each export returns the word count, `-needed` when
+    //! `out_cap` (in words) is short, or -1 for a null output, a malformed batch, an output
+    //! overlapping an input, a value PHP would decide differently (a saturating parts total) or a
+    //! panic.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, ints, span,
+    };
+    use super::{
+        nzb_hidden_nfo_patterns, nzb_is_par2_index, nzb_nfo_priority, nzb_parts_total, nzbc_find,
+        nzbc_hidden_excluded,
+    };
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::collections::hash_map::Entry;
+
+    /// Saturation limit of the 24-bit length fields.
+    const FIELD: usize = 0xFF_FFFF;
+
+    /// `k` whole little-endian `i64` columns of `count` values each.
+    fn columns(bytes: &[u8], count: usize, k: usize) -> Option<Vec<i64>> {
+        ints(bytes, count.checked_mul(k)?)
+    }
+
+    fn map<K, V>(n: usize) -> HashMap<K, V, FoldState> {
+        HashMap::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// Splits a blob into `lengths`-sized items that cover it exactly.
+    fn framed<'a>(blob: &'a [u8], lengths: &[i64]) -> Option<Vec<&'a [u8]>> {
+        let mut items = Vec::with_capacity(lengths.len());
+        let mut offset = 0usize;
+        for &length in lengths {
+            let end = offset.checked_add(usize::try_from(length).ok()?)?;
+            items.push(blob.get(offset..end)?);
+            offset = end;
+        }
+        (offset == blob.len()).then_some(items)
+    }
+
+    #[inline]
+    fn ci_at(s: &[u8], pos: usize, lit: &[u8]) -> bool {
+        s.len() >= pos
+            && s.len() - pos >= lit.len()
+            && s[pos..pos + lit.len()].eq_ignore_ascii_case(lit)
+    }
+
+    #[inline]
+    fn ends_ci(s: &[u8], end: usize, lit: &[u8]) -> bool {
+        end >= lit.len() && s[end - lit.len()..end].eq_ignore_ascii_case(lit)
+    }
+
+    #[inline]
+    fn digits_from(s: &[u8], pos: usize) -> usize {
+        s.get(pos..).map_or(0, |rest| {
+            rest.iter().take_while(|b| b.is_ascii_digit()).count()
+        })
+    }
+
+    #[inline]
+    fn digits_before(s: &[u8], end: usize) -> usize {
+        s[..end]
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    }
+
+    /// `[\w-]` in the C locale.
+    #[inline]
+    fn slug_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    }
+
+    #[inline]
+    fn saturating(total: i64, value: i64) -> i64 {
+        total.saturating_add(value.max(0))
+    }
+
+    // ---- NfoService::parseShowIdNative() -----------------------------------------------------
+
+    /// Up to `max` digits at `pos` (at least one), as `\d{1,max}` captures them.
+    #[inline]
+    fn digits_capped(t: &[u8], pos: usize, max: usize) -> Option<(usize, usize)> {
+        let run = digits_from(t, pos).min(max);
+        (run > 0).then_some((pos, pos + run))
+    }
+
+    /// `[\w-]+` at `pos`.
+    #[inline]
+    fn slug(t: &[u8], pos: usize) -> Option<(usize, usize)> {
+        let run = t
+            .get(pos..)
+            .map_or(0, |r| r.iter().take_while(|&&b| slug_byte(b)).count());
+        (run > 0).then_some((pos, pos + run))
+    }
+
+    /// The capture of show-id pattern `p` (1-8, parseShowIdNative() order) anchored at the dot
+    /// `d` that ends its host name.
+    fn show_pattern_at(t: &[u8], d: usize, p: u8) -> Option<(usize, usize)> {
+        match p {
+            1 if ends_ci(t, d, b"tvmaze") && ci_at(t, d, b".com/shows/") => {
+                digits_capped(t, d + 11, 6)
+            }
+            2 if ends_ci(t, d, b"imdb") && ci_at(t, d, b".com/title/tt") => {
+                let run = digits_from(t, d + 13);
+                (run >= 7).then_some((d + 11, d + 13 + run))
+            }
+            3 if ends_ci(t, d, b"thetvdb") && ci_at(t, d, b".com/?tab=series&id=") => {
+                digits_capped(t, d + 20, 8)
+            }
+            4 if ends_ci(t, d, b"thetvdb") && ci_at(t, d, b".com/series/") => {
+                digits_capped(t, d + 12, 8).or_else(|| slug(t, d + 12))
+            }
+            5 if ends_ci(t, d, b"themoviedb") && ci_at(t, d, b".org/movie/") => {
+                digits_capped(t, d + 11, 8)
+            }
+            6 if ends_ci(t, d, b"themoviedb") && ci_at(t, d, b".org/tv/") => {
+                digits_capped(t, d + 8, 8)
+            }
+            7 if ends_ci(t, d, b"anidb") && ci_at(t, d, b".net/") => {
+                if ci_at(t, d + 5, b"perl-bin/animedb.pl?show=anime&aid=") {
+                    digits_capped(t, d + 40, 6)
+                } else if ci_at(t, d + 5, b"anime/") {
+                    digits_capped(t, d + 11, 6)
+                } else {
+                    None
+                }
+            }
+            8 if ends_ci(t, d, b"trakt") && ci_at(t, d, b".tv/") => {
+                if ci_at(t, d + 4, b"shows/") {
+                    slug(t, d + 10)
+                } else if ci_at(t, d + 4, b"movies/") {
+                    slug(t, d + 11)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `t[s]` is `/` after a byte that ends `com`, `org`, `net` or `tv` (any case).
+    #[inline]
+    fn tld_slash(t: &[u8], s: usize) -> bool {
+        t[s] == b'/' && matches!(t[s - 1] | 0x20, b'm' | b'g' | b't' | b'v')
+    }
+
+    /// The first `s >= from.max(1)` with [`tld_slash`], skipping 16 bytes at a time with SIMD.
+    fn next_tld_slash(t: &[u8], from: usize) -> Option<usize> {
+        let mut p = from.max(1);
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::{
+                vandq_u8, vceqq_u8, vdupq_n_u8, vld1q_u8, vmaxvq_u8, vorrq_u8,
+            };
+            // SAFETY: each iteration loads 16 bytes at `p - 1` and `p`, ending by
+            // `p + 16 <= t.len()`; NEON is baseline on aarch64.
+            unsafe {
+                let base = t.as_ptr();
+                let (slash, fold) = (vdupq_n_u8(b'/'), vdupq_n_u8(0x20));
+                let (m, g, tt, v) = (
+                    vdupq_n_u8(b'm'),
+                    vdupq_n_u8(b'g'),
+                    vdupq_n_u8(b't'),
+                    vdupq_n_u8(b'v'),
+                );
+                while p + 16 <= t.len() {
+                    let prev = vorrq_u8(vld1q_u8(base.add(p - 1)), fold);
+                    let tld = vorrq_u8(
+                        vorrq_u8(vceqq_u8(prev, m), vceqq_u8(prev, g)),
+                        vorrq_u8(vceqq_u8(prev, tt), vceqq_u8(prev, v)),
+                    );
+                    if vmaxvq_u8(vandq_u8(vceqq_u8(vld1q_u8(base.add(p)), slash), tld)) != 0 {
+                        break;
+                    }
+                    p += 16;
+                }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{
+                _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128,
+                _mm_set1_epi8,
+            };
+            // SAFETY: as above; SSE2 is baseline on x86_64 and the loads are unaligned.
+            unsafe {
+                let base = t.as_ptr();
+                let splat = |v: u8| _mm_set1_epi8(v as i8);
+                let (slash, fold) = (splat(b'/'), splat(0x20));
+                let (m, g, tt, v) = (splat(b'm'), splat(b'g'), splat(b't'), splat(b'v'));
+                while p + 16 <= t.len() {
+                    let prev = _mm_or_si128(_mm_loadu_si128(base.add(p - 1).cast()), fold);
+                    let tld = _mm_or_si128(
+                        _mm_or_si128(_mm_cmpeq_epi8(prev, m), _mm_cmpeq_epi8(prev, g)),
+                        _mm_or_si128(_mm_cmpeq_epi8(prev, tt), _mm_cmpeq_epi8(prev, v)),
+                    );
+                    let here = _mm_cmpeq_epi8(_mm_loadu_si128(base.add(p).cast()), slash);
+                    if _mm_movemask_epi8(_mm_and_si128(here, tld)) != 0 {
+                        break;
+                    }
+                    p += 16;
+                }
+            }
+        }
+        (p..t.len()).find(|&s| tld_slash(t, s))
+    }
+
+    /// parseShowIdNative(): the first pattern (1-8) with any match and its leftmost capture, or
+    /// `(0, "")`. Every pattern starts with a host name and `.com/`, `.org/`, `.net/` or `.tv/`,
+    /// so one left-to-right pass over those slashes finds each pattern's leftmost match.
+    pub fn show_id(t: &[u8]) -> (u8, &[u8]) {
+        let mut best = (9u8, 0usize, 0usize);
+        let mut from = 1;
+        while let Some(s) = next_tld_slash(t, from) {
+            from = s + 1;
+            let d = if s >= 3 && t[s - 3] == b'.' {
+                s - 3
+            } else if s >= 4 && t[s - 4] == b'.' {
+                s - 4
+            } else {
+                continue;
+            };
+            for p in 1..best.0 {
+                if let Some((start, end)) = show_pattern_at(t, d, p) {
+                    best = (p, start, end);
+                    break;
+                }
+            }
+            if best.0 == 1 {
+                break;
+            }
+        }
+        if best.0 == 9 {
+            (0, &[])
+        } else {
+            (best.0, &t[best.1..best.2])
+        }
+    }
+
+    /// One word per text: `pattern | min(id length, 0xFFFFFF) << 8 | crc32(id) << 32` (0 without a
+    /// match). The matched texts and the per-pattern counts (1-8) follow.
+    pub fn show_id_plan(texts: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(texts.len() + 10);
+        let mut counts = [0i64; 9];
+        for &text in texts {
+            let (p, id) = show_id(text);
+            counts[p as usize] += 1;
+            out.push(if p == 0 {
+                0
+            } else {
+                i64::from(p) | (id.len().min(FIELD) as i64) << 8 | i64::from(crc32(id)) << 32
+            });
+        }
+        out.push(texts.len() as i64 - counts[0]);
+        out.extend_from_slice(&counts[1..]);
+        out
+    }
+
+    // ---- DatabaseNzbStore::read()/validPayload() ----------------------------------------------
+
+    /// One word per stored row: `flags | crc32(stored digest) << 32`. Flags: 1 readable (compressed
+    /// bytes in 0..=max_compressed, decoded bytes at most max_decoded), 2 the stored digest equals
+    /// the computed one, 4 the stored digest is 64 lowercase hex, 8 valid (readable, matching,
+    /// decoded bytes not negative), 16 a negative size, 32 an empty stored digest. Readable,
+    /// matching, valid and malformed-digest rows, the readable compressed bytes, the valid decoded
+    /// bytes (both saturating) and the largest valid decoded size follow.
+    pub fn integrity_plan(
+        stored: &[&[u8]],
+        computed: &[&[u8]],
+        compressed: &[i64],
+        decoded: &[i64],
+        max_compressed: i64,
+        max_decoded: i64,
+    ) -> Vec<i64> {
+        let mut out = Vec::with_capacity(stored.len() + 8);
+        let (mut readable_n, mut matched_n, mut valid_n, mut malformed) = (0i64, 0i64, 0i64, 0i64);
+        let (mut compressed_total, mut decoded_total, mut largest) = (0i64, 0i64, 0i64);
+        for (i, &digest) in stored.iter().enumerate() {
+            let (c, d) = (compressed[i], decoded[i]);
+            let readable = c >= 0 && c <= max_compressed && d <= max_decoded;
+            let matched = digest == computed[i];
+            let well_formed = digest.len() == 64
+                && digest
+                    .iter()
+                    .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            let valid = readable && matched && d >= 0;
+            readable_n += i64::from(readable);
+            matched_n += i64::from(matched);
+            valid_n += i64::from(valid);
+            malformed += i64::from(!well_formed);
+            if readable {
+                compressed_total = saturating(compressed_total, c);
+            }
+            if valid {
+                decoded_total = saturating(decoded_total, d);
+                largest = largest.max(d);
+            }
+            let flags = i64::from(readable)
+                | i64::from(matched) << 1
+                | i64::from(well_formed) << 2
+                | i64::from(valid) << 3
+                | i64::from(c < 0 || d < 0) << 4
+                | i64::from(digest.is_empty()) << 5;
+            out.push(flags | i64::from(crc32(digest)) << 32);
+        }
+        out.extend([
+            readable_n,
+            matched_n,
+            valid_n,
+            malformed,
+            compressed_total,
+            decoded_total,
+            largest,
+        ]);
+        out
+    }
+
+    // ---- NfoImportService::importManifest() routing -------------------------------------------
+
+    /// importManifest()'s routing for one manifest: 1 already imported, 2 held for metadata,
+    /// 3 terminal NZB outcome, 4 waiting for the NZB import, 5 no paired NFO, 6 captured failed
+    /// companion already removed, 7 no valid release identity, 8 importable.
+    pub fn manifest_decision(
+        state: &[u8],
+        has_nfo: bool,
+        relinquished: bool,
+        id: i64,
+        guid: &[u8],
+    ) -> i64 {
+        match state {
+            b"nfo_imported" => 1,
+            b"metadata_review" | b"metadata_deferred" => 2,
+            b"nzb_duplicate" | b"nzb_failed" | b"nzb_rejected" => 3,
+            b"nzb_imported" | b"nfo_failed" if !has_nfo => 5,
+            b"nzb_imported" | b"nfo_failed" if relinquished => 6,
+            b"nzb_imported" | b"nfo_failed" if id <= 0 || guid.is_empty() => 7,
+            b"nzb_imported" | b"nfo_failed" => 8,
+            _ => 4,
+        }
+    }
+
+    /// One word per manifest: `decision | flags << 8 | crc32(guid) << 32`. Flags: 1 an earlier
+    /// importable manifest has the guid, 2 an earlier importable manifest has the release id, 4
+    /// empty guid. The per-decision counts (1-8), the distinct importable guids and release ids
+    /// follow.
+    pub fn manifest_plan(
+        states: &[&[u8]],
+        guids: &[&[u8]],
+        ids: &[i64],
+        has_nfo: &[i64],
+        relinquished: &[i64],
+    ) -> Vec<i64> {
+        let mut out = Vec::with_capacity(states.len() + 11);
+        let mut counts = [0i64; 9];
+        let mut seen_guids = map::<&[u8], ()>(states.len());
+        let mut seen_ids = map::<i64, ()>(states.len());
+        for (i, &state) in states.iter().enumerate() {
+            let guid = guids[i];
+            let decision =
+                manifest_decision(state, has_nfo[i] != 0, relinquished[i] != 0, ids[i], guid);
+            counts[decision as usize] += 1;
+            let (repeat_guid, repeat_id) = if decision == 8 {
+                (
+                    seen_guids.insert(guid, ()).is_some(),
+                    seen_ids.insert(ids[i], ()).is_some(),
+                )
+            } else {
+                (false, false)
+            };
+            let flags = i64::from(repeat_guid)
+                | i64::from(repeat_id) << 1
+                | i64::from(guid.is_empty()) << 2;
+            out.push(decision | flags << 8 | i64::from(crc32(guid)) << 32);
+        }
+        out.extend_from_slice(&counts[1..]);
+        out.extend([seen_guids.len() as i64, seen_ids.len() as i64]);
+        out
+    }
+
+    // ---- NzbContentsService::par2FamilyKey() --------------------------------------------------
+
+    /// PCRE2 `\s` without UTF/UCP.
+    #[inline]
+    fn pcre_space(b: u8) -> bool {
+        matches!(b, b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' ')
+    }
+
+    /// End of a trailing `\.par2$` match (case-insensitive), if any.
+    fn par2_suffix_end(s: &[u8]) -> Option<usize> {
+        if ends_ci(s, s.len(), b".par2") {
+            Some(s.len())
+        } else if s.last() == Some(&b'\n') && ends_ci(s, s.len() - 1, b".par2") {
+            Some(s.len() - 1)
+        } else {
+            None
+        }
+    }
+
+    /// Family key source flags.
+    pub const KEY_QUOTED: i64 = 8;
+    pub const KEY_TOKEN: i64 = 16;
+    pub const KEY_PREFIXED: i64 = 32;
+    pub const KEY_VOLUME: i64 = 4;
+
+    /// par2FamilyKey(): the key (None when the name does not end in `.par2`) and the source flags
+    /// (KEY_QUOTED or KEY_TOKEN, else the trimmed subject; KEY_PREFIXED when a leading `[n/m]` was
+    /// removed; KEY_VOLUME when a `.volN+M` member suffix was folded).
+    pub fn par2_family(subject: &[u8]) -> (Option<Cow<'_, [u8]>>, i64) {
+        let mut flags = 0i64;
+        // preg_replace('/^\s*\[\d+\/\d+\]\s*/', '', $subject)
+        let mut s = subject;
+        let mut i = s.iter().take_while(|&&b| pcre_space(b)).count();
+        if s.get(i) == Some(&b'[') {
+            let first = digits_from(s, i + 1);
+            let slash = i + 1 + first;
+            if first > 0 && s.get(slash) == Some(&b'/') {
+                let second = digits_from(s, slash + 1);
+                let close = slash + 1 + second;
+                if second > 0 && s.get(close) == Some(&b']') {
+                    i = close + 1;
+                    i += s[i..].iter().take_while(|&&b| pcre_space(b)).count();
+                    s = &s[i..];
+                    flags |= KEY_PREFIXED;
+                }
+            }
+        }
+        let mut name: Option<&[u8]> = None;
+        // /"([^"]+\.par2)"/i
+        if let Some(mut open) = nzbc_find(s, 0, b'"') {
+            while let Some(close) = nzbc_find(s, open + 1, b'"') {
+                let inner = &s[open + 1..close];
+                if inner.len() > 5 && ends_ci(inner, inner.len(), b".par2") {
+                    name = Some(inner);
+                    flags |= KEY_QUOTED;
+                    break;
+                }
+                open = close;
+            }
+        }
+        // /(?:^|\s)([^\s"]+\.par2)(?=\s|$)/i
+        if name.is_none() {
+            let mut start = 0;
+            while start <= s.len() {
+                let run = s[start..]
+                    .iter()
+                    .take_while(|&&b| !pcre_space(b) && b != b'"')
+                    .count();
+                let end = start + run;
+                if run > 5 && (end == s.len() || pcre_space(s[end])) && ends_ci(s, end, b".par2") {
+                    name = Some(&s[start..end]);
+                    flags |= KEY_TOKEN;
+                    break;
+                }
+                match s[end..].iter().position(|&b| pcre_space(b)) {
+                    Some(p) => start = end + p + 1,
+                    None => break,
+                }
+            }
+        }
+        let name = name.unwrap_or_else(|| {
+            let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'"' | b'\'');
+            let start = s.iter().position(|b| !is_trim(b)).unwrap_or(s.len());
+            let end = s.iter().rposition(|b| !is_trim(b)).map_or(start, |p| p + 1);
+            &s[start..end]
+        });
+        // preg_replace('/\.vol\d+\+\d+\.par2$/i', '.par2', $name), then /\.par2$/i
+        let Some(end) = par2_suffix_end(name) else {
+            return (None, flags);
+        };
+        let dot = end - 5;
+        let second = digits_before(name, dot);
+        if second > 0 && dot > second && name[dot - second - 1] == b'+' {
+            let plus = dot - second - 1;
+            let first = digits_before(name, plus);
+            let digits_start = plus - first;
+            if first > 0
+                && digits_start >= 4
+                && name[digits_start - 4..digits_start].eq_ignore_ascii_case(b".vol")
+            {
+                let mut replaced = Vec::with_capacity(name.len());
+                replaced.extend_from_slice(&name[..digits_start - 4]);
+                replaced.extend_from_slice(b".par2");
+                replaced.extend_from_slice(&name[end..]);
+                return (Some(Cow::Owned(replaced)), flags | KEY_VOLUME);
+            }
+        }
+        (Some(Cow::Borrowed(name)), flags)
+    }
+
+    /// Two words per subject: `flags | min(key length, 0xFFFFFF) << 8 | crc32(key) << 32` and the
+    /// index of the first subject with the same key (-1 without a key). Flags: 1 has a key, 2 an
+    /// earlier subject has the key, 4 a volume suffix was folded, 8 quoted name, 16 bare `.par2`
+    /// token, 32 a leading `[n/m]` was removed. Keyed subjects, distinct families, volume members,
+    /// prefixed subjects and the largest family follow.
+    pub fn par2_family_plan(subjects: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(subjects.len() * 2 + 6);
+        let mut families = map::<Cow<'_, [u8]>, (usize, i64)>(subjects.len());
+        let (mut keyed, mut volumes, mut prefixed, mut largest) = (0i64, 0i64, 0i64, 0i64);
+        for (i, &subject) in subjects.iter().enumerate() {
+            let (key, mut flags) = par2_family(subject);
+            volumes += i64::from(flags & KEY_VOLUME != 0);
+            prefixed += i64::from(flags & KEY_PREFIXED != 0);
+            let Some(key) = key else {
+                out.extend([flags, -1]);
+                continue;
+            };
+            keyed += 1;
+            let (len, crc) = (key.len().min(FIELD) as i64, i64::from(crc32(&key)));
+            let first = match families.entry(key) {
+                Entry::Occupied(mut e) => {
+                    flags |= 2;
+                    let family = e.get_mut();
+                    family.1 += 1;
+                    largest = largest.max(family.1);
+                    family.0
+                }
+                Entry::Vacant(v) => {
+                    v.insert((i, 1));
+                    largest = largest.max(1);
+                    i
+                }
+            };
+            out.extend([1 | flags | len << 8 | crc << 32, first as i64]);
+        }
+        out.extend([keyed, families.len() as i64, volumes, prefixed, largest]);
+        out
+    }
+
+    // ---- NzbParserService subject detectors ---------------------------------------------------
+
+    /// Two words per subject: `flags | crc32(subject) << 32` and extractPartsTotal(). Flags:
+    /// detectNfoFile()'s priority (0-2) in bits 0-1, 4 detectHiddenNfoFile() with the segment
+    /// count, 8 detectPar2IndexFile(), 16 a positive parts total. NFO, hidden NFO and PAR2 index
+    /// subjects, the saturating parts sum and the largest total follow; None when a total would
+    /// saturate PHP's integer cast.
+    pub fn subject_plan(subjects: &[&[u8]], segments: &[i64]) -> Option<Vec<i64>> {
+        let mut out = Vec::with_capacity(subjects.len() * 2 + 6);
+        let (mut nfo, mut hidden_n, mut par2_n, mut sum, mut largest) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for (i, &s) in subjects.iter().enumerate() {
+            let priority = i64::from(nzb_nfo_priority(s));
+            let patterns = nzb_hidden_nfo_patterns(s);
+            let count = segments[i];
+            let hidden = ((count == 1 && patterns & (1 | 4 | 8) != 0)
+                || (count <= 2 && patterns & 2 != 0))
+                && !nzbc_hidden_excluded(s);
+            let par2 = nzb_is_par2_index(s);
+            let parts = nzb_parts_total(s)?;
+            nfo += i64::from(priority > 0);
+            hidden_n += i64::from(hidden);
+            par2_n += i64::from(par2);
+            sum = saturating(sum, parts);
+            largest = largest.max(parts);
+            let flags = priority
+                | i64::from(hidden) << 2
+                | i64::from(par2) << 3
+                | i64::from(parts > 0) << 4;
+            out.extend([flags | i64::from(crc32(s)) << 32, parts]);
+        }
+        out.extend([nfo, hidden_n, par2_n, sum, largest]);
+        Some(out)
+    }
+
+    // ---- exports -----------------------------------------------------------------------------
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `texts` holds the texts back to back; `ints` their byte lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w552_nfo_show_id_plan_batch(
+        texts: *const u8,
+        texts_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(texts, texts_len), (ints, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let lengths = columns(span(ints, ints_len)?, count, 1)?;
+                Some(show_id_plan(&framed(span(texts, texts_len)?, &lengths)?))
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the compressed and decoded byte counts as two whole columns.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w552_nzb_store_integrity_plan_batch(
+        stored: *const u8,
+        stored_len: usize,
+        computed: *const u8,
+        computed_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        max_compressed: i64,
+        max_decoded: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (stored, stored_len),
+            (computed, computed_len),
+            (ints, ints_len),
+        ];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let stored = column(span(stored, stored_len)?, count)?;
+                let computed = column(span(computed, computed_len)?, count)?;
+                let table = columns(span(ints, ints_len)?, count, 2)?;
+                let (compressed, decoded) = table.split_at(count);
+                Some(integrity_plan(
+                    &stored,
+                    &computed,
+                    compressed,
+                    decoded,
+                    max_compressed,
+                    max_decoded,
+                ))
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the release ids, has-NFO flags and relinquished flags as three whole columns.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w552_nfo_import_manifest_plan_batch(
+        states: *const u8,
+        states_len: usize,
+        guids: *const u8,
+        guids_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(states, states_len), (guids, guids_len), (ints, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let states = column(span(states, states_len)?, count)?;
+                let guids = column(span(guids, guids_len)?, count)?;
+                let table = columns(span(ints, ints_len)?, count, 3)?;
+                let (ids, rest) = table.split_at(count);
+                let (has_nfo, relinquished) = rest.split_at(count);
+                Some(manifest_plan(&states, &guids, ids, has_nfo, relinquished))
+            })
+        }
+    }
+
+    /// # Safety
+    /// `subjects` must be readable for `subjects_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w552_nzb_par2_family_plan_batch(
+        subjects: *const u8,
+        subjects_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(subjects, subjects_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                Some(par2_family_plan(&column(
+                    span(subjects, subjects_len)?,
+                    count,
+                )?))
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the segment counts.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w552_nzb_parser_subject_plan_batch(
+        subjects: *const u8,
+        subjects_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(subjects, subjects_len), (ints, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let subjects = column(span(subjects, subjects_len)?, count)?;
+                let segments = columns(span(ints, ints_len)?, count, 1)?;
+                subject_plan(&subjects, &segments)
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod w552_tests {
+        use super::super::wave49_verification_admission_inventory_prep_repo_sample::digest;
+        use super::*;
+
+        fn p(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn run(call: impl Fn(*mut i64, usize) -> isize) -> Vec<i64> {
+            let mut out = vec![0i64; 256];
+            let n = call(out.as_mut_ptr(), out.len());
+            assert!(n > 0, "export returned {n}");
+            out.truncate(n as usize);
+            let (body, last) = out.split_at(out.len() - 1);
+            assert_eq!(last[0], digest(body));
+            out.pop();
+            out
+        }
+
+        fn word(p: i64, id: &[u8]) -> i64 {
+            p | (id.len() as i64) << 8 | i64::from(crc32(id)) << 32
+        }
+
+        #[test]
+        fn w552_show_id_follows_pattern_priority() {
+            assert_eq!(
+                show_id(b"see https://www.tvmaze.com/shows/1234567/x"),
+                (1, &b"123456"[..])
+            );
+            assert_eq!(
+                show_id(b"IMDB.COM/Title/TT0111161 and tvmaze.com/shows/5"),
+                (1, &b"5"[..])
+            );
+            assert_eq!(
+                show_id(b"imdb.com/title/tt011116 imdb.com/title/tt01111612"),
+                (2, &b"tt01111612"[..])
+            );
+            assert_eq!(
+                show_id(b"thetvdb.com/series/the-show thetvdb.com/?tab=series&id=81189"),
+                (3, &b"81189"[..])
+            );
+            assert_eq!(
+                show_id(b"thetvdb.com/series/123456789x"),
+                (4, &b"12345678"[..])
+            );
+            assert_eq!(
+                show_id(b"thetvdb.com/series/Some_Show-2!"),
+                (4, &b"Some_Show-2"[..])
+            );
+            assert_eq!(
+                show_id(b"themoviedb.org/tv/1399 themoviedb.org/movie/550"),
+                (5, &b"550"[..])
+            );
+            assert_eq!(show_id(b"themoviedb.org/tv/1399"), (6, &b"1399"[..]));
+            assert_eq!(
+                show_id(b"anidb.net/perl-bin/animedb.pl?show=anime&aid=1234567"),
+                (7, &b"123456"[..])
+            );
+            assert_eq!(show_id(b"ANIDB.net/anime/69"), (7, &b"69"[..]));
+            assert_eq!(
+                show_id(b"trakt.tv/movies/the-matrix-1999 trakt.tv/shows/x"),
+                (8, &b"the-matrix-1999"[..])
+            );
+            assert_eq!(show_id(b"xtvmaze.com/shows/7"), (1, &b"7"[..]));
+            assert_eq!(
+                show_id(b"tvmaze.com/shows/ trakt.tv/users/x anidb.net/animex/1"),
+                (0, &b""[..])
+            );
+            assert_eq!(show_id(b""), (0, &b""[..]));
+            assert_eq!(show_id(b"."), (0, &b""[..]));
+            let w = show_id_plan(&[b"tvmaze.com/shows/42", b"nothing", b"trakt.tv/shows/a"]);
+            assert_eq!(&w[..3], &[word(1, b"42"), 0, word(8, b"a")]);
+            assert_eq!(&w[3..], &[2, 1, 0, 0, 0, 0, 0, 0, 1]);
+        }
+
+        #[test]
+        fn w552_integrity_plan_follows_documented_words() {
+            let hex = [b'a'; 64];
+            let w = integrity_plan(
+                &[&hex, &hex, b"", b"ABC"],
+                &[&hex, b"x", b"", b"ABC"],
+                &[10, 5, -1, 20],
+                &[100, 7, 3, 300],
+                16,
+                200,
+            );
+            assert_eq!(w[0], 1 | 2 | 4 | 8 | i64::from(crc32(&hex)) << 32);
+            assert_eq!(w[1], 1 | 4 | i64::from(crc32(&hex)) << 32);
+            assert_eq!(w[2], 2 | 16 | 32);
+            assert_eq!(w[3], 2 | i64::from(crc32(b"ABC")) << 32);
+            assert_eq!(&w[4..], &[2, 3, 1, 2, 15, 100, 100]);
+            let w = integrity_plan(
+                &[b"a", b"a"],
+                &[b"a", b"a"],
+                &[0, 0],
+                &[i64::MAX, i64::MAX],
+                0,
+                i64::MAX,
+            );
+            assert_eq!(&w[2..], &[2, 2, 2, 2, 0, i64::MAX, i64::MAX]);
+            assert_eq!(integrity_plan(&[], &[], &[], &[], 0, 0), vec![0; 7]);
+        }
+
+        #[test]
+        fn w552_manifest_plan_routes_like_import_manifest() {
+            assert_eq!(manifest_decision(b"nfo_imported", true, false, 1, b"g"), 1);
+            assert_eq!(
+                manifest_decision(b"metadata_deferred", true, false, 1, b"g"),
+                2
+            );
+            assert_eq!(manifest_decision(b"nzb_rejected", true, false, 1, b"g"), 3);
+            assert_eq!(manifest_decision(b"staged", true, false, 1, b"g"), 4);
+            assert_eq!(manifest_decision(b"NZB_IMPORTED", true, false, 1, b"g"), 4);
+            assert_eq!(manifest_decision(b"nzb_imported", false, true, 0, b""), 5);
+            assert_eq!(manifest_decision(b"nfo_failed", true, true, 0, b""), 6);
+            assert_eq!(manifest_decision(b"nfo_failed", true, false, 0, b"g"), 7);
+            assert_eq!(manifest_decision(b"nzb_imported", true, false, 3, b""), 7);
+            assert_eq!(manifest_decision(b"nzb_imported", true, false, 3, b"g"), 8);
+            let w = manifest_plan(
+                &[b"nzb_imported", b"nfo_failed", b"nzb_imported", b"staged"],
+                &[b"g", b"g", b"h", b""],
+                &[1, 2, 1, 0],
+                &[1, 1, 1, 0],
+                &[0, 0, 0, 0],
+            );
+            assert_eq!(w[0], 8 | i64::from(crc32(b"g")) << 32);
+            assert_eq!(w[1], 8 | 1 << 8 | i64::from(crc32(b"g")) << 32);
+            assert_eq!(w[2], 8 | 2 << 8 | i64::from(crc32(b"h")) << 32);
+            assert_eq!(w[3], 4 | 4 << 8);
+            assert_eq!(&w[4..], &[0, 0, 0, 1, 0, 0, 0, 3, 2, 2]);
+        }
+
+        #[test]
+        fn w552_par2_family_matches_par2_family_key() {
+            let key = |s: &[u8]| par2_family(s).0.map(|k| k.into_owned());
+            assert_eq!(
+                key(b"[01/10] - \"Show.S01E01.vol03+04.par2\" yEnc"),
+                Some(b"Show.S01E01.par2".to_vec())
+            );
+            assert_eq!(
+                par2_family(b"[01/10] - \"Show.vol03+04.par2\" yEnc").1,
+                KEY_PREFIXED | KEY_QUOTED | KEY_VOLUME
+            );
+            assert_eq!(
+                key(b"Some.Name.PAR2 yEnc (1/1)"),
+                Some(b"Some.Name.PAR2".to_vec())
+            );
+            assert_eq!(par2_family(b"Some.Name.PAR2 yEnc").1, KEY_TOKEN);
+            assert_eq!(key(b"  'x.vol1+2.par2'  "), Some(b"x.par2".to_vec()));
+            assert_eq!(key(b"x.par2\n"), Some(b"x.par2".to_vec()));
+            assert_eq!(key(b"x.par2\n\n"), Some(b"x.par2".to_vec()));
+            assert_eq!(key(b"\"x.par2\n\n"), None);
+            assert_eq!(key(b"\".par2\" a.par2\"b"), Some(b" a.par2".to_vec()));
+            assert_eq!(key(b"a\"b.par2 c"), None);
+            assert_eq!(key(b".vol1+2.par2"), Some(b".par2".to_vec()));
+            assert_eq!(key(b""), None);
+            let w = par2_family_plan(&[b"a.par2", b"\"a.vol0+1.par2\"", b"b.rar", b"a.par2"]);
+            let k = |s: &[u8]| (s.len() as i64) << 8 | i64::from(crc32(s)) << 32;
+            assert_eq!(
+                &w[..8],
+                &[
+                    1 | 16 | k(b"a.par2"),
+                    0,
+                    1 | 2 | 4 | 8 | k(b"a.par2"),
+                    0,
+                    0,
+                    -1,
+                    1 | 2 | 16 | k(b"a.par2"),
+                    0
+                ]
+            );
+            assert_eq!(&w[8..], &[3, 1, 1, 0, 3]);
+        }
+
+        #[test]
+        fn w552_subject_plan_matches_detectors() {
+            let w = subject_plan(
+                &[
+                    b"Release.nfo (1/1)",
+                    b"x.par2",
+                    b"file (12/40)",
+                    b"abc-def (1/1)",
+                ],
+                &[1, 3, 40, 1],
+            )
+            .unwrap();
+            assert_eq!(w[0] & 3, 1);
+            assert_eq!(w[1], 1);
+            assert_eq!(w[2] & 0xFF, 8);
+            assert_eq!(w[5], 40);
+            assert_eq!(w[4] & 0xFF, 16);
+            assert_eq!(w[6] & 4, 4);
+            assert_eq!(&w[8..], &[1, 2, 1, 42, 40]);
+            assert_eq!(subject_plan(&[b"A (1/99999999999999999999)"], &[1]), None);
+            assert_eq!(subject_plan(&[], &[]), Some(vec![0; 5]));
+        }
+
+        #[test]
+        fn w552_exports_frame_and_guard_batches() {
+            let lengths = p(&[2, 3]);
+            let w = run(|o, c| unsafe {
+                nntmux_w552_nfo_show_id_plan_batch(
+                    b"abc\0d".as_ptr(),
+                    5,
+                    lengths.as_ptr(),
+                    16,
+                    2,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, show_id_plan(&[b"ab", b"c\0d"]));
+            let sizes = p(&[1, 2]);
+            let w = run(|o, c| unsafe {
+                nntmux_w552_nzb_store_integrity_plan_batch(
+                    b"a".as_ptr(),
+                    1,
+                    b"a".as_ptr(),
+                    1,
+                    sizes.as_ptr(),
+                    16,
+                    1,
+                    5,
+                    5,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, integrity_plan(&[b"a"], &[b"a"], &[1], &[2], 5, 5));
+            let ints3 = p(&[1, 1, 0]);
+            let w = run(|o, c| unsafe {
+                nntmux_w552_nfo_import_manifest_plan_batch(
+                    b"nzb_imported".as_ptr(),
+                    12,
+                    b"g".as_ptr(),
+                    1,
+                    ints3.as_ptr(),
+                    24,
+                    1,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(
+                w,
+                manifest_plan(&[b"nzb_imported"], &[b"g"], &[1], &[1], &[0])
+            );
+            let w = run(|o, c| unsafe {
+                nntmux_w552_nzb_par2_family_plan_batch(b"a.par2\0b".as_ptr(), 8, 2, o, c)
+            });
+            assert_eq!(w, par2_family_plan(&[b"a.par2", b"b"]));
+            let one = p(&[1]);
+            let w = run(|o, c| unsafe {
+                nntmux_w552_nzb_parser_subject_plan_batch(
+                    b"x.nfo".as_ptr(),
+                    5,
+                    one.as_ptr(),
+                    8,
+                    1,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, subject_plan(&[b"x.nfo"], &[1]).unwrap());
+
+            let null = std::ptr::null::<u8>();
+            let mut out = [7i64; 32];
+            let o = out.as_mut_ptr();
+            unsafe {
+                // Empty batches accept null inputs.
+                assert_eq!(
+                    nntmux_w552_nfo_show_id_plan_batch(null, 0, null, 0, 0, o, 32),
+                    10
+                );
+                assert_eq!(
+                    nntmux_w552_nzb_store_integrity_plan_batch(
+                        null, 0, null, 0, null, 0, 0, 0, 0, o, 32
+                    ),
+                    8
+                );
+                assert_eq!(
+                    nntmux_w552_nfo_import_manifest_plan_batch(null, 0, null, 0, null, 0, 0, o, 32),
+                    11
+                );
+                assert_eq!(nntmux_w552_nzb_par2_family_plan_batch(null, 0, 0, o, 32), 6);
+                assert_eq!(
+                    nntmux_w552_nzb_parser_subject_plan_batch(null, 0, null, 0, 0, o, 32),
+                    6
+                );
+                out = [7; 32];
+                let o = out.as_mut_ptr();
+                let null_out = std::ptr::null_mut::<i64>();
+                // Null outputs, null non-empty inputs, short outputs, ragged and saturating batches.
+                assert_eq!(
+                    nntmux_w552_nzb_par2_family_plan_batch(b"a".as_ptr(), 1, 1, null_out, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w552_nzb_par2_family_plan_batch(null, 5, 1, o, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w552_nzb_par2_family_plan_batch(b"a\0b".as_ptr(), 3, 2, o, 3),
+                    -10
+                );
+                assert_eq!(
+                    nntmux_w552_nzb_par2_family_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w552_nfo_show_id_plan_batch(
+                        b"abcd".as_ptr(),
+                        4,
+                        lengths.as_ptr(),
+                        16,
+                        2,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w552_nfo_show_id_plan_batch(
+                        b"abc".as_ptr(),
+                        3,
+                        p(&[-1, 4]).as_ptr(),
+                        16,
+                        2,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w552_nfo_show_id_plan_batch(null, 3, lengths.as_ptr(), 16, 2, o, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w552_nzb_store_integrity_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        null,
+                        1,
+                        sizes.as_ptr(),
+                        16,
+                        1,
+                        5,
+                        5,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w552_nzb_store_integrity_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        b"a".as_ptr(),
+                        1,
+                        sizes.as_ptr(),
+                        8,
+                        1,
+                        5,
+                        5,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w552_nfo_import_manifest_plan_batch(
+                        b"s".as_ptr(),
+                        1,
+                        b"g".as_ptr(),
+                        1,
+                        ints3.as_ptr(),
+                        16,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w552_nzb_parser_subject_plan_batch(
+                        b"A (1/99999999999999999999)".as_ptr(),
+                        26,
+                        one.as_ptr(),
+                        8,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w552_nzb_parser_subject_plan_batch(b"x".as_ptr(), 1, null, 8, 1, o, 32),
+                    -1
+                );
+                assert_eq!(out, [7; 32]);
+                // An output overlapping an input is refused.
+                let mut shared = [0i64; 32];
+                shared[0] = i64::from_le_bytes(*b"x.par2ab");
+                assert_eq!(
+                    nntmux_w552_nzb_par2_family_plan_batch(
+                        shared.as_ptr() as *const u8,
+                        8,
+                        1,
+                        shared.as_mut_ptr(),
+                        32
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}

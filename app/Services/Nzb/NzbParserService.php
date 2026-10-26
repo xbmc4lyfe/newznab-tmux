@@ -6,6 +6,7 @@ namespace App\Services\Nzb;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 
 /**
  * Service for parsing and extracting information from NZB file contents.
@@ -646,5 +647,180 @@ class NzbParserService
         $supported = true;
 
         return $total;
+    }
+
+    /** Wave 55.2 paired benchmarks decide this default; see RustNfoServiceDbNzbStoreNfoImportNzbContentsParserW55ParityTest. */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    private const string W55_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w552_nzb_parser_subject_plan_batch(const char *subjects, size_t subjects_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 55 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w55', self::W55_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w55RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planSubjectBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch subject plan, as parseNzbFileList()/parseNzb() run the detectors on each file subject.
+     * Two words per subject: `flags | crc32(subject) << 32` and extractPartsTotal(). Flags:
+     * detectNfoFile()'s priority (0-2) in bits 0-1, 4 detectHiddenNfoFile() with the subject's
+     * segment count, 8 detectPar2IndexFile(), 16 a positive parts total. NFO, hidden NFO and PAR2
+     * index subjects, the parts sum (saturating at PHP_INT_MAX), the largest parts total and the
+     * XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $subjects
+     * @param  list<int>  $segmentCounts
+     * @return list<int>
+     */
+    public static function planSubjectBatch(array $subjects, array $segmentCounts): array
+    {
+        return self::usesW55RustFfi()
+            ? self::planSubjectBatchNative($subjects, $segmentCounts)
+            : self::planSubjectBatchPhp($subjects, $segmentCounts);
+    }
+
+    /**
+     * @param  list<string>  $subjects
+     * @param  list<int>  $segmentCounts
+     * @return list<int>
+     */
+    public static function planSubjectBatchPhp(array $subjects, array $segmentCounts): array
+    {
+        $parser = new self;
+        $segmentCounts = array_values($segmentCounts);
+        $out = [];
+        $nfo = $hidden = $par2 = $sum = $largest = 0;
+        foreach (array_values($subjects) as $i => $subject) {
+            $detected = $parser->detectNfoFile($subject);
+            $priority = $detected === false ? 0 : ($detected['priority'] === 2 ? 2 : 1);
+            $isHidden = $parser->detectHiddenNfoFile($subject, $segmentCounts[$i] ?? 0) !== false;
+            $isPar2 = $parser->detectPar2IndexFile($subject);
+            $parts = $parser->extractPartsTotal($subject);
+            $nfo += $priority > 0 ? 1 : 0;
+            $hidden += (int) $isHidden;
+            $par2 += (int) $isPar2;
+            $sum = $sum > PHP_INT_MAX - $parts ? PHP_INT_MAX : $sum + $parts;
+            $largest = max($largest, $parts);
+            array_push($out, $priority | ($isHidden ? 4 : 0) | ($isPar2 ? 8 : 0) | ($parts > 0 ? 16 : 0) | crc32($subject) << 32, $parts);
+        }
+        array_push($out, $nfo, $hidden, $par2, $sum, $largest);
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, PCRE's character tables are not
+     * the default (C) ones, a subject holds a NUL byte or a parts total saturates PHP's integer cast,
+     * or the lists differ in length or are not lists.
+     *
+     * @param  list<string>  $subjects
+     * @param  list<int>  $segmentCounts
+     * @return list<int>
+     */
+    public static function planSubjectBatchNative(array $subjects, array $segmentCounts): array
+    {
+        $count = \count($subjects);
+        $words = 2 * $count + 6;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w55RustFfiState('out', $words);
+        if ($state === null || \count($segmentCounts) !== $count || ! array_is_list($subjects) || ! array_is_list($segmentCounts)
+            || ! self::pcreUsesDefaultTables()) {
+            return self::planSubjectBatchPhp($subjects, $segmentCounts);
+        }
+        $blob = implode("\0", $subjects);
+        $ints = pack('P*', ...$segmentCounts);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
+            $written = $ffi->nntmux_w552_nzb_parser_subject_plan_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planSubjectBatchPhp($subjects, $segmentCounts);
+    }
+
+    /**
+     * Whether PCRE matches with its default (C) character tables, as the Wave 55 Rust matchers
+     * assume: no byte outside ASCII `\w`/`\s` is classified as either, and ASCII letters fold only
+     * to each other. An explicit setlocale() makes PHP rebuild the tables from LC_CTYPE (macOS
+     * C.UTF-8 marks Latin-1 letters as `\w`; Turkish folds `i` to a high byte), so this probes PCRE
+     * itself rather than the locale name.
+     */
+    public static function pcreUsesDefaultTables(): bool
+    {
+        static $probe = null;
+        // Lower-case letters, then every byte outside ASCII `\w`/`\s`.
+        $probe ??= 'abcdefghijklmnopqrstuvwxyz'.implode('', array_map(chr(...), [...range(0x00, 0x08), ...range(0x0E, 0x1F), ...range(0x21, 0x2F),
+            ...range(0x3A, 0x40), ...range(0x5B, 0x5E), 0x60, ...range(0x7B, 0xFF)]));
+
+        return preg_match('/\A[A-Z]{26}[^\w\s]*\z/i', $probe) === 1;
     }
 }

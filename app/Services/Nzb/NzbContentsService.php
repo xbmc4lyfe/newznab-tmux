@@ -13,6 +13,7 @@ use App\Services\PostProcessService;
 use App\Support\Par2RenameProgress;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Support\Facades\Cache;
@@ -1188,5 +1189,188 @@ class NzbContentsService
     public function getEchoOutput(): bool
     {
         return $this->echoOutput;
+    }
+
+    /** Wave 55.2 paired benchmarks decide this default; see RustNfoServiceDbNzbStoreNfoImportNzbContentsParserW55ParityTest. */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    private const string W55_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w552_nzb_par2_family_plan_batch(const char *subjects, size_t subjects_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 55 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w55', self::W55_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w55RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planPar2FamilyBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch PAR2 family plan over file subjects, grouping them by par2FamilyKey(). Two words per
+     * subject: `flags | min(key length, 0xFFFFFF) << 8 | crc32(key) << 32` and the index of the
+     * first subject with the same key (-1 without a key). Flags: 1 has a key, 2 an earlier
+     * subject has the key, 4 a `.volN+M` member suffix was folded, 8 quoted name, 16 bare `.par2`
+     * token, 32 a leading `[n/m]` was removed. Keyed subjects, distinct families, volume members,
+     * prefixed subjects, the largest family and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planPar2FamilyBatch(array $subjects): array
+    {
+        return self::usesW55RustFfi() ? self::planPar2FamilyBatchNative($subjects) : self::planPar2FamilyBatchPhp($subjects);
+    }
+
+    /**
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planPar2FamilyBatchPhp(array $subjects): array
+    {
+        $out = $families = $sizes = [];
+        $keyed = $volumes = $prefixed = $largest = 0;
+        foreach (array_values($subjects) as $i => $subject) {
+            [$key, $flags] = self::w55Par2Family($subject);
+            $volumes += ($flags & 4) !== 0 ? 1 : 0;
+            $prefixed += ($flags & 32) !== 0 ? 1 : 0;
+            if ($key === null) {
+                array_push($out, $flags, -1);
+
+                continue;
+            }
+            $keyed++;
+            if (isset($families[$key])) {
+                $flags |= 2;
+                $first = $families[$key];
+                $largest = max($largest, ++$sizes[$key]);
+            } else {
+                $first = $families[$key] = $i;
+                $sizes[$key] = 1;
+                $largest = max($largest, 1);
+            }
+            array_push($out, 1 | $flags | min(\strlen($key), 0xFFFFFF) << 8 | crc32($key) << 32, $first);
+        }
+        array_push($out, $keyed, \count($families), $volumes, $prefixed, $largest);
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, PCRE's character tables are not
+     * the default (C) ones, a subject holds a NUL byte, or the subjects are not a list.
+     *
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planPar2FamilyBatchNative(array $subjects): array
+    {
+        $count = \count($subjects);
+        $words = 2 * $count + 6;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w55RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($subjects) || ! NzbParserService::pcreUsesDefaultTables()) {
+            return self::planPar2FamilyBatchPhp($subjects);
+        }
+        $blob = implode("\0", $subjects);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
+            $written = $ffi->nntmux_w552_nzb_par2_family_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planPar2FamilyBatchPhp($subjects);
+    }
+
+    /**
+     * par2FamilyKey() with its source flags (see planPar2FamilyBatch()).
+     *
+     * @return array{string|null, int}
+     */
+    private static function w55Par2Family(string $subject): array
+    {
+        $flags = 0;
+        $stripped = preg_replace('/^\s*\[\d+\/\d+\]\s*/', '', $subject, -1, $prefixes);
+        if ($stripped !== null && $prefixes > 0) {
+            [$subject, $flags] = [$stripped, 32];
+        }
+        if (preg_match('/"([^"]+\.par2)"/i', $subject, $match) === 1) {
+            [$name, $flags] = [$match[1], $flags | 8];
+        } elseif (preg_match('/(?:^|\s)([^\s"]+\.par2)(?=\s|$)/i', $subject, $match) === 1) {
+            [$name, $flags] = [$match[1], $flags | 16];
+        } else {
+            $name = trim($subject, " \t\"'");
+        }
+        $folded = preg_replace('/\.vol\d+\+\d+\.par2$/i', '.par2', $name, -1, $volumes);
+        if ($folded !== null && $volumes > 0) {
+            [$name, $flags] = [$folded, $flags | 4];
+        }
+
+        return [preg_match('/\.par2$/i', $name) === 1 ? $name : null, $flags];
     }
 }
