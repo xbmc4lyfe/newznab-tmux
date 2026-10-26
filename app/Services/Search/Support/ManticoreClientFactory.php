@@ -521,4 +521,239 @@ final class ManticoreClientFactory
 
         return $value === '' ? null : $value;
     }
+
+    /** Hostname bytes {@see self::endpointPlanBatch()} accepts without flagging. */
+    private const string W59_HOST_BYTES = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-';
+
+    public const string W59_FFI_CDEF = 'int64_t nntmux_w595_endpoint_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W59.5 parity test's QUALIFICATION). */
+    public const bool W59_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 59.5 routing and FFI cache, kept in function-local statics (no static properties, so every W59 class
+     * follows the same shape). Without $op it reports the routing; 'set' swaps the override for $val and returns the
+     * previous one; 'reset' replaces the cached handle with $val (null re-resolves, false disables); 'buffer' returns
+     * `[FFI, int64_t[], capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w59RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w59_5', self::W59_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W59_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW59RustFfi(): bool
+    {
+        return self::w59RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with endpointPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW59RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w59RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w59RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 59.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w59Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w59RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w595_endpoint_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch endpoint plan over `host\tport\ttimeout\tretries`. Eight words per record: `[scheme, transport,
+     * host_len, port, timeout, attempts, backoff_ms, flags]`. The trimmed host is `[scheme://]host[:port][/path]`;
+     * scheme 0 none, 1 `http`, 2 `https` (ASCII case-insensitive), 3 other, and transport is 1 for `https`. Port is
+     * the host's own 1-65535 port, else the default port field (trimmed, empty reads 9308). Timeout (empty reads 5)
+     * clamps to 1-300 seconds; retries (empty reads 2) cap at 10 and attempts are `max(1, retries)`, each backing off
+     * `min(100 << i, 2000)` ms. Flags: 1 empty host, 2 host bytes outside `[A-Za-z0-9._-]`, 4 invalid host port, 8
+     * unknown scheme, 16 path, 32 invalid default port, 64 invalid timeout, 128 clamped timeout, 256 invalid retries,
+     * 512 capped retries, 1024 not exactly four fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function endpointPlanBatch(array $records): array
+    {
+        return self::usesW59RustFfi() ? self::endpointPlanBatchNative($records) : self::endpointPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function endpointPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 4 ? 0 : 1024;
+            $defaultPort = 9308;
+            $text = trim($fields[1] ?? '');
+            if ($text !== '') {
+                $value = \strlen($text) <= 5 && ctype_digit($text) ? (int) $text : 0;
+                if ($value >= 1 && $value <= 65535) {
+                    $defaultPort = $value;
+                } else {
+                    $flags |= 32;
+                }
+            }
+            $uri = trim($fields[0]);
+            $scheme = 0;
+            $rest = $uri;
+            $separator = strpos($uri, '://');
+            if ($separator !== false) {
+                $scheme = match (strtolower(substr($uri, 0, $separator))) {
+                    'http' => 1,
+                    'https' => 2,
+                    default => 3,
+                };
+                if ($scheme === 3) {
+                    $flags |= 8;
+                }
+                $rest = substr($uri, $separator + 3);
+            }
+            $slash = strpos($rest, '/');
+            if ($slash !== false) {
+                if (\strlen($rest) - $slash > 1) {
+                    $flags |= 16;
+                }
+                $rest = substr($rest, 0, $slash);
+            }
+            $port = $defaultPort;
+            $host = $rest;
+            $colon = strrpos($rest, ':');
+            if ($colon !== false) {
+                $text = substr($rest, $colon + 1);
+                $value = \strlen($text) <= 5 && ctype_digit($text) ? (int) $text : 0;
+                if ($value >= 1 && $value <= 65535) {
+                    $port = $value;
+                } else {
+                    $flags |= 4;
+                }
+                $host = substr($rest, 0, $colon);
+            }
+            if ($host === '') {
+                $flags |= 1;
+            } elseif (strspn($host, self::W59_HOST_BYTES) !== \strlen($host)) {
+                $flags |= 2;
+            }
+            $timeout = 5;
+            $text = trim($fields[2] ?? '');
+            if ($text !== '') {
+                if (\strlen($text) <= 6 && ctype_digit($text)) {
+                    $timeout = (int) $text;
+                    if ($timeout < 1 || $timeout > 300) {
+                        $timeout = max(1, min(300, $timeout));
+                        $flags |= 128;
+                    }
+                } else {
+                    $flags |= 64;
+                }
+            }
+            $retries = 2;
+            $text = trim($fields[3] ?? '');
+            if ($text !== '') {
+                if (\strlen($text) <= 3 && ctype_digit($text)) {
+                    $retries = (int) $text;
+                    if ($retries > 10) {
+                        $retries = 10;
+                        $flags |= 512;
+                    }
+                } else {
+                    $flags |= 256;
+                }
+            }
+            $attempts = max(1, $retries);
+            $backoff = 0;
+            for ($i = 0; $i < $attempts; $i++) {
+                $backoff += min(100 << $i, 2000);
+            }
+            array_push($out, $scheme, (int) ($scheme === 2), \strlen($host), $port, $timeout, $attempts, $backoff, $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function endpointPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w59Words($count, implode("\0", $records), 8 * $count) ?? self::endpointPlanBatchPhp($records);
+    }
 }

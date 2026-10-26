@@ -45727,3 +45727,1001 @@ mod wave58_5_verification_remote_scratch_spotcheck {
         }
     }
 }
+
+/// Wave 59.5 batch helpers for `ManticoreClientFactory`, `ManticoreIndexRegistry`,
+/// `ManticoreSchemaInspector`, `ReleaseIndexProjection` and `TmuxTaskRunner`. Each entry reads
+/// `count` NUL-joined records in place and writes a fixed number of words per record; the index
+/// resolver's first record is a newline-joined header of logical index names.
+mod wave59_5_manticore_client_registry_schema_release_index_tmux_task_runner {
+    use std::collections::HashMap;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Plan callback: header lines (empty unless the entry takes a header), record bytes and its
+    /// output words.
+    type Plan = fn(&[&[u8]], &[u8], &mut [i64]);
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// 1-`max` ASCII digits as an integer (PHP `ctype_digit()` plus `(int)`); `max` is at most 18.
+    fn number(field: &[u8], max: usize) -> Option<i64> {
+        if field.is_empty() || field.len() > max {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// 32-bit FNV-1a over several byte runs (PHP `hash('fnv1a32')` of their concatenation).
+    fn fnv1a32(parts: &[&[u8]]) -> u32 {
+        parts.iter().fold(0x811c_9dc5u32, |hash, part| {
+            part.iter().fold(hash, |hash, &b| {
+                (hash ^ u32::from(b)).wrapping_mul(0x0100_0193)
+            })
+        })
+    }
+
+    /// Up to `N` fields split on `separator` (missing fields empty) and the total field count.
+    fn fields<const N: usize>(record: &[u8], separator: u8) -> ([&[u8]; N], usize) {
+        let mut fields: [&[u8]; N] = [b""; N];
+        let mut total = 0usize;
+        for field in record.split(|&b| b == separator) {
+            if total < N {
+                fields[total] = field;
+            }
+            total += 1;
+        }
+        (fields, total)
+    }
+
+    /// ASCII case-insensitive substring test (PHP `str_contains()` of two `strtolower()` strings).
+    fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
+        needle.is_empty()
+            || haystack
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
+    }
+
+    /// 64-bit FNV-1a hasher for the per-record column map.
+    #[derive(Default)]
+    struct Fnv(u64);
+
+    impl Hasher for Fnv {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            let mut hash = if self.0 == 0 {
+                0xcbf2_9ce4_8422_2325
+            } else {
+                self.0
+            };
+            for &b in bytes {
+                hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            self.0 = hash;
+        }
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records, writing
+    /// `width` words per record straight into `out`. With `header` the first record is split on
+    /// newlines and passed to every plan call instead of producing words.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        width: usize,
+        header: bool,
+        plan: Plan,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            if header && count == 0 {
+                return if data.is_empty() { 0 } else { DECLINE };
+            }
+            let Some(records) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let (lines, records): (Vec<&[u8]>, &[&[u8]]) = if header {
+                (records[0].split(|&b| b == b'\n').collect(), &records[1..])
+            } else {
+                (Vec::new(), &records[..])
+            };
+            let needed = records.len() * width;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            for (record, slot) in records.iter().zip(words.chunks_exact_mut(width)) {
+                plan(&lines, record, slot);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Hostname bytes accepted without flagging (`[A-Za-z0-9._-]`).
+    fn host_byte(b: &u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
+    }
+
+    /// First `://` in `bytes`.
+    fn scheme_separator(bytes: &[u8]) -> Option<usize> {
+        let mut from = 0;
+        while let Some(at) = memchr(b':', &bytes[from..]) {
+            let at = from + at;
+            if bytes[at + 1..].starts_with(b"//") {
+                return Some(at);
+            }
+            from = at + 1;
+        }
+        None
+    }
+
+    /// `ManticoreClientFactory::endpointPlanBatch()` over `host\tport\ttimeout\tretries`:
+    /// `[scheme, transport, host_len, port, timeout, attempts, backoff_ms, flags]`. The trimmed host
+    /// is `[scheme://]host[:port][/path]`; scheme 0 none, 1 `http`, 2 `https` (ASCII
+    /// case-insensitive), 3 other, and transport is 1 for `https`. Port is the host's own 1-65535
+    /// port, else the default port field (trimmed, empty reads 9308). Timeout (empty reads 5) is
+    /// clamped to 1-300 seconds; retries (empty reads 2) cap at 10 and attempts are `max(1,
+    /// retries)`, each backing off `min(100 << i, 2000)` ms. Flags: 1 empty host, 2 host bytes
+    /// outside `[A-Za-z0-9._-]`, 4 invalid host port, 8 unknown scheme, 16 path, 32 invalid default
+    /// port, 64 invalid timeout, 128 clamped timeout, 256 invalid retries, 512 capped retries, 1024
+    /// not exactly four fields.
+    fn endpoint_plan(_: &[&[u8]], record: &[u8], words: &mut [i64]) {
+        let ([host, port, timeout, retries], total) = fields::<4>(record, b'\t');
+        let mut flags = if total == 4 { 0 } else { 1024 };
+        let default_port = match trim(port) {
+            b"" => 9308,
+            text => match number(text, 5) {
+                Some(value @ 1..=65535) => value,
+                _ => {
+                    flags |= 32;
+                    9308
+                }
+            },
+        };
+        let uri = trim(host);
+        let mut scheme = 0i64;
+        let mut rest = uri;
+        if let Some(at) = scheme_separator(uri) {
+            let prefix = &uri[..at];
+            scheme = if prefix.eq_ignore_ascii_case(b"http") {
+                1
+            } else if prefix.eq_ignore_ascii_case(b"https") {
+                2
+            } else {
+                flags |= 8;
+                3
+            };
+            rest = &uri[at + 3..];
+        }
+        if let Some(slash) = memchr(b'/', rest) {
+            if rest.len() - slash > 1 {
+                flags |= 16;
+            }
+            rest = &rest[..slash];
+        }
+        let mut port = default_port;
+        let host = match rest.iter().rposition(|&b| b == b':') {
+            Some(colon) => {
+                match number(&rest[colon + 1..], 5) {
+                    Some(value @ 1..=65535) => port = value,
+                    _ => flags |= 4,
+                }
+                &rest[..colon]
+            }
+            None => rest,
+        };
+        if host.is_empty() {
+            flags |= 1;
+        } else if !host.iter().all(host_byte) {
+            flags |= 2;
+        }
+        let timeout = match trim(timeout) {
+            b"" => 5,
+            text => match number(text, 6) {
+                Some(value) if value < 1 => {
+                    flags |= 128;
+                    1
+                }
+                Some(value) if value > 300 => {
+                    flags |= 128;
+                    300
+                }
+                Some(value) => value,
+                None => {
+                    flags |= 64;
+                    5
+                }
+            },
+        };
+        let retries = match trim(retries) {
+            b"" => 2,
+            text => match number(text, 3) {
+                Some(value) if value > 10 => {
+                    flags |= 512;
+                    10
+                }
+                Some(value) => value,
+                None => {
+                    flags |= 256;
+                    2
+                }
+            },
+        };
+        let attempts = retries.max(1);
+        let backoff: i64 = (0..attempts).map(|i| (100i64 << i).min(2000)).sum();
+        words.copy_from_slice(&[
+            scheme,
+            i64::from(scheme == 2),
+            host.len() as i64,
+            port,
+            timeout,
+            attempts,
+            backoff,
+            flags,
+        ]);
+    }
+
+    /// `[a-z0-9_]` (registry table and prefix bytes).
+    fn table_byte(b: &u8) -> bool {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_'
+    }
+
+    /// `ManticoreIndexRegistry::tableResolvePlanBatch()` over `name\tprefix` with the logical index
+    /// names as header: `[kind, index, base_len, physical_len, physical_hash, flags]`. A non-empty
+    /// prefix the name starts with is stripped; a remaining `_rt` suffix makes the name physical
+    /// (kind 2), otherwise logical (kind 1). Index is the 1-based header position of the base name
+    /// (0 unknown); a resolved name's physical table is `prefix.base._rt`, with its length and FNV-1a
+    /// 32 hash (both 0 when unresolved). An empty base is kind 0. Flags: 1 prefix stripped, 2
+    /// unknown base, 4 empty base, 8 prefix over 32 bytes or outside `[a-z0-9_]`, 16 name outside
+    /// `[a-z0-9_]`, 32 not exactly two fields.
+    fn index_resolve_plan(logicals: &[&[u8]], record: &[u8], words: &mut [i64]) {
+        let ([name, prefix], total) = fields::<2>(record, b'\t');
+        let mut flags = if total == 2 { 0 } else { 32 };
+        if prefix.len() > 32 || !prefix.iter().all(table_byte) {
+            flags |= 8;
+        }
+        if !name.iter().all(table_byte) {
+            flags |= 16;
+        }
+        let mut stripped = name;
+        if !prefix.is_empty() && name.starts_with(prefix) {
+            stripped = &name[prefix.len()..];
+            flags |= 1;
+        }
+        let (mut kind, base) = match stripped.strip_suffix(b"_rt") {
+            Some(base) => (2i64, base),
+            None => (1i64, stripped),
+        };
+        let mut index = 0i64;
+        if base.is_empty() {
+            flags |= 4;
+            kind = 0;
+        } else {
+            match logicals.iter().position(|&logical| logical == base) {
+                Some(at) => index = at as i64 + 1,
+                None => flags |= 2,
+            }
+        }
+        let (physical_len, hash) = if index > 0 {
+            (
+                (prefix.len() + base.len() + 3) as i64,
+                i64::from(fnv1a32(&[prefix, base, b"_rt"])),
+            )
+        } else {
+            (0, 0)
+        };
+        words.copy_from_slice(&[kind, index, base.len() as i64, physical_len, hash, flags]);
+    }
+
+    /// `ManticoreSchemaInspector::typesAreCompatible()` over raw (case-folded on compare) types.
+    fn types_compatible(actual: &[u8], expected: &[u8]) -> bool {
+        if expected.eq_ignore_ascii_case(b"integer") {
+            return contains_ci(actual, b"integer") || contains_ci(actual, b"uint");
+        }
+        contains_ci(actual, expected)
+    }
+
+    /// `ManticoreSchemaInspector::describePlanBatch()` over newline-separated lines: an expected
+    /// `name:type` comma list, then `DESCRIBE` rows `field\ttype[\tproperties]` (empty lines
+    /// skipped): `[columns, text_fields, attributes, missing, incompatible, id_present, flags]`.
+    /// Every accepted row counts as a column; `text` types (ASCII case-insensitive) are text fields
+    /// and every other row, or one whose properties contain `attribute`, an attribute. Each expected
+    /// pair (empty pairs skipped) is missing without a row of that field, or incompatible when the
+    /// last such row's type fails `typesAreCompatible()`. Flags: 1 row with one field (skipped), 2
+    /// row with an empty field name (skipped), 4 expected pair without `:` (skipped), 8 duplicate
+    /// field, 16 no columns.
+    fn describe_plan(_: &[&[u8]], record: &[u8], words: &mut [i64]) {
+        let mut lines = record.split(|&b| b == b'\n');
+        let spec = lines.next().unwrap_or_default();
+        let mut types: HashMap<&[u8], &[u8], BuildHasherDefault<Fnv>> = HashMap::default();
+        let (mut columns, mut text, mut attributes, mut id, mut flags) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let ([field, kind, properties], total) = fields::<3>(line, b'\t');
+            if total < 2 {
+                flags |= 1;
+                continue;
+            }
+            if field.is_empty() {
+                flags |= 2;
+                continue;
+            }
+            if types.insert(field, kind).is_some() {
+                flags |= 8;
+            }
+            columns += 1;
+            let is_text = kind.eq_ignore_ascii_case(b"text");
+            if is_text {
+                text += 1;
+            }
+            if !is_text || contains_ci(properties, b"attribute") {
+                attributes += 1;
+            }
+            if field == b"id" {
+                id = 1;
+            }
+        }
+        if columns == 0 {
+            flags |= 16;
+        }
+        let (mut missing, mut incompatible) = (0i64, 0i64);
+        if !spec.is_empty() {
+            for pair in spec.split(|&b| b == b',') {
+                if pair.is_empty() {
+                    continue;
+                }
+                let Some(colon) = memchr(b':', pair) else {
+                    flags |= 4;
+                    continue;
+                };
+                match types.get(&pair[..colon]) {
+                    None => missing += 1,
+                    Some(actual) => {
+                        if !types_compatible(actual, &pair[colon + 1..]) {
+                            incompatible += 1;
+                        }
+                    }
+                }
+            }
+        }
+        words.copy_from_slice(&[columns, text, attributes, missing, incompatible, id, flags]);
+    }
+
+    /// Latest timestamp a projected release date keeps (2100-01-01 UTC).
+    const MAX_TIMESTAMP: i64 = 4_102_444_800;
+
+    /// Trimmed optional `-` plus 1-18 digits; empty reads 0, anything else sets `invalid` and reads 0.
+    fn signed(field: &[u8], invalid: &mut bool) -> i64 {
+        let field = trim(field);
+        if field.is_empty() {
+            return 0;
+        }
+        let (negative, digits) = match field.strip_prefix(b"-") {
+            Some(digits) => (true, digits),
+            None => (false, field),
+        };
+        match number(digits, 18) {
+            Some(value) if negative => -value,
+            Some(value) => value,
+            None => {
+                *invalid = true;
+                0
+            }
+        }
+    }
+
+    /// Runs of `[A-Za-z0-9]` (PHP `preg_match_all('/[A-Za-z0-9]+/')`).
+    fn alnum_tokens(bytes: &[u8]) -> i64 {
+        let mut tokens = 0i64;
+        let mut inside = false;
+        for &b in bytes {
+            let alnum = b.is_ascii_alphanumeric();
+            if alnum && !inside {
+                tokens += 1;
+            }
+            inside = alnum;
+        }
+        tokens
+    }
+
+    /// `ReleaseIndexProjection::projectionPlanBatch()` over `id\tsearchname\tsize\tpostdate\tadddate\t
+    /// grabs\tcategories_id\tpasswordstatus`: `[id, name_len, tokens, size, postdate, adddate, grabs,
+    /// score, flags]`. Integers are trimmed optional `-` plus 1-18 digits (empty reads 0). The id is
+    /// 0 unless positive; name length and alphanumeric token count cover the trimmed searchname.
+    /// Size floors at 0, dates clamp to 0-4102444800 and a post date after a positive add date drops
+    /// to it, grabs clamp to 0-2147483647 and categories floor at 0. Score (0 without an id) is `5 *
+    /// min(tokens, 20)`, plus 10 for at least 1 MiB, `min(grabs, 1000) / 10`, 15 for a category and
+    /// 5 for a post date, minus 50 for a positive password status. Flags: 1 id not positive, 2 empty
+    /// searchname, 4 negative size, 8 clamped date, 16 post date after add date, 32 clamped grabs, 64
+    /// negative category, 128 invalid integer field, 256 not exactly eight fields.
+    fn release_projection_plan(_: &[&[u8]], record: &[u8], words: &mut [i64]) {
+        let ([id, name, size, post, add, grabs, category, password], total) =
+            fields::<8>(record, b'\t');
+        let mut flags = if total == 8 { 0 } else { 256 };
+        let mut invalid = false;
+        let id = signed(id, &mut invalid);
+        if id <= 0 {
+            flags |= 1;
+        }
+        let name = trim(name);
+        if name.is_empty() {
+            flags |= 2;
+        }
+        let tokens = alnum_tokens(name);
+        let mut size = signed(size, &mut invalid);
+        if size < 0 {
+            size = 0;
+            flags |= 4;
+        }
+        let mut dates = [signed(post, &mut invalid), signed(add, &mut invalid)];
+        for date in &mut dates {
+            if *date < 0 || *date > MAX_TIMESTAMP {
+                *date = (*date).clamp(0, MAX_TIMESTAMP);
+                flags |= 8;
+            }
+        }
+        let [mut post, add] = dates;
+        if add > 0 && post > add {
+            post = add;
+            flags |= 16;
+        }
+        let mut grabs = signed(grabs, &mut invalid);
+        if !(0..=2_147_483_647).contains(&grabs) {
+            grabs = grabs.clamp(0, 2_147_483_647);
+            flags |= 32;
+        }
+        let mut category = signed(category, &mut invalid);
+        if category < 0 {
+            category = 0;
+            flags |= 64;
+        }
+        let password = signed(password, &mut invalid);
+        if invalid {
+            flags |= 128;
+        }
+        let score = if id > 0 {
+            tokens.min(20) * 5
+                + if size >= 1_048_576 { 10 } else { 0 }
+                + grabs.min(1000) / 10
+                + if category > 0 { 15 } else { 0 }
+                - if password > 0 { 50 } else { 0 }
+                + if post > 0 { 5 } else { 0 }
+        } else {
+            0
+        };
+        words.copy_from_slice(&[
+            id.max(0),
+            name.len() as i64,
+            tokens,
+            size,
+            post,
+            add,
+            grabs,
+            score,
+            flags,
+        ]);
+    }
+
+    /// `[A-Za-z0-9_-]` (tmux session bytes).
+    fn session_byte(b: &u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')
+    }
+
+    /// Trimmed boolean switch: `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` (ASCII
+    /// case-insensitive); empty keeps `default`, anything else sets `invalid` and keeps it.
+    fn switch(field: &[u8], default: bool, invalid: &mut bool) -> bool {
+        let field = trim(field);
+        if field.is_empty() {
+            return default;
+        }
+        for (text, value) in [
+            (&b"1"[..], true),
+            (b"true", true),
+            (b"yes", true),
+            (b"on", true),
+            (b"0", false),
+            (b"false", false),
+            (b"no", false),
+            (b"off", false),
+        ] {
+            if field.eq_ignore_ascii_case(text) {
+                return value;
+            }
+        }
+        *invalid = true;
+        default
+    }
+
+    /// `TmuxTaskRunner::taskPlanBatch()` over `task\tpane\tcommand\tsleep\tenabled\twork\talive`:
+    /// `[action, window, pane, command_len, sleep, flags]`. The trimmed pane target is
+    /// `[session:]window.pane` (session `[A-Za-z0-9_-]+`, window and pane 1-3 digits; both -1 when
+    /// invalid). Sleep (trimmed, empty reads 0) caps at 86400 seconds; enabled and work default on,
+    /// alive off. Action follows `runTask()`: 0 rejected (flags 1, 2 or 4), 2 disabled, 3 no work, 1
+    /// already running, 4 respawn. Flags: 1 empty task name, 2 invalid pane target, 4 empty command,
+    /// 8 command with control bytes, 16 invalid sleep, 32 capped sleep, 64 invalid switch, 128 not
+    /// exactly seven fields.
+    fn task_runner_plan(_: &[&[u8]], record: &[u8], words: &mut [i64]) {
+        let ([task, target, command, sleep, enabled, work, alive], total) =
+            fields::<7>(record, b'\t');
+        let mut flags = if total == 7 { 0 } else { 128 };
+        if trim(task).is_empty() {
+            flags |= 1;
+        }
+        let target = trim(target);
+        let (session, location) = match target.iter().rposition(|&b| b == b':') {
+            Some(colon) => (Some(&target[..colon]), &target[colon + 1..]),
+            None => (None, target),
+        };
+        let session_ok = session.is_none_or(|s| !s.is_empty() && s.iter().all(session_byte));
+        let parsed = memchr(b'.', location).and_then(|dot| {
+            Some((
+                number(&location[..dot], 3)?,
+                number(&location[dot + 1..], 3)?,
+            ))
+        });
+        let (window, pane) = match parsed {
+            Some(pair) if session_ok => pair,
+            _ => {
+                flags |= 2;
+                (-1, -1)
+            }
+        };
+        let command = trim(command);
+        if command.is_empty() {
+            flags |= 4;
+        } else if command.iter().any(|&b| b < 0x20 || b == 0x7f) {
+            flags |= 8;
+        }
+        let sleep = match trim(sleep) {
+            b"" => 0,
+            text => match number(text, 6) {
+                Some(value) if value > 86_400 => {
+                    flags |= 32;
+                    86_400
+                }
+                Some(value) => value,
+                None => {
+                    flags |= 16;
+                    0
+                }
+            },
+        };
+        let mut invalid = false;
+        let enabled = switch(enabled, true, &mut invalid);
+        let work = switch(work, true, &mut invalid);
+        let alive = switch(alive, false, &mut invalid);
+        if invalid {
+            flags |= 64;
+        }
+        let action = if flags & 7 != 0 {
+            0
+        } else if !enabled {
+            2
+        } else if !work {
+            3
+        } else if alive {
+            1
+        } else {
+            4
+        };
+        words.copy_from_slice(&[action, window, pane, command.len() as i64, sleep, flags]);
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $header:expr, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes the
+            /// helper's fixed words per record and returns the words written, `-needed` when
+            /// `out_cap` is too small (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(
+                        count, flags, data, data_len, ints, ints_len, out, out_cap, $width, $header,
+                        $plan,
+                    )
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `ManticoreClientFactory::endpointPlanBatch()` (see [`endpoint_plan`]).
+        nntmux_w595_endpoint_plan, 8, false, endpoint_plan
+    );
+    entry!(
+        /// `ManticoreIndexRegistry::tableResolvePlanBatch()` (see [`index_resolve_plan`]); the first
+        /// record is the newline-joined logical name header and produces no words.
+        nntmux_w595_index_resolve_plan, 6, true, index_resolve_plan
+    );
+    entry!(
+        /// `ManticoreSchemaInspector::describePlanBatch()` (see [`describe_plan`]).
+        nntmux_w595_schema_describe_plan, 7, false, describe_plan
+    );
+    entry!(
+        /// `ReleaseIndexProjection::projectionPlanBatch()` (see [`release_projection_plan`]).
+        nntmux_w595_release_projection_plan, 9, false, release_projection_plan
+    );
+    entry!(
+        /// `TmuxTaskRunner::taskPlanBatch()` (see [`task_runner_plan`]).
+        nntmux_w595_task_runner_plan, 6, false, task_runner_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [(Entry, usize, bool); 5] = [
+            (nntmux_w595_endpoint_plan, 8, false),
+            (nntmux_w595_index_resolve_plan, 6, true),
+            (nntmux_w595_schema_describe_plan, 7, false),
+            (nntmux_w595_release_projection_plan, 9, false),
+            (nntmux_w595_task_runner_plan, 6, false),
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Vec<i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        #[test]
+        fn w595_endpoint_plans_parse_hosts_and_policies() {
+            let words = call(
+                nntmux_w595_endpoint_plan,
+                &[
+                    b"https://search.local:9443/\t\t30\t3",
+                    b"",
+                    b" manticore \t9312\t0\t",
+                    b"ftp://bad host:x/path\t70000\tx\t50",
+                    b"127.0.0.1:99999\t9308\t999\tx\textra",
+                ],
+            );
+            assert_eq!(
+                words,
+                [
+                    2, 1, 12, 9443, 30, 3, 700, 0, //
+                    0, 0, 0, 9308, 5, 2, 300, 1025, //
+                    0, 0, 9, 9312, 1, 2, 300, 128, //
+                    3, 0, 8, 9308, 5, 10, 13100, 638, //
+                    0, 0, 9, 9308, 300, 2, 300, 1412,
+                ]
+            );
+        }
+
+        #[test]
+        fn w595_index_resolve_plans_map_names() {
+            let header: &[u8] = b"releases\npredb\nmovies";
+            let words = call(
+                nntmux_w595_index_resolve_plan,
+                &[
+                    header,
+                    b"releases_rt\t",
+                    b"nn_predb_rt\tnn_",
+                    b"movies\t",
+                    b"_rt\t",
+                    b"Bogus\tBAD-",
+                    b"tv_rt\tx\ty",
+                ],
+            );
+            assert_eq!(
+                words,
+                [
+                    2,
+                    1,
+                    8,
+                    11,
+                    i64::from(fnv1a32(&[b"releases_rt"])),
+                    0, //
+                    2,
+                    2,
+                    5,
+                    11,
+                    i64::from(fnv1a32(&[b"nn_predb_rt"])),
+                    1, //
+                    1,
+                    3,
+                    6,
+                    9,
+                    i64::from(fnv1a32(&[b"movies_rt"])),
+                    0, //
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    4, //
+                    1,
+                    0,
+                    5,
+                    0,
+                    0,
+                    26, //
+                    2,
+                    0,
+                    2,
+                    0,
+                    0,
+                    34,
+                ]
+            );
+            let mut out = [0i64; 4];
+            let empty = unsafe {
+                nntmux_w595_index_resolve_plan(
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    4,
+                )
+            };
+            assert_eq!(empty, 0);
+        }
+
+        #[test]
+        fn w595_describe_plans_classify_columns() {
+            let words = call(
+                nntmux_w595_schema_describe_plan,
+                &[
+                    b"id:bigint,name:text,size:integer,gone:string,bad\nid\tbigint\t\nname\tTEXT\tindexed stored\nsize\tuint\t\nname\ttext\tindexed attribute\nlonely\n\tstring",
+                    b"",
+                    b"a:integer\na\tbigint",
+                ],
+            );
+            assert_eq!(
+                words,
+                [
+                    4, 2, 3, 1, 0, 1, 15, //
+                    0, 0, 0, 0, 0, 0, 16, //
+                    1, 0, 1, 0, 1, 0, 0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w595_release_projection_plans_clamp_and_score() {
+            let words = call(
+                nntmux_w595_release_projection_plan,
+                &[
+                    b"42\tSome.Movie.2024\t2097152\t1700000000\t1700000100\t55\t2040\t0",
+                    b"",
+                    b"7\t x \t-5\t9999999999\t100\t3000000000\t-1\t1",
+                    b"x\t\t1.5\t\t\t\t\t\textra",
+                ],
+            );
+            assert_eq!(
+                words,
+                [
+                    42, 15, 3, 2097152, 1700000000, 1700000100, 55, 50, 0, //
+                    0, 0, 0, 0, 0, 0, 0, 0, 259, //
+                    7, 1, 1, 0, 100, 100, 2147483647, 60, 124, //
+                    0, 0, 0, 0, 0, 0, 0, 0, 387,
+                ]
+            );
+        }
+
+        #[test]
+        fn w595_task_runner_plans_dispatch() {
+            let words = call(
+                nntmux_w595_task_runner_plan,
+                &[
+                    b"Binaries\tnntmux:0.1\tphp artisan update\t60\t1\t1\t0",
+                    b"",
+                    b"Backfill\t2.3\tcmd\t\tno\t\t",
+                    b"Releases\t1.1\tcmd\t999999\tyes\toff\t",
+                    b"Fix\t:1.1\tcmd\x01\tx\tmaybe\t1\tTRUE",
+                    b"Post\t1.2\tcmd\t5\t1\t1\t1",
+                ],
+            );
+            assert_eq!(
+                words,
+                [
+                    4, 0, 1, 18, 60, 0, //
+                    0, -1, -1, 0, 0, 135, //
+                    2, 2, 3, 3, 0, 0, //
+                    3, 1, 1, 3, 86400, 32, //
+                    0, -1, -1, 4, 0, 90, //
+                    1, 1, 2, 3, 5, 0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w595_entries_validate_the_abi() {
+            for (entry, width, header) in ENTRIES {
+                let data = b"a\0b\0c";
+                let produced = if header { 2 } else { 3 };
+                let mut out = [7i64; 32];
+                let call = |count: usize, flags: i64, len: usize, cap: usize, out: *mut i64| unsafe {
+                    entry(
+                        count,
+                        flags,
+                        data.as_ptr(),
+                        len,
+                        std::ptr::null(),
+                        0,
+                        out,
+                        cap,
+                    )
+                };
+                let needed = (produced * width) as i64;
+                assert_eq!(call(3, 0, 5, 32, out.as_mut_ptr()), needed);
+                assert_eq!(
+                    call(3, 0, 5, produced * width - 1, out.as_mut_ptr()),
+                    -needed
+                );
+                assert_eq!(call(3, 1, 5, 32, out.as_mut_ptr()), -1);
+                assert_eq!(call(4, 0, 5, 32, out.as_mut_ptr()), -1);
+                assert_eq!(call(2, 0, 5, 32, out.as_mut_ptr()), -1);
+                assert_eq!(call(0, 0, 0, 0, std::ptr::null_mut()), 0);
+                assert_eq!(call(3, 0, 5, 4, std::ptr::null_mut()), -1);
+                let overlapping = unsafe {
+                    entry(
+                        1,
+                        0,
+                        out.as_ptr().cast(),
+                        8,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        32,
+                    )
+                };
+                assert_eq!(overlapping, -1);
+            }
+        }
+    }
+}
