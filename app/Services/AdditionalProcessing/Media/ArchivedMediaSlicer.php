@@ -591,4 +591,240 @@ class ArchivedMediaSlicer
 
         return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
     }
+
+    // Rust is the default only while the paired W55.6 benchmark clears 1.5x on all four metrics.
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    public const string W55_FFI_CDEF = <<<'C'
+        int32_t nntmux_w556_stored_video_batch(const char *names, size_t names_len, const char *name_twin, size_t name_twin_len, const char *ints, size_t ints_len, size_t count, int64_t min_main_video_bytes, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W55_STORED_HEADER = 16;
+
+    private const int W55_MAX_ITEMS = 1_048_576;
+
+    private const int W55_VALUE_CAP = 1_099_511_627_775;
+
+    private const int W55_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /** Container backing value => code (case index + 1); 0 is none. */
+    private const array W55_CONTAINER_CODES = ['matroska' => 1, 'avi' => 2, 'mpeg' => 3, 'mpegts' => 4, 'mov' => 5, 'asf' => 6, 'ogg' => 7];
+
+    /**
+     * Classify a batch of archive listing entries as storedVideosPhp() and entryForPhp() do: per entry a
+     * name, a size and flags (bit 0 passworded, bit 1 directory, bit 2 compressed, bit 3 not the main
+     * archive; higher bits ignored); a missing size or flag is 0. An entry is eligible when no flag is
+     * set, its size is positive and VideoContainer::fromFileName() knows its extension; it is a sample
+     * when its name says so or it is smaller than `$minMainVideoBytes`.
+     *
+     * Layout: `[0]` count, `[1]` eligible, `[2]` ineligible, `[3..9]` eligible per container code (case
+     * index + 1), `[10]` eligible samples, `[11]` eligible main videos, `[12]` first largest eligible
+     * main video (-1 when none) and `[13]` its size, `[14]` eligible bytes (capped at 2^62), `[15]` FNV-1a
+     * digest; then per entry `code | eligible << 3 | sample << 4 | sample_name << 5 | reasons << 6 | size
+     * << 12` (reasons: flag bits 0-3, bit 4 size 0 or less, bit 5 no container; size clamped to
+     * 0..2^40-1).
+     *
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, int>  $sizes
+     * @param  array<array-key, int>  $flags
+     * @return list<int>
+     */
+    public static function classifyStoredVideoBatch(array $names, array $sizes, array $flags, int $minMainVideoBytes): array
+    {
+        return (self::usesW55RustFfi() ? self::classifyStoredVideoBatchNative($names, $sizes, $flags, $minMainVideoBytes) : null)
+            ?? self::classifyStoredVideoBatchPhp($names, $sizes, $flags, $minMainVideoBytes);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, int>  $sizes
+     * @param  array<array-key, int>  $flags
+     * @return list<int>
+     */
+    public static function classifyStoredVideoBatchPhp(array $names, array $sizes, array $flags, int $minMainVideoBytes): array
+    {
+        $names = array_values($names);
+        $sizes = array_values($sizes);
+        $flags = array_values($flags);
+        $count = \count($names);
+        $out = array_fill(0, self::W55_STORED_HEADER, 0);
+        $out[0] = $count;
+        $largestAt = -1;
+        $largest = 0;
+        $digest = 2_166_136_261;
+        $rows = [];
+        for ($i = 0; $i < $count; $i++) {
+            $name = $names[$i];
+            $raw = $sizes[$i] ?? 0;
+            $size = min(max($raw, 0), self::W55_VALUE_CAP);
+            $container = VideoContainer::fromFileName($name);
+            $code = $container === null ? 0 : self::W55_CONTAINER_CODES[$container->value];
+            $sampleName = preg_match('/(?:^|[\\\\\/._ -])sample(?:[\\\\\/._ -]|$)/i', $name) === 1;
+            $sample = $sampleName || $raw < $minMainVideoBytes;
+            $reasons = (($flags[$i] ?? 0) & 0xF) | ($raw <= 0 ? 16 : 0) | ($code === 0 ? 32 : 0);
+            if ($reasons === 0) {
+                $out[1]++;
+                $out[2 + $code]++;
+                $out[14] = min($out[14] + $size, self::W55_TOTAL_CAP);
+                if ($sample) {
+                    $out[10]++;
+                } else {
+                    $out[11]++;
+                    if ($largestAt < 0 || $size > $largest) {
+                        $largestAt = $i;
+                        $largest = $size;
+                    }
+                }
+            } else {
+                $out[2]++;
+            }
+            $row = $code | ($reasons === 0 ? 8 : 0) | ($sample ? 16 : 0) | ($sampleName ? 32 : 0) | $reasons << 6 | $size << 12;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[12] = $largestAt;
+        $out[13] = $largest;
+        $out[15] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust classification, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, int>  $sizes
+     * @param  array<array-key, int>  $flags
+     * @return list<int>|null
+     */
+    public static function classifyStoredVideoBatchNative(array $names, array $sizes, array $flags, int $minMainVideoBytes): ?array
+    {
+        $count = \count($names);
+        $strings = $count <= self::W55_MAX_ITEMS ? self::w55Strings(array_values($names)) : null;
+        if ($strings === null) {
+            return null;
+        }
+        [$joined, $twin] = $strings;
+        $ints = pack('q*', ...self::w55Fit($sizes, $count), ...self::w55Fit($flags, $count));
+        $fields = self::W55_STORED_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w55Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w556_stored_video_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $minMainVideoBytes, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 55.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $forced = self::w55RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 55.6 routing and binding, kept in function statics so earlier waves' static state stays
+     * untouched. No `$op` returns the forced routing (null for the default); `'set'` replaces it with
+     * `$val` and returns the previous value; `'binding'` returns the cached `additional_w55` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w55', self::W55_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 55.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w55Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w55RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Exactly `$count` values: the list itself when it already fits, otherwise padded with 0.
+     *
+     * @param  array<array-key, int>  $values
+     * @return list<int>
+     */
+    private static function w55Fit(array $values, int $count): array
+    {
+        return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, 0);
+    }
+
+    /**
+     * NUL-joined strings and, when one holds a NUL, the same list joined with 0x01 so Rust finds
+     * the separators where the two differ.
+     *
+     * @param  list<string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w55Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
+    }
 }
