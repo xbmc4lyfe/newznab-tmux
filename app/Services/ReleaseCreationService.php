@@ -20,10 +20,12 @@ use App\Support\Data\ReleaseCreationResult;
 use App\Support\RustPipelineLibrary;
 use App\Support\Utf8;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
+use Throwable;
 
 class ReleaseCreationService
 {
@@ -90,7 +92,7 @@ class ReleaseCreationService
 
                 return $result;
             }
-        } catch (\Throwable) {
+        } catch (Throwable) {
             // Missing symbols, unavailable FFI and declined inputs retain PHP behavior.
         }
 
@@ -109,7 +111,7 @@ class ReleaseCreationService
      * @param  list<int>|null  $allowedIds
      * @return array{added:int,dupes:int}
      *
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function createReleases(int|string|null $groupID, int $limit, bool $echoCLI, ?array $allowedIds = null): array
     {
@@ -508,5 +510,247 @@ class ReleaseCreationService
         }
 
         return $summary;
+    }
+
+    // ========================================================================
+    // WAVE 62.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 5.57x, p99 4.59x; uncommon mean 4.39x, p99 3.54x); see RustObfuscationRouterReleaseCreationExtraProcessingXrefW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    public const string W62_RELEASE_CREATION_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w621_release_creation_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w62ReleaseCreationPlanBatch(). */
+    public const int W62_RELEASE_CREATION_TRAILER = 16;
+
+    public static function usesW62RustFfi(): bool
+    {
+        $override = self::w62RustFfiState();
+
+        return \is_bool($override) ? $override : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the ReleaseCreationService Wave 62 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 62.1 release creation plans. Each item is `name|filesize|totalfiles|filecheck|minSize|minFiles|predbId`;
+     * numbers are 1-15 digits after trimming (the first three are required, the rest default to 0 when empty).
+     * The decision, in order: 6 a malformed number, 1 empty (trimmed) name, 2 filecheck other than
+     * CollectionFileCheckStatus::Sized, 3 zero size, 4 under minSize, 5 under minFiles, else 0 create. Flags:
+     * 1 PreDB match (renamed), 2 `"` in the name, 4 control bytes, 8 non-ASCII, 16 yEnc (case-insensitive),
+     * 32 a name over 255 bytes, 64 a case-insensitive repeat of an earlier name in the batch. Per item
+     * `decision | flags << 3 | bitLength(size) << 10 | min(files, 4095) << 17 | min(nameLength, 1023) << 29 |
+     * min(controlBytes, 63) << 39 | (fnv1a32(strtolower(name)) & 0x3ffff) << 45` (the GUID pre-plan bucket);
+     * then 7 decision and 7 flag counts, the MiB (size >> 20) of creatable items and the largest file count.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62ReleaseCreationPlanBatch(array $items): array
+    {
+        return self::usesW62RustFfi() ? self::w62ReleaseCreationPlanBatchNative($items) : self::w62ReleaseCreationPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62ReleaseCreationPlanBatchNative(array $items): array
+    {
+        return self::w62Invoke($items, \count($items) + self::W62_RELEASE_CREATION_TRAILER) ?? self::w62ReleaseCreationPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w62ReleaseCreationPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W62_RELEASE_CREATION_TRAILER, 0);
+        $seen = [];
+        foreach ($items as $item) {
+            [$rawName, $size, $files, $check, $minSize, $minFiles, $predb] = explode('|', (string) $item, 7) + ['', '', '', '', '', '', ''];
+            $name = trim($rawName);
+            $size = self::w62Uint($size, -1);
+            $files = self::w62Uint($files, -1);
+            $check = self::w62Uint($check, -1);
+            $minSize = self::w62Uint($minSize, 0);
+            $minFiles = self::w62Uint($minFiles, 0);
+            $predb = self::w62Uint($predb, 0);
+            $decision = match (true) {
+                min($size, $files, $check, $minSize, $minFiles, $predb) < 0 => 6,
+                $name === '' => 1,
+                $check !== CollectionFileCheckStatus::Sized->value => 2,
+                $size === 0 => 3,
+                $minSize > 0 && $size < $minSize => 4,
+                $minFiles > 0 && $files < $minFiles => 5,
+                default => 0,
+            };
+            $length = \strlen($name);
+            $control = (int) preg_match_all('/[\x00-\x1f\x7f]/', $name);
+            $flags = ($predb > 0 ? 1 : 0) | (str_contains($name, '"') ? 2 : 0) | ($control > 0 ? 4 : 0)
+                | (preg_match('/[\x80-\xff]/', $name) === 1 ? 8 : 0) | (stripos($name, 'yenc') !== false ? 16 : 0) | ($length > 255 ? 32 : 0);
+            $lower = strtolower($name);
+            if ($name !== '') {
+                if (isset($seen[$lower])) {
+                    $flags |= 64;
+                } else {
+                    $seen[$lower] = true;
+                }
+            }
+            $size = max(0, $size);
+            $files = max(0, $files);
+            $tail[$decision]++;
+            for ($b = 0; $b < 7; $b++) {
+                $tail[7 + $b] += $flags >> $b & 1;
+            }
+            if ($decision === 0) {
+                $tail[14] += $size >> 20;
+            }
+            $tail[15] = max($tail[15], $files);
+            $bits = 0;
+            for ($v = $size; $v > 0; $v >>= 1) {
+                $bits++;
+            }
+            $out[] = $decision | $flags << 3 | $bits << 10 | min($files, 4095) << 17 | min($length, 1023) << 29 | min($control, 63) << 39
+                | ((int) hexdec(hash('fnv1a32', $lower)) & 0x3FFFF) << 45;
+        }
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    /** A field of 1-15 digits after trimming as its value, $empty when empty, else -1. */
+    private static function w62Uint(string $raw, int $empty): int
+    {
+        $value = trim($raw);
+        if ($value === '') {
+            return $empty;
+        }
+
+        return \strlen($value) <= 15 && strspn($value, '0123456789') === \strlen($value) ? (int) $value : -1;
+    }
+
+    /**
+     * Wave 62 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('release_creation_w621', self::W62_RELEASE_CREATION_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w62RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w62RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 62.1 ReleaseCreationService export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w62Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w62RustFfiState('ffi');
+            $out = self::w62RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w62RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W62_RELEASE_CREATION_FFI_CDEF.)
+            $written = $ffi->nntmux_w621_release_creation_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

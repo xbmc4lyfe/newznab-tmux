@@ -9,6 +9,7 @@ use App\Services\TvProcessing\Providers\TvMazeProvider;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
+use InvalidArgumentException;
 use Throwable;
 
 /**
@@ -368,5 +369,289 @@ class TvMazePipe extends AbstractApiProviderPipe
         self::$ffi = $ffi ?? false;
 
         return $ffi;
+    }
+
+    // ========================================================================
+    // WAVE 62.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three paired runs reached 2.78x common mean, 2.48x common p99, 2.16x uncommon mean and 2.00x uncommon p99; see RustTvMazeTvdbPipeOutcomeWriterPosterResolverRunStateW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    private const string W62_TVMAZE_PIPE_FFI_CDEF = 'ssize_t nntmux_w624_tvmaze_lookup_plan_row_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per tvMazeLookupPlanRowBatch() record. */
+    public const int W62_ROW_WORDS = 6;
+
+    /** int64 summary words after the tvMazeLookupPlanRowBatch() records (none for an empty batch). */
+    public const int W62_TRAILER_WORDS = 8;
+
+    private const string W62_DIGITS = '0123456789';
+
+    private const string W62_UPPER = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+    /**
+     * TVMaze lookup plan rows for [title, airdate, country, videos id, tvmaze id, season, episode,
+     * season pack, consecutive transients] items.
+     *
+     * The title is normalized as w48Normalize() does; a trailing ` 1900`-` 2099` token is cut into
+     * the year when a query remains. Airdates are trimmed `YYYY-MM-DD` (or '.'/'/' separated) valid
+     * dates (`YYYYMMDD`, else 0). Countries are trimmed, uppercased two-letter codes (class 0 empty,
+     * 1 valid packed as `c0 << 8 | c1`, 2 otherwise). Season and episode clamp to 0..9999 and
+     * 0..99999; tvmaze ids of 1..99999999 are valid. Status: 1 empty query, 2 circuit open (3+
+     * transients), 3 show search, 4 season pack, 5 missing site id, 6 episode number lookup
+     * (key `season * 100000 + episode`), 7 airdate lookup (key the airdate), 8 no episode reference.
+     *
+     * Rows [status | title class << 4 (0 empty, 1 ok, 2 over 120 bytes) | country class << 6 |
+     * flags << 8 (1 year cut, 2 non-ASCII title, 4 unparsable airdate) | query bytes << 16 | year
+     * << 24, FNV-1a 32 query hash (0 empty), airdate, episode key (-1), tvmaze id (-1), country],
+     * then the trailer [skipped, searches, season packs, missing site ids, episode lookups, airdate
+     * lookups, no reference, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function tvMazeLookupPlanRowBatch(array $items): array
+    {
+        return self::usesW62RustFfi() ? self::tvMazeLookupPlanRowBatchNative($items) : self::tvMazeLookupPlanRowBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function tvMazeLookupPlanRowBatchPhp(array $items): array
+    {
+        self::w62Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $summary = [0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        foreach ($items as [$title, $airdate, $country, $videoId, $siteId, $season, $episode, $seasonPack, $transients]) {
+            $query = self::w48Normalize($title);
+            $length = \strlen($query);
+            $year = 0;
+            if ($length >= 6 && $query[$length - 5] === ' ' && strspn($query, self::W62_DIGITS, $length - 4) === 4) {
+                $candidate = (int) substr($query, -4);
+                if ($candidate >= 1900 && $candidate <= 2099) {
+                    $year = $candidate;
+                    $length -= 5;
+                    $query = substr($query, 0, $length);
+                }
+            }
+            $flags = ($year > 0 ? 1 : 0) | (mb_check_encoding($title, 'ASCII') ? 0 : 2);
+            $day = trim($airdate);
+            $air = self::w62Ymd($day);
+            if ($day !== '' && $air === 0) {
+                $flags |= 4;
+            }
+            $code = strtoupper(trim($country));
+            if ($code === '') {
+                $countryClass = $packed = 0;
+            } elseif (\strlen($code) === 2 && strspn($code, self::W62_UPPER) === 2) {
+                $countryClass = 1;
+                $packed = \ord($code[0]) << 8 | \ord($code[1]);
+            } else {
+                $countryClass = 2;
+                $packed = 0;
+            }
+            $season = max(0, min(9999, $season));
+            $episode = max(0, min(99_999, $episode));
+            $siteOk = $siteId >= 1 && $siteId <= 99_999_999;
+            $status = match (true) {
+                $length === 0 => 1,
+                $transients >= 3 => 2,
+                $videoId <= 0 => 3,
+                $seasonPack !== 0 => 4,
+                ! $siteOk => 5,
+                $episode > 0 => 6,
+                $air > 0 => 7,
+                default => 8,
+            };
+            $key = match ($status) {
+                6 => $season * 100_000 + $episode,
+                7 => $air,
+                default => -1,
+            };
+            $hash = $length === 0 ? 0 : self::w48Fnv($query);
+            $titleClass = $length === 0 ? 0 : ($length > 120 ? 2 : 1);
+            $word = $status | $titleClass << 4 | $countryClass << 6 | $flags << 8 | min(255, $length) << 16 | $year << 24;
+            array_push($out, $word, $hash, $air, $key, $siteOk ? $siteId : -1, $packed);
+            $summary[$status <= 2 ? 0 : $status - 2]++;
+            $value = $word ^ $hash << 20 ^ $key;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $summary[7] = $digest;
+
+        return [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function tvMazeLookupPlanRowBatchNative(array $items): array
+    {
+        self::w62Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w62Join([array_column($items, 0), array_column($items, 1), array_column($items, 2)], $count);
+        $ints = pack('P*', ...array_column($items, 3), ...array_column($items, 4), ...array_column($items, 5), ...array_column($items, 6), ...array_column($items, 7), ...array_column($items, 8));
+
+        return self::w62Call($blob, $twin, $ints, $count, $count * self::W62_ROW_WORDS + self::W62_TRAILER_WORDS)
+            ?? self::tvMazeLookupPlanRowBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w62Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W62 TVMaze lookup plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 9 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_string($item[2]) || ! \is_int($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5]) || ! \is_int($item[6]) || ! \is_int($item[7]) || ! \is_int($item[8])) {
+                throw new InvalidArgumentException('W62 TVMaze lookup plan batch items must be [string title, string airdate, string country, int videos id, int tvmaze id, int season, int episode, int season pack, int consecutive transients] lists.');
+            }
+        }
+    }
+
+    public static function usesW62RustFfi(): bool
+    {
+        $enabled = self::w62RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W62 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('enabled');
+        self::w62RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w62Join(array $columns, int $count): array
+    {
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\0", $column);
+        }
+        $joined = implode("\0", $parts);
+        if (substr_count($joined, "\0") === \count($columns) * $count - 1) {
+            return [$joined, ''];
+        }
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\x01", $column);
+        }
+
+        return [$joined, implode("\x01", $parts)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w62Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w62RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w62', self::W62_TVMAZE_PIPE_FFI_CDEF) ?? false;
+            self::w62RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w62RustFfiState('out', $out);
+                self::w62RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W62_TVMAZE_PIPE_FFI_CDEF.)
+            $written = $ffi->nntmux_w624_tvmaze_lookup_plan_row_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w62RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W62 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static: no arguments returns the state, one argument reads a key ('reset'
+     * clears everything) and two arguments write a key.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** A trimmed `YYYY-MM-DD` (or '.'/'/' separated) valid date with a positive year as `YYYYMMDD`, else 0. */
+    private static function w62Ymd(string $day): int
+    {
+        if (\strlen($day) !== 10 || strspn($day, self::W62_DIGITS, 0, 4) !== 4 || strspn($day, self::W62_DIGITS, 5, 2) !== 2
+            || strspn($day, self::W62_DIGITS, 8, 2) !== 2) {
+            return 0;
+        }
+        $separator = $day[4];
+        if (($separator !== '-' && $separator !== '.' && $separator !== '/') || $day[7] !== $separator) {
+            return 0;
+        }
+        $year = (int) substr($day, 0, 4);
+        $month = (int) substr($day, 5, 2);
+        $date = (int) substr($day, 8, 2);
+
+        return $year > 0 && checkdate($month, $date, $year) ? $year * 10_000 + $month * 100 + $date : 0;
     }
 }
