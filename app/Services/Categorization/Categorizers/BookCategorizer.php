@@ -9,6 +9,7 @@ use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 class BookCategorizer extends AbstractCategorizer
@@ -525,5 +526,280 @@ CDEF;
         }
 
         return self::$w423RustFfiHandle === false ? null : self::$w423RustFfiHandle;
+    }
+
+    // ========================================================================
+    // WAVE 60.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 7.29x, p99 6.20x; uncommon mean 6.30x, p99 5.06x); see RustCategorizersAbstractBookConsoleGroupNameReleaseContextW60ParityTest. */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    public const string W60_BOOK_CATEGORIZER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w603_book_token_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w60BookTokenBatch(). */
+    public const int W60_BOOK_CATEGORIZER_TRAILER = 28;
+
+    /**
+     * Book token flags: 1 ebook, 2 audiobook, 4 comic, 8 magazine, 16 technical, 32 retail and 64 ISBN (128, a
+     * 19xx/20xx year, and 13-digit 978/979 ISBNs are detected by shape).
+     *
+     * @var array<string, int>
+     */
+    public const array W60_BOOK_TOKEN_FLAGS = ['epub' => 1, 'mobi' => 1, 'azw' => 1, 'azw3' => 1, 'fb2' => 1, 'djvu' => 1, 'ebook' => 1,
+        'kindle' => 1, 'kobo' => 1, 'nook' => 1, 'audiobook' => 2, 'audiobooks' => 2, 'unabridged' => 2, 'abridged' => 2, 'audible' => 2,
+        'narrated' => 2, 'm4b' => 2, 'cbr' => 4, 'cbz' => 4, 'comic' => 4, 'comics' => 4, 'manga' => 4, 'manhwa' => 4, 'webtoon' => 4, 'c2c' => 4,
+        'tpb' => 4, 'magazine' => 8, 'magazines' => 8, 'weekly' => 8, 'monthly' => 8, 'quarterly' => 8, 'issue' => 8, 'apress' => 16,
+        'packt' => 16, 'oreilly' => 16, 'wiley' => 16, 'manning' => 16, 'wrox' => 16, 'programming' => 16, 'python' => 16, 'javascript' => 16,
+        'cookbook' => 16, 'handbook' => 16, 'retail' => 32, 'isbn' => 64];
+
+    /**
+     * Extension classes: 1 ebook, 2 PDF, 3 comic archive and 4 audio (any other 1-5 alphanumeric extension is 5).
+     *
+     * @var array<string, int>
+     */
+    public const array W60_BOOK_EXTENSIONS = ['epub' => 1, 'mobi' => 1, 'azw' => 1, 'azw3' => 1, 'fb2' => 1, 'djvu' => 1, 'lit' => 1, 'prc' => 1,
+        'pdf' => 2, 'cbr' => 3, 'cbz' => 3, 'cb7' => 3, 'cbt' => 3, 'm4b' => 4, 'mp3' => 4, 'm4a' => 4, 'aac' => 4, 'flac' => 4];
+
+    public static function usesW60RustFfi(): bool
+    {
+        $override = self::w60RustFfiState();
+
+        return \is_bool($override) ? $override : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the BookCategorizer Wave 60 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 60.3 book token classification plans. Each item is `releaseName|sizeBytes` (fields trimmed). Per item
+     * `rule | extension << 3 | flags << 6 | categoryId << 14 | confidenceMilli << 28 | sizeState << 38 | sizeBand << 40
+     * | min(tokens, 63) << 43 | min(nameLength, 255) << 49`: the extension (after the last `.`, 1-5 alphanumerics,
+     * case-insensitive) is 0 none or its W60_BOOK_EXTENSIONS class (5 other); flags OR the W60_BOOK_TOKEN_FLAGS of
+     * every `[^a-z0-9]+`-separated lowercase token, plus 128 for a four-digit 19xx/20xx token and 64 for a
+     * 13-digit 978/979 token; the rule, in order, is 1 comic (comic extension or flag, 0.9 with the extension else
+     * 0.85), 2 technical (0.85), 3 magazine (0.9 with a year else 0.75), 4 audiobook (0.9 with an audio extension
+     * else 0.85), 5 ebook (ebook extension 0.9, ebook flag 0.85 or a PDF with an ISBN or year 0.75), else 0
+     * unknown with category 0; size is w60BookSize(). Then six rule, six extension, eight flag and five size band
+     * counts, the valid size sum, the largest token count and the distinct valid extensions.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60BookTokenBatch(array $items): array
+    {
+        return self::usesW60RustFfi() ? self::w60BookTokenBatchNative($items) : self::w60BookTokenBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60BookTokenBatchNative(array $items): array
+    {
+        return self::w60Invoke($items, \count($items) + self::W60_BOOK_CATEGORIZER_TRAILER) ?? self::w60BookTokenBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60BookTokenBatchPhp(array $items): array
+    {
+        $out = [];
+        $rules = $extensions = [0, 0, 0, 0, 0, 0];
+        $flagCounts = array_fill(0, 8, 0);
+        $bands = [0, 0, 0, 0, 0];
+        $sizeSum = $maxTokens = 0;
+        $distinct = [];
+        foreach ($items as $item) {
+            $f = explode('|', (string) $item, 2) + ['', ''];
+            $name = trim($f[0]);
+            $dot = strrpos($name, '.');
+            $ext = $dot === false ? '' : strtolower(substr($name, $dot + 1));
+            $extLength = \strlen($ext);
+            $extension = 0;
+            if ($extLength >= 1 && $extLength <= 5 && strspn($ext, 'abcdefghijklmnopqrstuvwxyz0123456789') === $extLength) {
+                $distinct[$ext] = true;
+                $extension = self::W60_BOOK_EXTENSIONS[$ext] ?? 5;
+            }
+            $tokens = $name === '' ? [] : (preg_split('/[^a-z0-9]+/', strtolower($name), -1, PREG_SPLIT_NO_EMPTY) ?: []);
+            $flags = 0;
+            foreach ($tokens as $token) {
+                $flags |= self::W60_BOOK_TOKEN_FLAGS[$token] ?? 0;
+                $tokenLength = \strlen($token);
+                if ($tokenLength === 4 && strspn($token, '0123456789') === 4 && ($token[0].$token[1] === '19' || $token[0].$token[1] === '20')) {
+                    $flags |= 128;
+                } elseif ($tokenLength === 13 && strspn($token, '0123456789') === 13 && (str_starts_with($token, '978') || str_starts_with($token, '979'))) {
+                    $flags |= 64;
+                }
+            }
+            [$rule, $category, $confidence] = match (true) {
+                $extension === 3 || ($flags & 4) !== 0 => [1, Category::BOOKS_COMICS, $extension === 3 ? 900 : 850],
+                ($flags & 16) !== 0 => [2, Category::BOOKS_TECHNICAL, 850],
+                ($flags & 8) !== 0 => [3, Category::BOOKS_MAGAZINES, ($flags & 128) !== 0 ? 900 : 750],
+                ($flags & 2) !== 0 => [4, Category::MUSIC_AUDIOBOOK, $extension === 4 ? 900 : 850],
+                $extension === 1 => [5, Category::BOOKS_EBOOK, 900],
+                ($flags & 1) !== 0 => [5, Category::BOOKS_EBOOK, 850],
+                $extension === 2 && ($flags & (64 | 128)) !== 0 => [5, Category::BOOKS_EBOOK, 750],
+                default => [0, 0, 0],
+            };
+            [$sizeState, $band, $bytes] = self::w60BookSize(trim($f[1]));
+            $count = \count($tokens);
+            $rules[$rule]++;
+            $extensions[$extension]++;
+            $bands[$band]++;
+            for ($i = 0; $i < 8; $i++) {
+                $flagCounts[$i] += $flags >> $i & 1;
+            }
+            $sizeSum += $bytes;
+            $maxTokens = max($maxTokens, $count);
+            $out[] = $rule | $extension << 3 | $flags << 6 | $category << 14 | $confidence << 28 | $sizeState << 38 | $band << 40
+                | min($count, 63) << 43 | min(\strlen($name), 255) << 49;
+        }
+        array_push($out, ...$rules, ...$extensions, ...$flagCounts, ...$bands);
+        array_push($out, $sizeSum, $maxTokens, \count($distinct));
+
+        return $out;
+    }
+
+    /**
+     * Size state 0 empty, 1 up to 12 digits and 2 invalid; the band is 0 without a valid size, then 1 below 1 MiB,
+     * 2 below 50 MiB, 3 below 500 MiB and 4 larger; then the byte count (0 unless valid).
+     *
+     * @return array{int, int, int}
+     */
+    private static function w60BookSize(string $raw): array
+    {
+        if ($raw === '') {
+            return [0, 0, 0];
+        }
+        $length = \strlen($raw);
+        if ($length > 12 || strspn($raw, '0123456789') !== $length) {
+            return [2, 0, 0];
+        }
+        $bytes = (int) $raw;
+
+        return [1, $bytes < 1_048_576 ? 1 : ($bytes < 52_428_800 ? 2 : ($bytes < 524_288_000 ? 3 : 4)), $bytes];
+    }
+
+    /**
+     * Wave 60 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w603', self::W60_BOOK_CATEGORIZER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w60RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w60RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 60.3 BookCategorizer export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w60Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w60RustFfiState('ffi');
+            $out = self::w60RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w60RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W60_BOOK_CATEGORIZER_FFI_CDEF.)
+            $written = $ffi->nntmux_w603_book_token_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
