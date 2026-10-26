@@ -8,6 +8,8 @@ use App\Enums\TmuxPaneRole;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\Runners\BaseRunner;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -1011,5 +1013,241 @@ class TmuxTaskRunner
         $command = "nice -n{$niceness} {$artisan} multiprocessing:postprocess ama";
 
         return $this->launch($pane, $command, ['log_pane' => $logName, 'sleep' => $sleep]);
+    }
+
+    /** Session bytes {@see self::taskPlanBatch()} accepts in a pane target. */
+    private const string W59_SESSION_BYTES = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-';
+
+    /** ASCII control bytes {@see self::taskPlanBatch()} flags in a command. */
+    private const string W59_CONTROL_BYTES = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f";
+
+    public const string W59_FFI_CDEF = 'int64_t nntmux_w595_task_runner_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W59.5 parity test's QUALIFICATION). */
+    public const bool W59_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 59.5 routing and FFI cache, kept in function-local statics (no static properties, so every W59 class
+     * follows the same shape). Without $op it reports the routing; 'set' swaps the override for $val and returns the
+     * previous one; 'reset' replaces the cached handle with $val (null re-resolves, false disables); 'buffer' returns
+     * `[FFI, int64_t[], capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w59RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w59_5', self::W59_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W59_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW59RustFfi(): bool
+    {
+        return self::w59RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with taskPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW59RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w59RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w59RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 59.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w59Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w59RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w595_task_runner_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch dispatch plan over `task\tpane\tcommand\tsleep\tenabled\twork\talive`. Six words per record: `[action,
+     * window, pane, command_len, sleep, flags]`. The trimmed pane target is `[session:]window.pane` (session
+     * `[A-Za-z0-9_-]+`, window and pane 1-3 digits; both -1 when invalid). Sleep (trimmed, empty reads 0) caps at
+     * 86400 seconds; the switches accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` (ASCII case-insensitive),
+     * with enabled and work defaulting on and alive off. Action follows {@see runTask()}: 0 rejected (flags 1, 2 or 4),
+     * 2 disabled, 3 no work, 1 already running, 4 respawn. Flags: 1 empty task name, 2 invalid pane target, 4 empty
+     * command, 8 command with control bytes, 16 invalid sleep, 32 capped sleep, 64 invalid switch, 128 not exactly
+     * seven fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function taskPlanBatch(array $records): array
+    {
+        return self::usesW59RustFfi() ? self::taskPlanBatchNative($records) : self::taskPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function taskPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 7 ? 0 : 128;
+            if (trim($fields[0]) === '') {
+                $flags |= 1;
+            }
+            $target = trim($fields[1] ?? '');
+            $location = $target;
+            $sessionValid = true;
+            $colon = strrpos($target, ':');
+            if ($colon !== false) {
+                $session = substr($target, 0, $colon);
+                $location = substr($target, $colon + 1);
+                $sessionValid = $session !== '' && strspn($session, self::W59_SESSION_BYTES) === \strlen($session);
+            }
+            $window = $pane = -1;
+            $dot = strpos($location, '.');
+            if ($dot !== false && $sessionValid) {
+                $windowText = substr($location, 0, $dot);
+                $paneText = substr($location, $dot + 1);
+                if (\strlen($windowText) <= 3 && ctype_digit($windowText) && \strlen($paneText) <= 3 && ctype_digit($paneText)) {
+                    $window = (int) $windowText;
+                    $pane = (int) $paneText;
+                }
+            }
+            if ($window < 0) {
+                $flags |= 2;
+            }
+            $command = trim($fields[2] ?? '');
+            if ($command === '') {
+                $flags |= 4;
+            } elseif (strcspn($command, self::W59_CONTROL_BYTES) !== \strlen($command)) {
+                $flags |= 8;
+            }
+            $sleep = 0;
+            $text = trim($fields[3] ?? '');
+            if ($text !== '') {
+                if (\strlen($text) <= 6 && ctype_digit($text)) {
+                    $sleep = (int) $text;
+                    if ($sleep > 86400) {
+                        $sleep = 86400;
+                        $flags |= 32;
+                    }
+                } else {
+                    $flags |= 16;
+                }
+            }
+            $invalid = false;
+            $enabled = self::w59Switch($fields[4] ?? '', true, $invalid);
+            $work = self::w59Switch($fields[5] ?? '', true, $invalid);
+            $alive = self::w59Switch($fields[6] ?? '', false, $invalid);
+            if ($invalid) {
+                $flags |= 64;
+            }
+            $action = match (true) {
+                ($flags & 7) !== 0 => 0,
+                ! $enabled => 2,
+                ! $work => 3,
+                $alive => 1,
+                default => 4,
+            };
+            array_push($out, $action, $window, $pane, \strlen($command), $sleep, $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function taskPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w59Words($count, implode("\0", $records), 6 * $count) ?? self::taskPlanBatchPhp($records);
+    }
+
+    /** Trimmed boolean switch; empty keeps $default, anything unrecognized sets $invalid and keeps it. */
+    private static function w59Switch(string $field, bool $default, bool &$invalid): bool
+    {
+        $field = strtolower(trim($field));
+        if ($field === '') {
+            return $default;
+        }
+        $value = match ($field) {
+            '1', 'true', 'yes', 'on' => true,
+            '0', 'false', 'no', 'off' => false,
+            default => null,
+        };
+        if ($value === null) {
+            $invalid = true;
+
+            return $default;
+        }
+
+        return $value;
     }
 }

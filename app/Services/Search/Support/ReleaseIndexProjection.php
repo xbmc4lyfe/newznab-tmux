@@ -305,4 +305,224 @@ final class ReleaseIndexProjection
 
         return \is_string($value) ? $value : '';
     }
+
+    /** Latest timestamp {@see self::projectionPlanBatch()} keeps (2100-01-01 UTC). */
+    private const int W59_MAX_TIMESTAMP = 4102444800;
+
+    public const string W59_FFI_CDEF = 'int64_t nntmux_w595_release_projection_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W59.5 parity test's QUALIFICATION). */
+    public const bool W59_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 59.5 routing and FFI cache, kept in function-local statics (no static properties, so every W59 class
+     * follows the same shape). Without $op it reports the routing; 'set' swaps the override for $val and returns the
+     * previous one; 'reset' replaces the cached handle with $val (null re-resolves, false disables); 'buffer' returns
+     * `[FFI, int64_t[], capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w59RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w59_5', self::W59_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W59_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW59RustFfi(): bool
+    {
+        return self::w59RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with projectionPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW59RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w59RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w59RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 59.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w59Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w59RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w595_release_projection_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch release projection over `id\tsearchname\tsize\tpostdate\tadddate\tgrabs\tcategories_id\tpasswordstatus`.
+     * Nine words per record: `[id, name_len, tokens, size, postdate, adddate, grabs, score, flags]`. Integers are
+     * trimmed optional `-` plus 1-18 digits (empty reads 0). The id is 0 unless positive; name length and the
+     * `[A-Za-z0-9]+` token count cover the trimmed searchname. Size floors at 0, dates clamp to 0-4102444800 and a post
+     * date after a positive add date drops to it, grabs clamp to 0-2147483647 and categories floor at 0. Score (0
+     * without an id) is `5 * min(tokens, 20)`, plus 10 for at least 1 MiB, `min(grabs, 1000) / 10`, 15 for a category
+     * and 5 for a post date, minus 50 for a positive password status. Flags: 1 id not positive, 2 empty searchname, 4
+     * negative size, 8 clamped date, 16 post date after add date, 32 clamped grabs, 64 negative category, 128 invalid
+     * integer field, 256 not exactly eight fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function projectionPlanBatch(array $records): array
+    {
+        return self::usesW59RustFfi() ? self::projectionPlanBatchNative($records) : self::projectionPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function projectionPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 8 ? 0 : 256;
+            $invalid = false;
+            $id = self::w59Integer($fields[0], $invalid);
+            if ($id <= 0) {
+                $flags |= 1;
+            }
+            $name = trim($fields[1] ?? '');
+            if ($name === '') {
+                $flags |= 2;
+            }
+            $tokens = (int) preg_match_all('/[A-Za-z0-9]+/', $name);
+            $size = self::w59Integer($fields[2] ?? '', $invalid);
+            if ($size < 0) {
+                $size = 0;
+                $flags |= 4;
+            }
+            $post = self::w59Integer($fields[3] ?? '', $invalid);
+            if ($post < 0 || $post > self::W59_MAX_TIMESTAMP) {
+                $post = max(0, min(self::W59_MAX_TIMESTAMP, $post));
+                $flags |= 8;
+            }
+            $add = self::w59Integer($fields[4] ?? '', $invalid);
+            if ($add < 0 || $add > self::W59_MAX_TIMESTAMP) {
+                $add = max(0, min(self::W59_MAX_TIMESTAMP, $add));
+                $flags |= 8;
+            }
+            if ($add > 0 && $post > $add) {
+                $post = $add;
+                $flags |= 16;
+            }
+            $grabs = self::w59Integer($fields[5] ?? '', $invalid);
+            if ($grabs < 0 || $grabs > 2147483647) {
+                $grabs = max(0, min(2147483647, $grabs));
+                $flags |= 32;
+            }
+            $category = self::w59Integer($fields[6] ?? '', $invalid);
+            if ($category < 0) {
+                $category = 0;
+                $flags |= 64;
+            }
+            $password = self::w59Integer($fields[7] ?? '', $invalid);
+            if ($invalid) {
+                $flags |= 128;
+            }
+            $score = $id > 0
+                ? min($tokens, 20) * 5 + ($size >= 1048576 ? 10 : 0) + intdiv(min($grabs, 1000), 10)
+                    + ($category > 0 ? 15 : 0) - ($password > 0 ? 50 : 0) + ($post > 0 ? 5 : 0)
+                : 0;
+            array_push($out, max(0, $id), \strlen($name), $tokens, $size, $post, $add, $grabs, $score, $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function projectionPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w59Words($count, implode("\0", $records), 9 * $count) ?? self::projectionPlanBatchPhp($records);
+    }
+
+    /** Trimmed optional `-` plus 1-18 digits; empty reads 0, anything else sets $invalid and reads 0. */
+    private static function w59Integer(string $field, bool &$invalid): int
+    {
+        $field = trim($field);
+        if ($field === '') {
+            return 0;
+        }
+        $negative = $field[0] === '-';
+        $digits = $negative ? substr($field, 1) : $field;
+        if ($digits === '' || \strlen($digits) > 18 || ! ctype_digit($digits)) {
+            $invalid = true;
+
+            return 0;
+        }
+
+        return $negative ? -(int) $digits : (int) $digits;
+    }
 }

@@ -730,4 +730,212 @@ final class ManticoreSchemaInspector
 
         return $settings;
     }
+
+    public const string W59_FFI_CDEF = 'int64_t nntmux_w595_schema_describe_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W59.5 parity test's QUALIFICATION). */
+    public const bool W59_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 59.5 routing and FFI cache, kept in function-local statics (no static properties, so every W59 class
+     * follows the same shape). Without $op it reports the routing; 'set' swaps the override for $val and returns the
+     * previous one; 'reset' replaces the cached handle with $val (null re-resolves, false disables); 'buffer' returns
+     * `[FFI, int64_t[], capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w59RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w59_5', self::W59_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W59_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW59RustFfi(): bool
+    {
+        return self::w59RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with describePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW59RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w59RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w59RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 59.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w59Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w59RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w595_schema_describe_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch `DESCRIBE` inspection over newline-separated lines: an expected `name:type` comma list, then rows
+     * `field\ttype[\tproperties]` (empty lines skipped). Seven words per record: `[columns, text_fields, attributes,
+     * missing, incompatible, id_present, flags]`. Every accepted row counts as a column; `text` types (ASCII
+     * case-insensitive) are text fields and every other row, or one whose properties contain `attribute`, an
+     * attribute. Each expected pair (empty pairs skipped) is missing without a row of that field, or incompatible when
+     * the last such row's type fails {@see typesAreCompatible()} (both case-folded). Flags: 1 row with one field
+     * (skipped), 2 row with an empty field name (skipped), 4 expected pair without `:` (skipped), 8 duplicate field,
+     * 16 no columns.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function describePlanBatch(array $records): array
+    {
+        return self::usesW59RustFfi() ? self::describePlanBatchNative($records) : self::describePlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function describePlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $lines = explode("\n", $record);
+            $spec = array_shift($lines);
+            $types = [];
+            $columns = $text = $attributes = $id = $flags = 0;
+            foreach ($lines as $line) {
+                if ($line === '') {
+                    continue;
+                }
+                $parts = explode("\t", $line);
+                if (\count($parts) < 2) {
+                    $flags |= 1;
+
+                    continue;
+                }
+                $field = $parts[0];
+                if ($field === '') {
+                    $flags |= 2;
+
+                    continue;
+                }
+                $type = strtolower($parts[1]);
+                if (isset($types[$field])) {
+                    $flags |= 8;
+                }
+                $types[$field] = $type;
+                $columns++;
+                if ($type === 'text') {
+                    $text++;
+                }
+                if ($type !== 'text' || stripos($parts[2] ?? '', 'attribute') !== false) {
+                    $attributes++;
+                }
+                if ($field === 'id') {
+                    $id = 1;
+                }
+            }
+            if ($columns === 0) {
+                $flags |= 16;
+            }
+            $missing = $incompatible = 0;
+            if ($spec !== '') {
+                foreach (explode(',', $spec) as $pair) {
+                    if ($pair === '') {
+                        continue;
+                    }
+                    $colon = strpos($pair, ':');
+                    if ($colon === false) {
+                        $flags |= 4;
+
+                        continue;
+                    }
+                    $name = substr($pair, 0, $colon);
+                    if (! isset($types[$name])) {
+                        $missing++;
+                    } elseif (! self::typesAreCompatible($types[$name], strtolower(substr($pair, $colon + 1)))) {
+                        $incompatible++;
+                    }
+                }
+            }
+            array_push($out, $columns, $text, $attributes, $missing, $incompatible, $id, $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function describePlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w59Words($count, implode("\0", $records), 7 * $count) ?? self::describePlanBatchPhp($records);
+    }
 }

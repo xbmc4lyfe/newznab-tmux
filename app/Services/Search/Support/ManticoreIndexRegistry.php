@@ -334,4 +334,221 @@ final class ManticoreIndexRegistry
 
         return $byTable;
     }
+
+    /** Table and prefix bytes {@see self::tableResolvePlanBatch()} accepts without flagging. */
+    private const string W59_TABLE_BYTES = 'abcdefghijklmnopqrstuvwxyz0123456789_';
+
+    public const string W59_FFI_CDEF = 'int64_t nntmux_w595_index_resolve_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W59.5 parity test's QUALIFICATION). */
+    public const bool W59_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 59.5 routing and FFI cache, kept in function-local statics (no static properties, so every W59 class
+     * follows the same shape). Without $op it reports the routing; 'set' swaps the override for $val and returns the
+     * previous one; 'reset' replaces the cached handle with $val (null re-resolves, false disables); 'buffer' returns
+     * `[FFI, int64_t[], capacity]` with room for at least $val words, or null without the library; 'registry' returns
+     * the cached `[newline-joined logical names, logical => 1-based position]` lookup.
+     */
+    private static function w59RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+        static $registry = null;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w59_5', self::W59_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            case 'registry':
+                if ($registry === null) {
+                    $logicals = array_map('strval', array_keys(self::definitions()));
+                    $positions = [];
+                    foreach ($logicals as $position => $logical) {
+                        $positions[$logical] ??= $position + 1;
+                    }
+                    $registry = [implode("\n", $logicals), $positions];
+                }
+
+                return $registry;
+            default:
+                return $enabled ?? self::W59_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW59RustFfi(): bool
+    {
+        return self::w59RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with tableResolvePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW59RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w59RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w59RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 59.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w59Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w59RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w595_index_resolve_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Logical names and their 1-based positions from {@see definitions()}, cached for the batch helpers.
+     *
+     * @return array{string, array<string, int>}
+     */
+    private static function w59Registry(): array
+    {
+        /** @var array{string, array<string, int>} $registry */
+        $registry = self::w59RustFfiState('registry');
+
+        return $registry;
+    }
+
+    /**
+     * Batch table resolution over `name\tprefix` against the logical names of {@see definitions()}. Six words per
+     * record: `[kind, index, base_len, physical_len, physical_hash, flags]`. A non-empty prefix the name starts with is
+     * stripped; a remaining `_rt` suffix makes the name physical (kind 2), otherwise logical (kind 1). Index is the
+     * 1-based definition position of the base name (0 unknown); a resolved name's physical table is
+     * `prefix.base._rt`, with its length and FNV-1a 32 hash (both 0 when unresolved). An empty base is kind 0. Flags:
+     * 1 prefix stripped, 2 unknown base, 4 empty base, 8 prefix over 32 bytes or outside `[a-z0-9_]`, 16 name outside
+     * `[a-z0-9_]`, 32 not exactly two fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function tableResolvePlanBatch(array $records): array
+    {
+        return self::usesW59RustFfi() ? self::tableResolvePlanBatchNative($records) : self::tableResolvePlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function tableResolvePlanBatchPhp(array $records): array
+    {
+        $positions = self::w59Registry()[1];
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 2 ? 0 : 32;
+            $name = $fields[0];
+            $prefix = $fields[1] ?? '';
+            $prefixLength = \strlen($prefix);
+            if ($prefixLength > 32 || strspn($prefix, self::W59_TABLE_BYTES) !== $prefixLength) {
+                $flags |= 8;
+            }
+            if (strspn($name, self::W59_TABLE_BYTES) !== \strlen($name)) {
+                $flags |= 16;
+            }
+            $stripped = $name;
+            if ($prefix !== '' && str_starts_with($name, $prefix)) {
+                $stripped = substr($name, $prefixLength);
+                $flags |= 1;
+            }
+            $kind = 1;
+            $base = $stripped;
+            if (str_ends_with($stripped, '_rt')) {
+                $kind = 2;
+                $base = substr($stripped, 0, -3);
+            }
+            $index = 0;
+            if ($base === '') {
+                $flags |= 4;
+                $kind = 0;
+            } else {
+                $index = $positions[$base] ?? 0;
+                if ($index === 0) {
+                    $flags |= 2;
+                }
+            }
+            if ($index > 0) {
+                $physical = $prefix.$base.'_rt';
+                array_push($out, $kind, $index, \strlen($base), \strlen($physical), (int) hexdec(hash('fnv1a32', $physical)), $flags);
+            } else {
+                array_push($out, $kind, 0, \strlen($base), 0, 0, $flags);
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function tableResolvePlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        // The first record is the logical name header; it produces no words.
+        return self::w59Words($count + 1, self::w59Registry()[0]."\0".implode("\0", $records), 6 * $count)
+            ?? self::tableResolvePlanBatchPhp($records);
+    }
 }
