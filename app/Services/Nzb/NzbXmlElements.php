@@ -7,6 +7,8 @@ namespace App\Services\Nzb;
 use App\Exceptions\NzbPasswordMetadataRejected;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
+use Throwable;
 
 /** Traverse accepted NZB elements by namespace URI. */
 final class NzbXmlElements
@@ -70,7 +72,7 @@ final class NzbXmlElements
             }
 
             return unserialize(FFI::string($output, $written), ['allowed_classes' => false]);
-        } catch (\Throwable) {
+        } catch (Throwable) {
             return null;
         }
     }
@@ -305,5 +307,324 @@ final class NzbXmlElements
 
         return ['types' => $count, 'invalid' => $invalid, 'password' => $password, 'password_like' => $like, 'empty' => $empty,
             'other' => $other, 'rejected' => $rejected];
+    }
+
+    // ---- Wave 60.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 10.24x/10.76x, uncommon 9.61x/9.77x); see RustNzbUploadStagingXmlElementsPar2RecoveryResultFingerprintStoreW60ParityTest. */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    private const string W60_XML_ELEMENTS_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w602_nzb_xml_element_summary_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W60_XML_ELEMENTS_TAIL = 15;
+
+    /**
+     * Wave 60 routing, binding and output buffer, kept in function-local statics (no new static properties).
+     * Operations: null reads the routing override, 'set' replaces it (returning the previous
+     * one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]` with room
+     * for at least $val words (null without the library).
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w60', self::W60_XML_ELEMENTS_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w60RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        $enabled = self::w60RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with summarizeXmlElementBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w60Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w60Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /** 1 to $max ASCII digits as an integer, otherwise null. */
+    private static function w60Digits(string $value, int $max): ?int
+    {
+        $length = \strlen($value);
+
+        return $length > 0 && $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : null;
+    }
+
+    private const string W60_NAME_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_:.-';
+
+    private const string W60_WS = " \t\r\n";
+
+    /** Bytes a segment message-id must not contain: controls, space, angle brackets and DEL. */
+    private const string W60_MSGID_STOP = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20<>\x7f";
+
+    /** Element local name => kind; any other name is kind 9. */
+    private const array W60_KINDS = ['file' => 1, 'groups' => 2, 'group' => 3, 'segments' => 4, 'segment' => 5, 'meta' => 6, 'head' => 7, 'nzb' => 8];
+
+    /** Kind => attributes it must carry. */
+    private const array W60_REQUIRED = [1 => ['poster', 'date', 'subject'], 5 => ['bytes', 'number'], 6 => ['type']];
+
+    /**
+     * Per element string `kind | malformed << 4 | missing << 5 | bad_number << 6 | duplicate << 7 |
+     * unclosed << 8 | self_closing << 9 | bad_text << 10 | min(attributes, 7) << 11 |
+     * min(number, 0xFFFFF) << 14 | min(bytes, 0x1FFFFFFF) << 34`. The start tag is `<` and a
+     * `[A-Za-z0-9_:.-]+` name whose local part (after the last colon) selects the kind: 1 file, 2
+     * groups, 3 group, 4 segments, 5 segment, 6 meta, 7 head, 8 nzb, 9 other; then whitespace-led
+     * `name = "value"` (or single-quoted) attributes, the first of a repeated name winning, up to
+     * `>` or `/>`. Anything else is malformed (kind 0, no other bits). Missing: a file without
+     * poster/date/subject, a segment without bytes/number or a meta without type. Bad number: a
+     * file date or segment bytes that is not 1-18 digits, or a segment number that is not 1-18
+     * digits of at least 1. Unclosed: text after `/>`, or no last `</name>` (trailing whitespace
+     * allowed). Bad text: a segment message-id (trimmed content) that is empty or holds controls,
+     * spaces, `<`, `>` or DEL, or a group name that is empty or holds whitespace. Number and bytes
+     * are set for well-numbered segments only. Then the per-kind counts, the valid count (no flag
+     * set), the saturating bytes and largest number of valid segments, the valid password metas
+     * and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function summarizeXmlElementBatchPhp(array $rows): array
+    {
+        $out = [];
+        $kinds = array_fill(0, 10, 0);
+        $valid = $bytes = $maxNumber = $passwords = 0;
+        foreach ($rows as $row) {
+            $element = self::w60Element((string) $row);
+            if ($element === null) {
+                $kinds[0]++;
+                $out[] = 1 << 4;
+
+                continue;
+            }
+            [$word, $kind, $isValid, $segmentBytes, $number, $password] = $element;
+            $kinds[$kind]++;
+            if ($isValid) {
+                $valid++;
+                if ($kind === 5) {
+                    $bytes = $bytes > PHP_INT_MAX - $segmentBytes ? PHP_INT_MAX : $bytes + $segmentBytes;
+                    $maxNumber = max($maxNumber, $number);
+                }
+            }
+            $passwords += $password ? 1 : 0;
+            $out[] = $word;
+        }
+        array_push($out, ...$kinds);
+        array_push($out, $valid, $bytes, $maxNumber, $passwords);
+        $out[] = self::w60Digest($out);
+
+        return $out;
+    }
+
+    /** @return array{int, int, bool, int, int, bool}|null word, kind, valid, bytes, number and password, or null when malformed */
+    private static function w60Element(string $s): ?array
+    {
+        $n = \strlen($s);
+        if ($n < 2 || $s[0] !== '<') {
+            return null;
+        }
+        $length = strspn($s, self::W60_NAME_CHARS, 1);
+        if ($length === 0) {
+            return null;
+        }
+        $name = substr($s, 1, $length);
+        $colon = strrpos($name, ':');
+        $local = $colon === false ? $name : substr($name, $colon + 1);
+        if ($local === '') {
+            return null;
+        }
+        $kind = self::W60_KINDS[$local] ?? 9;
+        $i = 1 + $length;
+        $attributes = [];
+        $count = 0;
+        $duplicate = false;
+        while (true) {
+            $ws = strspn($s, self::W60_WS, $i);
+            $i += $ws;
+            if ($i >= $n) {
+                return null;
+            }
+            if ($s[$i] === '>') {
+                $i++;
+                $selfClosing = false;
+
+                break;
+            }
+            if ($s[$i] === '/') {
+                if ($i + 1 < $n && $s[$i + 1] === '>') {
+                    $i += 2;
+                    $selfClosing = true;
+
+                    break;
+                }
+
+                return null;
+            }
+            $attributeLength = $ws === 0 ? 0 : strspn($s, self::W60_NAME_CHARS, $i);
+            if ($attributeLength === 0) {
+                return null;
+            }
+            $attribute = substr($s, $i, $attributeLength);
+            $i += $attributeLength;
+            $i += strspn($s, self::W60_WS, $i);
+            if ($i >= $n || $s[$i] !== '=') {
+                return null;
+            }
+            $i++;
+            $i += strspn($s, self::W60_WS, $i);
+            if ($i >= $n || ($s[$i] !== '"' && $s[$i] !== "'")) {
+                return null;
+            }
+            $end = strpos($s, $s[$i], $i + 1);
+            if ($end === false) {
+                return null;
+            }
+            $count++;
+            if (isset($attributes[$attribute])) {
+                $duplicate = true;
+            } else {
+                $attributes[$attribute] = substr($s, $i + 1, $end - $i - 1);
+            }
+            $i = $end + 1;
+        }
+        if ($selfClosing) {
+            $text = '';
+            $unclosed = strspn($s, self::W60_WS, $i) !== $n - $i;
+        } else {
+            $close = $i < $n ? strrpos($s, '</', $i) : false;
+            $text = $close === false ? substr($s, $i) : substr($s, $i, $close - $i);
+            $unclosed = $close === false || rtrim(substr($s, $close + 2), self::W60_WS) !== $name.'>';
+        }
+        $text = trim($text, self::W60_WS);
+        $badText = match ($kind) {
+            5 => $text === '' || strcspn($text, self::W60_MSGID_STOP) !== \strlen($text),
+            3 => $text === '' || strcspn($text, self::W60_WS) !== \strlen($text),
+            default => false,
+        };
+        $missing = false;
+        foreach (self::W60_REQUIRED[$kind] ?? [] as $required) {
+            $missing = $missing || ! isset($attributes[$required]);
+        }
+        $badNumber = false;
+        $number = $bytes = 0;
+        if (! $missing && $kind === 1) {
+            $badNumber = self::w60Digits($attributes['date'], 18) === null;
+        } elseif (! $missing && $kind === 5) {
+            $parsedBytes = self::w60Digits($attributes['bytes'], 18);
+            $parsedNumber = self::w60Digits($attributes['number'], 18);
+            if ($parsedBytes === null || $parsedNumber === null || $parsedNumber < 1) {
+                $badNumber = true;
+            } else {
+                [$bytes, $number] = [$parsedBytes, $parsedNumber];
+            }
+        }
+        $valid = ! ($missing || $badNumber || $duplicate || $unclosed || $badText);
+        $word = $kind | (int) $missing << 5 | (int) $badNumber << 6 | (int) $duplicate << 7 | (int) $unclosed << 8 | (int) $selfClosing << 9
+            | (int) $badText << 10 | min($count, 7) << 11 | min($number, 0xFFFFF) << 14 | min($bytes, 0x1FFFFFFF) << 34;
+
+        return [$word, $kind, $valid, $bytes, $number, $kind === 6 && $valid && $attributes['type'] === 'password'];
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function summarizeXmlElementBatch(array $rows): array
+    {
+        return self::usesW60RustFfi() ? self::summarizeXmlElementBatchNative($rows) : self::summarizeXmlElementBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function summarizeXmlElementBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W60_XML_ELEMENTS_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w60RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::summarizeXmlElementBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W60_XML_ELEMENTS_FFI_CDEF.)
+            $written = $ffi->nntmux_w602_nzb_xml_element_summary_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w60Words($written, $out, $words) ?? self::summarizeXmlElementBatchPhp($rows);
     }
 }
