@@ -9,6 +9,7 @@ use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -623,5 +624,278 @@ CDEF;
         }
 
         return self::$w433RustFfiHandle === false ? null : self::$w433RustFfiHandle;
+    }
+
+    // ========================================================================
+    // WAVE 61.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 7.99x, p99 6.18x; uncommon mean 7.47x, p99 5.05x); see RustCategorizersMiscMovieMusicPcAnimeProcessorW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    public const string W61_MUSIC_CATEGORIZER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w611_music_token_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w61MusicTokenBatch(). */
+    public const int W61_MUSIC_CATEGORIZER_TRAILER = 32;
+
+    /**
+     * Music token flags: 1 lossless, 2 MP3, 4 other lossy, 8 audiobook, 16 music video, 32 podcast, 64 foreign,
+     * 128 discography, 256 source, 512 scene tag, 1024 single, 2048 video resolution/codec, 4096 bitrate and
+     * 32768 various artists (4096 for 2-4 digits + `kbps`/`kbit`/`k`, 8192 for 1-3 digits + `khz` or 1-2 digits +
+     * `bit` and 16384 for a 19xx/20xx year are detected by shape).
+     *
+     * @var array<string, int>
+     */
+    public const array W61_MUSIC_TOKEN_FLAGS = ['flac' => 1, 'alac' => 1, 'ape' => 1, 'wav' => 1, 'lossless' => 1, 'hires' => 1, 'mp3' => 2,
+        'aac' => 4, 'ogg' => 4, 'opus' => 4, 'm4a' => 4, 'wma' => 4, 'vorbis' => 4, 'audiobook' => 8, 'audiobooks' => 8, 'unabridged' => 8,
+        'abridged' => 8, 'audible' => 8, 'narrated' => 8, 'm4b' => 8, 'mvid' => 16, 'concert' => 16, 'musicvideo' => 16, 'videoclip' => 16,
+        'videoclips' => 16, 'podcast' => 32, 'podcasts' => 32, 'radio' => 32, 'broadcast' => 32, 'german' => 64, 'french' => 64, 'dutch' => 64,
+        'spanish' => 64, 'italian' => 64, 'swedish' => 64, 'deutsch' => 64, 'latino' => 64, 'kpop' => 64, 'jpop' => 64, 'cpop' => 64,
+        'chanson' => 64, 'schlager' => 64, 'discography' => 128, 'anthology' => 128, 'boxset' => 128, 'collection' => 128, 'cdm' => 1280,
+        'cds' => 1280, 'cd' => 256, 'cdda' => 256, 'vinyl' => 256, 'sacd' => 256, 'web' => 256, 'lp' => 256, 'cassette' => 256, 'tape' => 256,
+        'cdr' => 256, 'retail' => 512, 'proper' => 512, 'repack' => 512, 'int' => 512, 'single' => 1024, 'ep' => 1024, 'maxi' => 1024,
+        '720p' => 2048, '1080p' => 2048, '2160p' => 2048, 'x264' => 2048, 'x265' => 2048, 'vbr' => 4096, 'cbr' => 4096, 'va' => 32768,
+        'various' => 32768];
+
+    /**
+     * Category per w61MusicTokenBatch() rule.
+     *
+     * @var list<int>
+     */
+    public const array W61_MUSIC_RULE_CATEGORIES = [0, Category::MUSIC_AUDIOBOOK, Category::MUSIC_PODCAST, Category::MUSIC_FOREIGN,
+        Category::MUSIC_VIDEO, Category::MUSIC_LOSSLESS, Category::MUSIC_MP3, Category::MUSIC_OTHER];
+
+    public static function usesW61RustFfi(): bool
+    {
+        $override = self::w61RustFfiState();
+
+        return \is_bool($override) ? $override : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the MusicCategorizer Wave 61 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 61.1 music token, bitrate and format plans. Each item is `releaseName|categorizeForeign` (the name trimmed;
+     * the switch w61Truthy()). Per item `rule | format << 3 | flags << 5 | min(bitrate, 4095) << 21 | yearCode << 33
+     * | confidenceMilli << 41 | min(tokens, 63) << 51 | min(nameLength, 63) << 57`: flags OR the
+     * W61_MUSIC_TOKEN_FLAGS of every `[^a-z0-9]+`-separated lowercase token plus the shape flags; the bitrate is the
+     * largest bitrate token; the format is 1 lossless, 2 MP3, 3 other lossy or 0; the year code is the first
+     * 19xx/20xx token minus 1899 (0 none). The rule (W61_MUSIC_RULE_CATEGORIES), in order, is 1 audiobook (0.9 with a
+     * lossless or MP3 format, else 0.85), 2 podcast (0.85), 3 foreign (switch on with a format, 0.8), 4 video (the
+     * video flag, or a video resolution with a format or discography, 0.85), 5 lossless (0.95 with a sample rate or
+     * bit depth, else 0.9), 6 MP3 (0.9 from 192 kbps, else 0.8), 7 other (other lossy, or discography, source or
+     * single with a year, 0.7), else 0. Then eight rule, four format and sixteen flag counts, the bitrate sum, the
+     * largest bitrate, the confidence sum and the distinct years.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61MusicTokenBatch(array $items): array
+    {
+        return self::usesW61RustFfi() ? self::w61MusicTokenBatchNative($items) : self::w61MusicTokenBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61MusicTokenBatchNative(array $items): array
+    {
+        return self::w61Invoke($items, \count($items) + self::W61_MUSIC_CATEGORIZER_TRAILER) ?? self::w61MusicTokenBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61MusicTokenBatchPhp(array $items): array
+    {
+        $out = [];
+        $rules = array_fill(0, 8, 0);
+        $formats = [0, 0, 0, 0];
+        $flagCounts = array_fill(0, 16, 0);
+        $bitrateSum = $maxBitrate = $confidenceSum = 0;
+        $years = [];
+        foreach ($items as $item) {
+            $f = explode('|', (string) $item, 2) + ['', ''];
+            $name = trim($f[0]);
+            $foreign = self::w61Truthy($f[1]);
+            $tokens = $name === '' ? [] : (preg_split('/[^a-z0-9]+/', strtolower($name), -1, PREG_SPLIT_NO_EMPTY) ?: []);
+            $flags = $bitrate = $year = 0;
+            foreach ($tokens as $token) {
+                $flags |= self::W61_MUSIC_TOKEN_FLAGS[$token] ?? 0;
+                $tokenLength = \strlen($token);
+                $digits = strspn($token, '0123456789');
+                $suffix = substr($token, $digits);
+                if ($digits >= 2 && $digits <= 4 && ($suffix === 'kbps' || $suffix === 'kbit' || $suffix === 'k')) {
+                    $flags |= 4096;
+                    $bitrate = max($bitrate, (int) substr($token, 0, $digits));
+                }
+                if (($digits >= 1 && $digits <= 3 && $suffix === 'khz') || ($digits >= 1 && $digits <= 2 && $suffix === 'bit')) {
+                    $flags |= 8192;
+                }
+                if ($tokenLength === 4 && strspn($token, '0123456789') === 4 && ($token[0].$token[1] === '19' || $token[0].$token[1] === '20')) {
+                    $flags |= 16384;
+                    if ($year === 0) {
+                        $year = (int) $token - 1899;
+                    }
+                }
+            }
+            $format = ($flags & 1) !== 0 ? 1 : (($flags & 2) !== 0 ? 2 : (($flags & 4) !== 0 ? 3 : 0));
+            [$rule, $confidence] = match (true) {
+                ($flags & 8) !== 0 => [1, $format === 1 || $format === 2 ? 900 : 850],
+                ($flags & 32) !== 0 => [2, 850],
+                $foreign && ($flags & 64) !== 0 && $format !== 0 => [3, 800],
+                ($flags & 16) !== 0 || (($flags & 2048) !== 0 && ($format !== 0 || ($flags & 128) !== 0)) => [4, 850],
+                $format === 1 => [5, ($flags & 8192) !== 0 ? 950 : 900],
+                $format === 2 => [6, $bitrate >= 192 ? 900 : 800],
+                $format === 3 || (($flags & (128 | 256 | 1024)) !== 0 && $year !== 0) => [7, 700],
+                default => [0, 0],
+            };
+            $rules[$rule]++;
+            $formats[$format]++;
+            for ($i = 0; $i < 16; $i++) {
+                $flagCounts[$i] += $flags >> $i & 1;
+            }
+            $bitrateSum += $bitrate;
+            $maxBitrate = max($maxBitrate, $bitrate);
+            $confidenceSum += $confidence;
+            if ($year !== 0) {
+                $years[$year] = true;
+            }
+            $out[] = $rule | $format << 3 | $flags << 5 | min($bitrate, 4095) << 21 | $year << 33 | $confidence << 41
+                | min(\count($tokens), 63) << 51 | min(\strlen($name), 63) << 57;
+        }
+        array_push($out, ...$rules, ...$formats, ...$flagCounts);
+        array_push($out, $bitrateSum, $maxBitrate, $confidenceSum, \count($years));
+
+        return $out;
+    }
+
+    /** `1`, `true`, `yes` or `on` (trimmed, case-insensitive). */
+    private static function w61Truthy(string $raw): bool
+    {
+        return \in_array(strtolower(trim($raw)), ['1', 'true', 'yes', 'on'], true);
+    }
+
+    /**
+     * Wave 61 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w611', self::W61_MUSIC_CATEGORIZER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 61.1 MusicCategorizer export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w61Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w61RustFfiState('ffi');
+            $out = self::w61RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w61RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W61_MUSIC_CATEGORIZER_FFI_CDEF.)
+            $written = $ffi->nntmux_w611_music_token_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

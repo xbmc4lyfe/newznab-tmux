@@ -10,6 +10,7 @@ use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use App\Traits\DetectsHashedNames;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -636,5 +637,278 @@ class MiscCategorizer extends AbstractCategorizer
         }
 
         return self::$w423RustFfiHandle === false ? null : self::$w423RustFfiHandle;
+    }
+
+    // ========================================================================
+    // WAVE 61.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 9.84x, p99 7.06x; uncommon mean 7.84x, p99 5.56x); see RustCategorizersMiscMovieMusicPcAnimeProcessorW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    public const string W61_MISC_CATEGORIZER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w611_misc_token_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w61MiscTokenBatch(). */
+    public const int W61_MISC_CATEGORIZER_TRAILER = 29;
+
+    /**
+     * Misc token flags: 1 dataset/dump, 2 sample/proof, 4 password, 8 repost, 16 part/volume and 128 media signal
+     * (16 also for `part` + 1-3 digits, 32 for a 16+ character hex token with a digit and a letter and 64 for a
+     * vowel-free (`y` counts as a vowel) token of 10+ characters with 6+ letters are detected by shape).
+     *
+     * @var array<string, int>
+     */
+    public const array W61_MISC_TOKEN_FLAGS = ['dataset' => 1, 'datasets' => 1, 'dump' => 1, 'backup' => 1, 'database' => 1, 'sql' => 1,
+        'csv' => 1, 'sample' => 2, 'proof' => 2, 'password' => 4, 'passworded' => 4, 'pw' => 4, 'repost' => 8, 'reup' => 8, 'reupload' => 8,
+        'part' => 16, 'vol' => 16, 'volume' => 16, '480p' => 128, '720p' => 128, '1080p' => 128, '2160p' => 128, 'x264' => 128, 'x265' => 128,
+        'h264' => 128, 'h265' => 128, 'hevc' => 128, 'bluray' => 128, 'webrip' => 128, 'webdl' => 128, 'hdtv' => 128, 'dvdrip' => 128,
+        'bdrip' => 128, 'flac' => 128, 'mp3' => 128, 'aac' => 128, 'ac3' => 128, 'dts' => 128];
+
+    /**
+     * Extension classes: 1 archive, 2 verification, 3 index/info and 4 data (a three-digit split extension is 1, any
+     * other 1-5 alphanumeric extension is 5).
+     *
+     * @var array<string, int>
+     */
+    public const array W61_MISC_EXTENSIONS = ['rar' => 1, 'zip' => 1, '7z' => 1, 'tar' => 1, 'gz' => 1, 'bz2' => 1, 'xz' => 1, 'tgz' => 1,
+        'par2' => 2, 'sfv' => 2, 'md5' => 2, 'nfo' => 3, 'nzb' => 3, 'txt' => 3, 'csv' => 4, 'sql' => 4, 'json' => 4, 'xml' => 4, 'db' => 4];
+
+    public static function usesW61RustFfi(): bool
+    {
+        $override = self::w61RustFfiState();
+
+        return \is_bool($override) ? $override : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the MiscCategorizer Wave 61 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 61.1 misc token and length plans. Each item is a release name (trimmed). Per item `rule | hashKind << 3 |
+     * extension << 6 | flags << 9 | min(transitions, 63) << 17 | min(vowels, 255) << 23 | min(digits, 255) << 31 |
+     * confidenceMilli << 39 | min(tokens, 63) << 49 | min(nameLength, 255) << 55`: the hash kind is 5 for a UUID,
+     * else for an all-hex name 1 MD5 (32), 2 SHA-1 (40), 3 SHA-256 (64) or 4 another length of 16+, else 0; the
+     * extension (after the last `.`, 1-5 alphanumerics, case-insensitive) is 0 none or its W61_MISC_EXTENSIONS
+     * class; flags OR the W61_MISC_TOKEN_FLAGS of every `[^a-z0-9]+`-separated lowercase token plus the shape
+     * flags; vowels (aeiou) and digits are byte counts and transitions count letter/digit boundaries. The rule, in
+     * order, is 1 hash (0.95 for MD5/SHA, else 0.85), 2 zero-vowel gibberish without a media signal (0.78), 3 an
+     * obfuscated name of 20+ bytes with no `._ -` separator and 4+ transitions (0.7), 4 archive or verification
+     * extension (0.6), 5 dataset (flag or data extension, 0.65), else 0. Then six rule, six hash kind, six
+     * extension and eight flag counts, the name length sum, the largest transition count and the distinct valid
+     * extensions.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61MiscTokenBatch(array $items): array
+    {
+        return self::usesW61RustFfi() ? self::w61MiscTokenBatchNative($items) : self::w61MiscTokenBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61MiscTokenBatchNative(array $items): array
+    {
+        return self::w61Invoke($items, \count($items) + self::W61_MISC_CATEGORIZER_TRAILER) ?? self::w61MiscTokenBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61MiscTokenBatchPhp(array $items): array
+    {
+        $out = [];
+        $rules = $hashes = $extensions = [0, 0, 0, 0, 0, 0];
+        $flagCounts = array_fill(0, 8, 0);
+        $lengthSum = $maxTransitions = 0;
+        $distinct = [];
+        foreach ($items as $item) {
+            $name = trim((string) $item);
+            $length = \strlen($name);
+            $hash = 0;
+            if ($length === 36 && $name[8] === '-' && $name[13] === '-' && $name[18] === '-' && $name[23] === '-'
+                && strspn(str_replace('-', '', $name), '0123456789abcdefABCDEF') === 32) {
+                $hash = 5;
+            } elseif ($length > 0 && strspn($name, '0123456789abcdefABCDEF') === $length) {
+                $hash = match ($length) {
+                    32 => 1,
+                    40 => 2,
+                    64 => 3,
+                    default => $length >= 16 ? 4 : 0,
+                };
+            }
+            $dot = strrpos($name, '.');
+            $ext = $dot === false ? '' : strtolower(substr($name, $dot + 1));
+            $extLength = \strlen($ext);
+            $extension = 0;
+            if ($extLength >= 1 && $extLength <= 5 && strspn($ext, 'abcdefghijklmnopqrstuvwxyz0123456789') === $extLength) {
+                $distinct[$ext] = true;
+                $extension = self::W61_MISC_EXTENSIONS[$ext] ?? ($extLength === 3 && strspn($ext, '0123456789') === 3 ? 1 : 5);
+            }
+            $tokens = $name === '' ? [] : (preg_split('/[^a-z0-9]+/', strtolower($name), -1, PREG_SPLIT_NO_EMPTY) ?: []);
+            $flags = 0;
+            foreach ($tokens as $token) {
+                $flags |= self::W61_MISC_TOKEN_FLAGS[$token] ?? 0;
+                $tokenLength = \strlen($token);
+                if ($tokenLength >= 5 && $tokenLength <= 7 && str_starts_with($token, 'part') && strspn($token, '0123456789', 4) === $tokenLength - 4) {
+                    $flags |= 16;
+                }
+                if ($tokenLength >= 16 && strspn($token, '0123456789abcdef') === $tokenLength && strpbrk($token, 'abcdef') !== false
+                    && strpbrk($token, '0123456789') !== false) {
+                    $flags |= 32;
+                }
+                if ($tokenLength >= 10 && strpbrk($token, 'aeiouy') === false && \strlen((string) preg_replace('/[0-9]+/', '', $token)) >= 6) {
+                    $flags |= 64;
+                }
+            }
+            $vowels = (int) preg_match_all('/[aeiouAEIOU]/', $name);
+            $digits = (int) preg_match_all('/[0-9]/', $name);
+            $transitions = (int) preg_match_all('/(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])/', $name);
+            [$rule, $confidence] = match (true) {
+                $hash !== 0 => [1, $hash <= 3 ? 950 : 850],
+                ($flags & 64) !== 0 && ($flags & 128) === 0 => [2, 780],
+                $length >= 20 && strpbrk($name, '._ -') === false && $transitions >= 4 => [3, 700],
+                $extension === 1 || $extension === 2 => [4, 600],
+                ($flags & 1) !== 0 || $extension === 4 => [5, 650],
+                default => [0, 0],
+            };
+            $rules[$rule]++;
+            $hashes[$hash]++;
+            $extensions[$extension]++;
+            for ($i = 0; $i < 8; $i++) {
+                $flagCounts[$i] += $flags >> $i & 1;
+            }
+            $lengthSum += $length;
+            $maxTransitions = max($maxTransitions, $transitions);
+            $out[] = $rule | $hash << 3 | $extension << 6 | $flags << 9 | min($transitions, 63) << 17 | min($vowels, 255) << 23
+                | min($digits, 255) << 31 | $confidence << 39 | min(\count($tokens), 63) << 49 | min($length, 255) << 55;
+        }
+        array_push($out, ...$rules, ...$hashes, ...$extensions, ...$flagCounts);
+        array_push($out, $lengthSum, $maxTransitions, \count($distinct));
+
+        return $out;
+    }
+
+    /**
+     * Wave 61 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w611', self::W61_MISC_CATEGORIZER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 61.1 MiscCategorizer export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w61Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w61RustFfiState('ffi');
+            $out = self::w61RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w61RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W61_MISC_CATEGORIZER_FFI_CDEF.)
+            $written = $ffi->nntmux_w611_misc_token_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
