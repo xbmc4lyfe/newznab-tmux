@@ -23,6 +23,7 @@ use App\Services\Releases\Verification\NzbManifestReader;
 use App\Support\RustPipelineLibrary;
 use App\Support\Utf8;
 use FFI;
+use FFI\CData;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\LockTimeoutException;
@@ -441,20 +442,7 @@ class NzbImportService
 
     public function deriveReleaseNameFromNzbPathPhp(string $path): string
     {
-        $name = basename($path);
-
-        // Strip trailing .nzb or .nzb.gz (case-insensitive).
-        $name = preg_replace('/\.nzb(\.gz)?$/i', '', $name) ?? $name;
-
-        // Strip one trailing known media/container extension from the allow-list.
-        $name = preg_replace(
-            '/\.(mkv|mp4|avi|mov|wmv|flv|m4v|ts|webm|mpg|mpeg|iso|m2ts|ogm|divx|vob)$/i',
-            '',
-            $name
-        ) ?? $name;
-
-        // Tidy up any trailing dots/whitespace left behind.
-        return rtrim($name, ". \t\n\r\0\x0B");
+        return self::w56ReleaseName($path);
     }
 
     public static function deriveReleaseNameFromNzbPathNative(string $path): ?string
@@ -1201,5 +1189,208 @@ class NzbImportService
     {
         /** @var array{results: int, inserted: int, queued: int, metadata_ignored: int, metadata_deferred: int, duplicate: int, blacklisted: int, nogroup: int, failed: int, unknown: int, inserted_bytes: int} */
         return ['results' => $results, ...array_combine(self::W412_IMPORT_STATUSES, $counts), 'unknown' => $unknown, 'inserted_bytes' => $bytes];
+    }
+
+    /** Wave 56.2 paired benchmarks decide this default; see RustDirectorySyncCoverageCreationImportNzbServiceW56ParityTest. */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    private const string W56_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w56_import_file_plan_batch(const char *paths, size_t paths_len, const char *heads, size_t heads_len, const char *ints, size_t ints_len, size_t count, int64_t batch_size, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 56 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w56', self::W56_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w56RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planImportFileBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w56Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w56Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /**
+     * Batch import file plan over NZB paths and their leading bytes. Per file: `flags |
+     * min(release name length, 0xFFFFFF) << 8 | crc32(release name) << 32` (the name
+     * deriveReleaseNameFromNzbPathPhp() gives) and the import batch (importable ordinal /
+     * max(1, $batchSize)) of importable files (-1 otherwise). Flags: 1 `.nzb` basename, 2
+     * `.nzb.gz` basename (both case-insensitive), 4 gzip magic, 8 XML head (`<` after an
+     * optional UTF-8 BOM and spaces, tabs or line breaks), 16 extension/content mismatch (a
+     * `.nzb.gz` without gzip magic or a `.nzb` with it), 32 repeats an earlier non-empty release
+     * name, 64 importable (an NZB extension, gzip or XML content, no mismatch, a new non-empty
+     * name). NZB files, gzip heads, importable files, duplicates, batches and the XXH64 digest
+     * of all earlier words follow.
+     *
+     * @param  list<string>  $paths
+     * @param  list<string>  $heads
+     * @return list<int>
+     */
+    public static function planImportFileBatch(array $paths, array $heads, int $batchSize = 100): array
+    {
+        return self::usesW56RustFfi() ? self::planImportFileBatchNative($paths, $heads, $batchSize) : self::planImportFileBatchPhp($paths, $heads, $batchSize);
+    }
+
+    /**
+     * @param  list<string>  $paths
+     * @param  list<string>  $heads
+     * @return list<int>
+     */
+    public static function planImportFileBatchPhp(array $paths, array $heads, int $batchSize = 100): array
+    {
+        $size = max(1, $batchSize);
+        $heads = array_values($heads);
+        $out = $seen = [];
+        $nzb = $gzip = $importable = $duplicates = 0;
+        foreach (array_values($paths) as $i => $path) {
+            $head = $heads[$i] ?? '';
+            $base = strtolower(basename($path));
+            $gz = str_ends_with($base, '.nzb.gz');
+            $plain = ! $gz && str_ends_with($base, '.nzb');
+            $magic = str_starts_with($head, "\x1f\x8b");
+            $xml = str_starts_with(ltrim(str_starts_with($head, "\xEF\xBB\xBF") ? substr($head, 3) : $head, " \t\n\r"), '<');
+            $mismatch = ($gz && ! $magic) || ($plain && $magic);
+            $name = self::w56ReleaseName($path);
+            $duplicate = $name !== '' && isset($seen[$name]);
+            if ($name !== '') {
+                $seen[$name] = true;
+            }
+            $ok = ($gz || $plain) && ($magic || $xml) && ! $mismatch && $name !== '' && ! $duplicate;
+            $flags = ($plain ? 1 : 0) | ($gz ? 2 : 0) | ($magic ? 4 : 0) | ($xml ? 8 : 0) | ($mismatch ? 16 : 0) | ($duplicate ? 32 : 0) | ($ok ? 64 : 0);
+            $nzb += $gz || $plain ? 1 : 0;
+            $gzip += $magic ? 1 : 0;
+            $duplicates += $duplicate ? 1 : 0;
+            array_push($out, $flags | min(\strlen($name), 0xFFFFFF) << 8 | crc32($name) << 32, $ok ? intdiv($importable, $size) : -1);
+            $importable += $ok ? 1 : 0;
+        }
+        array_push($out, $nzb, $gzip, $importable, $duplicates, $importable > 0 ? intdiv($importable - 1, $size) + 1 : 0);
+        $out[] = self::w56Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, PCRE's character tables are not
+     * the default (C) ones, a path holds a NUL byte or the columns are not lists of one length.
+     *
+     * @param  list<string>  $paths
+     * @param  list<string>  $heads
+     * @return list<int>
+     */
+    public static function planImportFileBatchNative(array $paths, array $heads, int $batchSize = 100): array
+    {
+        $count = \count($paths);
+        $words = 2 * $count + 6;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 || \count($heads) !== $count ? null : self::w56RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($paths) || ! array_is_list($heads) || ! NzbParserService::pcreUsesDefaultTables()) {
+            return self::planImportFileBatchPhp($paths, $heads, $batchSize);
+        }
+        $blob = implode("\0", $paths);
+        $headBlob = implode('', $heads);
+        $lengths = pack('P*', ...array_map(strlen(...), $heads));
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w56_import_file_plan_batch($blob, \strlen($blob), $headBlob, \strlen($headBlob), $lengths, \strlen($lengths), $count, $batchSize, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w56Words($written, $out, $words) ?? self::planImportFileBatchPhp($paths, $heads, $batchSize);
+    }
+
+    private static function w56ReleaseName(string $path): string
+    {
+        $name = basename($path);
+
+        // Strip trailing .nzb or .nzb.gz (case-insensitive).
+        $name = preg_replace('/\.nzb(\.gz)?$/i', '', $name) ?? $name;
+
+        // Strip one trailing known media/container extension from the allow-list.
+        $name = preg_replace(
+            '/\.(mkv|mp4|avi|mov|wmv|flv|m4v|ts|webm|mpg|mpeg|iso|m2ts|ogm|divx|vob)$/i',
+            '',
+            $name
+        ) ?? $name;
+
+        // Tidy up any trailing dots/whitespace left behind.
+        return rtrim($name, ". \t\n\r\0\x0B");
     }
 }
