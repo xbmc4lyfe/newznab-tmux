@@ -61793,3 +61793,1091 @@ mod w624_tests {
         assert_eq!(bad, -1);
     }
 }
+// =============================================================================
+// Wave 63.4: CandidateAdmission, CandidateHeaderInventory, CandidatePreparationService,
+// CandidateRepository and CandidateSampleBatch verification batch plan rows.
+// =============================================================================
+
+pub mod w634_batch {
+    use super::w574_batch::MAX_RECORDS;
+    use super::w594_batch::{fnv, split};
+    use super::w614_batch::trim;
+    use std::collections::{HashMap, HashSet};
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// Record body: blob values (field-major), the int64 columns, the record count, output.
+    type Body = fn(&[&[u8]], &[i64], usize, &mut [i64]);
+
+    /// Upper clamp for epoch-second timestamps.
+    pub(crate) const TIME_MAX: i64 = 1 << 40;
+
+    /// Per-value clamp for byte totals, so 2^24 records cannot overflow a sum.
+    pub(crate) const BYTES_MAX: i64 = 1 << 36;
+
+    /// Attempts at which admission and preparation stop retrying a candidate.
+    pub(crate) const MAX_ATTEMPTS: i64 = 8;
+
+    /// Age in seconds after which an incomplete candidate is admitted for partial publication.
+    pub(crate) const PARTIAL_AGE: i64 = 86_400;
+
+    /// CandidateRepository's claim window.
+    pub(crate) const CLAIM_WINDOW: i64 = 100;
+
+    /// CandidateSampleBatch's selected articles per claim.
+    pub(crate) const SAMPLES_PER_CLAIM: i64 = 4;
+
+    /// Stored reason bytes.
+    pub(crate) const REASON_BYTES: usize = 2000;
+
+    const PARTIAL_DEFERRED: &[u8] = b"Partial publication deferred: ";
+
+    const FNV_BASIS: i64 = 2_166_136_261;
+
+    /// Column `k` of the packed int64 words for record `i`.
+    #[inline(always)]
+    fn col(ints: &[i64], count: usize, k: usize, i: usize) -> i64 {
+        ints[k * count + i]
+    }
+
+    #[inline(always)]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point to `len` readable bytes unless `len` is zero.
+    unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Validate the frame, split the blob and run `body`. Returns the words written, -1 for a
+    /// malformed frame or panic and `-needed` when `out_cap` is too small.
+    ///
+    /// # Safety
+    ///
+    /// See the exported functions.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        fields: usize,
+        columns: usize,
+        words: usize,
+        trailer: usize,
+        body: Body,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(blob as usize, blob_len, out as usize, out_bytes)
+                || overlaps(twin as usize, twin_len, out as usize, out_bytes)
+                || overlaps(ints as usize, ints_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(blob), Some(twin), Some(ints)) = (
+                unsafe { bytes(blob, blob_len) },
+                unsafe { bytes(twin, twin_len) },
+                unsafe { bytes(ints, ints_len) },
+            ) else {
+                return -1;
+            };
+            if ints.len() != count * columns * 8 {
+                return -1;
+            }
+            if count == 0 {
+                return if blob.is_empty() && twin.is_empty() {
+                    0
+                } else {
+                    -1
+                };
+            }
+            let all: Vec<i64> = ints
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|w| i64::from_le_bytes(*w))
+                .collect();
+            let mut values: Vec<&[u8]> = Vec::with_capacity(count * fields);
+            if !split(blob, twin, count * fields, &mut values) {
+                return -1;
+            }
+            let need = count * words + trailer;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from every input.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            body(&values, &all, count, out);
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Word-at-a-time multiplicative hasher for the per-batch duplicate sets and maps.
+    #[derive(Default)]
+    struct Fx(u64);
+
+    impl Fx {
+        #[inline(always)]
+        fn mix(&mut self, w: u64) {
+            self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+
+    impl Hasher for Fx {
+        #[inline(always)]
+        fn write(&mut self, bytes: &[u8]) {
+            let (chunks, tail) = bytes.as_chunks::<8>();
+            for c in chunks {
+                self.mix(u64::from_le_bytes(*c));
+            }
+            if !tail.is_empty() {
+                let mut w = [0u8; 8];
+                w[..tail.len()].copy_from_slice(tail);
+                self.mix(u64::from_le_bytes(w));
+            }
+        }
+
+        #[inline(always)]
+        fn write_u64(&mut self, n: u64) {
+            self.mix(n);
+        }
+
+        #[inline(always)]
+        fn write_usize(&mut self, n: usize) {
+            self.mix(n as u64);
+        }
+
+        #[inline(always)]
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+
+    type Build = BuildHasherDefault<Fx>;
+
+    #[inline(always)]
+    fn set<T>(count: usize) -> HashSet<T, Build> {
+        HashSet::with_capacity_and_hasher(count, Build::default())
+    }
+
+    #[inline(always)]
+    fn map<K, V>(count: usize) -> HashMap<K, V, Build> {
+        HashMap::with_capacity_and_hasher(count, Build::default())
+    }
+
+    const FNV_OFFSET: u32 = 0x811c_9dc5;
+
+    const FNV_PRIME: u32 = 0x0100_0193;
+
+    #[inline(always)]
+    fn fold<const LOWER: bool>(b: u8) -> u32 {
+        u32::from(if LOWER { b.to_ascii_lowercase() } else { b })
+    }
+
+    /// FNV-1a 32 of `s` (`LOWER`: of its ASCII-lowercased bytes), continuing from `h`.
+    #[inline(always)]
+    fn fnv_into<const LOWER: bool>(mut h: u32, s: &[u8]) -> u32 {
+        for b in s {
+            h = (h ^ fold::<LOWER>(*b)).wrapping_mul(FNV_PRIME);
+        }
+        h
+    }
+
+    /// `fnv_into` over four strings at once: the shared prefix runs interleaved so the four
+    /// multiply chains overlap, then each tail finishes alone.
+    #[inline(always)]
+    fn fnv4<const LOWER: bool>(mut h: [u32; 4], s: [&[u8]; 4]) -> [u32; 4] {
+        let n = s.iter().map(|x| x.len()).min().unwrap_or(0);
+        for (((a, b), c), d) in s[0][..n]
+            .iter()
+            .zip(&s[1][..n])
+            .zip(&s[2][..n])
+            .zip(&s[3][..n])
+        {
+            h[0] = (h[0] ^ fold::<LOWER>(*a)).wrapping_mul(FNV_PRIME);
+            h[1] = (h[1] ^ fold::<LOWER>(*b)).wrapping_mul(FNV_PRIME);
+            h[2] = (h[2] ^ fold::<LOWER>(*c)).wrapping_mul(FNV_PRIME);
+            h[3] = (h[3] ^ fold::<LOWER>(*d)).wrapping_mul(FNV_PRIME);
+        }
+        for (lane, part) in h.iter_mut().zip(s) {
+            *lane = fnv_into::<LOWER>(*lane, &part[n..]);
+        }
+        h
+    }
+
+    /// PHP `unpack('N', hash('fnv1a32', $s, true))[1]`.
+    #[cfg(test)]
+    pub(crate) fn fnv32(s: &[u8]) -> i64 {
+        i64::from(fnv_into::<false>(FNV_OFFSET, s))
+    }
+
+    /// `fnv32(value(i))` (`LOWER`: of the lowercased value) for every record, 0 for an empty
+    /// value; four records at a time.
+    fn fnv_column<'a, const LOWER: bool>(
+        count: usize,
+        value: impl Fn(usize) -> &'a [u8],
+    ) -> Vec<i64> {
+        let mut out = Vec::with_capacity(count);
+        let mut i = 0;
+        while i + 4 <= count {
+            let s = [value(i), value(i + 1), value(i + 2), value(i + 3)];
+            let h = fnv4::<LOWER>([FNV_OFFSET; 4], s);
+            for (hash, part) in h.iter().zip(s) {
+                out.push(if part.is_empty() { 0 } else { i64::from(*hash) });
+            }
+            i += 4;
+        }
+        for k in i..count {
+            let part = value(k);
+            out.push(if part.is_empty() {
+                0
+            } else {
+                i64::from(fnv_into::<LOWER>(FNV_OFFSET, part))
+            });
+        }
+        out
+    }
+
+    /// fnv1a32(identity:hash) for every admission record, four records at a time.
+    fn receipts(v: &[&[u8]], count: usize) -> Vec<i64> {
+        let mut out = Vec::with_capacity(count);
+        let mut i = 0;
+        while i + 4 <= count {
+            let h = fnv4::<false>([FNV_OFFSET; 4], [v[i], v[i + 1], v[i + 2], v[i + 3]]);
+            let h = h.map(|x| (x ^ u32::from(b':')).wrapping_mul(FNV_PRIME));
+            let c = count + i;
+            let h = fnv4::<false>(h, [v[c], v[c + 1], v[c + 2], v[c + 3]]);
+            out.extend(h.map(i64::from));
+            i += 4;
+        }
+        for k in i..count {
+            let h = fnv_into::<false>(fnv_into::<false>(FNV_OFFSET, v[k]), b":");
+            out.push(i64::from(fnv_into::<false>(h, v[count + k])));
+        }
+        out
+    }
+
+    /// PHP `trim($s, '<>')`.
+    #[inline(always)]
+    pub(crate) fn trim_angle(s: &[u8]) -> &[u8] {
+        let edge = |b: &u8| *b != b'<' && *b != b'>';
+        let start = s.iter().position(edge).unwrap_or(s.len());
+        let end = s.iter().rposition(edge).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// A trimmed message ID matching `/\A[^\s<>\x00-\x1f\x7f]+\z/D`.
+    #[inline(always)]
+    pub(crate) fn id_ok(s: &[u8]) -> bool {
+        // A branch-free fold so the scan vectorizes.
+        !s.is_empty()
+            && s.iter().fold(0u8, |bad, b| {
+                bad | u8::from(*b <= 0x20 || *b == 0x7f || *b == b'<' || *b == b'>')
+            }) == 0
+    }
+
+    #[inline(always)]
+    fn lower_hex(s: &[u8]) -> bool {
+        s.iter().fold(0u8, |bad, b| {
+            bad | u8::from(!(b.is_ascii_digit() || (b'a'..=b'f').contains(b)))
+        }) == 0
+    }
+
+    // -- CandidateAdmission ----------------------------------------------------------------------
+
+    /// 1 ready, 2 pending, 3 unknown, 4 verifying, 5 waiting_upload, 6 header_rejected, 0 other.
+    pub(crate) fn admission_status(s: &[u8]) -> i64 {
+        match s {
+            b"ready" => 1,
+            b"pending" => 2,
+            b"unknown" => 3,
+            b"verifying" => 4,
+            b"waiting_upload" => 5,
+            b"header_rejected" => 6,
+            _ => 0,
+        }
+    }
+
+    fn admission_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut summary = [0i64; 10];
+        let mut digest = FNV_BASIS;
+        let mut ids = set::<i64>(count);
+        let mut identities = set::<&[u8]>(count);
+        let receipts = receipts(v, count);
+        for (i, row) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let identity = v[i];
+            let hash = v[count + i];
+            let status = admission_status(v[2 * count + i]);
+            let id = col(ints, count, 0, i);
+            let version = col(ints, count, 1, i);
+            let attempts = col(ints, count, 2, i).clamp(0, 1_000_000);
+            let found = col(ints, count, 3, i).clamp(0, 1 << 31);
+            let expected = col(ints, count, 4, i).clamp(0, 1 << 31);
+            let created = col(ints, count, 5, i);
+            let next = col(ints, count, 6, i);
+            let lease = col(ints, count, 7, i);
+            let now = col(ints, count, 8, i).clamp(0, TIME_MAX);
+            let len = identity.len();
+            let mut flags = i64::from(id > 0)
+                | i64::from(version >= 1) << 1
+                | i64::from(hash.len() == 64 && lower_hex(hash)) << 2
+                | i64::from(len > 0) << 3
+                | i64::from(len > 0 && lower_hex(identity)) << 4;
+            if !ids.insert(id) {
+                flags |= 32;
+            }
+            if !identities.insert(identity) {
+                flags |= 64;
+            }
+            let permille = if expected > 0 {
+                found.min(expected) * 1000 / expected
+            } else {
+                -1
+            };
+            let age = if created > 0 && created <= now {
+                now - created
+            } else {
+                -1
+            };
+            let due = next <= now;
+            let wait = if due { 0 } else { (next - now).min(TIME_MAX) };
+            let decision: i64 = if flags & 0x0F != 0x0F {
+                1
+            } else if flags & 0x60 != 0 {
+                2
+            } else if !(1..=4).contains(&status) {
+                3
+            } else if lease > 0 && lease >= now {
+                4
+            } else if attempts >= MAX_ATTEMPTS {
+                5
+            } else if !due {
+                6
+            } else if permille == 1000 {
+                7
+            } else if age >= PARTIAL_AGE {
+                8
+            } else {
+                9
+            };
+            let receipt = receipts[i];
+            let word = decision
+                | status << 4
+                | flags << 8
+                | (len.min(0xFFFF) as i64) << 16
+                | attempts.min(0xFFFF) << 32;
+            *row = [word, receipt, permille, age, wait];
+            summary[decision as usize - 1] += 1;
+            digest = fnv(digest, word ^ receipt << 20 ^ wait);
+        }
+        summary[9] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- CandidateHeaderInventory ----------------------------------------------------------------
+
+    fn inventory_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 4);
+        let mut files = map::<&[u8], usize>(16);
+        // [segments, first declared total, highest clamped number]
+        let mut stats: Vec<[i64; 3]> = Vec::with_capacity(16);
+        let mut ids = set::<&[u8]>(count);
+        let mut numbers = set::<(usize, i64)>(count);
+        let (mut gaps, mut total_bytes, mut invalid, mut duplicates) = (0i64, 0i64, 0i64, 0i64);
+        let mut digest = FNV_BASIS;
+        let hashes = fnv_column::<false>(count, |i| trim_angle(v[count + i]));
+        for (i, row) in rows.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let key = v[i];
+            let id = trim_angle(v[count + i]);
+            let len = id.len();
+            let number = col(ints, count, 0, i);
+            let size = col(ints, count, 1, i);
+            let total = col(ints, count, 2, i);
+            let mut flags = i64::from(!id_ok(id));
+            if !ids.insert(id) {
+                flags |= 2;
+            }
+            if number < 1 || number > total {
+                flags |= 4;
+            }
+            let f = match files.get(key) {
+                Some(&f) => f,
+                None => {
+                    let f = stats.len();
+                    files.insert(key, f);
+                    stats.push([0, total, 0]);
+                    f
+                }
+            };
+            if !numbers.insert((f, number)) {
+                flags |= 8;
+            }
+            if size < 1 {
+                flags |= 16;
+            } else {
+                total_bytes += size.min(BYTES_MAX);
+            }
+            if key.is_empty() {
+                flags |= 32;
+            }
+            let s = &mut stats[f];
+            if total != s[1] {
+                flags |= 64;
+            }
+            let n = number.clamp(0, 1 << 31);
+            let gap = if n > s[2] { n - s[2] - 1 } else { 0 };
+            if n < s[2] {
+                flags |= 128;
+            }
+            s[2] = s[2].max(n);
+            s[0] += 1;
+            gaps += gap;
+            invalid += i64::from(flags != 0);
+            duplicates += i64::from(flags & 2 != 0);
+            let hash = hashes[i];
+            let word = flags | (len.min(0xFF_FFFF) as i64) << 8 | number.clamp(0, 0xFF_FFFF) << 32;
+            *row = [word, hash, gap, f as i64];
+            digest = fnv(digest, word ^ hash << 16 ^ gap);
+        }
+        let mut expected = 0i64;
+        let mut complete = 0i64;
+        for [segments, total, _] in &stats {
+            expected += (*segments).max((*total).clamp(0, 1 << 31));
+            complete += i64::from(*total >= 1 && *segments >= *total);
+        }
+        trailer.copy_from_slice(&[
+            count as i64,
+            stats.len() as i64,
+            expected,
+            complete,
+            gaps,
+            total_bytes,
+            invalid,
+            duplicates,
+            digest,
+        ]);
+    }
+
+    // -- CandidatePreparationService -------------------------------------------------------------
+
+    /// 0 ready, 1 waiting_upload, 2 header_rejected, 3 unknown, 4 other.
+    pub(crate) fn preparation_status(s: &[u8]) -> i64 {
+        match s {
+            b"ready" => 0,
+            b"waiting_upload" => 1,
+            b"header_rejected" => 2,
+            b"unknown" => 3,
+            _ => 4,
+        }
+    }
+
+    /// (class, extension) of a manifest path: class 0 empty, 1 relative, 2 absolute, 3 control
+    /// bytes or a `..` segment; extension 1 `.json`, 2 `.json.gz`, 3 `.json.zst`, 0 other.
+    pub(crate) fn manifest_path(p: &[u8]) -> (i64, i64) {
+        if p.is_empty() {
+            return (0, 0);
+        }
+        let class = if p.iter().any(|b| *b < 0x20 || *b == 0x7f)
+            || p.split(|b| *b == b'/').any(|s| s == b"..")
+        {
+            3
+        } else if p[0] == b'/' {
+            2
+        } else {
+            1
+        };
+        let ext = if p.ends_with(b".json") {
+            1
+        } else if p.ends_with(b".json.gz") {
+            2
+        } else if p.ends_with(b".json.zst") {
+            3
+        } else {
+            0
+        };
+        (class, ext)
+    }
+
+    fn preparation_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 4);
+        let mut summary = [0i64; 12];
+        summary[10] = -1;
+        let mut digest = FNV_BASIS;
+        let hashes = fnv_column::<false>(count, |i| {
+            let reason = v[count + i];
+            &reason[..reason.len().min(REASON_BYTES)]
+        });
+        for (i, row) in rows.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let code = preparation_status(v[i]);
+            let reason = v[count + i];
+            let text = &reason[..reason.len().min(REASON_BYTES)];
+            let (path, ext) = manifest_path(v[2 * count + i]);
+            let nzb = col(ints, count, 0, i);
+            let par2 = col(ints, count, 1, i);
+            let samples = col(ints, count, 2, i);
+            let attempts = col(ints, count, 3, i).clamp(0, 1_000_000);
+            let retry = col(ints, count, 4, i).clamp(1, 86_400);
+            let readiness =
+                i64::from(nzb > 0) | i64::from(par2 > 0) << 1 | i64::from(samples > 0) << 2;
+            let mut delay = -1;
+            let disposition: i64 = match code {
+                2 => 1,
+                3 if attempts >= MAX_ATTEMPTS => 2,
+                3 => {
+                    delay = (retry << attempts.min(6)).min(604_800);
+                    3
+                }
+                1 => 4,
+                4 => 9,
+                _ if path != 1 => 5,
+                _ if readiness & 1 == 0 => 6,
+                _ if readiness & 4 == 0 => 7,
+                _ => 8,
+            };
+            let score = if disposition == 8 {
+                100 + if par2 > 0 { 50 } else { 0 } + samples.clamp(0, 64)
+            } else {
+                0
+            };
+            let hash = hashes[i];
+            let word = disposition
+                | code << 4
+                | path << 8
+                | ext << 10
+                | readiness << 12
+                | (text.len() as i64) << 16
+                | attempts.min(0xFFFF) << 32;
+            *row = [word, hash, delay, score];
+            summary[disposition as usize - 1] += 1;
+            if nzb > 0 {
+                summary[9] += nzb.min(BYTES_MAX);
+            }
+            summary[10] = summary[10].max(delay);
+            digest = fnv(digest, word ^ hash << 20 ^ delay);
+        }
+        summary[11] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- CandidateRepository ---------------------------------------------------------------------
+
+    /// Claimable 1 ready, 2 pending, 3 unknown, 4 verifying; then 5 waiting_upload,
+    /// 6 header_rejected, 7 unrepairable, 8 dirty, 9 metadata_deferred, 10 metadata_review,
+    /// 11 filtered, 12 expired; 0 other.
+    pub(crate) fn repository_status(s: &[u8]) -> i64 {
+        match s {
+            b"ready" => 1,
+            b"pending" => 2,
+            b"unknown" => 3,
+            b"verifying" => 4,
+            b"waiting_upload" => 5,
+            b"header_rejected" => 6,
+            b"unrepairable" => 7,
+            b"dirty" => 8,
+            b"metadata_deferred" => 9,
+            b"metadata_review" => 10,
+            b"filtered" => 11,
+            b"expired" => 12,
+            _ => 0,
+        }
+    }
+
+    /// 0 empty, 1 an 8-4-4-4-12 hex UUID (either case), 2 other.
+    pub(crate) fn token_class(t: &[u8]) -> i64 {
+        if t.is_empty() {
+            return 0;
+        }
+        let uuid = t.len() == 36
+            && t.iter().enumerate().all(|(k, b)| {
+                if matches!(k, 8 | 13 | 18 | 23) {
+                    *b == b'-'
+                } else {
+                    b.is_ascii_hexdigit()
+                }
+            });
+        if uuid { 1 } else { 2 }
+    }
+
+    fn repository_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut summary = [0i64; 9];
+        summary[7] = -1;
+        let mut ids = set::<i64>(count);
+        let mut window: Vec<(i64, i64, usize)> = Vec::with_capacity(count);
+        let rows = rows.as_chunks_mut::<5>().0;
+        for (i, row) in rows.iter_mut().enumerate() {
+            let code = repository_status(v[i]);
+            let token = token_class(v[count + i]);
+            let deferred = v[2 * count + i].starts_with(PARTIAL_DEFERRED);
+            let id = col(ints, count, 0, i);
+            let version = col(ints, count, 1, i);
+            let next = col(ints, count, 2, i);
+            let lease = col(ints, count, 3, i);
+            let now = col(ints, count, 4, i).clamp(0, TIME_MAX);
+            let released = col(ints, count, 5, i) > 0;
+            let lease_seconds = col(ints, count, 6, i).clamp(1, 86_400);
+            let retry = col(ints, count, 7, i).clamp(0, 31_536_000);
+            let deterministic_retry = col(ints, count, 8, i).clamp(0, 31_536_000);
+            let deterministic = col(ints, count, 9, i) != 0;
+            let duplicate = !ids.insert(id);
+            let due = next <= now;
+            let free = lease <= 0 || lease < now;
+            let claimable = !released && (1..=4).contains(&code) && due && free && !duplicate;
+            let (action, lease_out): (i64, i64) = if claimable {
+                (1, now + lease_seconds)
+            } else if released {
+                (4, -1)
+            } else if code == 4 && !free && token == 1 {
+                (2, now + lease_seconds)
+            } else if code == 4 && free {
+                (3, 0)
+            } else if !due {
+                (5, -1)
+            } else {
+                (6, -1)
+            };
+            let retry_at = now
+                + if deterministic {
+                    deterministic_retry
+                } else {
+                    retry
+                };
+            let wait = if due { 0 } else { (next - now).min(TIME_MAX) };
+            let flags = i64::from(due)
+                | i64::from(free) << 1
+                | i64::from(released) << 2
+                | i64::from(duplicate) << 3
+                | i64::from(version < 1) << 5
+                | i64::from(code == 1) << 6
+                | i64::from(deferred) << 7;
+            *row = [
+                action | code << 4 | token << 8 | flags << 12,
+                lease_out,
+                retry_at,
+                -1,
+                wait,
+            ];
+            summary[action as usize - 1] += 1;
+            if action == 5 && (summary[7] < 0 || next < summary[7]) {
+                summary[7] = next;
+            }
+            if claimable {
+                window.push((next, id, i));
+            }
+        }
+        window.sort_unstable();
+        for (rank, &(_, _, i)) in window.iter().enumerate() {
+            let rank = rank as i64;
+            rows[i][3] = rank;
+            if rank < CLAIM_WINDOW {
+                rows[i][0] |= 16 << 12;
+            }
+        }
+        summary[6] = (window.len() as i64).min(CLAIM_WINDOW);
+        let mut digest = FNV_BASIS;
+        for row in rows.iter() {
+            digest = fnv(digest, row[0] ^ row[1] << 8 ^ row[3]);
+        }
+        summary[8] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- CandidateSampleBatch --------------------------------------------------------------------
+
+    /// 0 empty, 1 a `[a-z0-9.+_-]` name with an inner dot, 2 other (of a lowercased group).
+    pub(crate) fn group_class(g: &[u8]) -> i64 {
+        if g.is_empty() {
+            return 0;
+        }
+        let valid = g
+            .iter()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'+' | b'_' | b'-'))
+            && g.contains(&b'.')
+            && g[0] != b'.'
+            && g[g.len() - 1] != b'.';
+        if valid { 1 } else { 2 }
+    }
+
+    fn sample_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut first = map::<&[u8], i64>(count);
+        let mut per_claim = map::<i64, i64>(count);
+        let mut groups = set::<Vec<u8>>(16);
+        let mut group = Vec::with_capacity(64);
+        let (mut selected, mut duplicates, mut invalid, mut total_bytes) = (0i64, 0i64, 0i64, 0i64);
+        let mut digest = FNV_BASIS;
+        let id_hashes = fnv_column::<false>(count, |i| trim_angle(v[count + i]));
+        let group_hashes = fnv_column::<true>(count, |i| trim(v[i]));
+        for (i, row) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            group.clear();
+            group.extend(trim(v[i]).iter().map(u8::to_ascii_lowercase));
+            let key = trim_angle(v[count + i]);
+            let len = key.len();
+            let claim = col(ints, count, 0, i);
+            let number = col(ints, count, 1, i);
+            let total = col(ints, count, 2, i);
+            let size = col(ints, count, 3, i);
+            let mut flags = 0i64;
+            if len == 0 {
+                flags |= 8;
+            } else if !id_ok(key) {
+                flags |= 2;
+            }
+            let index = if len == 0 {
+                i as i64
+            } else if let Some(&f) = first.get(key) {
+                flags |= 4;
+                f
+            } else {
+                first.insert(key, i as i64);
+                i as i64
+            };
+            if claim < 1 {
+                flags |= 16;
+            }
+            if size < 1 {
+                flags |= 32;
+            }
+            let in_range = number >= 1 && number <= total && total <= 0x7FFF_FFFF;
+            if !in_range {
+                flags |= 64;
+            }
+            let taken = per_claim.entry(claim).or_insert(0);
+            if flags == 0 {
+                if *taken < SAMPLES_PER_CLAIM {
+                    flags |= 1;
+                    *taken += 1;
+                    selected += 1;
+                    total_bytes += size.min(BYTES_MAX);
+                } else {
+                    flags |= 128;
+                }
+            }
+            let taken = *taken;
+            duplicates += i64::from(flags & 4 != 0);
+            invalid += i64::from(flags & 0x7A != 0);
+            let position: i64 = if !in_range {
+                0
+            } else if number == 1 {
+                1
+            } else if number == total {
+                2
+            } else {
+                3
+            };
+            let coverage = if in_range { number * 1000 / total } else { -1 };
+            if !group.is_empty() && !groups.contains(group.as_slice()) {
+                groups.insert(group.clone());
+            }
+            let group_hash = group_hashes[i];
+            let id_hash = id_hashes[i];
+            let word = flags
+                | group_class(&group) << 8
+                | position << 10
+                | (len.min(0xFF_FFFF) as i64) << 12
+                | taken.min(0xFFFF) << 36;
+            *row = [word, id_hash, group_hash, index, coverage];
+            digest = fnv(digest, word ^ id_hash << 16 ^ group_hash << 24 ^ coverage);
+        }
+        trailer.copy_from_slice(&[
+            selected,
+            duplicates,
+            invalid,
+            groups.len() as i64,
+            per_claim.len() as i64,
+            total_bytes,
+            digest,
+        ]);
+    }
+
+    macro_rules! export634 {
+        ($name:ident, $fields:literal, $columns:literal, $words:literal, $trailer:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `blob` must point to `blob_len` readable bytes (`count * fields` NUL-joined
+            /// values, field-major), `twin` to `twin_len` readable bytes (empty, or the same
+            /// values joined by 0x01), `ints` to `ints_len` readable bytes (`columns` columns
+            /// of `count` packed little-endian int64 words) and `out` to `out_cap` writable,
+            /// aligned int64 words that overlap no input; null pointers are accepted only with
+            /// zero lengths. Bad shapes return -1 before writing, a short output returns
+            /// `-needed` without writing and panics map to -1.
+            #[unsafe(no_mangle)]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                twin: *const u8,
+                twin_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                const BODY: Body = $body;
+                unsafe {
+                    run(
+                        blob, blob_len, twin, twin_len, ints, ints_len, count, out, out_cap,
+                        $fields, $columns, $words, $trailer, BODY,
+                    )
+                }
+            }
+        };
+    }
+
+    export634!(
+        nntmux_w634_candidate_admission_plan_batch,
+        3,
+        9,
+        5,
+        10,
+        admission_row
+    );
+    export634!(
+        nntmux_w634_candidate_header_inventory_plan_batch,
+        2,
+        3,
+        4,
+        9,
+        inventory_row
+    );
+    export634!(
+        nntmux_w634_candidate_preparation_plan_batch,
+        3,
+        5,
+        4,
+        12,
+        preparation_row
+    );
+    export634!(
+        nntmux_w634_candidate_repository_plan_batch,
+        3,
+        10,
+        5,
+        9,
+        repository_row
+    );
+    export634!(
+        nntmux_w634_candidate_sample_plan_batch,
+        2,
+        4,
+        5,
+        7,
+        sample_row
+    );
+}
+
+#[cfg(test)]
+mod w634_tests {
+    use super::w634_batch::*;
+
+    type Export = unsafe extern "C" fn(
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        usize,
+        *mut i64,
+        usize,
+    ) -> isize;
+
+    /// Field-major frame without NULs, then the int columns.
+    fn call(export: Export, fields: &[&[&[u8]]], columns: &[&[i64]], out: &mut [i64]) -> isize {
+        let count = fields[0].len();
+        let blob = fields
+            .iter()
+            .flat_map(|f| f.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(&0u8);
+        let ints: Vec<u8> = columns
+            .iter()
+            .flat_map(|c| c.iter())
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        unsafe {
+            export(
+                blob.as_ptr(),
+                blob.len(),
+                std::ptr::null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn w634_classifiers() {
+        assert_eq!(trim_angle(b"<<a@b>>"), b"a@b");
+        assert_eq!(trim_angle(b"<>"), b"");
+        assert!(id_ok(b"part1of2.abc@news.example"));
+        assert!(!id_ok(b"a b@c"));
+        assert!(!id_ok(b"a\x7fb"));
+        assert!(!id_ok(b""));
+        assert_eq!(admission_status(b"verifying"), 4);
+        assert_eq!(admission_status(b"Ready"), 0);
+        assert_eq!(preparation_status(b"header_rejected"), 2);
+        assert_eq!(manifest_path(b"ab/cd/manifest.json.gz"), (1, 2));
+        assert_eq!(manifest_path(b"/abs/x.json"), (2, 1));
+        assert_eq!(manifest_path(b"a/../b.json"), (3, 1));
+        assert_eq!(manifest_path(b"..x/b.json.zst"), (1, 3));
+        assert_eq!(manifest_path(b"a\tb"), (3, 0));
+        assert_eq!(repository_status(b"metadata_review"), 10);
+        assert_eq!(token_class(b"0f8fad5b-d9cb-469f-a165-70867728950E"), 1);
+        assert_eq!(token_class(b"0f8fad5b-d9cb-469f-a165-70867728950"), 2);
+        assert_eq!(token_class(b""), 0);
+        assert_eq!(group_class(b"alt.binaries.teevee"), 1);
+        assert_eq!(group_class(b"alt"), 2);
+        assert_eq!(group_class(b".alt.x"), 2);
+        assert_eq!(fnv32(b""), 0x811c_9dc5);
+    }
+
+    #[test]
+    fn w634_rows_and_frames() {
+        let hex = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut out = vec![0i64; 5 + 10];
+        let written = call(
+            nntmux_w634_candidate_admission_plan_batch,
+            &[&[b"abc"], &[hex], &[b"ready"]],
+            &[&[7], &[1], &[0], &[10], &[10], &[100], &[200], &[0], &[300]],
+            &mut out,
+        );
+        assert_eq!(written, 15);
+        assert_eq!(out[0] & 0xF, 7);
+        assert_eq!((out[0] >> 8) & 0xFF, 0x1F);
+        assert_eq!(&out[2..5], &[1000, 200, 0]);
+        assert_eq!(out[5 + 6], 1);
+
+        let mut out = vec![0i64; 2 * 4 + 9];
+        let written = call(
+            nntmux_w634_candidate_header_inventory_plan_batch,
+            &[&[b"f", b"f"], &[b"<a@b>", b"<c@d>"]],
+            &[&[1, 3], &[100, 200], &[3, 3]],
+            &mut out,
+        );
+        assert_eq!(written, 17);
+        assert_eq!(out[0] & 0xFF, 0);
+        assert_eq!(out[4 + 2], 1);
+        assert_eq!(&out[8..16], &[2, 1, 3, 0, 1, 300, 0, 0]);
+
+        let mut out = vec![0i64; 2 * 5 + 9];
+        let written = call(
+            nntmux_w634_candidate_repository_plan_batch,
+            &[&[b"ready", b"pending"], &[b"", b""], &[b"", b""]],
+            &[
+                &[2, 1],
+                &[1, 1],
+                &[50, 40],
+                &[0, 0],
+                &[100, 100],
+                &[0, 0],
+                &[60, 60],
+                &[10, 10],
+                &[20, 20],
+                &[0, 1],
+            ],
+            &mut out,
+        );
+        assert_eq!(written, 19);
+        assert_eq!(&out[1..5], &[160, 110, 1, 0]);
+        assert_eq!(&out[6..10], &[160, 120, 0, 0]);
+        assert_eq!(out[10], 2);
+
+        let mut short = vec![0i64; 3];
+        let need = call(
+            nntmux_w634_candidate_sample_plan_batch,
+            &[&[b"alt.binaries.x"], &[b"<a@b>"]],
+            &[&[1], &[1], &[2], &[10]],
+            &mut short,
+        );
+        assert_eq!(need, -12);
+        let mut out = vec![0i64; 17];
+        let empty = unsafe {
+            nntmux_w634_candidate_preparation_plan_batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(empty, 0);
+        let bad = unsafe {
+            nntmux_w634_candidate_preparation_plan_batch(
+                b"a".as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(bad, -1);
+        let base = out.as_mut_ptr() as *const u8;
+        let overlap = unsafe {
+            nntmux_w634_candidate_sample_plan_batch(
+                base,
+                8,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(overlap, -1);
+        let misaligned = unsafe {
+            nntmux_w634_candidate_sample_plan_batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                (out.as_mut_ptr() as *mut u8).add(1) as *mut i64,
+                4,
+            )
+        };
+        assert_eq!(misaligned, -1);
+    }
+}
