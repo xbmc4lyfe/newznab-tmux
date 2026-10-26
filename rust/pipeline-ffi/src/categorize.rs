@@ -46195,3 +46195,1179 @@ pub mod series_admin_log_requests_horizon_http_feed_w593 {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 60.3: AbstractCategorizer, BookCategorizer, ConsoleCategorizer,
+// GroupNameCategorizer and ReleaseContext batch rows
+// ---------------------------------------------------------------------------
+
+/// Batch helpers for categorizer gate and dispatch plans, book token, console platform and
+/// newsgroup hierarchy classification and release context validation. Each export reads
+/// `|`-separated items as zero-copy slices of one blob (NUL-joined, or tiled by a length column)
+/// and writes one int64 word per item plus a trailer, so a batch costs one FFI crossing. The PHP
+/// `w60*BatchPhp()` methods are the reference implementation.
+pub mod categorizers_abstract_book_console_group_name_release_context_w603 {
+    use super::release_image_browse_duplicate_group_management_w553::run_items;
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hash, Hasher};
+
+    /// Byte-wise FNV-1a hasher for the per-call distinct-key sets; keys never outlive one call.
+    #[derive(Default)]
+    struct KeyHasher(u64);
+
+    impl Hasher for KeyHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            let mut hash = self.0 ^ 0xCBF2_9CE4_8422_2325;
+            for &b in bytes {
+                hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            self.0 = hash;
+        }
+
+        fn write_u8(&mut self, value: u8) {
+            self.0 = (self.0 ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+
+        fn write_u64(&mut self, value: u64) {
+            self.0 = (self.0 ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.0 = (self.0 ^ value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0 ^ (self.0 >> 31)
+        }
+    }
+
+    type KeySet<T> = HashSet<T, BuildHasherDefault<KeyHasher>>;
+
+    /// A key compared and hashed as PHP `strtolower()` would leave it.
+    #[derive(Clone, Copy)]
+    struct Caseless<'a>(&'a [u8]);
+
+    impl Hash for Caseless<'_> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            for &b in self.0 {
+                state.write_u8(b.to_ascii_lowercase());
+            }
+            state.write_usize(self.0.len());
+        }
+    }
+
+    impl PartialEq for Caseless<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.eq_ignore_ascii_case(other.0)
+        }
+    }
+
+    impl Eq for Caseless<'_> {}
+
+    /// PHP `trim()` with its default characters.
+    fn ptrim(s: &[u8]) -> &[u8] {
+        let keep = |b: &u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let Some(start) = s.iter().position(keep) else {
+            return &[];
+        };
+        let end = s.iter().rposition(keep).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// PHP `explode('|', $item, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(item: &[u8]) -> [&[u8]; N] {
+        let mut out: [&[u8]; N] = [&[]; N];
+        let mut rest = item;
+        for (i, slot) in out.iter_mut().enumerate() {
+            if i + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'|') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// 1 to `max` ASCII digits as their value, else `None`.
+    fn digits(s: &[u8], max: usize) -> Option<i64> {
+        if s.is_empty() || s.len() > max || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            s.iter()
+                .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0')),
+        )
+    }
+
+    /// ASCII case-insensitive `str_contains()` for a lowercase needle.
+    fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+        let n = needle.len();
+        if n == 0 {
+            return true;
+        }
+        if hay.len() < n {
+            return false;
+        }
+        find_ci(hay, needle, 0).is_some()
+    }
+
+    /// The first position from `from` where lowercase `needle` (non-empty) starts, ASCII
+    /// case-insensitively.
+    fn find_ci(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+        let last = hay.len().checked_sub(needle.len())?;
+        let (first, rest) = (needle[0], &needle[1..]);
+        let upper = first.to_ascii_uppercase();
+        let mut i = from;
+        while i <= last {
+            i += hay[i..=last]
+                .iter()
+                .position(|&b| b == first || b == upper)?;
+            if hay[i + 1..i + needle.len()].eq_ignore_ascii_case(rest) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Whether `s[i..]` starts with lowercase `needle`, ASCII case-insensitively.
+    fn at_ci(s: &[u8], i: usize, needle: &[u8]) -> bool {
+        s.len() - i >= needle.len() && s[i..i + needle.len()].eq_ignore_ascii_case(needle)
+    }
+
+    /// `contains_ci()` for any of `needles`.
+    fn contains_any(hay: &[u8], needles: &[&[u8]]) -> bool {
+        needles.iter().any(|n| contains_ci(hay, n))
+    }
+
+    /// ASCII case-insensitive `str_starts_with()` for a lowercase prefix.
+    fn starts_ci(s: &[u8], prefix: &[u8]) -> bool {
+        s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
+
+    /// `AbstractCategorizer::W463_YEAR_PATTERN`: a 19xx/20xx year not inside a longer digit run.
+    fn has_year(s: &[u8]) -> bool {
+        let n = s.len();
+        (0..n.saturating_sub(3)).any(|i| {
+            matches!(&s[i..i + 2], b"19" | b"20")
+                && s[i + 2].is_ascii_digit()
+                && s[i + 3].is_ascii_digit()
+                && (i == 0 || !s[i - 1].is_ascii_digit())
+                && (i + 4 == n || !s[i + 4].is_ascii_digit())
+        })
+    }
+
+    /// `AbstractCategorizer::W463_GROUP_SUFFIX_PATTERN`: a hyphen and 2-15 trailing alphanumerics.
+    fn group_suffix(s: &[u8]) -> bool {
+        let k = s
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_alphanumeric())
+            .count();
+        (2..=15).contains(&k) && s.len() > k && s[s.len() - k - 1] == b'-'
+    }
+
+    /// The `[^a-z0-9]+`-separated tokens of `strtolower($s)`, as slices of `s`.
+    fn tokens(s: &[u8]) -> impl Iterator<Item = &[u8]> {
+        s.split(|b| !b.is_ascii_alphanumeric())
+            .filter(|t| !t.is_empty())
+    }
+
+    /// A token lowercased into `buf`; tokens over 16 bytes match no keyword and come back empty.
+    fn lower<'b>(token: &[u8], buf: &'b mut [u8; 16]) -> &'b [u8] {
+        if token.len() > 16 {
+            return &[];
+        }
+        for (d, s) in buf.iter_mut().zip(token) {
+            *d = s.to_ascii_lowercase();
+        }
+        &buf[..token.len()]
+    }
+
+    /// `w60Confidence()`: 0 empty, 1 a 1-3 digit integer part with an optional `.` and 1-6
+    /// fraction digits worth at most 1.000, 2 well-formed but larger and 3 malformed; then the
+    /// value in thousandths (fraction truncated to three digits, 0 when malformed).
+    fn confidence(raw: &[u8]) -> (i64, i64) {
+        if raw.is_empty() {
+            return (0, 0);
+        }
+        let (int, frac) = match raw.iter().position(|&b| b == b'.') {
+            Some(p) => (&raw[..p], Some(&raw[p + 1..])),
+            None => (raw, None),
+        };
+        let Some(whole) = digits(int, 3) else {
+            return (3, 0);
+        };
+        let mut milli = whole * 1000;
+        if let Some(frac) = frac {
+            if frac.is_empty() || frac.len() > 6 || !frac.iter().all(u8::is_ascii_digit) {
+                return (3, 0);
+            }
+            let mut scale = 100;
+            for &b in frac.iter().take(3) {
+                milli += i64::from(b - b'0') * scale;
+                scale /= 10;
+            }
+        }
+        (if milli <= 1000 { 1 } else { 2 }, milli)
+    }
+
+    /// `w60Category()`: 0 empty, 1 a category id in 1000-8999, 2 other numbers of up to 9 digits
+    /// and 3 malformed; then the id (0 unless numeric).
+    fn category(raw: &[u8]) -> (i64, i64) {
+        if raw.is_empty() {
+            return (0, 0);
+        }
+        match digits(raw, 9) {
+            Some(id) if (1000..=8999).contains(&id) => (1, id),
+            Some(id) => (2, id),
+            None => (3, 0),
+        }
+    }
+
+    /// `w60Size()`: 0 empty, 1 up to 12 digits and 2 invalid; the band is 0 without a valid size,
+    /// then 1 below 1 MiB, 2 below 50 MiB, 3 below 500 MiB and 4 larger; then the byte count.
+    fn size(raw: &[u8]) -> (i64, i64, i64) {
+        if raw.is_empty() {
+            return (0, 0, 0);
+        }
+        match digits(raw, 12) {
+            Some(bytes) => {
+                let band = match bytes {
+                    0..1_048_576 => 1,
+                    1_048_576..52_428_800 => 2,
+                    52_428_800..524_288_000 => 3,
+                    _ => 4,
+                };
+                (1, band, bytes)
+            }
+            None => (2, 0, 0),
+        }
+    }
+
+    /// `AbstractCategorizer::w60CategorizerGateBatchPhp()`.
+    fn categorizer_gate(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 34);
+        let mut decisions = [0i64; 3];
+        let mut reasons = [0i64; 5];
+        let mut bands = [0i64; 4];
+        let mut tiers = [0i64; 4];
+        let mut roots = [0i64; 9];
+        let mut shapes = [0i64; 6];
+        let (mut max_priority, mut milli_sum) = (0i64, 0i64);
+        let mut groups: KeySet<Caseless> = KeySet::default();
+        for &item in items {
+            let [name, group, priority, conf, cat] = fields::<5>(item);
+            let (name, group, priority) = (ptrim(name), ptrim(group), ptrim(priority));
+            let (p_state, priority) = if priority.is_empty() {
+                (0, 50)
+            } else {
+                match digits(priority, 3) {
+                    Some(v) if v <= 100 => (1, v),
+                    _ => (2, 50),
+                }
+            };
+            let band = match priority {
+                ..=25 => 0,
+                26..=50 => 1,
+                51..=75 => 2,
+                _ => 3,
+            };
+            let (c_state, milli) = confidence(ptrim(conf));
+            let tier = match (c_state, milli) {
+                (1, 500..700) => 1,
+                (1, 700..850) => 2,
+                (1, 850..) => 3,
+                _ => 0,
+            };
+            let (cat_state, cat_id) = category(ptrim(cat));
+            let root = if cat_state == 1 { cat_id / 1000 } else { 0 };
+            let shape = [
+                name.contains(&b'.'),
+                name.contains(&b' '),
+                name.contains(&b'_'),
+                name.iter().any(|&b| b == b'[' || b == b'('),
+                group_suffix(name),
+                has_year(name),
+            ];
+            let reason = if name.is_empty() {
+                1
+            } else if name.len() < 3 {
+                2
+            } else if c_state == 3 {
+                3
+            } else if cat_state == 3 {
+                4
+            } else {
+                0
+            };
+            let decision = match reason {
+                0 if tier >= 1 && cat_state == 1 => 2,
+                0 => 1,
+                _ => 0,
+            };
+            decisions[decision as usize] += 1;
+            reasons[reason as usize] += 1;
+            bands[band as usize] += 1;
+            tiers[tier as usize] += 1;
+            roots[root as usize] += 1;
+            let mut word = p_state
+                | band << 2
+                | priority << 4
+                | c_state << 11
+                | tier << 13
+                | milli << 15
+                | cat_state << 35
+                | root << 37
+                | reason << 47
+                | decision << 50
+                | (name.len().min(255) as i64) << 52;
+            for (i, &on) in shape.iter().enumerate() {
+                if on {
+                    shapes[i] += 1;
+                    word |= 1 << (41 + i);
+                }
+            }
+            max_priority = max_priority.max(priority);
+            if decision == 2 {
+                milli_sum += milli;
+            }
+            if reason == 0 && !group.is_empty() {
+                groups.insert(Caseless(group));
+            }
+            out.push(word);
+        }
+        out.extend(decisions);
+        out.extend(reasons);
+        out.extend(bands);
+        out.extend(tiers);
+        out.extend(roots);
+        out.extend(shapes);
+        out.extend([max_priority, milli_sum, groups.len() as i64]);
+        out
+    }
+
+    /// `BookCategorizer::W60_BOOK_TOKEN_FLAGS`.
+    fn book_token_flag(token: &[u8]) -> i64 {
+        match token {
+            b"epub" | b"mobi" | b"azw" | b"azw3" | b"fb2" | b"djvu" | b"ebook" | b"kindle"
+            | b"kobo" | b"nook" => 1,
+            b"audiobook" | b"audiobooks" | b"unabridged" | b"abridged" | b"audible"
+            | b"narrated" | b"m4b" => 2,
+            b"cbr" | b"cbz" | b"comic" | b"comics" | b"manga" | b"manhwa" | b"webtoon" | b"c2c"
+            | b"tpb" => 4,
+            b"magazine" | b"magazines" | b"weekly" | b"monthly" | b"quarterly" | b"issue" => 8,
+            b"apress" | b"packt" | b"oreilly" | b"wiley" | b"manning" | b"wrox"
+            | b"programming" | b"python" | b"javascript" | b"cookbook" | b"handbook" => 16,
+            b"retail" => 32,
+            b"isbn" => 64,
+            _ if token.len() == 4
+                && token.iter().all(u8::is_ascii_digit)
+                && matches!(&token[..2], b"19" | b"20") =>
+            {
+                128
+            }
+            _ if token.len() == 13
+                && token.iter().all(u8::is_ascii_digit)
+                && matches!(&token[..3], b"978" | b"979") =>
+            {
+                64
+            }
+            _ => 0,
+        }
+    }
+
+    /// `BookCategorizer::w60BookTokenBatchPhp()`.
+    fn book_tokens(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 28);
+        let mut rules = [0i64; 6];
+        let mut exts = [0i64; 6];
+        let mut flag_counts = [0i64; 8];
+        let mut bands = [0i64; 5];
+        let (mut size_sum, mut max_tokens) = (0i64, 0i64);
+        let mut distinct: KeySet<u64> = KeySet::default();
+        let mut buf = [0u8; 16];
+        for &item in items {
+            let [name, raw_size] = fields::<2>(item);
+            let name = ptrim(name);
+            let ext = name
+                .iter()
+                .rposition(|&b| b == b'.')
+                .map_or(&[][..], |p| &name[p + 1..]);
+            let ext_class = if (1..=5).contains(&ext.len())
+                && ext.iter().all(u8::is_ascii_alphanumeric)
+            {
+                let mut key = ext.len() as u64;
+                for &b in ext {
+                    key = key << 8 | u64::from(b.to_ascii_lowercase());
+                }
+                distinct.insert(key);
+                match lower(ext, &mut buf) {
+                    b"epub" | b"mobi" | b"azw" | b"azw3" | b"fb2" | b"djvu" | b"lit" | b"prc" => 1,
+                    b"pdf" => 2,
+                    b"cbr" | b"cbz" | b"cb7" | b"cbt" => 3,
+                    b"m4b" | b"mp3" | b"m4a" | b"aac" | b"flac" => 4,
+                    _ => 5,
+                }
+            } else {
+                0
+            };
+            let (mut flags, mut count) = (0i64, 0i64);
+            for token in tokens(name) {
+                count += 1;
+                flags |= book_token_flag(lower(token, &mut buf));
+            }
+            let (rule, cat, conf) = if ext_class == 3 || flags & 4 != 0 {
+                (1, 7030, if ext_class == 3 { 900 } else { 850 })
+            } else if flags & 16 != 0 {
+                (2, 7040, 850)
+            } else if flags & 8 != 0 {
+                (3, 7010, if flags & 128 != 0 { 900 } else { 750 })
+            } else if flags & 2 != 0 {
+                (4, 3030, if ext_class == 4 { 900 } else { 850 })
+            } else if ext_class == 1 {
+                (5, 7020, 900)
+            } else if flags & 1 != 0 {
+                (5, 7020, 850)
+            } else if ext_class == 2 && flags & (64 | 128) != 0 {
+                (5, 7020, 750)
+            } else {
+                (0, 0, 0)
+            };
+            let (size_state, band, bytes) = size(ptrim(raw_size));
+            rules[rule as usize] += 1;
+            exts[ext_class as usize] += 1;
+            bands[band as usize] += 1;
+            for (i, slot) in flag_counts.iter_mut().enumerate() {
+                *slot += flags >> i & 1;
+            }
+            size_sum += bytes;
+            max_tokens = max_tokens.max(count);
+            out.push(
+                rule | ext_class << 3
+                    | flags << 6
+                    | cat << 14
+                    | conf << 28
+                    | size_state << 38
+                    | band << 40
+                    | count.min(63) << 43
+                    | (name.len().min(255) as i64) << 49,
+            );
+        }
+        out.extend(rules);
+        out.extend(exts);
+        out.extend(flag_counts);
+        out.extend(bands);
+        out.extend([size_sum, max_tokens, distinct.len() as i64]);
+        out
+    }
+
+    /// `ConsoleCategorizer::W60_CONSOLE_CATEGORIES` and `W60_CONSOLE_CONFIDENCE` by platform.
+    const CONSOLE_CATEGORIES: [i64; 15] = [
+        0, 1180, 1180, 1080, 1120, 1020, 1140, 1050, 1040, 1999, 1130, 1030, 1110, 1010, 1999,
+    ];
+    const CONSOLE_CONFIDENCE: [i64; 15] = [
+        0, 800, 900, 900, 900, 900, 900, 900, 850, 850, 900, 850, 900, 900, 800,
+    ];
+
+    /// `ConsoleCategorizer::w60ConsolePlatformBatchPhp()`.
+    fn console_platform(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 36);
+        let mut platforms = [0i64; 15];
+        let mut regions = [0i64; 10];
+        let mut formats = [0i64; 8];
+        let (mut alt, mut hints) = (0i64, 0i64);
+        let mut pairs = [false; 150];
+        let mut buf = [0u8; 16];
+        let mut next_buf = [0u8; 16];
+        for &item in items {
+            let [name, group] = fields::<2>(item);
+            let (name, group) = (ptrim(name), ptrim(group));
+            let (mut platform, mut region, mut format, mut count) = (0i64, 0i64, 0i64, 0i64);
+            let mut iter = tokens(name).peekable();
+            while let Some(token) = iter.next() {
+                count += 1;
+                let t = lower(token, &mut buf);
+                let next = iter.peek().map_or(&[][..], |n| lower(n, &mut next_buf));
+                let p = match t {
+                    b"ps5" => 1,
+                    b"ps4" => 2,
+                    b"ps3" => 3,
+                    b"psvita" | b"vita" | b"psv" => 4,
+                    b"psp" => 5,
+                    b"xboxone" | b"xbone" | b"xb1" | b"xsx" | b"xss" | b"xbsx" => 6,
+                    b"xbox360" | b"x360" => 7,
+                    b"xbox" => match next {
+                        b"one" | b"series" => 6,
+                        b"360" => 7,
+                        _ => 8,
+                    },
+                    b"switch" | b"nsw" | b"nsp" | b"xci" => 9,
+                    b"wiiu" => 10,
+                    b"wii" if next == b"u" => 10,
+                    b"wii" | b"wbfs" => 11,
+                    b"3ds" | b"cia" => 12,
+                    b"nds" => 13,
+                    b"snes" | b"nes" | b"n64" | b"gba" | b"gbc" | b"gb" | b"dreamcast"
+                    | b"saturn" | b"atari" | b"sega" | b"ps2" | b"ps1" | b"psx" | b"mame"
+                    | b"genesis" | b"megadrive" => 14,
+                    _ if t.len() >= 8
+                        && t.len() <= 10
+                        && t.starts_with(b"ppsa")
+                        && t[4..].iter().all(u8::is_ascii_digit) =>
+                    {
+                        1
+                    }
+                    _ if t.len() == 9
+                        && t.starts_with(b"cusa")
+                        && t[4..].iter().all(u8::is_ascii_digit) =>
+                    {
+                        2
+                    }
+                    _ => 0,
+                };
+                if p != 0 && (platform == 0 || p < platform) {
+                    platform = p;
+                }
+                let r = match t {
+                    b"pal" => 1,
+                    b"ntsc" => 2,
+                    b"usa" | b"us" => 3,
+                    b"eur" | b"europe" | b"eu" => 4,
+                    b"jpn" | b"japan" | b"jp" => 5,
+                    b"asia" => 6,
+                    b"kor" | b"korea" => 7,
+                    b"regionfree" => 8,
+                    b"region" if next == b"free" => 8,
+                    b"multi" => 9,
+                    _ if (6..=7).contains(&t.len())
+                        && t.starts_with(b"multi")
+                        && t[5..].iter().all(u8::is_ascii_digit) =>
+                    {
+                        9
+                    }
+                    _ => 0,
+                };
+                if r != 0 && (region == 0 || r < region) {
+                    region = r;
+                }
+                format |= match t {
+                    b"dlc" => 1,
+                    b"update" | b"patch" => 2,
+                    b"pkg" => 4,
+                    b"iso" => 8,
+                    b"nsp" | b"xci" => 16,
+                    b"cia" => 32,
+                    b"wbfs" => 64,
+                    b"rom" | b"roms" => 128,
+                    _ => 0,
+                };
+            }
+            let is_alt = i64::from(starts_ci(group, b"alt.binaries."));
+            let hint = i64::from(contains_any(
+                group,
+                &[
+                    b"console",
+                    b"games",
+                    b"nintendo",
+                    b"wii",
+                    b"xbox",
+                    b"ps3",
+                    b"ps4",
+                    b"psp",
+                    b"sony",
+                ],
+            ));
+            platforms[platform as usize] += 1;
+            regions[region as usize] += 1;
+            for (i, slot) in formats.iter_mut().enumerate() {
+                *slot += format >> i & 1;
+            }
+            alt += is_alt;
+            hints += hint;
+            if platform != 0 {
+                pairs[(platform * 10 + region) as usize] = true;
+            }
+            out.push(
+                platform
+                    | region << 4
+                    | format << 8
+                    | is_alt << 16
+                    | hint << 17
+                    | CONSOLE_CATEGORIES[platform as usize] << 18
+                    | CONSOLE_CONFIDENCE[platform as usize] << 29
+                    | count.min(63) << 39
+                    | (name.len().min(255) as i64) << 45,
+            );
+        }
+        out.extend(platforms);
+        out.extend(regions);
+        out.extend(formats);
+        out.extend([alt, hints, pairs.iter().filter(|&&p| p).count() as i64]);
+        out
+    }
+
+    /// `GroupNameCategorizer::W60_GROUP_RULES` category and confidence (thousandths) by rule.
+    const GROUP_RULES: [(i64, i64); 9] = [
+        (0, 0),
+        (5070, 800),
+        (5999, 600),
+        (2999, 600),
+        (6999, 700),
+        (3999, 600),
+        (1999, 600),
+        (4010, 600),
+        (7020, 500),
+    ];
+
+    /// The first `W60_GROUP_RULES` rule (1-8) with a needle anywhere in `rest`, else 0: one pass
+    /// that dispatches each position on its lowercase byte to the needles starting with it.
+    fn group_rule(rest: &[u8]) -> i64 {
+        let mut mask = 0u32;
+        for i in 0..rest.len() {
+            let at = |n: &[u8]| at_ci(rest, i, n);
+            mask |= match rest[i].to_ascii_lowercase() {
+                b'a' if at(b"anime") => return 1,
+                b'a' if at(b"app") => 1 << 6,
+                b't' if at(b"tv") => 1 << 1,
+                b'm' if at(b"movie") => 1 << 2,
+                b'm' if at(b"mp3") || at(b"music") => 1 << 4,
+                b'd' if at(b"dvd") => 1 << 2,
+                b'b' if at(b"bluray") => 1 << 2,
+                b'x' if at(b"x264") => 1 << 2,
+                b'x' if at(b"xxx") => 1 << 3,
+                b'e' if at(b"erotica") => 1 << 3,
+                b'e' if at(b"ebook") || at(b"e-book") => 1 << 7,
+                b's' if at(b"sound") => 1 << 4,
+                b's' if at(b"software") => 1 << 6,
+                b'l' if at(b"lossless") => 1 << 4,
+                b'g' if at(b"game") => 1 << 5,
+                b'c' if at(b"console") => 1 << 5,
+                b'c' if at(b"comic") => 1 << 7,
+                b'p' if at(b"psx") => 1 << 5,
+                b'n' if at(b"nintendo") => 1 << 5,
+                b'w' if at(b"warez") => 1 << 6,
+                b'0' if at(b"0day") => 1 << 6,
+                _ => 0,
+            };
+        }
+        if mask == 0 {
+            0
+        } else {
+            i64::from(mask.trailing_zeros()) + 1
+        }
+    }
+
+    /// `GroupNameCategorizer::w60GroupNameBatchPhp()`.
+    fn group_name(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 19);
+        let mut hierarchies = [0i64; 6];
+        let mut rules = [0i64; 9];
+        let (mut depth_sum, mut max_depth, mut abbreviated) = (0i64, 0i64, 0i64);
+        let mut groups: KeySet<Caseless> = KeySet::default();
+        for &item in items {
+            let g = ptrim(item);
+            let valid = g
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'_'));
+            let hierarchy = if g.is_empty() {
+                0
+            } else if !valid
+                || g[0] == b'.'
+                || g[g.len() - 1] == b'.'
+                || g.windows(2).any(|w| w == b"..")
+            {
+                5
+            } else if starts_ci(g, b"alt.binaries.") {
+                1
+            } else if starts_ci(g, b"alt.") {
+                2
+            } else if g.contains(&b'.') {
+                3
+            } else {
+                4
+            };
+            let depth = if matches!(hierarchy, 0 | 5) {
+                0
+            } else {
+                g.iter().filter(|&&b| b == b'.').count() as i64 + 1
+            };
+            let rule = find_ci(g, b"alt.binaries.", 0).map_or(0, |i| group_rule(&g[i + 13..]));
+            let (cat, conf) = GROUP_RULES[rule as usize];
+            let abbrev = i64::from(starts_ci(g, b"a.b."));
+            hierarchies[hierarchy as usize] += 1;
+            rules[rule as usize] += 1;
+            depth_sum += depth;
+            max_depth = max_depth.max(depth);
+            abbreviated += abbrev;
+            if !g.is_empty() {
+                groups.insert(Caseless(g));
+            }
+            out.push(
+                hierarchy
+                    | depth.min(15) << 3
+                    | rule << 7
+                    | cat << 11
+                    | conf << 24
+                    | abbrev << 34
+                    | (g.len().min(255) as i64) << 35,
+            );
+        }
+        out.extend(hierarchies);
+        out.extend(rules);
+        out.extend([depth_sum, max_depth, groups.len() as i64, abbreviated]);
+        out
+    }
+
+    /// `ReleaseContext::STANDALONE_SEASON_TOKEN_REGEX` delimiters.
+    fn season_delim(b: u8) -> bool {
+        matches!(b, b'.' | b'_' | b' ' | b'-')
+    }
+
+    /// Whether the `S`/`s` at `p` starts a delimiter-bounded season token of 1-3 digits.
+    fn season_at(s: &[u8], p: usize) -> bool {
+        if p > 0 && !season_delim(s[p - 1]) {
+            return false;
+        }
+        let k = s[p + 1..]
+            .iter()
+            .take(4)
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        (1..=3).contains(&k) && (p + 1 + k == s.len() || season_delim(s[p + 1 + k]))
+    }
+
+    /// `ReleaseContext::w60SeasonToken()`.
+    #[cfg(test)]
+    fn season_token(s: &[u8]) -> bool {
+        (0..s.len()).any(|p| s[p] | 0x20 == b's' && season_at(s, p))
+    }
+
+    /// The `w60ReleaseContextBatchPhp()` name feature bits 1, 2, 4, 8, 16, 32 and 128 and the
+    /// resolution, in one pass that dispatches each position on its lowercase byte.
+    fn name_features(name: &[u8]) -> (i64, i64) {
+        let mut features = if name.starts_with(b"OF.") { 2 } else { 0 };
+        let mut resolution = 0i64;
+        for i in 0..name.len() {
+            let at = |n: &[u8]| at_ci(name, i, n);
+            match name[i].to_ascii_lowercase() {
+                b's' => {
+                    if season_at(name, i) {
+                        features |= 1;
+                    }
+                    if at(b"spanish") {
+                        features |= 8;
+                    }
+                }
+                b'o' if at(b"onlyfans")
+                    || at(b"only-fans")
+                    || at(b"only_fans")
+                    || at(b"only fans") =>
+                {
+                    features |= 2;
+                }
+                b'w' if at(b"web-dl") || at(b"webrip") || at(b"web.dl") => features |= 4,
+                b'a' if at(b"amzn") => features |= 4,
+                b'g' if at(b"german") => features |= 8,
+                b'f' if at(b"french") => features |= 8,
+                b'i' if at(b"italian") => features |= 8,
+                b'n' if at(b"nordic") => features |= 8,
+                b'm' if at(b"multi") => features |= 8,
+                b'p' if at(b"proper") => features |= 16,
+                b'r' if at(b"repack") || at(b"rerip") => features |= 16,
+                b'x' if at(b"xxx") => features |= 32,
+                b'1' | b'2' => {
+                    if i + 4 <= name.len()
+                        && matches!(&name[i..i + 2], b"19" | b"20")
+                        && name[i + 2].is_ascii_digit()
+                        && name[i + 3].is_ascii_digit()
+                        && (i == 0 || !name[i - 1].is_ascii_digit())
+                        && (i + 4 == name.len() || !name[i + 4].is_ascii_digit())
+                    {
+                        features |= 128;
+                    }
+                    if at(b"2160p") {
+                        resolution = 4;
+                    } else if at(b"1080p") {
+                        resolution = resolution.max(3);
+                    }
+                }
+                b'7' if at(b"720p") => resolution = resolution.max(2),
+                b'4' if at(b"480p") => resolution = resolution.max(1),
+                _ => {}
+            }
+        }
+        (features, resolution)
+    }
+
+    /// `ReleaseContext::w60ReleaseContextBatchPhp()`.
+    fn release_context(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 44);
+        let mut name_states = [0i64; 4];
+        let mut group_states = [0i64; 4];
+        let mut poster_states = [0i64; 3];
+        let mut size_states = [0i64; 3];
+        let mut bands = [0i64; 5];
+        let mut cat_states = [0i64; 4];
+        let mut should_states = [0i64; 4];
+        let mut effective_count = 0i64;
+        let mut feature_counts = [0i64; 8];
+        let mut resolutions = [0i64; 5];
+        let mut size_sum = 0i64;
+        let mut posters: KeySet<Caseless> = KeySet::default();
+        let mut groups: KeySet<Caseless> = KeySet::default();
+        let mut buf = [0u8; 16];
+        for &item in items {
+            let [name, group, poster, raw_size, raw_cat, raw_should] = fields::<6>(item);
+            let (name, group, poster) = (ptrim(name), ptrim(group), ptrim(poster));
+            let name_state = if name.is_empty() {
+                0
+            } else if name.iter().any(|&b| b < 0x20 || b == 0x7f) {
+                3
+            } else if name.len() > 255 {
+                2
+            } else {
+                1
+            };
+            let group_state = if group.is_empty() {
+                0
+            } else if !group
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'_'))
+            {
+                3
+            } else if starts_ci(group, b"alt.binaries.") {
+                1
+            } else {
+                2
+            };
+            let poster_state = if poster.is_empty() {
+                0
+            } else {
+                let at = poster.iter().filter(|&&b| b == b'@').count();
+                let p = poster.iter().position(|&b| b == b'@').unwrap_or(0);
+                if at == 1 && p > 0 && p < poster.len() - 1 {
+                    1
+                } else {
+                    2
+                }
+            };
+            let (size_state, band, bytes) = size(ptrim(raw_size));
+            let (cat_state, cat_id) = category(ptrim(raw_cat));
+            let root = if cat_state == 1 { cat_id / 1000 } else { 0 };
+            let raw_should = ptrim(raw_should);
+            let should = if raw_should.is_empty() {
+                0
+            } else {
+                match lower(raw_should, &mut buf) {
+                    b"1" | b"true" | b"yes" | b"on" => 1,
+                    b"0" | b"false" | b"no" | b"off" => 2,
+                    _ => 3,
+                }
+            };
+            let effective = i64::from(should != 2 && name_state == 1);
+            let (mut features, resolution) = name_features(name);
+            if contains_ci(group, b"erotica") || contains_ci(group, b"xxx") {
+                features |= 64;
+            }
+            name_states[name_state as usize] += 1;
+            group_states[group_state as usize] += 1;
+            poster_states[poster_state as usize] += 1;
+            size_states[size_state as usize] += 1;
+            bands[band as usize] += 1;
+            cat_states[cat_state as usize] += 1;
+            should_states[should as usize] += 1;
+            effective_count += effective;
+            resolutions[resolution as usize] += 1;
+            size_sum += bytes;
+            for (i, slot) in feature_counts.iter_mut().enumerate() {
+                *slot += features >> i & 1;
+            }
+            let word = name_state
+                | group_state << 2
+                | poster_state << 4
+                | size_state << 6
+                | band << 8
+                | cat_state << 11
+                | root << 13
+                | should << 17
+                | effective << 19
+                | features << 20
+                | resolution << 28
+                | (name.len().min(1023) as i64) << 31
+                | (group.len().min(255) as i64) << 41;
+            if !poster.is_empty() {
+                posters.insert(Caseless(poster));
+            }
+            if !group.is_empty() {
+                groups.insert(Caseless(group));
+            }
+            out.push(word);
+        }
+        out.extend(name_states);
+        out.extend(group_states);
+        out.extend(poster_states);
+        out.extend(size_states);
+        out.extend(bands);
+        out.extend(cat_states);
+        out.extend(should_states);
+        out.push(effective_count);
+        out.extend(feature_counts);
+        out.extend(resolutions);
+        out.extend([size_sum, posters.len() as i64, groups.len() as i64]);
+        out
+    }
+
+    macro_rules! w603_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// Items are NUL-joined in `blob`, or concatenated with their byte lengths in `lens`
+            /// when it is non-null. Returns the word count, `-needed` when `out_cap` is too small,
+            /// or `-1` when it declines (null `out`, null `blob` with a length, `count` other than
+            /// the number of NUL-separated items, or `lens` that do not tile `blob`).
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+            /// `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run_items(blob, blob_len, lens, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w603_export!(
+        /// `AbstractCategorizer::w60CategorizerGateBatch()`.
+        nntmux_w603_abstract_categorizer_gate_batch => categorizer_gate
+    );
+    w603_export!(
+        /// `BookCategorizer::w60BookTokenBatch()`.
+        nntmux_w603_book_token_batch => book_tokens
+    );
+    w603_export!(
+        /// `ConsoleCategorizer::w60ConsolePlatformBatch()`.
+        nntmux_w603_console_platform_batch => console_platform
+    );
+    w603_export!(
+        /// `GroupNameCategorizer::w60GroupNameBatch()`.
+        nntmux_w603_group_name_batch => group_name
+    );
+    w603_export!(
+        /// `ReleaseContext::w60ReleaseContextBatch()`.
+        nntmux_w603_release_context_batch => release_context
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        /// Each export with the words an empty batch writes.
+        const EXPORTS: [(Export, isize); 5] = [
+            (nntmux_w603_abstract_categorizer_gate_batch, 34),
+            (nntmux_w603_book_token_batch, 28),
+            (nntmux_w603_console_platform_batch, 36),
+            (nntmux_w603_group_name_batch, 19),
+            (nntmux_w603_release_context_batch, 44),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            if items.iter().all(|i| !i.contains(&0)) {
+                let joined = items.join(&0u8);
+                let mut nul = vec![0i64; 4096];
+                let w = unsafe {
+                    f(
+                        joined.as_ptr(),
+                        joined.len(),
+                        ptr::null(),
+                        items.len(),
+                        nul.as_mut_ptr(),
+                        nul.len(),
+                    )
+                };
+                nul.truncate(w.max(0) as usize);
+                assert_eq!(nul, out, "NUL-joined and length-column calls differ");
+            }
+            out
+        }
+
+        #[test]
+        fn w603_php_helpers() {
+            assert_eq!(ptrim(b" \t\0x y\x0b\r\n"), b"x y");
+            assert_eq!(ptrim(b" \0 "), b"");
+            assert_eq!(fields::<3>(b"a|b"), [&b"a"[..], b"b", b""]);
+            assert_eq!(fields::<2>(b"a|b|c"), [&b"a"[..], b"b|c"]);
+            assert_eq!(confidence(b"0.85"), (1, 850));
+            assert_eq!(confidence(b"1"), (1, 1000));
+            assert_eq!(confidence(b"1.0005"), (1, 1000));
+            assert_eq!(confidence(b"1.001"), (2, 1001));
+            assert_eq!(confidence(b".5"), (3, 0));
+            assert_eq!(confidence(b"0."), (3, 0));
+            assert_eq!(confidence(b"0.1234567"), (3, 0));
+            assert!(
+                has_year(b"Book.2019.EPUB")
+                    && has_year(b"2020")
+                    && !has_year(b"12019")
+                    && !has_year(b"1899")
+            );
+            assert!(
+                group_suffix(b"x-GRP")
+                    && !group_suffix(b"x-G")
+                    && !group_suffix(b"-ABCDEFGHIJKLMNOP")
+            );
+            assert!(
+                season_token(b"Show.S01.Complete")
+                    && season_token(b"s1")
+                    && !season_token(b"Show.S1234")
+            );
+            assert!(!season_token(b"XS01.x") && !season_token(b"S01E02"));
+        }
+
+        #[test]
+        fn w603_gate_items() {
+            let out = call(
+                nntmux_w603_abstract_categorizer_gate_batch,
+                &[
+                    b"Some.Movie.2019-GRP|alt.binaries.x|40|0.9|2040",
+                    b"ab|g|200|x|",
+                    b"|||",
+                ],
+            );
+            assert_eq!(
+                out[0],
+                1 | 1 << 2
+                    | 40 << 4
+                    | 1 << 11
+                    | 3 << 13
+                    | 900 << 15
+                    | 1 << 35
+                    | 2 << 37
+                    | 1 << 41
+                    | 1 << 45
+                    | 1 << 46
+                    | 2 << 50
+                    | 19 << 52
+            );
+            assert_eq!(out[1], 2 | 1 << 2 | 50 << 4 | 3 << 11 | 2 << 47 | 2 << 52);
+            assert_eq!(out[2], 1 << 2 | 50 << 4 | 1 << 47);
+            assert_eq!(&out[3..6], &[2, 0, 1]);
+            assert_eq!(&out[34..], &[50, 900, 1]);
+        }
+
+        #[test]
+        fn w603_book_console_group_context_items() {
+            let book = call(
+                nntmux_w603_book_token_batch,
+                &[b"Author - Title (2019) Retail.epub|2048"],
+            );
+            assert_eq!(
+                book[0],
+                5 | 1 << 3
+                    | (1 | 32 | 128) << 6
+                    | 7020 << 14
+                    | 900 << 28
+                    | 1 << 38
+                    | 1 << 40
+                    | 5 << 43
+                    | 33 << 49
+            );
+            let console = call(
+                nntmux_w603_console_platform_batch,
+                &[b"Game.PAL.XBOX.360-GRP|alt.binaries.games.xbox360"],
+            );
+            assert_eq!(
+                console[0],
+                7 | 1 << 4 | 1 << 16 | 1 << 17 | 1050 << 18 | 900 << 29 | 5 << 39 | 21 << 45
+            );
+            let group = call(
+                nntmux_w603_group_name_batch,
+                &[
+                    b" Alt.Binaries.Multimedia.Anime ",
+                    b"alt.binaries.",
+                    b"a.b.teevee",
+                ],
+            );
+            assert_eq!(
+                group[0],
+                1 | 4 << 3 | 1 << 7 | 5070 << 11 | 800 << 24 | 29 << 35
+            );
+            assert_eq!(group[1], 5 | 13 << 35);
+            assert_eq!(group[2], 3 | 3 << 3 | 1 << 34 | 10 << 35);
+            let context = call(
+                nntmux_w603_release_context_batch,
+                &[b"Show.S01.1080p.WEB-DL-GRP|alt.binaries.tv|poster@x.y|1048576|5040|no"],
+            );
+            assert_eq!(
+                context[0],
+                1 | 1 << 2
+                    | 1 << 4
+                    | 1 << 6
+                    | 2 << 8
+                    | 1 << 11
+                    | 5 << 13
+                    | 2 << 17
+                    | (1 | 4) << 20
+                    | 3 << 28
+                    | 25 << 31
+                    | 15 << 41
+            );
+        }
+
+        #[test]
+        fn w603_exports_guard_their_buffers() {
+            let mut buf = [0i64; 128];
+            let o = buf.as_mut_ptr();
+            let n = ptr::null::<i64>();
+            for (f, trailer) in EXPORTS {
+                unsafe {
+                    assert_eq!(f(b"x".as_ptr(), 1, n, 1, ptr::null_mut(), 128), -1);
+                    assert_eq!(f(ptr::null(), 1, n, 1, o, 128), -1);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 1, o, 128), -1);
+                    assert_eq!(f(ptr::null(), 0, n, 0, o, 128), trailer);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 2, o, 1), -(trailer + 2));
+                    let lens = [1i64, 2];
+                    assert_eq!(
+                        f(b"a\0b".as_ptr(), 3, lens.as_ptr(), 2, o, 128),
+                        trailer + 2
+                    );
+                    assert_eq!(f(b"a\0bc".as_ptr(), 4, lens.as_ptr(), 2, o, 128), -1);
+                }
+            }
+        }
+    }
+}

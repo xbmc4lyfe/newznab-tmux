@@ -6,6 +6,7 @@ namespace App\Services\Categorization;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -398,5 +399,351 @@ class ReleaseContext
         }
 
         return $result === (self::NATIVE_HIGH_BYTE_SEEN | 1);
+    }
+
+    // ========================================================================
+    // WAVE 60.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 5.52x, p99 4.10x; uncommon mean 4.81x, p99 4.09x); see RustCategorizersAbstractBookConsoleGroupNameReleaseContextW60ParityTest. */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    public const string W60_RELEASE_CONTEXT_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w603_release_context_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w60ReleaseContextBatch(). */
+    public const int W60_RELEASE_CONTEXT_TRAILER = 44;
+
+    /** ASCII control bytes (0x00-0x1F and 0x7F). */
+    private const string W60_CONTROL_BYTES = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F";
+
+    /** shouldCategorize spellings: 1 true, 2 false (anything else non-empty is 3, treated as true). */
+    public const array W60_SHOULD_VALUES = ['1' => 1, 'true' => 1, 'yes' => 1, 'on' => 1, '0' => 2, 'false' => 2, 'no' => 2, 'off' => 2];
+
+    /**
+     * Feature needles (case-insensitive) for the web, foreign and proper flags.
+     *
+     * @var array<int, list<string>>
+     */
+    public const array W60_FEATURE_NEEDLES = [
+        2 => ['web-dl', 'webrip', 'web.dl', 'amzn'],
+        3 => ['german', 'french', 'spanish', 'italian', 'nordic', 'multi'],
+        4 => ['proper', 'repack', 'rerip'],
+    ];
+
+    public static function usesW60RustFfi(): bool
+    {
+        $override = self::w60RustFfiState();
+
+        return \is_bool($override) ? $override : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the ReleaseContext Wave 60 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 60.3 release context validation and feature summaries. Each item is
+     * `releaseName|groupName|poster|size|categoryId|shouldCategorize` (missing fields are empty, every field is
+     * trimmed). Per item `nameState | groupState << 2 | posterState << 4 | sizeState << 6 | sizeBand << 8 |
+     * categoryState << 11 | root << 13 | shouldState << 17 | effective << 19 | features << 20 | resolution << 28 |
+     * min(nameLength, 1023) << 31 | min(groupLength, 255) << 41`: the name is 0 empty, 3 holding a control byte, 2
+     * over 255 bytes, else 1; the group 0 empty, 3 a byte outside `[A-Za-z0-9.+_-]`, 1 a case-insensitive
+     * `alt.binaries.` prefix, else 2; the poster 0 empty, 1 one `@` with bytes on both sides, else 2; size follows
+     * w60Size() and the category w60Category() (root id / 1000 when valid); shouldCategorize is 0 empty, else its
+     * W60_SHOULD_VALUES state (case-insensitive) or 3; effective requires a state other than 2 and a valid name.
+     * Feature bits: 1 w60SeasonToken(), 2 an `OF.` prefix or OnlyFans spelling, 4/8/16 W60_FEATURE_NEEDLES web,
+     * foreign and proper, 32 `xxx`, 64 an erotica/xxx group and 128 a 19xx/20xx year; resolution is 4 2160p, 3
+     * 1080p, 2 720p, 1 480p, else 0. Then four name, four group, three poster, three size, five band, four category
+     * and four shouldCategorize state counts, the effective count, eight feature and five resolution counts, the
+     * valid size sum and the distinct (case-insensitive) posters and groups.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60ReleaseContextBatch(array $items): array
+    {
+        return self::usesW60RustFfi() ? self::w60ReleaseContextBatchNative($items) : self::w60ReleaseContextBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60ReleaseContextBatchNative(array $items): array
+    {
+        return self::w60Invoke($items, \count($items) + self::W60_RELEASE_CONTEXT_TRAILER) ?? self::w60ReleaseContextBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w60ReleaseContextBatchPhp(array $items): array
+    {
+        $out = [];
+        $nameStates = $groupStates = $categoryStates = $shouldStates = [0, 0, 0, 0];
+        $posterStates = $sizeStates = [0, 0, 0];
+        $bands = $resolutions = [0, 0, 0, 0, 0];
+        $featureCounts = array_fill(0, 8, 0);
+        $effectiveCount = $sizeSum = 0;
+        $posters = $groups = [];
+        foreach ($items as $item) {
+            $f = explode('|', (string) $item, 6) + ['', '', '', '', '', ''];
+            $name = trim($f[0]);
+            $group = trim($f[1]);
+            $poster = trim($f[2]);
+            $nameLength = \strlen($name);
+            $groupLength = \strlen($group);
+            $nameState = $name === '' ? 0 : (strcspn($name, self::W60_CONTROL_BYTES) !== $nameLength ? 3 : ($nameLength > 255 ? 2 : 1));
+            $groupState = match (true) {
+                $group === '' => 0,
+                strspn($group, 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.+-_') !== $groupLength => 3,
+                strncasecmp($group, 'alt.binaries.', 13) === 0 => 1,
+                default => 2,
+            };
+            $at = strpos($poster, '@');
+            $posterState = $poster === '' ? 0 : ($at !== false && $at > 0 && $at < \strlen($poster) - 1 && substr_count($poster, '@') === 1 ? 1 : 2);
+            [$sizeState, $band, $bytes] = self::w60Size(trim($f[3]));
+            [$categoryState, $categoryId] = self::w60Category(trim($f[4]));
+            $root = $categoryState === 1 ? intdiv($categoryId, 1000) : 0;
+            $should = strtolower(trim($f[5]));
+            $shouldState = $should === '' ? 0 : (self::W60_SHOULD_VALUES[$should] ?? 3);
+            $effective = $shouldState !== 2 && $nameState === 1 ? 1 : 0;
+            $lower = strtolower($name);
+            $lowerGroup = strtolower($group);
+            $features = 0;
+            if (self::w60SeasonToken($name)) {
+                $features |= 1;
+            }
+            if (str_starts_with($name, 'OF.') || str_contains($lower, 'onlyfans') || str_contains($lower, 'only-fans') || str_contains($lower, 'only_fans')
+                || str_contains($lower, 'only fans')) {
+                $features |= 2;
+            }
+            foreach (self::W60_FEATURE_NEEDLES as $bit => $needles) {
+                foreach ($needles as $needle) {
+                    if (str_contains($lower, $needle)) {
+                        $features |= 1 << $bit;
+
+                        break;
+                    }
+                }
+            }
+            if (str_contains($lower, 'xxx')) {
+                $features |= 32;
+            }
+            if (str_contains($lowerGroup, 'erotica') || str_contains($lowerGroup, 'xxx')) {
+                $features |= 64;
+            }
+            if (preg_match('/(?<![0-9])(?:19|20)[0-9]{2}(?![0-9])/', $name) === 1) {
+                $features |= 128;
+            }
+            $resolution = str_contains($lower, '2160p') ? 4 : (str_contains($lower, '1080p') ? 3 : (str_contains($lower, '720p') ? 2 : (str_contains($lower, '480p') ? 1 : 0)));
+            $nameStates[$nameState]++;
+            $groupStates[$groupState]++;
+            $posterStates[$posterState]++;
+            $sizeStates[$sizeState]++;
+            $bands[$band]++;
+            $categoryStates[$categoryState]++;
+            $shouldStates[$shouldState]++;
+            $effectiveCount += $effective;
+            $resolutions[$resolution]++;
+            for ($b = 0; $b < 8; $b++) {
+                $featureCounts[$b] += $features >> $b & 1;
+            }
+            $sizeSum += $bytes;
+            if ($poster !== '') {
+                $posters[strtolower($poster)] = true;
+            }
+            if ($group !== '') {
+                $groups[$lowerGroup] = true;
+            }
+            $out[] = $nameState | $groupState << 2 | $posterState << 4 | $sizeState << 6 | $band << 8 | $categoryState << 11 | $root << 13
+                | $shouldState << 17 | $effective << 19 | $features << 20 | $resolution << 28 | min($nameLength, 1023) << 31 | min($groupLength, 255) << 41;
+        }
+        array_push($out, ...$nameStates, ...$groupStates, ...$posterStates, ...$sizeStates, ...$bands, ...$categoryStates, ...$shouldStates);
+        $out[] = $effectiveCount;
+        array_push($out, ...$featureCounts, ...$resolutions);
+        array_push($out, $sizeSum, \count($posters), \count($groups));
+
+        return $out;
+    }
+
+    /**
+     * A delimiter-bounded `S` plus 1-3 digits, as STANDALONE_SEASON_TOKEN_REGEX matches it, compared bytewise.
+     */
+    private static function w60SeasonToken(string $name): bool
+    {
+        $length = \strlen($name);
+        $lower = strtolower($name);
+        for ($p = strpos($lower, 's'); $p !== false; $p = $p + 1 < $length ? strpos($lower, 's', $p + 1) : false) {
+            if ($p > 0 && ! str_contains('._ -', $name[$p - 1])) {
+                continue;
+            }
+            $k = strspn($name, '0123456789', $p + 1, 4);
+            if ($k >= 1 && $k <= 3 && ($p + 1 + $k === $length || str_contains('._ -', $name[$p + 1 + $k]))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Size state 0 empty, 1 up to 12 digits and 2 invalid; the band is 0 without a valid size, then 1 below 1 MiB,
+     * 2 below 50 MiB, 3 below 500 MiB and 4 larger; then the byte count (0 unless valid).
+     *
+     * @return array{int, int, int}
+     */
+    private static function w60Size(string $raw): array
+    {
+        if ($raw === '') {
+            return [0, 0, 0];
+        }
+        $length = \strlen($raw);
+        if ($length > 12 || strspn($raw, '0123456789') !== $length) {
+            return [2, 0, 0];
+        }
+        $bytes = (int) $raw;
+
+        return [1, $bytes < 1_048_576 ? 1 : ($bytes < 52_428_800 ? 2 : ($bytes < 524_288_000 ? 3 : 4)), $bytes];
+    }
+
+    /**
+     * Category state 0 empty, 1 an id in 1000-8999, 2 another number of up to nine digits and 3 malformed; then the
+     * id (0 unless numeric).
+     *
+     * @return array{int, int}
+     */
+    private static function w60Category(string $raw): array
+    {
+        if ($raw === '') {
+            return [0, 0];
+        }
+        $length = \strlen($raw);
+        if ($length > 9 || strspn($raw, '0123456789') !== $length) {
+            return [3, 0];
+        }
+        $id = (int) $raw;
+
+        return [$id >= 1000 && $id <= 8999 ? 1 : 2, $id];
+    }
+
+    /**
+     * Wave 60 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w603', self::W60_RELEASE_CONTEXT_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w60RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w60RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 60.3 ReleaseContext export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w60Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w60RustFfiState('ffi');
+            $out = self::w60RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w60RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W60_RELEASE_CONTEXT_FFI_CDEF.)
+            $written = $ffi->nntmux_w603_release_context_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
