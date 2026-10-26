@@ -43454,3 +43454,836 @@ pub mod tv_processing_pipes_provider_passable_result_w563 {
         }
     }
 }
+
+/// Wave 57.3 NameFixing checker batches for `AbstractNameChecker`, `AppNameChecker`,
+/// `GameNameChecker`, `MovieNameChecker` and `TvNameChecker`. Every export takes the Wave 55.3
+/// item layout (NUL-joined, or concatenated with an `int64_t` length column) and writes the
+/// `int64_t` words of the matching PHP `w57...Php()` helper. Tokens are maximal ASCII
+/// alphanumeric runs, compared ASCII case-insensitively.
+pub mod name_fixing_checkers_abstract_app_game_movie_tv_w573 {
+    use super::release_image_browse_duplicate_group_management_w553::run_items;
+    use std::collections::HashSet;
+
+    const FNV_OFFSET: u32 = 0x811C_9DC5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+
+    /// `GameNameChecker::W57_GAME_PLATFORMS`; the word stores index + 1.
+    const PLATFORMS: [&[u8]; 16] = [
+        b"ps3", b"ps4", b"ps5", b"xbox", b"xbox360", b"xboxone", b"x360", b"nsw", b"switch",
+        b"wii", b"wiiu", b"3ds", b"nds", b"psp", b"psvita", b"vita",
+    ];
+
+    /// `GameNameChecker::W57_GAME_GROUPS`; the word stores index + 1.
+    const GROUPS: [&[u8]; 24] = [
+        b"codex",
+        b"plaza",
+        b"skidrow",
+        b"reloaded",
+        b"cpy",
+        b"empress",
+        b"flt",
+        b"tenoke",
+        b"rune",
+        b"razor1911",
+        b"hoodlum",
+        b"prophet",
+        b"darksiders",
+        b"dodi",
+        b"fitgirl",
+        b"elamigos",
+        b"outlaws",
+        b"alias",
+        b"venom",
+        b"bigblue",
+        b"ali213",
+        b"goldberg",
+        b"chronos",
+        b"doge",
+    ];
+
+    /// Alphanumeric token spans of `item` into `out`.
+    fn spans(item: &[u8], out: &mut Vec<(usize, usize)>) {
+        out.clear();
+        let (mut i, n) = (0usize, item.len());
+        while i < n {
+            if item[i].is_ascii_alphanumeric() {
+                let start = i;
+                while i < n && item[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+                out.push((start, i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Lowercase copy of a token of at most 16 bytes; longer tokens match no keyword.
+    #[inline]
+    fn lower<'b>(t: &[u8], buf: &'b mut [u8; 16]) -> &'b [u8] {
+        if t.len() > 16 {
+            return &[];
+        }
+        for (d, s) in buf.iter_mut().zip(t) {
+            *d = s.to_ascii_lowercase();
+        }
+        &buf[..t.len()]
+    }
+
+    #[inline]
+    fn all_digits(t: &[u8]) -> bool {
+        !t.is_empty() && t.iter().all(u8::is_ascii_digit)
+    }
+
+    #[inline]
+    fn number(t: &[u8]) -> i64 {
+        t.iter().fold(0i64, |n, b| n * 10 + i64::from(b - b'0'))
+    }
+
+    /// Leading ASCII digits and the rest.
+    #[inline]
+    fn split_digits(t: &[u8]) -> (&[u8], &[u8]) {
+        let n = t.iter().take_while(|b| b.is_ascii_digit()).count();
+        t.split_at(n)
+    }
+
+    /// `/^(?:19|20)\d{2}$/`.
+    #[inline]
+    fn year(t: &[u8]) -> i64 {
+        if t.len() == 4 && (t.starts_with(b"19") || t.starts_with(b"20")) && all_digits(t) {
+            number(t)
+        } else {
+            0
+        }
+    }
+
+    /// PHP `trim()` with its default characters.
+    fn php_trim(v: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let start = v.iter().position(|b| !ws(b)).unwrap_or(v.len());
+        let end = v.iter().rposition(|b| !ws(b)).map_or(start, |p| p + 1);
+        &v[start..end]
+    }
+
+    /// `AbstractNameChecker::w57CandidateEligibilityBatchPhp()`.
+    fn candidate_eligibility(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 8);
+        let mut sp = Vec::new();
+        let mut totals = [0i64; 7];
+        let mut keys = HashSet::with_capacity(items.len());
+        for &item in items {
+            let t = php_trim(item);
+            spans(t, &mut sp);
+            let mut h = FNV_OFFSET;
+            for (k, &(s, e)) in sp.iter().enumerate() {
+                if k > 0 {
+                    h = (h ^ u32::from(b'.')).wrapping_mul(FNV_PRIME);
+                }
+                for &b in &t[s..e] {
+                    h = (h ^ u32::from(b.to_ascii_lowercase())).wrapping_mul(FNV_PRIME);
+                }
+            }
+            let tokens = sp.len() as i64;
+            let (mut dot, mut underscore, mut space) = (false, false, false);
+            let (mut nonascii, mut control, mut letter) = (false, false, false);
+            for &b in t {
+                match b {
+                    b'.' => dot = true,
+                    b'_' => underscore = true,
+                    b' ' => space = true,
+                    0x80..=0xFF => nonascii = true,
+                    0..=0x1F | 0x7F => control = true,
+                    b'a'..=b'z' | b'A'..=b'Z' => letter = true,
+                    _ => {}
+                }
+            }
+            let group = match t.iter().rposition(|&b| b == b'-') {
+                Some(p) if p > 0 => {
+                    let tail = &t[p + 1..];
+                    (2..=15).contains(&tail.len()) && tail.iter().all(u8::is_ascii_alphanumeric)
+                }
+                _ => false,
+            };
+            let len = t.len();
+            let eligible =
+                len >= 8 && tokens >= 2 && !control && (dot || underscore || space) && letter;
+            let flags = i64::from(dot)
+                | i64::from(underscore) << 1
+                | i64::from(space) << 2
+                | i64::from(group) << 3
+                | i64::from(nonascii) << 4
+                | i64::from(control) << 5
+                | i64::from(eligible) << 6;
+            let score = (4 * tokens.min(20)
+                + 20 * i64::from(group)
+                + 10 * i64::from(dot)
+                + 5 * i64::from(underscore)
+                + (len.min(200) / 10) as i64)
+                .min(255);
+            totals[0] += i64::from(eligible);
+            totals[1] += i64::from(group);
+            totals[2] += i64::from(nonascii);
+            totals[3] += i64::from(control);
+            totals[4] += i64::from(len == 0);
+            totals[5] = totals[5].max(score);
+            totals[6] += tokens;
+            keys.insert(h);
+            out.push(
+                i64::from(h)
+                    | tokens.min(63) << 32
+                    | flags << 38
+                    | score << 45
+                    | (len.min(1023) as i64) << 53,
+            );
+        }
+        out.extend(totals);
+        out.push(keys.len() as i64);
+        out
+    }
+
+    /// `AppNameChecker::W57_APP_TOKENS`.
+    #[inline]
+    fn app_token(l: &[u8]) -> i64 {
+        match l {
+            b"x64" | b"amd64" | b"64bit" => 2,
+            b"win64" => 2 | 64,
+            b"x86" | b"32bit" | b"i386" => 4,
+            b"win32" => 4 | 64,
+            b"multilingual" | b"multilang" | b"multi" => 8,
+            b"keygen" | b"crack" | b"cracked" | b"patch" | b"serial" | b"keymaker" => 16,
+            b"windows" | b"win" | b"win10" | b"win11" | b"winall" => 64,
+            b"macos" | b"macosx" | b"osx" | b"mac" => 128,
+            b"linux" | b"ubuntu" | b"debian" => 256,
+            b"adobe" | b"microsoft" | b"autodesk" | b"corel" | b"jetbrains" => 512,
+            b"portable" | b"retail" => 1024,
+            _ => 0,
+        }
+    }
+
+    /// First `/(?<![A-Za-z0-9])[vV](\d+)((?:\.\d+)+)/`: its part count (at most 15) and its
+    /// major version (9999 past four digits).
+    fn version(item: &[u8]) -> Option<(i64, i64)> {
+        let n = item.len();
+        let mut i = 0usize;
+        while i + 1 < n {
+            if matches!(item[i], b'v' | b'V')
+                && item[i + 1].is_ascii_digit()
+                && (i == 0 || !item[i - 1].is_ascii_alphanumeric())
+            {
+                let mut j = i + 1;
+                while j < n && item[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let major = &item[i + 1..j];
+                let mut parts = 1i64;
+                while j + 1 < n && item[j] == b'.' && item[j + 1].is_ascii_digit() {
+                    j += 1;
+                    while j < n && item[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    parts += 1;
+                }
+                if parts >= 2 {
+                    let major = if major.len() > 4 { 9999 } else { number(major) };
+                    return Some((parts.min(15), major));
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// `AppNameChecker::w57AppPatternBatchPhp()`.
+    fn app_patterns(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 10);
+        let mut sp = Vec::new();
+        let mut classes = [0i64; 7];
+        let (mut versions, mut arch, mut max_major) = (0i64, 0i64, 0i64);
+        let mut buf = [0u8; 16];
+        for &item in items {
+            spans(item, &mut sp);
+            let mut flags = 0i64;
+            let mut after_incl = false;
+            for &(s, e) in &sp {
+                let l = lower(&item[s..e], &mut buf);
+                let f = app_token(l);
+                if after_incl && f & 16 != 0 {
+                    flags |= 32;
+                }
+                flags |= f;
+                after_incl = l == b"incl";
+            }
+            let (mut parts, mut major) = (0i64, 0i64);
+            if let Some((p, m)) = version(item) {
+                flags |= 1;
+                (parts, major) = (p, m);
+                versions += 1;
+                max_major = max_major.max(m);
+            }
+            let class = if flags & (16 | 32) != 0 {
+                1
+            } else if flags & 512 != 0 {
+                2
+            } else if flags & 64 != 0 {
+                3
+            } else if flags & 128 != 0 {
+                4
+            } else if flags & 256 != 0 {
+                5
+            } else if flags & 1 != 0 {
+                6
+            } else {
+                0
+            };
+            classes[class as usize] += 1;
+            arch += i64::from(flags & 6 != 0);
+            out.push(
+                flags | class << 12 | parts << 16 | major << 20 | (sp.len().min(255) as i64) << 34,
+            );
+        }
+        out.extend(classes);
+        out.extend([versions, arch, max_major]);
+        out
+    }
+
+    /// `GameNameChecker::W57_GAME_TOKENS` flags of a non-platform token.
+    #[inline]
+    fn game_token(l: &[u8]) -> i64 {
+        match l {
+            b"pc" | b"gog" | b"steam" => 2,
+            b"dlc" => 4,
+            b"update" => 8,
+            b"repack" => 16,
+            b"pal" | b"ntsc" | b"usa" | b"eur" | b"jpn" | b"ntscu" | b"ntscj" => 64,
+            b"proper" | b"crackfix" | b"hotfix" | b"fix" => 128,
+            b"build" => 512,
+            _ => 0,
+        }
+    }
+
+    /// `GameNameChecker::w57GamePatternBatchPhp()`.
+    fn game_patterns(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 9);
+        let mut sp = Vec::new();
+        let mut classes = [0i64; 6];
+        let (mut dlc, mut update) = (0i64, 0i64);
+        let mut seen_groups = 0u32;
+        let mut buf = [0u8; 16];
+        for &item in items {
+            spans(item, &mut sp);
+            let (mut flags, mut platform) = (0i64, 0i64);
+            for &(s, e) in &sp {
+                let l = lower(&item[s..e], &mut buf);
+                if let Some(p) = PLATFORMS.iter().position(|&k| k == l) {
+                    flags |= 1;
+                    if platform == 0 {
+                        platform = p as i64 + 1;
+                    }
+                } else {
+                    flags |= game_token(l);
+                }
+                // `/^v\d+$/i` on the whole token, whatever its length.
+                if let [b'v' | b'V', rest @ ..] = &item[s..e]
+                    && all_digits(rest)
+                {
+                    flags |= 256;
+                }
+            }
+            let mut group = 0i64;
+            if let Some(&(s, e)) = sp.last()
+                && s > 0
+                && item[s - 1] == b'-'
+                && let Some(g) = GROUPS
+                    .iter()
+                    .position(|&k| k == lower(&item[s..e], &mut buf))
+            {
+                group = g as i64 + 1;
+                flags |= 32;
+                seen_groups |= 1 << g;
+            }
+            let class = match (flags & 1 != 0, flags & 32 != 0) {
+                (true, true) => 1,
+                (true, false) => 2,
+                (false, true) => 3,
+                _ if flags & (4 | 8) != 0 => 4,
+                _ if flags & 16 != 0 => 5,
+                _ => 0,
+            };
+            classes[class as usize] += 1;
+            dlc += i64::from(flags & 4 != 0);
+            update += i64::from(flags & 8 != 0);
+            out.push(
+                flags
+                    | class << 12
+                    | group << 16
+                    | platform << 24
+                    | (sp.len().min(255) as i64) << 32,
+            );
+        }
+        out.extend(classes);
+        out.extend([dlc, update, i64::from(seen_groups.count_ones())]);
+        out
+    }
+
+    /// `MovieNameChecker::W57_MOVIE_FLAGS`.
+    #[inline]
+    fn movie_flag(l: &[u8]) -> i64 {
+        match l {
+            b"dts" | b"ac3" | b"aac" | b"ddp" | b"ddp5" | b"dd5" | b"atmos" | b"truehd"
+            | b"flac" => 1,
+            b"hdr" | b"hdr10" | b"dv" | b"dolbyvision" | b"hdr10plus" => 2,
+            b"remux" | b"bdremux" => 4,
+            b"proper" | b"repack" => 8,
+            b"multi" | b"dual" | b"multisubs" => 16,
+            b"3d" | b"sbs" | b"hsbs" => 32,
+            _ => 0,
+        }
+    }
+
+    /// `MovieNameChecker::w57MoviePatternBatchPhp()`.
+    fn movie_patterns(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 8);
+        let mut sp = Vec::new();
+        let mut totals = [0i64; 8];
+        let mut buf = [0u8; 16];
+        let mut next_buf = [0u8; 16];
+        for &item in items {
+            spans(item, &mut sp);
+            let (mut yr, mut res, mut source, mut codec, mut flags) =
+                (0i64, 0i64, 0i64, 0i64, 0i64);
+            for (k, &(s, e)) in sp.iter().enumerate() {
+                let t = &item[s..e];
+                if yr == 0 {
+                    yr = year(t);
+                }
+                let l = lower(t, &mut buf);
+                let next = sp
+                    .get(k + 1)
+                    .map_or(&[][..], |&(ns, ne)| lower(&item[ns..ne], &mut next_buf));
+                if res == 0 {
+                    res = match l {
+                        b"480p" => 1,
+                        b"576p" => 2,
+                        b"720p" => 3,
+                        b"1080p" => 4,
+                        b"1080i" => 5,
+                        b"2160p" => 6,
+                        b"4k" | b"uhd" => 7,
+                        _ => 0,
+                    };
+                }
+                if source == 0 {
+                    source = match l {
+                        b"bluray" | b"bdrip" | b"brrip" | b"bdremux" => 1,
+                        b"webdl" => 2,
+                        b"webrip" => 3,
+                        b"web" => match next {
+                            b"dl" => 2,
+                            b"rip" => 3,
+                            _ => 4,
+                        },
+                        b"hdtv" => 5,
+                        b"dvdrip" | b"dvd" | b"dvdr" => 6,
+                        _ => 0,
+                    };
+                }
+                if codec == 0 {
+                    codec = match l {
+                        b"x264" => 1,
+                        b"h264" | b"avc" => 2,
+                        b"x265" => 3,
+                        b"h265" | b"hevc" => 4,
+                        b"xvid" | b"divx" => 5,
+                        b"av1" => 6,
+                        b"vp9" => 7,
+                        b"h" => match next {
+                            b"264" => 2,
+                            b"265" => 4,
+                            _ => 0,
+                        },
+                        _ => 0,
+                    };
+                }
+                flags |= movie_flag(l);
+            }
+            let score = i64::from(yr > 0)
+                + i64::from(res > 0)
+                + i64::from(source > 0)
+                + i64::from(codec > 0);
+            let matched = score >= 3 || (yr > 0 && res > 0);
+            totals[0] += i64::from(matched);
+            if yr > 0 {
+                totals[1] += 1;
+                totals[2] = if totals[2] == 0 {
+                    yr
+                } else {
+                    totals[2].min(yr)
+                };
+                totals[3] = totals[3].max(yr);
+            }
+            totals[4] += i64::from(res == 3);
+            totals[5] += i64::from(res == 4 || res == 5);
+            totals[6] += i64::from(res >= 6);
+            totals[7] += i64::from(flags & 2 != 0);
+            out.push(
+                yr | res << 12
+                    | source << 16
+                    | codec << 20
+                    | flags << 24
+                    | score << 30
+                    | i64::from(matched) << 33
+                    | (sp.len().min(255) as i64) << 34,
+            );
+        }
+        out.extend(totals);
+        out
+    }
+
+    /// `/^s(\d{1,3})e(\d{1,3})$/i`.
+    fn season_episode(t: &[u8]) -> Option<(i64, i64)> {
+        let rest = t.strip_prefix(b"s").or_else(|| t.strip_prefix(b"S"))?;
+        let (season, rest) = split_digits(rest);
+        let rest = rest
+            .strip_prefix(b"e")
+            .or_else(|| rest.strip_prefix(b"E"))?;
+        let (episode, rest) = split_digits(rest);
+        ((1..=3).contains(&season.len()) && (1..=3).contains(&episode.len()) && rest.is_empty())
+            .then(|| (number(season), number(episode)))
+    }
+
+    /// `/^(\d{1,2})x(\d{2})$/i`.
+    fn cross_episode(t: &[u8]) -> Option<(i64, i64)> {
+        let (season, rest) = split_digits(t);
+        let rest = rest
+            .strip_prefix(b"x")
+            .or_else(|| rest.strip_prefix(b"X"))?;
+        ((1..=2).contains(&season.len()) && rest.len() == 2 && all_digits(rest))
+            .then(|| (number(season), number(rest)))
+    }
+
+    /// `/^s(\d{1,3})$/i`.
+    fn season_pack(t: &[u8]) -> Option<i64> {
+        let rest = t.strip_prefix(b"s").or_else(|| t.strip_prefix(b"S"))?;
+        ((1..=3).contains(&rest.len()) && all_digits(rest)).then(|| number(rest))
+    }
+
+    /// `/^\d{2}$/` within `lo..=hi`.
+    #[inline]
+    fn two_digits(t: &[u8], lo: i64, hi: i64) -> Option<i64> {
+        (t.len() == 2 && all_digits(t))
+            .then(|| number(t))
+            .filter(|v| (lo..=hi).contains(v))
+    }
+
+    /// `TvNameChecker::W57_TV_FLAGS`.
+    #[inline]
+    fn tv_flag(l: &[u8]) -> i64 {
+        match l {
+            b"hdtv" => 1,
+            b"web" | b"webrip" | b"webdl" => 2,
+            b"bluray" | b"bdrip" | b"brrip" => 4,
+            b"480p" | b"720p" | b"1080p" | b"2160p" => 8,
+            b"proper" | b"repack" => 16,
+            b"complete" => 32,
+            b"amzn" | b"nf" | b"dsnp" | b"hmax" | b"atvp" | b"hulu" | b"pcok" | b"max" => 64,
+            _ => 0,
+        }
+    }
+
+    /// `TvNameChecker::w57TvPatternBatchPhp()`.
+    fn tv_patterns(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 8);
+        let mut sp = Vec::new();
+        let mut totals = [0i64; 8];
+        let mut buf = [0u8; 16];
+        for &item in items {
+            spans(item, &mut sp);
+            let (mut kind, mut season, mut episode, mut airdate, mut flags) =
+                (0i64, 0i64, 0i64, 0i64, 0i64);
+            let mut pack: Option<i64> = None;
+            for (k, &(s, e)) in sp.iter().enumerate() {
+                let t = &item[s..e];
+                if kind == 0 {
+                    if let Some((se, ep)) = season_episode(t) {
+                        (kind, season, episode) = (1, se, ep);
+                    } else if let Some((se, ep)) = cross_episode(t) {
+                        (kind, season, episode) = (2, se, ep);
+                    } else if let (y @ 1.., Some(&(ms, me)), Some(&(ds, de))) =
+                        (year(t), sp.get(k + 1), sp.get(k + 2))
+                        && let (Some(m), Some(d)) = (
+                            two_digits(&item[ms..me], 1, 12),
+                            two_digits(&item[ds..de], 1, 31),
+                        )
+                    {
+                        (kind, airdate) = (3, y * 10_000 + m * 100 + d);
+                    }
+                    if kind == 0 && pack.is_none() {
+                        pack = season_pack(t);
+                    }
+                }
+                flags |= tv_flag(lower(t, &mut buf));
+            }
+            if kind == 0
+                && let Some(p) = pack
+            {
+                (kind, season) = (4, p);
+            }
+            totals[kind as usize] += 1;
+            totals[5] = totals[5].max(season);
+            totals[6] = totals[6].max(episode);
+            totals[7] += i64::from(flags & 64 != 0);
+            out.push(
+                kind | season << 3
+                    | episode << 13
+                    | flags << 23
+                    | airdate << 30
+                    | (sp.len().min(255) as i64) << 55,
+            );
+        }
+        out.extend(totals);
+        out
+    }
+
+    macro_rules! w573_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// Items are NUL-joined in `blob`, or concatenated with their byte lengths in `lens`
+            /// when it is non-null. Returns the word count, `-needed` when `out_cap` is too small,
+            /// or `-1` when it declines (null `out`, null `blob` with a length, `count` other than
+            /// the number of NUL-separated items, or `lens` that do not tile `blob`).
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+            /// `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run_items(blob, blob_len, lens, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w573_export!(
+        /// `AbstractNameChecker::w57CandidateEligibilityBatch()`.
+        nntmux_w57_name_checker_candidate_eligibility_batch => candidate_eligibility
+    );
+    w573_export!(
+        /// `AppNameChecker::w57AppPatternBatch()`.
+        nntmux_w57_app_name_checker_pattern_batch => app_patterns
+    );
+    w573_export!(
+        /// `GameNameChecker::w57GamePatternBatch()`.
+        nntmux_w57_game_name_checker_pattern_batch => game_patterns
+    );
+    w573_export!(
+        /// `MovieNameChecker::w57MoviePatternBatch()`.
+        nntmux_w57_movie_name_checker_pattern_batch => movie_patterns
+    );
+    w573_export!(
+        /// `TvNameChecker::w57TvPatternBatch()`.
+        nntmux_w57_tv_name_checker_pattern_batch => tv_patterns
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        /// Each export with the words an empty batch writes.
+        const EXPORTS: [(Export, isize); 5] = [
+            (nntmux_w57_name_checker_candidate_eligibility_batch, 8),
+            (nntmux_w57_app_name_checker_pattern_batch, 10),
+            (nntmux_w57_game_name_checker_pattern_batch, 9),
+            (nntmux_w57_movie_name_checker_pattern_batch, 8),
+            (nntmux_w57_tv_name_checker_pattern_batch, 8),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            if items.iter().all(|i| !i.contains(&0)) {
+                let joined = items.join(&0u8);
+                let mut nul = vec![0i64; 4096];
+                let w = unsafe {
+                    f(
+                        joined.as_ptr(),
+                        joined.len(),
+                        ptr::null(),
+                        items.len(),
+                        nul.as_mut_ptr(),
+                        nul.len(),
+                    )
+                };
+                nul.truncate(w.max(0) as usize);
+                assert_eq!(out, nul, "NUL split differs");
+            }
+            out
+        }
+
+        fn fnv(bytes: &[u8]) -> i64 {
+            let mut h = FNV_OFFSET;
+            for &b in bytes {
+                h = (h ^ u32::from(b)).wrapping_mul(FNV_PRIME);
+            }
+            i64::from(h)
+        }
+
+        #[test]
+        fn w573_candidate_eligibility_flags_and_scores() {
+            let out = call(
+                nntmux_w57_name_checker_candidate_eligibility_batch,
+                &[
+                    b" The.Show.S01E02-GRP\n",
+                    b"",
+                    b"ab",
+                    b"caf\xc3\xa9 x\x01y long",
+                ],
+            );
+            let len = 19i64;
+            let score = 4 * 4 + 20 + 10 + len / 10;
+            assert_eq!(
+                out[0],
+                fnv(b"the.show.s01e02.grp")
+                    | 4 << 32
+                    | (1 | 8 | 64) << 38
+                    | score << 45
+                    | len << 53
+            );
+            assert_eq!(out[1], fnv(b""));
+            assert_eq!(out[2], fnv(b"ab") | 1 << 32 | 4 << 45 | 2 << 53);
+            assert_eq!(out[3] >> 38 & 127, 4 | 16 | 32);
+            assert_eq!(&out[4..], &[1, 1, 1, 1, 1, score, 9, 4]);
+        }
+
+        #[test]
+        fn w573_app_patterns_classify() {
+            let out = call(
+                nntmux_w57_app_name_checker_pattern_batch,
+                &[
+                    b"Adobe.Photoshop.v24.1.2.x64.Incl.Keygen",
+                    b"Tool.v1.Win32",
+                    b"App v12345.6 macOS",
+                    b"",
+                ],
+            );
+            assert_eq!(out[0] & 0xFFF, 1 | 2 | 16 | 32 | 512);
+            assert_eq!(out[0] >> 12 & 15, 1);
+            assert_eq!(out[0] >> 16 & 15, 3);
+            assert_eq!(out[0] >> 20 & 0x3FFF, 24);
+            assert_eq!(out[1] & 0xFFF, 4 | 64);
+            assert_eq!(out[1] >> 12 & 15, 3);
+            assert_eq!(out[2] >> 20 & 0x3FFF, 9999);
+            assert_eq!(out[2] >> 12 & 15, 4);
+            assert_eq!(&out[4..], &[1, 1, 0, 1, 1, 0, 0, 2, 2, 9999]);
+        }
+
+        #[test]
+        fn w573_game_patterns_classify() {
+            let out = call(
+                nntmux_w57_game_name_checker_pattern_batch,
+                &[
+                    b"Game.PS5-DUPLEX",
+                    b"Game.Switch.NSW-VENOM",
+                    b"Game.Update.v12-CODEX",
+                    b"Game.REPACK",
+                    b"x-codex",
+                ],
+            );
+            assert_eq!(out[0] & 0x3FF, 1);
+            assert_eq!(out[0] >> 24 & 255, 3);
+            assert_eq!(out[1] >> 12 & 15, 1);
+            assert_eq!(out[1] >> 16 & 255, 19);
+            assert_eq!(out[1] >> 24 & 255, 9);
+            assert_eq!(out[2] & 0x3FF, 8 | 32 | 256);
+            assert_eq!(out[2] >> 12 & 15, 3);
+            assert_eq!(out[3] >> 12 & 15, 5);
+            assert_eq!(&out[5..], &[0, 1, 1, 2, 0, 1, 0, 1, 2]);
+        }
+
+        #[test]
+        fn w573_movie_patterns_classify() {
+            let out = call(
+                nntmux_w57_movie_name_checker_pattern_batch,
+                &[
+                    b"Movie.2019.1080p.WEB-DL.H.264.DDP5.1",
+                    b"Film (1999) 2160p HDR BluRay x265",
+                    b"nothing",
+                ],
+            );
+            assert_eq!(out[0] & 0xFFF, 2019);
+            assert_eq!(out[0] >> 12 & 15, 4);
+            assert_eq!(out[0] >> 16 & 15, 2);
+            assert_eq!(out[0] >> 20 & 15, 2);
+            assert_eq!(out[0] >> 24 & 63, 1);
+            assert_eq!(out[0] >> 30 & 7, 4);
+            assert_eq!(out[0] >> 33 & 1, 1);
+            assert_eq!(out[1] >> 16 & 15, 1);
+            assert_eq!(out[1] >> 20 & 15, 3);
+            assert_eq!(out[2], 1 << 34);
+            assert_eq!(&out[3..], &[2, 2, 1999, 2019, 0, 1, 1, 1]);
+        }
+
+        #[test]
+        fn w573_tv_patterns_classify() {
+            let out = call(
+                nntmux_w57_tv_name_checker_pattern_batch,
+                &[
+                    b"Show.S01E02.720p.HDTV",
+                    b"Show 3x05 AMZN",
+                    b"Daily.2023.12.25.WEB",
+                    b"Show.S02.Complete",
+                    b"Show.2023.13.25",
+                ],
+            );
+            assert_eq!(out[0] & 0x3FFF_FFFF, 1 | 1 << 3 | 2 << 13 | (1 | 8) << 23);
+            assert_eq!(out[1] & 0x3FFF_FFFF, 2 | 3 << 3 | 5 << 13 | 64 << 23);
+            assert_eq!(out[2] & 7, 3);
+            assert_eq!(out[2] >> 30 & 0x1FF_FFFF, 20231225);
+            assert_eq!(out[3] & 0x3FFF_FFFF, 4 | 2 << 3 | 32 << 23);
+            assert_eq!(out[4] & 7, 0);
+            assert_eq!(&out[5..], &[1, 1, 1, 1, 1, 3, 5, 1]);
+        }
+
+        #[test]
+        fn w573_exports_guard_their_buffers() {
+            let mut buf = [0i64; 64];
+            let o = buf.as_mut_ptr();
+            let n = ptr::null::<i64>();
+            for (f, trailer) in EXPORTS {
+                unsafe {
+                    assert_eq!(f(b"x".as_ptr(), 1, n, 1, ptr::null_mut(), 64), -1);
+                    assert_eq!(f(ptr::null(), 1, n, 1, o, 64), -1);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 1, o, 64), -1);
+                    assert_eq!(f(ptr::null(), 0, n, 0, o, 64), trailer);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 2, o, 1), -(trailer + 2));
+                    let lens = [1i64, 2];
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, lens.as_ptr(), 2, o, 64), trailer + 2);
+                    assert_eq!(f(b"a\0bc".as_ptr(), 4, lens.as_ptr(), 2, o, 64), -1);
+                }
+            }
+        }
+    }
+}
