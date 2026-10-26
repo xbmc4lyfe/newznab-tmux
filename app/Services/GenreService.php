@@ -674,4 +674,326 @@ class GenreService
             throw new InvalidArgumentException('W50 batch columns must be lists.');
         }
     }
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 6.94x, p99 5.32x; uncommon mean 4.89x, p99 3.45x); see RustGamesProcessorGdprNotificationGenreIgdbClientExceptionW67ParityTest. */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    public const string W67_GENRE_SERVICE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w673_genre_service_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 67.3 batch. */
+    public const int W67_GENRE_SERVICE_TRAILER = 20;
+
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', true);
+    }
+
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', false);
+    }
+
+    /** Restores W67_RUST_FFI_DEFAULT and drops the cached library handle and scratch buffers. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('reset');
+    }
+
+    public static function usesW67RustFfi(): bool
+    {
+        $override = self::w67RustFfiState();
+
+        return \is_bool($override) ? $override : self::W67_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the GenreService Wave 67 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 67.3 genre upsert plan. Each item is `title|type|disabled|existingId`. The trimmed title is canonicalized
+     * (lower-cased, `_` as a space, whitespace runs collapsed to one space) and mapped through W67_GENRE_ALIASES.
+     * Type is 0 empty, 1 console (CONSOLE_TYPE or "console"), 2 music (MUSIC_TYPE or "music"), 3 game (GAME_TYPE,
+     * "game" or "pc"), 4 another number or 5 malformed; its state is the w67Count() state of up to 6 digits. Disabled
+     * is 0 empty, 1 "0", 2 "1" or 3 other; the existing ID (up to 10 digits) is 0 empty, 1 digits or 2 other. Action
+     * 6 invalid (malformed type, disabled or ID, or a title over 255 bytes), 0 skipped (empty canonical title, empty
+     * or unknown type), 1 duplicate of an earlier (type, canonical title) in the batch, 2 disable an existing genre, 3
+     * drop a disabled new genre, 4 update an existing genre or 5 insert. Per item `kind | typeState << 3 |
+     * disabledState << 5 | existingState << 7 | alias << 9 | multi (any of `/,&|;`) << 10 | nonAscii << 11 | changed
+     * (canonical differs from the trimmed title) << 12 | action << 13 | canonicalLength (cap 255) << 16 | words (cap
+     * 15) << 24 | duplicateOf (1-based first item, cap 2^24 - 1) << 28 | titleLength (cap 255) << 52`. Then the seven
+     * action and six kind counts, the aliased, multi-genre, non-ASCII and changed titles, the distinct (type,
+     * canonical title) keys, the disabled rows and the 1-based first inserted item.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67GenreServicePlanBatch(array $items): array
+    {
+        return self::usesW67RustFfi() ? self::w67GenreServicePlanBatchNative($items) : self::w67GenreServicePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67GenreServicePlanBatchNative(array $items): array
+    {
+        return self::w67Invoke($items, \count($items) + self::W67_GENRE_SERVICE_TRAILER) ?? self::w67GenreServicePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w67GenreServicePlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $actions = [0, 0, 0, 0, 0, 0, 0];
+        $kinds = [0, 0, 0, 0, 0, 0];
+        $aliases = $multis = $nonAsciiCount = $changedCount = $disabledCount = $firstInsert = 0;
+        $seen = [];
+        $index = 0;
+        foreach ($items as $item) {
+            [$rawTitle, $rawType, $rawDisabled, $rawExisting] = explode('|', (string) $item, 4) + ['', '', '', ''];
+            $title = trim($rawTitle);
+            $canonical = trim(preg_replace('/[ \t\n\r\0\x0B]+/', ' ', strtolower(strtr($title, '_', ' '))) ?? '');
+            $alias = self::W67_GENRE_ALIASES[$canonical] ?? null;
+            if ($alias !== null) {
+                $canonical = $alias;
+            }
+            $changed = $canonical !== $title;
+            $words = $canonical === '' ? 0 : substr_count($canonical, ' ') + 1;
+            [$typeState, $typeValue] = self::w67Count($rawType, 6);
+            $kind = match ($typeState) {
+                0 => 0,
+                1 => match ($typeValue) {
+                    self::CONSOLE_TYPE => 1,
+                    self::MUSIC_TYPE => 2,
+                    self::GAME_TYPE => 3,
+                    default => 4,
+                },
+                default => match (self::w67Keyword($rawType, self::W67_GENRE_TYPE_WORDS)) {
+                    1 => 1,
+                    2 => 2,
+                    3, 4 => 3,
+                    default => 5,
+                },
+            };
+            [$disabledRaw, $disabledValue] = self::w67Count($rawDisabled, 1);
+            $disabledState = match (true) {
+                $disabledRaw === 0 => 0,
+                $disabledRaw === 1 && $disabledValue === 0 => 1,
+                $disabledRaw === 1 && $disabledValue === 1 => 2,
+                default => 3,
+            };
+            [$existingState, $existing] = self::w67Count($rawExisting, 10);
+            $multi = strpbrk($title, '/,&|;') !== false;
+            $nonAscii = preg_match('/[\x80-\xFF]/', $title) === 1;
+            $duplicateOf = 0;
+            if ($kind === 5 || $disabledState === 3 || $existingState === 2 || \strlen($title) > 255) {
+                $action = 6;
+            } elseif ($canonical === '' || $kind === 0 || $kind === 4) {
+                $action = 0;
+            } else {
+                $key = $kind.':'.$canonical;
+                if (isset($seen[$key])) {
+                    $duplicateOf = $seen[$key] + 1;
+                    $action = 1;
+                } else {
+                    $seen[$key] = $index;
+                    $action = match (true) {
+                        $disabledState === 2 && $existing > 0 => 2,
+                        $disabledState === 2 => 3,
+                        $existing > 0 => 4,
+                        default => 5,
+                    };
+                }
+            }
+            $actions[$action]++;
+            $kinds[$kind]++;
+            $aliases += $alias !== null ? 1 : 0;
+            $multis += $multi ? 1 : 0;
+            $nonAsciiCount += $nonAscii ? 1 : 0;
+            $changedCount += $changed ? 1 : 0;
+            $disabledCount += $disabledState === 2 ? 1 : 0;
+            if ($action === 5 && $firstInsert === 0) {
+                $firstInsert = $index + 1;
+            }
+            $out[] = $kind | $typeState << 3 | $disabledState << 5 | $existingState << 7 | ($alias !== null ? 1 : 0) << 9 | ($multi ? 1 : 0) << 10
+                | ($nonAscii ? 1 : 0) << 11 | ($changed ? 1 : 0) << 12 | $action << 13 | min(\strlen($canonical), 255) << 16 | min($words, 15) << 24
+                | min($duplicateOf, 16_777_215) << 28 | min(\strlen($title), 255) << 52;
+            $index++;
+        }
+        array_push($out, ...$actions);
+        array_push($out, ...$kinds);
+        array_push($out, $aliases, $multis, $nonAsciiCount, $changedCount, \count($seen), $disabledCount, $firstInsert);
+
+        return $out;
+    }
+
+    /** Canonical genre aliases. */
+    private const array W67_GENRE_ALIASES = ['sci-fi' => 'science fiction', 'scifi' => 'science fiction', 'rpg' => 'role-playing', 'r&b' => 'rhythm and blues',
+        'hip hop' => 'hip-hop', 'rock & roll' => 'rock and roll'];
+
+    /** Type keywords: console, music, then game and pc for GAME_TYPE. */
+    private const array W67_GENRE_TYPE_WORDS = ['console', 'music', 'game', 'pc'];
+
+    /**
+     * (0 empty, 1 one to $max ASCII digits, 2 other; the value) for the trimmed field.
+     *
+     * @return array{int, int}
+     */
+    private static function w67Count(string $text, int $max): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $length = \strlen($text);
+
+        return $length <= $max && strspn($text, '0123456789') === $length ? [1, (int) $text] : [2, 0];
+    }
+
+    /**
+     * The trimmed field, lower-cased and matched against $words: 0 empty, 1-based index, or the word count + 1.
+     *
+     * @param  list<string>  $words
+     */
+    private static function w67Keyword(string $text, array $words): int
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return 0;
+        }
+        $position = array_search(strtolower($text), $words, true);
+
+        return $position === false ? \count($words) + 1 : $position + 1;
+    }
+
+    /**
+     * Wave 67 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and returns the
+     * previous override, 'reset' clears the override, library handle and buffers, 'ffi' resolves the library
+     * (null when unavailable) and 'out' and 'lens' return `int64_t` output and length-column buffers of at least
+     * $val words. Function statics keep the class's property set unchanged.
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('services_w673', self::W67_GENRE_SERVICE_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w67RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w67RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 67.3 GenreService export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call declines
+     * or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w67Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w67RustFfiState('ffi');
+            $out = self::w67RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w67RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W67_GENRE_SERVICE_FFI_CDEF.)
+            $written = $ffi->nntmux_w673_genre_service_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
