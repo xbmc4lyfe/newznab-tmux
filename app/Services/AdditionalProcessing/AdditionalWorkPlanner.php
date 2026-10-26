@@ -1298,4 +1298,409 @@ final readonly class AdditionalWorkPlanner
 
         return $state[$op] ?? null;
     }
+
+    // ========================================================================
+    // WAVE 64.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 6.38x, p99 4.96x; uncommon mean 4.54x, p99 3.73x); see RustAdditionalQueryDiagnosticsOrchestratorPlannerExtractionW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    public const string W64_WORK_PLANNER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w641_work_planner_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w64WorkPlannerPlanBatch(). */
+    public const int W64_WORK_PLANNER_TRAILER = 43;
+
+    public static function usesW64RustFfi(): bool
+    {
+        $override = self::w64RustFfiState();
+
+        return \is_bool($override) ? $override : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /** Forces the AdditionalWorkPlanner Wave 64 Rust path on until reset. */
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    /** Forces the AdditionalWorkPlanner Wave 64 PHP path until reset. */
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restores the benchmark default and drops the cached library handle and scratch buffers; earlier toggles are untouched. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    /**
+     * Runs $callback with the AdditionalWorkPlanner Wave 64 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 64.1 work plans, one per NZB file `title|size|segments|filecount|group` (trimmed fields; numbers are 1-15
+     * digits, empty 0). The name is the first non-empty `"..."` in the title, else the title; its lowercased last
+     * extension of 1-5 `[a-z0-9]` bytes picks the kind: 0 empty title, 1 rar, 2 rar volume (`.partN.rar` or `.rNN`), 3
+     * 7z (or `.7z.NNN`), 4 zip, 5 numbered split (`.NNN`), 6 par2, 7 nfo, diz or inf, 8 sfv, srs or nzb, 9 video (or a
+     * `.video.NNN` split), 10 audio, 11 image, 12 book, 13 other, 14 no extension. Stages: 1 inspect archive, 2 likely
+     * first volume, 4 PAR2 index, 8 NFO, 16 sample media info, 32 sample thumbnail, 64 JPG preview (10 KiB or more,
+     * outside music groups), 128 audio info, 256 probe an unnamed single file, 512 book; each but the book needs segments.
+     * Priority: 3 first volume, 2 archive, PAR2 index or NFO, 1 media, 0 none. Flags: 1 sample, 2 quoted name, 4 music
+     * group, 8 media split, 16 PAR2 recovery volume, 32 non-ASCII, 64 archive set seen earlier in the batch, 128
+     * malformed number. Per item `kind | stages << 4 | priority << 14 | flags << 16 | min(volume, 1023) << 24 |
+     * min(segmentsNeeded, 3) << 34 | bitLength(size) << 36 | min(segments, 4095) << 42 | min(nameLength, 255) << 54`;
+     * then 15 kind, 10 stage, 4 priority and 8 flag counts, the segments needed, the archive byte sum, the distinct
+     * archive sets, the book-flood flag, the no-supported-candidates flag and the most segments.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64WorkPlannerPlanBatch(array $items): array
+    {
+        return self::usesW64RustFfi() ? self::w64WorkPlannerPlanBatchNative($items) : self::w64WorkPlannerPlanBatchPhp($items);
+    }
+
+    /**
+     * Rust plan; falls back to the PHP reference when the library is missing or the call declines.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64WorkPlannerPlanBatchNative(array $items): array
+    {
+        return self::w64Invoke($items, \count($items) + self::W64_WORK_PLANNER_TRAILER) ?? self::w64WorkPlannerPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64WorkPlannerPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W64_WORK_PLANNER_TRAILER, 0);
+        $sets = [];
+        $count = 0;
+        $supported = false;
+        foreach ($items as $item) {
+            $item = (string) $item;
+            [$rawTitle, $rawSize, $rawSegments, $rawFiles, $rawGroup] = explode('|', $item, 5) + ['', '', '', '', ''];
+            $count++;
+            $title = trim($rawTitle);
+            $name = $title;
+            $flags = 0;
+            $open = strpos($title, '"');
+            if ($open !== false) {
+                $close = strpos($title, '"', $open + 1);
+                if ($close !== false && $close > $open + 1) {
+                    $name = substr($title, $open + 1, $close - $open - 1);
+                    $flags |= 2;
+                }
+            }
+            $lower = strtolower($name);
+            [$base, $extension] = self::w64SplitExtension($lower);
+            $dot = strrpos($base, '.');
+            [$base2, $inner] = $dot === false ? [$base, ''] : [substr($base, 0, $dot), substr($base, $dot + 1)];
+            $volume = 0;
+            $part = false;
+            $set = $base;
+            $extensionLength = \strlen($extension);
+            $innerLength = \strlen($inner);
+            if ($title === '') {
+                $kind = 0;
+            } elseif ($extension === '') {
+                $kind = 14;
+            } elseif ($extensionLength === 3 && strspn($extension, self::W64_DIGITS) === 3) {
+                $volume = (int) $extension;
+                if ($inner === '7z') {
+                    $set = $base2;
+                    $kind = 3;
+                } elseif (isset(self::W64_VIDEO_EXTENSIONS[$inner])) {
+                    $flags |= 8;
+                    $kind = 9;
+                } else {
+                    $kind = 5;
+                }
+            } elseif ($extension === 'rar') {
+                if ($innerLength > 4 && $innerLength <= 10 && str_starts_with($inner, 'part') && strspn($inner, self::W64_DIGITS, 4) === $innerLength - 4) {
+                    $volume = (int) substr($inner, 4);
+                    $part = true;
+                    $set = $base2;
+                    $kind = 2;
+                } else {
+                    $kind = 1;
+                }
+            } elseif ($extensionLength >= 3 && $extensionLength <= 4 && $extension[0] === 'r' && strspn($extension, self::W64_DIGITS, 1) === $extensionLength - 1) {
+                $volume = (int) substr($extension, 1) + 1;
+                $kind = 2;
+            } elseif (isset(self::W64_NAMED_KINDS[$extension])) {
+                $kind = self::W64_NAMED_KINDS[$extension];
+                if ($kind === 6 && str_contains($lower, '.vol')) {
+                    $flags |= 16;
+                }
+            } elseif (isset(self::W64_VIDEO_EXTENSIONS[$extension])) {
+                $kind = 9;
+            } elseif (isset(self::W64_AUDIO_EXTENSIONS[$extension])) {
+                $kind = 10;
+            } else {
+                $kind = 13;
+            }
+            $size = self::w64Uint($rawSize, 0);
+            $segments = self::w64Uint($rawSegments, 0);
+            $files = self::w64Uint($rawFiles, 0);
+            if ($size < 0 || $segments < 0 || $files < 0) {
+                $flags |= 128;
+            }
+            $size = max(0, $size);
+            $segments = max(0, $segments);
+            $group = strtolower(trim($rawGroup));
+            $music = false;
+            foreach (self::W64_MUSIC_GROUP_NEEDLES as $needle) {
+                if (str_contains($group, $needle)) {
+                    $music = true;
+                    break;
+                }
+            }
+            $sample = str_contains($lower, 'sample');
+            $flags |= ($sample ? 1 : 0) | ($music ? 4 : 0) | (preg_match('/[\x80-\xff]/', $item) === 1 ? 32 : 0);
+            $archive = $kind >= 1 && $kind <= 5;
+            $first = match ($kind) {
+                1, 4 => true,
+                2 => $part && $volume === 1,
+                3, 5 => $volume <= 1,
+                default => false,
+            };
+            if ($archive) {
+                if (isset($sets[$set])) {
+                    $flags |= 64;
+                } else {
+                    $sets[$set] = true;
+                }
+            }
+            $has = $segments > 0;
+            $stages = ($archive && $has ? 1 | ($first ? 2 : 0) : 0) | ($kind === 6 && ($flags & 16) === 0 && $has ? 4 : 0) | ($kind === 7 && $has ? 8 : 0)
+                | ($kind === 9 && $sample && $has ? 16 : 0) | ($sample && $has && ! ($archive || ($kind >= 6 && $kind <= 8) || $kind === 11) ? 32 : 0)
+                | ($kind === 11 && $has && ! $music && $size >= 10240 ? 64 : 0) | ($kind === 10 && $has ? 128 : 0)
+                | ($kind === 14 && $files === 1 && $has ? 256 : 0) | ($kind === 12 ? 512 : 0);
+            $needed = ($stages & 1) !== 0 ? min($segments, 2) : (($stages & 0x1FC) !== 0 ? 1 : 0);
+            $priority = match (true) {
+                ($stages & 2) !== 0 => 3,
+                ($stages & (1 | 4 | 8)) !== 0 => 2,
+                ($stages & (16 | 32 | 64 | 128 | 256)) !== 0 => 1,
+                default => 0,
+            };
+            if (($stages & (1 | 16 | 32 | 64 | 128 | 256)) !== 0) {
+                $supported = true;
+            }
+            $tail[$kind]++;
+            for ($b = 0; $b < 10; $b++) {
+                $tail[15 + $b] += $stages >> $b & 1;
+            }
+            $tail[25 + $priority]++;
+            for ($b = 0; $b < 8; $b++) {
+                $tail[29 + $b] += $flags >> $b & 1;
+            }
+            $tail[37] += $needed;
+            if ($archive) {
+                $tail[38] += min($size, 1 << 40);
+            }
+            $tail[42] = max($tail[42], $segments);
+            $out[] = $kind | $stages << 4 | $priority << 14 | $flags << 16 | min($volume, 1023) << 24 | min($needed, 3) << 34
+                | self::w64BitLength($size) << 36 | min($segments, 4095) << 42 | min(\strlen($name), 255) << 54;
+        }
+        $tail[39] = \count($sets);
+        $tail[40] = $tail[12] > 80 && $count <= $tail[12] * 2 ? 1 : 0;
+        $tail[41] = $count > 0 && ! $supported ? 1 : 0;
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    /** @var array<string, true> */
+    private const array W64_VIDEO_EXTENSIONS = ['avi' => true, 'f4v' => true, 'ifo' => true, 'm1v' => true, 'm2v' => true, 'm4v' => true, 'mkv' => true,
+        'mov' => true, 'mp4' => true, 'mpeg' => true, 'mpg' => true, 'mpgv' => true, 'mpv' => true, 'ogv' => true, 'qt' => true, 'rm' => true,
+        'rmvb' => true, 'ts' => true, 'vob' => true, 'wmv' => true];
+
+    /** @var array<string, true> */
+    private const array W64_AUDIO_EXTENSIONS = ['aac' => true, 'aiff' => true, 'ape' => true, 'ac3' => true, 'asf' => true, 'dts' => true, 'flac' => true,
+        'mka' => true, 'mks' => true, 'mp2' => true, 'mp3' => true, 'ra' => true, 'ogg' => true, 'ogm' => true, 'w64' => true, 'wav' => true, 'wma' => true];
+
+    /** @var array<string, int> */
+    private const array W64_NAMED_KINDS = ['7z' => 3, 'zip' => 4, 'zipx' => 4, 'par2' => 6, 'nfo' => 7, 'diz' => 7, 'inf' => 7, 'sfv' => 8, 'srs' => 8,
+        'nzb' => 8, 'jpg' => 11, 'jpeg' => 11, 'png' => 11, 'webp' => 11, 'epub' => 12, 'mobi' => 12, 'pdf' => 12, 'lit' => 12];
+
+    private const array W64_MUSIC_GROUP_NEEDLES = ['flac', 'lossless', 'mp3', 'music', 'sound'];
+
+    private const string W64_DIGITS = '0123456789';
+
+    /** A trimmed field of 1-15 digits; empty is $empty, anything else -1. */
+    private static function w64Uint(string $raw, int $empty): int
+    {
+        $value = trim($raw);
+        if ($value === '') {
+            return $empty;
+        }
+        $length = \strlen($value);
+
+        return $length <= 15 && strspn($value, self::W64_DIGITS) === $length ? (int) $value : -1;
+    }
+
+    private static function w64BitLength(int $value): int
+    {
+        $bits = 0;
+        for (; $value > 0; $value >>= 1) {
+            $bits++;
+        }
+
+        return $bits;
+    }
+
+    /**
+     * Splits a lowercased name at its last `.` when the extension is 1-5 `[a-z0-9]` bytes.
+     *
+     * @return array{0: string, 1: string}
+     */
+    private static function w64SplitExtension(string $name): array
+    {
+        $dot = strrpos($name, '.');
+        if ($dot === false) {
+            return [$name, ''];
+        }
+        $extension = substr($name, $dot + 1);
+        $length = \strlen($extension);
+        if ($length === 0 || $length > 5 || strspn($extension, 'abcdefghijklmnopqrstuvwxyz0123456789') !== $length) {
+            return [$name, ''];
+        }
+
+        return [substr($name, 0, $dot), $extension];
+    }
+
+    /**
+     * Wave 64 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'reset' clears the override, library handle and buffers, 'ffi'
+     * resolves the library (null when unavailable) and 'out' and 'lens' return `int64_t` output and
+     * length-column buffers of at least $val words.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_work_planner_w641', self::W64_WORK_PLANNER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 64.1 AdditionalWorkPlanner export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w64Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w64RustFfiState('ffi');
+            $out = self::w64RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w64RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W64_WORK_PLANNER_FFI_CDEF.)
+            $written = $ffi->nntmux_w641_work_planner_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
