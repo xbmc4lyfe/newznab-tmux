@@ -42614,3 +42614,842 @@ mod wave54_5_api_user_resolver_v1_presenter_release_rows_log_index_coord {
         }
     }
 }
+
+mod wave55_5_manticore_log_searcher_repo_reader_searcher_query {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Every Wave 55.5 helper returns four words per record.
+    const WIDTH: usize = 4;
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// PCRE `\w` without Unicode properties: ASCII letters, digits and `_`.
+    fn is_word(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    /// PCRE `\s`: space, `\t`, `\n`, `\v`, `\f` and `\r`.
+    fn is_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records, writing
+    /// four words per record straight into `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        plan: fn(&[u8], &mut [i64]),
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(fields) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = count * WIDTH;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            for (field, slot) in fields.iter().zip(words.chunks_exact_mut(WIDTH)) {
+                plan(field, slot);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Whether `line` starts with a stack frame `#\d+ `.
+    fn is_frame(line: &[u8]) -> bool {
+        let Some(rest) = line.strip_prefix(b"#") else {
+            return false;
+        };
+        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        digits > 0 && rest.get(digits) == Some(&b' ')
+    }
+
+    /// Whether `text` contains `needle` (first byte located with [`memchr`]).
+    fn contains(text: &[u8], needle: &[u8]) -> bool {
+        let mut rest = text;
+        while let Some(at) = memchr(needle[0], rest) {
+            if rest[at..].starts_with(needle) {
+                return true;
+            }
+            rest = &rest[at + 1..];
+        }
+        false
+    }
+
+    /// `ManticoreLogSearcher::hitTextPlanBatch()`: `[lines, first line length, stack frames, flags]`.
+    /// Lines: 0 for empty text, else newlines plus one; stack frames: lines starting `#\d+ `. Flags: 1
+    /// non-ASCII byte, 2 first line ends (ignoring trailing spaces, tabs and `\r`) with `}` or `]`, 4
+    /// holds `[stacktrace]`, 8 holds `\r`.
+    fn hit_text_plan(text: &[u8], words: &mut [i64]) {
+        let first = memchr(b'\n', text).unwrap_or(text.len());
+        let (mut lines, mut frames) = (0i64, 0i64);
+        if !text.is_empty() {
+            let mut rest = text;
+            loop {
+                lines += 1;
+                frames += i64::from(is_frame(rest));
+                let Some(at) = memchr(b'\n', rest) else {
+                    break;
+                };
+                rest = &rest[at + 1..];
+            }
+        }
+        let head = &text[..first];
+        let last = head
+            .iter()
+            .rposition(|&b| !matches!(b, b' ' | b'\t' | b'\r'))
+            .map(|at| head[at]);
+        let flags = i64::from(!text.is_ascii())
+            | i64::from(matches!(last, Some(b'}' | b']'))) << 1
+            | i64::from(contains(text, b"[stacktrace]")) << 2
+            | i64::from(memchr(b'\r', text).is_some()) << 3;
+        words.copy_from_slice(&[lines, first as i64, frames, flags]);
+    }
+
+    fn is_separator(byte: u8) -> bool {
+        byte == b'/' || byte == b'\\'
+    }
+
+    /// `LogFileRepository::relativePathPlanBatch()` over `ltrim(str_replace('\\', '/', trim($path)), '/')`:
+    /// `[normalized length, depth, basename offset, flags]`. Flags: 1 `..` segment, 2 empty or `.`
+    /// segment, 4 hidden basename, 8 `.log` suffix, 16 `.gz` suffix, 32 empty path.
+    fn path_plan(path: &[u8], words: &mut [i64]) {
+        let trimmed = trim(path);
+        let start = trimmed
+            .iter()
+            .position(|&b| !is_separator(b))
+            .unwrap_or(trimmed.len());
+        let normalized = &trimmed[start..];
+        if normalized.is_empty() {
+            words.copy_from_slice(&[0, 0, 0, 32]);
+            return;
+        }
+        let (mut depth, mut flags, mut segment) = (0i64, 0i64, 0usize);
+        for (at, &b) in normalized.iter().enumerate() {
+            if is_separator(b) {
+                depth += 1;
+                flags |= match &normalized[segment..at] {
+                    b"" | b"." => 2,
+                    b".." => 1,
+                    _ => 0,
+                };
+                segment = at + 1;
+            }
+        }
+        let base = &normalized[segment..];
+        flags |= match base {
+            b"" | b"." => 2,
+            b".." => 1,
+            _ => 0,
+        };
+        flags |= i64::from(base.first() == Some(&b'.')) << 2
+            | i64::from(base.ends_with(b".log")) << 3
+            | i64::from(base.ends_with(b".gz")) << 4;
+        words.copy_from_slice(&[normalized.len() as i64, depth, segment as i64, flags]);
+    }
+
+    /// Consumes `n` ASCII digits at `at`, returning the following position.
+    fn digits_at(line: &[u8], at: usize, n: usize) -> Option<usize> {
+        let end = at.checked_add(n)?;
+        line.get(at..end)?
+            .iter()
+            .all(u8::is_ascii_digit)
+            .then_some(end)
+    }
+
+    /// `LogEntry::W48_HEADER_PATTERN`: `^\[\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?
+    /// (?:[+-]\d{2}:?\d{2}|Z)?\]\s+([\w.\-]+)\.([A-Z]+):`.
+    fn is_header(line: &[u8]) -> bool {
+        let shape = |at: usize, byte: u8| line.get(at) == Some(&byte);
+        if !shape(0, b'[')
+            || digits_at(line, 1, 4).is_none()
+            || !shape(5, b'-')
+            || digits_at(line, 6, 2).is_none()
+            || !shape(8, b'-')
+            || digits_at(line, 9, 2).is_none()
+            || !matches!(line.get(11), Some(b'T' | b' '))
+            || digits_at(line, 12, 2).is_none()
+            || !shape(14, b':')
+            || digits_at(line, 15, 2).is_none()
+            || !shape(17, b':')
+            || digits_at(line, 18, 2).is_none()
+        {
+            return false;
+        }
+        let mut at = 20;
+        if shape(at, b'.') {
+            let run = line[at + 1..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+            if run == 0 {
+                return false;
+            }
+            at += 1 + run;
+        }
+        match line.get(at) {
+            Some(b'+' | b'-') => {
+                let Some(mut next) = digits_at(line, at + 1, 2) else {
+                    return false;
+                };
+                if shape(next, b':') {
+                    next += 1;
+                }
+                let Some(next) = digits_at(line, next, 2) else {
+                    return false;
+                };
+                at = next;
+            }
+            Some(b'Z') => at += 1,
+            _ => {}
+        }
+        if !shape(at, b']') {
+            return false;
+        }
+        let rest = &line[at + 1..];
+        let spaces = rest.iter().take_while(|&&b| is_space(b)).count();
+        if spaces == 0 {
+            return false;
+        }
+        let rest = &rest[spaces..];
+        let run = rest
+            .iter()
+            .take_while(|&&b| is_word(b) || b == b'.' || b == b'-')
+            .count();
+        if rest.get(run) != Some(&b':') {
+            return false;
+        }
+        let channel = &rest[..run];
+        let Some(dot) = channel.iter().rposition(|&b| b == b'.') else {
+            return false;
+        };
+        let level = &channel[dot + 1..];
+        dot > 0 && !level.is_empty() && level.iter().all(u8::is_ascii_uppercase)
+    }
+
+    /// `LogReader::linePlanBatch()` over the line without trailing `\r` bytes: `[kind, content length,
+    /// indent, flags]`. Kind: 0 blank (spaces/tabs only), 1 header, 2 stack frame, 3 `[stacktrace]`
+    /// marker, 4 other. Indent counts leading spaces and tabs. Flags: 1 trailing `\r`, 2 non-ASCII, 4
+    /// invalid UTF-8, 8 control byte other than tab.
+    fn line_plan(line: &[u8], words: &mut [i64]) {
+        let end = line
+            .iter()
+            .rposition(|&b| b != b'\r')
+            .map_or(0, |at| at + 1);
+        let content = &line[..end];
+        let indent = content
+            .iter()
+            .position(|&b| b != b' ' && b != b'\t')
+            .unwrap_or(content.len());
+        let kind = if indent == content.len() {
+            0
+        } else if is_header(content) {
+            1
+        } else if content.starts_with(b"[stacktrace]") {
+            3
+        } else if is_frame(content) {
+            2
+        } else {
+            4
+        };
+        let (ascii, control) = byte_classes(content);
+        let flags = i64::from(end < line.len())
+            | i64::from(!ascii) << 1
+            | i64::from(!ascii && std::str::from_utf8(content).is_err()) << 2
+            | i64::from(control) << 3;
+        words.copy_from_slice(&[kind, content.len() as i64, indent as i64, flags]);
+    }
+
+    fn is_control(byte: u8) -> bool {
+        (byte < 0x20 && byte != b'\t') || byte == 0x7f
+    }
+
+    /// Whether `bytes` is all ASCII and whether it holds a control byte other than tab, a word at a
+    /// time: `x - 0x20.. & !x & 0x80..` flags a word with a byte below 0x20 (rechecked per byte for
+    /// tabs) and the zero test of `x ^ 0x7f..` a DEL byte.
+    fn byte_classes(bytes: &[u8]) -> (bool, bool) {
+        let (words, tail) = bytes.as_chunks::<8>();
+        let (mut high, mut control) = (0u64, false);
+        for word in words {
+            let x = u64::from_le_bytes(*word);
+            high |= x;
+            if !control {
+                let below = x.wrapping_sub(LOW_BITS * 0x20) & !x & HIGH_BITS;
+                let del = x ^ (LOW_BITS * 0x7f);
+                control = del.wrapping_sub(LOW_BITS) & !del & HIGH_BITS != 0
+                    || (below != 0 && word.iter().any(|&b| is_control(b)));
+            }
+        }
+        let ascii = high & HIGH_BITS == 0 && tail.is_ascii();
+        (ascii, control || tail.iter().any(|&b| is_control(b)))
+    }
+
+    /// Longest field `LogSearcher::grepLinePlanBatch()` parses (`\d{1,18}`).
+    const MAX_DIGITS: usize = 18;
+
+    fn number(field: &[u8]) -> Option<i64> {
+        if field.is_empty() || field.len() > MAX_DIGITS {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// `LogSearcher::grepLinePlanBatch()` over grep `-n -b` output `LINE:OFFSET:content`: `[valid, line,
+    /// offset, content offset]`. Content offset: after the second colon, -1 without one (then the rest is
+    /// 0); valid fields are 1-18 ASCII digits, invalid ones report 0.
+    fn grep_line_plan(line: &[u8], words: &mut [i64]) {
+        let Some(first) = memchr(b':', line) else {
+            words.copy_from_slice(&[0, 0, 0, -1]);
+            return;
+        };
+        let Some(second) = memchr(b':', &line[first + 1..]).map(|at| at + first + 1) else {
+            words.copy_from_slice(&[0, 0, 0, -1]);
+            return;
+        };
+        let content = second as i64 + 1;
+        match (number(&line[..first]), number(&line[first + 1..second])) {
+            (Some(number), Some(offset)) => words.copy_from_slice(&[1, number, offset, content]),
+            _ => words.copy_from_slice(&[0, 0, 0, content]),
+        }
+    }
+
+    /// `LogEntryParser::LEVELS`, in mask bit order.
+    const LEVELS: [&[u8]; 8] = [
+        b"debug",
+        b"info",
+        b"notice",
+        b"warning",
+        b"error",
+        b"critical",
+        b"alert",
+        b"emergency",
+    ];
+
+    /// `SearchQuery::levelFilterPlanBatch()` over a comma-separated filter: `[mask, recognized, unknown,
+    /// duplicates]`. Items are trimmed and ASCII-lowercased; empty items are skipped. Bit `n` marks
+    /// `LogEntryParser::LEVELS[n]`.
+    fn level_filter_plan(filter: &[u8], words: &mut [i64]) {
+        let (mut mask, mut recognized, mut unknown, mut duplicates) = (0i64, 0i64, 0i64, 0i64);
+        for item in filter.split(|&b| b == b',') {
+            let name = trim(item);
+            if name.is_empty() {
+                continue;
+            }
+            match LEVELS.iter().position(|level| level.eq_ignore_ascii_case(name)) {
+                Some(index) => {
+                    let bit = 1i64 << index;
+                    if mask & bit != 0 {
+                        duplicates += 1;
+                    } else {
+                        mask |= bit;
+                        recognized += 1;
+                    }
+                }
+                None => unknown += 1,
+            }
+        }
+        words.copy_from_slice(&[mask, recognized, unknown, duplicates]);
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes four
+            /// words per record and returns the words written, `-needed` when `out_cap` is too small
+            /// (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe { run(count, flags, data, data_len, ints, ints_len, out, out_cap, $plan) }
+            }
+        };
+    }
+
+    entry!(
+        /// `ManticoreLogSearcher::hitTextPlanBatch()` (see [`hit_text_plan`]).
+        nntmux_w555_manticore_hit_text_plan, hit_text_plan
+    );
+    entry!(
+        /// `LogFileRepository::relativePathPlanBatch()` (see [`path_plan`]).
+        nntmux_w555_log_file_repository_path_plan, path_plan
+    );
+    entry!(
+        /// `LogReader::linePlanBatch()` (see [`line_plan`]).
+        nntmux_w555_log_reader_line_plan, line_plan
+    );
+    entry!(
+        /// `LogSearcher::grepLinePlanBatch()` (see [`grep_line_plan`]).
+        nntmux_w555_log_searcher_grep_line_plan, grep_line_plan
+    );
+    entry!(
+        /// `SearchQuery::levelFilterPlanBatch()` (see [`level_filter_plan`]).
+        nntmux_w555_search_query_level_filter_plan, level_filter_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [Entry; 5] = [
+            nntmux_w555_manticore_hit_text_plan,
+            nntmux_w555_log_file_repository_path_plan,
+            nntmux_w555_log_reader_line_plan,
+            nntmux_w555_log_searcher_grep_line_plan,
+            nntmux_w555_search_query_level_filter_plan,
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Result<Vec<i64>, i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        #[test]
+        fn w555_hit_text_plans_summarize_entries() {
+            let words = call(
+                nntmux_w555_manticore_hit_text_plan,
+                &[
+                    b"[2024-01-02 03:04:05] production.ERROR: boom {\"a\":1} \r\n[stacktrace]\n#0 /app/x.php(1): y\n#12 {main}\n#x no",
+                    b"",
+                    b"plain",
+                    b"caf\xc3\xa9 []\t\n\n",
+                    b"#1 \n#\n# 2 \n#3x",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    5, 54, 2, 14, //
+                    0, 0, 0, 0, //
+                    1, 5, 0, 0, //
+                    3, 9, 0, 3, //
+                    4, 3, 1, 0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w555_path_plans_normalize_relative_paths() {
+            let words = call(
+                nntmux_w555_log_file_repository_path_plan,
+                &[
+                    b" laravel-2024-01-02.log ",
+                    b"\\archive\\old.log.gz",
+                    b"//a/../b/.hidden",
+                    b"a//b/./c.log",
+                    b" \t/ ",
+                    b"",
+                    b"dir/",
+                    b"..",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    22, 0, 0, 8, //
+                    18, 1, 8, 16, //
+                    14, 3, 7, 5, //
+                    12, 4, 7, 10, //
+                    0, 0, 0, 32, //
+                    0, 0, 0, 32, //
+                    4, 1, 4, 2, //
+                    2, 0, 0, 5,
+                ]
+            );
+        }
+
+        #[test]
+        fn w555_line_plans_classify_log_lines() {
+            let words = call(
+                nntmux_w555_log_reader_line_plan,
+                &[
+                    b"[2024-01-02 03:04:05] production.ERROR: boom\r",
+                    b"[2024-01-02T03:04:05.123456+02:00]  a.b-c.INFO:x",
+                    b"[2024-01-02 03:04:05Z] app.Info: lower",
+                    b"[2024-01-02 03:04:05+0200] .ERROR: no channel",
+                    b"[stacktrace]",
+                    b"#0 /app/x.php(12): y",
+                    b"  \t\r\r",
+                    b"\tcaf\xc3\xa9",
+                    b"bad \xff\x01",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    1, 44, 0, 1, //
+                    1, 48, 0, 0, //
+                    4, 38, 0, 0, //
+                    4, 45, 0, 0, //
+                    3, 12, 0, 0, //
+                    2, 20, 0, 0, //
+                    0, 3, 3, 1, //
+                    4, 6, 1, 2, //
+                    4, 6, 0, 14,
+                ]
+            );
+        }
+
+        #[test]
+        fn w555_grep_line_plans_parse_fields() {
+            let words = call(
+                nntmux_w555_log_searcher_grep_line_plan,
+                &[
+                    b"12:3456:[2024-01-02] x: y",
+                    b"12:3456",
+                    b"no colon",
+                    b"1x:2:z",
+                    b"::",
+                    b"1234567890123456789:1:z",
+                    b"999999999999999999:0:",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    1, 12, 3456, 8, //
+                    0, 0, 0, -1, //
+                    0, 0, 0, -1, //
+                    0, 0, 0, 5, //
+                    0, 0, 0, 2, //
+                    0, 0, 0, 22, //
+                    1, 999_999_999_999_999_999, 0, 21,
+                ]
+            );
+        }
+
+        #[test]
+        fn w555_level_filter_plans_build_masks() {
+            let words = call(
+                nntmux_w555_search_query_level_filter_plan,
+                &[
+                    b"error, Warning ,info",
+                    b"",
+                    b",, ,",
+                    b"ERROR,error,bogus,emergency",
+                    b"debug,info,notice,warning,error,critical,alert,emergency",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    26, 3, 0, 0, //
+                    0, 0, 0, 0, //
+                    0, 0, 0, 0, //
+                    144, 2, 1, 1, //
+                    255, 8, 0, 0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w555_abi_declines_and_reports_capacity() {
+            for entry in ENTRIES {
+                let data = b"abc";
+                let mut out = [7i64; 4];
+                let small = unsafe {
+                    entry(
+                        1,
+                        0,
+                        data.as_ptr(),
+                        3,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        3,
+                    )
+                };
+                assert_eq!(small, -4);
+                assert_eq!(out, [7; 4]);
+                let null_out = unsafe {
+                    entry(
+                        1,
+                        0,
+                        data.as_ptr(),
+                        3,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(null_out, -4);
+                let cases: [(usize, i64, *const u8, usize, usize, *mut i64, usize); 5] = [
+                    (1, 0, std::ptr::null(), 3, 0, out.as_mut_ptr(), 4),
+                    (1, 0, data.as_ptr(), 3, 0, std::ptr::null_mut(), 4),
+                    (1, 1, data.as_ptr(), 3, 0, out.as_mut_ptr(), 4),
+                    (1, 0, data.as_ptr(), 3, 8, out.as_mut_ptr(), 4),
+                    (2, 0, data.as_ptr(), 3, 0, out.as_mut_ptr(), 4),
+                ];
+                let ints = [0u8; 8];
+                for (count, flags, ptr, len, ints_len, out_ptr, cap) in cases {
+                    let declined = unsafe {
+                        entry(
+                            count,
+                            flags,
+                            ptr,
+                            len,
+                            ints.as_ptr(),
+                            ints_len,
+                            out_ptr,
+                            cap,
+                        )
+                    };
+                    assert_eq!(declined, DECLINE);
+                }
+                let empty = unsafe {
+                    entry(
+                        0,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(empty, 0);
+                let nonempty_zero = unsafe {
+                    entry(
+                        0,
+                        0,
+                        data.as_ptr(),
+                        3,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        4,
+                    )
+                };
+                assert_eq!(nonempty_zero, DECLINE);
+                let shared = out.as_mut_ptr();
+                let overlap =
+                    unsafe { entry(1, 0, shared.cast::<u8>(), 8, std::ptr::null(), 0, shared, 4) };
+                assert_eq!(overlap, DECLINE);
+                assert_eq!(call(entry, &[b""]).unwrap().len(), 4);
+                assert_eq!(call(entry, &[b"a", b"", b"b"]).unwrap().len(), 12);
+            }
+        }
+
+        #[test]
+        fn w555_header_matches_pattern_edges() {
+            assert!(is_header(b"[2024-01-02 03:04:05] a.B:"));
+            assert!(is_header(b"[2024-01-02 03:04:05.1-0130]\x0bx.y.Z:"));
+            assert!(!is_header(b"[2024-01-02 03:04:05.] a.B:"));
+            assert!(!is_header(b"[2024-01-02 03:04:05+02:0] a.B:"));
+            assert!(!is_header(b"[2024-01-02 03:04:05]a.B:"));
+            assert!(!is_header(b"[2024-01-02 03:04:05] a.B-C:"));
+            assert!(!is_header(b"[2024-01-02 03:04:05] a.:"));
+            assert!(!is_header(b"[2024-01-02 03:04:05] a.B :"));
+            assert!(!is_header(b"[2024-01-02 03:04"));
+        }
+
+        #[test]
+        fn w555_byte_classes_match_per_byte_scan() {
+            let mut seed = 0x5551_u64;
+            let alphabet = [b'a', b' ', b'\t', 0x1f, 0x20, 0x7e, 0x7f, 0x80, 0xff, 0x00, 0x09, b'~'];
+            for _ in 0..20_000 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let bytes: Vec<u8> = (0..seed % 40)
+                    .map(|at| alphabet[((seed >> (at % 48)) as usize + at as usize) % 12])
+                    .collect();
+                assert_eq!(
+                    byte_classes(&bytes),
+                    (bytes.is_ascii(), bytes.iter().any(|&b| is_control(b))),
+                    "{bytes:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn w555_random_inputs_never_panic() {
+            let mut seed = 0x555_u64;
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let alphabet = [
+                0u8, b',', b' ', b':', b'[', b']', b'-', b'.', b'/', b'\\', b'\n', b'\r', 0xff,
+                0xc3, b'1', b'#', b'2', b'0', b'T', b'E',
+            ];
+            for round in 0..20_000 {
+                let data: Vec<u8> = (0..next() % 48)
+                    .map(|_| alphabet[(next() % 20) as usize])
+                    .collect();
+                let count = (next() % 5) as usize;
+                let mut out = vec![0i64; 32];
+                let _ = unsafe {
+                    ENTRIES[round % 5](
+                        count,
+                        0,
+                        data.as_ptr(),
+                        data.len(),
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                };
+            }
+        }
+    }
+}

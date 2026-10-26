@@ -374,4 +374,167 @@ final readonly class SearchQuery
 
         return implode('|', array_map(strtoupper(...), $levels));
     }
+
+    public const string W55_FFI_CDEF = 'int64_t nntmux_w555_search_query_level_filter_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W55.5 parity test's QUALIFICATION). */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    /** Mask bit per {@see LogEntryParser::LEVELS} entry, in order. */
+    private const array W55_LEVEL_BITS = ['debug' => 1, 'info' => 2, 'notice' => 4, 'warning' => 8, 'error' => 16, 'critical' => 32, 'alert' => 64, 'emergency' => 128];
+
+    /**
+     * Wave 55.5 routing and FFI cache, kept in function-local statics (readonly classes cannot declare static properties). Without $op it reports the
+     * routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the cached
+     * handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w55_5', self::W55_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W55_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        return self::w55RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with levelFilterPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 55.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w55Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w55RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w555_search_query_level_filter_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch parse of comma-separated level filters. Items are trimmed and lowercased; empty items are
+     * skipped. Four words per filter: `[mask, recognized, unknown, duplicates]`, where bit n of the mask
+     * marks {@see LogEntryParser::LEVELS}[n].
+     *
+     * @param  list<string>  $filters
+     * @return list<int>
+     */
+    public static function levelFilterPlanBatch(array $filters): array
+    {
+        return self::usesW55RustFfi() ? self::levelFilterPlanBatchNative($filters) : self::levelFilterPlanBatchPhp($filters);
+    }
+
+    /**
+     * @param  list<string>  $filters
+     * @return list<int>
+     */
+    public static function levelFilterPlanBatchPhp(array $filters): array
+    {
+        $out = [];
+        foreach ($filters as $filter) {
+            $mask = $recognized = $unknown = $duplicates = 0;
+            foreach (explode(',', $filter) as $item) {
+                $name = strtolower(trim($item));
+                if ($name === '') {
+                    continue;
+                }
+                $bit = self::W55_LEVEL_BITS[$name] ?? 0;
+                if ($bit === 0) {
+                    $unknown++;
+                } elseif (($mask & $bit) !== 0) {
+                    $duplicates++;
+                } else {
+                    $mask |= $bit;
+                    $recognized++;
+                }
+            }
+            array_push($out, $mask, $recognized, $unknown, $duplicates);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds
+     * a NUL.
+     *
+     * @param  list<string>  $filters
+     * @return list<int>
+     */
+    public static function levelFilterPlanBatchNative(array $filters): array
+    {
+        $count = \count($filters);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w55Words($count, implode("\0", $filters), 4 * $count) ?? self::levelFilterPlanBatchPhp($filters);
+    }
 }
