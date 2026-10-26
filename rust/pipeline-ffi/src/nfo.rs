@@ -43566,3 +43566,813 @@ pub mod wave56_2_directory_sync_coverage_creation_import_nzb_service {
         }
     }
 }
+
+pub mod wave57_2_mcp_path_guard_repo_context_redactor_status_tmux_collector {
+    //! Wave 57.2 batch kernels in the Wave 49.2 framing: NUL-joined string columns (exactly
+    //! `count` entries) and little-endian `i64` tables in, one `i64` word per item, a few
+    //! summary words and one XXH64 digest of the preceding words out. Each export returns the
+    //! word count, `-needed` when `out_cap` (in words) is short, or -1 for a null output, a
+    //! malformed batch, an output overlapping an input or a panic.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, ints, span,
+    };
+    use crate::cleaning::{mcp_is_sensitive_key_slice, mcp_redact_bytes};
+    use std::collections::HashSet;
+
+    /// Saturation limit of the 24-bit length fields.
+    const FIELD: usize = 0xFF_FFFF;
+
+    fn set<T>(n: usize) -> HashSet<T, FoldState> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    #[inline]
+    fn word(flags: i64, text: &[u8]) -> i64 {
+        flags | (text.len().min(FIELD) as i64) << 8 | i64::from(crc32(text)) << 32
+    }
+
+    /// PHP `trim()`'s default character set.
+    #[inline]
+    fn is_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+    }
+
+    /// PHP `trim($s)`.
+    fn trim(s: &[u8]) -> &[u8] {
+        let start = s.iter().position(|&b| !is_trim(b)).unwrap_or(s.len());
+        let end = s
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    // ---- ProjectPathGuard --------------------------------------------------------------------
+
+    const ROOT_FILES: [&[u8]; 11] = [
+        b".env.example",
+        b"AGENTS.md",
+        b"README.md",
+        b"composer.json",
+        b"composer.lock",
+        b"package.json",
+        b"package-lock.json",
+        b"phpstan.neon",
+        b"phpunit.xml",
+        b"pint.json",
+        b"vite.config.js",
+    ];
+
+    const ROOTS: [&[u8]; 7] = [
+        b"app",
+        b"bootstrap",
+        b"config",
+        b"database",
+        b"resources",
+        b"routes",
+        b"tests",
+    ];
+
+    const DENIED: [&[u8]; 6] = [
+        b".git",
+        b"node_modules",
+        b"public/build",
+        b"storage",
+        b"storage-runtime",
+        b"vendor",
+    ];
+
+    /// `str_contains($path, '/'.$denied.'/')`.
+    fn contains_slashed(path: &[u8], denied: &[u8]) -> bool {
+        path.iter().enumerate().any(|(i, &b)| {
+            b == b'/'
+                && path[i + 1..].starts_with(denied)
+                && path.get(i + 1 + denied.len()) == Some(&b'/')
+        })
+    }
+
+    /// `strtolower($segment)` is `.env` or a `.env.*` other than `.env.example`.
+    fn env_segment(seg: &[u8]) -> bool {
+        (seg.len() == 4 && seg.eq_ignore_ascii_case(b".env"))
+            || (seg.len() >= 5
+                && seg[..5].eq_ignore_ascii_case(b".env.")
+                && !seg.eq_ignore_ascii_case(b".env.example"))
+    }
+
+    /// `/(?:credential|private[_-]?key|id_rsa|id_ed25519|\.pem$|\.p12$|\.pfx$)/i` with the
+    /// default PCRE tables: ASCII case folding, `$` at the end or before a final newline.
+    fn credential_segment(seg: &[u8]) -> bool {
+        for i in 0..seg.len() {
+            let rem = &seg[i..];
+            let hit = match rem[0] | 0x20 {
+                b'c' => rem.len() >= 10 && rem[..10].eq_ignore_ascii_case(b"credential"),
+                b'p' => {
+                    rem.len() >= 10 && rem[..7].eq_ignore_ascii_case(b"private") && {
+                        let r = &rem[7..];
+                        r[..3].eq_ignore_ascii_case(b"key")
+                            || (r.len() >= 4
+                                && matches!(r[0], b'_' | b'-')
+                                && r[1..4].eq_ignore_ascii_case(b"key"))
+                    }
+                }
+                b'i' => {
+                    (rem.len() >= 6 && rem[..6].eq_ignore_ascii_case(b"id_rsa"))
+                        || (rem.len() >= 10 && rem[..10].eq_ignore_ascii_case(b"id_ed25519"))
+                }
+                _ => false,
+            };
+            if hit {
+                return true;
+            }
+        }
+        let ends = |s: &[u8]| {
+            s.len() >= 4 && {
+                let tail = &s[s.len() - 4..];
+                tail.eq_ignore_ascii_case(b".pem")
+                    || tail.eq_ignore_ascii_case(b".p12")
+                    || tail.eq_ignore_ascii_case(b".pfx")
+            }
+        };
+        ends(seg) || seg.strip_suffix(b"\n").is_some_and(ends)
+    }
+
+    /// ProjectPathGuard::normalizePhp()'s checks short of realpath(): leaves the trimmed (status
+    /// 1-2) or slash-collapsed (status 3+) path in `buf` and returns 0 accepted, 1 empty or NUL,
+    /// 2 absolute, 3 traversal, 4 outside the allowed roots, 5 denied segment, 6 environment
+    /// file, 7 credential or private key.
+    fn path_status(raw: &[u8], buf: &mut Vec<u8>) -> i64 {
+        buf.clear();
+        buf.extend(trim(raw).iter().map(|&b| if b == b'\\' { b'/' } else { b }));
+        if buf.is_empty() || buf.contains(&0) {
+            return 1;
+        }
+        if buf[0] == b'/'
+            || (buf.len() >= 3 && buf[0].is_ascii_alphabetic() && buf[1] == b':' && buf[2] == b'/')
+        {
+            return 2;
+        }
+        let mut w = 0;
+        for r in 0..buf.len() {
+            let b = buf[r];
+            if b == b'/' && w > 0 && buf[w - 1] == b'/' {
+                continue;
+            }
+            buf[w] = b;
+            w += 1;
+        }
+        buf.truncate(w);
+        let path = &buf[..];
+        if path.split(|&b| b == b'/').any(|s| s == b".." || s == b".") {
+            return 3;
+        }
+        if !ROOT_FILES.contains(&path) {
+            let root = path.split(|&b| b == b'/').next().unwrap_or_default();
+            if !ROOTS.contains(&root) {
+                return 4;
+            }
+            for denied in DENIED {
+                if path == denied
+                    || (path.starts_with(denied) && path.get(denied.len()) == Some(&b'/'))
+                    || contains_slashed(path, denied)
+                {
+                    return 5;
+                }
+            }
+        }
+        for seg in path.split(|&b| b == b'/') {
+            if env_segment(seg) {
+                return 6;
+            }
+            if credential_segment(seg) {
+                return 7;
+            }
+        }
+        0
+    }
+
+    /// Per path `word(status, text)`; then the eight status counts and the distinct accepted
+    /// paths.
+    pub fn path_guard_plan(paths: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(paths.len() + 10);
+        let mut counts = [0i64; 8];
+        let mut seen = set::<Vec<u8>>(paths.len());
+        let mut buf = Vec::new();
+        for &path in paths {
+            let status = path_status(path, &mut buf);
+            counts[status as usize] += 1;
+            if status == 0 && !seen.contains(&buf) {
+                seen.insert(buf.clone());
+            }
+            out.push(word(status, &buf));
+        }
+        out.extend(counts);
+        out.push(seen.len() as i64);
+        out
+    }
+
+    // ---- RepositoryContextCollector ----------------------------------------------------------
+
+    /// Single-byte PCRE `\R` breaks (CRLF is matched first).
+    #[inline]
+    fn is_break(b: u8) -> bool {
+        matches!(b, b'\n' | 0x0B | 0x0C | b'\r' | 0x85)
+    }
+
+    /// Per `git log --format=%h%x09%s` output, parsed as recentHistory() does: `flags |
+    /// min(commits, 0xFFFFFF) << 8 | crc32(entries) << 32`, entries joined as `commit\tsubject`
+    /// by newlines. Flags: 1 a line was skipped (empty commit), 2 a commit line had no tab, 4
+    /// every commit (at least one) is 4-40 lowercase hex digits. Then the total commits, outputs
+    /// without commits, outputs with skipped lines, outputs with untabbed lines and the distinct
+    /// commit hashes.
+    pub fn history_plan(outputs: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(outputs.len() + 6);
+        let mut seen = set::<&[u8]>(outputs.len() * 5);
+        let mut canon = Vec::new();
+        let (mut total, mut empty, mut skipped, mut untabbed) = (0i64, 0i64, 0i64, 0i64);
+        for &raw in outputs {
+            let text = trim(raw);
+            let n = text.len();
+            canon.clear();
+            let (mut commits, mut flags, mut hex) = (0usize, 0i64, true);
+            let (mut start, mut i) = (0usize, 0usize);
+            loop {
+                if i < n && !is_break(text[i]) {
+                    i += 1;
+                    continue;
+                }
+                let line = &text[start..i];
+                let tab = line.iter().position(|&b| b == b'\t');
+                let (commit, subject) = match tab {
+                    Some(t) => (&line[..t], &line[t + 1..]),
+                    None => (line, &b""[..]),
+                };
+                if commit.is_empty() {
+                    flags |= 1;
+                } else {
+                    if tab.is_none() {
+                        flags |= 2;
+                    }
+                    hex &= (4..=40).contains(&commit.len())
+                        && commit
+                            .iter()
+                            .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                    if commits > 0 {
+                        canon.push(b'\n');
+                    }
+                    canon.extend_from_slice(commit);
+                    canon.push(b'\t');
+                    canon.extend_from_slice(subject);
+                    commits += 1;
+                    seen.insert(commit);
+                }
+                if i >= n {
+                    break;
+                }
+                i += if text[i] == b'\r' && text.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+                start = i;
+            }
+            if hex && commits > 0 {
+                flags |= 4;
+            }
+            total += commits as i64;
+            empty += i64::from(commits == 0);
+            skipped += flags & 1;
+            untabbed += flags >> 1 & 1;
+            out.push(flags | (commits.min(FIELD) as i64) << 8 | i64::from(crc32(&canon)) << 32);
+        }
+        out.extend([total, empty, skipped, untabbed, seen.len() as i64]);
+        out
+    }
+
+    // ---- SensitiveValueRedactor --------------------------------------------------------------
+
+    /// Per (key, value), redactValue()'s result for a string item: `flags | min(len, 0xFFFFFF) <<
+    /// 8 | crc32(result) << 32`. Flags: 1 the key is sensitive (`[REDACTED]`), 2 redact()
+    /// changed the value. Then the sensitive keys, redacted values, unchanged values and the
+    /// total result bytes.
+    pub fn redaction_plan(keys: &[&[u8]], values: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(keys.len() + 5);
+        let (mut sensitive, mut redacted, mut unchanged, mut bytes) = (0i64, 0i64, 0i64, 0i64);
+        for (&key, &value) in keys.iter().zip(values) {
+            let w = if mcp_is_sensitive_key_slice(key) {
+                sensitive += 1;
+                word(1, b"[REDACTED]")
+            } else if let Some(result) = mcp_redact_bytes(value).filter(|r| r[..] != *value) {
+                redacted += 1;
+                word(2, &result)
+            } else {
+                unchanged += 1;
+                word(0, value)
+            };
+            bytes += (w >> 8) & FIELD as i64;
+            out.push(w);
+        }
+        out.extend([sensitive, redacted, unchanged, bytes]);
+        out
+    }
+
+    // ---- ServiceStatusCollector --------------------------------------------------------------
+
+    /// ServiceStatusEnum values in case order, with their severities.
+    const STATUSES: [(&[u8], i64); 5] = [
+        (b"operational", 0),
+        (b"degraded", 1),
+        (b"partial_outage", 3),
+        (b"major_outage", 4),
+        (b"maintenance", 2),
+    ];
+
+    /// Largest response time packed into a status word (40 bits).
+    const MS_FIELD: i64 = 0xFF_FFFF_FFFF;
+
+    /// Per service: `code | up << 3 | timed << 4 | (severity + 1) << 8 | clamp(ms, 0, 2^40-1) <<
+    /// 16`, code being the case position plus one (0 for an unknown status, severity -1). Then
+    /// the six code counts, up, down, incidents (severity >= 3), timed services, the saturating
+    /// sum of non-negative response times, the largest response time (PHP_INT_MIN when none)
+    /// and the worst severity (-1 when none).
+    pub fn status_plan(statuses: &[&[u8]], ms: &[i64], timed: &[bool]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(statuses.len() + 14);
+        let mut codes = [0i64; 6];
+        let (mut up_n, mut down_n, mut incidents, mut timed_n) = (0i64, 0i64, 0i64, 0i64);
+        let (mut sum, mut max, mut worst) = (0i64, i64::MIN, -1i64);
+        for (i, &status) in statuses.iter().enumerate() {
+            let found = STATUSES.iter().position(|&(value, _)| value == status);
+            let code = found.map_or(0, |p| p + 1);
+            let severity = found.map_or(-1, |p| STATUSES[p].1);
+            let up = found.is_some() && severity <= 1;
+            let has = timed[i];
+            codes[code] += 1;
+            up_n += i64::from(up);
+            down_n += i64::from(found.is_some() && !up);
+            incidents += i64::from(severity >= 3);
+            worst = worst.max(severity);
+            let clamped = if has {
+                timed_n += 1;
+                sum = sum.saturating_add(ms[i].max(0));
+                max = max.max(ms[i]);
+                ms[i].clamp(0, MS_FIELD)
+            } else {
+                0
+            };
+            out.push(
+                code as i64
+                    | i64::from(up) << 3
+                    | i64::from(has) << 4
+                    | (severity + 1) << 8
+                    | clamped << 16,
+            );
+        }
+        out.extend(codes);
+        out.extend([up_n, down_n, incidents, timed_n, sum, max, worst]);
+        out
+    }
+
+    // ---- TmuxSnapshotCollector ---------------------------------------------------------------
+
+    const TABLES: [&[u8]; 4] = [
+        b"collections_table",
+        b"binaries_table",
+        b"parts_table",
+        b"missed_parts_table",
+    ];
+
+    const CATEGORIES: [&[u8]; 8] = [
+        b"tv", b"movies", b"audio", b"books", b"console", b"pc", b"xxx", b"misc",
+    ];
+
+    const SCALARS: [&[u8]; 10] = [
+        b"total_work",
+        b"work",
+        b"work_available",
+        b"releases",
+        b"predb",
+        b"predb_matched",
+        b"nfo",
+        b"renamed",
+        b"active_groups",
+        b"all_groups",
+    ];
+
+    /// Per snapshot count key, as extractCountSeriesPhp() files it: `class | index << 3 |
+    /// duplicate << 7 | min(len, 0xFFFFFF) << 8 | crc32(label) << 32`. Class: 1 backlog
+    /// (`process*`, label the suffix), 2 table (label without `_table`), 3 category, 4 scalar
+    /// (label the key), 0 other (empty label); index is the position in its list. Then the five
+    /// class counts, duplicate keys, the snapshot age (`max(0, now - collected_at)`, saturating)
+    /// and whether it exceeds `max(0, stale_after)`.
+    pub fn count_key_plan(
+        keys: &[&[u8]],
+        collected_at: i64,
+        now: i64,
+        stale_after: i64,
+    ) -> Vec<i64> {
+        let mut out = Vec::with_capacity(keys.len() + 9);
+        let mut classes = [0i64; 5];
+        let mut duplicates = 0i64;
+        let mut seen = set::<&[u8]>(keys.len());
+        for &key in keys {
+            let (class, index, label): (i64, usize, &[u8]) = if key.starts_with(b"process") {
+                (1, 0, &key[7..])
+            } else if let Some(p) = TABLES.iter().position(|&t| t == key) {
+                (2, p, &key[..key.len() - 6])
+            } else if let Some(p) = CATEGORIES.iter().position(|&c| c == key) {
+                (3, p, key)
+            } else if let Some(p) = SCALARS.iter().position(|&s| s == key) {
+                (4, p, key)
+            } else {
+                (0, 0, b"")
+            };
+            let duplicate = !seen.insert(key);
+            classes[class as usize] += 1;
+            duplicates += i64::from(duplicate);
+            out.push(word(
+                class | (index as i64) << 3 | i64::from(duplicate) << 7,
+                label,
+            ));
+        }
+        let age = if collected_at >= now {
+            0
+        } else {
+            now.saturating_sub(collected_at)
+        };
+        out.extend(classes);
+        out.extend([duplicates, age, i64::from(age > stale_after.max(0))]);
+        out
+    }
+
+    // ---- exports -----------------------------------------------------------------------------
+
+    /// # Safety
+    /// `paths` must be readable for `paths_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w57_path_guard_plan_batch(
+        paths: *const u8,
+        paths_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(paths, paths_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                Some(path_guard_plan(&column(span(paths, paths_len)?, count)?))
+            })
+        }
+    }
+
+    /// # Safety
+    /// `outputs` must be readable for `outputs_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w57_repo_history_plan_batch(
+        outputs: *const u8,
+        outputs_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(outputs, outputs_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                Some(history_plan(&column(span(outputs, outputs_len)?, count)?))
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w57_redaction_plan_batch(
+        keys: *const u8,
+        keys_len: usize,
+        values: *const u8,
+        values_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(keys, keys_len), (values, values_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let keys = column(span(keys, keys_len)?, count)?;
+                let values = column(span(values, values_len)?, count)?;
+                Some(redaction_plan(&keys, &values))
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds one response time per service; `nulls` the indices of services without one.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w57_service_status_plan_batch(
+        statuses: *const u8,
+        statuses_len: usize,
+        ints_ptr: *const u8,
+        ints_len: usize,
+        nulls: *const u8,
+        nulls_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (statuses, statuses_len),
+            (ints_ptr, ints_len),
+            (nulls, nulls_len),
+        ];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let statuses = column(span(statuses, statuses_len)?, count)?;
+                let ms = ints(span(ints_ptr, ints_len)?, count)?;
+                let nulls = span(nulls, nulls_len)?;
+                if nulls.len() % 8 != 0 {
+                    return None;
+                }
+                let mut timed = vec![true; count];
+                for index in ints(nulls, nulls.len() / 8)? {
+                    *timed.get_mut(usize::try_from(index).ok()?)? = false;
+                }
+                Some(status_plan(&statuses, &ms, &timed))
+            })
+        }
+    }
+
+    /// # Safety
+    /// `keys` must be readable for `keys_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w57_tmux_count_key_plan_batch(
+        keys: *const u8,
+        keys_len: usize,
+        count: usize,
+        collected_at: i64,
+        now: i64,
+        stale_after: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(keys, keys_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                Some(count_key_plan(
+                    &column(span(keys, keys_len)?, count)?,
+                    collected_at,
+                    now,
+                    stale_after,
+                ))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod w572_tests {
+        use super::super::wave49_verification_admission_inventory_prep_repo_sample::digest;
+        use super::*;
+
+        fn run(call: impl Fn(*mut i64, usize) -> isize) -> Vec<i64> {
+            let mut out = vec![0i64; 64];
+            let n = call(out.as_mut_ptr(), out.len());
+            assert!(n > 0, "export returned {n}");
+            out.truncate(n as usize);
+            let (body, last) = out.split_at(out.len() - 1);
+            assert_eq!(last[0], digest(body));
+            out.pop();
+            out
+        }
+
+        fn status(path: &[u8]) -> (i64, Vec<u8>) {
+            let mut buf = Vec::new();
+            (path_status(path, &mut buf), buf)
+        }
+
+        #[test]
+        fn w572_path_status_mirrors_normalize_php() {
+            assert_eq!(status(b"  \t"), (1, b"".to_vec()));
+            assert_eq!(status(b"a\0b").0, 1);
+            assert_eq!(status(b"\0app/x\0").0, 0);
+            assert_eq!(status(b"\\etc\\passwd"), (2, b"/etc/passwd".to_vec()));
+            assert_eq!(status(b"C:\\x"), (2, b"C:/x".to_vec()));
+            assert_eq!(status(b"1:/x").0, 4);
+            assert_eq!(status(b"app//../x"), (3, b"app/../x".to_vec()));
+            assert_eq!(status(b"app/./x").0, 3);
+            assert_eq!(status(b"README.md").0, 0);
+            assert_eq!(status(b".env.example").0, 0);
+            assert_eq!(status(b"lib/x.php").0, 4);
+            assert_eq!(status(b"app/vendor/x").0, 5);
+            assert_eq!(status(b"app/vendor").0, 0);
+            assert_eq!(status(b"app/public/build/x").0, 5);
+            assert_eq!(status(b"app/.ENV").0, 6);
+            assert_eq!(status(b"app/.env.local").0, 6);
+            assert_eq!(status(b"app/.Env.Example").0, 0);
+            assert_eq!(status(b"app/Private-Key.txt").0, 7);
+            assert_eq!(status(b"app/private__key").0, 0);
+            assert_eq!(status(b"app/cert.PEM").0, 7);
+            assert_eq!(status(b"app/cert.pem\n/x").0, 7);
+            assert_eq!(status(b"app/cert.pem\n\n/x").0, 0);
+            assert_eq!(status(b"app/cert.pem.bak").0, 0);
+            assert_eq!(status(b"tests/Unit/ID_ED25519").0, 7);
+        }
+
+        #[test]
+        fn w572_history_splits_like_pcre_r() {
+            let plan = history_plan(&[
+                b"abc1234\tFix\tthings\r\ndef5678\tAdd\n",
+                b"",
+                b"\tno commit\x85zz\x0c",
+                b"abc1234\tdup",
+            ]);
+            assert_eq!(
+                plan[0],
+                4 | 2 << 8 | i64::from(crc32(b"abc1234\tFix\tthings\ndef5678\tAdd")) << 32
+            );
+            assert_eq!(plan[1], 1 | i64::from(crc32(b"")) << 32);
+            // trim() drops the leading tab, so "no commit" is an untabbed commit.
+            assert_eq!(
+                plan[2],
+                1 | 2 | 2 << 8 | i64::from(crc32(b"no commit\t\nzz\t")) << 32
+            );
+            assert_eq!(&plan[4..], &[5, 1, 2, 1, 4]);
+        }
+
+        #[test]
+        fn w572_redaction_status_and_count_keys() {
+            let plan = redaction_plan(
+                &[b"api_key", b"name", b"name", b"x"],
+                &[b"v", b"Bearer abcdef", b"plain value", b"tiny"],
+            );
+            assert_eq!(plan[0], word(1, b"[REDACTED]"));
+            assert_eq!(plan[1], word(2, b"Bearer [REDACTED]"));
+            assert_eq!(plan[2], word(0, b"plain value"));
+            assert_eq!(&plan[4..], &[1, 1, 2, 10 + 17 + 11 + 4]);
+
+            let plan = status_plan(
+                &[b"operational", b"major_outage", b"bogus", b"maintenance"],
+                &[250, -5, 7, 0],
+                &[true, true, false, false],
+            );
+            assert_eq!(plan[0], 1 | 1 << 3 | 1 << 4 | 1 << 8 | 250 << 16);
+            assert_eq!(plan[1], 4 | 1 << 4 | 5 << 8);
+            assert_eq!(plan[2], 0);
+            assert_eq!(plan[3], 5 | 3 << 8);
+            assert_eq!(&plan[4..], &[1, 1, 0, 0, 1, 1, 1, 2, 1, 2, 250, 250, 4]);
+
+            let plan = count_key_plan(
+                &[
+                    b"processmovies",
+                    b"parts_table",
+                    b"pc",
+                    b"nfo",
+                    b"other",
+                    b"pc",
+                    b"process",
+                ],
+                100,
+                50,
+                10,
+            );
+            assert_eq!(plan[0], word(1, b"movies"));
+            assert_eq!(plan[1], word(2 | 2 << 3, b"parts"));
+            assert_eq!(plan[2], word(3 | 5 << 3, b"pc"));
+            assert_eq!(plan[3], word(4 | 6 << 3, b"nfo"));
+            assert_eq!(plan[4], word(0, b""));
+            assert_eq!(plan[5], word(3 | 5 << 3 | 1 << 7, b"pc"));
+            assert_eq!(&plan[7..], &[1, 2, 1, 2, 1, 1, 0, 0]);
+            let tail = count_key_plan(&[], i64::MIN, i64::MAX, -3);
+            assert_eq!(&tail[5..], &[0, i64::MAX, 1]);
+        }
+
+        #[test]
+        fn w572_exports_frame_and_guard_batches() {
+            let null = std::ptr::null();
+            unsafe {
+                assert_eq!(
+                    run(|o, c| nntmux_w57_path_guard_plan_batch(b"app\0/x".as_ptr(), 6, 2, o, c))
+                        .len(),
+                    11
+                );
+                assert_eq!(
+                    run(|o, c| nntmux_w57_repo_history_plan_batch(b"a\tb".as_ptr(), 3, 1, o, c))
+                        .len(),
+                    6
+                );
+                assert_eq!(
+                    run(|o, c| nntmux_w57_redaction_plan_batch(
+                        b"k".as_ptr(),
+                        1,
+                        b"v".as_ptr(),
+                        1,
+                        1,
+                        o,
+                        c
+                    ))
+                    .len(),
+                    5
+                );
+                let ints = 5i64.to_le_bytes();
+                let nulls = 0i64.to_le_bytes();
+                assert_eq!(
+                    run(|o, c| nntmux_w57_service_status_plan_batch(
+                        b"degraded".as_ptr(),
+                        8,
+                        ints.as_ptr(),
+                        8,
+                        nulls.as_ptr(),
+                        8,
+                        1,
+                        o,
+                        c
+                    ))
+                    .len(),
+                    14
+                );
+                assert_eq!(
+                    run(|o, c| nntmux_w57_tmux_count_key_plan_batch(
+                        b"nfo".as_ptr(),
+                        3,
+                        1,
+                        1,
+                        2,
+                        3,
+                        o,
+                        c
+                    ))
+                    .len(),
+                    9
+                );
+                let mut out = [0i64; 32];
+                let o = out.as_mut_ptr();
+                assert_eq!(nntmux_w57_path_guard_plan_batch(null, 0, 0, o, 32), 10);
+                assert_eq!(
+                    nntmux_w57_path_guard_plan_batch(b"a".as_ptr(), 1, 1, o, 5),
+                    -11
+                );
+                assert_eq!(
+                    nntmux_w57_path_guard_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 32),
+                    -1
+                );
+                assert_eq!(nntmux_w57_path_guard_plan_batch(null, 3, 1, o, 32), -1);
+                assert_eq!(
+                    nntmux_w57_path_guard_plan_batch(b"a".as_ptr(), 1, 1, std::ptr::null_mut(), 32),
+                    -1
+                );
+                let bad = 1i64.to_le_bytes();
+                assert_eq!(
+                    nntmux_w57_service_status_plan_batch(
+                        b"x".as_ptr(),
+                        1,
+                        ints.as_ptr(),
+                        8,
+                        bad.as_ptr(),
+                        8,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w57_service_status_plan_batch(
+                        b"x".as_ptr(),
+                        1,
+                        ints.as_ptr(),
+                        8,
+                        bad.as_ptr(),
+                        4,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w57_redaction_plan_batch(
+                        b"k".as_ptr(),
+                        1,
+                        b"v\0w".as_ptr(),
+                        3,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                // An output overlapping an input is refused.
+                let mut shared = [0u8; 64];
+                shared[0] = b'a';
+                assert_eq!(
+                    nntmux_w57_repo_history_plan_batch(
+                        shared.as_ptr(),
+                        1,
+                        1,
+                        shared.as_mut_ptr() as *mut i64,
+                        8
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}
