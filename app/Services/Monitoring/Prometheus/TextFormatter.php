@@ -7,6 +7,7 @@ namespace App\Services\Monitoring\Prometheus;
 use App\Support\ReleaseSearchIndexDocument;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -222,5 +223,145 @@ final class TextFormatter
 
         return ['values' => \count($values), 'invalid' => \count($values) - \count($strings)]
             + array_combine(['label_escaped', 'help_escaped', 'backslashes', 'quotes', 'newlines', 'input_bytes', 'label_bytes', 'help_bytes', 'distinct_values'], $fields);
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W56 parity test measures 2.987x common mean, 2.803x
+     * common p99, 2.861x uncommon mean and 2.58x uncommon p99 (per-metric minimum of three runs),
+     * above the 1.5x rule.
+     */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    private const string W56_FFI_CDEF = 'ssize_t nntmux_w561_prometheus_token_code_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public const int W56_TOKEN_METRIC_NAME = 1;
+
+    public const int W56_TOKEN_LABEL_NAME = 2;
+
+    public const int W56_TOKEN_RESERVED_LABEL = 4;
+
+    public const int W56_TOKEN_LABEL_ESCAPE = 8;
+
+    public const int W56_TOKEN_HELP_ESCAPE = 16;
+
+    public const int W56_TOKEN_LENGTH_SHIFT = 8;
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 56 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * One word per exposition token: `W56_TOKEN_*` flags for a valid metric name and label name
+     * (the {@see MetricFamily} checks, whose `$` also matches before a final LF), a reserved `__`
+     * label prefix and whether the token changes when escaped as a label value or as help text,
+     * plus the escaped label value length `<< W56_TOKEN_LENGTH_SHIFT`.
+     *
+     * @param  array<array-key, string>  $tokens
+     * @return list<int>
+     */
+    public static function expositionTokenCodes(array $tokens): array
+    {
+        return self::usesW56RustFfi() ? self::expositionTokenCodesNative($tokens) : self::expositionTokenCodesPhp($tokens);
+    }
+
+    /**
+     * @param  array<array-key, string>  $tokens
+     * @return list<int>
+     */
+    public static function expositionTokenCodesPhp(array $tokens): array
+    {
+        $codes = [];
+        foreach ($tokens as $token) {
+            $code = (preg_match('/^[a-zA-Z_:][a-zA-Z0-9_:]*$/', $token) === 1 ? self::W56_TOKEN_METRIC_NAME : 0)
+                | (preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $token) === 1 ? self::W56_TOKEN_LABEL_NAME : 0)
+                | (str_starts_with($token, '__') ? self::W56_TOKEN_RESERVED_LABEL : 0)
+                | (strpbrk($token, "\\\n") !== false ? self::W56_TOKEN_HELP_ESCAPE : 0);
+            $escaped = str_replace(['\\', '"', "\n"], ['\\\\', '\\"', '\\n'], $token);
+            if ($escaped !== $token) {
+                $code |= self::W56_TOKEN_LABEL_ESCAPE;
+            }
+            $codes[] = $code | \strlen($escaped) << self::W56_TOKEN_LENGTH_SHIFT;
+        }
+
+        return $codes;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a token
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $tokens
+     * @return list<int>
+     */
+    public static function expositionTokenCodesNative(array $tokens): array
+    {
+        $count = \count($tokens);
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w56RustFfiState('out', $count);
+        if ($buffer === null) {
+            return self::expositionTokenCodesPhp($tokens);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $tokens);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w561_prometheus_token_code_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', FFI::string($out, $count * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::expositionTokenCodesPhp($tokens);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 56 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('prometheus_text_w56', self::W56_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }
