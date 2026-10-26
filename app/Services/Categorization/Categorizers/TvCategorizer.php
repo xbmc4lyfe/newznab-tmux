@@ -9,6 +9,7 @@ use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -685,5 +686,334 @@ CDEF;
         }
 
         return self::$w433RustFfiHandle === false ? null : self::$w433RustFfiHandle;
+    }
+
+    // ---- Wave 61.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 8.75x/6.20x, uncommon 10.71x/8.71x); see RustCategorizersTvXxxConsoleGamesServiceTitleParserW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    private const string W61_TV_CATEGORIZER_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w612_tv_categorize_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W61_TV_CATEGORIZER_TAIL = 32;
+
+    /** Category id per w61TvCategorizePlanBatch() category index (0: not TV). */
+    public const array W61_TV_CATEGORIES = [0, Category::TV_WEBDL, Category::TV_FOREIGN, Category::TV_SD, Category::TV_HD, Category::TV_UHD,
+        Category::TV_SPORT, Category::TV_ANIME, Category::TV_DOCU, Category::TV_OTHER];
+
+    /** Lowercase token => `res | source << 2 | codec << 6 | content << 9 | webdl << 15`. */
+    private const array W61_TV_TOKENS = [
+        '2160p' => 3, '4k' => 3, 'uhd' => 3, '1080p' => 2, '1080i' => 2, '720p' => 2, '480p' => 1, '576p' => 1, '360p' => 1, 'sdtv' => 1, 'sd' => 1,
+        'hdtv' => 1 << 2, 'pdtv' => 1 << 2, 'dsr' => 1 << 2, 'tvrip' => 1 << 2, 'satrip' => 1 << 2, 'dthrip' => 1 << 2,
+        'web' => 2 << 2, 'amzn' => 2 << 2, 'nf' => 2 << 2, 'dsnp' => 2 << 2, 'hmax' => 2 << 2, 'atvp' => 2 << 2, 'hulu' => 2 << 2,
+        'webdl' => 2 << 2 | 1 << 15, 'webrip' => 2 << 2 | 1 << 15,
+        'bluray' => 4 << 2, 'bdrip' => 4 << 2, 'bd' => 4 << 2, 'brrip' => 4 << 2, 'remux' => 4 << 2,
+        'dvdrip' => 8 << 2, 'dvdr' => 8 << 2, 'dvd5' => 8 << 2, 'dvd9' => 8 << 2, 'dvd' => 8 << 2,
+        'x264' => 1 << 6, 'h264' => 1 << 6, 'avc' => 1 << 6, 'x265' => 2 << 6, 'h265' => 2 << 6, 'hevc' => 2 << 6, 'xvid' => 4 << 6, 'divx' => 4 << 6,
+        'anime' => 1 << 9, 'subsplease' => 1 << 9, 'horriblesubs' => 1 << 9, 'erai' => 1 << 9, 'judas' => 1 << 9, 'ember' => 1 << 9, 'asw' => 1 << 9,
+        'commie' => 1 << 9,
+        'nfl' => 2 << 9, 'nba' => 2 << 9, 'nhl' => 2 << 9, 'mlb' => 2 << 9, 'mls' => 2 << 9, 'epl' => 2 << 9, 'ufc' => 2 << 9, 'wwe' => 2 << 9,
+        'boxing' => 2 << 9, 'f1' => 2 << 9, 'formula1' => 2 << 9, 'nascar' => 2 << 9, 'pga' => 2 << 9, 'tennis' => 2 << 9, 'golf' => 2 << 9,
+        'soccer' => 2 << 9, 'football' => 2 << 9, 'cricket' => 2 << 9, 'rugby' => 2 << 9, 'olympics' => 2 << 9, 'olympic' => 2 << 9,
+        'paralympics' => 2 << 9,
+        'documentary' => 4 << 9, 'docu' => 4 << 9, 'docuseries' => 4 << 9,
+        'danish' => 8 << 9, 'flemish' => 8 << 9, 'deutsch' => 8 << 9, 'dutch' => 8 << 9, 'french' => 8 << 9, 'german' => 8 << 9, 'hebrew' => 8 << 9,
+        'nlsub' => 8 << 9, 'dubbed' => 8 << 9, 'dub' => 8 << 9, 'dubs' => 8 << 9, 'norwegian' => 8 << 9, 'swedish' => 8 << 9, 'swesub' => 8 << 9,
+        'spanish' => 8 << 9, 'staffel' => 8 << 9, 'multisub' => 8 << 9,
+        'complete' => 16 << 9, 'proper' => 32 << 9, 'repack' => 32 << 9, 'rerip' => 32 << 9,
+    ];
+
+    /**
+     * Wave 61 routing, binding and output buffer, kept in function-local statics (no static
+     * properties). Operations: null reads the routing override, 'set' replaces it (returning the
+     * previous one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]`
+     * with room for at least $val words (null without the library).
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w61', self::W61_TV_CATEGORIZER_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w61RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW61RustFfi(): bool
+    {
+        $enabled = self::w61RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w61TvCategorizePlanBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61TvCategorizePlanBatch(array $rows): array
+    {
+        return self::usesW61RustFfi() ? self::w61TvCategorizePlanBatchNative($rows) : self::w61TvCategorizePlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61TvCategorizePlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W61_TV_CATEGORIZER_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w61RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w61TvCategorizePlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W61_TV_CATEGORIZER_FFI_CDEF.)
+            $written = $ffi->nntmux_w612_tv_categorize_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w61TvCategorizePlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w61Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** $min to $max ASCII digits as an integer, otherwise null. */
+    private static function w61Digits(string $value, int $min, int $max): ?int
+    {
+        $length = \strlen($value);
+
+        return $length >= $min && $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : null;
+    }
+
+    /**
+     * The maximal `[a-z0-9]` runs of the ASCII-lowercased value.
+     *
+     * @return list<string>
+     */
+    private static function w61Tokens(string $value): array
+    {
+        $tokens = $value === '' ? false : preg_split('/[^a-z0-9]+/', strtolower($value), -1, PREG_SPLIT_NO_EMPTY);
+
+        return $tokens === false ? [] : $tokens;
+    }
+
+    /**
+     * Wave 61.2 TV token classification and categorization plan. Per `name\tgroup` row `res |
+     * source << 2 | codec << 6 | content << 9 | webdl << 16 | kind << 17 | season << 20 | episode
+     * << 30 | category << 44 | min(tokens, 255) << 48 | min(len(name), 127) << 56` over the
+     * w61Tokens() of the name: res is the highest W61_TV_TOKENS resolution (3 UHD, 2 HD, 1 SD);
+     * source (1 HDTV, 2 web, 4 Blu-ray, 8 DVD), codec (1 x264, 2 x265, 4 XviD) and content (1
+     * anime, also for a group containing `anime` in any case, 2 sport, 4 documentary, 8 foreign,
+     * 16 complete, 32 repack, 64 a 1900-2099 year token) OR their tokens; webdl is a `webdl`
+     * or `webrip` token or `web` followed by `dl` or `rip`. Kind, season and episode come from
+     * the first token starting a marker (w61TvEpisode()). TV-like rows have a marker or an HDTV
+     * source. Category indexes W61_TV_CATEGORIES: anime 7, sport 6 (when TV-like or with a
+     * year), then non-TV-like 0, documentary 8, foreign 2, UHD 5, web-dl 1, HD or Blu-ray 4, SD,
+     * HDTV, DVD or XviD 3, else 9. Then ten category, four resolution, six kind and eight flag
+     * (seven content bits and webdl) counts, the TV-like rows, their distinct lowercase trimmed
+     * non-empty groups (by crc32), the largest season of kinds 1-3 and the XXH64 digest of all
+     * earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61TvCategorizePlanBatchPhp(array $rows): array
+    {
+        $out = $groups = [];
+        $categories = array_fill(0, 10, 0);
+        $resolutions = [0, 0, 0, 0];
+        $kinds = array_fill(0, 6, 0);
+        $flags = array_fill(0, 8, 0);
+        $tvRows = $maxSeason = 0;
+        foreach ($rows as $row) {
+            [$name, $group] = explode("\t", (string) $row, 2) + ['', ''];
+            $tokens = self::w61Tokens($name);
+            $res = $source = $codec = $content = $webdl = 0;
+            $kind = $season = $episode = 0;
+            foreach ($tokens as $i => $token) {
+                $code = self::W61_TV_TOKENS[$token] ?? 0;
+                if ($code !== 0) {
+                    $res = max($res, $code & 3);
+                    $source |= $code >> 2 & 15;
+                    $codec |= $code >> 6 & 7;
+                    $content |= $code >> 9 & 63;
+                    $webdl |= $code >> 15 & 1;
+                }
+                if ($token === 'web' && \in_array($tokens[$i + 1] ?? '', ['dl', 'rip'], true)) {
+                    $webdl = 1;
+                }
+                if (\strlen($token) === 4 && ($year = self::w61Digits($token, 4, 4)) !== null && $year >= 1900 && $year <= 2099) {
+                    $content |= 64;
+                }
+                if ($kind === 0) {
+                    [$kind, $season, $episode] = self::w61TvEpisode($tokens, $i);
+                }
+            }
+            if (stripos($group, 'anime') !== false) {
+                $content |= 1;
+            }
+            $tv = $kind !== 0 || ($source & 1) !== 0;
+            $category = match (true) {
+                ($content & 1) !== 0 => 7,
+                ($content & 2) !== 0 && ($tv || ($content & 64) !== 0) => 6,
+                ! $tv => 0,
+                ($content & 4) !== 0 => 8,
+                ($content & 8) !== 0 => 2,
+                $res === 3 => 5,
+                $webdl === 1 => 1,
+                $res === 2 || ($source & 4) !== 0 => 4,
+                $res === 1 || ($source & 9) !== 0 || ($codec & 4) !== 0 => 3,
+                default => 9,
+            };
+            $categories[$category]++;
+            $resolutions[$res]++;
+            $kinds[$kind]++;
+            for ($k = 0; $k < 7; $k++) {
+                $flags[$k] += $content >> $k & 1;
+            }
+            $flags[7] += $webdl;
+            if ($tv) {
+                $tvRows++;
+                $trimmed = trim($group);
+                if ($trimmed !== '') {
+                    $groups[crc32(strtolower($trimmed))] = true;
+                }
+            }
+            if ($kind >= 1 && $kind <= 3) {
+                $maxSeason = max($maxSeason, $season);
+            }
+            $out[] = $res | $source << 2 | $codec << 6 | $content << 9 | $webdl << 16 | $kind << 17 | $season << 20 | $episode << 30 | $category << 44
+                | min(\count($tokens), 255) << 48 | min(\strlen($name), 127) << 56;
+        }
+        array_push($out, ...$categories, ...$resolutions, ...$kinds, ...$flags);
+        array_push($out, $tvRows, \count($groups), $maxSeason);
+        $out[] = self::w61Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * `[kind, season, episode]` of the marker starting at token $i, checked in order: 1 `s` + 1-3
+     * digits + `e` + 1-4 digits (or `s` + 1-3 digits followed by an `e` + 1-4 digits token), 2
+     * `s` + 1-3 digits alone (a season pack; a token holding an `e` after its `s` only tries
+     * kind 1), 3 1-2 digits + `x` + 2-3 digits, 4 a 1900-2099 year followed by a 01-12 month and
+     * a 01-31 day token (season year - 1900, episode month * 32 + day), 5 `ep` or `e` + 1-4
+     * digits, or `ep`/`episode` followed by a 1-4 digit token; else `[0, 0, 0]`.
+     *
+     * @param  list<string>  $tokens
+     * @return array{int, int, int}
+     */
+    private static function w61TvEpisode(array $tokens, int $i): array
+    {
+        $token = $tokens[$i];
+        if ($token[0] === 's') {
+            $e = strpos($token, 'e', 1);
+            if ($e === false) {
+                $season = self::w61Digits(substr($token, 1), 1, 3);
+                if ($season !== null) {
+                    $next = $tokens[$i + 1] ?? '';
+                    $episode = str_starts_with($next, 'e') ? self::w61Digits(substr($next, 1), 1, 4) : null;
+
+                    return $episode === null ? [2, $season, 0] : [1, $season, $episode];
+                }
+            } else {
+                $season = self::w61Digits(substr($token, 1, $e - 1), 1, 3);
+                $episode = self::w61Digits(substr($token, $e + 1), 1, 4);
+                if ($season !== null && $episode !== null) {
+                    return [1, $season, $episode];
+                }
+            }
+        }
+        $x = strpos($token, 'x');
+        if ($x !== false && $x > 0) {
+            $season = self::w61Digits(substr($token, 0, $x), 1, 2);
+            $episode = self::w61Digits(substr($token, $x + 1), 2, 3);
+            if ($season !== null && $episode !== null) {
+                return [3, $season, $episode];
+            }
+        }
+        $year = self::w61Digits($token, 4, 4);
+        if ($year !== null && $year >= 1900 && $year <= 2099) {
+            $month = self::w61Digits($tokens[$i + 1] ?? '', 2, 2);
+            $day = self::w61Digits($tokens[$i + 2] ?? '', 2, 2);
+            if ($month !== null && $month >= 1 && $month <= 12 && $day !== null && $day >= 1 && $day <= 31) {
+                return [4, $year - 1900, $month * 32 + $day];
+            }
+        }
+        if ($token[0] === 'e') {
+            $episode = str_starts_with($token, 'ep') ? self::w61Digits(substr($token, 2), 1, 4) : null;
+            $episode ??= self::w61Digits(substr($token, 1), 1, 4);
+            if ($episode === null && ($token === 'ep' || $token === 'episode')) {
+                $episode = self::w61Digits($tokens[$i + 1] ?? '', 1, 4);
+            }
+            if ($episode !== null) {
+                return [5, 0, $episode];
+            }
+        }
+
+        return [0, 0, 0];
     }
 }

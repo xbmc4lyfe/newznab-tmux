@@ -16,6 +16,7 @@ use App\Services\IGDB\Exceptions\IgdbHttpException;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Carbon;
@@ -1671,5 +1672,283 @@ class GamesService
     public function matchGenreName(string $gameGenre): bool|string
     {
         return $this->igdbService->isKnownGenre($gameGenre) ? $gameGenre : false;
+    }
+
+    // ---- Wave 61.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 5.68x/4.02x, uncommon 4.33x/4.05x); see RustCategorizersTvXxxConsoleGamesServiceTitleParserW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    private const string W61_GAMES_SERVICE_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w612_games_lookup_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W61_GAMES_SERVICE_TAIL = 25;
+
+    /** Lowercase SCENE_GROUPS that a 1-20 byte `[A-Za-z0-9_]` group suffix can name. */
+    private const array W61_SCENE_GROUPS = [
+        'codex' => true, 'plaza' => true, 'gog' => true, 'cpy' => true, 'hoodlum' => true, 'empress' => true, 'rune' => true, 'tenoke' => true,
+        'flt' => true, 'reloaded' => true, 'skidrow' => true, 'prophet' => true, 'razor1911' => true, 'core' => true, 'reflex' => true, 'p2p' => true,
+        'goldberg' => true, 'darksiders' => true, 'tinyiso' => true, 'doge' => true, 'anomaly' => true, 'elamigos' => true, 'fitgirl' => true,
+        'dodi' => true, 'xatab' => true, 'blg' => true, 'rargb' => true, 'chronos' => true, 'fckdrm' => true, 'i_know' => true, 'steam' => true,
+        'sptgames' => true, 'kaos' => true, 'simplex' => true, 'ali213' => true, 'fltdox' => true, '3dmgame' => true, 'postmortem' => true,
+        'vace' => true, 'rogue' => true, 'outlaws' => true,
+    ];
+
+    /** Lowercase token => flag (1 edition, 2 DLC, 4 update, 8 crack, 16 repack, 64 ISO, 256 OS, 1024 scene group). */
+    private const array W61_GAMES_TOKENS = [
+        'deluxe' => 1, 'gold' => 1, 'goty' => 1, 'ultimate' => 1, 'definitive' => 1, 'enhanced' => 1, 'remastered' => 1, 'collectors' => 1,
+        'premium' => 1, 'anniversary' => 1, 'complete' => 1, 'edition' => 1,
+        'dlc' => 2, 'dlcs' => 2, 'unlocker' => 2, 'soundtrack' => 2, 'ost' => 2, 'expansion' => 2,
+        'update' => 4, 'patch' => 4, 'hotfix' => 4, 'crack' => 8, 'crackfix' => 8, 'crackonly' => 8, 'cracked' => 8,
+        'repack' => 16, 'proper' => 16, 'rerip' => 16, 'rip' => 16, 'iso' => 64, 'linux' => 256, 'macos' => 256, 'mac' => 256, 'osx' => 256,
+        'codex' => 1024, 'plaza' => 1024, 'gog' => 1024, 'cpy' => 1024, 'hoodlum' => 1024, 'empress' => 1024, 'rune' => 1024, 'tenoke' => 1024,
+        'flt' => 1024, 'reloaded' => 1024, 'skidrow' => 1024, 'prophet' => 1024, 'razor1911' => 1024, 'core' => 1024, 'reflex' => 1024, 'p2p' => 1024,
+        'goldberg' => 1024, 'darksiders' => 1024, 'tinyiso' => 1024, 'doge' => 1024, 'anomaly' => 1024, 'elamigos' => 1024, 'fitgirl' => 1024,
+        'dodi' => 1024, 'xatab' => 1024, 'blg' => 1024, 'rargb' => 1024, 'chronos' => 1024, 'fckdrm' => 1024, 'steam' => 1024, 'sptgames' => 1024,
+        'kaos' => 1024, 'simplex' => 1024, 'ali213' => 1024, 'fltdox' => 1024, '3dmgame' => 1024, 'postmortem' => 1024, 'vace' => 1024,
+        'rogue' => 1024, 'outlaws' => 1024,
+    ];
+
+    /**
+     * Wave 61 routing, binding and output buffer, kept in function-local statics (no static
+     * properties). Operations: null reads the routing override, 'set' replaces it (returning the
+     * previous one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]`
+     * with room for at least $val words (null without the library).
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w61', self::W61_GAMES_SERVICE_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w61RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW61RustFfi(): bool
+    {
+        $enabled = self::w61RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w61GameLookupPlanBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61GameLookupPlanBatch(array $rows): array
+    {
+        return self::usesW61RustFfi() ? self::w61GameLookupPlanBatchNative($rows) : self::w61GameLookupPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61GameLookupPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W61_GAMES_SERVICE_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w61RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w61GameLookupPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W61_GAMES_SERVICE_FFI_CDEF.)
+            $written = $ffi->nntmux_w612_games_lookup_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w61GameLookupPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w61Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** $min to $max ASCII digits as an integer, otherwise null. */
+    private static function w61Digits(string $value, int $min, int $max): ?int
+    {
+        $length = \strlen($value);
+
+        return $length >= $min && $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : null;
+    }
+
+    /**
+     * The maximal `[a-z0-9]` runs of the ASCII-lowercased value.
+     *
+     * @return list<string>
+     */
+    private static function w61Tokens(string $value): array
+    {
+        $tokens = $value === '' ? false : preg_split('/[^a-z0-9]+/', strtolower($value), -1, PREG_SPLIT_NO_EMPTY);
+
+        return $tokens === false ? [] : $tokens;
+    }
+
+    /**
+     * Wave 61.2 PC game lookup plan and store candidate scoring. Per `release\tcandidate\tyear`
+     * row `group | flags << 2 | yearState << 13 | decision << 15 | score << 17 | min(common, 63)
+     * << 24 | min(title, 63) << 30 | min(candidate, 63) << 36 | (releaseYear - 1900, or 0) << 42
+     * | min(len(release), 8191) << 50`. Group: 0 none, else the suffix after the release's last
+     * `-` (1-20 bytes of `[A-Za-z0-9_]`, removed before tokenizing) is 1 a W61_SCENE_GROUPS entry
+     * (any case) or 2 unknown. Flags OR the w61Tokens() of the rest: W61_GAMES_TOKENS bits plus
+     * 32 `multi` + 0-2 digits, 128 a version (`v` + 1-7 digits, `build`, or `build` + 1-9
+     * digits) and 512 a 1970-2099 year (the first is the release year). The title is the distinct
+     * tokens before the first flagged token, the candidate the distinct w61Tokens(); common
+     * counts shared tokens and score is 200 * common / (title + candidate), 0 when both are
+     * empty. Year state compares a trimmed four-digit 1970-2099 candidate year with the release
+     * year: 0 either missing, 1 equal, 3 one apart, 2 otherwise. Decision: 0 no title or no
+     * candidate, 3 score >= 85, 2 score >= 60 (both without a year mismatch), else 1. Then four
+     * decision, three group, eleven flag and four year-state counts, the score sum of rows
+     * deciding 2 or 3, the distinct known groups (by crc32) and the XXH64 digest of all earlier
+     * words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w61GameLookupPlanBatchPhp(array $rows): array
+    {
+        $out = $known = [];
+        $decisions = $yearStates = [0, 0, 0, 0];
+        $groupStates = [0, 0, 0];
+        $flagCounts = array_fill(0, 11, 0);
+        $scoreSum = 0;
+        foreach ($rows as $row) {
+            [$release, $candidate, $candidateYear] = explode("\t", (string) $row, 3) + ['', '', ''];
+            $body = $release;
+            $groupState = 0;
+            $dash = strrpos($release, '-');
+            if ($dash !== false) {
+                $suffix = substr($release, $dash + 1);
+                $length = \strlen($suffix);
+                if ($length >= 1 && $length <= 20 && strspn($suffix, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_') === $length) {
+                    $lower = strtolower($suffix);
+                    $groupState = isset(self::W61_SCENE_GROUPS[$lower]) ? 1 : 2;
+                    if ($groupState === 1) {
+                        $known[crc32($lower)] = true;
+                    }
+                    $body = substr($release, 0, $dash);
+                }
+            }
+            $flags = $releaseYear = 0;
+            $inTitle = true;
+            $title = [];
+            foreach (self::w61Tokens($body) as $token) {
+                $f = self::W61_GAMES_TOKENS[$token] ?? 0;
+                if (str_starts_with($token, 'multi') && (\strlen($token) === 5 || self::w61Digits(substr($token, 5), 1, 2) !== null)) {
+                    $f |= 32;
+                }
+                if (($token[0] === 'v' && self::w61Digits(substr($token, 1), 1, 7) !== null) || $token === 'build'
+                    || (str_starts_with($token, 'build') && self::w61Digits(substr($token, 5), 1, 9) !== null)) {
+                    $f |= 128;
+                }
+                if (\strlen($token) === 4 && ($year = self::w61Digits($token, 4, 4)) !== null && $year >= 1970 && $year <= 2099) {
+                    $f |= 512;
+                    if ($releaseYear === 0) {
+                        $releaseYear = $year;
+                    }
+                }
+                $flags |= $f;
+                if ($f !== 0) {
+                    $inTitle = false;
+                } elseif ($inTitle) {
+                    $title[$token] = true;
+                }
+            }
+            $candidates = array_fill_keys(self::w61Tokens($candidate), true);
+            $common = \count(array_intersect_key($title, $candidates));
+            $sum = \count($title) + \count($candidates);
+            $score = $sum > 0 ? intdiv(200 * $common, $sum) : 0;
+            $candidateValue = self::w61Digits(trim($candidateYear), 4, 4);
+            $candidateValue = $candidateValue !== null && $candidateValue >= 1970 && $candidateValue <= 2099 ? $candidateValue : 0;
+            $yearState = match (true) {
+                $candidateValue === 0 || $releaseYear === 0 => 0,
+                $candidateValue === $releaseYear => 1,
+                abs($candidateValue - $releaseYear) === 1 => 3,
+                default => 2,
+            };
+            $decision = match (true) {
+                $title === [] || $candidates === [] => 0,
+                $score >= 85 && $yearState !== 2 => 3,
+                $score >= 60 && $yearState !== 2 => 2,
+                default => 1,
+            };
+            $decisions[$decision]++;
+            $groupStates[$groupState]++;
+            for ($k = 0; $k < 11; $k++) {
+                $flagCounts[$k] += $flags >> $k & 1;
+            }
+            $yearStates[$yearState]++;
+            if ($decision >= 2) {
+                $scoreSum += $score;
+            }
+            $out[] = $groupState | $flags << 2 | $yearState << 13 | $decision << 15 | $score << 17 | min($common, 63) << 24 | min(\count($title), 63) << 30
+                | min(\count($candidates), 63) << 36 | ($releaseYear > 0 ? $releaseYear - 1900 : 0) << 42 | min(\strlen($release), 8191) << 50;
+        }
+        array_push($out, ...$decisions, ...$groupStates, ...$flagCounts, ...$yearStates);
+        array_push($out, $scoreSum, \count($known));
+        $out[] = self::w61Digest($out);
+
+        return $out;
     }
 }
