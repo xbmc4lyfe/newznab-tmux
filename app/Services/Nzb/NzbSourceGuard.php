@@ -7,6 +7,7 @@ namespace App\Services\Nzb;
 use App\Support\ReleaseArchiveNamingEvidence;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
@@ -1100,5 +1101,254 @@ final class NzbSourceGuard
 
         return ['names' => $count, 'invalid' => $invalid, 'staged' => $staged, 'canonical' => $canonical, 'other' => $other,
             'guid_bytes' => $bytes, 'max_guid_bytes' => $max];
+    }
+
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    public const string W56_FFI_CDEF = <<<'C'
+        int32_t nntmux_w566_anchor_receipt_batch(const char *versions, size_t versions_len, const char *fields, size_t fields_len, const char *field_twin, size_t field_twin_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W56_ANCHOR_HEADER = 9;
+
+    private const int W56_MAX_ITEMS = 1_048_576;
+
+    /**
+     * Check many deletion receipts as validateAnchorPhp() does, without throwing, from a version
+     * column and six string columns (kind, guid, path, anchor, dev, ino; missing values are 0 or
+     * empty). Status 0 valid inode, 1 valid absent, 2 unsupported (its version or kind), 3 malformed,
+     * 4 not matching its source.
+     *
+     * Layout: `[0]` count, `[1..5]` per status, `[6]` valid compressed (`.nzb.gz`) sources, `[7]`
+     * first rejected index (-1 when none), `[8]` FNV-1a digest; then per receipt `status |
+     * compressed << 3 | min(guid bytes, 255) << 4 | min(path bytes, 2^20-1) << 12`.
+     *
+     * @param  array<array-key, int>  $versions
+     * @param  array<array-key, string>  $kinds
+     * @param  array<array-key, string>  $guids
+     * @param  array<array-key, string>  $paths
+     * @param  array<array-key, string>  $anchors
+     * @param  array<array-key, string>  $devs
+     * @param  array<array-key, string>  $inos
+     * @return list<int>
+     */
+    public static function validateAnchorBatch(array $versions, array $kinds, array $guids, array $paths, array $anchors, array $devs, array $inos): array
+    {
+        return (self::usesW56RustFfi() ? self::validateAnchorBatchNative($versions, $kinds, $guids, $paths, $anchors, $devs, $inos) : null)
+            ?? self::validateAnchorBatchPhp($versions, $kinds, $guids, $paths, $anchors, $devs, $inos);
+    }
+
+    /**
+     * @param  array<array-key, int>  $versions
+     * @param  array<array-key, string>  $kinds
+     * @param  array<array-key, string>  $guids
+     * @param  array<array-key, string>  $paths
+     * @param  array<array-key, string>  $anchors
+     * @param  array<array-key, string>  $devs
+     * @param  array<array-key, string>  $inos
+     * @return list<int>
+     */
+    public static function validateAnchorBatchPhp(array $versions, array $kinds, array $guids, array $paths, array $anchors, array $devs, array $inos): array
+    {
+        $versions = array_values($versions);
+        $kinds = array_values($kinds);
+        $guids = array_values($guids);
+        $paths = array_values($paths);
+        $anchors = array_values($anchors);
+        $devs = array_values($devs);
+        $inos = array_values($inos);
+        $count = \count($versions);
+        $out = array_fill(0, self::W56_ANCHOR_HEADER, 0);
+        $out[0] = $count;
+        $out[7] = -1;
+        $digest = 2_166_136_261;
+        $rows = [];
+        for ($i = 0; $i < $count; $i++) {
+            $kind = $kinds[$i] ?? '';
+            $guid = $guids[$i] ?? '';
+            $path = $paths[$i] ?? '';
+            $base = '';
+            if ($versions[$i] !== 1 || ($kind !== 'inode' && $kind !== 'absent')) {
+                $status = 2;
+            } else {
+                $absent = $kind === 'absent';
+                $anchor = $anchors[$i] ?? '';
+                $dev = $devs[$i] ?? '';
+                $ino = $inos[$i] ?? '';
+                $base = basename($path);
+                $anchorBase = $absent ? '' : basename($anchor);
+                $status = match (true) {
+                    $guid === '' || $path === '' || str_contains($guid, "\0") || str_contains($path, "\0"),
+                    ! $absent && ($anchor === '' || $dev === '' || $ino === '' || str_contains($anchor, "\0") || str_contains($dev, "\0") || str_contains($ino, "\0")) => 3,
+                    preg_match('/^[a-zA-Z0-9_-]{1,40}$/D', $guid) !== 1 || ($base !== $guid.'.nzb.gz' && $base !== $guid.'.nzb') => 4,
+                    $absent => 1,
+                    dirname($path) !== dirname($anchor)
+                        || \strlen($anchorBase) !== \strlen($guid) + 55
+                        || ! str_starts_with($anchorBase, '.archive-audit-'.$guid.'-')
+                        || ! str_ends_with($anchorBase, '.anchor')
+                        || strspn($anchorBase, '0123456789abcdef', \strlen($guid) + 16, 32) !== 32
+                        || ! ctype_digit($dev) || ! ctype_digit($ino) => 4,
+                    default => 0,
+                };
+            }
+            $compressed = $status <= 1 && str_ends_with($base, '.gz') ? 1 : 0;
+            $out[1 + $status]++;
+            $out[6] += $compressed;
+            if ($status >= 2 && $out[7] < 0) {
+                $out[7] = $i;
+            }
+            $row = $status | $compressed << 3 | min(\strlen($guid), 255) << 4 | min(\strlen($path), 1_048_575) << 12;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[8] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust validation, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, int>  $versions
+     * @param  array<array-key, string>  $kinds
+     * @param  array<array-key, string>  $guids
+     * @param  array<array-key, string>  $paths
+     * @param  array<array-key, string>  $anchors
+     * @param  array<array-key, string>  $devs
+     * @param  array<array-key, string>  $inos
+     * @return list<int>|null
+     */
+    public static function validateAnchorBatchNative(array $versions, array $kinds, array $guids, array $paths, array $anchors, array $devs, array $inos): ?array
+    {
+        $count = \count($versions);
+        if ($count > self::W56_MAX_ITEMS) {
+            return null;
+        }
+        $ints = pack('q*', ...array_values($versions));
+        [$joined, $twin] = self::w56Strings([...self::w56Fit($kinds, $count, ''), ...self::w56Fit($guids, $count, ''), ...self::w56Fit($paths, $count, ''),
+            ...self::w56Fit($anchors, $count, ''), ...self::w56Fit($devs, $count, ''), ...self::w56Fit($inos, $count, '')]);
+        $fields = self::W56_ANCHOR_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w56Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w566_anchor_receipt_batch($ints, \strlen($ints), $joined, \strlen($joined), $twin, \strlen($twin), $count, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 56.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $forced = self::w56RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 56.6 routing and binding, kept in function statics so earlier waves' static state stays
+     * untouched. No `$op` returns the forced routing (null for the default); `'set'` replaces it with
+     * `$val` and returns the previous value; `'binding'` returns the cached `additional_w56` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w56', self::W56_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 56.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w56Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w56RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * NUL-joined values and, when one holds a NUL, the same list joined with 0x01 so Rust
+     * finds the separators where the two differ.
+     *
+     * @param  list<string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w56Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
+    }
+
+    /**
+     * Exactly `$count` values: the list itself when it already fits, otherwise padded with `$pad`.
+     *
+     * @template TValue
+     *
+     * @param  array<array-key, TValue>  $values
+     * @param  TValue  $pad
+     * @return list<TValue>
+     */
+    private static function w56Fit(array $values, int $count, mixed $pad): array
+    {
+        return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, $pad);
     }
 }
