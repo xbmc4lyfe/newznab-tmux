@@ -55007,7 +55007,7 @@ pub mod w574_batch {
     /// Record body: blob values (`fields` per record), every int64 word, output rows. The int64
     /// frame holds `count * fields` blob lengths in record order, then `stride - fields` more
     /// columns of `count` words each.
-    type Body = fn(&[&[u8]], &[i64], &mut [i64]);
+    pub(crate) type Body = fn(&[&[u8]], &[i64], &mut [i64]);
 
     #[inline(always)]
     fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
@@ -55034,7 +55034,7 @@ pub mod w574_batch {
     ///
     /// See the exported functions.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn run(
+    pub(crate) unsafe fn run(
         blob: *const u8,
         blob_len: usize,
         ints: *const u8,
@@ -56338,5 +56338,900 @@ mod w574_tests {
             call(nntmux_w57_movie_pattern_row_batch, b"", b"", 0, &mut out),
             0
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 58.4: Tmux layout, monitor cycle, console line, pane health and session line rows
+// ---------------------------------------------------------------------------
+
+/// Batch row helpers for `TmuxLayoutBuilder`, `TmuxMonitorService`, `TmuxOutput`,
+/// `TmuxPaneManager` and `TmuxSessionManager`. They reuse the Wave 57.4 frame (`run`): a
+/// concatenated blob plus packed little-endian int64 words, fixed-width int64 rows and an
+/// optional batch trailer, so a batch costs one FFI crossing. The PHP `*BatchPhp()` methods
+/// are the reference implementation.
+pub mod w584_batch {
+    use super::w574_batch::{Body, run, span};
+    use std::collections::HashSet;
+
+    /// Column `k` of the int64 words that follow the `count * fields` blob lengths.
+    #[inline(always)]
+    fn col(ints: &[i64], count: usize, fields: usize, k: usize, i: usize) -> i64 {
+        ints[count * fields + k * count + i]
+    }
+
+    /// PHP `(int) max(-4.0e18, min(4.0e18, floor($f)))`.
+    #[inline(always)]
+    fn floor_i(f: f64) -> i64 {
+        f.floor().clamp(-4.0e18, 4.0e18) as i64
+    }
+
+    /// PHP `(int) max(-4.0e18, min(4.0e18, ceil($f)))`.
+    #[inline(always)]
+    fn ceil_i(f: f64) -> i64 {
+        f.ceil().clamp(-4.0e18, 4.0e18) as i64
+    }
+
+    /// 1-9 ASCII digits at `pos` (PHP `strspn($s, '0123456789', $pos, 9)`), advancing `pos`.
+    #[inline(always)]
+    fn digits9(s: &[u8], pos: &mut usize) -> Option<i64> {
+        let start = *pos;
+        let mut value = 0i64;
+        while *pos < s.len() && *pos - start < 9 && s[*pos].is_ascii_digit() {
+            value = value * 10 + i64::from(s[*pos] - b'0');
+            *pos += 1;
+        }
+        (*pos > start).then_some(value)
+    }
+
+    #[inline(always)]
+    fn expect(s: &[u8], pos: &mut usize, byte: u8) -> Option<()> {
+        if s.get(*pos) == Some(&byte) {
+            *pos += 1;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+        if from > hay.len() || hay.len() - from < needle.len() {
+            return None;
+        }
+        hay[from..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|p| p + from)
+    }
+
+    #[inline(always)]
+    fn is_control(b: u8) -> bool {
+        b < 0x20 || b == 0x7f
+    }
+
+    // -- TmuxLayoutBuilder ---------------------------------------------------------------------
+
+    /// Panes per window (0-3) of planCoreLayoutStepsPhp() for Full, Basic and Stripped.
+    const EXPECTED_PANES: [[i64; 4]; 3] = [[4, 2, 4, 1], [2, 2, 4, 1], [2, 2, 0, 1]];
+
+    /// Expected panes for a window; unknown modes fall back to Full, unknown windows are 0.
+    pub(crate) fn expected_panes(mode: i64, window: i64) -> i64 {
+        let mode = if (0..=2).contains(&mode) {
+            mode as usize
+        } else {
+            0
+        };
+        if (0..4).contains(&window) {
+            EXPECTED_PANES[mode][window as usize]
+        } else {
+            0
+        }
+    }
+
+    pub(crate) struct LayoutStats {
+        pub panes: i64,
+        pub depth: i64,
+        pub h: i64,
+        pub v: i64,
+        pub min_area: i64,
+        last_id: i64,
+        pub increasing: bool,
+        pub geometry: bool,
+    }
+
+    /// One `WxH,X,Y` cell followed by `,ID` (leaf), `{cells}` (left-right) or `[cells]`
+    /// (top-bottom). Returns [w, h, x, y].
+    fn layout_cell(
+        s: &[u8],
+        pos: &mut usize,
+        depth: i64,
+        st: &mut LayoutStats,
+    ) -> Option<[i64; 4]> {
+        if depth > 64 {
+            return None;
+        }
+        let w = digits9(s, pos)?;
+        expect(s, pos, b'x')?;
+        let h = digits9(s, pos)?;
+        expect(s, pos, b',')?;
+        let x = digits9(s, pos)?;
+        expect(s, pos, b',')?;
+        let y = digits9(s, pos)?;
+        let open = *s.get(*pos)?;
+        *pos += 1;
+        if open == b',' {
+            let id = digits9(s, pos)?;
+            st.panes += 1;
+            st.depth = st.depth.max(depth);
+            st.min_area = st.min_area.min(w * h);
+            if id <= st.last_id {
+                st.increasing = false;
+            }
+            st.last_id = id;
+            return Some([w, h, x, y]);
+        }
+        let horizontal = match open {
+            b'{' => true,
+            b'[' => false,
+            _ => return None,
+        };
+        let close = if horizontal { b'}' } else { b']' };
+        let mut prev: Option<[i64; 4]> = None;
+        loop {
+            let c = layout_cell(s, pos, depth + 1, st)?;
+            let ok = if horizontal {
+                c[1] == h && c[3] == y && prev.map_or(c[2] == x, |p| c[2] == p[2] + p[0] + 1)
+            } else {
+                c[0] == w && c[2] == x && prev.map_or(c[3] == y, |p| c[3] == p[3] + p[1] + 1)
+            };
+            if !ok {
+                st.geometry = false;
+            }
+            prev = Some(c);
+            let next = *s.get(*pos)?;
+            *pos += 1;
+            if next == close {
+                break;
+            }
+            if next != b',' {
+                return None;
+            }
+        }
+        let last = prev?;
+        let ends = if horizontal {
+            last[2] + last[0] == x + w
+        } else {
+            last[3] + last[1] == y + h
+        };
+        if !ends {
+            st.geometry = false;
+        }
+        if horizontal {
+            st.h += 1;
+        } else {
+            st.v += 1;
+        }
+        Some([w, h, x, y])
+    }
+
+    /// tmux layout_checksum() over the body after the "xxxx," prefix.
+    pub(crate) fn layout_checksum(body: &[u8]) -> u16 {
+        body.iter().fold(0u16, |c, b| {
+            ((c >> 1).wrapping_add((c & 1) << 15)).wrapping_add(u16::from(*b))
+        })
+    }
+
+    /// (root [w, h, x, y], stats, checksum matches) or None for a malformed layout.
+    pub(crate) fn parse_layout(s: &[u8]) -> Option<([i64; 4], LayoutStats, bool)> {
+        if s.len() < 6 || s[4] != b',' || !s[..4].iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let mut st = LayoutStats {
+            panes: 0,
+            depth: 0,
+            h: 0,
+            v: 0,
+            min_area: i64::MAX,
+            last_id: -1,
+            increasing: true,
+            geometry: true,
+        };
+        let mut pos = 5;
+        let root = layout_cell(s, &mut pos, 0, &mut st)?;
+        if pos != s.len() {
+            return None;
+        }
+        let declared = u16::from_str_radix(std::str::from_utf8(&s[..4]).ok()?, 16).ok()?;
+        Some((root, st, declared == layout_checksum(&s[5..])))
+    }
+
+    /// Rows [status, width, height, panes, depth, left-right splits, top-bottom splits, min
+    /// pane area, shape, expected panes, flags]; trailer [valid, checksum ok, matching
+    /// expected, total panes].
+    fn layout_row(values: &[&[u8]], ints: &[i64], out: &mut [i64]) {
+        let count = values.len();
+        let (rows, trailer) = out.split_at_mut(count * 11);
+        let mut summary = [0i64; 4];
+        for (i, slot) in rows.as_chunks_mut::<11>().0.iter_mut().enumerate() {
+            let expected = expected_panes(col(ints, count, 1, 0, i), col(ints, count, 1, 1, i));
+            let Some((root, st, checksum)) = parse_layout(values[i]) else {
+                *slot = [-1, 0, 0, 0, 0, 0, 0, 0, -1, expected, 0];
+                continue;
+            };
+            let shape = match (st.h > 0, st.v > 0) {
+                (true, true) => 3,
+                (true, false) => 1,
+                (false, true) => 2,
+                (false, false) => 0,
+            };
+            let flags = i64::from(st.panes == expected)
+                | (i64::from(checksum) << 1)
+                | (i64::from(st.increasing) << 2)
+                | (i64::from(st.geometry) << 3)
+                | (i64::from(root[2] == 0 && root[3] == 0) << 4);
+            *slot = [
+                i64::from(!checksum),
+                root[0],
+                root[1],
+                st.panes,
+                st.depth,
+                st.h,
+                st.v,
+                st.min_area,
+                shape,
+                expected,
+                flags,
+            ];
+            summary[0] += 1;
+            summary[1] += i64::from(checksum);
+            summary[2] += i64::from(st.panes == expected);
+            summary[3] += st.panes;
+        }
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- TmuxMonitorService --------------------------------------------------------------------
+
+    /// Rows [delta, rate per minute, backlog delta, eta seconds, percent, trend, flags, score,
+    /// next iteration]; trailer [saturating delta sum, stalled, max eta, max score].
+    fn monitor_row(_: &[&[u8]], ints: &[i64], out: &mut [i64]) {
+        let count = ints.len() / 6;
+        let (rows, trailer) = out.split_at_mut(count * 9);
+        let mut summary = [0i64, 0, -1, 0];
+        for (i, slot) in rows.as_chunks_mut::<9>().0.iter_mut().enumerate() {
+            let c = |k| col(ints, count, 0, k, i);
+            let (now, start, elapsed, backlog, prev, iterations) =
+                (c(0), c(1), c(2), c(3), c(4), c(5));
+            let delta = now.saturating_sub(start);
+            let rate = if elapsed > 0 {
+                floor_i(delta as f64 * 60.0 / elapsed as f64)
+            } else {
+                0
+            };
+            let backlog_delta = backlog.saturating_sub(prev);
+            let eta = if rate > 0 && backlog > 0 {
+                ceil_i(backlog as f64 * 60.0 / rate as f64)
+            } else {
+                -1
+            };
+            let completed = delta.max(0);
+            let denom = completed.saturating_add(backlog.max(0));
+            let percent = if denom > 0 {
+                floor_i(completed as f64 * 100.0 / denom as f64)
+            } else {
+                0
+            };
+            let stalled = iterations > 0 && delta <= 0 && backlog > 0;
+            let growing = backlog_delta > 0;
+            let skew = elapsed < 0;
+            let flags = i64::from(stalled)
+                | (i64::from(growing) << 1)
+                | (i64::from(backlog_delta < 0) << 2)
+                | (i64::from(skew) << 3)
+                | (i64::from(backlog <= 0 && delta <= 0) << 4)
+                | (i64::from(iterations <= 0) << 5);
+            let score = if stalled { 50 } else { 0 }
+                + if growing { 20 } else { 0 }
+                + if eta > 3600 {
+                    20
+                } else if eta > 600 {
+                    10
+                } else {
+                    0
+                }
+                + if skew { 10 } else { 0 };
+            *slot = [
+                delta,
+                rate,
+                backlog_delta,
+                eta,
+                percent,
+                backlog_delta.signum(),
+                flags,
+                score,
+                iterations.saturating_add(1),
+            ];
+            summary[0] = summary[0].saturating_add(delta);
+            summary[1] += i64::from(stalled);
+            summary[2] = summary[2].max(eta);
+            summary[3] = summary[3].max(score);
+        }
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- TmuxOutput ----------------------------------------------------------------------------
+
+    /// Rows [visible bytes, visible chars, CSI, SGR, broken CSI, final foreground, resets,
+    /// flags, percent, bar cells, hours, minutes * 100 + seconds]; trailer [visible bytes,
+    /// max visible chars, lines with SGR, broken CSI].
+    fn console_row(values: &[&[u8]], ints: &[i64], out: &mut [i64]) {
+        let count = values.len();
+        let (rows, trailer) = out.split_at_mut(count * 12);
+        let mut summary = [0i64; 4];
+        for (i, slot) in rows.as_chunks_mut::<12>().0.iter_mut().enumerate() {
+            let s = values[i];
+            let (part, total, elapsed) = (
+                col(ints, count, 1, 0, i),
+                col(ints, count, 1, 1, i),
+                col(ints, count, 1, 2, i),
+            );
+            let (mut bytes, mut chars, mut csi, mut sgr, mut broken, mut resets) =
+                (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
+            let mut fg = -1i64;
+            let (mut lone, mut cr, mut high) = (false, false, false);
+            let n = s.len();
+            let mut j = 0;
+            while j < n {
+                let b = s[j];
+                if b == 0x1b && j + 1 < n && s[j + 1] == b'[' {
+                    let p0 = j + 2;
+                    let mut k = p0;
+                    while k < n && (0x30..=0x3f).contains(&s[k]) {
+                        k += 1;
+                    }
+                    let params = &s[p0..k];
+                    while k < n && (0x20..=0x2f).contains(&s[k]) {
+                        k += 1;
+                    }
+                    csi += 1;
+                    if k < n && (0x40..=0x7e).contains(&s[k]) {
+                        if s[k] == b'm' {
+                            sgr += 1;
+                            for param in params.split(|c| *c == b';') {
+                                if param.is_empty() {
+                                    resets += 1;
+                                    fg = -1;
+                                } else if param.len() <= 9 && param.iter().all(u8::is_ascii_digit) {
+                                    let v = param
+                                        .iter()
+                                        .fold(0i64, |a, d| a * 10 + i64::from(d - b'0'));
+                                    if v == 0 {
+                                        resets += 1;
+                                        fg = -1;
+                                    } else if v == 39 {
+                                        fg = -1;
+                                    } else if (30..=37).contains(&v) || (90..=97).contains(&v) {
+                                        fg = v;
+                                    }
+                                }
+                            }
+                        }
+                        k += 1;
+                    } else {
+                        broken += 1;
+                    }
+                    j = k;
+                    continue;
+                }
+                if is_control(b) {
+                    lone |= b == 0x1b;
+                    cr |= b == b'\r';
+                } else {
+                    bytes += 1;
+                    chars += i64::from(!(0x80..=0xbf).contains(&b));
+                    high |= b >= 0x80;
+                }
+                j += 1;
+            }
+            let percent = if total > 0 {
+                floor_i(part as f64 * 100.0 / total as f64)
+            } else {
+                0
+            };
+            let (hours, minsec) = if elapsed < 0 {
+                (-1, -1)
+            } else {
+                (elapsed / 3600, (elapsed % 3600) / 60 * 100 + elapsed % 60)
+            };
+            let flags = i64::from(s.last() == Some(&b'\n'))
+                | (i64::from(cr) << 1)
+                | (i64::from(fg != -1) << 2)
+                | (i64::from(lone) << 3)
+                | (i64::from(high) << 4);
+            *slot = [
+                bytes,
+                chars,
+                csi,
+                sgr,
+                broken,
+                fg,
+                resets,
+                flags,
+                percent,
+                percent.clamp(0, 100) * 20 / 100,
+                hours,
+                minsec,
+            ];
+            summary[0] += bytes;
+            summary[1] = summary[1].max(chars);
+            summary[2] += i64::from(sgr > 0);
+            summary[3] += broken;
+        }
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- TmuxPaneManager -----------------------------------------------------------------------
+
+    /// TmuxPaneRole backing values in case order.
+    pub(crate) const PANE_ROLES: [&[u8]; 20] = [
+        b"monitor",
+        b"binaries",
+        b"backfill",
+        b"releases",
+        b"sequential",
+        b"fix_names",
+        b"remove_crap",
+        b"post_additional",
+        b"post_tv",
+        b"post_metadata",
+        b"post_movies",
+        b"irc_scraper",
+        b"htop",
+        b"nmon",
+        b"vnstat",
+        b"tcptrack",
+        b"bandwidth_monitor",
+        b"mytop",
+        b"redis",
+        b"console",
+    ];
+
+    /// -1 for '', the value of 1-18 ASCII digits, else -2.
+    #[inline(always)]
+    pub(crate) fn strict_int(v: &[u8]) -> i64 {
+        if v.is_empty() {
+            -1
+        } else if v.len() <= 18 && v.iter().all(u8::is_ascii_digit) {
+            v.iter().fold(0i64, |a, d| a * 10 + i64::from(d - b'0'))
+        } else {
+            -2
+        }
+    }
+
+    #[inline(always)]
+    fn prefixed_digits(v: &[u8], prefix: u8) -> bool {
+        v.len() > 1 && v[0] == prefix && v[1..].iter().all(u8::is_ascii_digit)
+    }
+
+    /// Rows [pane number, role index, role span, window span, state, exit status, exit signal,
+    /// pid, server pid, flags]; trailer [valid, alive, dead, unreaped, needs reap, role
+    /// conflicts, last server pid].
+    fn pane_row(values: &[&[u8]], ints: &[i64], out: &mut [i64]) {
+        let count = values.len();
+        let (rows, trailer) = out.split_at_mut(count * 10);
+        let mut summary = [0i64; 7];
+        let mut roles: HashSet<&[u8]> = HashSet::new();
+        for (i, slot) in rows.as_chunks_mut::<10>().0.iter_mut().enumerate() {
+            let line = values[i];
+            let mut fields: [(usize, &[u8]); 9] = [(0, &[]); 9];
+            let mut present = 0usize;
+            let mut offset = 0usize;
+            for (n, field) in line.split(|b| *b == b'\t').enumerate() {
+                if n < 9 {
+                    fields[n] = (offset, field);
+                }
+                present = n + 1;
+                offset += field.len() + 1;
+            }
+            let [id, role, dead, status, pid, pipe, window, signal, server] = fields;
+            if !prefixed_digits(id.1, b'%') {
+                *slot = [-1, -1, -1, -1, -1, -1, -1, -1, -1, 0];
+                continue;
+            }
+            let field_span = |n: usize, f: (usize, &[u8])| {
+                if n < present {
+                    span(f.0, f.1.len())
+                } else {
+                    -1
+                }
+            };
+            let role_index = if role.1.is_empty() {
+                -2
+            } else {
+                PANE_ROLES
+                    .iter()
+                    .position(|r| *r == role.1)
+                    .map_or(-1, |p| p as i64)
+            };
+            let is_dead = dead.1 == b"1";
+            let exit = strict_int(status.1);
+            let sig = strict_int(signal.1);
+            let unreaped = is_dead && exit == -1 && sig == -1;
+            let now = col(ints, count, 1, 0, i);
+            let last = col(ints, count, 1, 1, i);
+            let needs_reap = unreaped && i128::from(now) - i128::from(last) >= 30;
+            let state = if !is_dead {
+                0
+            } else if unreaped {
+                3
+            } else if exit == 0 && sig < 0 {
+                1
+            } else {
+                2
+            };
+            let flags = i64::from(is_dead)
+                | (i64::from(pipe.1 == b"1") << 1)
+                | (i64::from(unreaped) << 2)
+                | (i64::from(needs_reap) << 3)
+                | (i64::from(is_dead && !unreaped) << 4)
+                | (i64::from(!is_dead && role.1.is_empty()) << 5)
+                | (i64::from(present > 9) << 6)
+                | (i64::from(prefixed_digits(window.1, b'@')) << 7);
+            let server_pid = strict_int(server.1);
+            *slot = [
+                strict_int(&id.1[1..]),
+                role_index,
+                field_span(1, role),
+                field_span(6, window),
+                state,
+                exit,
+                sig,
+                strict_int(pid.1),
+                server_pid,
+                flags,
+            ];
+            summary[0] += 1;
+            summary[1] += i64::from(!is_dead);
+            summary[2] += i64::from(is_dead);
+            summary[3] += i64::from(unreaped);
+            summary[4] += i64::from(needs_reap);
+            if !role.1.is_empty() && !roles.insert(role.1) {
+                summary[5] += 1;
+            }
+            summary[6] = server_pid;
+        }
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- TmuxSessionManager --------------------------------------------------------------------
+
+    /// 1-255 bytes without control bytes (and, for session names, without ':' or '.').
+    pub(crate) fn valid_name(name: &[u8], session: bool) -> bool {
+        (1..=255).contains(&name.len())
+            && !name
+                .iter()
+                .any(|b| is_control(*b) || (session && matches!(b, b':' | b'.')))
+    }
+
+    /// (status, index, name start, name length, count, extra, flag bits 0/1/6) or None.
+    fn session_line(s: &[u8], kind: i64) -> Option<(i64, i64, usize, usize, i64, i64, i64)> {
+        let p = find(s, b": ", 0).filter(|p| *p > 0)?;
+        if kind == 0 {
+            let mut q = p + 2;
+            let windows = digits9(s, &mut q)?;
+            if !s[q..].starts_with(b" window") {
+                return None;
+            }
+            q += 7;
+            if s.get(q) == Some(&b's') {
+                q += 1;
+            }
+            if !s[q..].starts_with(b" (created ") {
+                return None;
+            }
+            q += 10;
+            let close = find(s, b")", q)?;
+            let tail = &s[close + 1..];
+            let flags = i64::from(find(tail, b" (attached)", 0).is_some())
+                | (i64::from(find(tail, b" (group ", 0).is_some()) << 1);
+            return Some((0, -1, 0, p, windows, span(q, close - q), flags));
+        }
+        if kind != 1 || p > 9 || !s[..p].iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let index = s[..p]
+            .iter()
+            .fold(0i64, |a, d| a * 10 + i64::from(d - b'0'));
+        let q = find(s, b" (", p + 2)?;
+        if q == p + 2 {
+            return None;
+        }
+        let mut end = q;
+        let mut flags = 0i64;
+        while end > p + 2 && matches!(s[end - 1], b'*' | b'-' | b'#' | b'!' | b'~') {
+            flags |= match s[end - 1] {
+                b'*' => 1,
+                b'-' => 2,
+                _ => 64,
+            };
+            end -= 1;
+        }
+        let mut r = q + 2;
+        let panes = digits9(s, &mut r)?;
+        if !s[r..].starts_with(b" pane") {
+            return None;
+        }
+        r += 5;
+        if s.get(r) == Some(&b's') {
+            r += 1;
+        }
+        expect(s, &mut r, b')')?;
+        let mut geometry = -1;
+        if s[r..].starts_with(b" [") {
+            let mut g = r + 2;
+            if let Some(w) = digits9(s, &mut g)
+                && expect(s, &mut g, b'x').is_some()
+                && let Some(h) = digits9(s, &mut g)
+                && expect(s, &mut g, b']').is_some()
+            {
+                geometry = (w << 32) | h;
+            }
+        }
+        Some((1, index, p + 2, end - (p + 2), panes, geometry, flags))
+    }
+
+    /// Rows [status, window index, name span, windows or panes, created span or geometry,
+    /// flags]; trailer [parsed, matching expected, ready, malformed].
+    fn session_row(values: &[&[u8]], ints: &[i64], out: &mut [i64]) {
+        let count = values.len() / 2;
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut summary = [0i64; 4];
+        for (i, slot) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let (line, expected) = (values[2 * i], values[2 * i + 1]);
+            let kind = col(ints, count, 2, 0, i);
+            let Some((status, index, start, len, n, extra, bits)) = session_line(line, kind) else {
+                *slot = [-1, -1, -1, 0, -1, 0];
+                summary[3] += 1;
+                continue;
+            };
+            let name = &line[start..start + len];
+            let valid = valid_name(name, kind == 0);
+            let matched = name == expected;
+            let enough = n >= col(ints, count, 2, 1, i);
+            let ready = valid && matched && enough;
+            *slot = [
+                status,
+                index,
+                span(start, len),
+                n,
+                extra,
+                bits | (i64::from(valid) << 2)
+                    | (i64::from(matched) << 3)
+                    | (i64::from(enough) << 4)
+                    | (i64::from(ready) << 5),
+            ];
+            summary[0] += 1;
+            summary[1] += i64::from(matched);
+            summary[2] += i64::from(ready);
+        }
+        trailer.copy_from_slice(&summary);
+    }
+
+    macro_rules! export {
+        ($name:ident, $fields:literal, $stride:literal, $words:literal, $trailer:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `blob` must point to `blob_len` readable bytes, `ints` to `ints_len` readable
+            /// bytes (`count` records of packed little-endian int64 words) and `out` to
+            /// `out_cap` writable, aligned int64 words that overlap neither input; null
+            /// pointers are accepted only with zero lengths. Bad shapes return -1 before
+            /// slicing, a short output returns `-needed` without writing and panics map to -1.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                const BODY: Body = $body;
+                unsafe {
+                    run(
+                        blob, blob_len, ints, ints_len, count, out, out_cap, $fields, $stride,
+                        $words, $trailer, BODY,
+                    )
+                }
+            }
+        };
+    }
+
+    export!(nntmux_w58_layout_plan_row_batch, 1, 3, 11, 4, layout_row);
+    export!(nntmux_w58_monitor_cycle_row_batch, 0, 6, 9, 4, monitor_row);
+    export!(nntmux_w58_console_line_row_batch, 1, 4, 12, 4, console_row);
+    export!(nntmux_w58_pane_health_row_batch, 1, 3, 10, 7, pane_row);
+    export!(nntmux_w58_session_line_row_batch, 2, 4, 6, 4, session_row);
+}
+
+#[cfg(test)]
+mod w584_tests {
+    use super::w574_batch::span;
+    use super::w584_batch::*;
+
+    type Export =
+        unsafe extern "C" fn(*const u8, usize, *const u8, usize, usize, *mut i64, usize) -> isize;
+
+    fn pack(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn call(export: Export, blob: &[u8], ints: &[i64], count: usize, out: &mut [i64]) -> isize {
+        let ints = pack(ints);
+        unsafe {
+            export(
+                blob.as_ptr(),
+                blob.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn w584_layout_rows() {
+        let layout = b"b25d,80x24,0,0{40x24,0,0,1,39x24,41,0,2}";
+        let (root, st, checksum) = parse_layout(layout).unwrap();
+        assert_eq!(root, [80, 24, 0, 0]);
+        assert_eq!((st.panes, st.depth, st.h, st.v), (2, 1, 1, 0));
+        assert!(st.geometry && st.increasing && !checksum);
+        assert!(
+            !parse_layout(b"0000,80x24,0,0{40x24,0,0,1,40x24,41,0,2}")
+                .unwrap()
+                .1
+                .geometry
+        );
+        assert!(parse_layout(b"b25d,80x24,0,0").is_none());
+        assert!(parse_layout(b"zzzz,80x24,0,0,1").is_none());
+        assert!(parse_layout(b"0000,80x24,0,0{40x24,0,0,1").is_none());
+        assert_eq!(expected_panes(0, 0), 4);
+        assert_eq!(expected_panes(7, 2), 4);
+        assert_eq!(expected_panes(2, 2), 0);
+        assert_eq!(expected_panes(1, -1), 0);
+
+        let body = b"80x24,0,0,5";
+        let mut blob = format!("{:04x},", layout_checksum(body)).into_bytes();
+        blob.extend_from_slice(body);
+        let mut out = vec![0i64; 11 + 4];
+        let n = blob.len() as i64;
+        assert_eq!(
+            call(
+                nntmux_w58_layout_plan_row_batch,
+                &blob,
+                &[n, 2, 3],
+                1,
+                &mut out
+            ),
+            15
+        );
+        assert_eq!(
+            &out[..11],
+            &[0, 80, 24, 1, 0, 0, 0, 1920, 0, 1, 1 | 2 | 4 | 8 | 16]
+        );
+        assert_eq!(&out[11..], &[1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn w584_monitor_and_console_rows() {
+        let mut out = vec![0i64; 9 + 4];
+        assert_eq!(
+            call(
+                nntmux_w58_monitor_cycle_row_batch,
+                b"",
+                &[150, 100, 30, 200, 150, 3],
+                1,
+                &mut out
+            ),
+            13
+        );
+        assert_eq!(&out[..9], &[50, 100, 50, 120, 20, 1, 2, 20, 4]);
+        assert_eq!(&out[9..], &[50, 0, 120, 20]);
+        assert_eq!(
+            call(
+                nntmux_w58_monitor_cycle_row_batch,
+                b"x",
+                &[0; 6],
+                1,
+                &mut out
+            ),
+            -1
+        );
+
+        let line = b"\x1b[0;33mHi \xc3\xa9\x1b[0m\x1b[31\n";
+        let mut out = vec![0i64; 12 + 4];
+        let n = line.len() as i64;
+        assert_eq!(
+            call(
+                nntmux_w58_console_line_row_batch,
+                line,
+                &[n, 1, 3, 3725],
+                1,
+                &mut out
+            ),
+            16
+        );
+        assert_eq!(&out[..12], &[5, 4, 3, 2, 1, -1, 2, 1 | 16, 33, 6, 1, 205]);
+    }
+
+    #[test]
+    fn w584_pane_and_session_rows() {
+        let blob = b"%3\tmonitor\t1\t\t42\t0\t@1\t\t7%4\tmonitor\t0\t\t43\t1\t@1\t\t7\textra";
+        let first = 24i64;
+        let mut out = vec![0i64; 2 * 10 + 7];
+        assert_eq!(
+            call(
+                nntmux_w58_pane_health_row_batch,
+                blob,
+                &[first, blob.len() as i64 - first, 100, 100, 60, i64::MIN],
+                2,
+                &mut out
+            ),
+            27
+        );
+        assert_eq!(
+            &out[..10],
+            &[
+                3,
+                0,
+                span(3, 7),
+                span(19, 2),
+                3,
+                -1,
+                -1,
+                42,
+                7,
+                1 | 4 | 8 | 128
+            ]
+        );
+        assert_eq!(out[14], 0);
+        assert_eq!(out[19], 2 | 64 | 128);
+        assert_eq!(&out[20..], &[2, 1, 1, 1, 1, 1, 7]);
+        assert_eq!(strict_int(b""), -1);
+        assert_eq!(strict_int(b"0012"), 12);
+        assert_eq!(strict_int(b"1234567890123456789"), -2);
+        assert!(valid_name(b"nntmux", true));
+        assert!(!valid_name(b"a.b", true));
+        assert!(valid_name(b"a.b", false));
+
+        let line = b"nntmux: 4 windows (created Mon Oct 26 03:19:04 2026) (attached)";
+        let win = b"2: Post*- (4 panes) [80x24] [layout b25d] @2 (active)";
+        let mut blob = line.to_vec();
+        blob.extend_from_slice(b"nntmux");
+        blob.extend_from_slice(win);
+        blob.extend_from_slice(b"Post");
+        let lens = [line.len() as i64, 6, win.len() as i64, 4];
+        let mut out = vec![0i64; 2 * 6 + 4];
+        assert_eq!(
+            call(
+                nntmux_w58_session_line_row_batch,
+                &blob,
+                &[lens[0], lens[1], lens[2], lens[3], 0, 1, 4, 5],
+                2,
+                &mut out
+            ),
+            16
+        );
+        assert_eq!(
+            &out[..6],
+            &[0, -1, span(0, 6), 4, span(27, 24), 1 | 4 | 8 | 16 | 32]
+        );
+        assert_eq!(
+            &out[6..12],
+            &[1, 2, span(3, 4), 4, (80 << 32) | 24, 1 | 2 | 4 | 8]
+        );
+        assert_eq!(&out[12..], &[2, 2, 1, 0]);
     }
 }
