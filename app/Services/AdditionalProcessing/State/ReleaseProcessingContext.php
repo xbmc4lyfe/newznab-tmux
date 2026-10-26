@@ -11,6 +11,7 @@ use App\Services\AdditionalProcessing\DTO\DownloadedArchive;
 use App\Services\AdditionalProcessing\DTO\MediaSourcePlan;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -814,5 +815,244 @@ class ReleaseProcessingContext
         } catch (Throwable) {
             return null;
         }
+    }
+
+    // Rust is the default only while the paired W55.6 benchmark clears 1.5x on all four metrics.
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    public const string W55_FFI_CDEF = <<<'C'
+        int32_t nntmux_w556_context_summary_batch(const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W55_CONTEXT_HEADER = 14;
+
+    private const int W55_MAX_ITEMS = 1_048_576;
+
+    private const int W55_COUNT_CAP = 1_048_575;
+
+    private const int W55_SECONDS_CAP = 2_147_483_647;
+
+    private const int W55_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /**
+     * Summarize the processing state of many release contexts. Columns per context: flags (bit 0
+     * found video, 1 media info, 2 audio info, 3 audio sample, 4 JPG sample, 5 sample, 6 PAR2 info, 7
+     * passworded, 8 listing incomplete, 9 season pack, 10 probable season pack, 11 name evidence
+     * incomplete; higher bits ignored), elapsed nanoseconds (clamped to 0..2^62), timeout seconds
+     * (clamped to 0..2^31-1; 0 never times out), added and total file info (clamped to 0..2^20-1);
+     * missing values are 0. Needs and deferral mirror needsMediaProcessing(), needsSample() and
+     * defersArchiveNameChecks(); a context times out when its elapsed nanoseconds exceed the timeout.
+     *
+     * Layout: `[0]` count, `[1]` needing media, `[2]` needing a sample, `[3]` timed out, `[4]` deferring
+     * archive names, `[5]` passworded, `[6]` listing incomplete, `[7]` needing neither, `[8]` added and
+     * `[9]` total file info, `[10]` first longest context (-1 when none) and `[11]` its elapsed seconds,
+     * `[12]` missing found flags, `[13]` FNV-1a digest; then per context `missing | media << 7 | sample
+     * << 8 | timed_out << 9 | defers << 10 | file_ppm << 11 | seconds << 31` (missing has bit n set when
+     * found flag n is not; seconds capped at 2^31-1).
+     *
+     * @param  array<array-key, int>  $flags
+     * @param  array<array-key, int>  $elapsedNanoseconds
+     * @param  array<array-key, int>  $timeoutSeconds
+     * @param  array<array-key, int>  $addedFileInfo
+     * @param  array<array-key, int>  $totalFileInfo
+     * @return list<int>
+     */
+    public static function summarizeContextBatch(array $flags, array $elapsedNanoseconds, array $timeoutSeconds, array $addedFileInfo, array $totalFileInfo): array
+    {
+        return (self::usesW55RustFfi() ? self::summarizeContextBatchNative($flags, $elapsedNanoseconds, $timeoutSeconds, $addedFileInfo, $totalFileInfo) : null)
+            ?? self::summarizeContextBatchPhp($flags, $elapsedNanoseconds, $timeoutSeconds, $addedFileInfo, $totalFileInfo);
+    }
+
+    /**
+     * @param  array<array-key, int>  $flags
+     * @param  array<array-key, int>  $elapsedNanoseconds
+     * @param  array<array-key, int>  $timeoutSeconds
+     * @param  array<array-key, int>  $addedFileInfo
+     * @param  array<array-key, int>  $totalFileInfo
+     * @return list<int>
+     */
+    public static function summarizeContextBatchPhp(array $flags, array $elapsedNanoseconds, array $timeoutSeconds, array $addedFileInfo, array $totalFileInfo): array
+    {
+        $flags = array_values($flags);
+        $elapsedNanoseconds = array_values($elapsedNanoseconds);
+        $timeoutSeconds = array_values($timeoutSeconds);
+        $addedFileInfo = array_values($addedFileInfo);
+        $totalFileInfo = array_values($totalFileInfo);
+        $count = \count($flags);
+        $countCap = self::W55_COUNT_CAP;
+        $secondsCap = self::W55_SECONDS_CAP;
+        $out = array_fill(0, self::W55_CONTEXT_HEADER, 0);
+        $out[0] = $count;
+        $longAt = -1;
+        $long = 0;
+        $digest = 2_166_136_261;
+        $rows = [];
+        for ($i = 0; $i < $count; $i++) {
+            $f = $flags[$i] & 0xFFF;
+            $elapsed = min(max($elapsedNanoseconds[$i] ?? 0, 0), self::W55_TOTAL_CAP);
+            $timeout = min(max($timeoutSeconds[$i] ?? 0, 0), $secondsCap);
+            $added = min(max($addedFileInfo[$i] ?? 0, 0), $countCap);
+            $total = min(max($totalFileInfo[$i] ?? 0, 0), $countCap);
+            $missing = ~$f & 0x7F;
+            $media = ($missing & 0x0F) !== 0 ? 1 : 0;
+            $sample = ($missing & 0x30) !== 0 ? 1 : 0;
+            $timedOut = $timeout > 0 && $elapsed > $timeout * 1_000_000_000 ? 1 : 0;
+            $defers = ($f & 0xE00) !== 0 ? 1 : 0;
+            $seconds = min(intdiv($elapsed, 1_000_000_000), $secondsCap);
+            $ppm = $total > 0 ? min(intdiv($added * 1_000_000, $total), 1_000_000) : 0;
+            $out[1] += $media;
+            $out[2] += $sample;
+            $out[3] += $timedOut;
+            $out[4] += $defers;
+            $out[5] += ($f >> 7) & 1;
+            $out[6] += ($f >> 8) & 1;
+            $out[7] += $media === 0 && $sample === 0 ? 1 : 0;
+            $out[8] += $added;
+            $out[9] += $total;
+            if ($longAt < 0 || $elapsed > $long) {
+                $longAt = $i;
+                $long = $elapsed;
+            }
+            $bits = $missing - (($missing >> 1) & 0x55);
+            $bits = ($bits & 0x33) + (($bits >> 2) & 0x33);
+            $out[12] += ($bits + ($bits >> 4)) & 0x0F;
+            $row = $missing | $media << 7 | $sample << 8 | $timedOut << 9 | $defers << 10 | $ppm << 11 | $seconds << 31;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[10] = $longAt;
+        $out[11] = min(intdiv($long, 1_000_000_000), $secondsCap);
+        $out[13] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust summary, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, int>  $flags
+     * @param  array<array-key, int>  $elapsedNanoseconds
+     * @param  array<array-key, int>  $timeoutSeconds
+     * @param  array<array-key, int>  $addedFileInfo
+     * @param  array<array-key, int>  $totalFileInfo
+     * @return list<int>|null
+     */
+    public static function summarizeContextBatchNative(array $flags, array $elapsedNanoseconds, array $timeoutSeconds, array $addedFileInfo, array $totalFileInfo): ?array
+    {
+        $count = \count($flags);
+        if ($count > self::W55_MAX_ITEMS) {
+            return null;
+        }
+        $ints = pack(
+            'q*',
+            ...self::w55Fit($flags, $count), ...self::w55Fit($elapsedNanoseconds, $count), ...self::w55Fit($timeoutSeconds, $count),
+            ...self::w55Fit($addedFileInfo, $count), ...self::w55Fit($totalFileInfo, $count),
+        );
+        $fields = self::W55_CONTEXT_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w55Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w556_context_summary_batch($ints, \strlen($ints), $count, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 55.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $forced = self::w55RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 55.6 routing and binding, kept in function statics so earlier waves' static state stays
+     * untouched. No `$op` returns the forced routing (null for the default); `'set'` replaces it with
+     * `$val` and returns the previous value; `'binding'` returns the cached `additional_w55` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w55', self::W55_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 55.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w55Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w55RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Exactly `$count` values: the list itself when it already fits, otherwise padded with 0.
+     *
+     * @param  array<array-key, int>  $values
+     * @return list<int>
+     */
+    private static function w55Fit(array $values, int $count): array
+    {
+        return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, 0);
     }
 }

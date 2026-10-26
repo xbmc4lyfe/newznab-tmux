@@ -8,6 +8,7 @@ use App\Services\AdditionalProcessing\Enums\ProcessingStage;
 use App\Support\RustPipelineLibrary;
 use Closure;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 final class ProcessingMetrics
@@ -369,5 +370,229 @@ final class ProcessingMetrics
         }
 
         return self::$w466Ffi === false ? null : self::$w466Ffi;
+    }
+
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    public const string W55_FFI_CDEF = <<<'C'
+        int32_t nntmux_w556_stage_summary_batch(const char *keys, size_t keys_len, const char *key_twin, size_t key_twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W55_STAGE_HEADER = 21;
+
+    private const int W55_MAX_ITEMS = 1_048_576;
+
+    private const int W55_VALUE_CAP = 1_099_511_627_775;
+
+    /** ProcessingStage backing value => case index; any other key is code 13. */
+    private const array W55_STAGE_CODES = [
+        'workspace-preparation' => 0, 'nzb-parsing' => 1, 'release-initialization' => 2, 'message-id-selection' => 3,
+        'media-source-planning' => 4, 'direct-downloads' => 5, 'archive-downloads' => 6, 'extracted-files' => 7,
+        'media-sources' => 8, 'archive-fallbacks' => 9, 'timeout-handling' => 10, 'finalization' => 11, 'workspace-cleanup' => 12,
+    ];
+
+    /**
+     * Summarize stage timing records of many releases: a stage key (a `ProcessingStage` value) and
+     * nanoseconds (clamped to 0..2^40-1; a missing value is 0) per record.
+     *
+     * Layout: `[0]` count, `[1]` total nanoseconds, `[2..15]` nanoseconds per code (case index, 13 for
+     * unknown keys), `[16]` first slowest record (-1 when none), `[17]` unknown keys, `[18]` distinct
+     * known stages, `[19]` known stage bitmask, `[20]` FNV-1a digest; then per record `code | share_ppm
+     * << 4 | milliseconds << 24` (share of the total, 0 when the total is 0).
+     *
+     * @param  array<array-key, string>  $stages
+     * @param  array<array-key, int>  $nanoseconds
+     * @return list<int>
+     */
+    public static function summarizeStageBatch(array $stages, array $nanoseconds): array
+    {
+        return (self::usesW55RustFfi() ? self::summarizeStageBatchNative($stages, $nanoseconds) : null)
+            ?? self::summarizeStageBatchPhp($stages, $nanoseconds);
+    }
+
+    /**
+     * @param  array<array-key, string>  $stages
+     * @param  array<array-key, int>  $nanoseconds
+     * @return list<int>
+     */
+    public static function summarizeStageBatchPhp(array $stages, array $nanoseconds): array
+    {
+        $stages = array_values($stages);
+        $nanoseconds = array_values($nanoseconds);
+        $count = \count($stages);
+        $out = array_fill(0, self::W55_STAGE_HEADER, 0);
+        $out[0] = $count;
+        $slowAt = -1;
+        $slow = 0;
+        $mask = 0;
+        $codes = $values = [];
+        for ($i = 0; $i < $count; $i++) {
+            $code = self::W55_STAGE_CODES[$stages[$i]] ?? 13;
+            $ns = min(max($nanoseconds[$i] ?? 0, 0), self::W55_VALUE_CAP);
+            $out[1] += $ns;
+            $out[2 + $code] += $ns;
+            if ($slowAt < 0 || $ns > $slow) {
+                $slowAt = $i;
+                $slow = $ns;
+            }
+            if ($code === 13) {
+                $out[17]++;
+            } else {
+                $mask |= 1 << $code;
+            }
+            $codes[] = $code;
+            $values[] = $ns;
+        }
+        $total = $out[1];
+        $digest = 2_166_136_261;
+        $rows = [];
+        foreach ($codes as $i => $code) {
+            $ns = $values[$i];
+            $row = $code | ($total > 0 ? intdiv($ns * 1_000_000, $total) : 0) << 4 | intdiv($ns, 1_000_000) << 24;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $bits = $mask - (($mask >> 1) & 0x5555);
+        $bits = ($bits & 0x3333) + (($bits >> 2) & 0x3333);
+        $bits = ($bits + ($bits >> 4)) & 0x0F0F;
+        $out[16] = $slowAt;
+        $out[18] = ($bits + ($bits >> 8)) & 0x1F;
+        $out[19] = $mask;
+        $out[20] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust summary, or null when PHP must compute it (unavailable library or rejected input). Keys
+     * cross NUL-joined; Rust rejects a join with extra NULs, and only then does a 0x01-joined twin
+     * cross with a second call, so the common batch skips the NUL scan.
+     *
+     * @param  array<array-key, string>  $stages
+     * @param  array<array-key, int>  $nanoseconds
+     * @return list<int>|null
+     */
+    public static function summarizeStageBatchNative(array $stages, array $nanoseconds): ?array
+    {
+        $count = \count($stages);
+        if ($count > self::W55_MAX_ITEMS) {
+            return null;
+        }
+        $joined = implode("\0", $stages);
+        $ints = pack('q*', ...self::w55Fit($nanoseconds, $count));
+        $fields = self::W55_STAGE_HEADER + $count;
+        $twin = '';
+        // @phpstan-ignore method.notFound
+        $call = static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w556_stage_summary_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $fields);
+        $result = self::w55Call($fields, $call);
+        if ($result !== null || $count === 0 || substr_count($joined, "\0") === $count - 1) {
+            return $result;
+        }
+        $twin = implode("\x01", $stages);
+
+        // @phpstan-ignore method.notFound
+        return self::w55Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w556_stage_summary_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 55.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $forced = self::w55RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 55.6 routing and binding, kept in function statics so earlier waves' static state stays
+     * untouched. No `$op` returns the forced routing (null for the default); `'set'` replaces it with
+     * `$val` and returns the previous value; `'binding'` returns the cached `additional_w55` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w55', self::W55_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 55.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w55Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w55RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Exactly `$count` values: the list itself when it already fits, otherwise padded with 0.
+     *
+     * @param  array<array-key, int>  $values
+     * @return list<int>
+     */
+    private static function w55Fit(array $values, int $count): array
+    {
+        return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, 0);
     }
 }

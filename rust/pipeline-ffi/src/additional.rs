@@ -39869,3 +39869,897 @@ mod w546_additional_batch_tests {
         assert_eq!((status, out[1]), (1, W546_DEFAULT_PART));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 55.6: AdditionalProcessing state, metrics, context and media slicer
+// batch helpers (`nntmux_w556_*`) for PersistenceMetricsCollector,
+// ProcessingMetrics, ReleaseProcessingContext, ArchivedMediaSlicer and
+// ContainerSplicer. Same contract as Wave 54.6: names are NUL-joined (with a
+// 0x01-joined twin when one holds a NUL), mid chunks are concatenated with
+// `pack('V*')` lengths, integer columns are machine-order
+// `int64_t`, and the result is fixed-width `int64_t` words. Every export
+// returns 1, -1 for invalid input (PHP then computes the batch) or -2 when
+// `out` is null, misaligned or too small, and leaves `out` untouched unless it
+// returns 1.
+// ---------------------------------------------------------------------------
+
+/// Saturation of a 16-bit count field.
+const W556_SHORT_CAP: i64 = (1 << 16) - 1;
+
+/// Largest resume-probe window, and the default for 0 or less.
+const W556_WINDOW_CAP: i64 = (1 << 20) - 1;
+const W556_DEFAULT_WINDOW: i64 = 65_536;
+
+// --- PersistenceMetricsCollector::foldScopedEventBatch ----------------------
+
+pub(crate) const W556_EVENT_HEADER: usize = 12;
+
+/// Collector events across release scopes. Four columns per event: kind (0
+/// database statement, 1 search sync request, 2 search sync execution, other
+/// unknown), scope release ID (negative is no scope), event release ID and
+/// statement microseconds (clamped to 0..2^40-1). A scope differing from the
+/// previous event's opens a new scope with reset counters. Statements count
+/// under any scope; requests and executions only when the event release ID is
+/// the scope. Counters saturate at 2^20-1 (statements), 2^40-1 (microseconds)
+/// and 2^16-1 (requests, executions). `[0]` count, `[1]` statements, `[2]`
+/// statement microseconds (capped at 2^62), `[3]` requests, `[4]` executions,
+/// `[5]` ignored, `[6]` unknown, `[7]` scopes opened, `[8]` slowest statement
+/// microseconds and `[9]` its first event (-1 when none), `[10]` scopes closed
+/// with requests differing from executions, `[11]` FNV-1a digest; then per
+/// event `status | opened << 2 | kind << 3 | statements << 5 | requests << 25
+/// | executions << 41` (status 0 ignored, 1 applied, 2 unknown; kind 3 for
+/// unknown; the scope's running counters after the event).
+pub(crate) fn w556_event_batch(ints: &[i64], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W556_EVENT_HEADER + count];
+    out[0] = count as i64;
+    let mut slowest = (-1i64, 0i64);
+    let mut scope: Option<i64> = None;
+    let mut started = false;
+    let (mut statements, mut micros, mut requests, mut executions) = (0i64, 0i64, 0i64, 0i64);
+    for at in 0..count {
+        let kind = ints[at];
+        let raw_scope = ints[count + at];
+        let current = (raw_scope >= 0).then_some(raw_scope);
+        let release = ints[2 * count + at];
+        let elapsed = w47_clamp(ints[3 * count + at]);
+        let mut opened = 0i64;
+        if !started || current != scope {
+            if started && scope.is_some() && requests != executions {
+                out[10] += 1;
+            }
+            started = true;
+            scope = current;
+            (statements, micros, requests, executions) = (0, 0, 0, 0);
+            if current.is_some() {
+                out[7] += 1;
+                opened = 1;
+            }
+        }
+        let (status, code) = match kind {
+            0 if current.is_some() => {
+                statements = (statements + 1).min(W546_COUNT_CAP);
+                micros = (micros + elapsed).min(W47_VALUE_CAP);
+                out[1] += 1;
+                out[2] = w47_add(out[2], elapsed);
+                w546_pick(&mut slowest, at, elapsed, true);
+                (1, 0)
+            }
+            1 if current == Some(release) => {
+                requests = (requests + 1).min(W556_SHORT_CAP);
+                out[3] += 1;
+                (1, 1)
+            }
+            2 if current == Some(release) => {
+                executions = (executions + 1).min(W556_SHORT_CAP);
+                out[4] += 1;
+                (1, 2)
+            }
+            0..=2 => {
+                out[5] += 1;
+                (0, kind)
+            }
+            _ => {
+                out[6] += 1;
+                (2, 3)
+            }
+        };
+        out[W556_EVENT_HEADER + at] = status
+            | opened << 2
+            | code << 3
+            | statements << 5
+            | requests << 25
+            | executions << 41;
+    }
+    if started && scope.is_some() && requests != executions {
+        out[10] += 1;
+    }
+    out[8] = slowest.1;
+    out[9] = slowest.0;
+    out[11] = w526_digest(&out[W556_EVENT_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w556_scoped_event_batch(
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let ints = w47_ints(w15_input(ints, ints_len)?, 4, count)?;
+            Some(w556_event_batch(&ints, count))
+        })
+    }
+}
+
+// --- ProcessingMetrics::summarizeStageBatch ---------------------------------
+
+pub(crate) const W556_STAGE_CODES: usize = 14;
+pub(crate) const W556_STAGE_HEADER: usize = 2 + W556_STAGE_CODES + 5;
+
+/// `ProcessingStage` backing value code (case index), 13 for anything else.
+pub(crate) fn w556_stage_code(key: &[u8]) -> i64 {
+    match key {
+        b"workspace-preparation" => 0,
+        b"nzb-parsing" => 1,
+        b"release-initialization" => 2,
+        b"message-id-selection" => 3,
+        b"media-source-planning" => 4,
+        b"direct-downloads" => 5,
+        b"archive-downloads" => 6,
+        b"extracted-files" => 7,
+        b"media-sources" => 8,
+        b"archive-fallbacks" => 9,
+        b"timeout-handling" => 10,
+        b"finalization" => 11,
+        b"workspace-cleanup" => 12,
+        _ => 13,
+    }
+}
+
+/// Stage timing records: a stage key and nanoseconds (clamped to 0..2^40-1).
+/// `[0]` count, `[1]` total nanoseconds, `[2..=15]` nanoseconds per code,
+/// `[16]` first slowest record (-1 when none), `[17]` unknown keys, `[18]`
+/// distinct known stages, `[19]` known stage bitmask, `[20]` FNV-1a digest;
+/// then per record `code | share_ppm << 4 | milliseconds << 24` (share of the
+/// total, 0 when the total is 0).
+pub(crate) fn w556_stage_batch(keys: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+    let count = keys.len();
+    let mut out = vec![0i64; W556_STAGE_HEADER + count];
+    out[0] = count as i64;
+    let mut slowest = (-1i64, 0i64);
+    let mut mask = 0i64;
+    let mut codes = Vec::with_capacity(count);
+    for (at, key) in keys.iter().enumerate() {
+        let code = w556_stage_code(key);
+        let nanos = w47_clamp(ints[at]);
+        out[1] += nanos;
+        out[2 + code as usize] += nanos;
+        w546_pick(&mut slowest, at, nanos, true);
+        if code == 13 {
+            out[17] += 1;
+        } else {
+            mask |= 1 << code;
+        }
+        codes.push((code, nanos));
+    }
+    let total = out[1];
+    for (at, (code, nanos)) in codes.into_iter().enumerate() {
+        let ppm = if total > 0 { nanos * W546_PPM / total } else { 0 };
+        out[W556_STAGE_HEADER + at] = code | ppm << 4 | (nanos / 1_000_000) << 24;
+    }
+    out[16] = slowest.0;
+    out[18] = i64::from(mask.count_ones());
+    out[19] = mask;
+    out[20] = w526_digest(&out[W556_STAGE_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w556_stage_summary_batch(
+    keys: *const u8,
+    keys_len: usize,
+    key_twin: *const u8,
+    key_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let keys = w49_items(
+                w15_input(keys, keys_len)?,
+                w15_input(key_twin, key_twin_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+            Some(w556_stage_batch(&keys, &ints))
+        })
+    }
+}
+
+// --- ReleaseProcessingContext::summarizeContextBatch ------------------------
+
+pub(crate) const W556_CONTEXT_HEADER: usize = 14;
+
+/// Largest elapsed-seconds and timeout field.
+const W556_SECONDS_CAP: i64 = (1 << 31) - 1;
+
+/// Five columns per context: flags (bit 0 found video, 1 media info, 2 audio
+/// info, 3 audio sample, 4 JPG sample, 5 sample, 6 PAR2 info, 7 passworded, 8
+/// listing incomplete, 9 season pack, 10 probable season pack, 11 name
+/// evidence incomplete; higher bits ignored), elapsed nanoseconds (clamped to
+/// 0..2^62), timeout seconds (clamped to 0..2^31-1; 0 never times out), added
+/// and total file info (clamped to 0..2^20-1). A context times out when its
+/// elapsed nanoseconds exceed the timeout. `[0]` count, `[1]` needing media,
+/// `[2]` needing a sample, `[3]` timed out, `[4]` deferring archive names,
+/// `[5]` passworded, `[6]` listing incomplete, `[7]` needing neither, `[8]`
+/// added and `[9]` total file info, `[10]` first longest context (-1 when
+/// none) and `[11]` its elapsed seconds, `[12]` missing found flags, `[13]`
+/// FNV-1a digest; then per context `missing | media << 7 | sample << 8 |
+/// timed_out << 9 | defers << 10 | file_ppm << 11 | seconds << 31` (missing
+/// has bit n set when found flag n is not; seconds capped at 2^31-1).
+pub(crate) fn w556_context_batch(ints: &[i64], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W556_CONTEXT_HEADER + count];
+    out[0] = count as i64;
+    let mut longest = (-1i64, 0i64);
+    for at in 0..count {
+        let flags = ints[at] & 0xFFF;
+        let elapsed = ints[count + at].clamp(0, W47_TOTAL_CAP);
+        let timeout = ints[2 * count + at].clamp(0, W556_SECONDS_CAP);
+        let added = w546_count(ints[3 * count + at]);
+        let total = w546_count(ints[4 * count + at]);
+        let missing = !flags & 0x7F;
+        let media = i64::from(missing & 0x0F != 0);
+        let sample = i64::from(missing & 0x30 != 0);
+        let timed_out = i64::from(timeout > 0 && elapsed > timeout * 1_000_000_000);
+        let defers = i64::from(flags & 0xE00 != 0);
+        let seconds = (elapsed / 1_000_000_000).min(W556_SECONDS_CAP);
+        let ppm = if total > 0 {
+            (added * W546_PPM / total).min(W546_PPM)
+        } else {
+            0
+        };
+        out[1] += media;
+        out[2] += sample;
+        out[3] += timed_out;
+        out[4] += defers;
+        out[5] += (flags >> 7) & 1;
+        out[6] += (flags >> 8) & 1;
+        out[7] += i64::from(media == 0 && sample == 0);
+        out[8] += added;
+        out[9] += total;
+        w546_pick(&mut longest, at, elapsed, true);
+        out[12] += i64::from(missing.count_ones());
+        out[W556_CONTEXT_HEADER + at] = missing
+            | media << 7
+            | sample << 8
+            | timed_out << 9
+            | defers << 10
+            | ppm << 11
+            | seconds << 31;
+    }
+    out[10] = longest.0;
+    out[11] = (longest.1 / 1_000_000_000).min(W556_SECONDS_CAP);
+    out[13] = w526_digest(&out[W556_CONTEXT_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w556_context_summary_batch(
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let ints = w47_ints(w15_input(ints, ints_len)?, 5, count)?;
+            Some(w556_context_batch(&ints, count))
+        })
+    }
+}
+
+// --- ArchivedMediaSlicer::classifyStoredVideoBatch --------------------------
+
+pub(crate) const W556_STORED_HEADER: usize = 16;
+
+/// PHP `trim()` characters.
+#[inline]
+fn w556_trimmed(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+}
+
+/// PCRE `\s` without UTF mode.
+#[inline]
+fn w556_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
+}
+
+/// `VideoContainer::fromFileName()` code (case index + 1, 0 none): the first
+/// `/\.([a-z0-9]{2,4})"?(?:\s|$)/i` match of the trimmed name, greedy with
+/// backtracking, mapped by its lower-cased extension.
+pub(crate) fn w556_container_code(name: &[u8]) -> i64 {
+    let start = name.iter().position(|&b| !w556_trimmed(b)).unwrap_or(name.len());
+    let end = name.iter().rposition(|&b| !w556_trimmed(b)).map_or(start, |at| at + 1);
+    let name = &name[start..end.max(start)];
+    let len = name.len();
+    let mut at = 0;
+    while let Some(offset) = name[at..].iter().position(|&b| b == b'.') {
+        let dot = at + offset;
+        let run = name[dot + 1..]
+            .iter()
+            .take(4)
+            .take_while(|b| b.is_ascii_alphanumeric())
+            .count();
+        for ext_len in (2..=run).rev() {
+            let after = dot + 1 + ext_len;
+            let fits = |p: usize| p == len || w556_space(name[p]);
+            if (after < len && name[after] == b'"' && fits(after + 1)) || fits(after) {
+                let mut lower = [0u8; 4];
+                for (slot, byte) in lower.iter_mut().zip(&name[dot + 1..after]) {
+                    *slot = byte.to_ascii_lowercase();
+                }
+                return match &lower[..ext_len] {
+                    b"mkv" | b"mk3d" | b"webm" => 1,
+                    b"avi" | b"divx" | b"xvid" => 2,
+                    b"mpg" | b"mpeg" | b"vob" | b"m2v" | b"mpv" => 3,
+                    b"ts" | b"m2ts" | b"mts" => 4,
+                    b"mp4" | b"m4v" | b"mov" | b"qt" => 5,
+                    b"wmv" | b"asf" => 6,
+                    b"ogv" | b"ogm" => 7,
+                    _ => 0,
+                };
+            }
+        }
+        at = dot + 1;
+    }
+    0
+}
+
+/// `/(?:^|[\\\/._ -])sample(?:[\\\/._ -]|$)/i` on the untrimmed name (`$`
+/// also matches before a final newline).
+pub(crate) fn w556_sample_name(name: &[u8]) -> bool {
+    let edge = |byte: u8| matches!(byte, b'\\' | b'/' | b'.' | b'_' | b' ' | b'-');
+    let len = name.len();
+    if len < 6 {
+        return false;
+    }
+    (0..=len - 6).any(|at| {
+        name[at..at + 6].eq_ignore_ascii_case(b"sample")
+            && (at == 0 || edge(name[at - 1]))
+            && {
+                let after = at + 6;
+                after == len || edge(name[after]) || (after + 1 == len && name[after] == b'\n')
+            }
+    })
+}
+
+/// `storedVideosPhp()` eligibility and `entryForPhp()` sample test per archive
+/// entry: a name, a size and flags (bit 0 passworded, bit 1 directory, bit 2
+/// compressed, bit 3 not the main archive; higher bits ignored). `[0]` count,
+/// `[1]` eligible, `[2]` ineligible, `[3..=9]` eligible per container code,
+/// `[10]` eligible samples, `[11]` eligible main videos, `[12]` first largest
+/// eligible main video (-1 when none) and `[13]` its size, `[14]` eligible
+/// bytes (capped at 2^62), `[15]` FNV-1a digest; then per entry `code |
+/// eligible << 3 | sample << 4 | sample_name << 5 | reasons << 6 | size << 12`
+/// (reasons: flag bits 0-3, bit 4 size 0 or less, bit 5 no container; size
+/// clamped to 0..2^40-1; sample when named so or smaller than `min_main`).
+pub(crate) fn w556_stored_batch(names: &[&[u8]], ints: &[i64], min_main: i64) -> Vec<i64> {
+    let count = names.len();
+    let mut out = vec![0i64; W556_STORED_HEADER + count];
+    out[0] = count as i64;
+    let mut largest = (-1i64, 0i64);
+    for (at, name) in names.iter().enumerate() {
+        let raw_size = ints[at];
+        let size = w47_clamp(raw_size);
+        let flags = ints[count + at] & 0xF;
+        let code = w556_container_code(name);
+        let sample_name = w556_sample_name(name);
+        let sample = sample_name || raw_size < min_main;
+        let reasons = flags | i64::from(raw_size <= 0) << 4 | i64::from(code == 0) << 5;
+        let eligible = reasons == 0;
+        if eligible {
+            out[1] += 1;
+            out[2 + code as usize] += 1;
+            out[14] = w47_add(out[14], size);
+            if sample {
+                out[10] += 1;
+            } else {
+                out[11] += 1;
+                w546_pick(&mut largest, at, size, true);
+            }
+        } else {
+            out[2] += 1;
+        }
+        out[W556_STORED_HEADER + at] = code
+            | i64::from(eligible) << 3
+            | i64::from(sample) << 4
+            | i64::from(sample_name) << 5
+            | reasons << 6
+            | size << 12;
+    }
+    out[12] = largest.0;
+    out[13] = largest.1;
+    out[15] = w526_digest(&out[W556_STORED_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w556_stored_video_batch(
+    names: *const u8,
+    names_len: usize,
+    name_twin: *const u8,
+    name_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    min_main_video_bytes: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let names = w49_items(
+                w15_input(names, names_len)?,
+                w15_input(name_twin, name_twin_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w556_stored_batch(&names, &ints, min_main_video_bytes))
+        })
+    }
+}
+
+// --- ContainerSplicer::probeResumeBatch -------------------------------------
+
+pub(crate) const W556_PROBE_HEADER: usize = 8;
+
+/// First Matroska cluster, MPEG pack start and `/\d\d(?:dc|db|wb)/` offsets in
+/// one pass. Every pattern ends in one of five byte pairs (`B6 75`, `01 BA`,
+/// `dc`, `db`, `wb`), so 32-byte blocks are screened for those pairs with a
+/// branch-free (vector) reduction and only candidate blocks are checked byte by
+/// byte.
+fn w556_markers(hay: &[u8]) -> [Option<usize>; 3] {
+    let mut found = [None; 3];
+    if hay.len() < 4 {
+        return found;
+    }
+    let mut pending = 3;
+    let check = |at: usize, found: &mut [Option<usize>; 3], pending: &mut i32| {
+        let start = at - 3;
+        let slot = match (hay[at - 1], hay[at]) {
+            (0xB6, 0x75) if hay[start..at - 1] == [0x1F, 0x43] => 0,
+            (0x01, 0xBA) if hay[start..at - 1] == [0x00, 0x00] => 1,
+            (b'd', b'b' | b'c') | (b'w', b'b')
+                if hay[start].is_ascii_digit() && hay[start + 1].is_ascii_digit() =>
+            {
+                2
+            }
+            _ => return,
+        };
+        if found[slot].is_none() {
+            found[slot] = Some(start);
+            *pending -= 1;
+        }
+    };
+    // `cur[i]` is `hay[3 + i]` and `prev[i]` the byte before it.
+    let cur = &hay[3..];
+    let prev = &hay[2..hay.len() - 1];
+    let (cur_blocks, _) = cur.as_chunks::<32>();
+    let (prev_blocks, _) = prev.as_chunks::<32>();
+    for (index, (cur_block, prev_block)) in cur_blocks.iter().zip(prev_blocks).enumerate() {
+        let mut any = false;
+        for (&c, &p) in cur_block.iter().zip(prev_block) {
+            any |= ((p == 0xB6) & (c == 0x75))
+                | ((p == 0x01) & (c == 0xBA))
+                | ((p == b'd') & ((c | 1) == b'c'))
+                | ((p == b'w') & (c == b'b'));
+        }
+        if any {
+            for at in 0..32 {
+                check(3 + index * 32 + at, &mut found, &mut pending);
+            }
+            if pending == 0 {
+                return found;
+            }
+        }
+    }
+    for at in 3 + cur_blocks.len() * 32..hay.len() {
+        check(at, &mut found, &mut pending);
+    }
+    found
+}
+
+/// `transportStreamOffsetPhp()`: offset and stride code (1 for 188, 2 for 192).
+fn w556_transport(hay: &[u8]) -> Option<(usize, i64)> {
+    for (code, stride) in [(1i64, 188usize), (2, 192)] {
+        let limit = hay.len().saturating_sub(stride * 4).min(stride);
+        if let Some(offset) = (0..limit).find(|&o| {
+            hay[o] == 0x47
+                && hay[o + stride] == 0x47
+                && hay[o + stride * 2] == 0x47
+                && hay[o + stride * 3] == 0x47
+        }) {
+            return Some((offset, code));
+        }
+    }
+    None
+}
+
+/// Resume points in the first `window` bytes of each mid chunk (0 or less
+/// uses 65,536; capped at 2^20-1), as `splicePhp()` finds them: the Matroska
+/// cluster, the MPEG pack start, the transport stream offset and the AVI chunk.
+/// `[0]` count, `[1]` window, `[2..=5]` chunks with a cluster / pack start /
+/// transport offset / AVI chunk, `[6]` chunks with none, `[7]` FNV-1a digest;
+/// then two words per chunk: `cluster + 1 | (pack + 1) << 21 | (transport + 1)
+/// << 42` (0 when absent) and `avi + 1 | stride << 21 | found << 23 | scanned
+/// << 27` (stride 1 for 188, 2 for 192; found bits in header order; scanned
+/// bytes).
+pub(crate) fn w556_probe_batch(mids: &[&[u8]], window: i64) -> Vec<i64> {
+    let window = if window <= 0 {
+        W556_DEFAULT_WINDOW
+    } else {
+        window.min(W556_WINDOW_CAP)
+    } as usize;
+    let count = mids.len();
+    let mut out = vec![0i64; W556_PROBE_HEADER + 2 * count];
+    out[0] = count as i64;
+    out[1] = window as i64;
+    let slot = |found: Option<usize>| found.map_or(0, |at| at as i64 + 1);
+    for (at, mid) in mids.iter().enumerate() {
+        let hay = &mid[..mid.len().min(window)];
+        let [cluster, pack, avi] = w556_markers(hay).map(slot);
+        let (transport, stride) = w556_transport(hay).map_or((0, 0), |(o, s)| (o as i64 + 1, s));
+        let found = i64::from(cluster > 0)
+            | i64::from(pack > 0) << 1
+            | i64::from(transport > 0) << 2
+            | i64::from(avi > 0) << 3;
+        for bit in 0..4 {
+            out[2 + bit] += (found >> bit) & 1;
+        }
+        out[6] += i64::from(found == 0);
+        out[W556_PROBE_HEADER + 2 * at] = cluster | pack << 21 | transport << 42;
+        out[W556_PROBE_HEADER + 2 * at + 1] =
+            avi | stride << 21 | found << 23 | (hay.len() as i64) << 27;
+    }
+    out[7] = w526_digest(&out[W556_PROBE_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w556_resume_probe_batch(
+    mids: *const u8,
+    mids_len: usize,
+    mid_lens: *const u8,
+    mid_lens_len: usize,
+    count: usize,
+    window: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let mids = w47_items(
+                w15_input(mids, mids_len)?,
+                w15_input(mid_lens, mid_lens_len)?,
+                count,
+            )?;
+            Some(w556_probe_batch(&mids, window))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w556_additional_state_tests {
+    use super::*;
+    use std::ptr::{null, null_mut};
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn w556_event_batch_folds_scopes() {
+        // kinds, scopes, release ids, micros for six events over scopes none, 7, 7, 7, 9, 9.
+        let ints = [
+            0, 0, 1, 2, 1, 9, //
+            -1, 7, 7, 7, 9, 9, //
+            0, 0, 7, 8, 9, 0, //
+            50, 300, 0, 0, 0, 0,
+        ];
+        let out = w556_event_batch(&ints, 6);
+        assert_eq!(&out[..11], &[6, 1, 300, 2, 0, 2, 1, 2, 300, 1, 2]);
+        let base = W556_EVENT_HEADER;
+        assert_eq!(out[base], 0);
+        assert_eq!(out[base + 1], 1 | 1 << 2 | 1 << 5);
+        assert_eq!(out[base + 2], 1 | 1 << 3 | 1 << 5 | 1 << 25);
+        assert_eq!(out[base + 3], 2 << 3 | 1 << 5 | 1 << 25);
+        assert_eq!(out[base + 4], 1 | 1 << 2 | 1 << 3 | 1 << 25);
+        assert_eq!(out[base + 5], 2 | 3 << 3 | 1 << 25);
+        assert_eq!(out[11], w526_digest(&out[base..]));
+        let empty = w556_event_batch(&[], 0);
+        assert_eq!(&empty[..11], &[0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0]);
+    }
+
+    #[test]
+    fn w556_stage_batch_codes_and_shares() {
+        let keys: [&[u8]; 4] = [b"nzb-parsing", b"finalization", b"NZB-PARSING", b"nzb-parsing"];
+        let out = w556_stage_batch(&keys, &[3_000_000, 1_000_000, -5, 4_000_000]);
+        assert_eq!(&out[..3], &[4, 8_000_000, 0]);
+        assert_eq!(out[3], 7_000_000);
+        assert_eq!(out[13], 1_000_000);
+        assert_eq!(out[15], 0);
+        assert_eq!(&out[16..20], &[3, 1, 2, 1 << 1 | 1 << 11]);
+        let base = W556_STAGE_HEADER;
+        assert_eq!(out[base], 1 | 375_000 << 4 | 3 << 24);
+        assert_eq!(out[base + 2], 13);
+        assert_eq!(w556_stage_code(b"workspace-cleanup"), 12);
+        assert_eq!(w556_stage_batch(&[], &[])[16], -1);
+    }
+
+    #[test]
+    fn w556_context_batch_flags_and_timeouts() {
+        // flags, elapsed ns, timeout s, added, total.
+        let ints = [
+            0x3F | 1 << 7, 0, 1 << 9, //
+            5_000_000_001, 1, 3_000_000_000, //
+            5, 0, 3, //
+            2, 0, 9, //
+            4, 0, 3,
+        ];
+        let out = w556_context_batch(&ints, 3);
+        assert_eq!(&out[..13], &[3, 2, 2, 1, 1, 1, 0, 1, 11, 7, 0, 5, 1 + 7 + 7]);
+        let base = W556_CONTEXT_HEADER;
+        assert_eq!(out[base], 1 << 6 | 1 << 9 | 500_000 << 11 | 5 << 31);
+        assert_eq!(out[base + 1], 0x7F | 1 << 7 | 1 << 8);
+        assert_eq!(out[base + 2], 0x7F | 1 << 7 | 1 << 8 | 1 << 10 | 1_000_000 << 11 | 3 << 31);
+    }
+
+    #[test]
+    fn w556_container_code_and_sample_name() {
+        for (name, code) in [
+            (&b"Movie.MKV"[..], 1),
+            (b"  x.avi\n", 2),
+            (b"x.mkv1x", 0),
+            (b"x.mkv1x.ts", 4),
+            (b"a.mpeg\"", 3),
+            (b"a.mpeg\" tail", 3),
+            (b"a.mpeg\"x", 0),
+            (b"a.mp4 b.mkv", 5),
+            (b"a.zip b.mkv", 0),
+            (b"a.qt\x0C", 5),
+            (b".ogm", 7),
+            (b"a.x", 0),
+            (b"noext", 0),
+            (b"", 0),
+        ] {
+            assert_eq!(w556_container_code(name), code, "{}", String::from_utf8_lossy(name));
+        }
+        for (name, sample) in [
+            (&b"Sample/x.mkv"[..], true),
+            (b"x-SAMPLE.mkv", true),
+            (b"x.sample", true),
+            (b"x.sample\n", true),
+            (b"x.sample\n\n", false),
+            (b"xsample.mkv", false),
+            (b"x.samples.mkv", false),
+            (b"sampl", false),
+        ] {
+            assert_eq!(w556_sample_name(name), sample, "{}", String::from_utf8_lossy(name));
+        }
+        let names: [&[u8]; 4] = [b"a.mkv", b"sample.mkv", b"b.avi", b"c.rar"];
+        let out = w556_stored_batch(&names, &[900, 50, 900, 10, 0, 0, 4, 0], 100);
+        assert_eq!(&out[..15], &[4, 2, 2, 2, 0, 0, 0, 0, 0, 0, 1, 1, 0, 900, 950]);
+        let base = W556_STORED_HEADER;
+        assert_eq!(out[base], 1 | 1 << 3 | 900 << 12);
+        assert_eq!(out[base + 2], 2 | 4 << 6 | 900 << 12);
+        assert_eq!(out[base + 3], 1 << 4 | 1 << 11 | 10 << 12);
+    }
+
+    #[test]
+    fn w556_probe_batch_finds_resume_points() {
+        let mut ts = vec![0u8; 3 + 188 * 5];
+        for packet in 0..5 {
+            ts[3 + packet * 188] = 0x47;
+        }
+        let mixed = b"xx\x1F\x43\xB6\x75..00db\x00\x00\x01\xBA".to_vec();
+        let mids: [&[u8]; 3] = [&ts, &mixed, b""];
+        let out = w556_probe_batch(&mids, 0);
+        assert_eq!(&out[..7], &[3, W556_DEFAULT_WINDOW, 1, 1, 1, 1, 1]);
+        let base = W556_PROBE_HEADER;
+        assert_eq!(out[base], 4 << 42);
+        assert_eq!(out[base + 1], 1 << 21 | 4 << 23 | (ts.len() as i64) << 27);
+        assert_eq!(out[base + 2], 3 | 13 << 21);
+        assert_eq!(out[base + 3], 9 | 0b1011 << 23 | (mixed.len() as i64) << 27);
+        assert_eq!(out[base + 5], 0);
+        // A window cuts the scan.
+        let cut = w556_probe_batch(&mids[1..2], 6);
+        assert_eq!(cut[W556_PROBE_HEADER + 1], 1 << 23 | 6 << 27);
+        assert_eq!(w556_probe_batch(&[], i64::MAX)[1], W556_WINDOW_CAP);
+    }
+
+    #[test]
+    fn w556_markers_match_a_naive_scan() {
+        let naive = |hay: &[u8]| -> [Option<usize>; 3] {
+            let find = |pred: &dyn Fn(&[u8]) -> bool| hay.windows(4).position(pred);
+            [
+                find(&|w| w == [0x1F, 0x43, 0xB6, 0x75]),
+                find(&|w| w == [0x00, 0x00, 0x01, 0xBA]),
+                find(&|w| {
+                    w[0].is_ascii_digit()
+                        && w[1].is_ascii_digit()
+                        && matches!(&w[2..], b"dc" | b"db" | b"wb")
+                }),
+            ]
+        };
+        let alphabet = [0x1F, 0x43, 0xB6, 0x75, 0x00, 0x01, 0xBA, b'0', b'9', b'd', b'w', b'b', b'c', b'x'];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for round in 0..2_000 {
+            let len = round % 150;
+            let hay: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    alphabet[(state % alphabet.len() as u64) as usize]
+                })
+                .collect();
+            assert_eq!(w556_markers(&hay), naive(&hay), "{hay:?}");
+        }
+        assert_eq!(w556_markers(b"00wc 00wb"), [None, None, Some(5)]);
+    }
+
+    #[test]
+    fn w556_exports_validate_pointers_and_capacity() {
+        let mut out = [0i64; 64];
+        let ints = packed(&[0, 1, 1, 10]);
+        let status = unsafe {
+            nntmux_w556_scoped_event_batch(ints.as_ptr(), ints.len(), 1, out.as_mut_ptr(), 64)
+        };
+        assert_eq!((status, out[0], out[1]), (1, 1, 1));
+        let status =
+            unsafe { nntmux_w556_scoped_event_batch(ints.as_ptr(), ints.len(), 1, null_mut(), 64) };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w556_scoped_event_batch(ints.as_ptr(), ints.len(), 1, out.as_mut_ptr(), 4)
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w556_scoped_event_batch(ints.as_ptr(), ints.len() - 8, 1, out.as_mut_ptr(), 64)
+        };
+        assert_eq!(status, -1);
+        let status =
+            unsafe { nntmux_w556_context_summary_batch(null(), 40, 1, out.as_mut_ptr(), 64) };
+        assert_eq!(status, -1);
+        let misaligned = unsafe { out.as_mut_ptr().cast::<u8>().add(1).cast::<i64>() };
+        let status =
+            unsafe { nntmux_w556_context_summary_batch(null(), 0, 0, misaligned, 32) };
+        assert_eq!(status, -2);
+        out.fill(7);
+        for status in unsafe {
+            [
+                nntmux_w556_scoped_event_batch(null(), 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w556_stage_summary_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                ),
+                nntmux_w556_context_summary_batch(null(), 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w556_stored_video_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                ),
+                nntmux_w556_resume_probe_batch(null(), 0, null(), 0, 0, 0, out.as_mut_ptr(), 64),
+            ]
+        } {
+            assert_eq!((status, out[0]), (1, 0));
+        }
+        // NUL-joined keys, twin-joined names, length-prefixed mids and a mismatched count.
+        let keys = b"finalization\0nzb-parsing";
+        let ints = packed(&[5, 6]);
+        let status = unsafe {
+            nntmux_w556_stage_summary_batch(
+                keys.as_ptr(),
+                keys.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[19]), (1, 11, 1 << 1 | 1 << 11));
+        let status = unsafe {
+            nntmux_w556_stage_summary_batch(
+                keys.as_ptr(),
+                keys.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                8,
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+        let names = b"a.mk\0v\0b.ts";
+        let twin = b"a.mk\0v\x01b.ts";
+        let lengths: Vec<u8> = [6u32, 4].iter().flat_map(|len| len.to_le_bytes()).collect();
+        let ints = packed(&[10, 10, 0, 0]);
+        let status = unsafe {
+            nntmux_w556_stored_video_batch(
+                names.as_ptr(),
+                names.len(),
+                twin.as_ptr(),
+                twin.len(),
+                ints.as_ptr(),
+                ints.len(),
+                2,
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[6]), (1, 1, 1));
+        let status = unsafe {
+            nntmux_w556_resume_probe_batch(
+                names.as_ptr(),
+                names.len(),
+                lengths.as_ptr(),
+                lengths.len(),
+                3,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+    }
+}
