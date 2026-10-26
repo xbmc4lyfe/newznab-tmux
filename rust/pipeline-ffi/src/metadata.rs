@@ -62881,3 +62881,1255 @@ mod w634_tests {
         assert_eq!(misaligned, -1);
     }
 }
+
+pub mod w644_batch {
+    use super::w594_batch::{fnv, split};
+    use std::collections::{HashMap, HashSet};
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// Record body: blob values (field-major), the int64 columns, the record count, output.
+    type Body = fn(&[&[u8]], &[i64], usize, &mut [i64]);
+
+    pub(crate) const MAX_RECORDS: usize = 1 << 20;
+
+    /// Upper clamp for sizes, offsets and latencies.
+    pub(crate) const VALUE_CAP: i64 = (1 << 40) - 1;
+
+    /// Saturation point for byte totals that could exceed 2^63.
+    pub(crate) const TOTAL_CAP: i64 = 1 << 62;
+
+    /// Decoded bytes per article when the caller does not know it.
+    pub(crate) const DEFAULT_PART: i64 = 716_800;
+
+    pub(crate) const PART_CAP: i64 = 1 << 30;
+
+    /// Upper clamp for article/segment counts and row counters.
+    pub(crate) const SEGMENT_CAP: i64 = 0xFF_FFFF;
+
+    /// Bytes a PAR2 16k hash covers.
+    pub(crate) const SLICE_BYTES: i64 = 16_384;
+
+    const FNV_BASIS: i64 = 2_166_136_261;
+
+    const FNV_OFFSET: u32 = 0x811c_9dc5;
+
+    const FNV_PRIME: u32 = 0x0100_0193;
+
+    const MATROSKA_CLUSTER: &[u8] = b"\x1F\x43\xB6\x75";
+
+    const MPEG_PACK_START: &[u8] = b"\x00\x00\x01\xBA";
+
+    /// Column `k` of the packed int64 words for record `i`.
+    #[inline(always)]
+    fn col(ints: &[i64], count: usize, k: usize, i: usize) -> i64 {
+        ints[k * count + i]
+    }
+
+    #[inline(always)]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point to `len` readable bytes unless `len` is zero.
+    unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Validate the frame, split the blob and run `body`. Returns the words written, -1 for a
+    /// malformed frame or panic and `-needed` when `out_cap` is too small.
+    ///
+    /// # Safety
+    ///
+    /// See the exported functions.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        fields: usize,
+        columns: usize,
+        words: usize,
+        trailer: usize,
+        body: Body,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(blob as usize, blob_len, out as usize, out_bytes)
+                || overlaps(twin as usize, twin_len, out as usize, out_bytes)
+                || overlaps(ints as usize, ints_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(blob), Some(twin), Some(ints)) = (
+                unsafe { bytes(blob, blob_len) },
+                unsafe { bytes(twin, twin_len) },
+                unsafe { bytes(ints, ints_len) },
+            ) else {
+                return -1;
+            };
+            if ints.len() != count * columns * 8 {
+                return -1;
+            }
+            if count == 0 {
+                return if blob.is_empty() && twin.is_empty() {
+                    0
+                } else {
+                    -1
+                };
+            }
+            let all: Vec<i64> = ints
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|w| i64::from_le_bytes(*w))
+                .collect();
+            let mut values: Vec<&[u8]> = Vec::with_capacity(count * fields);
+            if !split(blob, twin, count * fields, &mut values) {
+                return -1;
+            }
+            let need = count * words + trailer;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from every input.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            body(&values, &all, count, out);
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Word-at-a-time multiplicative hasher for the per-batch duplicate sets and maps.
+    #[derive(Default)]
+    struct Fx(u64);
+
+    impl Fx {
+        #[inline(always)]
+        fn mix(&mut self, w: u64) {
+            self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+
+    impl Hasher for Fx {
+        #[inline(always)]
+        fn write(&mut self, bytes: &[u8]) {
+            let (chunks, tail) = bytes.as_chunks::<8>();
+            for c in chunks {
+                self.mix(u64::from_le_bytes(*c));
+            }
+            if !tail.is_empty() {
+                let mut w = [0u8; 8];
+                w[..tail.len()].copy_from_slice(tail);
+                self.mix(u64::from_le_bytes(w));
+            }
+        }
+
+        #[inline(always)]
+        fn write_u64(&mut self, n: u64) {
+            self.mix(n);
+        }
+
+        #[inline(always)]
+        fn write_i64(&mut self, n: i64) {
+            self.mix(n as u64);
+        }
+
+        #[inline(always)]
+        fn write_usize(&mut self, n: usize) {
+            self.mix(n as u64);
+        }
+
+        #[inline(always)]
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+
+    type Build = BuildHasherDefault<Fx>;
+
+    #[inline(always)]
+    fn set<T>(count: usize) -> HashSet<T, Build> {
+        HashSet::with_capacity_and_hasher(count, Build::default())
+    }
+
+    #[inline(always)]
+    fn map<K, V>(count: usize) -> HashMap<K, V, Build> {
+        HashMap::with_capacity_and_hasher(count, Build::default())
+    }
+
+    /// PHP `unpack('N', hash('fnv1a32', $s, true))[1]` (`LOWER`: of `strtolower($s)`), 0 for an
+    /// empty string.
+    #[inline(always)]
+    pub(crate) fn fnv32<const LOWER: bool>(s: &[u8]) -> i64 {
+        if s.is_empty() {
+            return 0;
+        }
+        let mut h = FNV_OFFSET;
+        for b in s {
+            let b = if LOWER { b.to_ascii_lowercase() } else { *b };
+            h = (h ^ u32::from(b)).wrapping_mul(FNV_PRIME);
+        }
+        i64::from(h)
+    }
+
+    /// PHP `trim($s)`: strips " \t\n\r\0\x0B".
+    #[inline(always)]
+    pub(crate) fn php_trim(s: &[u8]) -> &[u8] {
+        let keep = |b: &u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = s.iter().position(keep).unwrap_or(s.len());
+        let end = s.iter().rposition(keep).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    #[inline(always)]
+    fn ends_ci(s: &[u8], suffix: &[u8]) -> bool {
+        s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+
+    #[inline(always)]
+    fn trailing_digits(s: &[u8]) -> usize {
+        s.iter().rev().take_while(|b| b.is_ascii_digit()).count()
+    }
+
+    #[inline(always)]
+    fn digits(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |a, d| a * 10 + i64::from(d - b'0'))
+    }
+
+    const LOW: u64 = 0x0101_0101_0101_0101;
+
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+
+    /// Whether `word` may hold byte `b` (exact when false; a hit is rechecked bytewise).
+    #[inline(always)]
+    fn may_hold(word: u64, b: u8) -> bool {
+        let x = word ^ (LOW * u64::from(b));
+        x.wrapping_sub(LOW) & !x & HIGH != 0
+    }
+
+    /// First offset `k >= from` holding one of `bytes` for which `hit(k)` holds, or -1. Reads
+    /// eight bytes at a time and inspects only words that may hold one of them.
+    #[inline(always)]
+    fn scan<const N: usize>(
+        hay: &[u8],
+        from: usize,
+        bytes: [u8; N],
+        mut hit: impl FnMut(usize) -> bool,
+    ) -> i64 {
+        let mut i = from;
+        while i + 8 <= hay.len() {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&hay[i..i + 8]);
+            let word = u64::from_le_bytes(w);
+            if bytes.iter().any(|b| may_hold(word, *b)) {
+                for k in i..i + 8 {
+                    if bytes.contains(&hay[k]) && hit(k) {
+                        return k as i64;
+                    }
+                }
+            }
+            i += 8;
+        }
+        for k in i..hay.len() {
+            if bytes.contains(&hay[k]) && hit(k) {
+                return k as i64;
+            }
+        }
+        -1
+    }
+
+    /// First offset of `needle` in `hay`, or -1.
+    #[inline]
+    fn find(hay: &[u8], needle: &[u8]) -> i64 {
+        if needle.is_empty() || hay.len() < needle.len() {
+            return -1;
+        }
+        let n = needle.len();
+        scan(hay, 0, [needle[0]], |k| {
+            k + n <= hay.len() && &hay[k..k + n] == needle
+        })
+    }
+
+    /// VideoContainer case code of a lowercased-or-not extension: 1 matroska, 2 avi, 3 mpeg,
+    /// 4 mpegts, 5 mov, 6 asf, 7 ogg, 0 none.
+    fn extension_code(ext: &[u8]) -> i64 {
+        let mut lower = [0u8; 4];
+        for (d, s) in lower.iter_mut().zip(ext) {
+            *d = s.to_ascii_lowercase();
+        }
+        match &lower[..ext.len()] {
+            b"mkv" | b"mk3d" | b"webm" => 1,
+            b"avi" | b"divx" | b"xvid" => 2,
+            b"mpg" | b"mpeg" | b"vob" | b"m2v" | b"mpv" => 3,
+            b"ts" | b"m2ts" | b"mts" => 4,
+            b"mp4" | b"m4v" | b"mov" | b"qt" => 5,
+            b"wmv" | b"asf" => 6,
+            b"ogv" | b"ogm" => 7,
+            _ => 0,
+        }
+    }
+
+    /// `VideoContainer::fromFileName()` as a case code: the leftmost
+    /// `/\.([a-z0-9]{2,4})"?(?:\s|$)/i` match of the trimmed name decides.
+    pub(crate) fn container_of_name(name: &[u8]) -> i64 {
+        let s = php_trim(name);
+        let len = s.len();
+        for p in 0..len {
+            if s[p] != b'.' {
+                continue;
+            }
+            let run = s[p + 1..]
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric())
+                .count();
+            if !(2..=4).contains(&run) {
+                continue;
+            }
+            let mut r = p + 1 + run;
+            if r < len && s[r] == b'"' {
+                r += 1;
+            }
+            if r == len || matches!(s[r], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+                return extension_code(&s[p + 1..p + 1 + run]);
+            }
+        }
+        0
+    }
+
+    #[inline(always)]
+    fn sample_sep(b: u8) -> bool {
+        matches!(b, b'\\' | b'/' | b'.' | b'_' | b' ' | b'-')
+    }
+
+    /// `preg_match('/(?:^|[\\\\\/._ -])sample(?:[\\\\\/._ -]|$)/i', $name) === 1`.
+    pub(crate) fn is_sample(s: &[u8]) -> bool {
+        let len = s.len();
+        if len < 6 {
+            return false;
+        }
+        (0..=len - 6).any(|i| {
+            let e = i + 6;
+            s[i..e].eq_ignore_ascii_case(b"sample")
+                && (i == 0 || sample_sep(s[i - 1]))
+                && (e == len || sample_sep(s[e]) || (e + 1 == len && s[e] == b'\n'))
+        })
+    }
+
+    // -- MediaSourcePlan --------------------------------------------------------------------------
+
+    fn media_source_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut t = [0i64; 10];
+        t[0] = count as i64;
+        t[7] = -1;
+        let mut largest = -1i64;
+        let mut digest = FNV_BASIS;
+        for (i, row) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let name = v[i];
+            let real = col(ints, count, 0, i).clamp(0, VALUE_CAP);
+            let posted = col(ints, count, 1, i).clamp(0, SEGMENT_CAP);
+            let part = col(ints, count, 2, i);
+            let part = if part > 0 {
+                part.min(PART_CAP)
+            } else {
+                DEFAULT_PART
+            };
+            let budget = col(ints, count, 4, i).clamp(0, VALUE_CAP);
+            let container = container_of_name(name);
+            let sample = is_sample(name);
+            let expected = if real > 0 {
+                (real + part - 1) / part
+            } else {
+                0
+            };
+            let segments = if posted > 0 {
+                posted
+            } else {
+                expected.min(SEGMENT_CAP)
+            };
+            let have = col(ints, count, 3, i).clamp(0, segments);
+            let want = segments.min(budget / part + have);
+            let head_end = have.max((want + 1) / 2);
+            let tail = want - head_end;
+            let tail_start = segments - tail;
+            let fetch = head_end - have + tail;
+            let fetch_bytes = fetch * part;
+            let decision: i64 = if container == 0 {
+                1
+            } else if sample {
+                2
+            } else if segments == 0 {
+                3
+            } else if want == segments {
+                6
+            } else if fetch == 0 {
+                7
+            } else if tail > 0 {
+                5
+            } else {
+                4
+            };
+            let hash = fnv32::<true>(name);
+            let word = decision
+                | container << 4
+                | i64::from(sample) << 7
+                | (name.len().min(0xFFFF) as i64) << 8
+                | segments << 24;
+            *row = [
+                word,
+                hash,
+                head_end | tail_start << 24,
+                fetch_bytes,
+                expected,
+            ];
+            match decision {
+                1 => t[3] += 1,
+                2 => t[2] += 1,
+                7 => t[8] += 1,
+                4..=6 => {
+                    t[1] += 1;
+                    t[4] += i64::from(decision == 6);
+                    t[5] = (t[5] + fetch_bytes).min(TOTAL_CAP);
+                    t[6] += want;
+                    if real > largest {
+                        largest = real;
+                        t[7] = i as i64;
+                    }
+                }
+                _ => {}
+            }
+            digest = fnv(digest, word ^ hash << 16 ^ fetch_bytes);
+        }
+        t[9] = digest;
+        trailer.copy_from_slice(&t);
+    }
+
+    // -- Par2FileEntry ----------------------------------------------------------------------------
+
+    /// (role, number) of a PAR2-described name, given its container code. Roles: 6 `.volN+M.par2`
+    /// (number `N | M << 20`), 5 `.par2`, 2 `.partN.rar` (number N) or `.rar`, 3 `.rNN`, 4 `.NNN`,
+    /// 7 `.7z`, 8 `.zip`, 1 a video container, 9 `.nfo`, 10 audio, 11 image, else 0; number -1 when
+    /// absent.
+    pub(crate) fn par2_role(name: &[u8], container: i64) -> (i64, i64) {
+        let len = name.len();
+        if ends_ci(name, b".par2") {
+            let stem = &name[..len - 5];
+            let d2 = trailing_digits(stem);
+            if (1..=5).contains(&d2) && stem.len() > d2 && stem[stem.len() - d2 - 1] == b'+' {
+                let before = &stem[..stem.len() - d2 - 1];
+                let d1 = trailing_digits(before);
+                if (1..=5).contains(&d1) && ends_ci(&before[..before.len() - d1], b".vol") {
+                    let n = digits(&before[before.len() - d1..]);
+                    let m = digits(&stem[stem.len() - d2..]);
+                    return (6, n | m << 20);
+                }
+            }
+            return (5, -1);
+        }
+        if ends_ci(name, b".rar") {
+            let stem = &name[..len - 4];
+            let d = trailing_digits(stem);
+            if (1..=4).contains(&d) && ends_ci(&stem[..stem.len() - d], b".part") {
+                return (2, digits(&stem[stem.len() - d..]));
+            }
+            return (2, -1);
+        }
+        let d = trailing_digits(name);
+        if (2..=3).contains(&d) && ends_ci(&name[..len - d], b".r") {
+            return (3, digits(&name[len - d..]));
+        }
+        if d == 3 && len > 3 && name[len - 4] == b'.' {
+            return (4, digits(&name[len - 3..]));
+        }
+        if ends_ci(name, b".7z") {
+            return (7, -1);
+        }
+        if ends_ci(name, b".zip") {
+            return (8, -1);
+        }
+        if container != 0 {
+            return (1, -1);
+        }
+        if ends_ci(name, b".nfo") {
+            return (9, -1);
+        }
+        if [b".mp3".as_slice(), b".flac", b".m4a", b".ogg", b".wav"]
+            .iter()
+            .any(|s| ends_ci(name, s))
+        {
+            return (10, -1);
+        }
+        if [b".jpg".as_slice(), b".jpeg", b".png", b".gif"]
+            .iter()
+            .any(|s| ends_ci(name, s))
+        {
+            return (11, -1);
+        }
+        (0, -1)
+    }
+
+    /// 0 empty, 2 32 lower-case hex digits, 1 32 hex digits with an upper-case one, 3 other.
+    pub(crate) fn hash_class(h: &[u8]) -> i64 {
+        if h.is_empty() {
+            return 0;
+        }
+        if h.len() != 32 || !h.iter().all(u8::is_ascii_hexdigit) {
+            return 3;
+        }
+        if h.iter().any(u8::is_ascii_uppercase) {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn par2_entry_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut t = [0i64; 10];
+        t[0] = count as i64;
+        let mut names = set::<&[u8]>(count);
+        let mut hashes = set::<[u8; 32]>(count);
+        let mut digest = FNV_BASIS;
+        for (i, row) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let name = v[i];
+            let hash = v[count + i];
+            let raw = col(ints, count, 0, i);
+            let container = container_of_name(name);
+            let (role, number) = par2_role(name, container);
+            let class = hash_class(hash);
+            let slice = if raw > 0 { raw.min(SLICE_BYTES) } else { 0 };
+            let size = raw.clamp(0, VALUE_CAP);
+            let dup_name = !names.insert(name);
+            let mut prefix = -1;
+            let mut dup_hash = false;
+            if class == 1 || class == 2 {
+                let mut lower = [0u8; 32];
+                for (d, s) in lower.iter_mut().zip(hash) {
+                    *d = s.to_ascii_lowercase();
+                }
+                dup_hash = !hashes.insert(lower);
+                prefix = lower[..15].iter().fold(0i64, |a, b| {
+                    a << 4
+                        | i64::from(if b.is_ascii_digit() {
+                            b - b'0'
+                        } else {
+                            b - b'a' + 10
+                        })
+                });
+                t[5] += 1;
+            }
+            let flags = i64::from(dup_name)
+                | i64::from(dup_hash) << 1
+                | i64::from(is_sample(name)) << 2
+                | i64::from(raw <= 0) << 3
+                | i64::from(name.is_empty()) << 4;
+            let name_hash = fnv32::<false>(name);
+            let word = role
+                | class << 4
+                | flags << 8
+                | container << 16
+                | (name.len().min(0xFFFF) as i64) << 20
+                | slice << 36;
+            *row = [word, name_hash, prefix, size, number];
+            match role {
+                1 => t[1] += 1,
+                2 | 3 | 4 | 7 | 8 => t[2] += 1,
+                5 | 6 => t[3] += 1,
+                _ => t[4] += 1,
+            }
+            t[6] += i64::from(dup_name);
+            t[7] += i64::from(dup_hash);
+            t[8] += size;
+            digest = fnv(digest, word ^ name_hash << 12 ^ number);
+        }
+        t[9] = digest;
+        trailer.copy_from_slice(&t);
+    }
+
+    // -- PersistenceMetrics -----------------------------------------------------------------------
+
+    /// 1 media, 2 audio, 3 video, 4 nfo, 5 file (case-insensitive, trimmed), else 0.
+    pub(crate) fn persistence_kind(kind: &[u8]) -> i64 {
+        let k = php_trim(kind);
+        [b"media".as_slice(), b"audio", b"video", b"nfo", b"file"]
+            .iter()
+            .position(|s| k.eq_ignore_ascii_case(s))
+            .map_or(0, |p| p as i64 + 1)
+    }
+
+    #[inline(always)]
+    fn latency_bucket(micros: i64) -> i64 {
+        match micros {
+            ..1_000 => 0,
+            ..10_000 => 1,
+            ..100_000 => 2,
+            ..1_000_000 => 3,
+            _ => 4,
+        }
+    }
+
+    fn persistence_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 4);
+        let mut t = [0i64; 16];
+        t[0] = count as i64;
+        t[12] = -1;
+        let mut max = -1i64;
+        let mut seen = set::<(i64, i64)>(count);
+        let mut releases = map::<i64, i64>(count);
+        let mut digest = FNV_BASIS;
+        for (i, row) in rows.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let kind = persistence_kind(v[i]);
+            let error = php_trim(v[count + i]);
+            let release = col(ints, count, 0, i);
+            let micros = col(ints, count, 1, i).clamp(0, VALUE_CAP);
+            let written = col(ints, count, 2, i).clamp(0, SEGMENT_CAP);
+            let bytes = col(ints, count, 3, i).clamp(0, VALUE_CAP);
+            let ok = error.is_empty();
+            let dup = !seen.insert((release, kind));
+            let next = releases.len() as i64;
+            let ordinal = *releases.entry(release).or_insert(next);
+            let flags = i64::from(ok)
+                | i64::from(dup) << 1
+                | i64::from(release <= 0) << 2
+                | i64::from(kind == 0) << 3;
+            let hash = fnv32::<false>(error);
+            let word = kind
+                | flags << 4
+                | latency_bucket(micros) << 8
+                | written << 12
+                | (error.len().min(0xFFF) as i64) << 40;
+            *row = [word, hash, micros, ordinal];
+            t[1 + kind as usize] += 1;
+            t[7] += i64::from(!ok);
+            t[8] += i64::from(dup);
+            t[10] += micros;
+            if micros > max {
+                max = micros;
+                t[12] = i as i64;
+            }
+            t[13] += written;
+            t[14] += bytes;
+            digest = fnv(digest, word ^ hash << 20 ^ micros);
+        }
+        t[9] = releases.len() as i64;
+        t[11] = max;
+        t[15] = digest;
+        trailer.copy_from_slice(&t);
+    }
+
+    // -- ArchivedMediaSlicer ----------------------------------------------------------------------
+
+    /// A range bound of 1-18 ASCII digits, else -1.
+    #[inline(always)]
+    pub(crate) fn range_bound(s: &[u8]) -> i64 {
+        if s.is_empty() || s.len() > 18 || !s.iter().all(u8::is_ascii_digit) {
+            -1
+        } else {
+            digits(s)
+        }
+    }
+
+    fn slicer_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut t = [0i64; 10];
+        t[0] = count as i64;
+        t[6] = -1;
+        let mut digest = FNV_BASIS;
+        for (i, row) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let name = v[i];
+            let range = v[count + i];
+            let (start, end) = match range.iter().position(|b| *b == b'-') {
+                Some(p) => (range_bound(&range[..p]), range_bound(&range[p + 1..])),
+                None => (range_bound(range), -1),
+            };
+            let size = col(ints, count, 0, i).clamp(0, VALUE_CAP);
+            let next = col(ints, count, 1, i);
+            let has_next = next >= 0;
+            let next = next.min(VALUE_CAP);
+            let data_len = col(ints, count, 2, i).clamp(0, VALUE_CAP);
+            let part = col(ints, count, 3, i);
+            let part = if part > 0 {
+                part.min(PART_CAP)
+            } else {
+                DEFAULT_PART
+            };
+            let container = container_of_name(name);
+            let sample = is_sample(name);
+            let in_data = start >= 0 && start < data_len;
+            let flags = i64::from(start < 0)
+                | i64::from(end < 0) << 1
+                | i64::from(start >= 0 && end >= 0 && end < start) << 2
+                | i64::from(sample) << 3
+                | i64::from(has_next) << 4
+                | i64::from(in_data) << 5
+                | i64::from(container == 0) << 6;
+            let (in_volume_end, available, segment, segments) = if start >= 0 {
+                let ive = if has_next && next > start {
+                    next - 1
+                } else {
+                    start + size - 1
+                };
+                let available = if in_data {
+                    (ive.min(data_len - 1) - start + 1).max(0)
+                } else {
+                    0
+                };
+                let first = start / part;
+                let last = if ive >= start { ive / part } else { first };
+                (ive, available, first, last - first + 1)
+            } else {
+                (-1, 0, -1, 0)
+            };
+            let word = flags | container << 8 | segments.min(SEGMENT_CAP) << 12;
+            *row = [word, start, end, in_volume_end, available, segment];
+            if in_data {
+                t[1] += 1;
+                t[5] += available;
+                if !sample && container != 0 {
+                    t[4] += 1;
+                    if t[6] < 0 || size > t[7] {
+                        t[6] = i as i64;
+                        t[7] = size;
+                    }
+                }
+            } else {
+                t[2] += 1;
+            }
+            t[3] += i64::from(sample);
+            t[8] += i64::from(flags & 7 != 0);
+            digest = fnv(digest, word ^ available << 12 ^ start);
+        }
+        t[9] = digest;
+        trailer.copy_from_slice(&t);
+    }
+
+    // -- ContainerSplicer -------------------------------------------------------------------------
+
+    /// VideoContainer value code: 1 matroska, 2 avi, 3 mpeg, 4 mpegts, 5 mov, 6 asf, 7 ogg, 0 other.
+    pub(crate) fn container_code(c: &[u8]) -> i64 {
+        match c {
+            b"matroska" => 1,
+            b"avi" => 2,
+            b"mpeg" => 3,
+            b"mpegts" => 4,
+            b"mov" => 5,
+            b"asf" => 6,
+            b"ogg" => 7,
+            _ => 0,
+        }
+    }
+
+    #[inline(always)]
+    fn be32(s: &[u8], at: usize) -> i64 {
+        i64::from(u32::from_be_bytes([s[at], s[at + 1], s[at + 2], s[at + 3]]))
+    }
+
+    /// Walk the head's top-level ISO boxes: (flags, boxes, end of a complete `moov` or -1). Flags:
+    /// 1 `ftyp` first, 2 `moov` found, 4 `mdat` found, 8 `moov` before any `mdat`, 16 bad size.
+    pub(crate) fn mp4_head(head: &[u8]) -> (i64, i64, i64) {
+        let len = head.len() as i64;
+        let (mut pos, mut flags, mut boxes) = (0i64, 0i64, 0i64);
+        let (mut moov, mut moov_end, mut mdat) = (-1i64, -1i64, -1i64);
+        while pos + 8 <= len {
+            let at = pos as usize;
+            let mut size = be32(head, at);
+            let kind = &head[at + 4..at + 8];
+            let mut header = 8;
+            if size == 1 {
+                if pos + 16 > len {
+                    break;
+                }
+                let mut w = [0u8; 8];
+                w.copy_from_slice(&head[at + 8..at + 16]);
+                let large = u64::from_be_bytes(w);
+                if large > 1 << 62 {
+                    flags |= 16;
+                    break;
+                }
+                size = large as i64;
+                header = 16;
+            } else if size == 0 {
+                size = len - pos;
+            }
+            if size < header {
+                flags |= 16;
+                break;
+            }
+            boxes += 1;
+            if pos == 0 && kind == b"ftyp" {
+                flags |= 1;
+            }
+            if kind == b"moov" && moov < 0 {
+                moov = pos;
+                moov_end = pos + size;
+                flags |= 2;
+            }
+            if kind == b"mdat" && mdat < 0 {
+                mdat = pos;
+                flags |= 4;
+            }
+            pos += size;
+        }
+        if moov >= 0 && (mdat < 0 || moov < mdat) {
+            flags |= 8;
+        }
+        (
+            flags,
+            boxes,
+            if moov >= 0 && moov_end <= len {
+                moov_end
+            } else {
+                -1
+            },
+        )
+    }
+
+    /// First offset of a `moof`/`mdat`/`free`/`skip`/`moov` box header with a size of at least 8.
+    pub(crate) fn mp4_tail(tail: &[u8]) -> i64 {
+        let found = scan(tail, 4, [b'm', b'f', b's'], |k| {
+            k + 4 <= tail.len()
+                && matches!(
+                    &tail[k..k + 4],
+                    b"moof" | b"mdat" | b"free" | b"skip" | b"moov"
+                )
+                && be32(tail, k - 4) >= 8
+        });
+        if found < 0 { -1 } else { found - 4 }
+    }
+
+    /// First `/\d\d(?:dc|db|wb)/` offset.
+    pub(crate) fn avi_tail(tail: &[u8]) -> i64 {
+        let found = scan(tail, 2, [b'd', b'w'], |k| {
+            k + 2 <= tail.len()
+                && tail[k - 2].is_ascii_digit()
+                && tail[k - 1].is_ascii_digit()
+                && matches!(&tail[k..k + 2], b"dc" | b"db" | b"wb")
+        });
+        if found < 0 { -1 } else { found - 2 }
+    }
+
+    /// `VideoContainer::transportStreamOffsetPhp()` with its stride: (offset, stride) or (-1, 0).
+    pub(crate) fn ts_offset(tail: &[u8]) -> (i64, i64) {
+        let len = tail.len() as i64;
+        for stride in [188i64, 192] {
+            let limit = (len - stride * 4).min(stride);
+            for o in 0..limit.max(0) {
+                let at = |k: i64| tail[(o + k * stride) as usize] == 0x47;
+                if at(0) && at(1) && at(2) && at(3) {
+                    return (o, stride);
+                }
+            }
+        }
+        (-1, 0)
+    }
+
+    fn splicer_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut t = [0i64; 9];
+        t[0] = count as i64;
+        t[6] = -1;
+        let mut digest = FNV_BASIS;
+        for (i, row) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let code = container_code(v[i]);
+            let head = v[count + i];
+            let tail = v[2 * count + i];
+            let offset = col(ints, count, 0, i).clamp(0, VALUE_CAP);
+            let (mut flags, mut boxes, mut head_end, mut tail_start) = (0i64, 0i64, -1i64, -1i64);
+            match code {
+                1 => {
+                    head_end = find(head, MATROSKA_CLUSTER);
+                    tail_start = find(tail, MATROSKA_CLUSTER);
+                }
+                2 => {
+                    let movi = find(head, b"movi");
+                    if movi >= 8 && &head[movi as usize - 8..movi as usize - 4] == b"LIST" {
+                        head_end = movi + 4;
+                    }
+                    tail_start = avi_tail(tail);
+                }
+                3 => {
+                    head_end = 0;
+                    tail_start = find(tail, MPEG_PACK_START);
+                }
+                4 => {
+                    head_end = 0;
+                    let (o, stride) = ts_offset(tail);
+                    if o >= 0 {
+                        tail_start = o;
+                        flags = if stride == 188 { 1 } else { 2 };
+                        if (offset + o) % stride == 0 {
+                            flags |= 4;
+                        }
+                    }
+                }
+                5 => {
+                    (flags, boxes, head_end) = mp4_head(head);
+                    tail_start = mp4_tail(tail);
+                }
+                _ => {}
+            }
+            let status: i64 = if !(1..=5).contains(&code) {
+                2
+            } else if head_end >= 0 && tail_start >= 0 {
+                1
+            } else {
+                0
+            };
+            let joined = if status == 1 {
+                head_end + tail.len() as i64 - tail_start
+            } else {
+                0
+            };
+            let absolute = if tail_start >= 0 {
+                offset + tail_start
+            } else {
+                -1
+            };
+            let word = status
+                | code << 4
+                | flags << 8
+                | boxes.min(0xFFFF) << 16
+                | (head.len().min(0xFF_FFFF) as i64) << 32;
+            *row = [word, head_end, tail_start, joined, absolute];
+            match status {
+                1 => {
+                    t[1] += 1;
+                    t[4] = (t[4] + joined).min(TOTAL_CAP);
+                    if t[6] < 0 || joined > t[5] {
+                        t[5] = joined;
+                        t[6] = i as i64;
+                    }
+                }
+                0 => t[2] += 1,
+                _ => t[3] += 1,
+            }
+            t[7] += i64::from(code == 5 && flags & 8 != 0);
+            digest = fnv(digest, word ^ head_end << 8 ^ tail_start << 24);
+        }
+        t[8] = digest;
+        trailer.copy_from_slice(&t);
+    }
+
+    macro_rules! export644 {
+        ($name:ident, $fields:literal, $columns:literal, $words:literal, $trailer:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `blob` must point to `blob_len` readable bytes (`count * fields` NUL-joined
+            /// values, field-major), `twin` to `twin_len` readable bytes (empty, or the same
+            /// values joined by 0x01), `ints` to `ints_len` readable bytes (`columns` columns
+            /// of `count` packed little-endian int64 words) and `out` to `out_cap` writable,
+            /// aligned int64 words that overlap no input; null pointers are accepted only with
+            /// zero lengths. Bad shapes return -1 before writing, a short output returns
+            /// `-needed` without writing and panics map to -1.
+            #[unsafe(no_mangle)]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                twin: *const u8,
+                twin_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                const BODY: Body = $body;
+                unsafe {
+                    run(
+                        blob, blob_len, twin, twin_len, ints, ints_len, count, out, out_cap,
+                        $fields, $columns, $words, $trailer, BODY,
+                    )
+                }
+            }
+        };
+    }
+
+    export644!(
+        nntmux_w644_media_source_plan_batch,
+        1,
+        5,
+        5,
+        10,
+        media_source_row
+    );
+    export644!(
+        nntmux_w644_par2_file_entry_plan_batch,
+        2,
+        1,
+        5,
+        10,
+        par2_entry_row
+    );
+    export644!(
+        nntmux_w644_persistence_metrics_plan_batch,
+        2,
+        4,
+        4,
+        16,
+        persistence_row
+    );
+    export644!(
+        nntmux_w644_archived_media_slicer_plan_batch,
+        2,
+        4,
+        6,
+        10,
+        slicer_row
+    );
+    export644!(
+        nntmux_w644_container_splicer_plan_batch,
+        3,
+        1,
+        5,
+        9,
+        splicer_row
+    );
+}
+
+#[cfg(test)]
+mod w644_tests {
+    use super::w644_batch::*;
+
+    type Export = unsafe extern "C" fn(
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        usize,
+        *mut i64,
+        usize,
+    ) -> isize;
+
+    /// Field-major frame (0x01 twin when a value holds a NUL), then the int columns.
+    fn call(export: Export, fields: &[&[&[u8]]], columns: &[&[i64]], out: &mut [i64]) -> isize {
+        let count = fields[0].len();
+        let values: Vec<&[u8]> = fields.iter().flat_map(|f| f.iter()).copied().collect();
+        let blob = values.join(&0u8);
+        let twin = if values.iter().any(|v| v.contains(&0)) {
+            values.join(&1u8)
+        } else {
+            Vec::new()
+        };
+        let ints: Vec<u8> = columns
+            .iter()
+            .flat_map(|c| c.iter())
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        unsafe {
+            export(
+                blob.as_ptr(),
+                blob.len(),
+                if twin.is_empty() {
+                    std::ptr::null()
+                } else {
+                    twin.as_ptr()
+                },
+                twin.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn w644_classifiers() {
+        assert_eq!(container_of_name(b"Movie.2024.1080p.mkv"), 1);
+        assert_eq!(container_of_name(b" movie.AVI\" yEnc"), 2);
+        assert_eq!(container_of_name(b"movie.mkv5"), 0);
+        assert_eq!(container_of_name(b"a.nfo.mkv"), 1);
+        assert_eq!(container_of_name(b"a.mkv.nfo"), 0);
+        assert_eq!(container_of_name(b"a.nfo"), 0);
+        assert_eq!(container_of_name(b"a.m2ts"), 4);
+        assert_eq!(container_of_name(b"a.mp4\x0b"), 5);
+        assert!(is_sample(b"x/Sample/y.mkv"));
+        assert!(is_sample(b"x-sample\n"));
+        assert!(!is_sample(b"x-samples.mkv"));
+        assert!(!is_sample(b"xsample.mkv"));
+        assert_eq!(par2_role(b"a.vol03+04.PAR2", 0), (6, 3 | 4 << 20));
+        assert_eq!(par2_role(b"a.vol123456+4.par2", 0), (5, -1));
+        assert_eq!(par2_role(b"a.part07.rar", 0), (2, 7));
+        assert_eq!(par2_role(b"a.part12345.rar", 0), (2, -1));
+        assert_eq!(par2_role(b"a.r01", 0), (3, 1));
+        assert_eq!(par2_role(b"a.001", 0), (4, 1));
+        assert_eq!(par2_role(b"a.1234", 0), (0, -1));
+        assert_eq!(par2_role(b"a.mkv", 1), (1, -1));
+        assert_eq!(par2_role(b"a.JPEG", 0), (11, -1));
+        assert_eq!(hash_class(b"0123456789abcdef0123456789abcdef"), 2);
+        assert_eq!(hash_class(b"0123456789ABCDEF0123456789abcdef"), 1);
+        assert_eq!(hash_class(b"0123"), 3);
+        assert_eq!(persistence_kind(b" NFO\n"), 4);
+        assert_eq!(persistence_kind(b"nfos"), 0);
+        assert_eq!(range_bound(b"0012"), 12);
+        assert_eq!(range_bound(b" 12"), -1);
+        assert_eq!(range_bound(b"1234567890123456789"), -1);
+        assert_eq!(container_code(b"mov"), 5);
+        assert_eq!(fnv32::<false>(b""), 0);
+        assert_eq!(fnv32::<true>(b"A"), fnv32::<false>(b"a"));
+        assert_eq!(php_trim(b"\0 a \x0b"), b"a");
+    }
+
+    #[test]
+    fn w644_container_scans() {
+        let mut head = Vec::new();
+        head.extend_from_slice(&[0, 0, 0, 16]);
+        head.extend_from_slice(b"ftypisom\0\0\0\0");
+        head.extend_from_slice(&[0, 0, 0, 12]);
+        head.extend_from_slice(b"moov\0\0\0\0");
+        head.extend_from_slice(&[0, 0, 0, 0]);
+        head.extend_from_slice(b"mdat");
+        assert_eq!(mp4_head(&head), (1 | 2 | 4 | 8, 3, 28));
+        assert_eq!(mp4_head(b"\0\0\0\x04free"), (16, 0, -1));
+        assert_eq!(mp4_tail(b"xx\0\0\0\x07mdat\0\0\0\x08moof"), 10);
+        assert_eq!(avi_tail(b"xx1dc01wb"), 5);
+        let mut ts = vec![0u8; 3 + 188 * 5];
+        for k in 0..5 {
+            ts[3 + k * 188] = 0x47;
+        }
+        assert_eq!(ts_offset(&ts), (3, 188));
+    }
+
+    #[test]
+    fn w644_rows_and_frames() {
+        let mut out = vec![0i64; 5 + 10];
+        let written = call(
+            nntmux_w644_media_source_plan_batch,
+            &[&[b"Movie.mkv"]],
+            &[&[10 * 716_800], &[0], &[0], &[2], &[4 * 716_800]],
+            &mut out,
+        );
+        assert_eq!(written, 15);
+        assert_eq!(out[0] & 0xF, 5);
+        assert_eq!(out[2], 3 | 7 << 24);
+        assert_eq!(out[3], 4 * 716_800);
+        assert_eq!(&out[5..14], &[1, 1, 0, 0, 0, 4 * 716_800, 6, 0, 0]);
+
+        let mut out = vec![0i64; 2 * 4 + 16];
+        let written = call(
+            nntmux_w644_persistence_metrics_plan_batch,
+            &[&[b"nfo", b"NFO "], &[b"", b"disk full"]],
+            &[&[7, 7], &[500, 20_000], &[1, 2], &[10, 20]],
+            &mut out,
+        );
+        assert_eq!(written, 24);
+        assert_eq!(out[4] & 0xFF, 4 | 2 << 4);
+        assert_eq!(
+            &out[8..23],
+            &[2, 0, 0, 0, 0, 2, 0, 1, 1, 1, 20_500, 20_000, 1, 3, 30]
+        );
+
+        let mut out = vec![0i64; 6 + 10];
+        let written = call(
+            nntmux_w644_archived_media_slicer_plan_batch,
+            &[&[b"a.mkv"], &[b"100-\0x"]],
+            &[&[1000], &[-1], &[600], &[256]],
+            &mut out,
+        );
+        assert_eq!(written, 16);
+        assert_eq!(&out[1..6], &[100, -1, 1099, 500, 0]);
+
+        let mut short = vec![0i64; 3];
+        let need = call(
+            nntmux_w644_container_splicer_plan_batch,
+            &[&[b"mpeg"], &[b""], &[b"\0\0\x01\xBA"]],
+            &[&[0]],
+            &mut short,
+        );
+        assert_eq!(need, -14);
+        let mut out = vec![0i64; 14];
+        let written = call(
+            nntmux_w644_container_splicer_plan_batch,
+            &[&[b"mpeg"], &[b""], &[b"x\0\0\x01\xBA"]],
+            &[&[0]],
+            &mut out,
+        );
+        assert_eq!(written, 14);
+        assert_eq!(&out[1..5], &[0, 1, 4, 1]);
+
+        let mut out = vec![0i64; 15];
+        let empty = unsafe {
+            nntmux_w644_par2_file_entry_plan_batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(empty, 0);
+        let bad = unsafe {
+            nntmux_w644_par2_file_entry_plan_batch(
+                b"a".as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(bad, -1);
+        let base = out.as_mut_ptr() as *const u8;
+        let overlap = unsafe {
+            nntmux_w644_par2_file_entry_plan_batch(
+                base,
+                8,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(overlap, -1);
+        let misaligned = unsafe {
+            nntmux_w644_par2_file_entry_plan_batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                (out.as_mut_ptr() as *mut u8).add(1) as *mut i64,
+                4,
+            )
+        };
+        assert_eq!(misaligned, -1);
+    }
+}
