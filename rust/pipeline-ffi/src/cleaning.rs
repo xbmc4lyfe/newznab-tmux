@@ -45406,3 +45406,1077 @@ pub mod w601_monitoring_bounded_query_grafana_jwt_metric_family_exporter_cloudfl
         }
     }
 }
+
+pub mod w611_categorizers_misc_movie_music_pc_anime_processor {
+    //! Wave 61.1 per-item token plans for MiscCategorizer, MovieCategorizer, MusicCategorizer,
+    //! PcCategorizer and AnimeProcessor. Every export follows the Wave 60.3 contract: items are
+    //! NUL-joined in `blob`, or concatenated with their byte lengths in `lens` when it is
+    //! non-null; one `i64` word per item is written, then a fixed rollup trailer. Returns the
+    //! word count, `-needed` when `out_cap` (in words) is too small, or -1 when it declines
+    //! (null `out`, null `blob` with a length, `count` other than the number of NUL-separated
+    //! items, or `lens` that do not tile `blob`). Tokens are the runs of ASCII alphanumerics,
+    //! matched lowercase, as PHP `preg_split('/[^a-z0-9]+/', strtolower($name))`.
+
+    use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_ITEMS: usize = 1 << 22;
+    const DECLINE: isize = -1;
+
+    pub const MISC_TRAILER: usize = 29;
+    pub const MOVIE_TRAILER: usize = 42;
+    pub const MUSIC_TRAILER: usize = 32;
+    pub const PC_TRAILER: usize = 37;
+    pub const ANIME_TRAILER: usize = 35;
+
+    /// PHP `trim()` without a character list.
+    fn trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    /// PHP `explode('|', $item, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(item: &[u8]) -> [&[u8]; N] {
+        let mut out = [&item[..0]; N];
+        let mut rest = item;
+        for slot in out.iter_mut().take(N - 1) {
+            match rest.iter().position(|&b| b == b'|') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    return out;
+                }
+            }
+        }
+        out[N - 1] = rest;
+        out
+    }
+
+    /// `in_array(strtolower(trim($raw)), ['1', 'true', 'yes', 'on'], true)`.
+    fn truthy(raw: &[u8]) -> bool {
+        let t = trim(raw);
+        [&b"1"[..], b"true", b"yes", b"on"].iter().any(|k| t.eq_ignore_ascii_case(k))
+    }
+
+    /// Lowercase copy of a token of at most 16 bytes (longer tokens match no table key).
+    #[inline]
+    fn lower_key<'a>(t: &[u8], buf: &'a mut [u8; 16]) -> Option<&'a [u8]> {
+        if t.len() > 16 {
+            return None;
+        }
+        for (d, &s) in buf.iter_mut().zip(t) {
+            *d = s.to_ascii_lowercase();
+        }
+        Some(&buf[..t.len()])
+    }
+
+    /// Calls `f(token, start)` for every run of ASCII alphanumerics; returns the run count.
+    #[inline]
+    fn for_each_token(s: &[u8], mut f: impl FnMut(&[u8], usize)) -> i64 {
+        let (mut i, mut n) = (0, 0);
+        while i < s.len() {
+            if !s[i].is_ascii_alphanumeric() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < s.len() && s[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            f(&s[start..i], start);
+            n += 1;
+        }
+        n
+    }
+
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    fn digits_value(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |a, &d| a * 10 + i64::from(d - b'0'))
+    }
+
+    fn lead_digits(s: &[u8]) -> usize {
+        s.iter().take_while(|b| b.is_ascii_digit()).count()
+    }
+
+    /// A four-digit 19xx/20xx token.
+    fn year(t: &[u8]) -> Option<i64> {
+        (t.len() == 4 && all_digits(t) && (t.starts_with(b"19") || t.starts_with(b"20"))).then(|| digits_value(t))
+    }
+
+    fn year_code(t: &[u8]) -> Option<i64> {
+        year(t).map(|y| y - 1899)
+    }
+
+    trait Plan {
+        const TRAILER: usize;
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64;
+        fn finish(&mut self, tail: &mut [i64]);
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+    /// `out_cap` `i64`s).
+    unsafe fn run<P: Plan>(
+        mut plan: P,
+        blob: *const u8,
+        blob_len: usize,
+        lens: *const i64,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || (blob.is_null() && blob_len != 0)
+                || blob_len > isize::MAX as usize
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+                || (!lens.is_null() && !(lens as usize).is_multiple_of(std::mem::align_of::<i64>()))
+            {
+                return DECLINE;
+            }
+            let words = count + P::TRAILER;
+            if words > out_cap {
+                return -(words as isize);
+            }
+            if overlaps(blob as usize, blob_len, out as usize, words * 8)
+                || (!lens.is_null() && overlaps(lens as usize, count * 8, out as usize, words * 8))
+            {
+                return DECLINE;
+            }
+            // A null pointer is never sliced, even for an empty batch.
+            let bytes: &[u8] = if blob_len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(blob, blob_len) } };
+            // `words` words, checked against `out_cap` above; disjoint from the inputs.
+            let dst = unsafe { std::slice::from_raw_parts_mut(out, words) };
+            let (rows, tail) = dst.split_at_mut(count);
+            tail.fill(0);
+            if lens.is_null() {
+                if count == 0 {
+                    if !bytes.is_empty() {
+                        return DECLINE;
+                    }
+                } else {
+                    let mut n = 0;
+                    for entry in bytes.split(|&b| b == 0) {
+                        if n >= count {
+                            return DECLINE;
+                        }
+                        rows[n] = plan.item(entry, tail);
+                        n += 1;
+                    }
+                    if n != count {
+                        return DECLINE;
+                    }
+                }
+            } else {
+                let lens: &[i64] = if count == 0 { &[] } else { unsafe { std::slice::from_raw_parts(lens, count) } };
+                let mut total = 0usize;
+                for &len in lens {
+                    let Some(next) = usize::try_from(len).ok().and_then(|l| total.checked_add(l)) else {
+                        return DECLINE;
+                    };
+                    total = next;
+                }
+                if total != bytes.len() {
+                    return DECLINE;
+                }
+                let mut offset = 0usize;
+                for (slot, &len) in rows.iter_mut().zip(lens) {
+                    let end = offset + len as usize;
+                    *slot = plan.item(&bytes[offset..end], tail);
+                    offset = end;
+                }
+            }
+            plan.finish(tail);
+            words as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // ---- MiscCategorizer ----
+
+    fn misc_table(t: &[u8]) -> i64 {
+        match t {
+            b"dataset" | b"datasets" | b"dump" | b"backup" | b"database" | b"sql" | b"csv" => 1,
+            b"sample" | b"proof" => 2,
+            b"password" | b"passworded" | b"pw" => 4,
+            b"repost" | b"reup" | b"reupload" => 8,
+            b"part" | b"vol" | b"volume" => 16,
+            b"480p" | b"720p" | b"1080p" | b"2160p" | b"x264" | b"x265" | b"h264" | b"h265" | b"hevc" | b"bluray"
+            | b"webrip" | b"webdl" | b"hdtv" | b"dvdrip" | b"bdrip" | b"flac" | b"mp3" | b"aac" | b"ac3" | b"dts" => 128,
+            _ => 0,
+        }
+    }
+
+    fn misc_ext_class(ext: &[u8]) -> i64 {
+        match ext {
+            b"rar" | b"zip" | b"7z" | b"tar" | b"gz" | b"bz2" | b"xz" | b"tgz" => 1,
+            b"par2" | b"sfv" | b"md5" => 2,
+            b"nfo" | b"nzb" | b"txt" => 3,
+            b"csv" | b"sql" | b"json" | b"xml" | b"db" => 4,
+            _ if ext.len() == 3 && all_digits(ext) => 1,
+            _ => 5,
+        }
+    }
+
+    fn misc_token_flags(t: &[u8]) -> i64 {
+        let mut buf = [0u8; 16];
+        let mut flags = lower_key(t, &mut buf).map_or(0, misc_table);
+        let len = t.len();
+        if (5..=7).contains(&len) && t[..4].eq_ignore_ascii_case(b"part") && all_digits(&t[4..]) {
+            flags |= 16;
+        }
+        if len >= 16
+            && t.iter().all(u8::is_ascii_hexdigit)
+            && t.iter().any(u8::is_ascii_alphabetic)
+            && t.iter().any(u8::is_ascii_digit)
+        {
+            flags |= 32;
+        }
+        if len >= 10
+            && !t.iter().any(|&b| matches!(b | 0x20, b'a' | b'e' | b'i' | b'o' | b'u' | b'y'))
+            && t.iter().filter(|b| b.is_ascii_alphabetic()).count() >= 6
+        {
+            flags |= 64;
+        }
+        flags
+    }
+
+    fn misc_hash_kind(n: &[u8]) -> i64 {
+        let len = n.len();
+        if len == 36
+            && n.iter().enumerate().all(|(i, &b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() })
+        {
+            return 5;
+        }
+        if len == 0 || !n.iter().all(u8::is_ascii_hexdigit) {
+            return 0;
+        }
+        match len {
+            32 => 1,
+            40 => 2,
+            64 => 3,
+            _ if len >= 16 => 4,
+            _ => 0,
+        }
+    }
+
+    #[derive(Default)]
+    struct Misc {
+        extensions: HashSet<u64>,
+    }
+
+    impl Plan for Misc {
+        const TRAILER: usize = MISC_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let n = trim(item);
+            let len = n.len() as i64;
+            let hash = misc_hash_kind(n);
+            let mut ext_class = 0;
+            if let Some(dot) = n.iter().rposition(|&b| b == b'.') {
+                let ext = &n[dot + 1..];
+                if (1..=5).contains(&ext.len()) && ext.iter().all(u8::is_ascii_alphanumeric) {
+                    let mut buf = [0u8; 5];
+                    let mut key = 0u64;
+                    for (d, &b) in buf.iter_mut().zip(ext) {
+                        *d = b.to_ascii_lowercase();
+                        key = key << 8 | u64::from(*d);
+                    }
+                    self.extensions.insert(key);
+                    ext_class = misc_ext_class(&buf[..ext.len()]);
+                }
+            }
+            let mut flags = 0;
+            let tokens = for_each_token(n, |t, _| flags |= misc_token_flags(t));
+            let (mut vowels, mut digits, mut transitions, mut prev) = (0i64, 0i64, 0i64, 0u8);
+            for &b in n {
+                let class = if b.is_ascii_alphabetic() {
+                    vowels += i64::from(matches!(b | 0x20, b'a' | b'e' | b'i' | b'o' | b'u'));
+                    1
+                } else if b.is_ascii_digit() {
+                    digits += 1;
+                    2
+                } else {
+                    0
+                };
+                transitions += i64::from(class != 0 && prev != 0 && class != prev);
+                prev = class;
+            }
+            let (rule, confidence) = if hash != 0 {
+                (1, if hash <= 3 { 950 } else { 850 })
+            } else if flags & 64 != 0 && flags & 128 == 0 {
+                (2, 780)
+            } else if len >= 20 && !n.iter().any(|&b| matches!(b, b'.' | b'_' | b' ' | b'-')) && transitions >= 4 {
+                (3, 700)
+            } else if ext_class == 1 || ext_class == 2 {
+                (4, 600)
+            } else if flags & 1 != 0 || ext_class == 4 {
+                (5, 650)
+            } else {
+                (0, 0)
+            };
+            tail[rule as usize] += 1;
+            tail[6 + hash as usize] += 1;
+            tail[12 + ext_class as usize] += 1;
+            for (i, slot) in tail[18..26].iter_mut().enumerate() {
+                *slot += flags >> i & 1;
+            }
+            tail[26] += len;
+            tail[27] = tail[27].max(transitions);
+            rule | hash << 3
+                | ext_class << 6
+                | flags << 9
+                | transitions.min(63) << 17
+                | vowels.min(255) << 23
+                | digits.min(255) << 31
+                | confidence << 39
+                | tokens.min(63) << 49
+                | len.min(255) << 55
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[28] = self.extensions.len() as i64;
+        }
+    }
+
+    // ---- MovieCategorizer ----
+
+    /// Token flags, with the resolution tier `<< 16`.
+    fn movie_table(t: &[u8]) -> i64 {
+        match t {
+            b"2160p" | b"4k" | b"uhd" => 1 | 5 << 16,
+            b"720p" => 2 | 3 << 16,
+            b"1080p" | b"1080i" => 2 | 4 << 16,
+            b"480p" => 4 | 1 << 16,
+            b"576p" => 4 | 2 << 16,
+            b"sd" | b"dvdscr" => 4,
+            b"bluray" | b"bdrip" | b"brrip" | b"bd25" | b"bd50" | b"untouched" | b"remux" | b"bdmv" => 8,
+            b"webdl" | b"webrip" | b"web" => 16,
+            b"dvd" | b"dvdr" | b"dvd5" | b"dvd9" | b"dvdrip" => 32,
+            b"cam" | b"camrip" | b"hdcam" | b"ts" | b"hdts" | b"telesync" | b"tc" | b"telecine" => 64,
+            b"3d" | b"sbs" | b"hsbs" | b"mvc" => 128,
+            b"x265" | b"h265" | b"hevc" => 256,
+            b"x264" | b"h264" | b"avc" => 512,
+            b"hdr" | b"hdr10" | b"dv" | b"dovi" => 1024,
+            b"german" | b"french" | b"dutch" | b"spanish" | b"italian" | b"swedish" | b"danish" | b"norwegian" | b"flemish"
+            | b"hebrew" | b"castellano" | b"multisub" | b"nlsub" | b"swesub" | b"ita" | b"deutsch" => 2048,
+            b"trailer" | b"teaser" => 4096,
+            b"xvid" | b"divx" => 8192,
+            b"dts" | b"ac3" | b"aac" | b"ddp5" | b"atmos" | b"truehd" | b"dd5" => 16384,
+            _ => 0,
+        }
+    }
+
+    /// `s` + 1-3 digits + `e` + 1-4 digits.
+    fn season_episode_token(t: &[u8], max_season: usize) -> Option<(i64, i64)> {
+        let rest = t.strip_prefix(b"s").or_else(|| t.strip_prefix(b"S"))?;
+        let s = lead_digits(rest);
+        if !(1..=max_season).contains(&s) || !matches!(rest.get(s), Some(b'e' | b'E')) {
+            return None;
+        }
+        let ep = &rest[s + 1..];
+        ((1..=4).contains(&ep.len()) && all_digits(ep)).then(|| (digits_value(&rest[..s]), digits_value(ep)))
+    }
+
+    #[derive(Default)]
+    struct Movie {
+        years: HashSet<i64>,
+    }
+
+    impl Plan for Movie {
+        const TRAILER: usize = MOVIE_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [name, foreign, webdl] = fields::<3>(item);
+            let n = trim(name);
+            let (foreign, webdl) = (truthy(foreign), truthy(webdl));
+            let (mut flags, mut res, mut year) = (0i64, 0i64, 0i64);
+            let tokens = for_each_token(n, |t, _| {
+                let mut buf = [0u8; 16];
+                let v = lower_key(t, &mut buf).map_or(0, movie_table);
+                flags |= v & 0xffff;
+                res = res.max(v >> 16);
+                if year == 0
+                    && let Some(code) = year_code(t)
+                {
+                    year = code;
+                }
+                if season_episode_token(t, 3).is_some() {
+                    flags |= 32768;
+                }
+            });
+            let codec = if flags & 256 != 0 {
+                1
+            } else if flags & 512 != 0 {
+                2
+            } else if flags & 8192 != 0 {
+                3
+            } else {
+                0
+            };
+            let movieish = flags & (1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 | 8192) != 0 && flags & 32768 == 0;
+            let (rule, confidence) = if !movieish {
+                (0, 0)
+            } else if foreign && flags & 2048 != 0 {
+                (1, 800)
+            } else if flags & 4096 != 0 {
+                (2, 600)
+            } else if flags & 1 != 0 {
+                (3, 900)
+            } else if flags & 128 != 0 {
+                (4, 900)
+            } else if flags & 8 != 0 {
+                (5, 900)
+            } else if flags & 32 != 0 {
+                (6, 850)
+            } else if webdl && flags & 16 != 0 {
+                (7, 850)
+            } else if flags & (2 | 256 | 512) != 0 {
+                (8, 850)
+            } else if !webdl && flags & 16 != 0 {
+                (8, 800)
+            } else if flags & (4 | 8192) != 0 {
+                (9, 800)
+            } else {
+                (10, 600)
+            };
+            tail[rule as usize] += 1;
+            tail[11 + res as usize] += 1;
+            tail[17 + codec as usize] += 1;
+            for (i, slot) in tail[21..37].iter_mut().enumerate() {
+                *slot += flags >> i & 1;
+            }
+            if year != 0 {
+                let y = year + 1899;
+                tail[37] += 1;
+                tail[38] = if tail[38] == 0 { y } else { tail[38].min(y) };
+                tail[39] = tail[39].max(y);
+                self.years.insert(y);
+            }
+            tail[40] += confidence;
+            rule | res << 4
+                | codec << 7
+                | flags << 9
+                | year << 25
+                | i64::from(foreign) << 33
+                | i64::from(webdl) << 34
+                | confidence << 35
+                | tokens.min(63) << 45
+                | (n.len() as i64).min(255) << 51
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[41] = self.years.len() as i64;
+        }
+    }
+
+    // ---- MusicCategorizer ----
+
+    fn music_table(t: &[u8]) -> i64 {
+        match t {
+            b"flac" | b"alac" | b"ape" | b"wav" | b"lossless" | b"hires" => 1,
+            b"mp3" => 2,
+            b"aac" | b"ogg" | b"opus" | b"m4a" | b"wma" | b"vorbis" => 4,
+            b"audiobook" | b"audiobooks" | b"unabridged" | b"abridged" | b"audible" | b"narrated" | b"m4b" => 8,
+            b"mvid" | b"concert" | b"musicvideo" | b"videoclip" | b"videoclips" => 16,
+            b"podcast" | b"podcasts" | b"radio" | b"broadcast" => 32,
+            b"german" | b"french" | b"dutch" | b"spanish" | b"italian" | b"swedish" | b"deutsch" | b"latino" | b"kpop"
+            | b"jpop" | b"cpop" | b"chanson" | b"schlager" => 64,
+            b"discography" | b"anthology" | b"boxset" | b"collection" => 128,
+            b"cdm" | b"cds" => 256 | 1024,
+            b"cd" | b"cdda" | b"vinyl" | b"sacd" | b"web" | b"lp" | b"cassette" | b"tape" | b"cdr" => 256,
+            b"retail" | b"proper" | b"repack" | b"int" => 512,
+            b"single" | b"ep" | b"maxi" => 1024,
+            b"720p" | b"1080p" | b"2160p" | b"x264" | b"x265" => 2048,
+            b"vbr" | b"cbr" => 4096,
+            b"va" | b"various" => 32768,
+            _ => 0,
+        }
+    }
+
+    #[derive(Default)]
+    struct Music {
+        years: HashSet<i64>,
+    }
+
+    impl Plan for Music {
+        const TRAILER: usize = MUSIC_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let [name, foreign] = fields::<2>(item);
+            let n = trim(name);
+            let foreign = truthy(foreign);
+            let (mut flags, mut bitrate, mut year) = (0i64, 0i64, 0i64);
+            let tokens = for_each_token(n, |t, _| {
+                let mut buf = [0u8; 16];
+                flags |= lower_key(t, &mut buf).map_or(0, music_table);
+                let d = lead_digits(t);
+                let suffix = &t[d..];
+                if (2..=4).contains(&d)
+                    && (suffix.eq_ignore_ascii_case(b"kbps") || suffix.eq_ignore_ascii_case(b"kbit") || suffix.eq_ignore_ascii_case(b"k"))
+                {
+                    flags |= 4096;
+                    bitrate = bitrate.max(digits_value(&t[..d]));
+                }
+                if ((1..=3).contains(&d) && suffix.eq_ignore_ascii_case(b"khz")) || ((1..=2).contains(&d) && suffix.eq_ignore_ascii_case(b"bit")) {
+                    flags |= 8192;
+                }
+                if let Some(code) = year_code(t) {
+                    flags |= 16384;
+                    if year == 0 {
+                        year = code;
+                    }
+                }
+            });
+            let format = if flags & 1 != 0 {
+                1
+            } else if flags & 2 != 0 {
+                2
+            } else if flags & 4 != 0 {
+                3
+            } else {
+                0
+            };
+            let (rule, confidence) = if flags & 8 != 0 {
+                (1, if format == 1 || format == 2 { 900 } else { 850 })
+            } else if flags & 32 != 0 {
+                (2, 850)
+            } else if foreign && flags & 64 != 0 && format != 0 {
+                (3, 800)
+            } else if flags & 16 != 0 || (flags & 2048 != 0 && (format != 0 || flags & 128 != 0)) {
+                (4, 850)
+            } else if format == 1 {
+                (5, if flags & 8192 != 0 { 950 } else { 900 })
+            } else if format == 2 {
+                (6, if bitrate >= 192 { 900 } else { 800 })
+            } else if format == 3 || (flags & (128 | 256 | 1024) != 0 && year != 0) {
+                (7, 700)
+            } else {
+                (0, 0)
+            };
+            tail[rule as usize] += 1;
+            tail[8 + format as usize] += 1;
+            for (i, slot) in tail[12..28].iter_mut().enumerate() {
+                *slot += flags >> i & 1;
+            }
+            tail[28] += bitrate;
+            tail[29] = tail[29].max(bitrate);
+            tail[30] += confidence;
+            if year != 0 {
+                self.years.insert(year);
+            }
+            rule | format << 3
+                | flags << 5
+                | bitrate.min(4095) << 21
+                | year << 33
+                | confidence << 41
+                | tokens.min(63) << 51
+                | (n.len() as i64).min(63) << 57
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[31] = self.years.len() as i64;
+        }
+    }
+
+    // ---- PcCategorizer ----
+
+    /// Token flags, with the architecture mask (1 x86, 2 x64, 4 ARM) `<< 16`.
+    fn pc_table(t: &[u8]) -> i64 {
+        match t {
+            b"x86" | b"32bit" => 1 | 1 << 16,
+            b"win32" => 1 | 64 | 1 << 16,
+            b"x64" | b"amd64" | b"64bit" => 1 | 2 << 16,
+            b"win64" => 1 | 64 | 2 << 16,
+            b"arm64" | b"aarch64" | b"arm" => 1 | 4 << 16,
+            b"portable" | b"setup" | b"installer" | b"retail" | b"final" | b"build" | b"pro" | b"professional" | b"enterprise"
+            | b"ultimate" => 1,
+            b"iso" | b"img" | b"bin" | b"cue" | b"nrg" | b"mdf" => 2,
+            b"macos" | b"osx" | b"macosx" | b"dmg" | b"mac" => 4,
+            b"ios" | b"iphone" | b"ipad" | b"ipa" => 8,
+            b"android" | b"apk" | b"xapk" => 16,
+            b"game" | b"games" | b"gog" | b"steam" | b"fitgirl" | b"dodi" | b"codex" | b"plaza" | b"skidrow" | b"reloaded"
+            | b"cpy" | b"empress" | b"razor1911" | b"tenoke" | b"flt" | b"rune" | b"elamigos" | b"prophet" | b"hoodlum"
+            | b"dlc" => 32,
+            b"windows" | b"win" | b"win10" | b"win11" | b"winall" => 64,
+            b"linux" | b"ubuntu" | b"debian" | b"fedora" | b"deb" | b"rpm" | b"appimage" => 128,
+            b"office" | b"adobe" | b"photoshop" | b"autocad" | b"microsoft" | b"vmware" => 256,
+            b"multi" | b"multilingual" => 1024,
+            b"tutorial" | b"course" | b"udemy" | b"lynda" | b"pluralsight" | b"training" => 2048,
+            b"crack" | b"cracked" | b"keygen" | b"patch" | b"serial" | b"activator" | b"regged" | b"incl" => 4096,
+            b"ps4" | b"ps5" | b"xbox" | b"switch" | b"nsp" | b"wii" | b"xci" => 8192,
+            b"0day" | b"zeroday" => 32768,
+            _ => 0,
+        }
+    }
+
+    #[derive(Default)]
+    struct Pc {
+        versions: HashSet<i64>,
+    }
+
+    impl Plan for Pc {
+        const TRAILER: usize = PC_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let n = trim(item);
+            let (mut flags, mut arch_mask, mut version) = (0i64, 0i64, None::<i64>);
+            let tokens = for_each_token(n, |t, _| {
+                let mut buf = [0u8; 16];
+                let v = lower_key(t, &mut buf).map_or(0, pc_table);
+                flags |= v & 0xffff;
+                arch_mask |= v >> 16;
+                if let Some(rest) = t.strip_prefix(b"v").or_else(|| t.strip_prefix(b"V"))
+                    && (1..=4).contains(&rest.len())
+                    && all_digits(rest)
+                {
+                    flags |= 512;
+                    version.get_or_insert(digits_value(rest));
+                }
+                if t.len() >= 6 && t.len() <= 7 && t[..5].eq_ignore_ascii_case(b"multi") && all_digits(&t[5..]) {
+                    flags |= 1024;
+                }
+                if year(t).is_some() {
+                    flags |= 16384;
+                }
+            });
+            let arch = if arch_mask & 4 != 0 {
+                4
+            } else if arch_mask & 3 == 3 {
+                3
+            } else if arch_mask & 2 != 0 {
+                2
+            } else {
+                arch_mask & 1
+            };
+            let platform = if flags & 8 != 0 {
+                4
+            } else if flags & 16 != 0 {
+                5
+            } else if flags & 4 != 0 {
+                2
+            } else if flags & 128 != 0 {
+                3
+            } else if flags & 64 != 0 || arch_mask & 3 != 0 {
+                1
+            } else {
+                0
+            };
+            let (rule, confidence) = if flags & (2048 | 8192) != 0 {
+                (0, 0)
+            } else if flags & 8 != 0 {
+                (1, 900)
+            } else if flags & 16 != 0 {
+                (2, 900)
+            } else if flags & 4 != 0 {
+                (3, 850)
+            } else if flags & 32 != 0 {
+                (4, 850)
+            } else if flags & 2 != 0 {
+                (5, 800)
+            } else if flags & (1 | 64 | 128 | 256 | 512 | 4096 | 32768) != 0 {
+                (6, if flags & 4096 != 0 { 800 } else { 750 })
+            } else {
+                (0, 0)
+            };
+            let v = version.unwrap_or(0);
+            tail[rule as usize] += 1;
+            tail[7 + platform as usize] += 1;
+            tail[13 + arch as usize] += 1;
+            for (i, slot) in tail[18..34].iter_mut().enumerate() {
+                *slot += flags >> i & 1;
+            }
+            tail[34] += confidence;
+            tail[35] = tail[35].max(v);
+            if version.is_some() {
+                self.versions.insert(v);
+            }
+            rule | platform << 3
+                | arch << 6
+                | flags << 9
+                | v << 25
+                | confidence << 39
+                | tokens.min(63) << 49
+                | (n.len() as i64).min(255) << 55
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[36] = self.versions.len() as i64;
+        }
+    }
+
+    // ---- AnimeProcessor ----
+
+    /// Token flags, with the resolution tier `<< 12`.
+    fn anime_table(t: &[u8]) -> i64 {
+        match t {
+            b"480p" => 1 << 12,
+            b"576p" => 2 << 12,
+            b"720p" => 3 << 12,
+            b"1080p" => 4 << 12,
+            b"2160p" | b"4k" => 5 << 12,
+            b"movie" | b"film" | b"gekijouban" => 1,
+            b"ova" | b"ona" | b"oad" | b"special" | b"specials" => 2,
+            b"batch" | b"complete" => 4,
+            b"bd" | b"bdrip" | b"bluray" | b"bdremux" => 8,
+            b"web" | b"webrip" | b"webdl" | b"cr" | b"crunchyroll" | b"funimation" | b"amzn" | b"nf" => 16,
+            b"hevc" | b"x265" | b"h265" => 32,
+            b"x264" | b"h264" | b"avc" => 64,
+            b"10bit" | b"hi10p" | b"hi10" => 128,
+            b"dub" | b"dubbed" | b"dual" | b"dualaudio" => 256,
+            b"sub" | b"subs" | b"subbed" | b"softsub" | b"hardsub" | b"multisub" | b"eng" => 512,
+            b"raw" => 1024,
+            _ => 0,
+        }
+    }
+
+    /// `N{a}xM{b}` with the digit run lengths in the given ranges.
+    fn by_token(t: &[u8], left: (usize, usize), right: (usize, usize)) -> Option<(i64, i64)> {
+        let l = lead_digits(t);
+        if !(left.0..=left.1).contains(&l) || !matches!(t.get(l), Some(b'x' | b'X')) {
+            return None;
+        }
+        let r = &t[l + 1..];
+        ((right.0..=right.1).contains(&r.len()) && all_digits(r)).then(|| (digits_value(&t[..l]), digits_value(r)))
+    }
+
+    fn short_number(t: &[u8]) -> Option<i64> {
+        ((1..=4).contains(&t.len()) && all_digits(t)).then(|| digits_value(t))
+    }
+
+    /// `e` or `ep` followed by 1-4 digits.
+    fn episode_token(t: &[u8]) -> Option<i64> {
+        let rest = t.strip_prefix(b"e").or_else(|| t.strip_prefix(b"E"))?;
+        let rest = rest.strip_prefix(b"p").or_else(|| rest.strip_prefix(b"P")).unwrap_or(rest);
+        short_number(rest)
+    }
+
+    #[derive(Default)]
+    struct Anime {
+        tokens: Vec<(usize, usize)>,
+        subgroups: HashSet<Vec<u8>>,
+    }
+
+    impl Plan for Anime {
+        const TRAILER: usize = ANIME_TRAILER;
+
+        fn item(&mut self, item: &[u8], tail: &mut [i64]) -> i64 {
+            let n = trim(item);
+            let len = n.len();
+            let (mut sg_state, mut sg_len) = (0i64, 0i64);
+            if n.first() == Some(&b'[') {
+                match n.iter().position(|&b| b == b']') {
+                    Some(close) if close > 1 => {
+                        sg_state = 1;
+                        sg_len = (close - 1) as i64;
+                        self.subgroups.insert(n[1..close].to_ascii_lowercase());
+                    }
+                    _ => sg_state = 2,
+                }
+            }
+            let crc = (0..len.saturating_sub(9)).any(|i| {
+                let closer = match n[i] {
+                    b'[' => b']',
+                    b'(' => b')',
+                    _ => return false,
+                };
+                n[i + 9] == closer && n[i + 1..i + 9].iter().all(u8::is_ascii_hexdigit)
+            });
+            self.tokens.clear();
+            let toks = &mut self.tokens;
+            for_each_token(n, |t, start| toks.push((start, start + t.len())));
+            let (mut flags, mut res) = (0i64, 0i64);
+            let (mut k1, mut k2, mut k4) = (None, None, None);
+            for (idx, &(s, e)) in self.tokens.iter().enumerate() {
+                let t = &n[s..e];
+                let mut buf = [0u8; 16];
+                let v = lower_key(t, &mut buf).map_or(0, anime_table);
+                flags |= v & 0xfff;
+                res = res.max(v >> 12);
+                if t.len() == 2 && (t[0] | 0x20) == b'v' && (b'2'..=b'9').contains(&t[1]) {
+                    flags |= 2048;
+                }
+                if let Some((_, h)) = by_token(t, (3, 4), (3, 4)) {
+                    res = res.max(match h {
+                        480 => 1,
+                        576 => 2,
+                        720 => 3,
+                        1080 => 4,
+                        2160 => 5,
+                        _ => 0,
+                    });
+                }
+                if k1.is_none()
+                    && let Some((season, ep)) = season_episode_token(t, 2)
+                {
+                    k1 = Some((s, season, ep));
+                }
+                if k2.is_none()
+                    && let Some((season, ep)) = by_token(t, (1, 2), (1, 3))
+                {
+                    k2 = Some((s, season, ep));
+                }
+                if k4.is_none() {
+                    let word = t.eq_ignore_ascii_case(b"ep") || t.eq_ignore_ascii_case(b"episode");
+                    let next = if word { self.tokens.get(idx + 1).and_then(|&(ns, ne)| short_number(&n[ns..ne])) } else { None };
+                    if let Some(ep) = next.or_else(|| episode_token(t)) {
+                        k4 = Some((s, 0, ep));
+                    }
+                }
+            }
+            let k3 = || {
+                (0..len.saturating_sub(3)).find_map(|i| {
+                    if &n[i..i + 3] != b" - " {
+                        return None;
+                    }
+                    let d = lead_digits(&n[i + 3..]);
+                    (1..=4).contains(&d).then(|| (i, 0, digits_value(&n[i + 3..i + 3 + d])))
+                })
+            };
+            let (kind, (pos, season, episode)) = if let Some(m) = k1 {
+                (1, m)
+            } else if let Some(m) = k2 {
+                (2, m)
+            } else if let Some(m) = k3() {
+                (3, m)
+            } else if let Some(m) = k4 {
+                (4, m)
+            } else {
+                (0, (len, 0, 0))
+            };
+            let mut start = 0;
+            loop {
+                while start < len && matches!(n[start], b' ' | b'_' | b'.') {
+                    start += 1;
+                }
+                if start < len
+                    && n[start] == b'['
+                    && let Some(close) = n[start..].iter().position(|&b| b == b']')
+                {
+                    start += close + 1;
+                    continue;
+                }
+                break;
+            }
+            let bracket = n[start..].iter().position(|&b| b == b'[' || b == b'(').map_or(len, |p| start + p);
+            let end = pos.min(bracket);
+            let title: &[u8] = if end > start {
+                let raw = &n[start..end];
+                let strip = |b: &u8| matches!(*b, b' ' | b'_' | b'.' | b'-');
+                let a = raw.iter().position(|b| !strip(b)).unwrap_or(raw.len());
+                let z = raw.iter().rposition(|b| !strip(b)).map_or(a, |z| z + 1);
+                &raw[a..z]
+            } else {
+                &[]
+            };
+            let words = for_each_token(title, |_, _| {});
+            let plan = if title.is_empty() {
+                0
+            } else if flags & 4 != 0 {
+                4
+            } else if flags & 3 != 0 {
+                3
+            } else if kind != 0 {
+                2
+            } else {
+                1
+            };
+            tail[plan as usize] += 1;
+            tail[5 + kind as usize] += 1;
+            tail[10 + res as usize] += 1;
+            tail[16 + sg_state as usize] += 1;
+            tail[19] += i64::from(crc);
+            for (i, slot) in tail[20..32].iter_mut().enumerate() {
+                *slot += flags >> i & 1;
+            }
+            tail[32] += episode;
+            tail[33] = tail[33].max(episode);
+            plan | kind << 3
+                | res << 6
+                | sg_state << 9
+                | i64::from(crc) << 11
+                | flags << 12
+                | season.min(99) << 24
+                | episode.min(9999) << 31
+                | (title.len() as i64).min(255) << 45
+                | words.min(31) << 53
+                | sg_len.min(31) << 58
+        }
+
+        fn finish(&mut self, tail: &mut [i64]) {
+            tail[34] = self.subgroups.len() as i64;
+        }
+    }
+
+    macro_rules! w611_export {
+        ($(#[$doc:meta])* $name:ident => $plan:ident) => {
+            $(#[$doc])*
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out`
+            /// for `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run($plan::default(), blob, blob_len, lens, count, out, out_cap) }
+            }
+        };
+    }
+
+    w611_export!(
+        /// `MiscCategorizer::w61MiscTokenBatch()`.
+        nntmux_w611_misc_token_batch => Misc
+    );
+    w611_export!(
+        /// `MovieCategorizer::w61MovieTokenBatch()`.
+        nntmux_w611_movie_token_batch => Movie
+    );
+    w611_export!(
+        /// `MusicCategorizer::w61MusicTokenBatch()`.
+        nntmux_w611_music_token_batch => Music
+    );
+    w611_export!(
+        /// `PcCategorizer::w61PcTokenBatch()`.
+        nntmux_w611_pc_token_batch => Pc
+    );
+    w611_export!(
+        /// `AnimeProcessor::w61AnimeReleasePlanBatch()`.
+        nntmux_w611_anime_release_plan_batch => Anime
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        const EXPORTS: [(Export, usize); 5] = [
+            (nntmux_w611_misc_token_batch, MISC_TRAILER),
+            (nntmux_w611_movie_token_batch, MOVIE_TRAILER),
+            (nntmux_w611_music_token_batch, MUSIC_TRAILER),
+            (nntmux_w611_pc_token_batch, PC_TRAILER),
+            (nntmux_w611_anime_release_plan_batch, ANIME_TRAILER),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe { f(blob.as_ptr(), blob.len(), lens.as_ptr(), items.len(), out.as_mut_ptr(), out.len()) };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            if items.iter().all(|i| !i.contains(&0)) {
+                let joined = items.join(&0u8);
+                let mut nul = vec![0i64; 4096];
+                let w = unsafe { f(joined.as_ptr(), joined.len(), ptr::null(), items.len(), nul.as_mut_ptr(), nul.len()) };
+                nul.truncate(w.max(0) as usize);
+                assert_eq!(nul, out, "NUL-joined and length-column calls differ");
+            }
+            out
+        }
+
+        #[test]
+        fn w611_helpers() {
+            assert_eq!(trim(b" \t a b\0\x0b"), b"a b");
+            assert_eq!(fields::<3>(b"a|b|c|d"), [&b"a"[..], b"b", b"c|d"]);
+            assert_eq!(fields::<3>(b"a"), [&b"a"[..], b"", b""]);
+            assert!(truthy(b" YES ") && truthy(b"1") && !truthy(b"01") && !truthy(b""));
+            assert_eq!(season_episode_token(b"S01E02", 3), Some((1, 2)));
+            assert_eq!(season_episode_token(b"s1234e1", 3), None);
+            assert_eq!(by_token(b"1920x1080", (3, 4), (3, 4)), Some((1920, 1080)));
+            assert_eq!(by_token(b"1x18", (1, 2), (1, 3)), Some((1, 18)));
+            assert_eq!(episode_token(b"Ep12"), Some(12));
+            assert_eq!(episode_token(b"e"), None);
+            assert_eq!(misc_hash_kind(b"d41d8cd98f00b204e9800998ecf8427e"), 1);
+            assert_eq!(misc_hash_kind(b"123e4567-e89b-12d3-a456-426614174000"), 5);
+            assert_eq!(misc_ext_class(b"001"), 1);
+        }
+
+        #[test]
+        fn w611_known_words() {
+            let misc = call(nntmux_w611_misc_token_batch, &[b"d41d8cd98f00b204e9800998ecf8427e", b"Backup.Files.rar"]);
+            assert_eq!(misc[0] & 7, 1);
+            assert_eq!(misc[0] >> 3 & 7, 1);
+            assert_eq!(misc[1] & 7, 4);
+            assert_eq!(misc[1] >> 6 & 7, 1);
+            assert_eq!(misc[2 + 28], 1);
+
+            let movie = call(nntmux_w611_movie_token_batch, &[b"Dune.2021.2160p.UHD.BluRay.x265-GRP|0|1", b"Show.S01E02.720p"]);
+            assert_eq!(movie[0] & 15, 3);
+            assert_eq!(movie[0] >> 4 & 7, 5);
+            assert_eq!(movie[0] >> 25 & 255, 2021 - 1899);
+            assert_eq!(movie[1] & 15, 0);
+            assert_eq!(movie[2 + 38], 2021);
+
+            let music = call(nntmux_w611_music_token_batch, &[b"Artist-Album-2020-320kbps-MP3", b"Artist - Album (FLAC 24bit)"]);
+            assert_eq!(music[0] & 7, 6);
+            assert_eq!(music[0] >> 21 & 4095, 320);
+            assert_eq!(music[1] & 7, 5);
+
+            let pc = call(nntmux_w611_pc_token_batch, &[b"Adobe.Photoshop.v2024.x64.Incl.Keygen", b"Game.PS4-GRP"]);
+            assert_eq!(pc[0] & 7, 6);
+            assert_eq!(pc[0] >> 25 & 0x3fff, 2024);
+            assert_eq!(pc[0] >> 6 & 7, 2);
+            assert_eq!(pc[1] & 7, 0);
+
+            let anime = call(nntmux_w611_anime_release_plan_batch, &[b"[SubsPlease] Frieren - 12 (1080p) [ABCD1234].mkv"]);
+            assert_eq!(anime[0] & 7, 2);
+            assert_eq!(anime[0] >> 3 & 7, 3);
+            assert_eq!(anime[0] >> 6 & 7, 4);
+            assert_eq!(anime[0] >> 11 & 1, 1);
+            assert_eq!(anime[0] >> 31 & 0x3fff, 12);
+            assert_eq!(anime[0] >> 45 & 255, 7);
+            assert_eq!(anime[0] >> 58, 10);
+        }
+
+        #[test]
+        fn w611_exports_guard_counts_capacity_and_tail() {
+            let blob = b"a.rar\0b";
+            for (export, trailer) in EXPORTS {
+                let mut out = vec![7i64; 64];
+                unsafe {
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, out.as_mut_ptr(), 64), (trailer + 2) as isize);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, out.as_mut_ptr(), trailer + 1), -((trailer + 2) as isize));
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 3, out.as_mut_ptr(), 64), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 1, out.as_mut_ptr(), 64), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 0, out.as_mut_ptr(), 64), -1);
+                    out.fill(7);
+                    assert_eq!(export(ptr::null(), 0, ptr::null(), 0, out.as_mut_ptr(), 64), trailer as isize);
+                    assert!(out[..trailer].iter().all(|&w| w == 0));
+                    assert_eq!(export(ptr::null(), 0, ptr::null(), 1, out.as_mut_ptr(), 64), (trailer + 1) as isize);
+                    assert_eq!(export(ptr::null(), 2, ptr::null(), 1, out.as_mut_ptr(), 64), -1);
+                    assert_eq!(export(blob.as_ptr(), blob.len(), ptr::null(), 2, ptr::null_mut(), 8), -1);
+                    let lens = [3i64, 4];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), lens.as_ptr(), 2, out.as_mut_ptr(), 64), (trailer + 2) as isize);
+                    let bad = [3i64, 3];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), bad.as_ptr(), 2, out.as_mut_ptr(), 64), -1);
+                    let negative = [-1i64, 8];
+                    assert_eq!(export(blob.as_ptr(), blob.len(), negative.as_ptr(), 2, out.as_mut_ptr(), 64), -1);
+                }
+                let nul = call(export, &[b"a\0b", b"", b"\0"]);
+                assert_eq!(nul.len(), trailer + 3);
+            }
+        }
+    }
+}

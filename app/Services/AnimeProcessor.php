@@ -12,6 +12,7 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\PopulateAniListService as PaList;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 class AnimeProcessor
@@ -678,6 +679,327 @@ class AnimeProcessor
             }
 
             return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    // ========================================================================
+    // WAVE 61.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 6.46x, p99 4.63x; uncommon mean 7.12x, p99 5.76x); see RustCategorizersMiscMovieMusicPcAnimeProcessorW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    public const string W61_ANIME_PROCESSOR_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w611_anime_release_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w61AnimeReleasePlanBatch(). */
+    public const int W61_ANIME_PROCESSOR_TRAILER = 35;
+
+    /**
+     * Anime token flags: 1 movie, 2 OVA/special, 4 batch, 8 BD source, 16 web source, 32 HEVC, 64 AVC, 128 10-bit,
+     * 256 dub, 512 sub and 1024 raw (2048, a `v2`-`v9` revision token, is detected by shape).
+     *
+     * @var array<string, int>
+     */
+    public const array W61_ANIME_TOKEN_FLAGS = ['movie' => 1, 'film' => 1, 'gekijouban' => 1, 'ova' => 2, 'ona' => 2, 'oad' => 2, 'special' => 2,
+        'specials' => 2, 'batch' => 4, 'complete' => 4, 'bd' => 8, 'bdrip' => 8, 'bluray' => 8, 'bdremux' => 8, 'web' => 16, 'webrip' => 16,
+        'webdl' => 16, 'cr' => 16, 'crunchyroll' => 16, 'funimation' => 16, 'amzn' => 16, 'nf' => 16, 'hevc' => 32, 'x265' => 32, 'h265' => 32,
+        'x264' => 64, 'h264' => 64, 'avc' => 64, '10bit' => 128, 'hi10p' => 128, 'hi10' => 128, 'dub' => 256, 'dubbed' => 256, 'dual' => 256,
+        'dualaudio' => 256, 'sub' => 512, 'subs' => 512, 'subbed' => 512, 'softsub' => 512, 'hardsub' => 512, 'multisub' => 512, 'eng' => 512,
+        'raw' => 1024];
+
+    /**
+     * Resolution tiers: 1 480p, 2 576p, 3 720p, 4 1080p and 5 2160p.
+     *
+     * @var array<string, int>
+     */
+    public const array W61_ANIME_RESOLUTIONS = ['480p' => 1, '576p' => 2, '720p' => 3, '1080p' => 4, '2160p' => 5, '4k' => 5];
+
+    /**
+     * Resolution tier per `WIDTHxHEIGHT` height.
+     *
+     * @var array<int, int>
+     */
+    public const array W61_ANIME_HEIGHTS = [480 => 1, 576 => 2, 720 => 3, 1080 => 4, 2160 => 5];
+
+    public static function usesW61RustFfi(): bool
+    {
+        $override = self::w61RustFfiState();
+
+        return \is_bool($override) ? $override : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the AnimeProcessor Wave 61 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 61.1 anime release subgroup, title, episode, resolution, hash tag and AniList lookup plans. Each item is a
+     * release name (trimmed). Per item `plan | episodeKind << 3 | resolution << 6 | subgroupState << 9 | crc << 11 |
+     * flags << 12 | min(season, 99) << 24 | min(episode, 9999) << 31 | min(titleLength, 255) << 45 |
+     * min(titleWords, 31) << 53 | min(subgroupLength, 31) << 58`. The subgroup state is 1 for a leading `[group]`, 2
+     * for `[]` or an unclosed `[`, else 0; crc is a `[XXXXXXXX]` or `(XXXXXXXX)` 8-hex tag; flags OR the
+     * W61_ANIME_TOKEN_FLAGS of every `[a-z0-9]+` lowercase token plus the revision shape; the resolution is the
+     * largest W61_ANIME_RESOLUTIONS or W61_ANIME_HEIGHTS (`WWWxHHH`, 3-4 digits each) tier. The episode kind, in
+     * order, is 1 the first `s`+1-2 digit+`e`+1-4 digit token, 2 the first 1-2 digit `x` 1-3 digit token, 3 the
+     * first ` - ` + 1-4 digits, 4 the first `ep`/`episode` token followed by a 1-4 digit token or `e`/`ep` + 1-4
+     * digit token, else 0 (season 0 for kinds 3 and 4). The title starts after leading ` _.` and closed `[...]`
+     * blocks and ends before the episode match and the next `[` or `(`, trimmed of ` _.-`; title words count its
+     * alphanumeric runs. The AniList lookup plan is 0 extraction failure (empty title), 4 batch, 3 movie/OVA, 2
+     * title and episode, else 1 title only. Then five plan, five episode kind, six resolution and three subgroup
+     * state counts, the hash tag count, twelve flag counts, the episode sum, the largest episode and the distinct
+     * (case-insensitive) subgroups.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61AnimeReleasePlanBatch(array $items): array
+    {
+        return self::usesW61RustFfi() ? self::w61AnimeReleasePlanBatchNative($items) : self::w61AnimeReleasePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61AnimeReleasePlanBatchNative(array $items): array
+    {
+        return self::w61Invoke($items, \count($items) + self::W61_ANIME_PROCESSOR_TRAILER) ?? self::w61AnimeReleasePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61AnimeReleasePlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $plans = $kinds = [0, 0, 0, 0, 0];
+        $resolutions = [0, 0, 0, 0, 0, 0];
+        $subgroupStates = [0, 0, 0];
+        $flagCounts = array_fill(0, 12, 0);
+        $crcCount = $episodeSum = $maxEpisode = 0;
+        $subgroups = [];
+        foreach ($items as $item) {
+            $name = trim((string) $item);
+            $length = \strlen($name);
+            $subgroupState = $subgroupLength = 0;
+            if ($length > 0 && $name[0] === '[') {
+                $close = strpos($name, ']');
+                if ($close !== false && $close > 1) {
+                    $subgroupState = 1;
+                    $subgroupLength = $close - 1;
+                    $subgroups[strtolower(substr($name, 1, $close - 1))] = true;
+                } else {
+                    $subgroupState = 2;
+                }
+            }
+            $crc = preg_match('/\[[0-9A-Fa-f]{8}\]|\([0-9A-Fa-f]{8}\)/', $name) === 1 ? 1 : 0;
+            preg_match_all('/[a-z0-9]+/', strtolower($name), $matches, PREG_OFFSET_CAPTURE);
+            $tokens = $matches[0];
+            $flags = $resolution = 0;
+            $byEpisode = $byCross = $byWord = null;
+            foreach ($tokens as $index => [$token, $offset]) {
+                $flags |= self::W61_ANIME_TOKEN_FLAGS[$token] ?? 0;
+                $resolution = max($resolution, self::W61_ANIME_RESOLUTIONS[$token] ?? 0);
+                $first = $token[0];
+                if (\strlen($token) === 2 && $first === 'v' && strspn($token, '23456789', 1) === 1) {
+                    $flags |= 2048;
+                }
+                if (str_contains($token, 'x')) {
+                    if (preg_match('/\A[0-9]{3,4}x([0-9]{3,4})\z/', $token, $m) === 1) {
+                        $resolution = max($resolution, self::W61_ANIME_HEIGHTS[(int) $m[1]] ?? 0);
+                    }
+                    if ($byCross === null && preg_match('/\A([0-9]{1,2})x([0-9]{1,3})\z/', $token, $m) === 1) {
+                        $byCross = [$offset, (int) $m[1], (int) $m[2]];
+                    }
+                }
+                if ($byEpisode === null && $first === 's' && preg_match('/\As([0-9]{1,2})e([0-9]{1,4})\z/', $token, $m) === 1) {
+                    $byEpisode = [$offset, (int) $m[1], (int) $m[2]];
+                }
+                if ($byWord === null && $first === 'e') {
+                    $next = $tokens[$index + 1][0] ?? '';
+                    if (($token === 'ep' || $token === 'episode') && preg_match('/\A[0-9]{1,4}\z/', $next) === 1) {
+                        $byWord = [$offset, 0, (int) $next];
+                    } elseif (preg_match('/\Aep?([0-9]{1,4})\z/', $token, $m) === 1) {
+                        $byWord = [$offset, 0, (int) $m[1]];
+                    }
+                }
+            }
+            if ($byEpisode !== null) {
+                [$kind, [$position, $season, $episode]] = [1, $byEpisode];
+            } elseif ($byCross !== null) {
+                [$kind, [$position, $season, $episode]] = [2, $byCross];
+            } elseif (preg_match('/ - ([0-9]{1,4})(?![0-9])/', $name, $m, PREG_OFFSET_CAPTURE) === 1) {
+                [$kind, $position, $season, $episode] = [3, $m[0][1], 0, (int) $m[1][0]];
+            } elseif ($byWord !== null) {
+                [$kind, [$position, $season, $episode]] = [4, $byWord];
+            } else {
+                [$kind, $position, $season, $episode] = [0, $length, 0, 0];
+            }
+            $start = 0;
+            while (true) {
+                if ($start < $length) {
+                    $start += strspn($name, ' _.', $start);
+                }
+                if ($start < $length && $name[$start] === '[') {
+                    $close = strpos($name, ']', $start);
+                    if ($close !== false) {
+                        $start = $close + 1;
+
+                        continue;
+                    }
+                }
+
+                break;
+            }
+            $bracket = $start < $length ? $start + strcspn($name, '[(', $start) : $length;
+            $end = min($position, $bracket);
+            $title = $end > $start ? trim(substr($name, $start, $end - $start), ' _.-') : '';
+            $words = $title === '' ? 0 : (int) preg_match_all('/[A-Za-z0-9]+/', $title);
+            $plan = match (true) {
+                $title === '' => 0,
+                ($flags & 4) !== 0 => 4,
+                ($flags & 3) !== 0 => 3,
+                $kind !== 0 => 2,
+                default => 1,
+            };
+            $plans[$plan]++;
+            $kinds[$kind]++;
+            $resolutions[$resolution]++;
+            $subgroupStates[$subgroupState]++;
+            $crcCount += $crc;
+            for ($i = 0; $i < 12; $i++) {
+                $flagCounts[$i] += $flags >> $i & 1;
+            }
+            $episodeSum += $episode;
+            $maxEpisode = max($maxEpisode, $episode);
+            $out[] = $plan | $kind << 3 | $resolution << 6 | $subgroupState << 9 | $crc << 11 | $flags << 12 | min($season, 99) << 24
+                | min($episode, 9999) << 31 | min(\strlen($title), 255) << 45 | min($words, 31) << 53 | min($subgroupLength, 31) << 58;
+        }
+        array_push($out, ...$plans, ...$kinds, ...$resolutions, ...$subgroupStates);
+        $out[] = $crcCount;
+        array_push($out, ...$flagCounts);
+        array_push($out, $episodeSum, $maxEpisode, \count($subgroups));
+
+        return $out;
+    }
+
+    /**
+     * Wave 61 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('anime_w611', self::W61_ANIME_PROCESSOR_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 61.1 AnimeProcessor export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w61Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w61RustFfiState('ffi');
+            $out = self::w61RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w61RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W61_ANIME_PROCESSOR_FFI_CDEF.)
+            $written = $ffi->nntmux_w611_anime_release_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
         } catch (Throwable) {
             return null;
         }
