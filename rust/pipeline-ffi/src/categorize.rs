@@ -48905,3 +48905,1090 @@ pub mod predb_feed_entry_importer_source_factory_irc_networks_parser_w613 {
         }
     }
 }
+
+/// Wave 62.3 batch plans for `ParsedTvRelease`, `LocalDbPipe`, `ParseInfoPipe`, `TmdbPipe` and
+/// `TraktPipe`. Each export mirrors the class's `w62...BatchPhp()` reference word for word.
+pub mod tv_parsed_release_localdb_parseinfo_tmdb_trakt_pipe_w623 {
+    use super::release_image_browse_duplicate_group_management_w553::run_items;
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hash, Hasher};
+
+    /// Byte-wise FNV-1a hasher for the per-call distinct-key sets; keys never outlive one call.
+    #[derive(Default)]
+    struct KeyHasher(u64);
+
+    impl Hasher for KeyHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            let mut hash = self.0 ^ 0xCBF2_9CE4_8422_2325;
+            for &b in bytes {
+                hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            self.0 = hash;
+        }
+
+        fn write_u8(&mut self, value: u8) {
+            self.0 = (self.0 ^ u64::from(value)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+
+        fn write_u64(&mut self, value: u64) {
+            self.0 = (self.0 ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn write_i64(&mut self, value: i64) {
+            self.write_u64(value as u64);
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.write_u64(value as u64);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0 ^ (self.0 >> 31)
+        }
+    }
+
+    type KeySet<T> = HashSet<T, BuildHasherDefault<KeyHasher>>;
+
+    /// A key compared and hashed as PHP `strtolower()` would leave it.
+    #[derive(Clone, Copy)]
+    struct Caseless<'a>(&'a [u8]);
+
+    impl Hash for Caseless<'_> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            for &b in self.0 {
+                state.write_u8(b.to_ascii_lowercase());
+            }
+            state.write_usize(self.0.len());
+        }
+    }
+
+    impl PartialEq for Caseless<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.eq_ignore_ascii_case(other.0)
+        }
+    }
+
+    impl Eq for Caseless<'_> {}
+
+    /// `ParsedTvRelease::W47_COUNTRIES` in order.
+    const COUNTRIES: [&[u8]; 20] = [
+        b"US", b"UK", b"CA", b"AU", b"NZ", b"IE", b"DE", b"FR", b"NL", b"SE", b"NO", b"DK", b"FI",
+        b"ES", b"IT", b"JP", b"KR", b"BR", b"MX", b"IN",
+    ];
+
+    fn trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    /// PHP `trim()` with its default characters.
+    fn ptrim(s: &[u8]) -> &[u8] {
+        let Some(start) = s.iter().position(|&b| !trim_byte(b)) else {
+            return &[];
+        };
+        let end = s
+            .iter()
+            .rposition(|&b| !trim_byte(b))
+            .map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// PHP `rtrim()` with its default characters.
+    fn prtrim(s: &[u8]) -> &[u8] {
+        let end = s.iter().rposition(|&b| !trim_byte(b)).map_or(0, |p| p + 1);
+        &s[..end]
+    }
+
+    /// PHP `explode('|', $item, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(item: &[u8]) -> [&[u8]; N] {
+        let mut out: [&[u8]; N] = [&[]; N];
+        let mut rest = item;
+        for (i, slot) in out.iter_mut().enumerate() {
+            if i + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'|') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// `min` to `max` ASCII digits as their value, else `None`.
+    fn digits(s: &[u8], min: usize, max: usize) -> Option<i64> {
+        if s.len() < min || s.len() > max || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            s.iter()
+                .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0')),
+        )
+    }
+
+    /// A byte in `W62_CONTROL_CHARS` (C0 controls and DEL).
+    fn control(b: u8) -> bool {
+        b < 0x20 || b == 0x7f
+    }
+
+    /// 0 empty, 1 up to 255 bytes without control bytes, 2 otherwise.
+    fn text_state(t: &[u8]) -> i64 {
+        if t.is_empty() {
+            0
+        } else if t.len() <= 255 && !t.iter().any(|&b| control(b)) {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// A 19xx/20xx four-digit year.
+    fn year(s: &[u8]) -> Option<i64> {
+        if s.len() == 4 && (s.starts_with(b"19") || s.starts_with(b"20")) {
+            digits(s, 4, 4)
+        } else {
+            None
+        }
+    }
+
+    /// (0 empty, 1 year, 2 invalid; the year or 0).
+    fn year_state(s: &[u8]) -> (i64, i64) {
+        if s.is_empty() {
+            return (0, 0);
+        }
+        year(s).map_or((2, 0), |y| (1, y))
+    }
+
+    /// (0 empty, 1 a positive 1-10 digit id, 2 invalid; the id or 0).
+    fn id_state(s: &[u8]) -> (i64, i64) {
+        if s.is_empty() {
+            return (0, 0);
+        }
+        match digits(s, 1, 10) {
+            Some(v) if v > 0 => (1, v),
+            _ => (2, 0),
+        }
+    }
+
+    /// As [`id_state`], also accepting `tt` (any case) and 7-10 digits.
+    fn imdb_state(s: &[u8]) -> (i64, i64) {
+        if s.len() >= 2 && s[..2].eq_ignore_ascii_case(b"tt") {
+            return match digits(&s[2..], 7, 10) {
+                Some(v) if v > 0 => (1, v),
+                _ => (2, 0),
+            };
+        }
+        id_state(s)
+    }
+
+    /// Two ASCII letters.
+    fn country2(s: &[u8]) -> bool {
+        s.len() == 2 && s[0].is_ascii_alphabetic() && s[1].is_ascii_alphabetic()
+    }
+
+    /// 1, true, yes or on (any case, trimmed).
+    fn flag(s: &[u8]) -> bool {
+        let t = ptrim(s);
+        t == b"1"
+            || t.eq_ignore_ascii_case(b"true")
+            || t.eq_ignore_ascii_case(b"yes")
+            || t.eq_ignore_ascii_case(b"on")
+    }
+
+    /// The `[a-z0-9]+` runs of the lowercased bytes (case kept; compare caselessly).
+    fn tokens(s: &[u8]) -> impl Iterator<Item = &[u8]> {
+        s.split(|b| !b.is_ascii_alphanumeric())
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Byte length of `tokens(s)` joined by one separator.
+    fn joined_len(s: &[u8]) -> i64 {
+        let (mut len, mut n) = (0i64, 0i64);
+        for t in tokens(s) {
+            len += t.len() as i64;
+            n += 1;
+        }
+        if n == 0 { 0 } else { len + n - 1 }
+    }
+
+    /// `tokens(s)` lowercased and joined by `sep`.
+    fn joined(s: &[u8], sep: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(s.len());
+        for t in tokens(s) {
+            if !out.is_empty() {
+                out.push(sep);
+            }
+            out.extend(t.iter().map(u8::to_ascii_lowercase));
+        }
+        out
+    }
+
+    /// `YYYY-MM-DD` (separator `-`, `.` or `/`, used twice) in 1900-2099 as YYYYMMDD.
+    fn airdate(s: &[u8]) -> Option<i64> {
+        if s.len() != 10 {
+            return None;
+        }
+        let sep = s[4];
+        if !matches!(sep, b'-' | b'.' | b'/') || s[7] != sep {
+            return None;
+        }
+        let y = digits(&s[..4], 4, 4)?;
+        let m = digits(&s[5..7], 2, 2)?;
+        let d = digits(&s[8..10], 2, 2)?;
+        ((1900..=2099).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d))
+            .then_some(y * 10000 + m * 100 + d)
+    }
+
+    /// `ParsedTvRelease::w62ReleaseSummaryBatchPhp()`.
+    fn release_summary(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 20);
+        let mut kinds = [0i64; 6];
+        let mut names = [0i64; 3];
+        let mut countries = [0i64; 4];
+        let mut titles: KeySet<Caseless> = KeySet::default();
+        let (mut title_sum, mut max_season, mut max_episode) = (0i64, 0i64, 0i64);
+        let (mut min_air, mut max_air, mut suffixes) = (0i64, 0i64, 0i64);
+        for &item in items {
+            let [
+                raw_name,
+                raw_clean,
+                raw_season,
+                raw_episode,
+                raw_air,
+                raw_country,
+                raw_year,
+            ] = fields::<7>(item);
+            let name = ptrim(raw_name);
+            let name_state = text_state(name);
+            let clean0 = ptrim(raw_clean);
+            let from_name = clean0.is_empty() && !name.is_empty();
+            let clean = if clean0.is_empty() { name } else { clean0 };
+            let n = clean.len();
+            let suffix = n >= 6
+                && clean[n - 1] == b')'
+                && clean[n - 6] == b'('
+                && year(&clean[n - 5..n - 1]).is_some();
+            let title = if suffix {
+                prtrim(&clean[..n - 6])
+            } else {
+                clean
+            };
+            let s = ptrim(raw_season);
+            let (season_state, season) = if s.is_empty() {
+                (0, 0)
+            } else {
+                digits(s, 1, 3).map_or((2, 0), |v| (1, v))
+            };
+            let e = ptrim(raw_episode);
+            let (episode_state, episode) = if e.is_empty() {
+                (0, 0)
+            } else if e.eq_ignore_ascii_case(b"all") {
+                (3, 0)
+            } else {
+                digits(e, 1, 4).map_or((2, 0), |v| (1, v))
+            };
+            let a = ptrim(raw_air);
+            let (air_state, air) = if a.is_empty() {
+                (0, 0)
+            } else {
+                airdate(a).map_or((2, 0), |v| (1, v))
+            };
+            let c = ptrim(raw_country);
+            let (country_state, country_index) = if c.is_empty() {
+                (0, 0)
+            } else if country2(c) {
+                let upper = [c[0].to_ascii_uppercase(), c[1].to_ascii_uppercase()];
+                COUNTRIES
+                    .iter()
+                    .position(|k| *k == upper)
+                    .map_or((2, 0), |p| (1, p as i64 + 1))
+            } else {
+                (3, 0)
+            };
+            let (year_st, year_value) = year_state(ptrim(raw_year));
+            let kind = if name_state != 1 {
+                0
+            } else if episode_state == 3 && season_state == 1 {
+                1
+            } else if season_state == 1 && episode_state == 1 && episode > 0 {
+                2
+            } else if air_state == 1 {
+                3
+            } else if season_state == 1 {
+                4
+            } else {
+                5
+            };
+            if name_state == 1 && !title.is_empty() {
+                titles.insert(Caseless(title));
+            }
+            kinds[kind as usize] += 1;
+            names[name_state as usize] += 1;
+            countries[country_state as usize] += 1;
+            title_sum += title.len() as i64;
+            if season_state == 1 {
+                max_season = max_season.max(season);
+            }
+            if episode_state == 1 {
+                max_episode = max_episode.max(episode);
+            }
+            if air_state == 1 {
+                min_air = if min_air == 0 { air } else { min_air.min(air) };
+                max_air = max_air.max(air);
+            }
+            suffixes += i64::from(suffix);
+            let year_off = if year_st == 1 { year_value - 1900 } else { 0 };
+            out.push(
+                name_state
+                    | i64::from(from_name) << 2
+                    | i64::from(suffix) << 3
+                    | season_state << 4
+                    | episode_state << 6
+                    | air_state << 8
+                    | country_state << 10
+                    | year_st << 12
+                    | kind << 14
+                    | season.min(1023) << 17
+                    | episode.min(16383) << 27
+                    | year_off << 41
+                    | country_index << 49
+                    | (title.len() as i64).min(255) << 54,
+            );
+        }
+        out.extend(kinds);
+        out.extend(names);
+        out.extend(countries);
+        out.extend([
+            titles.len() as i64,
+            title_sum,
+            max_season,
+            max_episode,
+            min_air,
+            max_air,
+            suffixes,
+        ]);
+        out
+    }
+
+    /// Title tokens without a leading `the` while another token follows.
+    fn local_tokens(s: &[u8]) -> Vec<&[u8]> {
+        let mut v: Vec<&[u8]> = tokens(s).collect();
+        if v.len() > 1 && v[0].eq_ignore_ascii_case(b"the") {
+            v.remove(0);
+        }
+        v
+    }
+
+    fn distinct<'a>(v: &[&'a [u8]]) -> Vec<&'a [u8]> {
+        let mut d: Vec<&[u8]> = Vec::with_capacity(v.len());
+        for &t in v {
+            if !d.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+                d.push(t);
+            }
+        }
+        d
+    }
+
+    /// (0 empty, 1 positive, 2 other; the id) for a trimmed `[+-]?\d{1,18}` site id.
+    fn site_id(s: &[u8]) -> (i64, i64) {
+        let t = ptrim(s);
+        if t.is_empty() {
+            return (0, 0);
+        }
+        let (negative, body) = match t[0] {
+            b'+' => (false, &t[1..]),
+            b'-' => (true, &t[1..]),
+            _ => (false, t),
+        };
+        match digits(body, 1, 18) {
+            Some(v) if !negative && v > 0 => (1, v),
+            _ => (2, 0),
+        }
+    }
+
+    /// `LocalDbPipe::w62LocalPlanBatchPhp()`.
+    fn local_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 12);
+        let mut outcomes = [0i64; 4];
+        let mut decisions = [0i64; 3];
+        let (mut best, mut best_score, mut score_sum, mut exacts) = (0i64, 0i64, 0i64, 0i64);
+        let mut videos: KeySet<i64> = KeySet::default();
+        for (index, &item) in items.iter().enumerate() {
+            let [title, y1, c1, cand, y2, c2, video, episode, pack] = fields::<9>(item);
+            let a = local_tokens(title);
+            let b = local_tokens(cand);
+            let exact = !a.is_empty()
+                && a.len() == b.len()
+                && a.iter().zip(&b).all(|(x, y)| x.eq_ignore_ascii_case(y));
+            let (da, db) = (distinct(&a), distinct(&b));
+            let shared = da
+                .iter()
+                .filter(|t| db.iter().any(|x| x.eq_ignore_ascii_case(t)))
+                .count() as i64;
+            let union = da.len() as i64 + db.len() as i64 - shared;
+            let title_score = if union == 0 { 0 } else { 100 * shared / union };
+            let year_code = match (year(ptrim(y1)), year(ptrim(y2))) {
+                (Some(p), Some(q)) if p == q => 1,
+                (Some(p), Some(q)) if (p - q).abs() == 1 => 2,
+                (Some(_), Some(_)) => 3,
+                _ => 0,
+            };
+            let (ca, cb) = (ptrim(c1), ptrim(c2));
+            let country_code = if country2(ca) && country2(cb) {
+                if ca.eq_ignore_ascii_case(cb) { 1 } else { 2 }
+            } else {
+                0
+            };
+            let (video_state, video_id) = site_id(video);
+            let (episode_state, _) = site_id(episode);
+            let season_pack = flag(pack);
+            let outcome = if video_state != 1 {
+                0
+            } else if season_pack {
+                1
+            } else if episode_state == 1 {
+                2
+            } else {
+                3
+            };
+            let gross = title_score
+                + [0, 20, 10, 0][year_code as usize]
+                + if country_code == 1 { 10 } else { 0 };
+            let penalty =
+                if year_code == 3 { 40 } else { 0 } + if country_code == 2 { 20 } else { 0 };
+            let score = (gross - penalty).max(0);
+            let decision = if score >= 110 {
+                2
+            } else if score >= 80 {
+                1
+            } else {
+                0
+            };
+            outcomes[outcome as usize] += 1;
+            decisions[decision as usize] += 1;
+            if best == 0 || score > best_score {
+                best = index as i64 + 1;
+                best_score = score;
+            }
+            if video_state == 1 {
+                videos.insert(video_id);
+            }
+            score_sum += score;
+            exacts += i64::from(exact);
+            out.push(
+                title_score
+                    | year_code << 7
+                    | country_code << 9
+                    | video_state << 11
+                    | episode_state << 13
+                    | i64::from(season_pack) << 15
+                    | outcome << 16
+                    | decision << 18
+                    | score.min(511) << 20
+                    | (a.len() as i64).min(255) << 29
+                    | (b.len() as i64).min(255) << 37
+                    | i64::from(exact) << 45,
+            );
+        }
+        out.extend(outcomes);
+        out.extend(decisions);
+        out.extend([best, best_score, videos.len() as i64, score_sum, exacts]);
+        out
+    }
+
+    /// The leading ASCII digit run and the rest.
+    fn lead_digits(t: &[u8]) -> (&[u8], &[u8]) {
+        let p = t
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(t.len());
+        (&t[..p], &t[p..])
+    }
+
+    /// `prefix` (any case) then `min` to `max` digits.
+    fn prefixed(t: &[u8], prefix: &[u8], min: usize, max: usize) -> Option<i64> {
+        let p = prefix.len();
+        if t.len() > p && t[..p].eq_ignore_ascii_case(prefix) {
+            digits(&t[p..], min, max)
+        } else {
+            None
+        }
+    }
+
+    /// `s(\d{1,3})e(\d{1,4})((?:e\d{1,4})*)` as (season, episode, last trailing episode).
+    fn se(t: &[u8]) -> Option<(i64, i64, Option<i64>)> {
+        if t.first().map(u8::to_ascii_lowercase) != Some(b's') {
+            return None;
+        }
+        let (sd, rest) = lead_digits(&t[1..]);
+        let season = digits(sd, 1, 3)?;
+        if rest.first().map(u8::to_ascii_lowercase) != Some(b'e') {
+            return None;
+        }
+        let (ed, mut rest) = lead_digits(&rest[1..]);
+        let episode = digits(ed, 1, 4)?;
+        let mut last = None;
+        while !rest.is_empty() {
+            if rest[0].to_ascii_lowercase() != b'e' {
+                return None;
+            }
+            let (d, r) = lead_digits(&rest[1..]);
+            last = Some(digits(d, 1, 4)?);
+            rest = r;
+        }
+        Some((season, episode, last))
+    }
+
+    /// `(\d{1,2})x(\d{2,3})`.
+    fn nx(t: &[u8]) -> Option<(i64, i64)> {
+        let (d, rest) = lead_digits(t);
+        let season = digits(d, 1, 2)?;
+        if rest.first().map(u8::to_ascii_lowercase) != Some(b'x') {
+            return None;
+        }
+        Some((season, digits(&rest[1..], 2, 3)?))
+    }
+
+    /// (kind, season, episode, end, year, month, day) for the marker at `k`.
+    fn marker(toks: &[&[u8]], k: usize) -> Option<(i64, i64, i64, i64, i64, i64, i64)> {
+        let t = toks[k];
+        let next = toks.get(k + 1).copied();
+        let next_e = || next.and_then(|n| prefixed(n, b"e", 1, 4));
+        if let Some((s, e, last)) = se(t) {
+            let end = if last.is_some() { last } else { next_e() };
+            return Some(match end {
+                Some(x) if x > e => (2, s, e, x, 0, 0, 0),
+                _ => (1, s, e, e, 0, 0, 0),
+            });
+        }
+        if let Some((s, e)) = nx(t) {
+            return Some((1, s, e, e, 0, 0, 0));
+        }
+        if let Some(s) = prefixed(t, b"s", 1, 3) {
+            return Some(match next_e() {
+                Some(e) => (1, s, e, e, 0, 0, 0),
+                None => (3, s, 0, 0, 0, 0, 0),
+            });
+        }
+        if let Some(y) = year(t)
+            && k + 2 < toks.len()
+            && let (Some(m), Some(d)) = (digits(toks[k + 1], 1, 2), digits(toks[k + 2], 1, 2))
+            && (1..=12).contains(&m)
+            && (1..=31).contains(&d)
+        {
+            return Some((4, 0, 0, 0, y, m, d));
+        }
+        let part = if t.eq_ignore_ascii_case(b"part") || t.eq_ignore_ascii_case(b"pt") {
+            next.and_then(|n| digits(n, 1, 2))
+        } else {
+            prefixed(t, b"part", 1, 2).or_else(|| prefixed(t, b"pt", 1, 2))
+        };
+        if let Some(v) = part
+            && v >= 1
+        {
+            return Some((5, 0, v, v, 0, 0, 0));
+        }
+        let ep = if t.eq_ignore_ascii_case(b"ep") || t.eq_ignore_ascii_case(b"episode") {
+            next.and_then(|n| digits(n, 1, 4))
+        } else {
+            prefixed(t, b"ep", 1, 4)
+        };
+        match ep {
+            Some(v) if v >= 1 => Some((6, 0, v, v, 0, 0, 0)),
+            _ => None,
+        }
+    }
+
+    /// `ParseInfoPipe::w62ParsePlanBatchPhp()`.
+    fn parse_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 14);
+        let mut kinds = [0i64; 7];
+        let mut gates = [0i64; 4];
+        let (mut token_sum, mut span_sum, mut max_season) = (0i64, 0i64, 0i64);
+        let mut toks: Vec<&[u8]> = Vec::new();
+        for &item in items {
+            let t = ptrim(item);
+            let gate = if t.is_empty() {
+                0
+            } else if t.len() > 512 {
+                2
+            } else if t.iter().any(|&b| control(b)) {
+                3
+            } else {
+                1
+            };
+            let (mut kind, mut season, mut episode, mut end) = (0i64, 0i64, 0i64, 0i64);
+            let (mut y, mut m, mut d, mut title_tokens) = (0i64, 0i64, 0i64, 0i64);
+            if gate == 1 {
+                toks.clear();
+                toks.extend(tokens(t));
+                title_tokens = toks.len() as i64;
+                for k in 0..toks.len() {
+                    if let Some(found) = marker(&toks, k) {
+                        (kind, season, episode, end, y, m, d) = found;
+                        title_tokens = k as i64;
+                        break;
+                    }
+                }
+            }
+            let year_off = if y > 0 { y - 1900 } else { 0 };
+            kinds[kind as usize] += 1;
+            gates[gate as usize] += 1;
+            token_sum += title_tokens;
+            if kind == 2 {
+                span_sum += end - episode;
+            }
+            if (1..=3).contains(&kind) {
+                max_season = max_season.max(season);
+            }
+            out.push(
+                kind | gate << 3
+                    | season.min(1023) << 5
+                    | episode.min(16383) << 15
+                    | end.min(16383) << 29
+                    | year_off << 43
+                    | m << 51
+                    | d << 55
+                    | title_tokens.min(7) << 60,
+            );
+        }
+        out.extend(kinds);
+        out.extend(gates);
+        out.extend([token_sum, span_sum, max_season]);
+        out
+    }
+
+    /// A distinct TMDB request: an id lookup by route or a title search with its year.
+    #[derive(Hash, PartialEq, Eq)]
+    enum Request {
+        Id(i64, i64),
+        Query(Vec<u8>, i64),
+    }
+
+    /// `TmdbPipe::w62TmdbPlanBatchPhp()`.
+    fn tmdb_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 17);
+        let mut routes = [0i64; 6];
+        let mut tvdbs = [0i64; 3];
+        let mut imdbs = [0i64; 3];
+        let mut tmdbs = [0i64; 3];
+        let mut with_ids = 0i64;
+        let mut requests: KeySet<Request> = KeySet::default();
+        for &item in items {
+            let [
+                raw_title,
+                raw_tvdb,
+                raw_imdb,
+                raw_tmdb,
+                raw_year,
+                raw_country,
+                reason,
+            ] = fields::<7>(item);
+            let title = ptrim(raw_title);
+            let title_state = text_state(title);
+            let (tvdb_state, tvdb) = id_state(ptrim(raw_tvdb));
+            let (imdb_st, imdb) = imdb_state(ptrim(raw_imdb));
+            let (tmdb_state, tmdb) = id_state(ptrim(raw_tmdb));
+            let (year_st, year_value) = year_state(ptrim(raw_year));
+            let c = ptrim(raw_country);
+            let country_state = if c.is_empty() {
+                0
+            } else if country2(c) {
+                1
+            } else {
+                2
+            };
+            let unavailable = !ptrim(reason).is_empty();
+            let query_len = joined_len(title);
+            let (route, id) = if unavailable {
+                (0, 0)
+            } else if tmdb_state == 1 {
+                (2, tmdb)
+            } else if tvdb_state == 1 {
+                (3, tvdb)
+            } else if imdb_st == 1 {
+                (4, imdb)
+            } else if title_state == 1 && query_len > 0 {
+                (5, 0)
+            } else {
+                (1, 0)
+            };
+            match route {
+                2..=4 => {
+                    requests.insert(Request::Id(route, id));
+                }
+                5 => {
+                    requests.insert(Request::Query(joined(title, b' '), year_value));
+                }
+                _ => {}
+            }
+            routes[route as usize] += 1;
+            tvdbs[tvdb_state as usize] += 1;
+            imdbs[imdb_st as usize] += 1;
+            tmdbs[tmdb_state as usize] += 1;
+            with_ids += i64::from(tvdb_state == 1 || imdb_st == 1 || tmdb_state == 1);
+            out.push(
+                title_state
+                    | tvdb_state << 2
+                    | imdb_st << 4
+                    | tmdb_state << 6
+                    | i64::from(unavailable) << 8
+                    | route << 9
+                    | year_st << 12
+                    | country_state << 14
+                    | query_len.min(255) << 16
+                    | id.min(0xFFFF_FFFF) << 24,
+            );
+        }
+        out.extend(routes);
+        out.extend(tvdbs);
+        out.extend(imdbs);
+        out.extend(tmdbs);
+        out.extend([requests.len() as i64, with_ids]);
+        out
+    }
+
+    /// 0 empty, 1 a 1-100 byte `[a-z0-9-]` slug (any case) without edge or doubled hyphens, 2 invalid.
+    fn slug_state(s: &[u8]) -> i64 {
+        if s.is_empty() {
+            0
+        } else if s.len() <= 100
+            && s.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+            && s[0] != b'-'
+            && s[s.len() - 1] != b'-'
+            && !s.windows(2).any(|w| w == b"--")
+        {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// `TraktPipe::w62TraktPlanBatchPhp()`.
+    fn trakt_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 12);
+        let mut routes = [0i64; 7];
+        let mut queries = [0i64; 4];
+        let mut slugs: KeySet<Vec<u8>> = KeySet::default();
+        for &item in items {
+            let [
+                raw_title,
+                raw_slug,
+                raw_trakt,
+                raw_tvdb,
+                raw_imdb,
+                raw_season,
+                raw_episode,
+                reason,
+            ] = fields::<8>(item);
+            let title = ptrim(raw_title);
+            let title_state = text_state(title);
+            let slug = ptrim(raw_slug);
+            let slug_st = slug_state(slug);
+            let derived_len = if title_state == 1 {
+                joined_len(title)
+            } else {
+                0
+            };
+            let (trakt_state, _) = id_state(ptrim(raw_trakt));
+            let (tvdb_state, _) = id_state(ptrim(raw_tvdb));
+            let (imdb_st, _) = imdb_state(ptrim(raw_imdb));
+            let s = ptrim(raw_season);
+            let (season_state, season) = if s.is_empty() {
+                (0, 0)
+            } else {
+                digits(s, 1, 3).map_or((2, 0), |v| (1, v))
+            };
+            let e = ptrim(raw_episode);
+            let (episode_state, episode) = if e.is_empty() {
+                (0, 0)
+            } else {
+                digits(e, 1, 4).map_or((2, 0), |v| (1, v))
+            };
+            let unavailable = !ptrim(reason).is_empty();
+            let route = if unavailable {
+                0
+            } else if trakt_state == 1 {
+                2
+            } else if slug_st == 1 {
+                3
+            } else if imdb_st == 1 {
+                4
+            } else if tvdb_state == 1 {
+                5
+            } else if derived_len > 0 {
+                6
+            } else {
+                1
+            };
+            let query = if route <= 1 {
+                0
+            } else if season_state == 1 && episode_state == 1 && episode > 0 {
+                3
+            } else if season_state == 1 {
+                2
+            } else {
+                1
+            };
+            let effective_len = if slug_st == 1 {
+                slug.len() as i64
+            } else {
+                derived_len
+            };
+            if route == 3 {
+                slugs.insert(slug.to_ascii_lowercase());
+            } else if route == 6 {
+                slugs.insert(joined(title, b'-'));
+            }
+            routes[route as usize] += 1;
+            queries[query as usize] += 1;
+            out.push(
+                title_state
+                    | slug_st << 2
+                    | trakt_state << 4
+                    | tvdb_state << 6
+                    | imdb_st << 8
+                    | season_state << 10
+                    | episode_state << 12
+                    | i64::from(unavailable) << 14
+                    | route << 15
+                    | query << 18
+                    | effective_len.min(255) << 20
+                    | season.min(1023) << 28
+                    | episode.min(16383) << 38,
+            );
+        }
+        out.extend(routes);
+        out.extend(queries);
+        out.push(slugs.len() as i64);
+        out
+    }
+
+    macro_rules! w623_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// Items are NUL-joined in `blob`, or concatenated with their byte lengths in `lens`
+            /// when it is non-null. Returns the word count, `-needed` when `out_cap` is too small,
+            /// or `-1` when it declines (null `out`, null `blob` with a length, `count` other than
+            /// the number of NUL-separated items, or `lens` that do not tile `blob`).
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+            /// `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run_items(blob, blob_len, lens, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w623_export!(
+        /// `ParsedTvRelease::w62ReleaseSummaryBatch()`.
+        nntmux_w623_parsed_tv_release_batch => release_summary
+    );
+    w623_export!(
+        /// `LocalDbPipe::w62LocalPlanBatch()`.
+        nntmux_w623_local_db_pipe_batch => local_plan
+    );
+    w623_export!(
+        /// `ParseInfoPipe::w62ParsePlanBatch()`.
+        nntmux_w623_parse_info_pipe_batch => parse_plan
+    );
+    w623_export!(
+        /// `TmdbPipe::w62TmdbPlanBatch()`.
+        nntmux_w623_tmdb_pipe_batch => tmdb_plan
+    );
+    w623_export!(
+        /// `TraktPipe::w62TraktPlanBatch()`.
+        nntmux_w623_trakt_pipe_batch => trakt_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        /// Each export with the words an empty batch writes.
+        const EXPORTS: [(Export, isize); 5] = [
+            (nntmux_w623_parsed_tv_release_batch, 20),
+            (nntmux_w623_local_db_pipe_batch, 12),
+            (nntmux_w623_parse_info_pipe_batch, 14),
+            (nntmux_w623_tmdb_pipe_batch, 17),
+            (nntmux_w623_trakt_pipe_batch, 12),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        #[test]
+        fn w623_helpers() {
+            assert_eq!(ptrim(b" \0x\t"), b"x");
+            assert_eq!(prtrim(b" x \n"), b" x");
+            assert_eq!(airdate(b"2024-03-09"), Some(20_240_309));
+            assert_eq!(airdate(b"2024-03/09"), None);
+            assert_eq!(airdate(b"1899-01-01"), None);
+            assert_eq!(imdb_state(b"tt0944947"), (1, 944_947));
+            assert_eq!(imdb_state(b"TT12"), (2, 0));
+            assert_eq!(imdb_state(b"81189"), (1, 81_189));
+            assert_eq!(site_id(b" +12 "), (1, 12));
+            assert_eq!(site_id(b"-3"), (2, 0));
+            assert_eq!(se(b"S01E02e03"), Some((1, 2, Some(3))));
+            assert_eq!(se(b"s1234e01"), None);
+            assert_eq!(nx(b"3x07"), Some((3, 7)));
+            assert_eq!(slug_state(b"the-office"), 1);
+            assert_eq!(slug_state(b"the--office"), 2);
+            assert_eq!(joined(b"The Office (US)", b'-'), b"the-office-us");
+            assert_eq!(joined_len(b"..a..bc.."), 4);
+        }
+
+        #[test]
+        fn w623_items() {
+            let parsed = call(
+                nntmux_w623_parsed_tv_release_batch,
+                &[
+                    b"Show|Show (2019)|1|2|2024-01-02|us|2019",
+                    b"Show||1|all|||",
+                ],
+            );
+            assert_eq!(
+                parsed[0],
+                1 | 1 << 3
+                    | 1 << 4
+                    | 1 << 6
+                    | 1 << 8
+                    | 1 << 10
+                    | 1 << 12
+                    | 2 << 14
+                    | 1 << 17
+                    | 2 << 27
+                    | 119 << 41
+                    | 1 << 49
+                    | 4 << 54
+            );
+            assert_eq!(
+                parsed[1],
+                1 | 1 << 2 | 1 << 4 | 3 << 6 | 1 << 14 | 1 << 17 | 4 << 54
+            );
+            assert_eq!(parsed[2 + 6 + 3 + 4], 1);
+            let local = call(
+                nntmux_w623_local_db_pipe_batch,
+                &[
+                    b"The Office|2005|US|Office|2005|us|12|7|0",
+                    b"a b|||a c|||0||yes",
+                ],
+            );
+            assert_eq!(
+                local[0],
+                100 | 1 << 7
+                    | 1 << 9
+                    | 1 << 11
+                    | 1 << 13
+                    | 2 << 16
+                    | 2 << 18
+                    | 130 << 20
+                    | 1 << 29
+                    | 1 << 37
+                    | 1 << 45
+            );
+            assert_eq!(
+                local[1],
+                33 | 2 << 11 | 1 << 15 | 33 << 20 | 2 << 29 | 2 << 37
+            );
+            let parse = call(
+                nntmux_w623_parse_info_pipe_batch,
+                &[
+                    b"Show.Name.S01E02-E03.720p",
+                    b"Show 2024 03 09 x",
+                    b"Doc Part 2",
+                    b"\x01",
+                ],
+            );
+            assert_eq!(parse[0], 2 | 1 << 3 | 1 << 5 | 2 << 15 | 3 << 29 | 2 << 60);
+            assert_eq!(
+                parse[1],
+                4 | 1 << 3 | 124 << 43 | 3 << 51 | 9 << 55 | 1 << 60
+            );
+            assert_eq!(parse[2], 5 | 1 << 3 | 2 << 15 | 2 << 29 | 1 << 60);
+            assert_eq!(parse[3], 3 << 3);
+            let tmdb = call(
+                nntmux_w623_tmdb_pipe_batch,
+                &[
+                    b"Show|81189|tt0944947|1396|2008|US|",
+                    b"Show|||||",
+                    b"x||||||down",
+                ],
+            );
+            assert_eq!(
+                tmdb[0],
+                1 | 1 << 2 | 1 << 4 | 1 << 6 | 2 << 9 | 1 << 12 | 1 << 14 | 4 << 16 | 1396 << 24
+            );
+            assert_eq!(tmdb[1], 1 | 5 << 9 | 4 << 16);
+            assert_eq!(tmdb[2], 1 | 1 << 8 | 1 << 16);
+            assert_eq!(tmdb[3 + 6 + 9], 2);
+            let trakt = call(
+                nntmux_w623_trakt_pipe_batch,
+                &[b"The Office (US)||||tt0386676|2|5|", b"x|the-office|||||"],
+            );
+            assert_eq!(
+                trakt[0],
+                1 | 1 << 8 | 1 << 10 | 1 << 12 | 4 << 15 | 3 << 18 | 13 << 20 | 2 << 28 | 5 << 38
+            );
+            assert_eq!(trakt[1], 1 | 1 << 2 | 3 << 15 | 1 << 18 | 10 << 20);
+        }
+
+        #[test]
+        fn w623_exports_guard_their_buffers() {
+            let mut buf = [0i64; 128];
+            let o = buf.as_mut_ptr();
+            let n = ptr::null::<i64>();
+            for (f, trailer) in EXPORTS {
+                unsafe {
+                    assert_eq!(f(b"x".as_ptr(), 1, n, 1, ptr::null_mut(), 128), -1);
+                    assert_eq!(f(ptr::null(), 1, n, 1, o, 128), -1);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 1, o, 128), -1);
+                    assert_eq!(f(ptr::null(), 0, n, 0, o, 128), trailer);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 2, o, 1), -(trailer + 2));
+                    let lens = [1i64, 2];
+                    assert_eq!(
+                        f(b"a\0b".as_ptr(), 3, lens.as_ptr(), 2, o, 128),
+                        trailer + 2
+                    );
+                    assert_eq!(f(b"a\0bc".as_ptr(), 4, lens.as_ptr(), 2, o, 128), -1);
+                }
+            }
+        }
+    }
+}
