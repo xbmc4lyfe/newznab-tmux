@@ -8,6 +8,8 @@ use App\Models\UsenetGroup;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
@@ -59,7 +61,7 @@ class ReleasesRunner extends BaseRunner
                 return null;
             }
 
-            return $written === 0 ? '' : \FFI::string($scratch, $written);
+            return $written === 0 ? '' : FFI::string($scratch, $written);
         } catch (\Throwable) {
             return null;
         }
@@ -388,6 +390,227 @@ class ReleasesRunner extends BaseRunner
                 cli()->error('Batch '.($batchIndex + 1).' failed: '.$e->getMessage());
                 throw new RuntimeException('Worker batch failed.', 0, $e);
             }
+        }
+    }
+
+    // ========================================================================
+    // WAVE 58.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 4.09x, p99 3.83x; uncommon mean 4.00x, p99 3.32x); see RustPostProcessReleasesRunnerDowntimeCompensatorTmuxCommandW58ParityTest. */
+    public const bool W58_RUST_FFI_DEFAULT = true;
+
+    public const string W58_RELEASES_RUNNER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w58_releases_runner_work_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** ASCII-lowercased release stage => stage index of w58ReleaseWorkBatch(). */
+    public const array W58_RELEASE_STAGES = ['releases' => 1, 'collections' => 2, 'groups' => 3, 'fixnames' => 4, 'nzbs' => 5, 'backfill' => 6];
+
+    /** Base score per stage index of w58ReleaseWorkBatch(). */
+    public const array W58_RELEASE_STAGE_WEIGHTS = [0, 60, 50, 20, 40, 30, 10];
+
+    /** Trailer words after the per-item words of w58ReleaseWorkBatch(). */
+    public const int W58_RELEASE_TRAILER = 11;
+
+    public static function usesW58RustFfi(): bool
+    {
+        $override = self::w58RustFfiState();
+
+        return \is_bool($override) ? $override : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 58 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 58.3 release work items `groupId:stage:limit` (split as explode(':', $item, 3)). Per item
+     * `stage | groupValid << 3 | limitValid << 4 | qualified << 5 | score << 6 | limit << 13 | id << 29`: stage
+     * is the W58_RELEASE_STAGES index of the ASCII-lowercased second field (0 unknown), the group id and limit
+     * are valid as 1-9 ASCII digits (id 0 and limit 0 otherwise; the limit is capped at 65535), qualified
+     * needs a valid positive id, a known stage and a valid limit, and score is the stage weight + 30 qualified
+     * + min(limit, 1000) / 100. Then the seven stage counts, the qualified count, the distinct qualified
+     * group ids, the max valid limit and the total score.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w58ReleaseWorkBatch(array $items): array
+    {
+        return self::usesW58RustFfi() ? self::w58ReleaseWorkBatchNative($items) : self::w58ReleaseWorkBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w58ReleaseWorkBatchNative(array $items): array
+    {
+        return self::w58Invoke($items, \count($items) + self::W58_RELEASE_TRAILER) ?? self::w58ReleaseWorkBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w58ReleaseWorkBatchPhp(array $items): array
+    {
+        $out = [];
+        $stages = array_fill(0, 7, 0);
+        $qualifiedCount = 0;
+        $groups = [];
+        $maxLimit = 0;
+        $totalScore = 0;
+        foreach ($items as $item) {
+            [$group, $stage, $limit] = array_pad(explode(':', (string) $item, 3), 3, '');
+            $stage = self::W58_RELEASE_STAGES[strtolower($stage)] ?? 0;
+            $groupValid = self::w58Digits($group);
+            $id = $groupValid ? (int) $group : 0;
+            $limitValid = self::w58Digits($limit);
+            $limit = $limitValid ? min((int) $limit, 65535) : 0;
+            $qualified = $groupValid && $id > 0 && $stage !== 0 && $limitValid;
+            $score = self::W58_RELEASE_STAGE_WEIGHTS[$stage] + ($qualified ? 30 : 0) + intdiv(min($limit, 1000), 100);
+            $stages[$stage]++;
+            if ($qualified) {
+                $qualifiedCount++;
+                $groups[$id] = true;
+            }
+            if ($limitValid) {
+                $maxLimit = max($maxLimit, $limit);
+            }
+            $totalScore += $score;
+            $out[] = $stage | ($groupValid ? 1 : 0) << 3 | ($limitValid ? 1 : 0) << 4 | ($qualified ? 1 : 0) << 5 | $score << 6
+                | $limit << 13 | $id << 29;
+        }
+        array_push($out, ...$stages);
+        array_push($out, $qualifiedCount, \count($groups), $maxLimit, $totalScore);
+
+        return $out;
+    }
+
+    /** One to nine ASCII digits. */
+    private static function w58Digits(string $value): bool
+    {
+        $length = \strlen($value);
+
+        return $length >= 1 && $length <= 9 && strspn($value, '0123456789') === $length;
+    }
+
+    /**
+     * Wave 58 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w58', self::W58_RELEASES_RUNNER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w58RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w58RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 58.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w58Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w58RustFfiState('ffi');
+            $out = self::w58RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w58RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W58_RELEASES_RUNNER_FFI_CDEF.)
+            $written = $ffi->nntmux_w58_releases_runner_work_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (\Throwable) {
+            return null;
         }
     }
 }
