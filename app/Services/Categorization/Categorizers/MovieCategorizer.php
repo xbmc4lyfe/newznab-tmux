@@ -9,6 +9,7 @@ use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -552,5 +553,287 @@ CDEF;
         }
 
         return self::$w423RustFfiHandle === false ? null : self::$w423RustFfiHandle;
+    }
+
+    // ========================================================================
+    // WAVE 61.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 7.65x, p99 5.87x; uncommon mean 6.73x, p99 4.69x); see RustCategorizersMiscMovieMusicPcAnimeProcessorW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    public const string W61_MOVIE_CATEGORIZER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w611_movie_token_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w61MovieTokenBatch(). */
+    public const int W61_MOVIE_CATEGORIZER_TRAILER = 42;
+
+    /**
+     * Movie token flags: 1 UHD, 2 HD, 4 SD, 8 BluRay, 16 WEB, 32 DVD, 64 cam/telesync, 128 3D, 256 HEVC, 512 AVC,
+     * 1024 HDR, 2048 foreign, 4096 trailer, 8192 XviD/DivX and 16384 audio (32768, an `s`+1-3 digit+`e`+1-4 digit
+     * episode token, is detected by shape).
+     *
+     * @var array<string, int>
+     */
+    public const array W61_MOVIE_TOKEN_FLAGS = ['2160p' => 1, '4k' => 1, 'uhd' => 1, '720p' => 2, '1080p' => 2, '1080i' => 2, '480p' => 4,
+        '576p' => 4, 'sd' => 4, 'dvdscr' => 4, 'bluray' => 8, 'bdrip' => 8, 'brrip' => 8, 'bd25' => 8, 'bd50' => 8, 'untouched' => 8,
+        'remux' => 8, 'bdmv' => 8, 'webdl' => 16, 'webrip' => 16, 'web' => 16, 'dvd' => 32, 'dvdr' => 32, 'dvd5' => 32, 'dvd9' => 32,
+        'dvdrip' => 32, 'cam' => 64, 'camrip' => 64, 'hdcam' => 64, 'ts' => 64, 'hdts' => 64, 'telesync' => 64, 'tc' => 64, 'telecine' => 64,
+        '3d' => 128, 'sbs' => 128, 'hsbs' => 128, 'mvc' => 128, 'x265' => 256, 'h265' => 256, 'hevc' => 256, 'x264' => 512, 'h264' => 512,
+        'avc' => 512, 'hdr' => 1024, 'hdr10' => 1024, 'dv' => 1024, 'dovi' => 1024, 'german' => 2048, 'french' => 2048, 'dutch' => 2048,
+        'spanish' => 2048, 'italian' => 2048, 'swedish' => 2048, 'danish' => 2048, 'norwegian' => 2048, 'flemish' => 2048, 'hebrew' => 2048,
+        'castellano' => 2048, 'multisub' => 2048, 'nlsub' => 2048, 'swesub' => 2048, 'ita' => 2048, 'deutsch' => 2048, 'trailer' => 4096,
+        'teaser' => 4096, 'xvid' => 8192, 'divx' => 8192, 'dts' => 16384, 'ac3' => 16384, 'aac' => 16384, 'ddp5' => 16384, 'atmos' => 16384,
+        'truehd' => 16384, 'dd5' => 16384];
+
+    /**
+     * Resolution tiers: 1 480p, 2 576p, 3 720p, 4 1080p and 5 2160p.
+     *
+     * @var array<string, int>
+     */
+    public const array W61_MOVIE_RESOLUTIONS = ['480p' => 1, '576p' => 2, '720p' => 3, '1080p' => 4, '1080i' => 4, '2160p' => 5, '4k' => 5, 'uhd' => 5];
+
+    /**
+     * Category per w61MovieTokenBatch() rule.
+     *
+     * @var list<int>
+     */
+    public const array W61_MOVIE_RULE_CATEGORIES = [0, Category::MOVIE_FOREIGN, Category::MOVIE_OTHER, Category::MOVIE_UHD, Category::MOVIE_3D,
+        Category::MOVIE_BLURAY, Category::MOVIE_DVD, Category::MOVIE_WEBDL, Category::MOVIE_HD, Category::MOVIE_SD, Category::MOVIE_OTHER];
+
+    public static function usesW61RustFfi(): bool
+    {
+        $override = self::w61RustFfiState();
+
+        return \is_bool($override) ? $override : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the MovieCategorizer Wave 61 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 61.1 movie token, year, codec and resolution plans. Each item is `releaseName|categorizeForeign|catWebDL`
+     * (the name trimmed; the switches w61Truthy()). Per item `rule | resolution << 4 | codec << 7 | flags << 9 |
+     * yearCode << 25 | foreign << 33 | webdl << 34 | confidenceMilli << 35 | min(tokens, 63) << 45 |
+     * min(nameLength, 255) << 51`: flags OR the W61_MOVIE_TOKEN_FLAGS of every `[^a-z0-9]+`-separated lowercase
+     * token plus the episode shape flag; the resolution is the largest W61_MOVIE_RESOLUTIONS tier; the codec is 1
+     * HEVC, 2 AVC, 3 XviD/DivX or 0; the year code is the first 19xx/20xx token minus 1899 (0 none). A name is a
+     * movie with any UHD, HD, SD, BluRay, WEB, DVD, cam, 3D, HEVC, AVC or XviD flag and no episode token; the rule
+     * (W61_MOVIE_RULE_CATEGORIES), in order, is 1 foreign (switch on, 0.8), 2 trailer (0.6), 3 UHD (0.9), 4 3D
+     * (0.9), 5 BluRay (0.9), 6 DVD (0.85), 7 WEB-DL (switch on, 0.85), 8 HD (0.85, or WEB with the switch off,
+     * 0.8), 9 SD (0.8), 10 other (0.6), else 0. Then eleven rule, six resolution, four codec and sixteen flag
+     * counts, the items with a year, the smallest and largest year (0 without one), the confidence sum and the
+     * distinct years.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61MovieTokenBatch(array $items): array
+    {
+        return self::usesW61RustFfi() ? self::w61MovieTokenBatchNative($items) : self::w61MovieTokenBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61MovieTokenBatchNative(array $items): array
+    {
+        return self::w61Invoke($items, \count($items) + self::W61_MOVIE_CATEGORIZER_TRAILER) ?? self::w61MovieTokenBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61MovieTokenBatchPhp(array $items): array
+    {
+        $out = [];
+        $rules = array_fill(0, 11, 0);
+        $resolutions = [0, 0, 0, 0, 0, 0];
+        $codecs = [0, 0, 0, 0];
+        $flagCounts = array_fill(0, 16, 0);
+        $yearItems = $minYear = $maxYear = $confidenceSum = 0;
+        $years = [];
+        foreach ($items as $item) {
+            $f = explode('|', (string) $item, 3) + ['', '', ''];
+            $name = trim($f[0]);
+            $foreign = self::w61Truthy($f[1]);
+            $webdl = self::w61Truthy($f[2]);
+            $tokens = $name === '' ? [] : (preg_split('/[^a-z0-9]+/', strtolower($name), -1, PREG_SPLIT_NO_EMPTY) ?: []);
+            $flags = $resolution = $year = 0;
+            foreach ($tokens as $token) {
+                $flags |= self::W61_MOVIE_TOKEN_FLAGS[$token] ?? 0;
+                $resolution = max($resolution, self::W61_MOVIE_RESOLUTIONS[$token] ?? 0);
+                $tokenLength = \strlen($token);
+                if ($year === 0 && $tokenLength === 4 && strspn($token, '0123456789') === 4 && ($token[0].$token[1] === '19' || $token[0].$token[1] === '20')) {
+                    $year = (int) $token - 1899;
+                }
+                if ($token[0] === 's' && preg_match('/\As[0-9]{1,3}e[0-9]{1,4}\z/', $token) === 1) {
+                    $flags |= 32768;
+                }
+            }
+            $codec = ($flags & 256) !== 0 ? 1 : (($flags & 512) !== 0 ? 2 : (($flags & 8192) !== 0 ? 3 : 0));
+            $movie = ($flags & (1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 | 8192)) !== 0 && ($flags & 32768) === 0;
+            [$rule, $confidence] = match (true) {
+                ! $movie => [0, 0],
+                $foreign && ($flags & 2048) !== 0 => [1, 800],
+                ($flags & 4096) !== 0 => [2, 600],
+                ($flags & 1) !== 0 => [3, 900],
+                ($flags & 128) !== 0 => [4, 900],
+                ($flags & 8) !== 0 => [5, 900],
+                ($flags & 32) !== 0 => [6, 850],
+                $webdl && ($flags & 16) !== 0 => [7, 850],
+                ($flags & (2 | 256 | 512)) !== 0 => [8, 850],
+                ! $webdl && ($flags & 16) !== 0 => [8, 800],
+                ($flags & (4 | 8192)) !== 0 => [9, 800],
+                default => [10, 600],
+            };
+            $rules[$rule]++;
+            $resolutions[$resolution]++;
+            $codecs[$codec]++;
+            for ($i = 0; $i < 16; $i++) {
+                $flagCounts[$i] += $flags >> $i & 1;
+            }
+            if ($year !== 0) {
+                $fullYear = $year + 1899;
+                $yearItems++;
+                $minYear = $minYear === 0 ? $fullYear : min($minYear, $fullYear);
+                $maxYear = max($maxYear, $fullYear);
+                $years[$fullYear] = true;
+            }
+            $confidenceSum += $confidence;
+            $out[] = $rule | $resolution << 4 | $codec << 7 | $flags << 9 | $year << 25 | (int) $foreign << 33 | (int) $webdl << 34
+                | $confidence << 35 | min(\count($tokens), 63) << 45 | min(\strlen($name), 255) << 51;
+        }
+        array_push($out, ...$rules, ...$resolutions, ...$codecs, ...$flagCounts);
+        array_push($out, $yearItems, $minYear, $maxYear, $confidenceSum, \count($years));
+
+        return $out;
+    }
+
+    /** `1`, `true`, `yes` or `on` (trimmed, case-insensitive). */
+    private static function w61Truthy(string $raw): bool
+    {
+        return \in_array(strtolower(trim($raw)), ['1', 'true', 'yes', 'on'], true);
+    }
+
+    /**
+     * Wave 61 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w611', self::W61_MOVIE_CATEGORIZER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 61.1 MovieCategorizer export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w61Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w61RustFfiState('ffi');
+            $out = self::w61RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w61RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W61_MOVIE_CATEGORIZER_FFI_CDEF.)
+            $written = $ffi->nntmux_w611_movie_token_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
