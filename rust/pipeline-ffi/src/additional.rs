@@ -40763,3 +40763,917 @@ mod w556_additional_state_tests {
         assert_eq!(status, -1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 56.6: processing outcome tokens, ffmpeg frame outputs, NZB source
+// receipts, installation path pairs and upload manifest entries
+// (`nntmux_w566_*`) for ProcessingOutcome, FfmpegFrameGrabber, NzbSourceGuard,
+// NzbSourceInstallation and NzbUploadManifestService. Same contract as Wave
+// 55.6: strings are NUL-joined column after column (with a 0x01-joined twin
+// when one holds a NUL), integer columns are machine-order `int64_t`, and the
+// result is fixed-width `int64_t` words. Every export returns 1, -1 for
+// invalid input (PHP then computes the batch) or -2 when `out` is null,
+// misaligned or too small, and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+/// Saturation of a 20-bit length field.
+const W566_LEN_CAP: usize = (1 << 20) - 1;
+
+/// `count * columns` strings split into `columns` columns of `count` items.
+fn w566_columns<'a>(
+    joined: &'a [u8],
+    twin: &[u8],
+    columns: usize,
+    count: usize,
+) -> Option<Vec<&'a [u8]>> {
+    if count > W47_MAX_ITEMS {
+        return None;
+    }
+    w49_items(joined, twin, columns.checked_mul(count)?)
+}
+
+/// PHP `trim()` with its default characters.
+#[inline]
+fn w566_trim(value: &[u8]) -> &[u8] {
+    let blank = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+    let start = value.iter().position(|b| !blank(b)).unwrap_or(value.len());
+    let end = value.iter().rposition(|b| !blank(b)).map_or(start, |at| at + 1);
+    &value[start..end]
+}
+
+/// `[parent, base]` of a path split after its last `/` (no slash: empty parent).
+#[inline]
+fn w566_split_path(path: &[u8]) -> (&[u8], &[u8]) {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(slash) => (&path[..=slash], &path[slash + 1..]),
+        None => (&[], path),
+    }
+}
+
+#[inline]
+fn w566_lower_hex(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+// --- ProcessingOutcome::parseOutcomeTokenBatch -------------------------------
+
+pub(crate) const W566_OUTCOME_HEADER: usize = 23;
+
+/// Declaration index of a normalized outcome token; 12 when it names no case.
+fn w566_outcome_case(key: &[u8]) -> i64 {
+    match key {
+        b"completed" => 0,
+        b"no-useful-artifacts" => 1,
+        b"passworded" => 2,
+        b"group-unavailable" => 3,
+        b"temporary-workspace-unavailable" => 4,
+        b"timed-out" => 5,
+        b"deleted-after-timeout" => 6,
+        b"deleted-broken-nzb" => 7,
+        b"deleted-par2-only" => 8,
+        b"not-found" => 9,
+        b"awaiting-late-articles" => 10,
+        b"failed" => 11,
+        _ => 12,
+    }
+}
+
+/// Raw outcome tokens, each trimmed, ASCII-lowercased and with `_` and spaces
+/// turned into `-` before it is resolved. Cases 0-2 are successful, 6-8
+/// deleted, 3-5 and 10 retryable, 0-2 and 6-9 terminal. `[0]` count,
+/// `[1..=13]` per case (13 unknown), `[14]` successful, `[15]` deleted, `[16]`
+/// retryable, `[17]` terminal, `[18]` known tokens that needed normalizing,
+/// `[19]` first unknown and `[20]` first retryable index (-1 when none),
+/// `[21]` successful ppm, `[22]` FNV-1a digest; then per token `case |
+/// successful << 4 | deleted << 5 | retryable << 6 | terminal << 7 |
+/// normalized << 8 | min(bytes, 65535) << 16`.
+pub(crate) fn w566_outcome_batch(tokens: &[&[u8]]) -> Vec<i64> {
+    let count = tokens.len();
+    let mut out = vec![0i64; W566_OUTCOME_HEADER + count];
+    out[0] = count as i64;
+    out[19] = -1;
+    out[20] = -1;
+    let mut key = [0u8; 32];
+    for (at, token) in tokens.iter().enumerate() {
+        let trimmed = w566_trim(token);
+        let case = if trimmed.len() <= key.len() {
+            for (slot, &byte) in key.iter_mut().zip(trimmed) {
+                *slot = match byte {
+                    b'_' | b' ' => b'-',
+                    other => other.to_ascii_lowercase(),
+                };
+            }
+            w566_outcome_case(&key[..trimmed.len()])
+        } else {
+            12
+        };
+        let successful = i64::from(case <= 2);
+        let deleted = i64::from((6..=8).contains(&case));
+        let retryable = i64::from(matches!(case, 3..=5 | 10));
+        let terminal = i64::from(case <= 2 || (6..=9).contains(&case));
+        let normalized = i64::from(case < 12 && key[..trimmed.len()] != **token);
+        out[1 + case as usize] += 1;
+        out[14] += successful;
+        out[15] += deleted;
+        out[16] += retryable;
+        out[17] += terminal;
+        out[18] += normalized;
+        if case == 12 && out[19] < 0 {
+            out[19] = at as i64;
+        }
+        if retryable == 1 && out[20] < 0 {
+            out[20] = at as i64;
+        }
+        out[W566_OUTCOME_HEADER + at] = case
+            | successful << 4
+            | deleted << 5
+            | retryable << 6
+            | terminal << 7
+            | normalized << 8
+            | (token.len().min(65_535) as i64) << 16;
+    }
+    if count > 0 {
+        out[21] = out[14] * 1_000_000 / count as i64;
+    }
+    out[22] = w526_digest(&out[W566_OUTCOME_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w566_outcome_token_batch(
+    tokens: *const u8,
+    tokens_len: usize,
+    token_twin: *const u8,
+    token_twin_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let tokens = w566_columns(
+                w15_input(tokens, tokens_len)?,
+                w15_input(token_twin, token_twin_len)?,
+                1,
+                count,
+            )?;
+            Some(w566_outcome_batch(&tokens))
+        })
+    }
+}
+
+// --- FfmpegFrameGrabber::classifyFrameBatch ----------------------------------
+
+pub(crate) const W566_FRAME_HEADER: usize = 13;
+
+/// Largest seek offset in milliseconds (2^31-1) and largest expected frame
+/// timestamp (2^30-1).
+const W566_SEEK_CAP: i64 = (1 << 31) - 1;
+const W566_EXPECTED_CAP: i64 = (1 << 30) - 1;
+
+/// `/^frame_([0-9a-f]{8})_(\d{2,9})\.jpg$/D`: the token and frame number.
+fn w566_frame_name(base: &[u8]) -> Option<(&[u8], i64)> {
+    let digits = base.len().checked_sub(19)?;
+    if !(2..=9).contains(&digits)
+        || !base.starts_with(b"frame_")
+        || base[14] != b'_'
+        || !base.ends_with(b".jpg")
+        || !w566_lower_hex(&base[6..14])
+    {
+        return None;
+    }
+    let mut number = 0i64;
+    for &b in &base[15..15 + digits] {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        number = number * 10 + i64::from(b - b'0');
+    }
+    Some((&base[6..14], number))
+}
+
+/// Frames `grab()` wrote, as paths and byte sizes, with the seek start and
+/// spacing in milliseconds (each clamped to 0..2^31-1). Basenames must be
+/// `frame_<8 hex>_<2-9 digits>.jpg`; the first matching name fixes the token.
+/// Status 0 accepted, 1 bad name, 2 empty (size 0 or less), 3 foreign token,
+/// 4 not after the last accepted frame. `[0]` count, `[1..=5]` per status,
+/// `[6]` accepted bytes (sizes clamped to 2^40-1, total capped at 2^62), `[7]`
+/// first and `[8]` last accepted frame number (-1 when none), `[9]` frames
+/// missing between accepted ones, `[10]` seek start, `[11]` spacing, `[12]`
+/// FNV-1a digest; then per frame `status | number << 3 | expected << 33`
+/// (expected milliseconds `start + (number - 1) * spacing`, `start` for frame
+/// 0 or a bad name, capped at 2^30-1).
+pub(crate) fn w566_frame_batch(paths: &[&[u8]], sizes: &[i64], from: i64, spacing: i64) -> Vec<i64> {
+    let count = paths.len();
+    let from = from.clamp(0, W566_SEEK_CAP);
+    let spacing = spacing.clamp(0, W566_SEEK_CAP);
+    let mut out = vec![0i64; W566_FRAME_HEADER + count];
+    out[0] = count as i64;
+    out[7] = -1;
+    out[8] = -1;
+    out[10] = from;
+    out[11] = spacing;
+    let mut first: Option<&[u8]> = None;
+    for (at, path) in paths.iter().enumerate() {
+        let (_, base) = w566_split_path(path);
+        let size = sizes[at];
+        let (status, number) = match w566_frame_name(base) {
+            None => (1, 0),
+            Some((token, number)) => {
+                let first = *first.get_or_insert(token);
+                let status = if token != first {
+                    3
+                } else if size <= 0 {
+                    2
+                } else if out[8] >= 0 && number <= out[8] {
+                    4
+                } else {
+                    0
+                };
+                (status, number)
+            }
+        };
+        if status == 0 {
+            out[6] = w47_add(out[6], w47_clamp(size));
+            if out[8] >= 0 {
+                out[9] += number - out[8] - 1;
+            } else {
+                out[7] = number;
+            }
+            out[8] = number;
+        }
+        out[1 + status as usize] += 1;
+        let expected = (from + (number - 1).max(0) * spacing).min(W566_EXPECTED_CAP);
+        out[W566_FRAME_HEADER + at] = status | number << 3 | expected << 33;
+    }
+    out[12] = w526_digest(&out[W566_FRAME_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w566_frame_output_batch(
+    paths: *const u8,
+    paths_len: usize,
+    path_twin: *const u8,
+    path_twin_len: usize,
+    sizes: *const u8,
+    sizes_len: usize,
+    count: usize,
+    from_ms: i64,
+    spacing_ms: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let paths = w566_columns(
+                w15_input(paths, paths_len)?,
+                w15_input(path_twin, path_twin_len)?,
+                1,
+                count,
+            )?;
+            let sizes = w47_ints(w15_input(sizes, sizes_len)?, 1, count)?;
+            Some(w566_frame_batch(&paths, &sizes, from_ms, spacing_ms))
+        })
+    }
+}
+
+// --- NzbSourceGuard::validateAnchorBatch -------------------------------------
+
+pub(crate) const W566_ANCHOR_HEADER: usize = 9;
+
+/// Deletion receipts as `validateAnchorPhp()` checks them, from a version
+/// column and six string columns (kind, guid, path, anchor, dev, ino). Status 0
+/// valid inode, 1 valid absent, 2 unsupported, 3 malformed, 4 not matching its
+/// source. `[0]` count, `[1..=5]` per status, `[6]` valid compressed
+/// (`.nzb.gz`) sources, `[7]` first rejected index (-1 when none), `[8]` FNV-1a
+/// digest; then per receipt `status | compressed << 3 | min(guid bytes, 255) <<
+/// 4 | min(path bytes, 2^20-1) << 12`.
+/// Byte classes: bit 0 GUID (`[a-zA-Z0-9_-]`), bit 1 lowercase hex, bit 2 digit.
+const W566_CLASS: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut b = 0;
+    while b < 256 {
+        let c = b as u8;
+        let digit = c.is_ascii_digit();
+        let hex = digit || (c >= b'a' && c <= b'f');
+        let guid = c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+        table[b] = guid as u8 | (hex as u8) << 1 | (digit as u8) << 2;
+        b += 1;
+    }
+    table
+};
+
+/// Every byte has class bit `bit` (branch-free over the whole slice).
+#[inline]
+fn w566_all_class(bytes: &[u8], bit: u8) -> bool {
+    bytes.iter().fold(bit, |acc, &b| acc & W566_CLASS[b as usize]) == bit
+}
+
+/// PHP `dirname()` of `path` when its basename (after trailing slashes) is
+/// exactly `base`; `None` when the basename differs.
+fn w566_dir_of(path: &[u8], base: impl Fn(&[u8]) -> bool, base_len: usize) -> Option<&[u8]> {
+    let end = path.iter().rposition(|&b| b != b'/')? + 1;
+    let cut = end.checked_sub(base_len)?;
+    if (cut > 0 && path[cut - 1] != b'/') || !base(&path[cut..end]) {
+        return None;
+    }
+    let mut dir = cut;
+    while dir > 0 && path[dir - 1] == b'/' {
+        dir -= 1;
+    }
+    Some(match (cut, dir) {
+        (0, _) => b".",
+        (_, 0) => b"/",
+        _ => &path[..dir],
+    })
+}
+
+/// `nzb_custody::validate_anchor_code()` (0 valid, 1 malformed, 2 not matching
+/// its source) without scanning whole paths: a valid basename has a fixed
+/// width, so only the bytes it covers and the slashes before it are read.
+fn w566_anchor_code(absent: bool, guid: &[u8], path: &[u8], anchor: &[u8], dev: &[u8], ino: &[u8]) -> i32 {
+    let field = |s: &[u8]| !s.is_empty() && !s.contains(&0);
+    if !field(guid) || !field(path) || (!absent && (!field(anchor) || !field(dev) || !field(ino))) {
+        return 1;
+    }
+    let g = guid.len();
+    if g > 40 || !w566_all_class(guid, 1) {
+        return 2;
+    }
+    let source = |ext: &[u8]| {
+        w566_dir_of(path, |base| base.starts_with(guid) && &base[g..] == ext, g + ext.len())
+    };
+    let Some(path_dir) = source(b".nzb.gz").or_else(|| source(b".nzb")) else {
+        return 2;
+    };
+    if absent {
+        return 0;
+    }
+    let anchored = |base: &[u8]| {
+        base.starts_with(b".archive-audit-")
+            && &base[15..15 + g] == guid
+            && base[15 + g] == b'-'
+            && w566_all_class(&base[16 + g..48 + g], 2)
+            && base.ends_with(b".anchor")
+    };
+    let matched = w566_dir_of(anchor, anchored, g + 55) == Some(path_dir)
+        && w566_all_class(dev, 4)
+        && w566_all_class(ino, 4);
+    if matched { 0 } else { 2 }
+}
+
+pub(crate) fn w566_anchor_batch(versions: &[i64], fields: &[&[u8]]) -> Vec<i64> {
+    let count = versions.len();
+    let mut out = vec![0i64; W566_ANCHOR_HEADER + count];
+    out[0] = count as i64;
+    out[7] = -1;
+    for at in 0..count {
+        let column = |c: usize| fields[c * count + at];
+        let (kind, guid, path) = (column(0), column(1), column(2));
+        let absent = kind == b"absent";
+        let status = if versions[at] != 1 || !(absent || kind == b"inode") {
+            2
+        } else {
+            match w566_anchor_code(absent, guid, path, column(3), column(4), column(5)) {
+                0 => i64::from(absent),
+                1 => 3,
+                _ => 4,
+            }
+        };
+        let kept = path.iter().rposition(|&b| b != b'/').map_or(0, |at| at + 1);
+        let compressed = i64::from(status <= 1 && path[..kept].ends_with(b".gz"));
+        out[1 + status as usize] += 1;
+        out[6] += compressed;
+        if status >= 2 && out[7] < 0 {
+            out[7] = at as i64;
+        }
+        out[W566_ANCHOR_HEADER + at] = status
+            | compressed << 3
+            | (guid.len().min(255) as i64) << 4
+            | (path.len().min(W566_LEN_CAP) as i64) << 12;
+    }
+    out[8] = w526_digest(&out[W566_ANCHOR_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w566_anchor_receipt_batch(
+    versions: *const u8,
+    versions_len: usize,
+    fields: *const u8,
+    fields_len: usize,
+    field_twin: *const u8,
+    field_twin_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let versions = w47_ints(w15_input(versions, versions_len)?, 1, count)?;
+            let fields = w566_columns(
+                w15_input(fields, fields_len)?,
+                w15_input(field_twin, field_twin_len)?,
+                6,
+                count,
+            )?;
+            Some(w566_anchor_batch(&versions, &fields))
+        })
+    }
+}
+
+// --- NzbSourceInstallation::classifyPathPairBatch ----------------------------
+
+pub(crate) const W566_PAIR_HEADER: usize = 11;
+
+/// Installation path pairs as `normalizeSourcePathPairPhp()` sees them, plus
+/// whether the destination is the source's staged generation
+/// (`<source basename>.c<digits>-<16 hex>.next` per `STAGED_NAME`). Status 0
+/// unchanged, 1 in-place generation (ready), 2 in-place other name, 3
+/// relocated, 4 an empty path. `[0]` count, `[1..=5]` per status, `[6]` staged,
+/// `[7]` sibling, `[8]` canonical (`<guid>.nzb.gz`) sources, `[9]` first index
+/// with status 2 or more (-1 when none), `[10]` FNV-1a digest; then per pair
+/// `status | staged << 3 | sibling << 4 | empty << 5 | canonical << 6 |
+/// generation << 7 | min(candidate digits, 255) << 8 | min(destination bytes,
+/// 2^20-1) << 16`.
+pub(crate) fn w566_pair_batch(fields: &[&[u8]], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W566_PAIR_HEADER + count];
+    out[0] = count as i64;
+    out[9] = -1;
+    for at in 0..count {
+        let (source, destination) = (fields[at], fields[count + at]);
+        let (source_parent, source_base) = w566_split_path(source);
+        let (destination_parent, destination_base) = w566_split_path(destination);
+        let staged = i64::from(source != destination);
+        let empty = i64::from(source.is_empty() || destination.is_empty());
+        let sibling = i64::from(empty == 0 && source_parent == destination_parent);
+        let canonical = i64::from(source_base.len() > 7 && source_base.ends_with(b".nzb.gz"));
+        let digits = match nzb_custody::staged_guid_len(destination_base) {
+            Some(guid) if guid + 7 == source_base.len() && destination_base.starts_with(source_base) => {
+                Some(destination_base.len() - guid - 31)
+            }
+            _ => None,
+        };
+        let generation = i64::from(digits.is_some());
+        let status = if empty == 1 {
+            4
+        } else if staged == 0 {
+            0
+        } else if sibling == 1 {
+            if generation == 1 { 1 } else { 2 }
+        } else {
+            3
+        };
+        out[1 + status as usize] += 1;
+        out[6] += staged;
+        out[7] += sibling;
+        out[8] += canonical;
+        if status >= 2 && out[9] < 0 {
+            out[9] = at as i64;
+        }
+        out[W566_PAIR_HEADER + at] = status
+            | staged << 3
+            | sibling << 4
+            | empty << 5
+            | canonical << 6
+            | generation << 7
+            | (digits.unwrap_or(0).min(255) as i64) << 8
+            | (destination.len().min(W566_LEN_CAP) as i64) << 16;
+    }
+    out[10] = w526_digest(&out[W566_PAIR_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w566_install_pair_batch(
+    fields: *const u8,
+    fields_len: usize,
+    field_twin: *const u8,
+    field_twin_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let fields = w566_columns(
+                w15_input(fields, fields_len)?,
+                w15_input(field_twin, field_twin_len)?,
+                2,
+                count,
+            )?;
+            Some(w566_pair_batch(&fields, count))
+        })
+    }
+}
+
+// --- NzbUploadManifestService::classifyManifestEntryBatch -------------------
+
+pub(crate) const W566_MANIFEST_HEADER: usize = 23;
+
+/// Index of a manifest state constant; 10 for any other string.
+fn w566_manifest_state(state: &[u8]) -> i64 {
+    match state {
+        b"staged" => 0,
+        b"nzb_imported" => 1,
+        b"nzb_duplicate" => 2,
+        b"nzb_failed" => 3,
+        b"nzb_pending" => 4,
+        b"metadata_review" => 5,
+        b"metadata_deferred" => 6,
+        b"nzb_rejected" => 7,
+        b"nfo_imported" => 8,
+        b"nfo_failed" => 9,
+        _ => 10,
+    }
+}
+
+/// Upload manifest entries as `read()`, `assertSafeFilename()` and
+/// `canReconcileCandidatePhp()` check them, from two integer columns (version,
+/// companion capture bytes) and five string columns (state, NZB filename, NFO
+/// filename or empty for none, candidate identity, capture SHA-256 or empty for
+/// none). Status 0 valid, 1 unsupported version, 2 unsafe NZB name, 3 unsafe
+/// NFO name, 4 malformed capture (not 64 lowercase hex or negative bytes). A
+/// capture counts only on a valid version 2 entry. `[0]` count, `[1..=5]` per
+/// status, `[6..=16]` per state (16 unknown), `[17]` reconcilable, `[18]` with
+/// an NFO, `[19]` captures, `[20]` capture bytes (clamped to 2^40-1 each,
+/// total capped at 2^62), `[21]` first rejected index (-1 when none), `[22]`
+/// FNV-1a digest; then per entry `status | state << 3 | reconcilable << 7 |
+/// nfo << 8 | capture << 9 | version << 10 | capture bytes << 12` (version 0
+/// when unsupported).
+pub(crate) fn w566_manifest_batch(ints: &[i64], fields: &[&[u8]], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W566_MANIFEST_HEADER + count];
+    out[0] = count as i64;
+    out[21] = -1;
+    for at in 0..count {
+        let column = |c: usize| fields[c * count + at];
+        let (version, bytes) = (ints[at], ints[count + at]);
+        let (state, nzb, nfo, identity, digest) = (column(0), column(1), column(2), column(3), column(4));
+        let nfo_present = !nfo.is_empty();
+        let status = if version != 1 && version != 2 {
+            1
+        } else if !nzb_custody::safe_upload_filename(nzb, b"nzb") {
+            2
+        } else if nfo_present && !nzb_custody::safe_upload_filename(nfo, b"nfo") {
+            3
+        } else if !digest.is_empty() && (digest.len() != 64 || !w566_lower_hex(digest) || bytes < 0) {
+            4
+        } else {
+            0
+        };
+        let state_index = w566_manifest_state(state);
+        let reconcilable = i64::from(nzb_custody::can_reconcile_candidate(Some(state), Some(identity)));
+        let capture = i64::from(status == 0 && version == 2 && !digest.is_empty());
+        let captured = if capture == 1 { w47_clamp(bytes) } else { 0 };
+        out[1 + status as usize] += 1;
+        out[6 + state_index as usize] += 1;
+        out[17] += reconcilable;
+        out[18] += i64::from(nfo_present);
+        out[19] += capture;
+        out[20] = w47_add(out[20], captured);
+        if status != 0 && out[21] < 0 {
+            out[21] = at as i64;
+        }
+        out[W566_MANIFEST_HEADER + at] = status
+            | state_index << 3
+            | reconcilable << 7
+            | i64::from(nfo_present) << 8
+            | capture << 9
+            | (if status == 1 { 0 } else { version }) << 10
+            | captured << 12;
+    }
+    out[22] = w526_digest(&out[W566_MANIFEST_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w566_manifest_entry_batch(
+    ints: *const u8,
+    ints_len: usize,
+    fields: *const u8,
+    fields_len: usize,
+    field_twin: *const u8,
+    field_twin_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            let fields = w566_columns(
+                w15_input(fields, fields_len)?,
+                w15_input(field_twin, field_twin_len)?,
+                5,
+                count,
+            )?;
+            Some(w566_manifest_batch(&ints, &fields, count))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w566_outcome_frame_guard_install_manifest_tests {
+    use super::*;
+    use std::ptr::{null, null_mut};
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn w566_outcome_batch_normalizes_tokens() {
+        let tokens: [&[u8]; 6] = [
+            b"completed",
+            b"  Timed_Out\n",
+            b"DELETED BROKEN NZB",
+            b"bogus",
+            b"failed",
+            b"awaiting-late-articles",
+        ];
+        let out = w566_outcome_batch(&tokens);
+        assert_eq!(out[0], 6);
+        assert_eq!(&out[1..14], &[1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1]);
+        assert_eq!(&out[14..22], &[1, 1, 2, 2, 2, 3, 1, 166_666]);
+        let base = W566_OUTCOME_HEADER;
+        assert_eq!(out[base], 1 << 4 | 1 << 7 | 9 << 16);
+        assert_eq!(out[base + 1], 5 | 1 << 6 | 1 << 8 | 12 << 16);
+        assert_eq!(out[base + 2], 7 | 1 << 5 | 1 << 7 | 1 << 8 | 18 << 16);
+        assert_eq!(out[base + 3], 12 | 5 << 16);
+        assert_eq!(out[22], w526_digest(&out[base..]));
+        let long = [b'a'; 40];
+        assert_eq!(w566_outcome_batch(&[&long])[13], 1);
+        let empty = w566_outcome_batch(&[]);
+        assert_eq!((empty[19], empty[20], empty[21]), (-1, -1, 0));
+    }
+
+    #[test]
+    fn w566_frame_batch_validates_outputs() {
+        let paths: [&[u8]; 6] = [
+            b"/tmp/x/frame_0a1b2c3d_01.jpg",
+            b"/tmp/x/frame_0a1b2c3d_03.jpg",
+            b"/tmp/x/frame_0a1b2c3d_02.jpg",
+            b"/tmp/x/frame_ffffffff_04.jpg",
+            b"frame_0a1b2c3d_05.jpg",
+            b"/tmp/x/frame_0A1B2C3D_06.jpg",
+        ];
+        let out = w566_frame_batch(&paths, &[10, 20, 30, 40, 0, 50], 1_500, 2_000);
+        assert_eq!(&out[..12], &[6, 2, 1, 1, 1, 1, 30, 1, 3, 1, 1_500, 2_000]);
+        let base = W566_FRAME_HEADER;
+        assert_eq!(out[base], 1 << 3 | 1_500 << 33);
+        assert_eq!(out[base + 1], 3 << 3 | 5_500 << 33);
+        assert_eq!(out[base + 2], 4 | 2 << 3 | 3_500 << 33);
+        assert_eq!(out[base + 3], 3 | 4 << 3 | 7_500 << 33);
+        assert_eq!(out[base + 4], 2 | 5 << 3 | 9_500 << 33);
+        assert_eq!(out[base + 5], 1 | 1_500 << 33);
+        assert_eq!(w566_frame_name(b"frame_00000000_123456789.jpg"), Some((&b"00000000"[..], 123_456_789)));
+        assert_eq!(w566_frame_name(b"frame_00000000_1234567890.jpg"), None);
+        assert_eq!(w566_frame_name(b"frame_00000000_1.jpg"), None);
+        let capped = w566_frame_batch(&[b"frame_00000000_999999999.jpg"], &[1], i64::MAX, i64::MAX);
+        assert_eq!((capped[10], capped[base] >> 33), (W566_SEEK_CAP, W566_EXPECTED_CAP));
+    }
+
+    #[test]
+    fn w566_anchor_batch_matches_receipt_rules() {
+        let anchor = b"/d/.archive-audit-abc-0123456789abcdef0123456789abcdef.anchor";
+        let fields: [&[u8]; 30] = [
+            b"inode", b"absent", b"inode", b"bogus", b"inode", //
+            b"abc", b"abc", b"abc", b"abc", b"a/c", //
+            b"/d/abc.nzb.gz", b"/e/abc.nzb", b"/d/abc.nzb.gz", b"/d/abc.nzb", b"/d/abc.nzb", //
+            anchor, b"", b"", anchor, anchor, //
+            b"12", b"", b"12", b"1", b"1", //
+            b"34", b"", b"34", b"1", b"1",
+        ];
+        let out = w566_anchor_batch(&[1, 1, 1, 1, 1], &fields);
+        assert_eq!(&out[..8], &[5, 1, 1, 1, 1, 1, 1, 2]);
+        let base = W566_ANCHOR_HEADER;
+        assert_eq!(out[base], 1 << 3 | 3 << 4 | 13 << 12);
+        assert_eq!(out[base + 1], 1 | 3 << 4 | 10 << 12);
+        assert_eq!(out[base + 2], 3 | 3 << 4 | 13 << 12);
+        assert_eq!(out[base + 4] & 7, 4);
+        let single: [&[u8]; 6] = [b"absent", b"abc", b"/d/abc.nzb", b"", b"", b""];
+        assert_eq!(w566_anchor_batch(&[1], &single)[2], 1);
+        assert_eq!(w566_anchor_batch(&[2], &single)[3], 1);
+    }
+
+    #[test]
+    fn w566_anchor_code_matches_exact_check() {
+        let mut seen = [0usize; 3];
+        let pieces: [&[u8]; 12] = [b"/", b"//", b"d", b"ab", b".", b"-", b"0", b"f", b"A", b"\0", b".nzb", b".gz"];
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for _ in 0..20_000 {
+            let guid: Vec<u8> = (0..next(4)).flat_map(|_| pieces[2 + next(7)].to_vec()).collect();
+            let dir: Vec<u8> = (0..next(4)).flat_map(|_| pieces[next(5)].to_vec()).collect();
+            let mut path = dir.clone();
+            path.extend_from_slice(&guid);
+            path.extend_from_slice([&b".nzb.gz"[..], b".nzb", b".nzb.g", b""][next(4)]);
+            let mut anchor = if next(4) == 0 { b"/x/".to_vec() } else { dir.clone() };
+            anchor.extend_from_slice(b".archive-audit-");
+            anchor.extend_from_slice(&guid);
+            anchor.extend_from_slice(b"-0123456789abcdef0123456789abcdef.anchor");
+            for value in [&mut path, &mut anchor] {
+                match next(12) {
+                    0 => value.push(b'/'),
+                    1 => value.insert(0, 0),
+                    2 => {
+                        let at = next(value.len() + 1);
+                        value.truncate(at);
+                    }
+                    _ => {}
+                }
+            }
+            let dev: &[u8] = [&b"12"[..], b"", b"1x"][next(3)];
+            for absent in [false, true] {
+                let exact = nzb_custody::validate_anchor_code(absent, &guid, &path, &anchor, dev, b"7");
+                assert_eq!(w566_anchor_code(absent, &guid, &path, &anchor, dev, b"7"), exact, "{guid:?} {path:?} {anchor:?}");
+                seen[exact as usize] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&n| n > 500), "{seen:?}");
+    }
+
+    #[test]
+    fn w566_pair_batch_classifies_generations() {
+        let fields: [&[u8]; 10] = [
+            b"/n/abc.nzb.gz",
+            b"/n/abc.nzb.gz",
+            b"/n/abc.nzb.gz",
+            b"/n/abc.nzb.gz",
+            b"",
+            b"/n/abc.nzb.gz",
+            b"/n/abc.nzb.gz.c42-0123456789abcdef.next",
+            b"/n/abd.nzb.gz.c42-0123456789abcdef.next",
+            b"/m/abc.nzb.gz",
+            b"/m/x",
+        ];
+        let out = w566_pair_batch(&fields, 5);
+        assert_eq!(&out[..10], &[5, 1, 1, 1, 1, 1, 4, 3, 4, 2]);
+        let base = W566_PAIR_HEADER;
+        assert_eq!(out[base], 1 << 4 | 1 << 6 | 13 << 16);
+        assert_eq!(out[base + 1], 1 | 1 << 3 | 1 << 4 | 1 << 6 | 1 << 7 | 2 << 8 | 39 << 16);
+        assert_eq!(out[base + 2] & 7, 2);
+        assert_eq!(out[base + 3] & 7, 3);
+        assert_eq!(out[base + 4], 4 | 1 << 3 | 1 << 5 | 4 << 16);
+    }
+
+    #[test]
+    fn w566_manifest_batch_checks_entries() {
+        let digest = [b'a'; 64];
+        let fields: [&[u8]; 20] = [
+            b"nzb_pending", b"metadata_review", b"staged", b"weird", //
+            b"a.nzb", b"b.NZB", b"../c.nzb", b"d.nzb", //
+            b"", b"a.nfo", b"", b"x.txt", //
+            b"", b"0123456789abcdef0123456789abcdef01234567", b"", b"", //
+            &digest, b"", b"", b"",
+        ];
+        let out = w566_manifest_batch(&[2, 2, 2, 1, 7, 0, 0, 0], &fields, 4);
+        assert_eq!(&out[..6], &[4, 2, 0, 1, 1, 0]);
+        assert_eq!((out[6], out[10], out[11], out[16]), (1, 1, 1, 1));
+        assert_eq!(&out[17..22], &[2, 2, 1, 7, 2]);
+        let base = W566_MANIFEST_HEADER;
+        assert_eq!(out[base], 4 << 3 | 1 << 7 | 1 << 9 | 2 << 10 | 7 << 12);
+        assert_eq!(out[base + 1], 5 << 3 | 1 << 7 | 1 << 8 | 2 << 10);
+        assert_eq!(out[base + 3], 3 | 10 << 3 | 1 << 8 | 1 << 10);
+        let bad = w566_manifest_batch(&[3, -1], &[b"staged", b"a.nzb", b"", b"", &digest], 1);
+        assert_eq!(bad[W566_MANIFEST_HEADER], 1);
+        let negative = w566_manifest_batch(&[2, -1], &[b"staged", b"a.nzb", b"", b"", &digest], 1);
+        assert_eq!(negative[W566_MANIFEST_HEADER] & 7, 4);
+    }
+
+    #[test]
+    fn w566_exports_validate_pointers_and_capacity() {
+        let mut out = [0i64; 64];
+        let tokens = b"completed\0failed";
+        let status = unsafe {
+            nntmux_w566_outcome_token_batch(tokens.as_ptr(), tokens.len(), null(), 0, 2, out.as_mut_ptr(), 64)
+        };
+        assert_eq!((status, out[0], out[1], out[12]), (1, 2, 1, 1));
+        let status = unsafe {
+            nntmux_w566_outcome_token_batch(tokens.as_ptr(), tokens.len(), null(), 0, 2, null_mut(), 64)
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w566_outcome_token_batch(tokens.as_ptr(), tokens.len(), null(), 0, 2, out.as_mut_ptr(), 4)
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w566_outcome_token_batch(tokens.as_ptr(), tokens.len(), null(), 0, 3, out.as_mut_ptr(), 64)
+        };
+        assert_eq!(status, -1);
+        let misaligned = unsafe { out.as_mut_ptr().cast::<u8>().add(1).cast::<i64>() };
+        let status = unsafe { nntmux_w566_install_pair_batch(null(), 0, null(), 0, 0, misaligned, 32) };
+        assert_eq!(status, -2);
+        out.fill(7);
+        for status in unsafe {
+            [
+                nntmux_w566_outcome_token_batch(null(), 0, null(), 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w566_frame_output_batch(null(), 0, null(), 0, null(), 0, 0, 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w566_anchor_receipt_batch(null(), 0, null(), 0, null(), 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w566_install_pair_batch(null(), 0, null(), 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w566_manifest_entry_batch(null(), 0, null(), 0, null(), 0, 0, out.as_mut_ptr(), 64),
+            ]
+        } {
+            assert_eq!((status, out[0]), (1, 0));
+        }
+        // A NUL inside a path is carried by the 0x01-joined twin.
+        let paths = b"frame_00000000_01.jpg\0a\0b";
+        let twin = b"frame_00000000_01.jpg\x01a\0b";
+        let sizes = packed(&[5, 6]);
+        let status = unsafe {
+            nntmux_w566_frame_output_batch(
+                paths.as_ptr(),
+                paths.len(),
+                twin.as_ptr(),
+                twin.len(),
+                sizes.as_ptr(),
+                sizes.len(),
+                2,
+                0,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[2]), (1, 1, 1));
+        let status = unsafe {
+            nntmux_w566_frame_output_batch(
+                paths.as_ptr(),
+                paths.len(),
+                twin.as_ptr(),
+                twin.len(),
+                sizes.as_ptr(),
+                8,
+                2,
+                0,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+        let versions = packed(&[1]);
+        let fields = b"absent\0abc\0/n/abc.nzb\0\0\0";
+        let status = unsafe {
+            nntmux_w566_anchor_receipt_batch(
+                versions.as_ptr(),
+                versions.len(),
+                fields.as_ptr(),
+                fields.len(),
+                null(),
+                0,
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[2]), (1, 1));
+        let ints = packed(&[1, 0]);
+        let fields = b"staged\0a.nzb\0\0\0";
+        let status = unsafe {
+            nntmux_w566_manifest_entry_batch(
+                ints.as_ptr(),
+                ints.len(),
+                fields.as_ptr(),
+                fields.len(),
+                null(),
+                0,
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[6]), (1, 1, 1));
+    }
+}
