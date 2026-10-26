@@ -537,4 +537,269 @@ final readonly class SearchQuery
 
         return self::w55Words($count, implode("\0", $filters), 4 * $count) ?? self::levelFilterPlanBatchPhp($filters);
     }
+
+    /** C signature of the Wave 67.6 {@see self::w67SearchQueryPlanBatch()} helper. */
+    private const string W67_SEARCH_QUERY_PLAN_FFI_CDEF = 'int64_t nntmux_w676_search_query_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 67.6 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 8.23/8.14/8.10/8.65x); see tests/Unit/RustLogViewerRepoReaderSearcherQueryMcpProcessRunnerW67ParityTest.php.
+     */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    /** PCRE `\s` bytes separating query tokens. */
+    private const string W67_SPACE = " \t\n\r\x0b\x0c";
+
+    /**
+     * Wave 67.6 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w67_6', self::W67_SEARCH_QUERY_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W67_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 67.6 plan batch to Rust until disabled or reset. */
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', true);
+    }
+
+    /** Route the Wave 67.6 plan batch to PHP until enabled or reset. */
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', false);
+    }
+
+    /** Restore W67_RUST_FFI_DEFAULT routing and drop the cached Wave 67.6 handle and buffer. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', null);
+        self::w67RustFfiState('reset', null);
+    }
+
+    public static function usesW67RustFfi(): bool
+    {
+        return self::w67RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w67SearchQueryPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 67.6 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w67Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w67RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w676_search_query_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** `YYYYMMDD` of an exact `\d{4}-\d{2}-\d{2}` value with month 1-12 and day 1-31, or 0. */
+    private static function w67Date(string $value): int
+    {
+        if (\strlen($value) !== 10 || $value[4] !== '-' || $value[7] !== '-' || strspn($value, '0123456789', 0, 4) !== 4 || strspn($value, '0123456789', 5, 2) !== 2 || strspn($value, '0123456789', 8, 2) !== 2) {
+            return 0;
+        }
+        $month = (int) substr($value, 5, 2);
+        $day = (int) substr($value, 8, 2);
+
+        return $month >= 1 && $month <= 12 && $day >= 1 && $day <= 31 ? (int) substr($value, 0, 4) * 10_000 + $month * 100 + $day : 0;
+    }
+
+    /**
+     * Batch query parse plan over raw query strings. Tokens are separated by ASCII whitespace; a `"` starts a
+     * phrase that runs to the next `"` (or the end, error 4). Eight words per query: `[tokens, terms, level
+     * mask, from, to, flags, cost, errors]`. Tokens `OR`, `AND` and `NOT` set flags 1, 2 and 4. Case-insensitive
+     * prefixes: `level:a,b` ORs W55_LEVEL_BITS (unknown names error 8), `from:`/`to:` take an exact
+     * `YYYY-MM-DD` (month 1-12, day 1-31) as `YYYYMMDD` (else error 16), `is:regex` and `is:case` set flags 16
+     * and 32 (other values error 8). `-term` is a negated term (flag 8); other tokens and non-empty phrases
+     * (flag 512) are terms, single-byte terms set flag 64. Cost: 10 per term plus term bytes, 50 more per term
+     * for regex, 100 without terms; flag 128 when it exceeds 1000 and 256 for an empty query. Error 32 marks
+     * from after to.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67SearchQueryPlanBatch(array $records): array
+    {
+        return self::usesW67RustFfi() ? self::w67SearchQueryPlanBatchNative($records) : self::w67SearchQueryPlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67SearchQueryPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w67Words($count, implode("\0", $records), 8 * $count) ?? self::w67SearchQueryPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67SearchQueryPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $length = \strlen($record);
+            $at = 0;
+            $tokens = $terms = $termBytes = $mask = $from = $to = $flags = $errors = 0;
+            while (true) {
+                $at += strspn($record, self::W67_SPACE, $at);
+                if ($at >= $length) {
+                    break;
+                }
+                $tokens++;
+                if ($record[$at] === '"') {
+                    $close = strpos($record, '"', $at + 1);
+                    if ($close === false) {
+                        $errors |= 4;
+                        $phrase = substr($record, $at + 1);
+                        $at = $length;
+                    } else {
+                        $phrase = substr($record, $at + 1, $close - $at - 1);
+                        $at = $close + 1;
+                    }
+                    if ($phrase !== '') {
+                        $terms++;
+                        $termBytes += \strlen($phrase);
+                        $flags |= 512;
+                    }
+
+                    continue;
+                }
+                $span = strcspn($record, self::W67_SPACE, $at);
+                $token = substr($record, $at, $span);
+                $at += $span;
+                if ($token === 'OR') {
+                    $flags |= 1;
+                } elseif ($token === 'AND') {
+                    $flags |= 2;
+                } elseif ($token === 'NOT') {
+                    $flags |= 4;
+                } else {
+                    $lower = strtolower($token);
+                    if (str_starts_with($lower, 'level:')) {
+                        foreach (explode(',', substr($lower, 6)) as $name) {
+                            if ($name !== '') {
+                                $bit = self::W55_LEVEL_BITS[$name] ?? 0;
+                                $errors |= $bit === 0 ? 8 : 0;
+                                $mask |= $bit;
+                            }
+                        }
+                    } elseif (str_starts_with($lower, 'from:')) {
+                        $date = self::w67Date(substr($token, 5));
+                        $errors |= $date === 0 ? 16 : 0;
+                        $from = $date === 0 ? $from : $date;
+                    } elseif (str_starts_with($lower, 'to:')) {
+                        $date = self::w67Date(substr($token, 3));
+                        $errors |= $date === 0 ? 16 : 0;
+                        $to = $date === 0 ? $to : $date;
+                    } elseif (str_starts_with($lower, 'is:')) {
+                        $flags |= match (substr($lower, 3)) {
+                            'regex' => 16,
+                            'case' => 32,
+                            default => 0,
+                        };
+                        $errors |= \in_array(substr($lower, 3), ['regex', 'case'], true) ? 0 : 8;
+                    } elseif ($token[0] === '-' && $span > 1) {
+                        $flags |= 8;
+                        $terms++;
+                        $termBytes += $span - 1;
+                    } else {
+                        $terms++;
+                        $termBytes += $span;
+                        $flags |= $span < 2 ? 64 : 0;
+                    }
+                }
+            }
+            if ($from !== 0 && $to !== 0 && $from > $to) {
+                $errors |= 32;
+            }
+            $cost = 10 * $terms + $termBytes + (($flags & 16) !== 0 ? 50 * $terms : 0) + ($terms === 0 ? 100 : 0);
+            $flags |= ($cost > 1000 ? 128 : 0) | ($tokens === 0 ? 256 : 0);
+            array_push($out, $tokens, $terms, $mask, $from, $to, $flags, $cost, $errors);
+        }
+
+        return $out;
+    }
 }
