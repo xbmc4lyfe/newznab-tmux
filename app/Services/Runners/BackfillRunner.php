@@ -7,6 +7,7 @@ namespace App\Services\Runners;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
@@ -15,6 +16,33 @@ class BackfillRunner extends BaseRunner
     public const string FFI_CDEF = <<<'C'
         ssize_t nntmux_runner_release_transform(uint32_t mode, const char *input, size_t len, char *out, size_t cap);
         C;
+
+    /**
+     * Enabled: the paired benchmark in the W58 parity test measures 4.786x common mean, 4.453x
+     * common p99, 3.868x uncommon mean and 2.558x uncommon p99 (per-metric minimum of four runs),
+     * above the 1.5x rule.
+     */
+    public const bool W58_RUST_FFI_DEFAULT = true;
+
+    public const string W58_BACKFILL_RUNNER_FFI_CDEF = 'ssize_t nntmux_w581_backfill_work_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public const int W58_BACKFILL_WORDS = 4;
+
+    public const int W58_BACKFILL_NEEDED = 1;
+
+    public const int W58_BACKFILL_TARGET_REACHED = 2;
+
+    public const int W58_BACKFILL_COMPRESSED = 4;
+
+    public const int W58_BACKFILL_THREADS_CLAMPED = 8;
+
+    public const int W58_BACKFILL_MALFORMED = 16;
+
+    public const int W58_BACKFILL_MESSAGES_ADJUSTED = 32;
+
+    public const int W58_BACKFILL_GROUP_VALID = 64;
+
+    public const int W58_BACKFILL_THREADS_SHIFT = 8;
 
     // Retain PHP until common/uncommon mean and p99 all demonstrate a 1.5x gain.
     private static bool $useRustFfi = false;
@@ -80,6 +108,153 @@ class BackfillRunner extends BaseRunner
         }
 
         return null;
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        $enabled = self::w58RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 58 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Four words per
+     * `group\tour_first\ttheir_first\tquantity\tthreads\tmax_messages\tpostdate_days\ttarget_days\tcompressed`
+     * row: the needed, target-reached, compressed, threads-clamped, messages-adjusted and
+     * group-valid flags plus the threads (clamped to 1-32) `<< W58_BACKFILL_THREADS_SHIFT`; then
+     * the planSafeBackfillQueuesPhp() queue count, the lowest queued article and the work-item
+     * score (days left to the target * 1000000 + the article gap up to 999999). A malformed row
+     * yields `[W58_BACKFILL_MALFORMED, 0, 0, 0]`.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function backfillWorkBatch(array $rows): array
+    {
+        return self::usesW58RustFfi() ? self::backfillWorkBatchNative($rows) : self::backfillWorkBatchPhp($rows);
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function backfillWorkBatchPhp(array $rows): array
+    {
+        $words = [];
+        foreach ($rows as $row) {
+            $fields = explode("\t", $row);
+            $ints = [];
+            if (\count($fields) === 9 && ($fields[8] === '0' || $fields[8] === '1')) {
+                for ($i = 1; $i <= 7 && preg_match('/\A-?[0-9]{1,18}\z/', $fields[$i]) === 1; $i++) {
+                    $ints[] = (int) $fields[$i];
+                }
+            }
+            if (\count($ints) !== 7) {
+                array_push($words, self::W58_BACKFILL_MALFORMED, 0, 0, 0);
+
+                continue;
+            }
+            [$ourFirst, $theirFirst, $quantity, $threads, $maxMessages, $days, $target] = $ints;
+            $clampedThreads = max(1, min(32, $threads));
+            $flags = ($fields[8] === '1' ? self::W58_BACKFILL_COMPRESSED : 0)
+                | ($clampedThreads !== $threads ? self::W58_BACKFILL_THREADS_CLAMPED : 0)
+                | (preg_match('/\A[A-Za-z0-9][A-Za-z0-9.+_-]{0,254}\z/', $fields[0]) === 1 ? self::W58_BACKFILL_GROUP_VALID : 0);
+            if ($maxMessages < 1) {
+                $maxMessages = 20000;
+                $flags |= self::W58_BACKFILL_MESSAGES_ADJUSTED;
+            } elseif ($maxMessages > 1000000) {
+                $maxMessages = 1000000;
+                $flags |= self::W58_BACKFILL_MESSAGES_ADJUSTED;
+            }
+            $quantity = max(0, min(10000000, $quantity));
+            $count = $ourFirst - $theirFirst;
+            $queues = $count > 0 ? intdiv(min($count, $quantity * $clampedThreads) + $maxMessages - 1, $maxMessages) : 0;
+            $days = max(0, min(36500, $days));
+            $target = max(0, min(36500, $target));
+            $flags |= ($count > 0 ? self::W58_BACKFILL_NEEDED : 0) | ($days >= $target ? self::W58_BACKFILL_TARGET_REACHED : 0);
+            $words[] = $flags | $clampedThreads << self::W58_BACKFILL_THREADS_SHIFT;
+            $words[] = $queues;
+            $words[] = $ourFirst - $queues * $maxMessages;
+            $words[] = $count > 0 && $days < $target ? ($target - $days) * 1000000 + min($count, 999999) : 0;
+        }
+
+        return $words;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or Rust declines the batch (a
+     * row holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function backfillWorkBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w58RustFfiState('out', $count * self::W58_BACKFILL_WORDS);
+        if ($buffer === null) {
+            return self::backfillWorkBatchPhp($rows);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $rows);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w581_backfill_work_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        $words = $written === $count ? unpack('q*', FFI::string($out, $count * self::W58_BACKFILL_WORDS * 8)) : false;
+        if (! \is_array($words)) {
+            return self::backfillWorkBatchPhp($rows);
+        }
+
+        /** @var list<int> */
+        return array_values($words);
+    }
+
+    /**
+     * Wave 58 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('backfill_runner_w58', self::W58_BACKFILL_RUNNER_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 
     /**
