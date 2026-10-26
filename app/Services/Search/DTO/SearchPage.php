@@ -6,6 +6,7 @@ namespace App\Services\Search\DTO;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use Throwable;
 
 final readonly class SearchPage
 {
@@ -269,5 +270,165 @@ final readonly class SearchPage
         }
 
         return ['ids' => $copied, 'total' => (int) $meta[0], 'fuzzy' => $meta[1] === 1];
+    }
+
+    public const string W56_FFI_CDEF = 'int64_t nntmux_w565_search_page_id_list_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W56.5 parity test's QUALIFICATION). */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 56.5 routing and FFI cache, kept in function-local statics (readonly classes cannot declare static properties). Without $op it reports
+     * the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[],
+     * capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w56_5', self::W56_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W56_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        return self::w56RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with idListPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 56.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w56Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w56RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w565_search_page_id_list_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch normalization of comma-separated page id lists. Items are trimmed and empty items skipped;
+     * 1-18 ASCII digits are ids, anything else is invalid. Four words per list: `[valid, distinct, max,
+     * invalid]`, where `distinct` counts distinct id values and `max` is 0 without an id.
+     *
+     * @param  list<string>  $idLists
+     * @return list<int>
+     */
+    public static function idListPlanBatch(array $idLists): array
+    {
+        return self::usesW56RustFfi() ? self::idListPlanBatchNative($idLists) : self::idListPlanBatchPhp($idLists);
+    }
+
+    /**
+     * @param  list<string>  $idLists
+     * @return list<int>
+     */
+    public static function idListPlanBatchPhp(array $idLists): array
+    {
+        $out = [];
+        foreach ($idLists as $list) {
+            $valid = $invalid = $max = 0;
+            $seen = [];
+            foreach (explode(',', $list) as $item) {
+                $token = trim($item);
+                if ($token === '') {
+                    continue;
+                }
+                if (\strlen($token) <= 18 && ctype_digit($token)) {
+                    $id = (int) $token;
+                    $valid++;
+                    $seen[$id] = true;
+                    $max = max($max, $id);
+                } else {
+                    $invalid++;
+                }
+            }
+            array_push($out, $valid, \count($seen), $max, $invalid);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds
+     * a NUL.
+     *
+     * @param  list<string>  $idLists
+     * @return list<int>
+     */
+    public static function idListPlanBatchNative(array $idLists): array
+    {
+        $count = \count($idLists);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w56Words($count, implode("\0", $idLists), 4 * $count) ?? self::idListPlanBatchPhp($idLists);
     }
 }
