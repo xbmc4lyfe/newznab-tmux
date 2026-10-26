@@ -6,6 +6,7 @@ namespace App\Enums;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -529,5 +530,335 @@ enum TvLookupStatus: int
         }
 
         return $ffi === false ? null : $ffi;
+    }
+
+    // Rust is the default only while the paired W63.6 benchmark clears 1.5x on all four metrics.
+    public const bool W63_RUST_FFI_DEFAULT = true;
+
+    private const string W63_TV_FFI_CDEF = <<<'C'
+        int32_t nntmux_w636_tv_lookup_status_batch(const char *strings, size_t strings_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t max_attempts, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W63_TV_HEADER = 25;
+
+    private const int W63_MAX_ITEMS = 1_048_576;
+
+    /** Attempt clamp (2^16 - 1), elapsed clamp (2^40) and cooldown cap (7 days). */
+    private const int W63_ATTEMPT_CAP = 65_535;
+
+    private const int W63_ELAPSED_CAP = 1_099_511_627_776;
+
+    private const int W63_COOLDOWN_CAP = 604_800;
+
+    /** Attempt limit used for a limit at or below 0. */
+    private const int W63_TV_ATTEMPTS = 10;
+
+    /** Non-positive stored value => case. */
+    private const array W63_TV_VALUES = [0 => 0, -10 => 1, -11 => 2, -12 => 3, -100 => 4, -1 => 6, -2 => 6, -3 => 6, -4 => 7, -6 => 7];
+
+    /** `classifyValuePhp()` flags per case. */
+    private const array W63_TV_FLAGS = [3, 5, 11, 13, 5, 16, 32, 64, 0];
+
+    /** Case name => case. */
+    private const array W63_TV_NAMES = ['Pending' => 0, 'ShowNotFound' => 1, 'EpisodeMissing' => 2, 'SeasonPack' => 3, 'ParseFailed' => 4];
+
+    /** Lowercased trimmed alias => case. */
+    private const array W63_TV_ALIASES = [
+        'pending' => 0, 'waiting' => 0, 'queued' => 0,
+        'show_not_found' => 1, 'show-not-found' => 1, 'not_found' => 1, 'notfound' => 1,
+        'episode_missing' => 2, 'episode-missing' => 2, 'no_episode' => 2,
+        'season_pack' => 3, 'season-pack' => 3, 'pack' => 3,
+        'parse_failed' => 4, 'parse-failed' => 4, 'unparseable' => 4, 'unparsable' => 4,
+    ];
+
+    /**
+     * Plan TV lookup retries in order. A canonical integer status (`(string) (int) $s === $s`) classifies by
+     * value (source 0); otherwise by case name (1), an alias of `strtolower(trim($status))` (2), else unknown
+     * text (3). Cases 0..4 are Pending, ShowNotFound, EpisodeMissing, SeasonPack and ParseFailed, 5 a matched
+     * episode id, 6 legacy pending (normalized to Pending), 7 legacy exhausted (normalized to ShowNotFound), 8
+     * unknown. Attempts and the limit (at or below 0 means 10) clamp to 0..2^16-1, seconds since the last
+     * attempt to 0..2^40. Action 0 skip (matched), 1 dispatch, 2 cooldown, 3 give up (Pending becomes
+     * ShowNotFound, EpisodeMissing parks), 4 terminal, 5 invalid. A retryable status's cooldown is 0 before its
+     * first attempt, else its base (Pending 900, EpisodeMissing 21,600 seconds) doubled per further attempt up
+     * to 6 times, capped at 7 days. Target 15 when none.
+     *
+     * Layout: `[0]` count, `[1..9]` per case, `[10..13]` per source, `[14..19]` per action, `[20]` normalized,
+     * `[21]` shortest wait (-1), `[22]` first invalid (-1), `[23]` total attempts, `[24]` FNV-1a digest; then
+     * per status `case | source << 4 | flags << 6 | action << 13 | target << 16 | normalized << 20 | wait << 21
+     * | attempts << 41 | min(token bytes, 63) << 57`.
+     *
+     * @param  array<array-key, int|string>  $statuses
+     * @param  array<array-key, int>  $attempts
+     * @param  array<array-key, int>  $elapsed
+     * @return list<int>
+     */
+    public static function w63TvLookupStatusPlanBatch(array $statuses, array $attempts, array $elapsed, int $maxAttempts = self::W63_TV_ATTEMPTS): array
+    {
+        return (self::usesW63RustFfi() ? self::w63TvLookupStatusPlanBatchNative($statuses, $attempts, $elapsed, $maxAttempts) : null)
+            ?? self::w63TvLookupStatusPlanBatchPhp($statuses, $attempts, $elapsed, $maxAttempts);
+    }
+
+    /**
+     * @param  array<array-key, int|string>  $statuses
+     * @param  array<array-key, int>  $attempts
+     * @param  array<array-key, int>  $elapsed
+     * @return list<int>
+     */
+    public static function w63TvLookupStatusPlanBatchPhp(array $statuses, array $attempts, array $elapsed, int $maxAttempts = self::W63_TV_ATTEMPTS): array
+    {
+        $statuses = array_values($statuses);
+        $count = \count($statuses);
+        $attempts = self::w63Column($attempts, $count);
+        $elapsed = self::w63Column($elapsed, $count);
+        $limit = $maxAttempts <= 0 ? self::W63_TV_ATTEMPTS : min($maxAttempts, self::W63_ATTEMPT_CAP);
+        $out = array_fill(0, self::W63_TV_HEADER, 0);
+        $out[0] = $count;
+        $out[21] = $out[22] = -1;
+        $digest = 2_166_136_261;
+        $rows = [];
+        foreach ($statuses as $at => $status) {
+            if (\is_int($status)) {
+                $value = $status;
+                $status = (string) $status;
+                $numeric = true;
+            } else {
+                $status = (string) $status;
+                $value = (int) $status;
+                $numeric = (string) $value === $status;
+            }
+            if ($numeric) {
+                $case = $value > 0 ? 5 : (self::W63_TV_VALUES[$value] ?? 8);
+                $source = 0;
+            } else {
+                $case = self::W63_TV_NAMES[$status] ?? null;
+                $source = 1;
+                if ($case === null) {
+                    $case = self::W63_TV_ALIASES[strtolower(trim($status))] ?? 8;
+                    $source = $case === 8 ? 3 : 2;
+                }
+            }
+            $tries = max(0, min((int) $attempts[$at], self::W63_ATTEMPT_CAP));
+            $since = max(0, min((int) $elapsed[$at], self::W63_ELAPSED_CAP));
+            $base = match ($case) {
+                6 => 0,
+                7 => 1,
+                default => $case,
+            };
+            $normalized = $case === 6 || $case === 7 ? 1 : 0;
+            $wait = 0;
+            if ($base === 5) {
+                $action = 0;
+                $target = 15;
+            } elseif ($base === 8) {
+                $action = 5;
+                $target = 15;
+            } elseif ($base === 1 || $base === 3 || $base === 4) {
+                $action = 4;
+                $target = $base;
+            } elseif ($tries >= $limit) {
+                $action = 3;
+                $target = $base === 0 ? 1 : 2;
+            } else {
+                $cooldown = $tries === 0 ? 0 : min(($base === 0 ? 900 : 21_600) << min($tries - 1, 6), self::W63_COOLDOWN_CAP);
+                $target = $base;
+                if ($since >= $cooldown) {
+                    $action = 1;
+                } else {
+                    $action = 2;
+                    $wait = $cooldown - $since;
+                }
+            }
+            $out[1 + $case]++;
+            $out[10 + $source]++;
+            $out[14 + $action]++;
+            $out[20] += $normalized;
+            if ($wait > 0 && ($out[21] < 0 || $wait < $out[21])) {
+                $out[21] = $wait;
+            }
+            if ($action === 5 && $out[22] < 0) {
+                $out[22] = $at;
+            }
+            $out[23] += $tries;
+            $row = $case | $source << 4 | self::W63_TV_FLAGS[$case] << 6 | $action << 13 | $target << 16 | $normalized << 20 | $wait << 21 | $tries << 41
+                | min(\strlen($status), 63) << 57;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[24] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust plan, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, int|string>  $statuses
+     * @param  array<array-key, int>  $attempts
+     * @param  array<array-key, int>  $elapsed
+     * @return list<int>|null
+     */
+    public static function w63TvLookupStatusPlanBatchNative(array $statuses, array $attempts, array $elapsed, int $maxAttempts = self::W63_TV_ATTEMPTS): ?array
+    {
+        $count = \count($statuses);
+        if ($count > self::W63_MAX_ITEMS) {
+            return null;
+        }
+        [$joined, $twin] = self::w63Strings(array_values($statuses));
+        $ints = pack('q*', ...self::w63Column($attempts, $count), ...self::w63Column($elapsed, $count));
+        $words = self::W63_TV_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w63Call($words, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w636_tv_lookup_status_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $maxAttempts, $out, $words));
+    }
+
+    /**
+     * Route the Wave 63.6 batch plan through Rust for the rest of the process.
+     */
+    public static function enableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', true);
+    }
+
+    /**
+     * Route the Wave 63.6 batch plan through PHP for the rest of the process.
+     */
+    public static function disableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', false);
+    }
+
+    /**
+     * Restore the default Wave 63.6 routing and drop the cached binding and scratch buffer.
+     */
+    public static function resetW63RustFfi(): void
+    {
+        self::w63RustFfiState('reset');
+    }
+
+    public static function usesW63RustFfi(): bool
+    {
+        $forced = self::w63RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W63_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run `$callback` with the Wave 63.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW63RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w63RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w63RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 63.6 routing and binding in function statics (enums cannot declare properties). No `$op` returns
+     * the forced routing (null for the default); `'set'` replaces it with `$val` and returns the previous
+     * value; `'reset'` clears the routing, binding and buffer; `'binding'` returns the cached binding and an
+     * output buffer of at least `$val` values, or null.
+     */
+    private static function w63RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $enabled = $ffi = $buffer = null;
+            $capacity = 0;
+
+            return null;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w636', self::W63_TV_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 63.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w63Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w63RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Values NUL-joined and, when one holds a NUL, the same values joined with 0x01 so Rust finds the
+     * separators where the two differ.
+     *
+     * @param  list<int|string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w63Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
+    }
+
+    /**
+     * Values by position, cut or padded with `$pad` to `$count`.
+     *
+     * @template T of int|string
+     *
+     * @param  array<array-key, T>  $values
+     * @param  T  $pad
+     * @return list<T>
+     */
+    private static function w63Column(array $values, int $count, int|string $pad = 0): array
+    {
+        $values = array_values($values);
+
+        return \count($values) === $count ? $values : array_pad(\array_slice($values, 0, $count), $count, $pad);
     }
 }
