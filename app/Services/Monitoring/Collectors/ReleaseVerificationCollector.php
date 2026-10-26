@@ -377,4 +377,201 @@ final class ReleaseVerificationCollector implements MetricsCollector
 
         return true;
     }
+
+    /**
+     * Enabled: the paired benchmark in the W57 parity test measures 8.649x common mean, 8.797x
+     * common p99, 7.915x uncommon mean and 5.502x uncommon p99 (per-metric minimum of four runs),
+     * above the 1.5x rule.
+     */
+    private const bool W57_RUST_FFI_DEFAULT = true;
+
+    private const string W57_FFI_CDEF = 'ssize_t nntmux_w571_verification_latency_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public const int W57_LATENCY_WORDS = 8;
+
+    /** Upper bounds (milliseconds) of the first seven histogram buckets; the eighth is +Inf. */
+    public const array W57_LATENCY_BUCKETS = [100, 250, 500, 1000, 2500, 5000, 10000];
+
+    public const int W57_HEALTH_UNKNOWN = 0;
+
+    public const int W57_HEALTH_HEALTHY = 1;
+
+    public const int W57_HEALTH_DEGRADED = 2;
+
+    public const int W57_HEALTH_CRITICAL = 3;
+
+    public const int W57_LATENCY_INVALID = 4;
+
+    public const int W57_LATENCY_DEGRADED_P95 = 1000;
+
+    public const int W57_LATENCY_CRITICAL_P99 = 5000;
+
+    public static function usesW57RustFfi(): bool
+    {
+        $enabled = self::w57RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W57_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 57 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW57RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w57RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w57RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Eight words per `,`-separated window of millisecond latency samples (each trimmed, blanks
+     * skipped, anything but 1-9 digits counted invalid): the health rollup (W57_HEALTH_UNKNOWN
+     * without samples, CRITICAL from a W57_LATENCY_CRITICAL_P99 p99, DEGRADED from a
+     * W57_LATENCY_DEGRADED_P95 p95 or any invalid sample, else HEALTHY) plus W57_LATENCY_INVALID
+     * and the invalid count (at most 255) `<< 8`; then the sample count, sum, nearest-rank
+     * p50/p95/p99 and max (-1 without samples) and the W57_LATENCY_BUCKETS histogram as eight
+     * 8-bit saturating counts packed from the low byte.
+     *
+     * @param  array<array-key, string>  $windows
+     * @return list<int>
+     */
+    public static function latencyBatch(array $windows): array
+    {
+        return self::usesW57RustFfi() ? self::latencyBatchNative($windows) : self::latencyBatchPhp($windows);
+    }
+
+    /**
+     * @param  array<array-key, string>  $windows
+     * @return list<int>
+     */
+    public static function latencyBatchPhp(array $windows): array
+    {
+        $words = [];
+        foreach ($windows as $window) {
+            $samples = [];
+            $invalid = 0;
+            foreach (explode(',', $window) as $raw) {
+                $sample = trim($raw);
+                if ($sample === '') {
+                    continue;
+                }
+                if (\strlen($sample) <= 9 && ctype_digit($sample)) {
+                    $samples[] = (int) $sample;
+                } else {
+                    $invalid++;
+                }
+            }
+            sort($samples);
+            $count = \count($samples);
+            $sum = 0;
+            $buckets = [0, 0, 0, 0, 0, 0, 0, 0];
+            foreach ($samples as $sample) {
+                $sum += $sample;
+                $bucket = 7;
+                foreach (self::W57_LATENCY_BUCKETS as $i => $limit) {
+                    if ($sample <= $limit) {
+                        $bucket = $i;
+                        break;
+                    }
+                }
+                $buckets[$bucket]++;
+            }
+            $packed = 0;
+            foreach ($buckets as $i => $bucketCount) {
+                $packed |= min(255, $bucketCount) << (8 * $i);
+            }
+            [$p50, $p95, $p99, $max] = $count === 0 ? [-1, -1, -1, -1] : [
+                $samples[intdiv(50 * $count + 99, 100) - 1],
+                $samples[intdiv(95 * $count + 99, 100) - 1],
+                $samples[intdiv(99 * $count + 99, 100) - 1],
+                $samples[$count - 1],
+            ];
+            $health = match (true) {
+                $count === 0 => self::W57_HEALTH_UNKNOWN,
+                $p99 >= self::W57_LATENCY_CRITICAL_P99 => self::W57_HEALTH_CRITICAL,
+                $p95 >= self::W57_LATENCY_DEGRADED_P95 || $invalid > 0 => self::W57_HEALTH_DEGRADED,
+                default => self::W57_HEALTH_HEALTHY,
+            };
+            array_push(
+                $words,
+                $health | ($invalid > 0 ? self::W57_LATENCY_INVALID : 0) | min(255, $invalid) << 8,
+                $count,
+                $sum,
+                $p50,
+                $p95,
+                $p99,
+                $max,
+                $packed,
+            );
+        }
+
+        return $words;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a window
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $windows
+     * @return list<int>
+     */
+    public static function latencyBatchNative(array $windows): array
+    {
+        $count = \count($windows);
+        $words = $count * self::W57_LATENCY_WORDS;
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w57RustFfiState('out', $words);
+        if ($buffer === null) {
+            return self::latencyBatchPhp($windows);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $windows);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w571_verification_latency_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', FFI::string($out, $words * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::latencyBatchPhp($windows);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 57 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w57RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('release_verification_collector_w57', self::W57_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
+    }
 }
