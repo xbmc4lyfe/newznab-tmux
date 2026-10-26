@@ -610,4 +610,240 @@ class BookPipe extends AbstractCategorizationPipe
 
         return \is_array($values) ? array_values($values) : self::planBookResultBatchPhp($categoryIds, $confidences, $matchedBy);
     }
+
+    /** C signature of the Wave 66.5 {@see self::w66BookPipePlanBatch()} helper. */
+    private const string W66_BOOK_PIPE_PLAN_FFI_CDEF = 'int64_t nntmux_w665_book_pipe_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 66.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 6.71/5.92/5.74/5.05x); see tests/Unit/RustCategorizationBookPassableConsoleGroupNameMiscPipeW66ParityTest.php.
+     */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 66.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w66_5', self::W66_BOOK_PIPE_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W66_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 66.5 plan batch to Rust until disabled or reset. */
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', true);
+    }
+
+    /** Route the Wave 66.5 plan batch to PHP until enabled or reset. */
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', false);
+    }
+
+    /** Restore W66_RUST_FFI_DEFAULT routing and drop the cached Wave 66.5 handle and buffer. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('set', null);
+        self::w66RustFfiState('reset', null);
+    }
+
+    public static function usesW66RustFfi(): bool
+    {
+        return self::w66RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w66BookPipePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 66.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w66Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w66RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w665_book_pipe_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w66Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /** Wave 66.5 uppercased release-name tokens: 1 ebook format, 2 audiobook, 4 magazine, 8 comic, 16 technical publisher. */
+    private const array W66_BOOK_TOKENS = [
+        'EPUB' => 1, 'MOBI' => 1, 'AZW' => 1, 'AZW3' => 1, 'PDF' => 1, 'DJVU' => 1, 'FB2' => 1, 'LIT' => 1, 'EBOOK' => 1, 'EBOOKS' => 1,
+        'AUDIOBOOK' => 2, 'AUDIOBOOKS' => 2, 'M4B' => 2, 'UNABRIDGED' => 2, 'ABRIDGED' => 2, 'NARRATED' => 2,
+        'MAGAZINE' => 4, 'MAGAZINES' => 4, 'MAG' => 4, 'ISSUE' => 4, 'WEEKLY' => 4, 'MONTHLY' => 4,
+        'CBR' => 8, 'CBZ' => 8, 'COMIC' => 8, 'COMICS' => 8, 'MANGA' => 8, 'GRAPHIC' => 8,
+        'OREILLY' => 16, 'PACKT' => 16, 'APRESS' => 16, 'WILEY' => 16, 'MANNING' => 16, 'NOSTARCH' => 16,
+    ];
+
+    /** Wave 66.5 matched-by families in match order (family = index + 1). */
+    private const array W66_BOOK_FAMILIES = ['comic_', 'manga', 'technical_', 'magazine_', 'ebook_', 'audiobook_'];
+
+    /**
+     * Batch Book pipe plan over `releaseName\tcategoryId\tconfidence\tmatchedBy\tcurrentCategory`, confidences in
+     * permille. Eight words per record: `[tokens, kinds, proposed, mask, decision, target, family, errors]`. Tokens
+     * are maximal ASCII alphanumeric runs of the release name; kinds ORs their W66_BOOK_TOKENS bits plus 32 for a
+     * 1900-2099 year. Proposed: audiobook MUSIC_AUDIOBOOK, else comic BOOKS_COMICS, magazine BOOKS_MAGAZINES,
+     * technical BOOKS_TECHNICAL, ebook BOOKS_EBOOK, else 0. Mask: 1 successful (like evaluateResultPhp()), 2 in the
+     * book family (7000-7999 or MUSIC_AUDIOBOOK), 4 terminal (>= 950). Decision/target: 3 keeps a hashed current
+     * category, 1 takes a successful in-family result, 2 moves an empty, misc or BOOKS_UNKNOWN current category to
+     * the proposal, 0 keeps the current one (default OTHER_MISC). Family is the first W66_BOOK_FAMILIES prefix of
+     * matchedBy (0 none). Numbers are trimmed 1-15 ASCII digits; errors: 1 invalid number, 2 not exactly five
+     * fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66BookPipePlanBatch(array $records): array
+    {
+        return self::usesW66RustFfi() ? self::w66BookPipePlanBatchNative($records) : self::w66BookPipePlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66BookPipePlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w66Words($count, implode("\0", $records), 8 * $count) ?? self::w66BookPipePlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w66BookPipePlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $errors = \count($fields) === 5 ? 0 : 2;
+            $tokens = $kinds = 0;
+            foreach (preg_split('/[^A-Z0-9]+/', strtoupper($fields[0]), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                $tokens++;
+                $kinds |= self::W66_BOOK_TOKENS[$token]
+                    ?? (\strlen($token) === 4 && ctype_digit($token) && (int) $token >= 1900 && (int) $token <= 2099 ? 32 : 0);
+            }
+            $category = self::w66Number($fields[1] ?? '', 0, $errors);
+            $confidence = self::w66Number($fields[2] ?? '', 0, $errors);
+            $label = $fields[3] ?? '';
+            $current = self::w66Number($fields[4] ?? '', Category::OTHER_MISC, $errors);
+            $proposed = match (true) {
+                ($kinds & 2) !== 0 => Category::MUSIC_AUDIOBOOK,
+                ($kinds & 8) !== 0 => Category::BOOKS_COMICS,
+                ($kinds & 4) !== 0 => Category::BOOKS_MAGAZINES,
+                ($kinds & 16) !== 0 => Category::BOOKS_TECHNICAL,
+                ($kinds & 1) !== 0 => Category::BOOKS_EBOOK,
+                default => 0,
+            };
+            $success = $confidence > 0 && ! ($category === Category::OTHER_MISC && $label === 'no_match');
+            $inDomain = ($category >= Category::BOOKS_ROOT && $category <= Category::BOOKS_ROOT + 999) || $category === Category::MUSIC_AUDIOBOOK;
+            [$decision, $target] = match (true) {
+                $current === Category::OTHER_HASHED => [3, $current],
+                $success && $inDomain => [1, $category],
+                $proposed !== 0 && ($current === 0 || $current === Category::OTHER_MISC || $current === Category::BOOKS_UNKNOWN) => [2, $proposed],
+                default => [0, $current],
+            };
+            $family = 0;
+            foreach (self::W66_BOOK_FAMILIES as $index => $prefix) {
+                if (str_starts_with($label, $prefix)) {
+                    $family = $index + 1;
+                    break;
+                }
+            }
+            array_push($out, $tokens, $kinds, $proposed, ($success ? 1 : 0) | ($inDomain ? 2 : 0) | ($confidence >= 950 ? 4 : 0), $decision, $target, $family, $errors);
+        }
+
+        return $out;
+    }
 }
