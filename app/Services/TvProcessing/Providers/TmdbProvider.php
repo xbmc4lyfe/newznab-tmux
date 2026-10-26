@@ -8,6 +8,7 @@ use App\Services\TmdbClient;
 use App\Services\TraktService;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 class TmdbProvider extends AbstractTvProvider
@@ -302,8 +303,7 @@ class TmdbProvider extends AbstractTvProvider
         $imdbId = '';
         $externalIds = TmdbClient::getArray($show, 'external_ids');
         if (! empty($externalIds['imdb_id'])) {
-            preg_match('/tt(?P<imdbid>\d{6,})$/i', (string) $externalIds['imdb_id'], $imdb);
-            $imdbId = (string) ($imdb['imdbid'] ?? '');
+            $imdbId = self::w56TmdbImdbId((string) $externalIds['imdb_id']);
         }
 
         $originCountry = TmdbClient::getArray($show, 'origin_country');
@@ -546,5 +546,210 @@ class TmdbProvider extends AbstractTvProvider
         } catch (Throwable) {
             return null;
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 56.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean 6.10x, p99 5.14x; uncommon mean 77.24x, p99 54.09x); see RustTmdbTvMazeTvdbPar2AccumulatorCompactFpW56ParityTest. */
+    public const bool W56_RUST_FFI_DEFAULT = true;
+
+    public const string W56_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w564_tmdb_show_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * TMDB show rows as formatShowInfo() and candidate matching see them. Each record yields
+     * four words: flags (strict Y-m-d air date 1, blank title 2, trimmed case-insensitive
+     * title match 4, tt\d{6,} IMDB id 8, non-ASCII title 16), the IMDB digits span (offset
+     * << 32 | length, or -1), the air date year (-1) and similar_text() of the lowercased
+     * trimmed title and name (-1 past 255 bytes).
+     *
+     * @param  list<string>  $imdbIds
+     * @param  list<string>  $airDates
+     * @param  list<string>  $titles
+     * @param  list<string>  $ours
+     * @return list<int>
+     */
+    public static function tmdbShowRowBatch(array $imdbIds, array $airDates, array $titles, array $ours): array
+    {
+        return self::usesW56RustFfi()
+            ? self::tmdbShowRowBatchNative($imdbIds, $airDates, $titles, $ours)
+            : self::tmdbShowRowBatchPhp($imdbIds, $airDates, $titles, $ours);
+    }
+
+    /**
+     * @param  list<string>  $imdbIds
+     * @param  list<string>  $airDates
+     * @param  list<string>  $titles
+     * @param  list<string>  $ours
+     * @return list<int>
+     */
+    public static function tmdbShowRowBatchNative(array $imdbIds, array $airDates, array $titles, array $ours): array
+    {
+        self::w56TmdbColumns($imdbIds, $airDates, $titles, $ours);
+        $count = \count($imdbIds);
+        if ($count === 0) {
+            return [];
+        }
+        $text = implode("\0", $imdbIds)."\0".implode("\0", $airDates)."\0".implode("\0", $titles)."\0".implode("\0", $ours);
+
+        return self::w56TmdbCall($text, '', $count, 4)
+            ?? self::tmdbShowRowBatchPhp($imdbIds, $airDates, $titles, $ours);
+    }
+
+    /**
+     * @param  list<string>  $imdbIds
+     * @param  list<string>  $airDates
+     * @param  list<string>  $titles
+     * @param  list<string>  $ours
+     * @return list<int>
+     */
+    public static function tmdbShowRowBatchPhp(array $imdbIds, array $airDates, array $titles, array $ours): array
+    {
+        self::w56TmdbColumns($imdbIds, $airDates, $titles, $ours);
+        $out = [];
+        foreach ($imdbIds as $i => $imdb) {
+            $date = $airDates[$i];
+            $title = trim($titles[$i]);
+            $name = trim($ours[$i]);
+            $span = self::w56TmdbImdbSpan($imdb);
+            $flags = (preg_match('/\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z/', $date) === 1 ? 1 : 0)
+                | ($title === '' ? 2 : 0)
+                | ($name !== '' && strtolower($title) === strtolower($name) ? 4 : 0)
+                | ($span >= 0 ? 8 : 0)
+                | (preg_match('/[\x80-\xff]/', $title) === 1 ? 16 : 0);
+            array_push(
+                $out,
+                $flags,
+                $span,
+                preg_match('/\A([0-9]{4})(?:-|\z)/', $date, $match) === 1 ? (int) $match[1] : -1,
+                \strlen($title) > 255 || \strlen($name) > 255 ? -1 : similar_text(strtolower($title), strtolower($name)),
+            );
+        }
+
+        return $out;
+    }
+
+    /** formatShowInfo()'s preg_match('/tt(?P<imdbid>\d{6,})$/i') capture, through the W56 toggle. */
+    private static function w56TmdbImdbId(string $raw): string
+    {
+        $span = self::usesW56RustFfi() ? self::tmdbShowRowBatchNative([$raw], [''], [''], [''])[1] : self::w56TmdbImdbSpan($raw);
+
+        return $span < 0 ? '' : substr($raw, $span >> 32, $span & 0xFFFFFFFF);
+    }
+
+    private static function w56TmdbImdbSpan(string $value): int
+    {
+        return preg_match('/tt(\d{6,})$/i', $value, $match, PREG_OFFSET_CAPTURE) === 1
+            ? ($match[1][1] << 32) | \strlen($match[1][0])
+            : -1;
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W56 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('enabled');
+        self::w56RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * Equal-length list columns, or InvalidArgumentException.
+     *
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w56TmdbColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (! array_is_list($column) || \count($column) !== $count) {
+                throw new \InvalidArgumentException('W56 batch columns must be lists of equal length.');
+            }
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: `$words` int64 words back per record. Null when the
+     * library is missing or declines a malformed frame, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w56TmdbCall(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+            $state = self::w56RustFfiState();
+            $ffi = $state['ffi'];
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w56', self::W56_FFI_CDEF) ?? false;
+                self::w56RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w56RustFfiState('out', $out);
+                self::w56RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w564_tmdb_show_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W56 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }

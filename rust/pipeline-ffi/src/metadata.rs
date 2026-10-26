@@ -53985,3 +53985,999 @@ mod w554_tests {
         assert_eq!(out, vec![4 | 8 | 16 | 128, span(200_000, 21), 2019, -1]);
     }
 }
+
+/// Wave 56.4 batch exports: TmdbProvider, TvMazeProvider and TvdbProvider show rows (IMDB id
+/// spans, air date parsing, title/alias matching and similar_text() scores) share the W50.4
+/// runner (NUL-joined text columns, column after column, a packed int64 header and int64
+/// words per record). Par2PacketAccumulator packet rows and CompactFingerprintCollector
+/// fingerprint rows carry binary values, so they take a concatenated blob plus packed int64
+/// lengths instead. Every export writes fixed-width int64 words per record.
+pub mod w564_batch {
+    use super::w504_batch::{Batch, Shape, run, span_word, trim};
+    use std::collections::HashMap;
+    use std::collections::hash_map::Entry;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// Values longer than this (after trim) score -1 instead of a similar_text() count.
+    pub const SIMILAR_MAX: usize = 255;
+
+    /// preg_match('/tt(\d{6,})$/i'): the digits span (`$` also matches before one final LF).
+    pub(crate) fn imdb_span(value: &[u8]) -> i64 {
+        let body = value.strip_suffix(b"\n").unwrap_or(value);
+        let digits = body.iter().rev().take_while(|c| c.is_ascii_digit()).count();
+        let start = body.len() - digits;
+        if digits >= 6
+            && start >= 2
+            && body[start - 1].eq_ignore_ascii_case(&b't')
+            && body[start - 2].eq_ignore_ascii_case(&b't')
+        {
+            span_word(start, digits)
+        } else {
+            -1
+        }
+    }
+
+    #[inline(always)]
+    fn digits_value(digits: &[u8]) -> Option<i64> {
+        if digits.iter().all(u8::is_ascii_digit) {
+            Some(
+                digits
+                    .iter()
+                    .fold(0i64, |acc, d| acc * 10 + i64::from(d - b'0')),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// /\A([0-9]{4})(?:-|\z)/: the year or -1.
+    fn year(value: &[u8]) -> i64 {
+        if value.len() < 4 || (value.len() > 4 && value[4] != b'-') {
+            return -1;
+        }
+        digits_value(&value[..4]).unwrap_or(-1)
+    }
+
+    /// /\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z/.
+    fn strict_date(value: &[u8]) -> bool {
+        value.len() == 10 && airdate_prefix(value).is_some()
+    }
+
+    /// /\A([0-9]{4})-([0-9]{2})-([0-9]{2})/ as (year, month, day).
+    fn airdate_prefix(value: &[u8]) -> Option<(i64, i64, i64)> {
+        if value.len() < 10 || value[4] != b'-' || value[7] != b'-' {
+            return None;
+        }
+        Some((
+            digits_value(&value[..4])?,
+            digits_value(&value[5..7])?,
+            digits_value(&value[8..10])?,
+        ))
+    }
+
+    /// The airdate prefix as YYYYMMDD when the month is 1-12 and the day 1-31, else -1.
+    fn airdate_packed(value: &[u8]) -> i64 {
+        match airdate_prefix(value) {
+            Some((y, m, d)) if (1..=12).contains(&m) && (1..=31).contains(&d) => {
+                y * 10000 + m * 100 + d
+            }
+            _ => -1,
+        }
+    }
+
+    /// Trimmed, ASCII case-insensitive equality with a non-empty trimmed `ours`.
+    #[inline(always)]
+    fn ci_match(theirs: &[u8], ours: &[u8]) -> bool {
+        !ours.is_empty() && theirs.eq_ignore_ascii_case(ours)
+    }
+
+    /// PHP php_similar_str(): the first longest common substring in (p, q) scan order and the
+    /// number of times the running maximum improved.
+    fn similar_str(a: &[u8], b: &[u8]) -> (usize, usize, usize, usize) {
+        let (mut pos1, mut pos2, mut max, mut count) = (0, 0, 0, 0);
+        for p in 0..a.len() {
+            if a.len() - p <= max {
+                // No later start can beat the running maximum; PHP's extra pairs are no-ops.
+                break;
+            }
+            for q in 0..b.len() {
+                if b.len() - q <= max {
+                    break;
+                }
+                let l = a[p..]
+                    .iter()
+                    .zip(&b[q..])
+                    .take_while(|(x, y)| x == y)
+                    .count();
+                if l > max {
+                    max = l;
+                    count += 1;
+                    pos1 = p;
+                    pos2 = q;
+                }
+            }
+        }
+        (pos1, pos2, max, count)
+    }
+
+    /// similar_text() as a count, with PHP's recursion (including the `count > 1` guard on
+    /// the left half) driven by an explicit stack.
+    pub(crate) fn similar_text(a: &[u8], b: &[u8]) -> i64 {
+        let mut stack = vec![(a, b)];
+        let mut sum = 0usize;
+        while let Some((a, b)) = stack.pop() {
+            let (pos1, pos2, max, count) = similar_str(a, b);
+            if max == 0 {
+                continue;
+            }
+            sum += max;
+            if pos1 > 0 && pos2 > 0 && count > 1 {
+                stack.push((&a[..pos1], &b[..pos2]));
+            }
+            if pos1 + max < a.len() && pos2 + max < b.len() {
+                stack.push((&a[pos1 + max..], &b[pos2 + max..]));
+            }
+        }
+        sum as i64
+    }
+
+    /// similar_text(strtolower(trim(a)), strtolower(trim(b))), or -1 past SIMILAR_MAX bytes.
+    fn similarity(theirs: &[u8], ours: &[u8], buf: &mut [u8; 2 * SIMILAR_MAX]) -> i64 {
+        if theirs.len() > SIMILAR_MAX || ours.len() > SIMILAR_MAX {
+            return -1;
+        }
+        let (left, right) = buf.split_at_mut(SIMILAR_MAX);
+        for (dst, src) in left.iter_mut().zip(theirs) {
+            *dst = src.to_ascii_lowercase();
+        }
+        for (dst, src) in right.iter_mut().zip(ours) {
+            *dst = src.to_ascii_lowercase();
+        }
+        similar_text(&left[..theirs.len()], &right[..ours.len()])
+    }
+
+    /// TMDB rows over (imdb ids, air dates, titles, ours): [flags, imdb span or -1, year or -1,
+    /// similarity]; flags: strict date 1, blank title 2, title match 4, imdb id 8, non-ASCII
+    /// title 16.
+    fn tmdb_show_row(b: &Batch<'_>, out: &mut [i64]) {
+        let mut buf = [0u8; 2 * SIMILAR_MAX];
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let imdb = imdb_span(b.text(0, i));
+            let date = b.text(1, i);
+            let (_, title) = trim(b.text(2, i));
+            let (_, ours) = trim(b.text(3, i));
+            let mut flags = i64::from(strict_date(date));
+            if title.is_empty() {
+                flags |= 2;
+            }
+            if ci_match(title, ours) {
+                flags |= 4;
+            }
+            if imdb >= 0 {
+                flags |= 8;
+            }
+            if !title.is_ascii() {
+                flags |= 16;
+            }
+            *slot = [flags, imdb, year(date), similarity(title, ours, &mut buf)];
+        }
+    }
+
+    /// preg_replace('/<[^>]*>/', '', ...) as (remaining bytes, removed tags).
+    fn strip_tags(value: &[u8]) -> (i64, i64) {
+        let (mut visible, mut tags, mut i) = (0usize, 0i64, 0usize);
+        while i < value.len() {
+            let Some(lt) = value[i..].iter().position(|c| *c == b'<') else {
+                visible += value.len() - i;
+                break;
+            };
+            visible += lt;
+            let lt = i + lt;
+            let Some(gt) = value[lt + 1..].iter().position(|c| *c == b'>') else {
+                visible += value.len() - lt;
+                break;
+            };
+            tags += 1;
+            i = lt + gt + 2;
+        }
+        (visible as i64, tags)
+    }
+
+    /// TVMaze rows over (summaries, imdb ids, countries, networks, titles, ours): [flags, imdb
+    /// span or -1, summary bytes without tags, tag count, similarity]; flags: two-letter
+    /// uppercase country 1, network 2, title match 4, imdb id 8, tagged summary 16, summary
+    /// entity '&' 32.
+    fn tvmaze_show_row(b: &Batch<'_>, out: &mut [i64]) {
+        let mut buf = [0u8; 2 * SIMILAR_MAX];
+        for (i, slot) in out.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let summary = b.text(0, i);
+            let imdb = imdb_span(b.text(1, i));
+            let country = b.text(2, i);
+            let (_, network) = trim(b.text(3, i));
+            let (_, title) = trim(b.text(4, i));
+            let (_, ours) = trim(b.text(5, i));
+            let (visible, tags) = strip_tags(summary);
+            let mut flags = 0i64;
+            if country.len() == 2 && country.iter().all(u8::is_ascii_uppercase) {
+                flags |= 1;
+            }
+            if !network.is_empty() {
+                flags |= 2;
+            }
+            if ci_match(title, ours) {
+                flags |= 4;
+            }
+            if imdb >= 0 {
+                flags |= 8;
+            }
+            if tags > 0 {
+                flags |= 16;
+            }
+            if summary.contains(&b'&') {
+                flags |= 32;
+            }
+            *slot = [
+                flags,
+                imdb,
+                visible,
+                tags,
+                similarity(title, ours, &mut buf),
+            ];
+        }
+    }
+
+    /// TVDB rows over (imdb ids, aired, titles, ours, US-joined aliases) with (season, episode)
+    /// ints: [flags, imdb span or -1, YYYYMMDD or -1, first matching alias or -1, season *
+    /// 1000000 + episode or -1]; flags: aired 1, title match 2, alias match 4, imdb id 8,
+    /// numbered episode 16.
+    fn tvdb_show_row(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let imdb = imdb_span(b.text(0, i));
+            let aired = airdate_packed(b.text(1, i));
+            let (_, title) = trim(b.text(2, i));
+            let (_, ours) = trim(b.text(3, i));
+            let alias = if ours.is_empty() {
+                -1
+            } else {
+                first_alias(b.text(4, i), ours)
+            };
+            let (season, episode) = (b.int(i, 0), b.int(i, 1));
+            let key = if (0..=9999).contains(&season) && (1..=999_999).contains(&episode) {
+                season * 1_000_000 + episode
+            } else {
+                -1
+            };
+            let mut flags = i64::from(aired >= 0);
+            if ci_match(title, ours) {
+                flags |= 2;
+            }
+            if alias >= 0 {
+                flags |= 4;
+            }
+            if imdb >= 0 {
+                flags |= 8;
+            }
+            if key >= 0 {
+                flags |= 16;
+            }
+            *slot = [flags, imdb, aired, alias, key];
+        }
+    }
+
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const US: u64 = LO * 0x1f;
+
+    /// First 0x1f byte, eight bytes per step; the lowest flagged byte is exact.
+    #[inline]
+    fn find_us(hay: &[u8]) -> Option<usize> {
+        let (chunks, tail) = hay.as_chunks::<8>();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let word = u64::from_le_bytes(*chunk) ^ US;
+            let found = word.wrapping_sub(LO) & !word & HI;
+            if found != 0 {
+                return Some(i * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let done = chunks.len() * 8;
+        tail.iter().position(|c| *c == 0x1f).map(|p| done + p)
+    }
+
+    /// Index of the first US-separated alias whose trimmed value matches `ours`, or -1.
+    fn first_alias(mut aliases: &[u8], ours: &[u8]) -> i64 {
+        let mut k = 0i64;
+        loop {
+            let end = find_us(aliases);
+            let alias = &aliases[..end.unwrap_or(aliases.len())];
+            if alias.len() >= ours.len() && ci_match(trim(alias).1, ours) {
+                return k;
+            }
+            let Some(end) = end else {
+                return -1;
+            };
+            aliases = &aliases[end + 1..];
+            k += 1;
+        }
+    }
+
+    macro_rules! export_text {
+        ($name:ident, $cols:literal, $per:literal, $words:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `text` must point to `text_len` readable bytes, `ints` to `ints_len` readable
+            /// bytes and `out` to `out_cap` writable, aligned int64 words that overlap neither
+            /// input; null pointers are accepted only with zero lengths. The W50.4 runner
+            /// rejects bad shapes before slicing, reports `-needed` for a short output and maps
+            /// panics to -1.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                text: *const u8,
+                text_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let shape = Shape {
+                    cols: $cols,
+                    head: 0,
+                    per: $per,
+                    words: $words,
+                };
+                unsafe {
+                    run(
+                        text, text_len, ints, ints_len, count, out, out_cap, shape, $body,
+                    )
+                }
+            }
+        };
+    }
+
+    export_text!(nntmux_w564_tmdb_show_row_batch, 4, 0, 4, tmdb_show_row);
+    export_text!(nntmux_w564_tvmaze_show_row_batch, 6, 0, 5, tvmaze_show_row);
+    export_text!(nntmux_w564_tvdb_show_row_batch, 5, 2, 5, tvdb_show_row);
+
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    const MAX_RECORDS: usize = 1 << 20;
+
+    unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_BYTES {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    type BlobBody = fn(&[&[u8]], &[i64], &mut [i64]);
+
+    /// Blob runner: `count` values' full lengths as packed int64 in `lens` (non-negative) and
+    /// their first min(length, `prefix`) bytes concatenated in `blob`, which must hold exactly
+    /// those slices. The body sees the slices and the full lengths.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_blob(
+        blob: *const u8,
+        blob_len: usize,
+        lens: *const u8,
+        lens_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        prefix: usize,
+        words: usize,
+        body: BlobBody,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(blob as usize, blob_len, out as usize, out_bytes)
+                || overlaps(lens as usize, lens_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(blob), Some(lens)) = (unsafe { bytes(blob, blob_len) }, unsafe {
+                bytes(lens, lens_len)
+            }) else {
+                return -1;
+            };
+            if lens.len() != count * 8 {
+                return -1;
+            }
+            let full: Vec<i64> = lens
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|w| i64::from_le_bytes(*w))
+                .collect();
+            let mut values: Vec<&[u8]> = Vec::with_capacity(count);
+            let mut rest = blob;
+            for len in &full {
+                let Ok(len) = usize::try_from(*len) else {
+                    return -1;
+                };
+                let len = len.min(prefix);
+                if len > rest.len() {
+                    return -1;
+                }
+                let (value, tail) = rest.split_at(len);
+                values.push(value);
+                rest = tail;
+            }
+            if !rest.is_empty() {
+                return -1;
+            }
+            if count == 0 {
+                return 0;
+            }
+            let need = count * words;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from both inputs.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            body(&values, &full, out);
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    const PAR2_MARKER: &[u8; 8] = b"PAR2\x00PKT";
+    const PAR2_MAIN: &[u8] = b"PAR 2.0\x00Main\x00\x00\x00\x00";
+    const PAR2_FILEDESC: &[u8] = b"PAR 2.0\x00FileDesc";
+    const PAR2_FILEVER: &[u8] = b"PAR 2.0\x00IFSC\x00\x00\x00\x00";
+    const PAR2_RECOVERY: [&[u8]; 3] = [
+        b"PAR 2.0\x00RecvSlic",
+        b"PAR 2.0\x00FileSlic",
+        b"PAR 2.0\x00PkdRecvS",
+    ];
+    const PAR2_AUXILIARY: [&[u8]; 6] = [
+        b"PAR 2.0\x00Creator\x00",
+        b"PAR 2.0\x00UniFileN",
+        b"PAR 2.0\x00CommASCI",
+        b"PAR 2.0\x00CommUni\x00",
+        b"PAR 2.0\x00RFSC\x00\x00\x00\x00",
+        b"PAR 2.0\x00PkdMain\x00",
+    ];
+
+    #[inline(always)]
+    fn le32(p: &[u8], at: usize) -> i64 {
+        i64::from(u32::from_le_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]]))
+    }
+
+    #[inline(always)]
+    fn le64(p: &[u8], at: usize) -> i64 {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&p[at..at + 8]);
+        i64::from_le_bytes(word)
+    }
+
+    fn key16(p: &[u8], at: usize) -> [u8; 16] {
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&p[at..at + 16]);
+        key
+    }
+
+    /// summarizePacketBatchPhp()'s classes: truncated 1, bad marker 2, bad length 3, Main 4,
+    /// FileDesc 5, IFSC 6, recovery 7, auxiliary 8, unknown 9, malformed 10. `p` holds the
+    /// first min(len, PAR2_PREFIX) bytes of a `len`-byte packet.
+    fn par2_class(p: &[u8], len: i64) -> i64 {
+        if len < 64 {
+            return 1;
+        }
+        if &p[..8] != PAR2_MARKER {
+            return 2;
+        }
+        let (low, high) = (le32(p, 8), le32(p, 12));
+        if high > 0x7FFF_FFFF || low % 4 != 0 || len != high * 0x1_0000_0000 + low {
+            return 3;
+        }
+        let kind = &p[48..64];
+        let body = len - 64;
+        if kind == PAR2_MAIN {
+            if body < 12 || (body - 12) % 16 != 0 || le32(p, 72) > (body - 12) / 16 {
+                10
+            } else {
+                4
+            }
+        } else if kind == PAR2_FILEDESC {
+            if body < 56 { 10 } else { 5 }
+        } else if kind == PAR2_FILEVER {
+            if body < 16 || (body - 16) % 20 != 0 {
+                10
+            } else {
+                6
+            }
+        } else if PAR2_RECOVERY.contains(&kind) {
+            7
+        } else if PAR2_AUXILIARY.contains(&kind) {
+            8
+        } else {
+            9
+        }
+    }
+
+    /// Bytes of each packet the PAR2 rows read: the header, Main slice size and file count and
+    /// the FileDesc file length; payloads stay in PHP.
+    pub const PAR2_PREFIX: usize = 120;
+
+    /// PAR2 packet rows over packet prefixes plus each packet's full length: [class, Main slice
+    /// size or FileDesc file length or -1, Main file count or -1, first earlier header-valid
+    /// packet with the same packet MD5 or -1, first accepted packet of the same recovery set
+    /// (itself when first) or -1 when not accepted].
+    fn par2_packet_row(values: &[&[u8]], lens: &[i64], out: &mut [i64]) {
+        let mut md5s: HashMap<[u8; 16], i64> = HashMap::with_capacity(values.len());
+        let mut sets: HashMap<[u8; 16], i64> = HashMap::with_capacity(values.len());
+        for (i, (p, slot)) in values
+            .iter()
+            .zip(out.as_chunks_mut::<5>().0.iter_mut())
+            .enumerate()
+        {
+            let class = par2_class(p, lens[i]);
+            let (size, files) = match class {
+                4 => (le64(p, 64), le32(p, 72)),
+                5 => (le64(p, 112), -1),
+                _ => (-1, -1),
+            };
+            let (mut dup, mut set) = (-1, -1);
+            if class >= 4 {
+                match md5s.entry(key16(p, 16)) {
+                    Entry::Occupied(first) => dup = *first.get(),
+                    Entry::Vacant(slot) => {
+                        slot.insert(i as i64);
+                    }
+                }
+            }
+            if (4..=8).contains(&class) {
+                set = *sets.entry(key16(p, 32)).or_insert(i as i64);
+            }
+            *slot = [class, size, files, dup, set];
+        }
+    }
+
+    #[inline(always)]
+    fn hex_value(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    fn hex16(hex: &[u8]) -> Option<[u8; 16]> {
+        let mut value = [0u8; 16];
+        for (dst, pair) in value.iter_mut().zip(hex.as_chunks::<2>().0) {
+            *dst = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
+        }
+        Some(value)
+    }
+
+    /// The 16-byte fingerprint and its kind: raw binary (exactly 16 bytes) 1, 32 hex digits 2,
+    /// 0x-prefixed 32 hex digits 3 (hex forms after trim()), else 0.
+    fn fingerprint(value: &[u8]) -> (i64, [u8; 16]) {
+        if value.len() == 16 {
+            return (1, key16(value, 0));
+        }
+        let (_, hex) = trim(value);
+        let (kind, digits) = match hex {
+            [b'0', b'x' | b'X', rest @ ..] if rest.len() == 32 => (3, rest),
+            _ if hex.len() == 32 => (2, hex),
+            _ => return (0, [0; 16]),
+        };
+        hex16(digits).map_or((0, [0; 16]), |v| (kind, v))
+    }
+
+    /// Fingerprint rows: [kind, high 64 bits (big-endian), low 64 bits, first row with the same
+    /// fingerprint (itself when first) or -1 when invalid].
+    fn fingerprint_row(values: &[&[u8]], _: &[i64], out: &mut [i64]) {
+        let mut seen: HashMap<[u8; 16], i64> = HashMap::with_capacity(values.len());
+        for (i, (value, slot)) in values
+            .iter()
+            .zip(out.as_chunks_mut::<4>().0.iter_mut())
+            .enumerate()
+        {
+            let (kind, fp) = fingerprint(value);
+            if kind == 0 {
+                *slot = [0, 0, 0, -1];
+                continue;
+            }
+            let (hi, lo) = fp.split_at(8);
+            let first = *seen.entry(fp).or_insert(i as i64);
+            *slot = [
+                kind,
+                i64::from_be_bytes(hi.try_into().unwrap_or([0; 8])),
+                i64::from_be_bytes(lo.try_into().unwrap_or([0; 8])),
+                first,
+            ];
+        }
+    }
+
+    macro_rules! export_blob {
+        ($name:ident, $prefix:expr, $words:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `blob` must point to `blob_len` readable bytes, `lens` to `lens_len` readable
+            /// bytes (`count` packed little-endian int64 lengths) and `out` to `out_cap`
+            /// writable, aligned int64 words that overlap neither input; null pointers are
+            /// accepted only with zero lengths. Bad shapes return -1 before slicing, a short
+            /// output returns `-needed` without writing and panics map to -1.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const u8,
+                lens_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe {
+                    run_blob(
+                        blob, blob_len, lens, lens_len, count, out, out_cap, $prefix, $words,
+                        $body,
+                    )
+                }
+            }
+        };
+    }
+
+    export_blob!(
+        nntmux_w564_par2_packet_row_batch,
+        PAR2_PREFIX,
+        5,
+        par2_packet_row
+    );
+    export_blob!(
+        nntmux_w564_compact_fingerprint_row_batch,
+        usize::MAX,
+        4,
+        fingerprint_row
+    );
+}
+
+#[cfg(test)]
+mod w564_tests {
+    use super::w564_batch::*;
+
+    type Export =
+        unsafe extern "C" fn(*const u8, usize, *const u8, usize, usize, *mut i64, usize) -> isize;
+
+    fn call(export: Export, text: &[u8], ints: &[u8], count: usize, out: &mut [i64]) -> isize {
+        unsafe {
+            export(
+                text.as_ptr(),
+                text.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    fn pack(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn rows(export: Export, text: &[u8], ints: &[u8], count: usize, words: usize) -> Vec<i64> {
+        let mut out = vec![i64::MIN; count * words];
+        assert_eq!(
+            call(export, text, ints, count, &mut out),
+            (count * words) as isize
+        );
+        out
+    }
+
+    /// Blob and packed lengths for binary values.
+    fn blob(values: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+        let lens: Vec<i64> = values.iter().map(|v| v.len() as i64).collect();
+        (values.concat(), pack(&lens))
+    }
+
+    /// PAR2 frame: packet prefixes plus full lengths.
+    fn par2_blob(values: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+        let prefixes: Vec<&[u8]> = values
+            .iter()
+            .map(|v| &v[..v.len().min(PAR2_PREFIX)])
+            .collect();
+        let lens: Vec<i64> = values
+            .iter()
+            .map(|v| v.len() as i64)
+            .collect();
+        (prefixes.concat(), pack(&lens))
+    }
+
+    fn span(offset: i64, len: i64) -> i64 {
+        (offset << 32) | len
+    }
+
+    #[test]
+    fn w564_imdb_and_similar_text() {
+        assert_eq!(imdb_span(b"tt0903747"), span(2, 7));
+        assert_eq!(imdb_span(b"TT1234567\n"), span(2, 7));
+        assert_eq!(imdb_span(b"tt1234567\n\n"), -1);
+        assert_eq!(imdb_span(b"tt12345"), -1);
+        assert_eq!(imdb_span(b"xtt123456"), span(3, 6));
+        assert_eq!(imdb_span(b"t123456"), -1);
+        // PHP 8.5: similar_text('World', 'Word'), ('Hello', 'World') with the count > 1 guard
+        // skipping the left half, ('bafoobar', 'barfoo').
+        assert_eq!(similar_text(b"World", b"Word"), 4);
+        assert_eq!(similar_text(b"Hello", b"World"), 1);
+        assert_eq!(similar_text(b"", b"abc"), 0);
+        assert_eq!(similar_text(b"bafoobar", b"barfoo"), 5);
+    }
+
+    #[test]
+    fn w564_tmdb_rows() {
+        let text = [
+            &b"tt0903747"[..],
+            b"",
+            b"2008-01-20",
+            b"2008",
+            b" Breaking Bad ",
+            b"Caf\xc3\xa9",
+            b"breaking bad",
+            b"",
+        ]
+        .join(&0u8);
+        let out = rows(nntmux_w564_tmdb_show_row_batch, &text, &[], 2, 4);
+        assert_eq!(out, vec![13, span(2, 7), 2008, 12, 16, -1, 2008, 0]);
+    }
+
+    #[test]
+    fn w564_tvmaze_rows() {
+        let text = [
+            &b"<p>Hi &amp; <b>bye</b></p>"[..],
+            b"tt7654321",
+            b"US",
+            b" HBO ",
+            b"Show",
+            b"show",
+        ]
+        .join(&0u8);
+        let out = rows(nntmux_w564_tvmaze_show_row_batch, &text, &[], 1, 5);
+        assert_eq!(out, vec![1 | 2 | 4 | 8 | 16 | 32, span(2, 7), 12, 4, 4]);
+        let text = [&b"a<b<c>d<e"[..], b"", b"usa", b"", b"", b""].join(&0u8);
+        let out = rows(nntmux_w564_tvmaze_show_row_batch, &text, &[], 1, 5);
+        assert_eq!(out, vec![16, -1, 4, 1, 0]);
+    }
+
+    #[test]
+    fn w564_tvdb_rows() {
+        let text = [
+            &b"tt1234567"[..],
+            b"2020-02-30T00:00",
+            b"Doctor Who",
+            b" doctor who ",
+            b"Dr Who\x1f DOCTOR WHO ",
+        ]
+        .join(&0u8);
+        let out = rows(nntmux_w564_tvdb_show_row_batch, &text, &pack(&[3, 7]), 1, 5);
+        assert_eq!(out, vec![31, span(2, 7), 20200230, 1, 3_000_007]);
+        let text = [&b""[..], b"2020-13-01", b"", b"", b""].join(&0u8);
+        let out = rows(
+            nntmux_w564_tvdb_show_row_batch,
+            &text,
+            &pack(&[-1, 0]),
+            1,
+            5,
+        );
+        assert_eq!(out, vec![0, -1, -1, -1, -1]);
+    }
+
+    fn par2(kind: &[u8], body: &[u8], set: &[u8; 16], md5: u8) -> Vec<u8> {
+        let mut p = b"PAR2\x00PKT".to_vec();
+        p.extend_from_slice(&((64 + body.len()) as u64).to_le_bytes());
+        p.extend_from_slice(&[md5; 16]);
+        p.extend_from_slice(set);
+        p.extend_from_slice(kind);
+        p.extend_from_slice(body);
+        p
+    }
+
+    #[test]
+    fn w564_par2_rows() {
+        let mut main_body = 768_000u64.to_le_bytes().to_vec();
+        main_body.extend_from_slice(&1u32.to_le_bytes());
+        main_body.extend_from_slice(&[1; 16]);
+        let main = par2(b"PAR 2.0\x00Main\x00\x00\x00\x00", &main_body, &[7; 16], 1);
+        let mut desc_body = vec![0xaa; 48];
+        desc_body.extend_from_slice(&42u64.to_le_bytes());
+        desc_body.extend_from_slice(b"name");
+        let desc = par2(b"PAR 2.0\x00FileDesc", &desc_body, &[7; 16], 2);
+        let unknown = par2(b"PAR 2.0\x00Unknown!", b"", &[9; 16], 1);
+        let other = par2(b"PAR 2.0\x00Creator\x00", b"abcd", &[8; 16], 3);
+        let big = par2(b"PAR 2.0\x00RecvSlic", &[0x55; 4096], &[8; 16], 4);
+        let values: [&[u8]; 7] = [&main, &desc, &main, b"short", &unknown, &other, &big];
+        let (data, lens) = par2_blob(&values);
+        assert!(data.len() < 1024);
+        let out = rows(nntmux_w564_par2_packet_row_batch, &data, &lens, 7, 5);
+        assert_eq!(
+            out,
+            vec![
+                4, 768_000, 1, -1, 0, //
+                5, 42, -1, -1, 0, //
+                4, 768_000, 1, 0, 0, //
+                1, -1, -1, -1, -1, //
+                9, -1, -1, 0, -1, //
+                8, -1, -1, -1, 5, //
+                7, -1, -1, -1, 5,
+            ]
+        );
+        // The blob must hold exactly min(length, PAR2_PREFIX) bytes per packet.
+        let mut out = vec![0i64; 5];
+        for (data, len) in [(&main[..10], 200), (&main[..], 200), (&big[..], 4160)] {
+            assert_eq!(
+                call(
+                    nntmux_w564_par2_packet_row_batch,
+                    data,
+                    &pack(&[len]),
+                    1,
+                    &mut out
+                ),
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn w564_fingerprint_rows() {
+        let raw = [0x0cu8; 16];
+        let values: [&[u8]; 5] = [
+            &raw,
+            b" 0X0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C\n",
+            b"0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0g",
+            b"",
+            b"ffffffffffffffff0000000000000001",
+        ];
+        let (data, lens) = blob(&values);
+        let out = rows(
+            nntmux_w564_compact_fingerprint_row_batch,
+            &data,
+            &lens,
+            5,
+            4,
+        );
+        let word = i64::from_be_bytes([0x0c; 8]);
+        assert_eq!(
+            out,
+            vec![
+                1, word, word, 0, //
+                3, word, word, 0, //
+                0, 0, 0, -1, //
+                0, 0, 0, -1, //
+                2, -1, 1, 4,
+            ]
+        );
+    }
+
+    #[test]
+    fn w564_raw_export_contract() {
+        let exports: [(Export, usize, usize, usize, bool); 5] = [
+            (nntmux_w564_tmdb_show_row_batch, 4, 0, 4, false),
+            (nntmux_w564_tvmaze_show_row_batch, 6, 0, 5, false),
+            (nntmux_w564_tvdb_show_row_batch, 5, 2, 5, false),
+            (nntmux_w564_par2_packet_row_batch, 0, 0, 5, true),
+            (nntmux_w564_compact_fingerprint_row_batch, 0, 0, 4, true),
+        ];
+        for (export, cols, per, words, binary) in exports {
+            let (text, ints) = if binary && words == 5 {
+                par2_blob(&[b"ab", b"\0c"])
+            } else if binary {
+                blob(&[b"ab", b"\0c"])
+            } else {
+                (
+                    vec![&b"a"[..]; 2 * cols].join(&0u8),
+                    pack(&vec![1; 2 * per]),
+                )
+            };
+            let mut out = vec![i64::MIN; 2 * words];
+            unsafe {
+                assert_eq!(
+                    export(
+                        text.as_ptr(),
+                        text.len(),
+                        ints.as_ptr(),
+                        ints.len(),
+                        2,
+                        std::ptr::null_mut(),
+                        64
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        text.len(),
+                        ints.as_ptr(),
+                        ints.len(),
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    0
+                );
+                let mut shared = vec![0i64; 64];
+                let base = shared.as_mut_ptr();
+                assert_eq!(
+                    export(base.cast(), 8, ints.as_ptr(), ints.len(), 2, base, 64),
+                    -1
+                );
+            }
+            assert!(out.iter().all(|w| *w == i64::MIN));
+            let mut extra = text.clone();
+            extra.extend_from_slice(b"\0b");
+            assert_eq!(call(export, &extra, &ints, 2, &mut out), -1);
+            let mut wrong = ints.clone();
+            wrong.extend_from_slice(&[0; 8]);
+            assert_eq!(call(export, &text, &wrong, 2, &mut out), -1);
+            let mut short = vec![i64::MIN; 2 * words - 1];
+            assert_eq!(
+                call(export, &text, &ints, 2, &mut short),
+                -((2 * words) as isize)
+            );
+            assert!(short.iter().all(|w| *w == i64::MIN));
+            assert_eq!(
+                call(export, &text, &ints, 2, &mut out),
+                (2 * words) as isize
+            );
+            assert!(out.iter().all(|w| *w != i64::MIN));
+        }
+        // Negative and overrunning blob lengths.
+        let mut out = [0i64; 8];
+        let neg = pack(&[-1, 3]);
+        assert_eq!(
+            call(nntmux_w564_par2_packet_row_batch, b"ab", &neg, 2, &mut out),
+            -1
+        );
+        let over = pack(&[2, 3]);
+        assert_eq!(
+            call(
+                nntmux_w564_compact_fingerprint_row_batch,
+                b"abc",
+                &over,
+                2,
+                &mut out
+            ),
+            -1
+        );
+    }
+
+    #[test]
+    fn w564_long_inputs_stay_bounded() {
+        let long = vec![b'<'; 200_000];
+        let text = [&long[..], &long, &long, &long, &long, &long].join(&0u8);
+        let out = rows(nntmux_w564_tvmaze_show_row_batch, &text, &[], 1, 5);
+        assert_eq!(out, vec![2 | 4, -1, 200_000, 0, -1]);
+        let title = vec![b'a'; 256];
+        let text = [&b""[..], b"", &title, b"a"].join(&0u8);
+        let out = rows(nntmux_w564_tmdb_show_row_batch, &text, &[], 1, 4);
+        assert_eq!(out, vec![0, -1, -1, -1]);
+    }
+}
