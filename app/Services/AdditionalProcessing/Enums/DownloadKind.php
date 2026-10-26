@@ -304,4 +304,273 @@ enum DownloadKind: string
 
         return \count($values) === $count ? $values : array_pad(\array_slice($values, 0, $count), $count, 0);
     }
+
+    // Rust is the default only while the paired W60.6 benchmark clears 1.5x on all four metrics.
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    private const string W60_KIND_FFI_CDEF = <<<'C'
+        int32_t nntmux_w606_download_kind_batch(const char *strings, size_t strings_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t article_budget, int64_t timeout_seconds, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W60_KIND_HEADER = 24;
+
+    private const int W60_MAX_ITEMS = 1_048_576;
+
+    private const int W60_VALUE_CAP = (1 << 40) - 1;
+
+    private const int W60_TOTAL_CAP = 1 << 62;
+
+    /** Case name => case index. */
+    private const array W60_NAMES = [
+        'Sample' => 0, 'MediaInfo' => 1, 'Audio' => 2, 'Jpg' => 3, 'Compressed' => 4, 'Par2Index' => 5, 'MediaSource' => 6,
+    ];
+
+    /** Normalized alias => case index. */
+    private const array W60_ALIASES = [
+        'samples' => 0, 'mediainfo' => 1, 'info' => 1, 'mp3' => 2, 'music' => 2, 'jpeg' => 3, 'image' => 3, 'preview' => 3,
+        'archive' => 4, 'rar' => 4, 'par2' => 5, 'par2index' => 5, 'par' => 5, 'source' => 6, 'mediasource' => 6, 'video' => 6,
+    ];
+
+    /** Article limit and timeout percent per case (7 unknown). */
+    private const array W60_ARTICLE_LIMITS = [40, 8, 20, 4, 12, 2, 1, 0];
+
+    private const array W60_TIMEOUT_PERCENT = [100, 50, 75, 25, 100, 25, 50, 0];
+
+    /**
+     * Plan downloads in order. Kinds resolve by backing value (source 0), case name (1), the backing value of
+     * `str_replace('_', '-', strtolower(trim($kind)))` (2), an alias of it (3), else unknown case 7 (4).
+     * Requested articles clamp to 0..2^20-1 and bytes to 0..2^40-1; each download plans `min(requested,
+     * kind limit, remaining budget)` articles of the shared `$articleBudget` (clamped to 0..2^40-1) and a
+     * timeout of `$timeoutSeconds` (clamped to 0..86400) scaled by the kind's percent plus 250 ms per article.
+     *
+     * Layout: `[0]` count, `[1..8]` per case, `[9..13]` per source, `[14]` previews, `[15]` requested and
+     * `[16]` planned articles, `[17]` truncated and `[18]` the first truncated index (-1), `[19]` planned
+     * bytes, `[20]` remaining budget, `[21]` max and `[22]` total timeout ms, `[23]` FNV-1a digest; then per
+     * download `case | source << 3 | preview << 6 | truncated << 7 | planned << 8 | timeout ms << 29 |
+     * min(kind bytes, 31) << 58`.
+     *
+     * @param  array<array-key, string>  $kinds
+     * @param  array<array-key, int>  $articles
+     * @param  array<array-key, int>  $bytes
+     * @return list<int>
+     */
+    public static function planDownloadKindBatch(array $kinds, array $articles, array $bytes, int $articleBudget, int $timeoutSeconds = 60): array
+    {
+        return (self::usesW60RustFfi() ? self::planDownloadKindBatchNative($kinds, $articles, $bytes, $articleBudget, $timeoutSeconds) : null)
+            ?? self::planDownloadKindBatchPhp($kinds, $articles, $bytes, $articleBudget, $timeoutSeconds);
+    }
+
+    /**
+     * @param  array<array-key, string>  $kinds
+     * @param  array<array-key, int>  $articles
+     * @param  array<array-key, int>  $bytes
+     * @return list<int>
+     */
+    public static function planDownloadKindBatchPhp(array $kinds, array $articles, array $bytes, int $articleBudget, int $timeoutSeconds = 60): array
+    {
+        $kinds = array_values($kinds);
+        $articles = array_values($articles);
+        $bytes = array_values($bytes);
+        $count = \count($kinds);
+        $budget = min(max($articleBudget, 0), self::W60_VALUE_CAP);
+        $base = min(max($timeoutSeconds, 0), 86_400);
+        $out = array_fill(0, self::W60_KIND_HEADER, 0);
+        $out[0] = $count;
+        $out[18] = -1;
+        $used = 0;
+        $digest = 2_166_136_261;
+        $rows = [];
+        foreach ($kinds as $at => $kind) {
+            $kind = (string) $kind;
+            $source = 0;
+            $case = self::W49_KINDS[$kind] ?? null;
+            if ($case === null) {
+                $source = 1;
+                $case = self::W60_NAMES[$kind] ?? null;
+                if ($case === null) {
+                    $normalized = str_replace('_', '-', strtolower(trim($kind)));
+                    $source = 2;
+                    $case = self::W49_KINDS[$normalized] ?? null;
+                    if ($case === null) {
+                        $source = 3;
+                        $case = self::W60_ALIASES[$normalized] ?? null;
+                        if ($case === null) {
+                            $source = 4;
+                            $case = 7;
+                        }
+                    }
+                }
+            }
+            $requested = min(max((int) ($articles[$at] ?? 0), 0), 1_048_575);
+            $size = min(max((int) ($bytes[$at] ?? 0), 0), self::W60_VALUE_CAP);
+            $planned = min($requested, self::W60_ARTICLE_LIMITS[$case], $budget - $used);
+            $used += $planned;
+            $truncated = $planned < $requested ? 1 : 0;
+            $perArticle = $requested > 0 ? intdiv($size, $requested) : 0;
+            $timeout = intdiv($base * 1_000 * self::W60_TIMEOUT_PERCENT[$case], 100) + $planned * 250;
+            $preview = $case === 3 || $case === 5 || $case === 6 ? 1 : 0;
+            $out[1 + $case]++;
+            $out[9 + $source]++;
+            $out[14] += $preview;
+            $out[15] += $requested;
+            $out[16] += $planned;
+            $out[17] += $truncated;
+            if ($truncated === 1 && $out[18] < 0) {
+                $out[18] = $at;
+            }
+            $out[19] = min($out[19] + $perArticle * $planned, self::W60_TOTAL_CAP);
+            $out[21] = max($out[21], $timeout);
+            $out[22] += $timeout;
+            $row = $case | $source << 3 | $preview << 6 | $truncated << 7 | $planned << 8 | $timeout << 29 | min(\strlen($kind), 31) << 58;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[20] = $budget - $used;
+        $out[23] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust plan, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $kinds
+     * @param  array<array-key, int>  $articles
+     * @param  array<array-key, int>  $bytes
+     * @return list<int>|null
+     */
+    public static function planDownloadKindBatchNative(array $kinds, array $articles, array $bytes, int $articleBudget, int $timeoutSeconds = 60): ?array
+    {
+        $count = \count($kinds);
+        if ($count > self::W60_MAX_ITEMS) {
+            return null;
+        }
+        [$joined, $twin] = self::w60Strings(array_values($kinds));
+        $ints = pack('q*', ...self::w60Column($articles, $count), ...self::w60Column($bytes, $count));
+        $fields = self::W60_KIND_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w60Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w606_download_kind_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $articleBudget, $timeoutSeconds, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 60.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        $forced = self::w60RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 60.6 routing and binding in function statics (enums and readonly classes cannot declare properties).
+     * No `$op` returns the forced routing (null for the default); `'set'` replaces it with `$val` and returns
+     * the previous value; `'binding'` returns the cached binding and an output buffer of at least `$val`
+     * values, or null.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w606', self::W60_KIND_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 60.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w60Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w60RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Values NUL-joined and, when one holds a NUL, the same values joined with 0x01 so Rust finds the
+     * separators where the two differ.
+     *
+     * @param  list<string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w60Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
+    }
+
+    /**
+     * Values by position, cut or padded with `$pad` to `$count`.
+     *
+     * @template T of int|string
+     *
+     * @param  array<array-key, T>  $values
+     * @param  T  $pad
+     * @return list<T>
+     */
+    private static function w60Column(array $values, int $count, int|string $pad = 0): array
+    {
+        $values = array_values($values);
+
+        return \count($values) === $count ? $values : array_pad(\array_slice($values, 0, $count), $count, $pad);
+    }
 }

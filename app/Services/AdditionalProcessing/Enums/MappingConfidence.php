@@ -397,4 +397,270 @@ enum MappingConfidence: string
 
         return \count($values) === $count ? $values : array_pad(\array_slice($values, 0, $count), $count, 0);
     }
+
+    // Rust is the default only while the paired W60.6 benchmark clears 1.5x on all four metrics.
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    private const string W60_MAPPING_FFI_CDEF = <<<'C'
+        int32_t nntmux_w606_mapping_confidence_batch(const char *strings, size_t strings_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W60_MAPPING_HEADER = 20;
+
+    private const int W60_MAX_ITEMS = 1_048_576;
+
+    private const int W60_VALUE_CAP = (1 << 40) - 1;
+
+    private const int W60_TOTAL_CAP = 1 << 62;
+
+    /** Backing value => case index. */
+    private const array W60_VALUES = ['verified' => 0, 'unique-size' => 1];
+
+    /** Case name => case index. */
+    private const array W60_NAMES = ['Verified' => 0, 'UniqueSize' => 1];
+
+    /**
+     * Weigh mapping evidence. Values resolve by backing value (source 0), case name (1), the backing value
+     * of `str_replace('_', '-', strtolower(trim($value)))` (2), else unknown case 2 (3); rank is 2 verified,
+     * 1 unique size, 0 unknown. PAR2, NFO and header evidence counts clamp to 0..255 and sizes to
+     * 0..2^40-1. The score is `min(1000, rank * 100 + par2 * 40 + nfo * 15 + header * 25)`; tier 2 from 300,
+     * 1 from 150. A unique-size match with PAR2 evidence is promotable; a verified one without PAR2 or
+     * header evidence conflicts.
+     *
+     * Layout: `[0]` count, `[1..3]` per case, `[4..7]` per source, `[8..10]` per tier, `[11]` promotable,
+     * `[12]` conflicts, `[13]` score sum, `[14]` max score and `[15]` its first index (-1), `[16]` verified
+     * and `[17]` unique-size bytes (capped at 2^62), `[18]` mean score, `[19]` FNV-1a digest; then per mapping
+     * `case | source << 2 | tier << 4 | promotable << 6 | conflict << 7 | rank << 8 | score << 10 | par2 << 20
+     * | nfo << 28 | header << 36 | min(value bytes, 255) << 44`.
+     *
+     * @param  array<array-key, string>  $values
+     * @param  array<array-key, int>  $par2Matches
+     * @param  array<array-key, int>  $nfoMatches
+     * @param  array<array-key, int>  $headerMatches
+     * @param  array<array-key, int>  $sizes
+     * @return list<int>
+     */
+    public static function planMappingConfidenceBatch(array $values, array $par2Matches, array $nfoMatches, array $headerMatches, array $sizes): array
+    {
+        return (self::usesW60RustFfi() ? self::planMappingConfidenceBatchNative($values, $par2Matches, $nfoMatches, $headerMatches, $sizes) : null)
+            ?? self::planMappingConfidenceBatchPhp($values, $par2Matches, $nfoMatches, $headerMatches, $sizes);
+    }
+
+    /**
+     * @param  array<array-key, string>  $values
+     * @param  array<array-key, int>  $par2Matches
+     * @param  array<array-key, int>  $nfoMatches
+     * @param  array<array-key, int>  $headerMatches
+     * @param  array<array-key, int>  $sizes
+     * @return list<int>
+     */
+    public static function planMappingConfidenceBatchPhp(array $values, array $par2Matches, array $nfoMatches, array $headerMatches, array $sizes): array
+    {
+        $values = array_values($values);
+        $par2Matches = array_values($par2Matches);
+        $nfoMatches = array_values($nfoMatches);
+        $headerMatches = array_values($headerMatches);
+        $sizes = array_values($sizes);
+        $count = \count($values);
+        $out = array_fill(0, self::W60_MAPPING_HEADER, 0);
+        $out[0] = $count;
+        $out[15] = -1;
+        $digest = 2_166_136_261;
+        $rows = [];
+        foreach ($values as $at => $value) {
+            $value = (string) $value;
+            $source = 0;
+            $case = self::W60_VALUES[$value] ?? null;
+            if ($case === null) {
+                $source = 1;
+                $case = self::W60_NAMES[$value] ?? null;
+                if ($case === null) {
+                    $source = 2;
+                    $case = self::W60_VALUES[str_replace('_', '-', strtolower(trim($value)))] ?? null;
+                    if ($case === null) {
+                        $source = 3;
+                        $case = 2;
+                    }
+                }
+            }
+            $rank = 2 - $case;
+            $par2 = min(max((int) ($par2Matches[$at] ?? 0), 0), 255);
+            $nfo = min(max((int) ($nfoMatches[$at] ?? 0), 0), 255);
+            $header = min(max((int) ($headerMatches[$at] ?? 0), 0), 255);
+            $size = min(max((int) ($sizes[$at] ?? 0), 0), self::W60_VALUE_CAP);
+            $score = min(1_000, $rank * 100 + $par2 * 40 + $nfo * 15 + $header * 25);
+            $tier = $score >= 300 ? 2 : ($score >= 150 ? 1 : 0);
+            $promotable = $case === 1 && $par2 > 0 ? 1 : 0;
+            $conflict = $case === 0 && $par2 === 0 && $header === 0 ? 1 : 0;
+            $out[1 + $case]++;
+            $out[4 + $source]++;
+            $out[8 + $tier]++;
+            $out[11] += $promotable;
+            $out[12] += $conflict;
+            $out[13] += $score;
+            if ($out[15] < 0 || $score > $out[14]) {
+                $out[14] = $score;
+                $out[15] = $at;
+            }
+            if ($case < 2) {
+                $out[16 + $case] = min($out[16 + $case] + $size, self::W60_TOTAL_CAP);
+            }
+            $row = $case | $source << 2 | $tier << 4 | $promotable << 6 | $conflict << 7 | $rank << 8 | $score << 10 | $par2 << 20
+                | $nfo << 28 | $header << 36 | min(\strlen($value), 255) << 44;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        if ($count > 0) {
+            $out[18] = intdiv($out[13], $count);
+        }
+        $out[19] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust plan, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $values
+     * @param  array<array-key, int>  $par2Matches
+     * @param  array<array-key, int>  $nfoMatches
+     * @param  array<array-key, int>  $headerMatches
+     * @param  array<array-key, int>  $sizes
+     * @return list<int>|null
+     */
+    public static function planMappingConfidenceBatchNative(array $values, array $par2Matches, array $nfoMatches, array $headerMatches, array $sizes): ?array
+    {
+        $count = \count($values);
+        if ($count > self::W60_MAX_ITEMS) {
+            return null;
+        }
+        [$joined, $twin] = self::w60Strings(array_values($values));
+        $ints = pack('q*', ...self::w60Column($par2Matches, $count), ...self::w60Column($nfoMatches, $count),
+            ...self::w60Column($headerMatches, $count), ...self::w60Column($sizes, $count));
+        $fields = self::W60_MAPPING_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w60Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w606_mapping_confidence_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 60.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        $forced = self::w60RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 60.6 routing and binding in function statics (enums and readonly classes cannot declare properties).
+     * No `$op` returns the forced routing (null for the default); `'set'` replaces it with `$val` and returns
+     * the previous value; `'binding'` returns the cached binding and an output buffer of at least `$val`
+     * values, or null.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w606', self::W60_MAPPING_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 60.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w60Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w60RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Values NUL-joined and, when one holds a NUL, the same values joined with 0x01 so Rust finds the
+     * separators where the two differ.
+     *
+     * @param  list<string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w60Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
+    }
+
+    /**
+     * Values by position, cut or padded with `$pad` to `$count`.
+     *
+     * @template T of int|string
+     *
+     * @param  array<array-key, T>  $values
+     * @param  T  $pad
+     * @return list<T>
+     */
+    private static function w60Column(array $values, int $count, int|string $pad = 0): array
+    {
+        $values = array_values($values);
+
+        return \count($values) === $count ? $values : array_pad(\array_slice($values, 0, $count), $count, $pad);
+    }
 }
