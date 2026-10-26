@@ -564,4 +564,223 @@ final class ReleaseItemPayloadBuilder
             return null;
         }
     }
+
+    /** C signature of the Wave 60.5 {@see self::payloadPlanBatch()} helper. */
+    private const string W60_PAYLOAD_PLAN_FFI_CDEF = 'int64_t nntmux_w605_v1_payload_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 60.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 3.68/2.25/4.70/4.89x); see
+     * tests/Unit/RustApiCanonicalizerQueryParamsV1BuilderV2PresenterLogQueryW60ParityTest.php.
+     */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 60.5 routing and FFI cache, kept in function-local statics (no static properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w60_5', self::W60_PAYLOAD_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W60_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        return self::w60RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with payloadPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 60.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w60Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w60RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w605_v1_payload_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch API v1 item plan over
+     * `server_url\ttoken\tguid\tsize\tgrabs\tcategories_id\tcoverurl\tnfostatus\tdl\textended\tdel`. Nine words per
+     * record: `[link_len, details_len, size, grabs, category, parent, attr_count, enclosure, flags]`. Lengths follow
+     * {@see build()}: the download link `{url}/getnzb?id={guid}.nzb&r={token}[&del=1]` and the details URL
+     * `{url}/details/{guid}` over the raw fields. Size and grabs (empty 0) are trimmed 1-18 digits, the category 1-9
+     * digits with its thousand parent. Attributes count category, size, a non-empty cover and, when extended, files,
+     * grabs, comments, password and info for nfostatus 1. Extended, del and dl are 1 only for the trimmed integer 1;
+     * an empty dl keeps the enclosure. Flags: 1 empty guid, 2 guid not forty hex digits, 4 invalid size, 8 invalid
+     * grabs, 16 invalid category, 32 server URL ending in `/`, 64 empty token, 128 not exactly eleven fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function payloadPlanBatch(array $records): array
+    {
+        return self::usesW60RustFfi() ? self::payloadPlanBatchNative($records) : self::payloadPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function payloadPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 11 ? 0 : 128;
+            $server = $fields[0];
+            $token = $fields[1] ?? '';
+            $guid = $fields[2] ?? '';
+            $del = self::w60Integer(trim($fields[10] ?? '')) === 1;
+            $extended = self::w60Integer(trim($fields[9] ?? '')) === 1;
+            $dl = trim($fields[8] ?? '');
+            $enclosure = $dl === '' || self::w60Integer($dl) === 1 ? 1 : 0;
+            $link = \strlen($server) + 11 + \strlen($guid) + 7 + \strlen($token) + ($del ? 6 : 0);
+            $details = \strlen($server) + 9 + \strlen($guid);
+            if ($guid === '') {
+                $flags |= 1;
+            } elseif (\strlen($guid) !== 40 || ! ctype_xdigit($guid)) {
+                $flags |= 2;
+            }
+            $size = self::w60Digits(trim($fields[3] ?? ''), 18);
+            if ($size === null) {
+                $size = 0;
+                $flags |= 4;
+            }
+            $grabs = 0;
+            $text = trim($fields[4] ?? '');
+            if ($text !== '') {
+                $value = self::w60Digits($text, 18);
+                if ($value === null) {
+                    $flags |= 8;
+                } else {
+                    $grabs = $value;
+                }
+            }
+            $category = self::w60Digits(trim($fields[5] ?? ''), 9);
+            if ($category === null) {
+                $category = $parent = 0;
+                $flags |= 16;
+            } else {
+                $parent = $category - $category % 1000;
+            }
+            $attributes = 2 + (trim($fields[6] ?? '') !== '' ? 1 : 0)
+                + ($extended ? 4 + (self::w60Integer(trim($fields[7] ?? '')) === 1 ? 1 : 0) : 0);
+            if (str_ends_with($server, '/')) {
+                $flags |= 32;
+            }
+            if ($token === '') {
+                $flags |= 64;
+            }
+            array_push($out, $link, $details, $size, $grabs, $category, $parent, $attributes, $enclosure, $flags);
+        }
+
+        return $out;
+    }
+
+    /** 1-$max ASCII digits as an integer, else null. */
+    private static function w60Digits(string $text, int $max): ?int
+    {
+        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
+    }
+
+    /** An optional `+`/`-` sign followed by 1-18 ASCII digits, else null. */
+    private static function w60Integer(string $text): ?int
+    {
+        $sign = $text[0] ?? '';
+        $body = $sign === '-' || $sign === '+' ? substr($text, 1) : $text;
+        if ($body === '' || \strlen($body) > 18 || ! ctype_digit($body)) {
+            return null;
+        }
+
+        return $sign === '-' ? -(int) $body : (int) $body;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function payloadPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w60Words($count, implode("\0", $records), 9 * $count) ?? self::payloadPlanBatchPhp($records);
+    }
 }
