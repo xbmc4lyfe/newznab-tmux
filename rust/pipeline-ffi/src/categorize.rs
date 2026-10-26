@@ -41974,3 +41974,756 @@ pub mod categorization_pipes_console_group_misc_music_pc_w543 {
         }
     }
 }
+
+/// Wave 55.3 per-record batches for `ReleaseImageService`, `ReleaseBrowseService`,
+/// `ReleaseDuplicateFinder`, `ReleaseGroupResolver` and `ReleaseManagementService`. Each export
+/// takes `count` NUL-joined items and writes one `i64` word per record, then that helper's trailer
+/// words, through the Wave 53.3 buffer guard (`run`).
+pub mod release_image_browse_duplicate_group_management_w553 {
+    use super::tv_book_service_books_consoles_games_w533::{
+        Batch, DECLINE, run, tally, tokens, trim,
+    };
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::ptr;
+
+    /// Upper bound on `count`, so a corrupt count never drives a huge allocation.
+    const MAX_COUNT: usize = 1 << 24;
+
+    /// Word-at-a-time FNV-style hasher for the per-call group sets; names are not
+    /// attacker-sensitive and the sets never outlive one call.
+    #[derive(Default)]
+    struct NameHasher(u64);
+
+    impl Hasher for NameHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            const PRIME: u64 = 0x0000_0100_0000_01B3;
+            let (words, tail) = bytes.as_chunks::<8>();
+            let mut hash = self.0 ^ 0xCBF2_9CE4_8422_2325;
+            for word in words {
+                hash = (hash ^ u64::from_le_bytes(*word)).wrapping_mul(PRIME);
+            }
+            let mut last = [0u8; 8];
+            last[..tail.len()].copy_from_slice(tail);
+            hash = (hash ^ u64::from_le_bytes(last)).wrapping_mul(PRIME);
+            self.0 = (hash ^ (hash >> 29)).wrapping_mul(PRIME) ^ (bytes.len() as u64);
+        }
+
+        fn write_u8(&mut self, value: u8) {
+            self.write_usize(usize::from(value));
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.0 = (self.0 ^ value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0 ^ (self.0 >> 32)
+        }
+    }
+
+    type NameSet<T> = HashSet<T, BuildHasherDefault<NameHasher>>;
+
+    /// `$ext` alternatives of `/\.(?:jpe?g|png|gif|webp|bmp)(?:[?#]|\z)/i`.
+    const IMAGE_EXTENSIONS: [&[u8]; 6] = [b"jpg", b"jpeg", b"png", b"gif", b"webp", b"bmp"];
+
+    /// `\A[A-Za-z0-9][A-Za-z0-9_-]*\z`.
+    fn valid_basename(value: &[u8]) -> bool {
+        value.first().is_some_and(u8::is_ascii_alphanumeric)
+            && value
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    }
+
+    /// `/\.(?:jpe?g|png|gif|webp|bmp)(?:[?#]|\z)/i` anywhere in `value`.
+    fn image_extension(value: &[u8]) -> bool {
+        value.iter().enumerate().any(|(i, &b)| {
+            let rest = &value[i + 1..];
+            b == b'.'
+                && IMAGE_EXTENSIONS.iter().any(|ext| {
+                    rest.len() >= ext.len()
+                        && rest[..ext.len()].eq_ignore_ascii_case(ext)
+                        && matches!(rest.get(ext.len()), None | Some(b'?' | b'#'))
+                })
+        })
+    }
+
+    /// `ReleaseImageService::w55ImageReferenceFlagBatchPhp()`: per trimmed reference
+    /// `flags | length << 16` with flags 1 empty, 2 valid basename, 4 http(s) URL, 8 `@` in the URL
+    /// authority, 16 URL with `?`, 32 image extension and 64 https; then the seven flag counts.
+    fn image_references(refs: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(refs.len() + 7);
+        let mut totals = [0i64; 7];
+        for item in refs {
+            let entry = trim(item);
+            let word = if entry.is_empty() {
+                1
+            } else {
+                let mut flags = if valid_basename(entry) { 2 } else { 0 };
+                let secure = entry.len() > 4 && entry[4].eq_ignore_ascii_case(&b's');
+                let scheme = 4 + usize::from(secure);
+                if entry.len() >= scheme + 3
+                    && entry[..4].eq_ignore_ascii_case(b"http")
+                    && &entry[scheme..scheme + 3] == b"://"
+                {
+                    let authority = &entry[scheme + 3..];
+                    let end = authority
+                        .iter()
+                        .position(|b| matches!(b, b'/' | b'?' | b'#'))
+                        .unwrap_or(authority.len());
+                    flags |= 4
+                        | if authority[..end].contains(&b'@') { 8 } else { 0 }
+                        | if entry.contains(&b'?') { 16 } else { 0 }
+                        | if secure { 64 } else { 0 };
+                }
+                if image_extension(entry) {
+                    flags |= 32;
+                }
+                flags | ((entry.len() as i64) << 16)
+            };
+            tally(&mut totals, word);
+            out.push(word);
+        }
+        out.extend(totals);
+        out
+    }
+
+    /// `ReleaseBrowseService::w55BrowseOrderPlanBatchPhp()`: per order
+    /// `field | 16 explicit direction | 32 asc | 64 index-sortable field` with field 0 postdate,
+    /// 1 categories_id, 2 searchname, 3 size, 4 totalpart, 5 grabs, 6 comments and 7 adddate; then
+    /// the eight field counts, the explicit and asc counts and the distinct field/direction pairs.
+    fn browse_orders(orders: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(orders.len() + 11);
+        let mut fields = [0i64; 8];
+        let (mut explicit_total, mut asc_total, mut pairs) = (0i64, 0i64, 0u16);
+        for &order in orders {
+            let order: &[u8] = if order.is_empty() { b"posted_desc" } else { order };
+            let mut segments = order.split(|&b| b == b'_');
+            let field: i64 = match segments.next().unwrap_or_default() {
+                b"cat" => 1,
+                b"name" => 2,
+                b"size" => 3,
+                b"files" => 4,
+                b"stats" => 5,
+                b"comments" => 6,
+                b"added" => 7,
+                _ => 0,
+            };
+            // `/^(asc|desc)$/i` without `D`: `$` also matches before one final newline.
+            let direction = segments.next().map(|s| s.strip_suffix(b"\n").unwrap_or(s));
+            let explicit = direction.is_some_and(|d| {
+                d.eq_ignore_ascii_case(b"asc") || d.eq_ignore_ascii_case(b"desc")
+            });
+            let asc = explicit && direction.is_some_and(|d| d.len() == 3);
+            let word = field
+                | if explicit { 16 } else { 0 }
+                | if asc { 32 } else { 0 }
+                | if field != 2 { 64 } else { 0 };
+            fields[field as usize] += 1;
+            explicit_total += i64::from(explicit);
+            asc_total += i64::from(asc);
+            pairs |= 1 << (field * 2 + i64::from(asc));
+            out.push(word);
+        }
+        out.extend(fields);
+        out.extend([explicit_total, asc_total, i64::from(pairs.count_ones())]);
+        out
+    }
+
+    /// Appends the ASCII-lowercased alphanumeric tokens of `value` to `found` and their
+    /// concatenation to `key`.
+    fn folded<'a>(value: &'a [u8], found: &mut Vec<&'a [u8]>, key: &mut Vec<u8>) {
+        for token in tokens(value) {
+            found.push(token);
+            key.extend(token.iter().map(u8::to_ascii_lowercase));
+        }
+    }
+
+    /// `ReleaseDuplicateFinder::w55CandidateNameMatchBatchPhp()`: `items[0]` is the incoming search
+    /// name, then per candidate `flags | shared << 16 | tokens << 32` with flags 1 empty, 2 exact
+    /// match, 4 folded key match (lowercased alphanumerics only) and 8 folded key prefix either way,
+    /// `shared` the distinct incoming tokens the candidate carries and `tokens` its token count;
+    /// then the four flag counts and the distinct incoming token count.
+    fn candidate_names(items: &[&[u8]]) -> Vec<i64> {
+        let (target, candidates) = items.split_first().map_or((&b""[..], &[][..]), |(t, c)| (*t, c));
+        let (mut distinct, mut target_key) = (Vec::new(), Vec::new());
+        folded(target, &mut distinct, &mut target_key);
+        let mut unique: Vec<&[u8]> = Vec::with_capacity(distinct.len());
+        for token in distinct {
+            if !unique.iter().any(|u| u.eq_ignore_ascii_case(token)) {
+                unique.push(token);
+            }
+        }
+        let mut out = Vec::with_capacity(candidates.len() + 5);
+        let mut totals = [0i64; 4];
+        let (mut found, mut key) = (Vec::new(), Vec::new());
+        for &name in candidates {
+            found.clear();
+            key.clear();
+            folded(name, &mut found, &mut key);
+            let mut flags = i64::from(name.is_empty());
+            if !target.is_empty() && name == target {
+                flags |= 2;
+            }
+            if !key.is_empty() {
+                if key == target_key {
+                    flags |= 4;
+                }
+                if !target_key.is_empty()
+                    && (key.starts_with(&target_key) || target_key.starts_with(&key))
+                {
+                    flags |= 8;
+                }
+            }
+            let shared = unique
+                .iter()
+                .filter(|t| found.iter().any(|f| f.eq_ignore_ascii_case(t)))
+                .count();
+            tally(&mut totals, flags);
+            out.push(
+                flags
+                    | ((shared.min(0xffff) as i64) << 16)
+                    | ((found.len().min(0x7fff_ffff) as i64) << 32),
+            );
+        }
+        out.extend(totals);
+        out.push(unique.len() as i64);
+        out
+    }
+
+    /// Byte classes for `[\w\-]` (1) and `.` (2); every other byte is 0.
+    const GROUP_CLASS: [u8; 256] = {
+        let mut table = [0u8; 256];
+        let mut i = 0;
+        while i < 256 {
+            let b = i as u8;
+            table[i] = if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+                1
+            } else if b == b'.' {
+                2
+            } else {
+                0
+            };
+            i += 1;
+        }
+        table
+    };
+
+    /// The dot-separated part count when `body` is two or more non-empty `[\w\-]+` parts.
+    fn group_segments(body: &[u8]) -> Option<usize> {
+        let (mut segments, mut run) = (1usize, 0usize);
+        for &b in body {
+            match GROUP_CLASS[usize::from(b)] {
+                1 => run += 1,
+                2 if run > 0 => {
+                    segments += 1;
+                    run = 0;
+                }
+                _ => return None,
+            }
+        }
+        (run > 0 && segments >= 2).then_some(segments)
+    }
+
+    /// `ReleaseGroupResolver::w55GroupNamePlanBatchPhp()`: per name
+    /// `flags | segments << 8 | normalized length << 16` with flags 1 rejected by
+    /// `UsenetGroup::isValidGroupPhp()`, 2 `a.b.` alias expanded, 4 normalized name over 255 bytes
+    /// and 8 exact repeat of an earlier name, `segments` the dot-separated parts (at most 255) and
+    /// rejected names carrying neither; then the four flag counts and the distinct normalized groups
+    /// that are valid and not too long.
+    fn group_names(names: &[&[u8]]) -> Vec<i64> {
+        const ALT_BINARIES: &[u8] = b"alt.binaries.";
+        let mut out = Vec::with_capacity(names.len() + 5);
+        let mut totals = [0i64; 4];
+        let mut seen: NameSet<&[u8]> =
+            NameSet::with_capacity_and_hasher(names.len(), Default::default());
+        let mut groups: NameSet<(bool, &[u8])> =
+            NameSet::with_capacity_and_hasher(names.len(), Default::default());
+        for &name in names {
+            let repeat = if seen.insert(name) { 0 } else { 8 };
+            // `/^([\w\-]+\.)+[\w\-]+$/i` without `D`: `$` also matches before one final newline.
+            let segments = group_segments(name.strip_suffix(b"\n").unwrap_or(name));
+            let word = if let Some(segments) = segments {
+                let aliased = name.len() >= 4 && name[..4].eq_ignore_ascii_case(b"a.b.");
+                let length = name.len() + if aliased { ALT_BINARIES.len() - 4 } else { 0 };
+                let too_long = length > 255;
+                if !too_long {
+                    groups.insert(if aliased {
+                        (true, &name[4..])
+                    } else if let Some(rest) = name.strip_prefix(ALT_BINARIES) {
+                        (true, rest)
+                    } else {
+                        (false, name)
+                    });
+                }
+                (if aliased { 2 } else { 0 })
+                    | (if too_long { 4 } else { 0 })
+                    | ((segments.min(0xff) as i64) << 8)
+                    | ((length as i64) << 16)
+            } else {
+                1
+            } | repeat;
+            tally(&mut totals, word);
+            out.push(word);
+        }
+        out.extend(totals);
+        out.push(groups.len() as i64);
+        out
+    }
+
+    /// All-digit piece of `min..=max` bytes, as its decimal value.
+    fn digit_piece(piece: &[u8], min: usize, max: usize) -> Option<i64> {
+        ((min..=max).contains(&piece.len()) && piece.iter().all(u8::is_ascii_digit))
+            .then(|| piece.iter().fold(0i64, |n, b| n * 10 + i64::from(b - b'0')))
+    }
+
+    /// PHP `checkdate()`.
+    fn calendar_date(year: i64, month: i64, day: i64) -> bool {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => 0,
+        };
+        (1..=32767).contains(&year) && (1..=days).contains(&day)
+    }
+
+    /// `ReleaseManagementService::w55ExportDateKeyBatchPhp()`: per `d/m/Y` export date the key
+    /// `Y * 10000 + m * 100 + d`, or -1 empty, -2 not three `/` pieces, -3 pieces other than 1-2,
+    /// 1-2 and 4 ASCII digits and -4 no such calendar date; then the valid, empty, malformed,
+    /// non-numeric and impossible counts, the smallest and largest keys (0 without one) and the
+    /// distinct keys.
+    fn export_dates(dates: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(dates.len() + 8);
+        let mut totals = [0i64; 5];
+        let mut keys = Vec::with_capacity(dates.len());
+        for &date in dates {
+            let word = if date.is_empty() {
+                -1
+            } else {
+                let mut pieces = date.split(|&b| b == b'/');
+                match (pieces.next(), pieces.next(), pieces.next(), pieces.next()) {
+                    (Some(d), Some(m), Some(y), None) => {
+                        match (digit_piece(d, 1, 2), digit_piece(m, 1, 2), digit_piece(y, 4, 4)) {
+                            (Some(d), Some(m), Some(y)) if calendar_date(y, m, d) => {
+                                y * 10_000 + m * 100 + d
+                            }
+                            (Some(_), Some(_), Some(_)) => -4,
+                            _ => -3,
+                        }
+                    }
+                    _ => -2,
+                }
+            };
+            if word > 0 {
+                totals[0] += 1;
+                keys.push(word);
+            } else {
+                totals[(-word) as usize] += 1;
+            }
+            out.push(word);
+        }
+        keys.sort_unstable();
+        let (min, max) = (
+            keys.first().copied().unwrap_or(0),
+            keys.last().copied().unwrap_or(0),
+        );
+        keys.dedup();
+        out.extend(totals);
+        out.extend([min, max, keys.len() as i64]);
+        out
+    }
+
+    /// Like the Wave 53.3 `run`, but a non-null `lens` (`count` byte lengths) splits `blob` into
+    /// unseparated items instead of on NUL, so items holding NUL bytes stay on Rust.
+    ///
+    /// # Safety
+    /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+    /// `out_cap` `i64`s).
+    unsafe fn run_items(
+        blob: *const u8,
+        blob_len: usize,
+        lens: *const i64,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        body: Batch,
+    ) -> isize {
+        if lens.is_null() {
+            return unsafe { run(blob, blob_len, count, out, out_cap, body) };
+        }
+        if out.is_null()
+            || (blob.is_null() && blob_len != 0)
+            || blob_len > isize::MAX as usize
+            || out_cap > isize::MAX as usize / 8
+            || count > MAX_COUNT
+        {
+            return DECLINE;
+        }
+        let blob: &[u8] = if blob.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(blob, blob_len) }
+        };
+        let lens: &[i64] = unsafe { std::slice::from_raw_parts(lens, count) };
+        let result = std::panic::catch_unwind(|| {
+            let mut items = Vec::with_capacity(count);
+            let mut offset = 0usize;
+            for &len in lens {
+                let end = offset.checked_add(usize::try_from(len).ok()?)?;
+                items.push(blob.get(offset..end)?);
+                offset = end;
+            }
+            (offset == blob.len()).then(|| body(&items))
+        });
+        let Ok(Some(values)) = result else {
+            return DECLINE;
+        };
+        if values.len() > out_cap {
+            return -(values.len() as isize);
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(values.as_ptr(), out, values.len());
+        }
+        values.len() as isize
+    }
+
+    macro_rules! w553_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// Items are NUL-joined in `blob`, or concatenated with their byte lengths in `lens`
+            /// when it is non-null. Returns the word count, `-needed` when `out_cap` is too small,
+            /// or `-1` when it declines (null `out`, null `blob` with a length, `count` other than
+            /// the number of NUL-separated items, or `lens` that do not tile `blob`).
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+            /// `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run_items(blob, blob_len, lens, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w553_export!(
+        /// `ReleaseImageService::w55ImageReferenceFlagBatch()`.
+        nntmux_w553_release_image_reference_flag_batch => image_references
+    );
+    w553_export!(
+        /// `ReleaseBrowseService::w55BrowseOrderPlanBatch()`.
+        nntmux_w553_release_browse_order_plan_batch => browse_orders
+    );
+    w553_export!(
+        /// `ReleaseDuplicateFinder::w55CandidateNameMatchBatch()`; the first item is the search name.
+        nntmux_w553_release_duplicate_name_match_batch => candidate_names
+    );
+    w553_export!(
+        /// `ReleaseGroupResolver::w55GroupNamePlanBatch()`.
+        nntmux_w553_release_group_name_plan_batch => group_names
+    );
+    w553_export!(
+        /// `ReleaseManagementService::w55ExportDateKeyBatch()`.
+        nntmux_w553_release_export_date_key_batch => export_dates
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        /// Each export with the words an empty batch writes and the leading items that write no
+        /// per-record word (the duplicate batch's search name).
+        const EXPORTS: [(Export, isize, isize); 5] = [
+            (nntmux_w553_release_image_reference_flag_batch, 7, 0),
+            (nntmux_w553_release_browse_order_plan_batch, 11, 0),
+            (nntmux_w553_release_duplicate_name_match_batch, 5, 1),
+            (nntmux_w553_release_group_name_plan_batch, 5, 0),
+            (nntmux_w553_release_export_date_key_batch, 8, 0),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    ptr::null(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            assert_eq!(out, call_lens(f, items), "length-column split differs");
+            out
+        }
+
+        fn call_lens(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        #[test]
+        fn w553_image_references_flag_basenames_urls_and_extensions() {
+            let out = call(
+                nntmux_w553_release_image_reference_flag_batch,
+                &[
+                    b"abc-123_x",
+                    b" HTTPS://user:pw@cdn.example.com/a/cover.JPEG?w=1 ",
+                    b"http://example.com/x.png#top",
+                    b"",
+                    b"_hidden",
+                    b"ftp://example.com/x.webp",
+                    b"http:/example.com",
+                    b"http://a/b@c.gif.txt",
+                ],
+            );
+            assert_eq!(
+                out,
+                [
+                    2 | 9 << 16,
+                    4 | 8 | 16 | 32 | 64 | 48 << 16,
+                    4 | 32 | 28 << 16,
+                    1,
+                    7 << 16,
+                    32 | 24 << 16,
+                    17 << 16,
+                    4 | 20 << 16,
+                    1,
+                    1,
+                    3,
+                    1,
+                    1,
+                    3,
+                    1
+                ]
+            );
+        }
+
+        #[test]
+        fn w553_browse_orders_resolve_fields_and_directions() {
+            let out = call(
+                nntmux_w553_release_browse_order_plan_batch,
+                &[
+                    b"",
+                    b"name_ASC",
+                    b"cat_desc\n",
+                    b"size",
+                    b"stats_up",
+                    b"Cat_asc",
+                    b"added_asc_extra",
+                    b"comments_desc\n\n",
+                ],
+            );
+            assert_eq!(
+                out,
+                [
+                    16 | 64,
+                    2 | 16 | 32,
+                    1 | 16 | 64,
+                    3 | 64,
+                    5 | 64,
+                    16 | 32 | 64,
+                    7 | 16 | 32 | 64,
+                    6 | 64,
+                    2,
+                    1,
+                    1,
+                    1,
+                    0,
+                    1,
+                    1,
+                    1,
+                    5,
+                    3,
+                    8
+                ]
+            );
+        }
+
+        #[test]
+        fn w553_candidate_names_match_exact_folded_and_prefix_keys() {
+            let out = call(
+                nntmux_w553_release_duplicate_name_match_batch,
+                &[
+                    b"Some.Movie.2019.1080p",
+                    b"Some.Movie.2019.1080p",
+                    b"some movie 2019 1080p",
+                    b"Some.Movie.2019",
+                    b"",
+                    b"Other.Movie.2019.2019",
+                    b"Some.Movie.2019.1080p.REPACK",
+                ],
+            );
+            assert_eq!(
+                out,
+                [
+                    2 | 4 | 8 | 4 << 16 | 4 << 32,
+                    4 | 8 | 4 << 16 | 4 << 32,
+                    8 | 3 << 16 | 3 << 32,
+                    1,
+                    2 << 16 | 4 << 32,
+                    8 | 4 << 16 | 5 << 32,
+                    1,
+                    1,
+                    2,
+                    4,
+                    4
+                ]
+            );
+            assert_eq!(
+                call(nntmux_w553_release_duplicate_name_match_batch, &[b"", b"", b"x"]),
+                [1, 1 << 32, 1, 0, 0, 0, 0]
+            );
+        }
+
+        #[test]
+        fn w553_group_names_validate_alias_and_repeat() {
+            let long = [b"alt.".as_slice(), &[b'x'; 250]].concat();
+            let out = call(
+                nntmux_w553_release_group_name_plan_batch,
+                &[
+                    b"a.b.teevee",
+                    b"alt.binaries.teevee",
+                    b"A.B.teevee",
+                    b"alt.binaries.teevee",
+                    b"alt..x",
+                    b"single",
+                    b"alt.bin\n",
+                    b"alt.b!n",
+                    &long,
+                ],
+            );
+            assert_eq!(
+                out,
+                [
+                    2 | 3 << 8 | 19 << 16,
+                    3 << 8 | 19 << 16,
+                    2 | 3 << 8 | 19 << 16,
+                    8 | 3 << 8 | 19 << 16,
+                    1,
+                    1,
+                    2 << 8 | 8 << 16,
+                    1,
+                    2 << 8 | 254 << 16,
+                    3,
+                    2,
+                    0,
+                    1,
+                    3
+                ]
+            );
+            let longer = [b"a.b.".as_slice(), &[b'x'; 245]].concat();
+            assert_eq!(
+                call(nntmux_w553_release_group_name_plan_batch, &[&longer])[0],
+                2 | 4 | 3 << 8 | 258 << 16
+            );
+        }
+
+        #[test]
+        fn w553_export_dates_key_valid_calendar_dates() {
+            let out = call(
+                nntmux_w553_release_export_date_key_batch,
+                &[
+                    b"25/12/2023",
+                    b"1/2/1999",
+                    b"",
+                    b"2023-12-25",
+                    b"29/02/2023",
+                    b"29/02/2024",
+                    b"1/1/99",
+                    b"a/b/c",
+                    b"1/2/3/4",
+                    b"25/12/2023",
+                    b"01/01/0000",
+                ],
+            );
+            assert_eq!(
+                out,
+                [
+                    20231225, 19990201, -1, -2, -4, 20240229, -3, -3, -2, 20231225, -4, 4, 1, 2, 2,
+                    2, 19990201, 20240229, 3
+                ]
+            );
+            assert!(calendar_date(2000, 2, 29) && !calendar_date(1900, 2, 29));
+        }
+
+        #[test]
+        fn w553_length_column_keeps_nul_items() {
+            let nul = call_lens(
+                nntmux_w553_release_group_name_plan_batch,
+                &[b"alt.x\0y", b"alt.x\0y", b"a.b.c"],
+            );
+            assert_eq!(nul, [1, 9, 2 | 3 << 8 | 14 << 16, 2, 1, 0, 1, 1]);
+            let dates = call_lens(nntmux_w553_release_export_date_key_batch, &[b"1/1/2024\0"]);
+            assert_eq!(dates[0], -3);
+            let dup = call_lens(
+                nntmux_w553_release_duplicate_name_match_batch,
+                &[b"a\0b", b"A B", b"a\0b"],
+            );
+            assert_eq!(dup, [4 | 8 | 2 << 16 | 2 << 32, 2 | 4 | 8 | 2 << 16 | 2 << 32, 0, 1, 2, 2, 2]);
+        }
+
+        #[test]
+        fn w553_exports_guard_pointers_and_capacity() {
+            let mut out = [0i64; 64];
+            let o = out.as_mut_ptr();
+            let n = ptr::null::<i64>();
+            for (f, trailer, lead) in EXPORTS {
+                unsafe {
+                    assert_eq!(f(b"x".as_ptr(), 1, n, 1, ptr::null_mut(), 64), DECLINE);
+                    assert_eq!(f(ptr::null(), 1, n, 1, o, 64), DECLINE);
+                    assert_eq!(f(ptr::null(), 0, n, (1 << 24) + 1, o, 64), DECLINE);
+                    assert_eq!(f(b"x".as_ptr(), 1, n, 1, o, usize::MAX), DECLINE);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 1, o, 64), DECLINE);
+                    assert_eq!(f(b"a".as_ptr(), 1, n, 2, o, 64), DECLINE);
+                    assert_eq!(f(b"x".as_ptr(), 1, n, 0, o, 64), DECLINE);
+                    assert_eq!(f(ptr::null(), 0, n, 0, o, 64), trailer);
+                    assert_eq!(f(ptr::null(), 0, n, 1, o, 64), trailer + 1 - lead);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 2, o, 1), -(trailer + 2 - lead));
+                    // Length columns must tile the blob exactly, without negative lengths.
+                    let lens = [1i64, 2];
+                    let l = lens.as_ptr();
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, l, 2, o, 64), trailer + 2 - lead);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, l, 2, ptr::null_mut(), 64), DECLINE);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, l, 2, o, 1), -(trailer + 2 - lead));
+                    assert_eq!(f(b"a\0bc".as_ptr(), 4, l, 2, o, 64), DECLINE);
+                    assert_eq!(f(b"a\0".as_ptr(), 2, l, 2, o, 64), DECLINE);
+                    assert_eq!(f(ptr::null(), 3, l, 2, o, 64), DECLINE);
+                    assert_eq!(f(b"ab".as_ptr(), 2, [3i64, -1].as_ptr(), 2, o, 64), DECLINE);
+                    assert_eq!(f(ptr::null(), 0, l, 0, o, 64), trailer);
+                    assert_eq!(f(b"x".as_ptr(), 1, l, (1 << 24) + 1, o, 64), DECLINE);
+                }
+            }
+        }
+    }
+}

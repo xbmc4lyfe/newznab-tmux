@@ -779,4 +779,197 @@ class ReleaseImageService
 
         return $summary;
     }
+
+    /** Wave 55.3 paired benchmarks decide this default; see RustReleaseImageBrowseDuplicateGroupManagementW55ParityTest. */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    public const string W55_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w553_release_image_reference_flag_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public static function usesW55RustFfi(): bool
+    {
+        $override = self::w55RustFfiState();
+
+        return \is_bool($override) ? $override : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 55 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 55.3 image reference flags. Per trimmed reference `flags | length << 16`, with flags 1 empty,
+     * 2 a basename isValidBasenamePhp() accepts, 4 http(s) URL, 8 `@` in its authority, 16 http(s) URL
+     * holding `?`, 32 image extension before a query, fragment or the end and 64 https, and `length` the
+     * trimmed byte length; then the seven flag counts.
+     *
+     * @param  array<array-key, string>  $refs
+     * @return list<int>
+     */
+    public static function w55ImageReferenceFlagBatch(array $refs): array
+    {
+        return self::usesW55RustFfi() ? self::w55ImageReferenceFlagBatchNative($refs) : self::w55ImageReferenceFlagBatchPhp($refs);
+    }
+
+    /**
+     * @param  array<array-key, string>  $refs
+     * @return list<int>
+     */
+    public static function w55ImageReferenceFlagBatchNative(array $refs): array
+    {
+        return self::w55Invoke($refs, \count($refs) + 7) ?? self::w55ImageReferenceFlagBatchPhp($refs);
+    }
+
+    /**
+     * @param  array<array-key, string>  $refs
+     * @return list<int>
+     */
+    public static function w55ImageReferenceFlagBatchPhp(array $refs): array
+    {
+        $out = [];
+        $totals = [0, 0, 0, 0, 0, 0, 0];
+        foreach ($refs as $ref) {
+            $entry = trim((string) $ref);
+            if ($entry === '') {
+                $word = 1;
+            } else {
+                $word = \strlen($entry) << 16;
+                // Same pattern as isValidBasenamePhp().
+                if (preg_match('/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/D', $entry) === 1) {
+                    $word |= 2;
+                }
+                if (preg_match('#\Ahttp(s?)://([^/?\#]*)#i', $entry, $match) === 1) {
+                    $word |= 4 | (str_contains($match[2], '@') ? 8 : 0) | (str_contains($entry, '?') ? 16 : 0) | ($match[1] !== '' ? 64 : 0);
+                }
+                if (preg_match('/\.(?:jpe?g|png|gif|webp|bmp)(?:[?#]|\z)/i', $entry) === 1) {
+                    $word |= 32;
+                }
+            }
+            for ($bit = 0; $bit < 7; $bit++) {
+                $totals[$bit] += ($word >> $bit) & 1;
+            }
+            $out[] = $word;
+        }
+        array_push($out, ...$totals);
+
+        return $out;
+    }
+
+    /**
+     * Wave 55 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('release_w55', self::W55_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w55RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w55RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 55.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w55Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w55RustFfiState('ffi');
+            $out = self::w55RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w55RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
+            $written = $ffi->nntmux_w553_release_image_reference_flag_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
