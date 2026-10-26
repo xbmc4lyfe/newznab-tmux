@@ -3970,4 +3970,176 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
             default => null,
         };
     }
+
+    public const string W56_FFI_CDEF = 'int64_t nntmux_w565_manticore_user_query_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W56.5 parity test's QUALIFICATION). */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 56.5 routing and FFI cache, kept in function-local statics. Without $op it reports
+     * the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[],
+     * capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w56_5', self::W56_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof \FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W56_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        return self::w56RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with userQueryPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 56.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w56Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w56RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w565_manticore_user_query_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', \FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch plan of the {@see self::prepareUserSearchQueryPhp()} tokenizer over the trimmed query
+     * (`[-!]?"[^"]*"|\S+`). Four words per query: `[tokens, negated, phrases, flags]`. Negated tokens are
+     * longer than one byte and start with `!` or `-`; phrases are quoted matches. Flags: 1 empty (or `*`)
+     * query, 2 `|` token, 4 unquoted token starting or ending with `*`, 8 non-ASCII.
+     *
+     * @param  list<string>  $queries
+     * @return list<int>
+     */
+    public static function userQueryPlanBatch(array $queries): array
+    {
+        return self::usesW56RustFfi() ? self::userQueryPlanBatchNative($queries) : self::userQueryPlanBatchPhp($queries);
+    }
+
+    /**
+     * @param  list<string>  $queries
+     * @return list<int>
+     */
+    public static function userQueryPlanBatchPhp(array $queries): array
+    {
+        $out = [];
+        foreach ($queries as $raw) {
+            $flags = preg_match('/[\x80-\xff]/', $raw) === 1 ? 8 : 0;
+            $query = trim($raw);
+            if ($query === '' || $query === '*') {
+                array_push($out, 0, 0, 0, $flags | 1);
+
+                continue;
+            }
+            preg_match_all('/[-!]?"[^"]*"|\S+/', $query, $matches);
+            $negated = $phrases = 0;
+            foreach ($matches[0] as $token) {
+                if ($token === '|') {
+                    $flags |= 2;
+
+                    continue;
+                }
+                $first = $token[0];
+                $length = \strlen($token);
+                if ($length > 1 && ($first === '!' || $first === '-')) {
+                    $negated++;
+                }
+                $open = $first === '"' ? 0 : (($first === '!' || $first === '-') && $length > 1 && $token[1] === '"' ? 1 : -1);
+                if ($open >= 0 && $length - $open >= 2 && $token[$length - 1] === '"') {
+                    $phrases++;
+                } elseif ($first === '*' || $token[$length - 1] === '*') {
+                    $flags |= 4;
+                }
+            }
+            array_push($out, \count($matches[0]), $negated, $phrases, $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds
+     * a NUL.
+     *
+     * @param  list<string>  $queries
+     * @return list<int>
+     */
+    public static function userQueryPlanBatchNative(array $queries): array
+    {
+        $count = \count($queries);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w56Words($count, implode("\0", $queries), 4 * $count) ?? self::userQueryPlanBatchPhp($queries);
+    }
 }
