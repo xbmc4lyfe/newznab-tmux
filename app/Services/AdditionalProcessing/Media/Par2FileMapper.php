@@ -9,6 +9,7 @@ use App\Services\AdditionalProcessing\DTO\Par2FileEntry;
 use App\Services\AdditionalProcessing\Enums\MappingConfidence;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -664,5 +665,378 @@ final readonly class Par2FileMapper
         }
 
         return $sources;
+    }
+
+    // ========================================================================
+    // WAVE 65.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 3.99x, p99 3.64x; uncommon mean 4.49x, p99 3.84x); see RustAdditionalMediaStageToolPar2MapperThumbExtractionW65ParityTest. */
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    public const string W65_PAR2_FILE_MAPPER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w651_par2_file_mapper_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w65Par2FileMapperPlanBatch(). */
+    public const int W65_PAR2_FILE_MAPPER_TRAILER = 37;
+
+    public static function usesW65RustFfi(): bool
+    {
+        $override = self::w65RustFfiState();
+
+        return \is_bool($override) ? $override : self::W65_RUST_FFI_DEFAULT;
+    }
+
+    /** Forces the Par2FileMapper Wave 65 Rust path on until reset. */
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', true);
+    }
+
+    /** Forces the Par2FileMapper Wave 65 PHP path until reset. */
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', false);
+    }
+
+    /** Restores the benchmark default and drops the cached library handle and scratch buffers; earlier toggles are untouched. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('reset');
+    }
+
+    /**
+     * Runs $callback with the Par2FileMapper Wave 65 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 65.1 PAR2 mapping plans, one per PAR2 file description `hash16k|name|size|subject|bytes|segments` (trimmed fields;
+     * numbers are 1-15 digits, empty 0). The NZB file name is the first non-empty `"..."` run of the subject, else the whole
+     * subject. Confidence: 3 exact name, 2 case-insensitive name, 1 same name without extension, 0 none. Size state: 0
+     * unknown, 1 encoded bytes within 5% plus 4 KiB above the PAR2 size, 2 smaller, 3 larger. Media role from the PAR2 name:
+     * 0 none, 1 video, 2 audio, 3 image, 4 archive volume, 5 par2, 6 nfo, 7 subtitle, 8 other. Decision: 0 empty row, 1
+     * malformed (bad number or empty name), 2 hash not 32 hex digits, 3 hash repeated in the batch, 4 unmatched, 5 size
+     * mismatch, 6 weak mapping, 7 mapped. Flags: 1 quoted subject, 2 non-ASCII name, 4 control byte in the name, 8 path
+     * separator, 16 uppercase hash, 32 sample, 64 name repeated (case-insensitive), 128 no segments. Per item `decision |
+     * confidence << 3 | sizeState << 5 | role << 7 | flags << 11 | bitLength(size) << 19 | bitLength(bytes) << 25 |
+     * min(segments, 4095) << 31 | (fnv1a32(lowercase name) & 0xFFF) << 43 | min(nameLength, 255) << 55`; then 8 decision, 4
+     * confidence, 4 size state, 9 role and 8 flag counts, the mapped byte and segment sums, the distinct hashes and names.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65Par2FileMapperPlanBatch(array $items): array
+    {
+        return self::usesW65RustFfi() ? self::w65Par2FileMapperPlanBatchNative($items) : self::w65Par2FileMapperPlanBatchPhp($items);
+    }
+
+    /**
+     * Rust plan; falls back to the PHP reference when the library is missing or the call declines.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65Par2FileMapperPlanBatchNative(array $items): array
+    {
+        return self::w65Invoke($items, \count($items) + self::W65_PAR2_FILE_MAPPER_TRAILER) ?? self::w65Par2FileMapperPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w65Par2FileMapperPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W65_PAR2_FILE_MAPPER_TRAILER, 0);
+        $hashes = [];
+        $names = [];
+        foreach ($items as $item) {
+            $item = (string) $item;
+            [$rawHash, $rawName, $rawSize, $rawSubject, $rawBytes, $rawSegments] = explode('|', $item, 6) + ['', '', '', '', '', ''];
+            $hashRaw = trim($rawHash);
+            $hash = strtolower($hashRaw);
+            $validHash = \strlen($hash) === 32 && strspn($hash, '0123456789abcdef') === 32;
+            $name = trim($rawName);
+            $nameLength = \strlen($name);
+            $size = self::w65Uint($rawSize, 0);
+            $subject = trim($rawSubject);
+            $target = $subject;
+            $quoted = false;
+            $open = strpos($subject, '"');
+            if ($open !== false) {
+                $close = strpos($subject, '"', $open + 1);
+                if ($close !== false && $close > $open + 1) {
+                    $target = substr($subject, $open + 1, $close - $open - 1);
+                    $quoted = true;
+                }
+            }
+            $bytes = self::w65Uint($rawBytes, 0);
+            $segments = self::w65Uint($rawSegments, 0);
+            $lower = strtolower($name);
+            $targetLower = strtolower($target);
+            $confidence = match (true) {
+                $name === '' || $target === '' => 0,
+                $name === $target => 3,
+                $lower === $targetLower => 2,
+                self::w65SplitExtension($lower)[0] === self::w65SplitExtension($targetLower)[0] => 1,
+                default => 0,
+            };
+            $sizeState = match (true) {
+                $size <= 0 || $bytes <= 0 => 0,
+                $bytes < $size => 2,
+                $bytes <= $size + intdiv($size, 20) + 4096 => 1,
+                default => 3,
+            };
+            $role = self::w65MediaRole($lower);
+            if (trim($item) === '') {
+                $decision = 0;
+            } elseif ($size < 0 || $bytes < 0 || $segments < 0 || $name === '') {
+                $decision = 1;
+            } elseif (! $validHash) {
+                $decision = 2;
+            } elseif (isset($hashes[$hash])) {
+                $decision = 3;
+            } else {
+                $hashes[$hash] = true;
+                $decision = $confidence === 0 ? 4 : ($sizeState >= 2 ? 5 : ($confidence === 1 ? 6 : 7));
+            }
+            $flags = ($quoted ? 1 : 0) | (preg_match('/[\x80-\xff]/', $name) === 1 ? 2 : 0)
+                | (strcspn($name, self::W65_CONTROL_BYTES) !== $nameLength ? 4 : 0) | (strpbrk($name, '/\\') !== false ? 8 : 0)
+                | (strpbrk($hashRaw, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') !== false ? 16 : 0) | (str_contains($lower, 'sample') ? 32 : 0)
+                | ($segments === 0 ? 128 : 0);
+            if ($lower !== '') {
+                if (isset($names[$lower])) {
+                    $flags |= 64;
+                } else {
+                    $names[$lower] = true;
+                }
+            }
+            $tail[$decision]++;
+            $tail[8 + $confidence]++;
+            $tail[12 + $sizeState]++;
+            $tail[16 + $role]++;
+            for ($b = 0; $b < 8; $b++) {
+                $tail[25 + $b] += $flags >> $b & 1;
+            }
+            if ($decision >= 6) {
+                $tail[33] += max(0, min($size, 1 << 40));
+                $tail[34] += max(0, min($segments, 1 << 40));
+            }
+            $out[] = $decision | $confidence << 3 | $sizeState << 5 | $role << 7 | $flags << 11 | self::w65BitLength($size) << 19
+                | self::w65BitLength($bytes) << 25 | max(0, min($segments, 4095)) << 31 | ((int) hexdec(hash('fnv1a32', $lower)) & 0xFFF) << 43
+                | min($nameLength, 255) << 55;
+        }
+        $tail[35] = \count($hashes);
+        $tail[36] = \count($names);
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    /** @var array<string, true> */
+    private const array W65_PAR2_VIDEO = ['avi' => true, 'm2ts' => true, 'm4v' => true, 'mkv' => true, 'mov' => true, 'mp4' => true, 'mpeg' => true,
+        'mpg' => true, 'ts' => true, 'vob' => true, 'webm' => true, 'wmv' => true];
+
+    /** @var array<string, true> */
+    private const array W65_PAR2_AUDIO = ['aac' => true, 'ac3' => true, 'dts' => true, 'flac' => true, 'm4a' => true, 'mp3' => true, 'ogg' => true,
+        'opus' => true, 'wav' => true, 'wma' => true];
+
+    /** @var array<string, true> */
+    private const array W65_PAR2_IMAGE = ['bmp' => true, 'gif' => true, 'jpeg' => true, 'jpg' => true, 'png' => true, 'webp' => true];
+
+    /** @var array<string, true> */
+    private const array W65_PAR2_SUBTITLE = ['ass' => true, 'idx' => true, 'srt' => true, 'ssa' => true, 'sub' => true];
+
+    private const string W65_DIGITS = '0123456789';
+
+    private const string W65_CONTROL_BYTES = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F";
+
+    /** A trimmed field of 1-15 digits; empty is $empty, anything else -1. */
+    private static function w65Uint(string $raw, int $empty): int
+    {
+        $value = trim($raw);
+        if ($value === '') {
+            return $empty;
+        }
+        $length = \strlen($value);
+
+        return $length <= 15 && strspn($value, self::W65_DIGITS) === $length ? (int) $value : -1;
+    }
+
+    private static function w65BitLength(int $value): int
+    {
+        $bits = 0;
+        for (; $value > 0; $value >>= 1) {
+            $bits++;
+        }
+
+        return $bits;
+    }
+
+    /**
+     * Splits a lowercased name at its last `.` when the extension is 1-5 `[a-z0-9]` bytes.
+     *
+     * @return array{0: string, 1: string}
+     */
+    private static function w65SplitExtension(string $name): array
+    {
+        $dot = strrpos($name, '.');
+        if ($dot === false) {
+            return [$name, ''];
+        }
+        $extension = substr($name, $dot + 1);
+        $length = \strlen($extension);
+        if ($length === 0 || $length > 5 || strspn($extension, 'abcdefghijklmnopqrstuvwxyz0123456789') !== $length) {
+            return [$name, ''];
+        }
+
+        return [substr($name, 0, $dot), $extension];
+    }
+
+    /** The media role of a lowercased PAR2 file name. */
+    private static function w65MediaRole(string $lower): int
+    {
+        if ($lower === '') {
+            return 0;
+        }
+        [, $extension] = self::w65SplitExtension($lower);
+
+        return match (true) {
+            isset(self::W65_PAR2_VIDEO[$extension]) => 1,
+            isset(self::W65_PAR2_AUDIO[$extension]) => 2,
+            isset(self::W65_PAR2_IMAGE[$extension]) => 3,
+            $extension === 'rar' || $extension === '7z' || $extension === 'zip'
+                || (\strlen($extension) === 3 && ($extension[0] === 'r' ? strspn($extension, self::W65_DIGITS, 1) === 2 : strspn($extension, self::W65_DIGITS) === 3)) => 4,
+            $extension === 'par2' => 5,
+            $extension === 'nfo' || $extension === 'diz' => 6,
+            isset(self::W65_PAR2_SUBTITLE[$extension]) => 7,
+            default => 8,
+        };
+    }
+
+    /**
+     * Wave 65 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'reset' clears the override, library handle and buffers, 'ffi'
+     * resolves the library (null when unavailable) and 'out' and 'lens' return `int64_t` output and
+     * length-column buffers of at least $val words.
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('par2_file_mapper_w651', self::W65_PAR2_FILE_MAPPER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w65RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w65RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 65.1 Par2FileMapper export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w65Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w65RustFfiState('ffi');
+            $out = self::w65RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w65RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W65_PAR2_FILE_MAPPER_FFI_CDEF.)
+            $written = $ffi->nntmux_w651_par2_file_mapper_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

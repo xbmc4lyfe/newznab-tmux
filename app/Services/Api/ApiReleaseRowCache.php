@@ -560,4 +560,245 @@ class ApiReleaseRowCache
 
         return self::w53Words($count, implode("\0", $values), '', 3 * $count) ?? self::leafFingerprintBatchPhp($values);
     }
+
+    /** C signature of the Wave 65.5 {@see self::w65ApiReleaseCachePlanBatch()} helper. */
+    private const string W65_API_RELEASE_CACHE_PLAN_FFI_CDEF = 'int64_t nntmux_w655_api_release_cache_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 65.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 4.38/2.67/5.77/4.93x); see tests/Unit/RustApiCapabilitiesCacheUsageUserResolverV1PresenterW65ParityTest.php.
+     */
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 65.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w65_5', self::W65_API_RELEASE_CACHE_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W65_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 65.5 plan batch to Rust until disabled or reset. */
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', true);
+    }
+
+    /** Route the Wave 65.5 plan batch to PHP until enabled or reset. */
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', false);
+    }
+
+    /** Restore W65_RUST_FFI_DEFAULT routing and drop the cached Wave 65.5 handle and buffer. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', null);
+        self::w65RustFfiState('reset', null);
+    }
+
+    public static function usesW65RustFfi(): bool
+    {
+        return self::w65RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w65ApiReleaseCachePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 65.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w65Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w65RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w655_api_release_cache_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w65Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /**
+     * Batch release row cache plan over `version\tscope\tparams\tttl\tjitter\tstale_ttl\tage\tbytes\tbudget\tlock`.
+     * Ten words per record: `[hash, kept, dropped, normalized_length, ttl, stale_ttl, status, storable, chunks, flags]`.
+     * Params are `&`-separated `key=value` pairs, each side trimmed; empty items, empty keys or values and items without
+     * `=` are dropped, and kept pairs are byte-sorted and `&`-joined. Hash is crc32() of
+     * `api_release_rows:{version}:{scope}:{normalized}` (version and scope trimmed). TTL (default 600, at least 1)
+     * adds `hash % (jitter + 1)` when jitter (default 60) is positive; stale TTL (default 900) is at least that.
+     * Age is empty for no entry. Status: 1 hit (age below TTL), 3 lock owner miss when the lock (non-zero) is free,
+     * 2 stale while refreshing (age below stale TTL), else 4 contended miss. Storable when budget is 0 or bytes fit;
+     * chunks are 64 KiB pages. Numbers are trimmed 1-15 ASCII digits. Flags: 1 invalid number, 2 not exactly ten
+     * fields, 4 pair without `=` or key.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w65ApiReleaseCachePlanBatch(array $records): array
+    {
+        return self::usesW65RustFfi() ? self::w65ApiReleaseCachePlanBatchNative($records) : self::w65ApiReleaseCachePlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w65ApiReleaseCachePlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w65Words($count, implode("\0", $records), 10 * $count) ?? self::w65ApiReleaseCachePlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w65ApiReleaseCachePlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 10 ? 0 : 2;
+            $pairs = [];
+            $dropped = 0;
+            if (($fields[2] ?? '') !== '') {
+                foreach (explode('&', $fields[2]) as $item) {
+                    $item = trim($item);
+                    if ($item === '') {
+                        $dropped++;
+
+                        continue;
+                    }
+                    $eq = strpos($item, '=');
+                    if ($eq === false) {
+                        $dropped++;
+                        $flags |= 4;
+
+                        continue;
+                    }
+                    $key = trim(substr($item, 0, $eq));
+                    $value = trim(substr($item, $eq + 1));
+                    if ($key === '') {
+                        $dropped++;
+                        $flags |= 4;
+
+                        continue;
+                    }
+                    if ($value === '') {
+                        $dropped++;
+
+                        continue;
+                    }
+                    $pairs[] = $key.'='.$value;
+                }
+            }
+            sort($pairs, SORT_STRING);
+            $normalized = implode('&', $pairs);
+            $hash = crc32('api_release_rows:'.trim($fields[0]).':'.trim($fields[1] ?? '').':'.$normalized);
+            $ttl = max(1, self::w65Number($fields[3] ?? '', 600, $flags));
+            $jitter = self::w65Number($fields[4] ?? '', 60, $flags);
+            $effective = $ttl + ($jitter > 0 ? $hash % ($jitter + 1) : 0);
+            $stale = max($effective, self::w65Number($fields[5] ?? '', 900, $flags));
+            $age = self::w65Number($fields[6] ?? '', -1, $flags);
+            $bytes = self::w65Number($fields[7] ?? '', 0, $flags);
+            $budget = self::w65Number($fields[8] ?? '', 0, $flags);
+            $contended = self::w65Number($fields[9] ?? '', 0, $flags) !== 0;
+            $status = match (true) {
+                $age >= 0 && $age < $effective => 1,
+                ! $contended => 3,
+                $age >= 0 && $age < $stale => 2,
+                default => 4,
+            };
+            array_push($out, $hash, \count($pairs), $dropped, \strlen($normalized), $effective, $stale, $status, (int) ($budget === 0 || $bytes <= $budget), intdiv($bytes + 65535, 65536), $flags);
+        }
+
+        return $out;
+    }
 }
