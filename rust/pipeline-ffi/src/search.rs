@@ -43453,3 +43453,768 @@ mod wave55_5_manticore_log_searcher_repo_reader_searcher_query {
         }
     }
 }
+
+mod wave56_5_search_page_elastic_manticore_driver_client_helper {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Every Wave 56.5 helper returns four words per record.
+    const WIDTH: usize = 4;
+
+    /// Plan callback: record bytes, its four output words and a reusable scratch vector.
+    type Plan = fn(&[u8], &mut [i64], &mut Vec<i64>);
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// First occurrence of `needle` in `text` (PHP `strpos()`).
+    fn find(text: &[u8], needle: &[u8]) -> Option<usize> {
+        let mut from = 0;
+        while let Some(at) = memchr(needle[0], &text[from..]) {
+            let at = from + at;
+            if text[at..].starts_with(needle) {
+                return Some(at);
+            }
+            from = at + 1;
+        }
+        None
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// PCRE `\s`: space, `\t`, `\n`, `\v`, `\f` and `\r`.
+    fn is_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    /// Longest decimal run the helpers parse into an `i64`.
+    const MAX_DIGITS: usize = 18;
+
+    /// 1-18 ASCII digits as an integer (PHP `ctype_digit()` plus `(int)`).
+    fn number(field: &[u8]) -> Option<i64> {
+        if field.is_empty() || field.len() > MAX_DIGITS {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records, writing
+    /// four words per record straight into `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        plan: Plan,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(fields) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = count * WIDTH;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            let mut scratch = Vec::new();
+            for (field, slot) in fields.iter().zip(words.chunks_exact_mut(WIDTH)) {
+                plan(field, slot, &mut scratch);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `SearchPage::idListPlanBatch()` over a comma-separated id list: `[valid, distinct, max, invalid]`.
+    /// Items are PHP-trimmed and empty items skipped; 1-18 ASCII digits are ids (distinct by value,
+    /// max 0 without one), anything else is invalid.
+    fn id_list_plan(list: &[u8], words: &mut [i64], ids: &mut Vec<i64>) {
+        ids.clear();
+        let (mut max, mut invalid) = (0i64, 0i64);
+        for item in list.split(|&b| b == b',') {
+            let token = trim(item);
+            if token.is_empty() {
+                continue;
+            }
+            match number(token) {
+                Some(id) => {
+                    ids.push(id);
+                    max = max.max(id);
+                }
+                None => invalid += 1,
+            }
+        }
+        let valid = ids.len() as i64;
+        ids.sort_unstable();
+        ids.dedup();
+        words.copy_from_slice(&[valid, ids.len() as i64, max, invalid]);
+    }
+
+    /// Lucene query string reserved characters.
+    fn is_reserved(byte: u8) -> bool {
+        matches!(
+            byte,
+            b'+' | b'-'
+                | b'='
+                | b'&'
+                | b'|'
+                | b'>'
+                | b'<'
+                | b'!'
+                | b'('
+                | b')'
+                | b'{'
+                | b'}'
+                | b'['
+                | b']'
+                | b'^'
+                | b'"'
+                | b'~'
+                | b'*'
+                | b'?'
+                | b':'
+                | b'\\'
+                | b'/'
+        )
+    }
+
+    /// `ElasticSearchDriver::queryStringPlanBatch()` over `preg_replace('/\s+/', ' ',
+    /// trim(str_replace('.', ' ', $q)))`: `[normalized length, terms, reserved, flags]`. `''`, `'0'`
+    /// and `'*'` report `[0, 0, 0, 1]`. Terms are runs of non-space bytes, reserved counts Lucene
+    /// reserved bytes. Flags: 2 non-ASCII, 4 had a dot, 8 whitespace collapsing changed the text.
+    fn query_string_plan(query: &[u8], words: &mut [i64], _: &mut Vec<i64>) {
+        if matches!(query, b"" | b"0" | b"*") {
+            words.copy_from_slice(&[0, 0, 0, 1]);
+            return;
+        }
+        let map = |b: u8| if b == b'.' { b' ' } else { b };
+        let start = query
+            .iter()
+            .position(|&b| !is_trim(map(b)))
+            .unwrap_or(query.len());
+        let end = query
+            .iter()
+            .rposition(|&b| !is_trim(map(b)))
+            .map_or(start, |at| at + 1);
+        let (mut length, mut terms, mut reserved) = (0i64, 0i64, 0i64);
+        let (mut in_space, mut collapsed) = (true, false);
+        let mut previous_space = false;
+        for &raw in &query[start..end] {
+            let b = map(raw);
+            if is_space(b) {
+                if previous_space {
+                    collapsed = true;
+                } else {
+                    length += 1;
+                    collapsed |= b != b' ';
+                }
+                previous_space = true;
+                in_space = true;
+            } else {
+                length += 1;
+                terms += i64::from(in_space);
+                reserved += i64::from(is_reserved(b));
+                previous_space = false;
+                in_space = false;
+            }
+        }
+        let flags = i64::from(!query.is_ascii()) << 1
+            | i64::from(memchr(b'.', query).is_some()) << 2
+            | i64::from(collapsed) << 3;
+        words.copy_from_slice(&[length, terms, reserved, flags]);
+    }
+
+    /// `ManticoreSearchDriver::userQueryPlanBatch()` over the tokens of
+    /// `preg_match_all('/[-!]?"[^"]*"|\S+/', trim($q))`: `[tokens, negated, phrases, flags]`. Negated
+    /// tokens are longer than one byte and start with `!` or `-`; phrases are quoted matches. Flags: 1
+    /// empty (or `*`) query, 2 `|` token, 4 unquoted token starting or ending with `*`, 8 non-ASCII.
+    fn user_query_plan(raw: &[u8], words: &mut [i64], _: &mut Vec<i64>) {
+        let mut flags = i64::from(!raw.is_ascii()) << 3;
+        let query = trim(raw);
+        if query.is_empty() || query == b"*" {
+            words.copy_from_slice(&[0, 0, 0, flags | 1]);
+            return;
+        }
+        let (mut tokens, mut negated, mut phrases) = (0i64, 0i64, 0i64);
+        let mut at = 0;
+        while at < query.len() {
+            let b = query[at];
+            if is_space(b) {
+                at += 1;
+                continue;
+            }
+            let open = if matches!(b, b'-' | b'!') && query.get(at + 1) == Some(&b'"') {
+                Some(at + 1)
+            } else if b == b'"' {
+                Some(at)
+            } else {
+                None
+            };
+            let close =
+                open.and_then(|open| memchr(b'"', &query[open + 1..]).map(|c| open + 1 + c));
+            let end = match close {
+                Some(close) => close + 1,
+                None => {
+                    at + query[at..]
+                        .iter()
+                        .position(|&c| is_space(c))
+                        .unwrap_or(query.len() - at)
+                }
+            };
+            let token = &query[at..end];
+            tokens += 1;
+            if token == b"|" {
+                flags |= 2;
+            } else {
+                negated += i64::from(token.len() > 1 && matches!(token[0], b'!' | b'-'));
+                if close.is_some() {
+                    phrases += 1;
+                } else if token[0] == b'*' || token[token.len() - 1] == b'*' {
+                    flags |= 4;
+                }
+            }
+            at = end;
+        }
+        words.copy_from_slice(&[tokens, negated, phrases, flags]);
+    }
+
+    /// Hostname bytes that need no escaping: ASCII letters, digits, `.`, `-` and `_`.
+    fn is_host_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+    }
+
+    /// `ElasticsearchClientFactory::hostUriPlanBatch()` over a trimmed host URI: `[scheme, port, host
+    /// length, flags]`. Scheme: 0 none, 1 `http`, 2 `https` (ASCII case-insensitive), 3 other. Port:
+    /// -1 none, -2 invalid, else 1-65535. Flags: 1 empty, 2 path, 4 credentials, 8 bracketed IPv6
+    /// host, 16 invalid (empty host, bad port, unclosed bracket or junk after it), 32 unbracketed host
+    /// with bytes outside `[A-Za-z0-9._-]`.
+    fn host_uri_plan(raw: &[u8], words: &mut [i64], _: &mut Vec<i64>) {
+        let uri = trim(raw);
+        if uri.is_empty() {
+            words.copy_from_slice(&[0, -1, 0, 1]);
+            return;
+        }
+        let (mut scheme, mut flags) = (0i64, 0i64);
+        let mut rest = uri;
+        if let Some(sep) = find(uri, b"://") {
+            let name = &uri[..sep];
+            scheme = if name.eq_ignore_ascii_case(b"http") {
+                1
+            } else if name.eq_ignore_ascii_case(b"https") {
+                2
+            } else {
+                3
+            };
+            rest = &uri[sep + 3..];
+        }
+        if let Some(slash) = memchr(b'/', rest) {
+            flags |= 2;
+            rest = &rest[..slash];
+        }
+        if let Some(at) = rest.iter().rposition(|&b| b == b'@') {
+            flags |= 4;
+            rest = &rest[at + 1..];
+        }
+        let host;
+        let mut port_text: Option<&[u8]> = None;
+        if rest.first() == Some(&b'[') {
+            match memchr(b']', rest) {
+                None => {
+                    flags |= 16;
+                    host = rest;
+                }
+                Some(close) => {
+                    flags |= 8;
+                    host = &rest[..=close];
+                    let tail = &rest[close + 1..];
+                    if !tail.is_empty() {
+                        if tail[0] == b':' {
+                            port_text = Some(&tail[1..]);
+                        } else {
+                            flags |= 16;
+                        }
+                    }
+                }
+            }
+        } else {
+            match rest.iter().rposition(|&b| b == b':') {
+                Some(colon) => {
+                    host = &rest[..colon];
+                    port_text = Some(&rest[colon + 1..]);
+                }
+                None => host = rest,
+            }
+            if !host.iter().all(|&b| is_host_byte(b)) {
+                flags |= 32;
+            }
+        }
+        let port = match port_text {
+            None => -1,
+            Some(text) => match number(text) {
+                Some(port) if text.len() <= 5 && (1..=65_535).contains(&port) => port,
+                _ => {
+                    flags |= 16;
+                    -2
+                }
+            },
+        };
+        if host.is_empty() {
+            flags |= 16;
+        }
+        words.copy_from_slice(&[scheme, port, host.len() as i64, flags]);
+    }
+
+    /// Skips JSON insignificant whitespace (`strspn(" \t\n\r")`) from `at`.
+    fn skip_json_space(text: &[u8], at: usize) -> usize {
+        at + text[at..]
+            .iter()
+            .take_while(|&&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            .count()
+    }
+
+    /// Digits after optional whitespace at `at`: -1 without digits, -2 beyond 18 digits.
+    fn json_digits(text: &[u8], at: usize) -> i64 {
+        let at = skip_json_space(text, at);
+        let run = text[at..].iter().take_while(|b| b.is_ascii_digit()).count();
+        match run {
+            0 => -1,
+            1..=MAX_DIGITS => number(&text[at..at + run]).unwrap_or(-1),
+            _ => -2,
+        }
+    }
+
+    /// `ElasticsearchResponseHelper::hitPlanBatch()` over a raw response body: `[ids, total, errors,
+    /// error entries]`. Ids and error entries count `"_id":` and `"error":`. Total reads the digits
+    /// after the first `"total":`, or after `"value":` inside the `{...}` object it opens (-1 when
+    /// missing, -2 beyond 18 digits). Errors: 1 `"errors": true`, 0 `false`, -1 otherwise.
+    fn hit_plan(body: &[u8], words: &mut [i64], _: &mut Vec<i64>) {
+        let (mut ids, mut entries) = (0i64, 0i64);
+        let (mut total_at, mut errors_at) = (None, None);
+        let mut from = 0;
+        while let Some(at) = memchr(b'"', &body[from..]) {
+            let at = from + at;
+            let rest = &body[at + 1..];
+            match rest.first() {
+                Some(b'_') if rest.starts_with(b"_id\":") => ids += 1,
+                Some(b'e') => {
+                    if rest.starts_with(b"error\":") {
+                        entries += 1;
+                    } else if errors_at.is_none() && rest.starts_with(b"errors\":") {
+                        errors_at = Some(at + 9);
+                    }
+                }
+                Some(b't') if total_at.is_none() && rest.starts_with(b"total\":") => {
+                    total_at = Some(at + 8);
+                }
+                _ => {}
+            }
+            from = at + 1;
+        }
+        let total = total_at.map_or(-1, |at| {
+            let at = skip_json_space(body, at);
+            if body.get(at) == Some(&b'{') {
+                let segment = &body[at..];
+                let segment = &segment[..memchr(b'}', segment).unwrap_or(segment.len())];
+                find(segment, b"\"value\":").map_or(-1, |value| json_digits(segment, value + 8))
+            } else {
+                json_digits(body, at)
+            }
+        });
+        let errors = errors_at.map_or(-1, |at| {
+            let rest = &body[skip_json_space(body, at)..];
+            if rest.starts_with(b"true") {
+                1
+            } else if rest.starts_with(b"false") {
+                0
+            } else {
+                -1
+            }
+        });
+        words.copy_from_slice(&[ids, total, errors, entries]);
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes four
+            /// words per record and returns the words written, `-needed` when `out_cap` is too small
+            /// (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe { run(count, flags, data, data_len, ints, ints_len, out, out_cap, $plan) }
+            }
+        };
+    }
+
+    entry!(
+        /// `SearchPage::idListPlanBatch()` (see [`id_list_plan`]).
+        nntmux_w565_search_page_id_list_plan, id_list_plan
+    );
+    entry!(
+        /// `ElasticSearchDriver::queryStringPlanBatch()` (see [`query_string_plan`]).
+        nntmux_w565_elastic_query_string_plan, query_string_plan
+    );
+    entry!(
+        /// `ManticoreSearchDriver::userQueryPlanBatch()` (see [`user_query_plan`]).
+        nntmux_w565_manticore_user_query_plan, user_query_plan
+    );
+    entry!(
+        /// `ElasticsearchClientFactory::hostUriPlanBatch()` (see [`host_uri_plan`]).
+        nntmux_w565_es_client_host_uri_plan, host_uri_plan
+    );
+    entry!(
+        /// `ElasticsearchResponseHelper::hitPlanBatch()` (see [`hit_plan`]).
+        nntmux_w565_es_response_hit_plan, hit_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [Entry; 5] = [
+            nntmux_w565_search_page_id_list_plan,
+            nntmux_w565_elastic_query_string_plan,
+            nntmux_w565_manticore_user_query_plan,
+            nntmux_w565_es_client_host_uri_plan,
+            nntmux_w565_es_response_hit_plan,
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Result<Vec<i64>, i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        #[test]
+        fn w565_id_list_plans_dedupe_ids() {
+            const MAX: i64 = 999_999_999_999_999_999;
+            let words = call(
+                nntmux_w565_search_page_id_list_plan,
+                &[
+                    b"1, 2,3,2 ,007,7",
+                    b"",
+                    b",, ,",
+                    b"x,-1,1.5,9",
+                    b"1234567890123456789,999999999999999999",
+                    b"\t42\n",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    6, 4, 7, 0, //
+                    0, 0, 0, 0, //
+                    0, 0, 0, 0, //
+                    1, 1, 9, 3, //
+                    1, 1, MAX, 1, //
+                    1, 1, 42, 0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w565_query_string_plans_normalize_queries() {
+            let words = call(
+                nntmux_w565_elastic_query_string_plan,
+                &[
+                    b"",
+                    b"0",
+                    b"*",
+                    b"The.Matrix.1999",
+                    b"  a   b\tc ",
+                    b"...",
+                    b"\x0cx",
+                    b"foo:(bar) -baz caf\xc3\xa9",
+                    b"00",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    0, 0, 0, 1, //
+                    0, 0, 0, 1, //
+                    0, 0, 0, 1, //
+                    15, 3, 0, 4, //
+                    5, 3, 0, 8, //
+                    0, 0, 0, 4, //
+                    2, 1, 0, 8, //
+                    20, 3, 4, 2, //
+                    2, 1, 0, 0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w565_user_query_plans_tokenize_queries() {
+            let words = call(
+                nntmux_w565_manticore_user_query_plan,
+                &[
+                    b"",
+                    b" * ",
+                    b"harry -potter !\"deathly hallows\" | *man*",
+                    b"\"unterminated phrase",
+                    b"-\"a\" \"\" x\"y z\"",
+                    b"- ! caf\xc3\xa9",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    0, 0, 0, 1, //
+                    0, 0, 0, 1, //
+                    5, 2, 1, 6, //
+                    2, 0, 0, 0, //
+                    4, 1, 2, 0, //
+                    3, 0, 0, 8,
+                ]
+            );
+        }
+
+        #[test]
+        fn w565_host_uri_plans_parse_hosts() {
+            let words = call(
+                nntmux_w565_es_client_host_uri_plan,
+                &[
+                    b"",
+                    b"localhost",
+                    b" https://user:pass@es.example.com:9243/prefix ",
+                    b"HTTP://[::1]:9200",
+                    b"ftp://host:0",
+                    b"http://[::1",
+                    b"http://:9200",
+                    b"bad host:99999",
+                    b"http://[::1]x",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    0, -1, 0, 1, //
+                    0, -1, 9, 0, //
+                    2, 9243, 14, 6, //
+                    1, 9200, 5, 8, //
+                    3, -2, 4, 16, //
+                    1, -1, 4, 16, //
+                    1, 9200, 0, 16, //
+                    0, -2, 8, 48, //
+                    1, -1, 5, 24,
+                ]
+            );
+        }
+
+        #[test]
+        fn w565_hit_plans_scan_responses() {
+            let words = call(
+                nntmux_w565_es_response_hit_plan,
+                &[
+                    b"{\"hits\":{\"total\":{\"value\":42,\"relation\":\"eq\"},\"hits\":[{\"_id\":\"1\"},{\"_id\":\"2\"}]}}",
+                    b"{\"errors\": true,\"items\":[{\"index\":{\"error\":{}}},{\"index\":{\"error\":{}}}]}",
+                    b"{\"errors\":false}",
+                    b"{\"hits\":{\"total\": 7}}",
+                    b"",
+                    b"{\"total\":{\"relation\":\"eq\"},\"value\":3}",
+                    b"{\"total\":1234567890123456789}",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    2, 42, -1, 0, //
+                    0, -1, 1, 2, //
+                    0, -1, 0, 0, //
+                    0, 7, -1, 0, //
+                    0, -1, -1, 0, //
+                    0, -1, -1, 0, //
+                    0, -2, -1, 0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w565_entries_validate_the_abi() {
+            for entry in ENTRIES {
+                let data = b"a\0b";
+                let mut out = [7i64; 8];
+                let call = |count: usize, flags: i64, len: usize, cap: usize, out: *mut i64| unsafe {
+                    entry(
+                        count,
+                        flags,
+                        data.as_ptr(),
+                        len,
+                        std::ptr::null(),
+                        0,
+                        out,
+                        cap,
+                    )
+                };
+                assert_eq!(call(2, 0, 3, 8, out.as_mut_ptr()), 8);
+                assert_eq!(call(2, 0, 3, 7, out.as_mut_ptr()), -8);
+                assert_eq!(call(2, 1, 3, 8, out.as_mut_ptr()), -1);
+                assert_eq!(call(3, 0, 3, 8, out.as_mut_ptr()), -1);
+                assert_eq!(call(1, 0, 3, 8, out.as_mut_ptr()), -1);
+                assert_eq!(call(0, 0, 0, 0, std::ptr::null_mut()), 0);
+                assert_eq!(call(2, 0, 3, 4, std::ptr::null_mut()), -1);
+                let overlapping = unsafe {
+                    entry(
+                        1,
+                        0,
+                        out.as_ptr().cast(),
+                        8,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        8,
+                    )
+                };
+                assert_eq!(overlapping, -1);
+            }
+        }
+    }
+}
