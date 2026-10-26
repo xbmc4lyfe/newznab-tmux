@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 use Throwable;
 
 class GdprExportService
@@ -525,5 +526,262 @@ class GdprExportService
 
         /** @var list<int>|null */
         return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    // ========================================================================
+    // WAVE 60.4 BATCH HELPER
+    // ========================================================================
+
+    /** Disabled: the minimum of four paired runs reached only 1.37x common mean, 1.23x uncommon mean and 1.19x uncommon p99 (common p99 1.52x), since PHP's native json_encode() already sizes values in C; see RustGdprAuditInventoryErasureExportRetentionServiceW60ParityTest. */
+    public const bool W60_RUST_FFI_DEFAULT = false;
+
+    private const string W60_FFI_CDEF = 'ssize_t nntmux_w604_gdpr_export_manifest_row_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per exportManifestRowBatch() record. */
+    public const int W60_ROW_WORDS = 5;
+
+    /** int64 summary words after the exportManifestRowBatch() records (none for an empty batch). */
+    public const int W60_TRAILER_WORDS = 7;
+
+    /** Section codes beyond the GdprDataInventory export tables. */
+    private const array W60_EXTRA_SECTIONS = ['account' => 100, 'subject' => 101, 'retained_audit_records' => 102, 'retained_payment_records' => 103, 'passkeys' => 104];
+
+    /**
+     * Export manifest rows for [section, field, value, byte budget] items in payload order.
+     * Sections are the GdprDataInventory::exportTablesPhp() key position + 1, or 100 account,
+     * 101 subject, 102 retained audit records, 103 retained payment records, 104 passkeys, else
+     * 0. Action 1 removes an account REDACTED_USER_COLUMNS field (redactAccountAttributesPhp()),
+     * 2 replaces a passkey `credential_id`/`data` value with "[redacted]", 0 keeps it.
+     *
+     * Encoded lengths are `strlen(json_encode($s, JSON_UNESCAPED_SLASHES))` (-1 when the string
+     * is not UTF-8). An entry costs field + value + 1 bytes (0 when removed or invalid); the
+     * manifest offset is the running total before the entry, and it is over budget when the
+     * budget is positive and the running total after the entry exceeds it.
+     *
+     * Rows [section | flags << 8 (action, 4 invalid, 8 empty value, 16 over budget), field
+     * bytes, value bytes, encoded value bytes (0 removed, 12 replaced), manifest offset], then
+     * the trailer [kept, redacted, invalid, distinct sections, total bytes (saturating), over
+     * budget, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: int}>  $items
+     * @return list<int>
+     */
+    public static function exportManifestRowBatch(array $items): array
+    {
+        return self::usesW60RustFfi() ? self::exportManifestRowBatchNative($items) : self::exportManifestRowBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int}>  $items
+     * @return list<int>
+     */
+    public static function exportManifestRowBatchPhp(array $items): array
+    {
+        self::w60Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $sections = self::W60_EXTRA_SECTIONS;
+        foreach (array_keys(GdprDataInventory::exportTablesPhp()) as $position => $key) {
+            $sections[$key] = $position + 1;
+        }
+        $redacted = array_flip(self::REDACTED_USER_COLUMNS);
+        $out = [];
+        $summary = [0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        $seen = [];
+        $total = 0;
+        foreach ($items as [$section, $field, $value, $budget]) {
+            $code = $sections[$section] ?? 0;
+            $seen[$code] = true;
+            $action = match (true) {
+                $code === 100 && isset($redacted[$field]) => 1,
+                $code === 104 && ($field === 'credential_id' || $field === 'data') => 2,
+                default => 0,
+            };
+            $fieldJson = json_encode($field, JSON_UNESCAPED_SLASHES);
+            $fieldLength = $fieldJson === false ? -1 : \strlen($fieldJson);
+            if ($action === 0) {
+                $valueJson = json_encode($value, JSON_UNESCAPED_SLASHES);
+                $valueLength = $valueJson === false ? -1 : \strlen($valueJson);
+            } else {
+                $valueLength = $action === 1 ? 0 : 12;
+            }
+            $invalid = $fieldLength < 0 || $valueLength < 0;
+            $entry = $invalid || $action === 1 ? 0 : $fieldLength + $valueLength + 1;
+            $offset = $total;
+            $total = $entry > PHP_INT_MAX - $total ? PHP_INT_MAX : $total + $entry;
+            $over = $budget > 0 && $total > $budget;
+            $word = $code | ($action | ($invalid ? 4 : 0) | ($value === '' ? 8 : 0) | ($over ? 16 : 0)) << 8;
+            array_push($out, $word, \strlen($field), \strlen($value), $valueLength, $offset);
+            if ($invalid) {
+                $summary[2]++;
+            } elseif ($action === 0) {
+                $summary[0]++;
+            }
+            if ($action !== 0) {
+                $summary[1]++;
+            }
+            if ($over) {
+                $summary[5]++;
+            }
+            $mix = $word ^ $valueLength << 16 ^ $offset;
+            $digest = (($digest ^ (($mix ^ ($mix >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $summary[3] = \count($seen);
+        $summary[4] = $total;
+        $summary[6] = $digest;
+
+        return [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int}>  $items
+     * @return list<int>
+     */
+    public static function exportManifestRowBatchNative(array $items): array
+    {
+        self::w60Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w60Join([array_column($items, 0), array_column($items, 1), array_column($items, 2)], $count);
+        $ints = pack('P*', ...array_column($items, 3));
+
+        return self::w60Call($blob, $twin, $ints, $count, $count * self::W60_ROW_WORDS + self::W60_TRAILER_WORDS)
+            ?? self::exportManifestRowBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w60Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W60 export manifest batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 4 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1])
+                || ! \is_string($item[2]) || ! \is_int($item[3])) {
+                throw new InvalidArgumentException('W60 export manifest batch items must be [string section, string field, string value, int byte budget] lists.');
+            }
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        $enabled = self::w60RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W60 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('enabled');
+        self::w60RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w60Join(array $columns, int $count): array
+    {
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\0", $column);
+        }
+        $joined = implode("\0", $parts);
+        if (substr_count($joined, "\0") === \count($columns) * $count - 1) {
+            return [$joined, ''];
+        }
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\x01", $column);
+        }
+
+        return [$joined, implode("\x01", $parts)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w60Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w60RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w60', self::W60_FFI_CDEF) ?? false;
+            self::w60RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w60RustFfiState('out', $out);
+                self::w60RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W60_FFI_CDEF.)
+            $written = $ffi->nntmux_w604_gdpr_export_manifest_row_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w60RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W60 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static: no arguments returns the state, one argument reads a key ('reset'
+     * clears everything) and two arguments write a key.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
     }
 }

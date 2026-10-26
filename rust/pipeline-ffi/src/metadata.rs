@@ -58373,3 +58373,1084 @@ mod w594_tests {
         assert_eq!(&out[7..14], &[1, 0, 0, 0, 0, 0, 100]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 60.4: GDPR audit event, data inventory, erasure, export manifest and retention plan rows
+// ---------------------------------------------------------------------------
+
+/// Batch row helpers for `GdprAuditService`, `GdprDataInventory`, `GdprErasureService`,
+/// `GdprExportService` and `GdprRetentionService`. They use the Wave 59.4 frame: a field-major
+/// NUL-joined blob (value `f` of record `i` is `values[f * count + i]`), an optional 0x01 twin
+/// when a value holds a NUL, and `columns` columns of `count` packed little-endian int64 words.
+/// Each export writes fixed-width int64 rows followed by a batch trailer. The PHP `*BatchPhp()`
+/// methods are the reference implementation.
+pub mod w604_batch {
+    use super::w574_batch::MAX_RECORDS;
+    use super::w594_batch::{dec_len, fnv, split};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// Record body: blob values (field-major), the int64 columns, the record count, output.
+    type Body = fn(&[&[u8]], &[i64], usize, &mut [i64]);
+
+    /// Upper clamp for epoch-second timestamps.
+    pub(crate) const TIME_MAX: i64 = 1 << 40;
+
+    /// Upper clamp for row counts.
+    pub(crate) const ROWS_MAX: i64 = 1 << 48;
+
+    const DAY: i64 = 86_400;
+
+    const FNV_BASIS: i64 = 2_166_136_261;
+
+    /// Column `k` of the packed int64 words for record `i`.
+    #[inline(always)]
+    fn col(ints: &[i64], count: usize, k: usize, i: usize) -> i64 {
+        ints[k * count + i]
+    }
+
+    #[inline(always)]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point to `len` readable bytes unless `len` is zero.
+    unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Validate the frame, split the blob and run `body`. Returns the words written, -1 for a
+    /// malformed frame or panic and `-needed` when `out_cap` is too small.
+    ///
+    /// # Safety
+    ///
+    /// See the exported functions.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        fields: usize,
+        columns: usize,
+        words: usize,
+        trailer: usize,
+        body: Body,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(blob as usize, blob_len, out as usize, out_bytes)
+                || overlaps(twin as usize, twin_len, out as usize, out_bytes)
+                || overlaps(ints as usize, ints_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(blob), Some(twin), Some(ints)) = (
+                unsafe { bytes(blob, blob_len) },
+                unsafe { bytes(twin, twin_len) },
+                unsafe { bytes(ints, ints_len) },
+            ) else {
+                return -1;
+            };
+            if ints.len() != count * columns * 8 {
+                return -1;
+            }
+            if count == 0 {
+                return if blob.is_empty() && twin.is_empty() {
+                    0
+                } else {
+                    -1
+                };
+            }
+            let all: Vec<i64> = ints
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|w| i64::from_le_bytes(*w))
+                .collect();
+            let mut values: Vec<&[u8]> = Vec::with_capacity(count * fields);
+            if !split(blob, twin, count * fields, &mut values) {
+                return -1;
+            }
+            let need = count * words + trailer;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from every input.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            body(&values, &all, count, out);
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    #[inline(always)]
+    fn utf8(s: &[u8]) -> bool {
+        s.is_ascii() || std::str::from_utf8(s).is_ok()
+    }
+
+    #[inline(always)]
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[inline(always)]
+    fn digits(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |a, d| a * 10 + i64::from(d - b'0'))
+    }
+
+    /// PHP `trim($s)` with the default " \t\n\r\0\x0B" set.
+    #[inline(always)]
+    fn trim_space(s: &[u8]) -> &[u8] {
+        let space = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = s.iter().position(|b| !space(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !space(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// PHP `trim($s, '`"')`.
+    #[inline(always)]
+    fn trim_quotes(s: &[u8]) -> &[u8] {
+        let quote = |b: &u8| matches!(b, b'`' | b'"');
+        let start = s.iter().position(|b| !quote(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !quote(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// A normalized identifier lowercased into `buf`: (bytes, valid) where valid means 1-64
+    /// bytes of `[a-z0-9_]` after lowercasing; longer names are returned truncated and invalid.
+    #[inline(always)]
+    fn ident<'b>(s: &[u8], buf: &'b mut [u8; 64]) -> (&'b [u8], bool) {
+        let n = s.len().min(64);
+        let mut valid = !s.is_empty() && s.len() <= 64;
+        for (d, b) in buf[..n].iter_mut().zip(s) {
+            *d = b.to_ascii_lowercase();
+            valid &= d.is_ascii_lowercase() || d.is_ascii_digit() || *d == b'_';
+        }
+        (&buf[..n], valid)
+    }
+
+    // -- GdprAuditService ----------------------------------------------------------------------
+
+    /// Audit event code: 0-4 for the known events, 14 for another `[a-z][a-z0-9_]{2,63}` event,
+    /// 15 otherwise.
+    pub(crate) fn audit_event_code(e: &[u8]) -> i64 {
+        match e {
+            b"request_submitted" => 0,
+            b"request_rejected" => 1,
+            b"export_generated" => 2,
+            b"erasure_soft_delete" => 3,
+            b"erasure_force_delete" => 4,
+            _ if (3..=64).contains(&e.len())
+                && e[0].is_ascii_lowercase()
+                && e.iter()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_') =>
+            {
+                14
+            }
+            _ => 15,
+        }
+    }
+
+    /// Retention window in days for an audit event code.
+    #[inline(always)]
+    fn audit_window(code: i64) -> i64 {
+        match code {
+            0 | 1 => 1095,
+            2 => 30,
+            3 | 4 => 2190,
+            14 => 365,
+            _ => 90,
+        }
+    }
+
+    /// (class, id): 0 empty, 1 `system`, 2 `user:N`, 3 `admin:N` (N 1-18 digits, no leading
+    /// zero), 4 malformed (id -1).
+    pub(crate) fn audit_actor(a: &[u8]) -> (i64, i64) {
+        match a {
+            b"" => (0, -1),
+            b"system" => (1, -1),
+            _ => {
+                let Some(p) = a.iter().position(|b| *b == b':') else {
+                    return (4, -1);
+                };
+                let class = match &a[..p] {
+                    b"user" => 2,
+                    b"admin" => 3,
+                    _ => return (4, -1),
+                };
+                let n = &a[p + 1..];
+                if n.is_empty() || n.len() > 18 || n[0] == b'0' || !n.iter().all(u8::is_ascii_digit)
+                {
+                    return (4, -1);
+                }
+                (class, digits(n))
+            }
+        }
+    }
+
+    /// (class, masked): 0 empty, 1 IPv4 (masked to `a << 16 | b << 8 | c`), 2 IPv6-shaped
+    /// (masked to its ':' count), 3 other (-1).
+    pub(crate) fn audit_ip(s: &[u8]) -> (i64, i64) {
+        if s.is_empty() {
+            return (0, -1);
+        }
+        let mut octets = [0i64; 4];
+        let mut n = 0;
+        let mut ok = true;
+        for part in s.split(|b| *b == b'.') {
+            if n == 4
+                || part.is_empty()
+                || part.len() > 3
+                || !part.iter().all(u8::is_ascii_digit)
+                || (part.len() > 1 && part[0] == b'0')
+            {
+                ok = false;
+                break;
+            }
+            let v = digits(part);
+            if v > 255 {
+                ok = false;
+                break;
+            }
+            octets[n] = v;
+            n += 1;
+        }
+        if ok && n == 4 {
+            return (1, octets[0] << 16 | octets[1] << 8 | octets[2]);
+        }
+        let colons = s.iter().filter(|b| **b == b':').count() as i64;
+        let mut doubles = 0;
+        let mut i = 0;
+        while i + 1 < s.len() {
+            if s[i] == b':' && s[i + 1] == b':' {
+                doubles += 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        if (2..=39).contains(&s.len())
+            && colons >= 2
+            && doubles <= 1
+            && s.iter().all(|b| b.is_ascii_hexdigit() || *b == b':')
+        {
+            return (2, colons);
+        }
+        (3, -1)
+    }
+
+    /// Rows [event | actor class << 4 | ip class << 8 | retention << 12 | flags << 16, actor
+    /// id, masked ip, age days, window days, description length]; trailer [valid, invalid,
+    /// expired, nearing, future, pii, max age, digest].
+    fn audit_row(values: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut summary = [0i64; 8];
+        let mut digest = FNV_BASIS;
+        for (i, slot) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let (event, actor, ip, desc) = (
+                values[i],
+                values[count + i],
+                values[2 * count + i],
+                values[3 * count + i],
+            );
+            let code = audit_event_code(event);
+            let (actor_class, actor_id) = audit_actor(actor);
+            let (ip_class, masked) = audit_ip(ip);
+            let subject = col(ints, count, 0, i);
+            let actor_col = col(ints, count, 1, i);
+            let request = col(ints, count, 2, i);
+            let created = col(ints, count, 3, i).clamp(0, TIME_MAX);
+            let now = col(ints, count, 4, i).clamp(0, TIME_MAX);
+            let window = audit_window(code);
+            let (status, age) = if created > now {
+                (3, 0)
+            } else {
+                let age = (now - created) / DAY;
+                let status = if age >= window {
+                    2
+                } else if age * 10 >= window * 9 {
+                    1
+                } else {
+                    0
+                };
+                (status, age)
+            };
+            let person = actor_class == 2 || actor_class == 3;
+            let ctrl = desc.iter().any(|b| *b < 0x20 || *b == 0x7f);
+            let at = desc.contains(&b'@');
+            let flags = i64::from(subject > 0)
+                | i64::from(actor_col > 0) << 1
+                | i64::from(request > 0) << 2
+                | i64::from(person && subject > 0 && actor_id == subject) << 3
+                | i64::from(ctrl) << 4
+                | i64::from(!utf8(desc)) << 5
+                | i64::from(at) << 6
+                | i64::from(person && actor_col > 0 && actor_id != actor_col) << 7;
+            let word = code | actor_class << 4 | ip_class << 8 | status << 12 | flags << 16;
+            *slot = [word, actor_id, masked, age, window, desc.len() as i64];
+            if code != 15 && actor_class != 4 && ip_class != 3 {
+                summary[0] += 1;
+            } else {
+                summary[1] += 1;
+            }
+            match status {
+                2 => summary[2] += 1,
+                1 => summary[3] += 1,
+                3 => summary[4] += 1,
+                _ => {}
+            }
+            if ip_class == 1 || ip_class == 2 || at {
+                summary[5] += 1;
+            }
+            summary[6] = summary[6].max(age);
+            digest = fnv(digest, word ^ masked.wrapping_shl(20) ^ age);
+        }
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- GdprDataInventory ---------------------------------------------------------------------
+
+    /// Inventory membership bits (1 erasable, 2 anonymized, 4 exported, 8 retained) of a
+    /// normalized table name, as `GdprDataInventory::w49TableWords() & 15`.
+    pub(crate) fn inventory_membership(name: &[u8]) -> i64 {
+        match name {
+            b"user_requests"
+            | b"user_downloads"
+            | b"dnzb_failures"
+            | b"users_releases"
+            | b"user_series"
+            | b"user_movies"
+            | b"user_excluded_categories"
+            | b"user_invitations"
+            | b"trusted_devices"
+            | b"role_promotion_stats" => 5,
+            b"password_securities"
+            | b"passkeys"
+            | b"model_has_permissions"
+            | b"model_has_roles" => 1,
+            b"release_comments" | b"release_reports" => 6,
+            b"invitations_sent" | b"invitations_used" | b"role_history" | b"promotion_stats"
+            | b"gdpr_requests" | b"gdpr_consents" | b"invitations" => 4,
+            b"gdpr_audit_logs" | b"user_role_history" => 12,
+            b"payments" | b"paypal_payments" | b"user_activities" => 8,
+            _ => 0,
+        }
+    }
+
+    /// Personal-data category of a normalized column: 0 other, 1 contact, 2 network, 3
+    /// identity, 4 secret, 5 identifier, 6 temporal.
+    pub(crate) fn column_category(c: &[u8]) -> i64 {
+        match c {
+            b"email" | b"email_address" => 1,
+            b"ip" | b"ip_address" | b"host" | b"last_ip" => 2,
+            b"username" | b"name" | b"firstname" | b"lastname" => 3,
+            b"password"
+            | b"remember_token"
+            | b"session_token"
+            | b"api_token"
+            | b"resetguid"
+            | b"verification_token"
+            | b"sabapikey"
+            | b"nzbgetpassword"
+            | b"nzbvortex_api_key"
+            | b"cp_api" => 4,
+            _ if contains(c, b"password") || contains(c, b"secret") || contains(c, b"token") => 4,
+            _ if contains(c, b"email") => 1,
+            _ if c.ends_with(b"_ip") => 2,
+            _ if c == b"id" || c.ends_with(b"_id") => 5,
+            _ if c.ends_with(b"_at") || c == b"timestamp" => 6,
+            _ => 0,
+        }
+    }
+
+    const SENSITIVITY: [i64; 7] = [0, 3, 2, 2, 4, 1, 0];
+
+    fn legal_basis(b: &[u8]) -> i64 {
+        match b {
+            b"contract" => 1,
+            b"legal_obligation" => 2,
+            b"legitimate_interest" => 3,
+            b"consent" => 4,
+            _ => 0,
+        }
+    }
+
+    /// Rows [membership | category << 4 | sensitivity << 8 | basis << 12 | status << 16 |
+    /// flags << 20, table length, column length, risk, rows]; trailer [personal, secrets,
+    /// missing basis, exported secrets, invalid, total risk, digest].
+    fn inventory_row(values: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut summary = [0i64; 7];
+        let mut digest = FNV_BASIS;
+        let (mut tbuf, mut cbuf) = ([0u8; 64], [0u8; 64]);
+        for (i, slot) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let (table, column, basis) = (values[i], values[count + i], values[2 * count + i]);
+            let mut t = trim_space(table);
+            if let Some(dot) = t.iter().rposition(|b| *b == b'.') {
+                t = &t[dot + 1..];
+            }
+            let t = trim_quotes(t);
+            let c = trim_quotes(trim_space(column));
+            let (tname, table_ok) = ident(t, &mut tbuf);
+            let (cname, column_ok) = ident(c, &mut cbuf);
+            let membership = if t.len() <= 64 {
+                inventory_membership(tname)
+            } else {
+                0
+            };
+            let category = if column_ok { column_category(cname) } else { 0 };
+            let sensitivity = SENSITIVITY[category as usize];
+            let basis = legal_basis(basis);
+            let flags = col(ints, count, 1, i) & 3;
+            let exported = flags & 1 != 0 || membership & 4 != 0;
+            let encrypted = flags & 2 != 0;
+            let personal = (1..=4).contains(&category);
+            let status = if !table_ok {
+                3
+            } else if !column_ok {
+                4
+            } else if category == 4 && exported && !encrypted {
+                2
+            } else if personal && basis == 0 {
+                1
+            } else {
+                0
+            };
+            let row_count = col(ints, count, 0, i).clamp(0, ROWS_MAX);
+            let risk = if status < 3 {
+                row_count * sensitivity * if encrypted { 1 } else { 2 }
+            } else {
+                0
+            };
+            let word = membership
+                | category << 4
+                | sensitivity << 8
+                | basis << 12
+                | status << 16
+                | flags << 20;
+            *slot = [word, t.len() as i64, c.len() as i64, risk, row_count];
+            if status < 3 {
+                summary[0] += i64::from(personal);
+                summary[1] += i64::from(category == 4);
+            }
+            match status {
+                1 => summary[2] += 1,
+                2 => summary[3] += 1,
+                3 | 4 => summary[4] += 1,
+                _ => {}
+            }
+            summary[5] = summary[5].saturating_add(risk);
+            digest = fnv(digest, word ^ risk);
+        }
+        summary[6] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- GdprErasureService --------------------------------------------------------------------
+
+    /// `GdprDataInventory::erasableTablesPhp()`: (table, user column, has extra conditions).
+    const ERASABLE: [(&[u8], &[u8], bool); 14] = [
+        (b"user_requests", b"users_id", false),
+        (b"user_downloads", b"users_id", false),
+        (b"dnzb_failures", b"users_id", false),
+        (b"users_releases", b"users_id", false),
+        (b"user_series", b"users_id", false),
+        (b"user_movies", b"users_id", false),
+        (b"user_excluded_categories", b"users_id", false),
+        (b"user_invitations", b"user_id", false),
+        (b"trusted_devices", b"user_id", false),
+        (b"password_securities", b"user_id", false),
+        (b"passkeys", b"authenticatable_id", true),
+        (b"model_has_permissions", b"model_id", true),
+        (b"model_has_roles", b"model_id", true),
+        (b"role_promotion_stats", b"user_id", false),
+    ];
+
+    /// `GdprDataInventory::anonymizedTablesPhp()`: (table, user column).
+    const ANONYMIZED: [(&[u8], &[u8]); 2] = [
+        (b"release_comments", b"users_id"),
+        (b"release_reports", b"users_id"),
+    ];
+
+    /// `GdprDataInventory::retainedRecordsPhp()` tables.
+    const RETAINED: [&[u8]; 5] = [
+        b"payments",
+        b"paypal_payments",
+        b"user_activities",
+        b"gdpr_audit_logs",
+        b"user_role_history",
+    ];
+
+    fn erasure_scope(s: &[u8]) -> i64 {
+        match s {
+            b"erase" => 1,
+            b"anonymize" => 2,
+            b"retain" => 3,
+            _ => 0,
+        }
+    }
+
+    /// Rows [action | scope << 4 | flags << 8, cascade rank, affected rows, anonymous username
+    /// length | email length << 16, legal hold seconds left]; trailer [delete, anonymize,
+    /// retain, held, column mismatch, invalid, affected rows, digest].
+    fn erasure_row(values: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut summary = [0i64; 8];
+        let mut digest = FNV_BASIS;
+        for (i, slot) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let (table, column, scope) = (values[i], values[count + i], values[2 * count + i]);
+            let user = col(ints, count, 0, i);
+            let row_count = col(ints, count, 1, i);
+            let hold = col(ints, count, 2, i).clamp(0, TIME_MAX);
+            let now = col(ints, count, 3, i).clamp(0, TIME_MAX);
+            let input = col(ints, count, 4, i);
+            let erasable = ERASABLE.iter().position(|(t, _, _)| *t == table);
+            let anonymized = ANONYMIZED.iter().position(|(t, _)| *t == table);
+            let retained = RETAINED.iter().position(|t| *t == table);
+            let action = if user <= 0 {
+                6
+            } else if hold > now {
+                4
+            } else if let Some(e) = erasable {
+                if ERASABLE[e].1 == column { 1 } else { 5 }
+            } else if let Some(a) = anonymized {
+                if ANONYMIZED[a].1 == column { 2 } else { 5 }
+            } else if retained.is_some() {
+                3
+            } else {
+                0
+            };
+            let rank = if let Some(e) = erasable {
+                e as i64 + 1
+            } else if let Some(a) = anonymized {
+                a as i64 + 100
+            } else if let Some(r) = retained {
+                r as i64 + 200
+            } else {
+                0
+            };
+            let scope = erasure_scope(scope);
+            let applies = (1..=3).contains(&action);
+            let flags = i64::from(erasable.is_some_and(|e| ERASABLE[e].2))
+                | i64::from(scope != 0 && applies && scope != action) << 1
+                | i64::from(scope == 0) << 2
+                | (input & 1) << 3
+                | (input & 2) << 3;
+            let affected = if applies {
+                row_count.clamp(0, ROWS_MAX)
+            } else {
+                0
+            };
+            let lengths = if user > 0 {
+                let n = dec_len(user);
+                (13 + n) | (29 + n) << 16
+            } else {
+                0
+            };
+            let word = action | scope << 4 | flags << 8;
+            *slot = [word, rank, affected, lengths, (hold - now).max(0)];
+            if (1..=6).contains(&action) {
+                summary[action as usize - 1] += 1;
+            }
+            summary[6] = summary[6].saturating_add(affected);
+            digest = fnv(digest, word ^ rank << 12 ^ affected);
+        }
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- GdprExportService ---------------------------------------------------------------------
+
+    /// Export section code: `GdprDataInventory::exportTablesPhp()` key position + 1, 100
+    /// account, 101 subject, 102 retained audit records, 103 retained payment records, 104
+    /// passkeys, 0 otherwise.
+    pub(crate) fn export_section(s: &[u8]) -> i64 {
+        match s {
+            b"user_requests" => 1,
+            b"user_downloads" => 2,
+            b"dnzb_failures" => 3,
+            b"users_releases" => 4,
+            b"user_series" => 5,
+            b"user_movies" => 6,
+            b"user_excluded_categories" => 7,
+            b"user_invitations" => 8,
+            b"release_comments" => 9,
+            b"release_reports" => 10,
+            b"invitations_sent" => 11,
+            b"invitations_used" => 12,
+            b"trusted_devices" => 13,
+            b"role_history" => 14,
+            b"promotion_stats" => 15,
+            b"gdpr_requests" => 16,
+            b"gdpr_consents" => 17,
+            b"gdpr_audit_logs" => 18,
+            b"account" => 100,
+            b"subject" => 101,
+            b"retained_audit_records" => 102,
+            b"retained_payment_records" => 103,
+            b"passkeys" => 104,
+            _ => 0,
+        }
+    }
+
+    /// Length of PHP `json_encode($s, JSON_UNESCAPED_SLASHES)` (with quotes), -1 when `$s` is
+    /// not valid UTF-8.
+    pub(crate) fn json_len(s: &[u8]) -> i64 {
+        let mut len = 2i64;
+        let ascii = |b: u8| -> i64 {
+            match b {
+                b'"' | b'\\' | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' => 2,
+                0..=0x1f => 6,
+                _ => 1,
+            }
+        };
+        if s.is_ascii() {
+            for b in s {
+                len += ascii(*b);
+            }
+            return len;
+        }
+        let Ok(text) = std::str::from_utf8(s) else {
+            return -1;
+        };
+        for ch in text.chars() {
+            len += if ch.is_ascii() {
+                ascii(ch as u8)
+            } else if (ch as u32) < 0x1_0000 {
+                6
+            } else {
+                12
+            };
+        }
+        len
+    }
+
+    const ACCOUNT_REDACTED: [&[u8]; 10] = [
+        b"password",
+        b"remember_token",
+        b"session_token",
+        b"api_token",
+        b"resetguid",
+        b"verification_token",
+        b"sabapikey",
+        b"nzbgetpassword",
+        b"nzbvortex_api_key",
+        b"cp_api",
+    ];
+
+    /// Rows [section | flags << 8, field length, value length, encoded value length, manifest
+    /// offset]; trailer [kept, redacted, invalid, distinct sections, total bytes, over budget,
+    /// digest].
+    fn export_row(values: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut summary = [0i64; 7];
+        let mut digest = FNV_BASIS;
+        let mut sections = [0u64; 2];
+        let mut total = 0i64;
+        for (i, slot) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let (section, field, value) = (values[i], values[count + i], values[2 * count + i]);
+            let budget = col(ints, count, 0, i);
+            let code = export_section(section);
+            sections[(code >> 6) as usize] |= 1 << (code & 63);
+            let action = if code == 100 && ACCOUNT_REDACTED.contains(&field) {
+                1
+            } else if code == 104 && (field == b"credential_id" || field == b"data") {
+                2
+            } else {
+                0
+            };
+            let field_len = json_len(field);
+            let value_len = match action {
+                1 => 0,
+                2 => 12,
+                _ => json_len(value),
+            };
+            let invalid = field_len < 0 || value_len < 0;
+            let entry = if invalid || action == 1 {
+                0
+            } else {
+                field_len + value_len + 1
+            };
+            let offset = total;
+            total = total.saturating_add(entry);
+            let over = budget > 0 && total > budget;
+            let flags = action
+                | i64::from(invalid) << 2
+                | i64::from(value.is_empty()) << 3
+                | i64::from(over) << 4;
+            let word = code | flags << 8;
+            *slot = [
+                word,
+                field.len() as i64,
+                value.len() as i64,
+                value_len,
+                offset,
+            ];
+            if invalid {
+                summary[2] += 1;
+            } else if action == 0 {
+                summary[0] += 1;
+            }
+            summary[1] += i64::from(action != 0);
+            summary[5] += i64::from(over);
+            digest = fnv(digest, word ^ value_len << 16 ^ offset);
+        }
+        summary[3] = i64::from(sections[0].count_ones() + sections[1].count_ones());
+        summary[4] = total;
+        summary[6] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- GdprRetentionService ------------------------------------------------------------------
+
+    /// (type code, window days): 1 export_file 7, 2 gdpr_request indefinite (0), 3 payment
+    /// 3650, 4 audit_log 2190, 5 user_activity 365, 6 session 30, (0, 0) otherwise.
+    pub(crate) fn retention_type(t: &[u8]) -> (i64, i64) {
+        match t {
+            b"export_file" => (1, 7),
+            b"gdpr_request" => (2, 0),
+            b"payment" => (3, 3650),
+            b"audit_log" => (4, 2190),
+            b"user_activity" => (5, 365),
+            b"session" => (6, 30),
+            _ => (0, 0),
+        }
+    }
+
+    /// Rows [status | type << 4 | disk class << 8 | disk defaulted << 10, cutoff, purge at,
+    /// seconds until purge, age days]; trailer [retain, grace, purge, indefinite, invalid,
+    /// purge chunks, digest].
+    fn retention_row(values: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 5);
+        let mut summary = [0i64; 7];
+        let mut digest = FNV_BASIS;
+        let mut fill = 0i64;
+        for (i, slot) in rows.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let (kind, disk) = (values[i], values[count + i]);
+            let created = col(ints, count, 0, i).clamp(0, TIME_MAX);
+            let expires = col(ints, count, 1, i).clamp(0, TIME_MAX);
+            let now = col(ints, count, 2, i).clamp(0, TIME_MAX);
+            let grace = col(ints, count, 3, i).clamp(0, 365) * DAY;
+            let size = col(ints, count, 4, i);
+            let chunk = if size <= 0 { 100 } else { size.min(1000) };
+            let (code, window) = retention_type(kind);
+            let defaulted = disk.is_empty() || disk == b"0";
+            let disk_class = if defaulted || disk == b"local" {
+                0
+            } else if disk == b"s3" {
+                1
+            } else if disk.len() <= 64
+                && disk
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+            {
+                2
+            } else {
+                3
+            };
+            let (status, cutoff, purge_at) = if code == 0 {
+                (4, -1, -1)
+            } else if created == 0 || created > now + DAY {
+                (5, -1, -1)
+            } else if window == 0 && expires == 0 {
+                (3, -1, -1)
+            } else {
+                let cutoff = if expires > 0 {
+                    expires
+                } else {
+                    created + window * DAY
+                };
+                let purge_at = cutoff + grace;
+                let status = if now < cutoff {
+                    0
+                } else if now < purge_at {
+                    1
+                } else {
+                    2
+                };
+                (status, cutoff, purge_at)
+            };
+            let until = if status <= 2 {
+                (purge_at - now).max(0)
+            } else {
+                -1
+            };
+            let age = if created <= now {
+                (now - created) / DAY
+            } else {
+                0
+            };
+            let word = status | code << 4 | disk_class << 8 | i64::from(defaulted) << 10;
+            *slot = [word, cutoff, purge_at, until, age];
+            match status {
+                0..=3 => summary[status as usize] += 1,
+                _ => summary[4] += 1,
+            }
+            if status == 2 {
+                fill += 1;
+                if fill >= chunk {
+                    summary[5] += 1;
+                    fill = 0;
+                }
+            }
+            digest = fnv(digest, word ^ until ^ age << 24);
+        }
+        if fill > 0 {
+            summary[5] += 1;
+        }
+        summary[6] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    macro_rules! export604 {
+        ($name:ident, $fields:literal, $columns:literal, $words:literal, $trailer:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `blob` must point to `blob_len` readable bytes (`count * fields` NUL-joined
+            /// values, field-major), `twin` to `twin_len` readable bytes (empty, or the same
+            /// values joined by 0x01), `ints` to `ints_len` readable bytes (`columns` columns
+            /// of `count` packed little-endian int64 words) and `out` to `out_cap` writable,
+            /// aligned int64 words that overlap no input; null pointers are accepted only with
+            /// zero lengths. Bad shapes return -1 before writing, a short output returns
+            /// `-needed` without writing and panics map to -1.
+            #[unsafe(no_mangle)]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                twin: *const u8,
+                twin_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                const BODY: Body = $body;
+                unsafe {
+                    run(
+                        blob, blob_len, twin, twin_len, ints, ints_len, count, out, out_cap,
+                        $fields, $columns, $words, $trailer, BODY,
+                    )
+                }
+            }
+        };
+    }
+
+    export604!(
+        nntmux_w604_gdpr_audit_event_row_batch,
+        4,
+        5,
+        6,
+        8,
+        audit_row
+    );
+    export604!(
+        nntmux_w604_gdpr_inventory_plan_row_batch,
+        3,
+        2,
+        5,
+        7,
+        inventory_row
+    );
+    export604!(
+        nntmux_w604_gdpr_erasure_plan_row_batch,
+        3,
+        5,
+        5,
+        8,
+        erasure_row
+    );
+    export604!(
+        nntmux_w604_gdpr_export_manifest_row_batch,
+        3,
+        1,
+        5,
+        7,
+        export_row
+    );
+    export604!(
+        nntmux_w604_gdpr_retention_plan_row_batch,
+        2,
+        5,
+        5,
+        7,
+        retention_row
+    );
+}
+
+#[cfg(test)]
+mod w604_tests {
+    use super::w604_batch::*;
+
+    type Export = unsafe extern "C" fn(
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        usize,
+        *mut i64,
+        usize,
+    ) -> isize;
+
+    /// Field-major frame without NULs, then the int columns.
+    fn call(export: Export, fields: &[&[&[u8]]], columns: &[&[i64]], out: &mut [i64]) -> isize {
+        let count = fields[0].len();
+        let blob = fields
+            .iter()
+            .flat_map(|f| f.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(&0u8);
+        let ints: Vec<u8> = columns
+            .iter()
+            .flat_map(|c| c.iter())
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        unsafe {
+            export(
+                blob.as_ptr(),
+                blob.len(),
+                std::ptr::null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn w604_audit_helpers() {
+        assert_eq!(audit_event_code(b"export_generated"), 2);
+        assert_eq!(audit_event_code(b"consent_given"), 14);
+        assert_eq!(audit_event_code(b"Consent"), 15);
+        assert_eq!(audit_event_code(b"ab"), 15);
+        assert_eq!(audit_actor(b"user:42"), (2, 42));
+        assert_eq!(audit_actor(b"admin:7"), (3, 7));
+        assert_eq!(audit_actor(b"user:07"), (4, -1));
+        assert_eq!(audit_actor(b"system"), (1, -1));
+        assert_eq!(audit_actor(b""), (0, -1));
+        assert_eq!(audit_ip(b"192.168.1.20"), (1, 192 << 16 | 168 << 8 | 1));
+        assert_eq!(audit_ip(b"192.168.01.20"), (3, -1));
+        assert_eq!(audit_ip(b"256.1.1.1"), (3, -1));
+        assert_eq!(audit_ip(b"2001:db8::1"), (2, 3));
+        assert_eq!(audit_ip(b"1::2::3"), (3, -1));
+        assert_eq!(audit_ip(b""), (0, -1));
+    }
+
+    #[test]
+    fn w604_inventory_export_retention_helpers() {
+        assert_eq!(inventory_membership(b"gdpr_audit_logs"), 12);
+        assert_eq!(inventory_membership(b"release_comments"), 6);
+        assert_eq!(column_category(b"api_token"), 4);
+        assert_eq!(column_category(b"oauth_secret_hash"), 4);
+        assert_eq!(column_category(b"backup_email"), 1);
+        assert_eq!(column_category(b"last_seen_ip"), 2);
+        assert_eq!(column_category(b"users_id"), 5);
+        assert_eq!(column_category(b"created_at"), 6);
+        assert_eq!(column_category(b"notes"), 0);
+        assert_eq!(json_len(b"a/b"), 5);
+        assert_eq!(json_len(b"\"\n\x01"), 2 + 2 + 2 + 6);
+        assert_eq!(json_len("é日😀".as_bytes()), 2 + 6 + 6 + 12);
+        assert_eq!(json_len(b"\xff"), -1);
+        assert_eq!(export_section(b"gdpr_audit_logs"), 18);
+        assert_eq!(export_section(b"passkeys"), 104);
+        assert_eq!(retention_type(b"gdpr_request"), (2, 0));
+        assert_eq!(retention_type(b"bogus"), (0, 0));
+    }
+
+    #[test]
+    fn w604_rows_and_frames() {
+        let mut out = vec![0i64; 2 * 5 + 8];
+        let written = call(
+            nntmux_w604_gdpr_erasure_plan_row_batch,
+            &[
+                &[b"passkeys", b"payments"],
+                &[b"authenticatable_id", b"email"],
+                &[b"erase", b"retain"],
+            ],
+            &[&[42, 42], &[3, 9], &[0, 0], &[100, 100], &[1, 0]],
+            &mut out,
+        );
+        assert_eq!(written, 18);
+        assert_eq!(
+            &out[..5],
+            &[1 | 1 << 4 | (1 | 8) << 8, 11, 3, 15 | 31 << 16, 0]
+        );
+        assert_eq!(&out[5..10], &[3 | 3 << 4, 200, 9, 15 | 31 << 16, 0]);
+        assert_eq!(&out[10..17], &[1, 0, 1, 0, 0, 0, 12]);
+
+        let mut out = vec![0i64; 5 + 7];
+        let written = call(
+            nntmux_w604_gdpr_retention_plan_row_batch,
+            &[&[b"export_file"], &[b""]],
+            &[&[1000], &[0], &[1000 + 8 * 86_400], &[0], &[0]],
+            &mut out,
+        );
+        assert_eq!(written, 12);
+        let cutoff = 1000 + 7 * 86_400;
+        assert_eq!(&out[..5], &[2 | 1 << 4 | 1 << 10, cutoff, cutoff, 0, 8]);
+        assert_eq!(&out[5..11], &[0, 0, 1, 0, 0, 1]);
+
+        // Short output and malformed frames.
+        let mut short = vec![0i64; 4];
+        assert_eq!(
+            call(
+                nntmux_w604_gdpr_export_manifest_row_batch,
+                &[&[b"account"], &[b"password"], &[b"x"]],
+                &[&[0]],
+                &mut short,
+            ),
+            -12
+        );
+        assert_eq!(
+            call(
+                nntmux_w604_gdpr_inventory_plan_row_batch,
+                &[&[b"t"], &[b"c"]],
+                &[&[0], &[0]],
+                &mut out,
+            ),
+            -1
+        );
+        let empty = unsafe {
+            nntmux_w604_gdpr_audit_event_row_batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(empty, 0);
+    }
+}

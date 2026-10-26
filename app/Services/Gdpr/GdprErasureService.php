@@ -15,6 +15,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 use Throwable;
 
 class GdprErasureService
@@ -760,5 +761,257 @@ class GdprErasureService
 
         /** @var list<int>|null */
         return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    // ========================================================================
+    // WAVE 60.4 BATCH HELPER
+    // ========================================================================
+
+    /** Disabled: the minimum of four paired runs reached only 1.39x common p99, 1.36x uncommon mean and 1.43x uncommon p99 (common mean 1.61x), since the fixed-table lookups are cheap in PHP while validation, packing and decoding stay fixed; see RustGdprAuditInventoryErasureExportRetentionServiceW60ParityTest. */
+    public const bool W60_RUST_FFI_DEFAULT = false;
+
+    private const string W60_FFI_CDEF = 'ssize_t nntmux_w604_gdpr_erasure_plan_row_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per erasurePlanRowBatch() record. */
+    public const int W60_ROW_WORDS = 5;
+
+    /** int64 summary words after the erasurePlanRowBatch() records (none for an empty batch). */
+    public const int W60_TRAILER_WORDS = 8;
+
+    /** Upper clamp for epoch-second timestamps. */
+    private const int W60_TIME_MAX = 1 << 40;
+
+    /** Upper clamp for row counts. */
+    private const int W60_ROWS_MAX = 1 << 48;
+
+    private const array W60_SCOPES = ['erase' => 1, 'anonymize' => 2, 'retain' => 3];
+
+    /**
+     * Erasure plan rows for [table, user column, requested scope, user id, row count, legal hold
+     * until, now, flags (1 force delete, 2 user trashed)] items against the GdprDataInventory
+     * tables (times are epoch seconds clamped to 0..2^40).
+     *
+     * Action: 6 invalid user id (<= 0), 4 legal hold (hold until > now), 1 delete (erasable
+     * table with its user column), 2 anonymize (anonymized table with its user column), 5 user
+     * column mismatch, 3 retain minimized (retained record table), else 0 skip. Cascade rank is
+     * the erasable position + 1, the anonymized position + 100 or the retained position + 200
+     * (0 for unknown tables). Scopes are 1 erase, 2 anonymize, 3 retain, else 0. Flags: 1 extra
+     * conditions, 2 scope disagrees with the action, 4 unknown scope, 8 force delete, 16
+     * trashed. Affected rows (clamped to 0..2^48) count only for actions 1-3.
+     *
+     * Rows [action | scope << 4 | flags << 8, cascade rank, affected rows, anonymous username
+     * bytes | anonymous email bytes << 16 (0 without a user), legal hold seconds left], then the
+     * trailer [delete, anonymize, retain, held, column mismatch, invalid, affected rows
+     * (saturating), FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int}>  $items
+     * @return list<int>
+     */
+    public static function erasurePlanRowBatch(array $items): array
+    {
+        return self::usesW60RustFfi() ? self::erasurePlanRowBatchNative($items) : self::erasurePlanRowBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int}>  $items
+     * @return list<int>
+     */
+    public static function erasurePlanRowBatchPhp(array $items): array
+    {
+        self::w60Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $erasable = GdprDataInventory::erasableTablesPhp();
+        $erasableRank = array_flip(array_keys($erasable));
+        $anonymized = GdprDataInventory::anonymizedTablesPhp();
+        $anonymizedRank = array_flip(array_keys($anonymized));
+        $retainedRank = array_flip(array_column(GdprDataInventory::retainedRecordsPhp(), 'table'));
+        $out = [];
+        $summary = [0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        foreach ($items as [$table, $column, $scope, $user, $rows, $hold, $now, $flags]) {
+            $hold = max(0, min(self::W60_TIME_MAX, $hold));
+            $now = max(0, min(self::W60_TIME_MAX, $now));
+            $action = match (true) {
+                $user <= 0 => 6,
+                $hold > $now => 4,
+                isset($erasable[$table]) => $erasable[$table]['user_column'] === $column ? 1 : 5,
+                isset($anonymized[$table]) => $anonymized[$table]['user_column'] === $column ? 2 : 5,
+                isset($retainedRank[$table]) => 3,
+                default => 0,
+            };
+            $rank = isset($erasableRank[$table]) ? $erasableRank[$table] + 1
+                : (isset($anonymizedRank[$table]) ? $anonymizedRank[$table] + 100 : (isset($retainedRank[$table]) ? $retainedRank[$table] + 200 : 0));
+            $scope = self::W60_SCOPES[$scope] ?? 0;
+            $applies = $action >= 1 && $action <= 3;
+            $outFlags = (isset($erasable[$table]['extra']) ? 1 : 0) | ($scope !== 0 && $applies && $scope !== $action ? 2 : 0)
+                | ($scope === 0 ? 4 : 0) | ($flags & 1) << 3 | ($flags & 2) << 3;
+            $affected = $applies ? max(0, min(self::W60_ROWS_MAX, $rows)) : 0;
+            $digits = \strlen((string) $user);
+            $lengths = $user > 0 ? (13 + $digits) | (29 + $digits) << 16 : 0;
+            $word = $action | $scope << 4 | $outFlags << 8;
+            array_push($out, $word, $rank, $affected, $lengths, max(0, $hold - $now));
+            if ($action >= 1) {
+                $summary[$action - 1]++;
+            }
+            $summary[6] = $affected > PHP_INT_MAX - $summary[6] ? PHP_INT_MAX : $summary[6] + $affected;
+            $value = $word ^ $rank << 12 ^ $affected;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $summary[7] = $digest;
+
+        return [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: int, 4: int, 5: int, 6: int, 7: int}>  $items
+     * @return list<int>
+     */
+    public static function erasurePlanRowBatchNative(array $items): array
+    {
+        self::w60Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w60Join([array_column($items, 0), array_column($items, 1), array_column($items, 2)], $count);
+        $ints = pack('P*', ...array_column($items, 3), ...array_column($items, 4), ...array_column($items, 5), ...array_column($items, 6), ...array_column($items, 7));
+
+        return self::w60Call($blob, $twin, $ints, $count, $count * self::W60_ROW_WORDS + self::W60_TRAILER_WORDS)
+            ?? self::erasurePlanRowBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w60Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W60 erasure plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 8 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1])
+                || ! \is_string($item[2]) || ! \is_int($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5]) || ! \is_int($item[6])
+                || ! \is_int($item[7])) {
+                throw new InvalidArgumentException('W60 erasure plan batch items must be [string table, string user column, string scope, int user id, int row count, int legal hold until, int now, int flags] lists.');
+            }
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        $enabled = self::w60RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W60 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('enabled');
+        self::w60RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w60Join(array $columns, int $count): array
+    {
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\0", $column);
+        }
+        $joined = implode("\0", $parts);
+        if (substr_count($joined, "\0") === \count($columns) * $count - 1) {
+            return [$joined, ''];
+        }
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\x01", $column);
+        }
+
+        return [$joined, implode("\x01", $parts)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w60Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w60RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w60', self::W60_FFI_CDEF) ?? false;
+            self::w60RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w60RustFfiState('out', $out);
+                self::w60RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W60_FFI_CDEF.)
+            $written = $ffi->nntmux_w604_gdpr_erasure_plan_row_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w60RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W60 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static: no arguments returns the state, one argument reads a key ('reset'
+     * clears everything) and two arguments write a key.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
     }
 }
