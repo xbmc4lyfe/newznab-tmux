@@ -8,6 +8,7 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Support\RustPipelineLibrary;
 use Closure;
 use FFI;
+use FFI\CData;
 use GuzzleHttp\Exception\GuzzleException;
 use Throwable;
 
@@ -389,5 +390,194 @@ class MoviesProcessor
         } catch (Throwable) {
             return null;
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 55.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 6.36x, p99 3.87x; uncommon mean 7.05x, p99 5.47x); see RustMoviesMusicProcessorMusicPostProcessTvMazeW55ParityTest. */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    public const string W55_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w554_movie_title_tag_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * summarizeMovieReleaseBatchPhp() per title instead of as totals. Each title yields four
+     * words: flags (resolution 1, source 2, codec 4, HDR 8, 19xx/20xx year 16, complete
+     * 32 = all but HDR, empty after trim() 64), the ASCII alphanumeric token count, the first
+     * year token (-1) and the trimmed span (leading offset << 32 | trimmed length).
+     *
+     * @param  list<string>  $titles
+     * @return list<int>
+     */
+    public static function movieTitleTagRowBatch(array $titles): array
+    {
+        return self::usesW55RustFfi()
+            ? self::movieTitleTagRowBatchNative($titles)
+            : self::movieTitleTagRowBatchPhp($titles);
+    }
+
+    /**
+     * @param  list<string>  $titles
+     * @return list<int>
+     */
+    public static function movieTitleTagRowBatchNative(array $titles): array
+    {
+        self::w55AssertColumns($titles);
+        $count = \count($titles);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w55Call(implode("\0", $titles), '', $count, 4)
+            ?? self::movieTitleTagRowBatchPhp($titles);
+    }
+
+    /**
+     * @param  list<string>  $titles
+     * @return list<int>
+     */
+    public static function movieTitleTagRowBatchPhp(array $titles): array
+    {
+        self::w55AssertColumns($titles);
+        $out = [];
+        foreach ($titles as $raw) {
+            $title = trim($raw);
+            $lead = \strlen($raw) - \strlen(ltrim($raw));
+            if ($title === '') {
+                array_push($out, 64, 0, -1, $lead << 32);
+
+                continue;
+            }
+            $flags = 0;
+            $year = -1;
+            $tokens = preg_split('/[^A-Za-z0-9]+/', strtoupper($title), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            foreach ($tokens as $token) {
+                $flags |= isset(self::W414_RESOLUTION_TOKENS[$token]) ? 1 : 0;
+                $flags |= isset(self::W414_SOURCE_TOKENS[$token]) ? 2 : 0;
+                $flags |= isset(self::W414_CODEC_TOKENS[$token]) ? 4 : 0;
+                $flags |= isset(self::W414_HDR_TOKENS[$token]) ? 8 : 0;
+                if (\strlen($token) === 4 && strspn($token, '0123456789') === 4 && (str_starts_with($token, '19') || str_starts_with($token, '20'))) {
+                    $flags |= 16;
+                    if ($year < 0) {
+                        $year = (int) $token;
+                    }
+                }
+            }
+            if (($flags & 23) === 23) {
+                $flags |= 32;
+            }
+            array_push($out, $flags, \count($tokens), $year, ($lead << 32) | \strlen($title));
+        }
+
+        return $out;
+    }
+
+    /**
+     * Equal-length list columns, or InvalidArgumentException.
+     *
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w55AssertColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (! array_is_list($column) || \count($column) !== $count) {
+                throw new \InvalidArgumentException('W55 batch columns must be lists of equal length.');
+            }
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W55 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('enabled');
+        self::w55RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text columns and packed int64 header in,
+     * `$words` int64 words back per record. Null when the library is missing or declines
+     * (a value holding a NUL byte adds a field, which the export rejects).
+     *
+     * @return list<int>|null
+     */
+    private static function w55Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            $state = self::w55RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w55', self::W55_FFI_CDEF) ?? false;
+                self::w55RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w55RustFfiState('out', $out);
+                self::w55RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
+            $written = $ffi->nntmux_w554_movie_title_tag_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W55 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }

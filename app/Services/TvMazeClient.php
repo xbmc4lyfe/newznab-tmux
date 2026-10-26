@@ -9,6 +9,7 @@ use App\Support\RustPipelineLibrary;
 use DariusIII\TVMaze\Episode;
 use DariusIII\TVMaze\TVShow;
 use FFI;
+use FFI\CData;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
@@ -483,5 +484,195 @@ class TvMazeClient
         } catch (Throwable) {
             return null;
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 55.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 4.94x, p99 2.74x; uncommon mean 3.48x, p99 3.16x); see RustMoviesMusicProcessorMusicPostProcessTvMazeW55ParityTest. */
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    public const string W55_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w554_tvmaze_aka_name_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** W464 country suffixes by code. */
+    private const array W55_COUNTRY_CODES = ['US' => 0, 'UK' => 1, 'AU' => 2, 'CA' => 3, 'NZ' => 4, 'JP' => 5, 'KR' => 6];
+
+    /**
+     * summarizeTvMazeAkaNameBatchPhp() per AKA name instead of as totals. Each name yields four
+     * words: flags (empty 1, blank 2, padded 4, article prefix 8, (dddd) year suffix 16,
+     * country suffix 32, punctuation 64, digit 128, non-ASCII 256, whitespace pair 512), the
+     * trimmed span (leading offset << 32 | trimmed length), the suffix year (-1) and the
+     * country suffix index in US, UK, AU, CA, NZ, JP, KR order (-1).
+     *
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function akaNameRowBatch(array $names): array
+    {
+        return self::usesW55RustFfi()
+            ? self::akaNameRowBatchNative($names)
+            : self::akaNameRowBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function akaNameRowBatchNative(array $names): array
+    {
+        self::w55AssertColumns($names);
+        $count = \count($names);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w55Call(implode("\0", $names), '', $count, 4)
+            ?? self::akaNameRowBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function akaNameRowBatchPhp(array $names): array
+    {
+        self::w55AssertColumns($names);
+        $out = [];
+        foreach ($names as $entry) {
+            if ($entry === '') {
+                array_push($out, 1, 0, -1, -1);
+
+                continue;
+            }
+            $name = trim($entry);
+            $lead = \strlen($entry) - \strlen(ltrim($entry));
+            $flags = ($name === '' ? 2 : 0) | ($name !== $entry ? 4 : 0);
+            $flags |= preg_match('/\A(?:[Tt][Hh][Ee]|[Aa][Nn]?)[ \t\n\r\x0b\f]/', $name) === 1 ? 8 : 0;
+            $year = -1;
+            $country = -1;
+            if (preg_match('/\(([0-9]{4})\)\z/', $name, $match) === 1) {
+                $flags |= 16;
+                $year = (int) $match[1];
+            } elseif (preg_match('/\((US|UK|AU|CA|NZ|JP|KR)\)\z/', $name, $match) === 1) {
+                $flags |= 32;
+                $country = self::W55_COUNTRY_CODES[$match[1]];
+            }
+            $flags |= preg_match('/[:!?&]/', $name) === 1 ? 64 : 0;
+            $flags |= preg_match('/[0-9]/', $name) === 1 ? 128 : 0;
+            $flags |= preg_match('/[\x80-\xff]/', $name) === 1 ? 256 : 0;
+            $flags |= preg_match('/[ \t\n\r\x0b\f]{2}/', $name) === 1 ? 512 : 0;
+            array_push($out, $flags, ($lead << 32) | \strlen($name), $year, $country);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Equal-length list columns, or InvalidArgumentException.
+     *
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w55AssertColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (! array_is_list($column) || \count($column) !== $count) {
+                throw new \InvalidArgumentException('W55 batch columns must be lists of equal length.');
+            }
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W55 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('enabled');
+        self::w55RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text columns and packed int64 header in,
+     * `$words` int64 words back per record. Null when the library is missing or declines
+     * (a value holding a NUL byte adds a field, which the export rejects).
+     *
+     * @return list<int>|null
+     */
+    private static function w55Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            $state = self::w55RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w55', self::W55_FFI_CDEF) ?? false;
+                self::w55RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w55RustFfiState('out', $out);
+                self::w55RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
+            $written = $ffi->nntmux_w554_tvmaze_aka_name_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W55 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }

@@ -519,4 +519,197 @@ final class PostProcessService
 
         return self::$w466Ffi === false ? null : self::$w466Ffi;
     }
+
+    // ---------------------------------------------------------------------
+    // Wave 55.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Disabled: PHP resolves each value too cheaply for packing, the crossing and decoding to pay off (minimum of three paired runs: common mean 1.19x, p99 1.00x; uncommon mean 1.10x, p99 0.91x); see RustMoviesMusicProcessorMusicPostProcessTvMazeW55ParityTest. */
+    private const bool W55_RUST_FFI_DEFAULT = false;
+
+    public const string W55_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w554_tv_lookup_mode_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * resolveTvLookupMode() per value with an integer default, as summarizeTvLookupModes()
+     * counts them. Each value yields two words: the resolved mode and flags (is_numeric() 1,
+     * renamed only 2, bucket << 2 with skip 0, all 1, renamed 2 and other 3, integer literal
+     * 16, whitespace-padded numeric string 32, null or '' 64).
+     *
+     * @param  list<int|string|null>  $values
+     * @return list<int>
+     */
+    public static function tvLookupModeRowBatch(array $values, int $defaultLookupValue): array
+    {
+        return self::usesW55RustFfi()
+            ? self::tvLookupModeRowBatchNative($values, $defaultLookupValue)
+            : self::tvLookupModeRowBatchPhp($values, $defaultLookupValue);
+    }
+
+    /**
+     * @param  list<int|string|null>  $values
+     * @return list<int>
+     */
+    public static function tvLookupModeRowBatchNative(array $values, int $defaultLookupValue): array
+    {
+        self::w55AssertColumns($values);
+        foreach ($values as $value) {
+            if ($value !== null && ! \is_int($value) && ! \is_string($value)) {
+                throw new \InvalidArgumentException('W55 TV lookup values must be int, string or null.');
+            }
+        }
+        $count = \count($values);
+        if ($count === 0) {
+            return [];
+        }
+
+        // implode() renders int and null exactly as is_numeric()/(int) read them.
+        return self::w55Call(implode("\0", $values), pack('P', $defaultLookupValue), $count, 2)
+            ?? self::tvLookupModeRowBatchPhp($values, $defaultLookupValue);
+    }
+
+    /**
+     * @param  list<int|string|null>  $values
+     * @return list<int>
+     */
+    public static function tvLookupModeRowBatchPhp(array $values, int $defaultLookupValue): array
+    {
+        self::w55AssertColumns($values);
+        $out = [];
+        foreach ($values as $value) {
+            if ($value === null) {
+                $resolved = $defaultLookupValue;
+                $flags = 64;
+            } elseif (\is_int($value)) {
+                $resolved = $value;
+                $flags = 17;
+            } elseif (\is_string($value)) {
+                if (is_numeric($value)) {
+                    $resolved = (int) $value;
+                    $flags = 1 | (strpbrk($value, '.eE') === false ? 16 : 0) | (trim($value, " \t\n\r\v\f") !== $value ? 32 : 0);
+                } else {
+                    $resolved = $defaultLookupValue;
+                    $flags = $value === '' ? 64 : 0;
+                }
+            } else {
+                throw new \InvalidArgumentException('W55 TV lookup values must be int, string or null.');
+            }
+            $flags |= match ($resolved) {
+                0 => 0,
+                1 => 4,
+                2 => 10,
+                default => 12,
+            };
+            array_push($out, $resolved, $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Equal-length list columns, or InvalidArgumentException.
+     *
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w55AssertColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (! array_is_list($column) || \count($column) !== $count) {
+                throw new \InvalidArgumentException('W55 batch columns must be lists of equal length.');
+            }
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $enabled = self::w55RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W55 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('enabled');
+        self::w55RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text columns and packed int64 header in,
+     * `$words` int64 words back per record. Null when the library is missing or declines
+     * (a value holding a NUL byte adds a field, which the export rejects).
+     *
+     * @return list<int>|null
+     */
+    private static function w55Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            $state = self::w55RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w55', self::W55_FFI_CDEF) ?? false;
+                self::w55RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w55RustFfiState('out', $out);
+                self::w55RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
+            $written = $ffi->nntmux_w554_tv_lookup_mode_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W55 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
+    }
 }
