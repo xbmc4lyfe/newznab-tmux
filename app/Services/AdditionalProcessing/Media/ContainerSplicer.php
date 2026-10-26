@@ -392,4 +392,208 @@ final class ContainerSplicer
 
         return $buffer === null ? null : [$ffi, $buffer];
     }
+
+    // Rust is the default only while the paired W55.6 benchmark clears 1.5x on all four metrics.
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    public const string W55_FFI_CDEF = <<<'C'
+        int32_t nntmux_w556_resume_probe_batch(const char *mids, size_t mids_len, const char *mid_lens, size_t mid_lens_len, size_t count, int64_t window, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W55_PROBE_HEADER = 8;
+
+    public const int W55_DEFAULT_WINDOW = 65_536;
+
+    private const int W55_MAX_ITEMS = 1_048_576;
+
+    private const int W55_WINDOW_CAP = 1_048_575;
+
+    /**
+     * Find every resume point splicePhp() looks for in the first `$window` bytes of each mid chunk (0 or
+     * less uses 65,536; capped at 2^20-1), so a chunk of unknown container can be matched to the ones it
+     * can resume as: the Matroska cluster, the MPEG pack start, the transport stream offset
+     * (VideoContainer::transportStreamOffsetPhp()) and the AVI stream chunk.
+     *
+     * Layout: `[0]` count, `[1]` window, `[2..5]` chunks with a cluster / pack start / transport offset /
+     * AVI chunk, `[6]` chunks with none, `[7]` FNV-1a digest; then two words per chunk: `cluster + 1 |
+     * (pack + 1) << 21 | (transport + 1) << 42` (0 when absent) and `avi + 1 | stride << 21 | found << 23
+     * | scanned << 27` (stride 1 for 188-byte and 2 for 192-byte packets; found bits in header order;
+     * scanned bytes).
+     *
+     * @param  array<array-key, string>  $mids
+     * @return list<int>
+     */
+    public static function probeResumeBatch(array $mids, int $window = self::W55_DEFAULT_WINDOW): array
+    {
+        return (self::usesW55RustFfi() ? self::probeResumeBatchNative($mids, $window) : null) ?? self::probeResumeBatchPhp($mids, $window);
+    }
+
+    /**
+     * @param  array<array-key, string>  $mids
+     * @return list<int>
+     */
+    public static function probeResumeBatchPhp(array $mids, int $window = self::W55_DEFAULT_WINDOW): array
+    {
+        $window = $window <= 0 ? self::W55_DEFAULT_WINDOW : min($window, self::W55_WINDOW_CAP);
+        $out = array_fill(0, self::W55_PROBE_HEADER, 0);
+        $out[0] = \count($mids);
+        $out[1] = $window;
+        $digest = 2_166_136_261;
+        $rows = [];
+        foreach ($mids as $mid) {
+            $hay = \strlen($mid) > $window ? substr($mid, 0, $window) : $mid;
+            $length = \strlen($hay);
+            $cluster = strpos($hay, self::MATROSKA_CLUSTER);
+            $cluster = $cluster === false ? 0 : $cluster + 1;
+            $pack = strpos($hay, self::MPEG_PACK_START);
+            $pack = $pack === false ? 0 : $pack + 1;
+            $transport = $stride = 0;
+            foreach ([1 => 188, 2 => 192] as $code => $step) {
+                for ($offset = 0, $limit = min($length - $step * 4, $step); $offset < $limit; $offset++) {
+                    if ($hay[$offset] === "\x47" && $hay[$offset + $step] === "\x47"
+                        && $hay[$offset + $step * 2] === "\x47" && $hay[$offset + $step * 3] === "\x47"
+                    ) {
+                        $transport = $offset + 1;
+                        $stride = $code;
+                        break 2;
+                    }
+                }
+            }
+            $avi = preg_match('/\d\d(?:dc|db|wb)/', $hay, $chunk, PREG_OFFSET_CAPTURE) === 1 ? $chunk[0][1] + 1 : 0;
+            $found = ($cluster > 0 ? 1 : 0) | ($pack > 0 ? 2 : 0) | ($transport > 0 ? 4 : 0) | ($avi > 0 ? 8 : 0);
+            $out[2] += $found & 1;
+            $out[3] += ($found >> 1) & 1;
+            $out[4] += ($found >> 2) & 1;
+            $out[5] += $found >> 3;
+            $out[6] += $found === 0 ? 1 : 0;
+            $first = $cluster | $pack << 21 | $transport << 42;
+            $second = $avi | $stride << 21 | $found << 23 | $length << 27;
+            $digest = (($digest ^ (($first ^ ($first >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $digest = (($digest ^ (($second ^ ($second >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $first;
+            $rows[] = $second;
+        }
+        $out[7] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust probe, or null when PHP must compute it (unavailable library or rejected input). Only each
+     * chunk's scan window crosses.
+     *
+     * @param  array<array-key, string>  $mids
+     * @return list<int>|null
+     */
+    public static function probeResumeBatchNative(array $mids, int $window = self::W55_DEFAULT_WINDOW): ?array
+    {
+        $count = \count($mids);
+        if ($count > self::W55_MAX_ITEMS) {
+            return null;
+        }
+        $window = $window <= 0 ? self::W55_DEFAULT_WINDOW : min($window, self::W55_WINDOW_CAP);
+        $mids = array_values($mids);
+        $lengths = array_map('strlen', $mids);
+        if ($count > 0 && max($lengths) > $window) {
+            $mids = array_map(static fn (string $mid): string => \strlen($mid) > $window ? substr($mid, 0, $window) : $mid, $mids);
+            $lengths = array_map('strlen', $mids);
+        }
+        $joined = implode('', $mids);
+        $lengthPack = pack('V*', ...$lengths);
+        $fields = self::W55_PROBE_HEADER + 2 * $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w55Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w556_resume_probe_batch($joined, \strlen($joined), $lengthPack, \strlen($lengthPack), $count, $window, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 55.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $forced = self::w55RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 55.6 routing and binding, kept in function statics so earlier waves' static state stays
+     * untouched. No `$op` returns the forced routing (null for the default); `'set'` replaces it with
+     * `$val` and returns the previous value; `'binding'` returns the cached `additional_w55` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w55', self::W55_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 55.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w55Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w55RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
 }

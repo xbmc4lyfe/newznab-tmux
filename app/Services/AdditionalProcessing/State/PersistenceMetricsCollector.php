@@ -334,4 +334,262 @@ final class PersistenceMetricsCollector
             $this->searchSyncExecutions,
         ]);
     }
+
+    // Rust is the default only while the paired W55.6 benchmark clears 1.5x on all four metrics.
+    private const bool W55_RUST_FFI_DEFAULT = true;
+
+    public const string W55_FFI_CDEF = <<<'C'
+        int32_t nntmux_w556_scoped_event_batch(const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W55_EVENT_HEADER = 12;
+
+    private const int W55_MAX_ITEMS = 1_048_576;
+
+    private const int W55_COUNT_CAP = 1_048_575;
+
+    private const int W55_SHORT_CAP = 65_535;
+
+    private const int W55_VALUE_CAP = 1_099_511_627_775;
+
+    private const int W55_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /**
+     * Fold collector events across many release scopes in one pass, as consecutive
+     * beginReleaseScope()/record*() calls would: a scope differing from the previous event's opens a
+     * new scope with reset counters. Columns per event: kind (`EVENT_*`; others are unknown), scope
+     * release ID (negative is no scope), event release ID and statement microseconds (clamped to
+     * 0..2^40-1); missing values are 0. Statements count under any scope; sync requests and executions
+     * only for the scope's own release. Running counters saturate at 2^20-1 statements, 2^40-1
+     * microseconds and 2^16-1 requests/executions.
+     *
+     * Layout: `[0]` count, `[1]` statements, `[2]` statement microseconds (capped at 2^62), `[3]`
+     * requests, `[4]` executions, `[5]` ignored, `[6]` unknown, `[7]` scopes opened, `[8]` slowest
+     * statement microseconds and `[9]` its first event (-1 when none), `[10]` scopes closed with
+     * requests differing from executions, `[11]` FNV-1a digest; then per event `status | opened << 2 |
+     * kind << 3 | statements << 5 | requests << 25 | executions << 41` (status 0 ignored, 1 applied, 2
+     * unknown; kind 3 for unknown; the scope's running counters after the event).
+     *
+     * @param  array<array-key, int>  $kinds
+     * @param  array<array-key, int>  $scopes
+     * @param  array<array-key, int>  $releaseIds
+     * @param  array<array-key, int>  $micros
+     * @return list<int>
+     */
+    public static function foldScopedEventBatch(array $kinds, array $scopes, array $releaseIds, array $micros): array
+    {
+        return (self::usesW55RustFfi() ? self::foldScopedEventBatchNative($kinds, $scopes, $releaseIds, $micros) : null)
+            ?? self::foldScopedEventBatchPhp($kinds, $scopes, $releaseIds, $micros);
+    }
+
+    /**
+     * @param  array<array-key, int>  $kinds
+     * @param  array<array-key, int>  $scopes
+     * @param  array<array-key, int>  $releaseIds
+     * @param  array<array-key, int>  $micros
+     * @return list<int>
+     */
+    public static function foldScopedEventBatchPhp(array $kinds, array $scopes, array $releaseIds, array $micros): array
+    {
+        $kinds = array_values($kinds);
+        $scopes = array_values($scopes);
+        $releaseIds = array_values($releaseIds);
+        $micros = array_values($micros);
+        $count = \count($kinds);
+        $valueCap = self::W55_VALUE_CAP;
+        $out = array_fill(0, self::W55_EVENT_HEADER, 0);
+        $out[0] = $count;
+        $slowAt = -1;
+        $slow = 0;
+        $scope = null;
+        $started = false;
+        $statements = $elapsed = $requests = $executions = 0;
+        $digest = 2_166_136_261;
+        $rows = [];
+        for ($i = 0; $i < $count; $i++) {
+            $kind = $kinds[$i];
+            $raw = $scopes[$i] ?? 0;
+            $current = $raw >= 0 ? $raw : null;
+            $release = $releaseIds[$i] ?? 0;
+            $m = min(max($micros[$i] ?? 0, 0), $valueCap);
+            $opened = 0;
+            if (! $started || $current !== $scope) {
+                if ($started && $scope !== null && $requests !== $executions) {
+                    $out[10]++;
+                }
+                $started = true;
+                $scope = $current;
+                $statements = $elapsed = $requests = $executions = 0;
+                if ($current !== null) {
+                    $out[7]++;
+                    $opened = 1;
+                }
+            }
+            if ($kind === self::EVENT_DATABASE_STATEMENT && $current !== null) {
+                $statements = min($statements + 1, self::W55_COUNT_CAP);
+                $elapsed = min($elapsed + $m, $valueCap);
+                $out[1]++;
+                $out[2] = min($out[2] + $m, self::W55_TOTAL_CAP);
+                if ($slowAt < 0 || $m > $slow) {
+                    $slowAt = $i;
+                    $slow = $m;
+                }
+                $status = 1;
+                $code = 0;
+            } elseif ($kind === self::EVENT_SEARCH_SYNC_REQUEST && $current === $release) {
+                $requests = min($requests + 1, self::W55_SHORT_CAP);
+                $out[3]++;
+                $status = 1;
+                $code = 1;
+            } elseif ($kind === self::EVENT_SEARCH_SYNC_EXECUTION && $current === $release) {
+                $executions = min($executions + 1, self::W55_SHORT_CAP);
+                $out[4]++;
+                $status = 1;
+                $code = 2;
+            } elseif ($kind >= 0 && $kind <= 2) {
+                $out[5]++;
+                $status = 0;
+                $code = $kind;
+            } else {
+                $out[6]++;
+                $status = 2;
+                $code = 3;
+            }
+            $row = $status | $opened << 2 | $code << 3 | $statements << 5 | $requests << 25 | $executions << 41;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        if ($started && $scope !== null && $requests !== $executions) {
+            $out[10]++;
+        }
+        $out[8] = $slow;
+        $out[9] = $slowAt;
+        $out[11] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust fold, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, int>  $kinds
+     * @param  array<array-key, int>  $scopes
+     * @param  array<array-key, int>  $releaseIds
+     * @param  array<array-key, int>  $micros
+     * @return list<int>|null
+     */
+    public static function foldScopedEventBatchNative(array $kinds, array $scopes, array $releaseIds, array $micros): ?array
+    {
+        $count = \count($kinds);
+        if ($count > self::W55_MAX_ITEMS) {
+            return null;
+        }
+        $ints = pack('q*', ...self::w55Fit($kinds, $count), ...self::w55Fit($scopes, $count), ...self::w55Fit($releaseIds, $count), ...self::w55Fit($micros, $count));
+        $fields = self::W55_EVENT_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w55Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w556_scoped_event_batch($ints, \strlen($ints), $count, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 55.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w55RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w55RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW55RustFfi(): bool
+    {
+        $forced = self::w55RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W55_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 55.6 routing and binding, kept in function statics so earlier waves' static state stays
+     * untouched. No `$op` returns the forced routing (null for the default); `'set'` replaces it with
+     * `$val` and returns the previous value; `'binding'` returns the cached `additional_w55` binding and
+     * an output buffer of at least `$val` values, or null.
+     */
+    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w55', self::W55_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 55.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w55Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w55RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Exactly `$count` values: the list itself when it already fits, otherwise padded with 0.
+     *
+     * @param  array<array-key, int>  $values
+     * @return list<int>
+     */
+    private static function w55Fit(array $values, int $count): array
+    {
+        return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, 0);
+    }
 }
