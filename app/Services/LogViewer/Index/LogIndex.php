@@ -658,4 +658,237 @@ class LogIndex
 
         return self::w54Words($count, implode("\0", $lines), 4 * $count) ?? self::headerPlanBatchPhp($lines);
     }
+
+    /** C signature of the Wave 67.5 {@see self::w67LogIndexPlanBatch()} helper. */
+    private const string W67_LOG_INDEX_PLAN_FFI_CDEF = 'int64_t nntmux_w675_log_index_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 67.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 7.35/5.97/6.81/5.68x); see tests/Unit/RustLogViewerIndexCoordinatorManticoreEntryParserW67ParityTest.php.
+     */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 67.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w67_5', self::W67_LOG_INDEX_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W67_RUST_FFI_DEFAULT;
+        }
+    }
+
+    /** Route the Wave 67.5 plan batch to Rust until disabled or reset. */
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', true);
+    }
+
+    /** Route the Wave 67.5 plan batch to PHP until enabled or reset. */
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', false);
+    }
+
+    /** Restore W67_RUST_FFI_DEFAULT routing and drop the cached Wave 67.5 handle and buffer. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('set', null);
+        self::w67RustFfiState('reset', null);
+    }
+
+    public static function usesW67RustFfi(): bool
+    {
+        return self::w67RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with w67LogIndexPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 67.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w67Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w67RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w675_log_index_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Trimmed 1-15 ASCII digits as an integer; empty yields $default, anything else sets bit 1 and yields $default. */
+    private static function w67Number(string $field, int $default, int &$flags): int
+    {
+        $text = trim($field);
+        if ($text === '') {
+            return $default;
+        }
+        if (\strlen($text) <= 15 && strspn($text, '0123456789') === \strlen($text)) {
+            return (int) $text;
+        }
+        $flags |= 1;
+
+        return $default;
+    }
+
+    /** Wave 67.5 default chunk size, as `LogIndexer::MAX_BATCH_BYTES`. */
+    private const int W67_CHUNK_BYTES = 8_388_608;
+
+    /** Largest file id whose {@see documentId()} stays a positive 64-bit integer. */
+    private const int W67_MAX_FILE_ID = (1 << (63 - self::OFFSET_BITS)) - 1;
+
+    /**
+     * Batch incremental index plan over `file_id\tsize\tinode\tstored_inode\tstored_size\tindexed_offset\tchunk_bytes`.
+     * Eight words per record: `[action, resume_offset, remaining, chunks, last_chunk_bytes, first_document_id,
+     * end_document_id, flags]`. Numbers are trimmed 1-15 ASCII digits; empty or invalid ones take their default (0,
+     * chunk bytes W67_CHUNK_BYTES floored at 1). Action: 3 new (no stored inode), 2 reset (inode changed or the file
+     * shrank below the stored size or offset), 1 index the unread tail, 0 caught up; resets resume at 0. The remaining
+     * bytes split into chunk-sized reads (the last one possibly shorter). Document ids are {@see documentId()} of the
+     * resume offset and the size, -1 when out of range. Flags: 1 invalid number, 2 not exactly seven fields, 4 inode
+     * changed, 8 truncated, 16 size or offset beyond OFFSET_BITS, 32 file id beyond W67_MAX_FILE_ID.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67LogIndexPlanBatch(array $records): array
+    {
+        return self::usesW67RustFfi() ? self::w67LogIndexPlanBatchNative($records) : self::w67LogIndexPlanBatchPhp($records);
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67LogIndexPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w67Words($count, implode("\0", $records), 8 * $count) ?? self::w67LogIndexPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function w67LogIndexPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 7 ? 0 : 2;
+            $fileId = self::w67Number($fields[0], 0, $flags);
+            $size = self::w67Number($fields[1] ?? '', 0, $flags);
+            $inode = self::w67Number($fields[2] ?? '', 0, $flags);
+            $storedInode = self::w67Number($fields[3] ?? '', 0, $flags);
+            $storedSize = self::w67Number($fields[4] ?? '', 0, $flags);
+            $offset = self::w67Number($fields[5] ?? '', 0, $flags);
+            $chunk = max(1, self::w67Number($fields[6] ?? '', self::W67_CHUNK_BYTES, $flags));
+            if ($storedInode !== 0 && $inode !== $storedInode) {
+                $flags |= 4;
+            }
+            if ($storedInode !== 0 && ($size < $storedSize || $size < $offset)) {
+                $flags |= 8;
+            }
+            if ($size >= 1 << self::OFFSET_BITS || $offset >= 1 << self::OFFSET_BITS) {
+                $flags |= 16;
+            }
+            if ($fileId > self::W67_MAX_FILE_ID) {
+                $flags |= 32;
+            }
+            $action = match (true) {
+                $storedInode === 0 => 3,
+                ($flags & 12) !== 0 => 2,
+                default => $offset < $size ? 1 : 0,
+            };
+            $resume = $action >= 2 ? 0 : $offset;
+            $remaining = $size - $resume;
+            $chunks = intdiv($remaining + $chunk - 1, $chunk);
+            $valid = ($flags & 48) === 0;
+            array_push(
+                $out,
+                $action,
+                $resume,
+                $remaining,
+                $chunks,
+                $remaining === 0 ? 0 : $remaining - ($chunks - 1) * $chunk,
+                $valid ? self::documentId($fileId, $resume) : -1,
+                $valid ? self::documentId($fileId, $size) : -1,
+                $flags,
+            );
+        }
+
+        return $out;
+    }
 }
