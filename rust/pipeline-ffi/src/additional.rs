@@ -44229,3 +44229,1010 @@ mod w596_proxy_context_verdict_rows_book_tests {
         assert_eq!(status, -2);
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 60.6: archived media entry summary, release result classification,
+// download kind plan, mapping confidence plan and media source resolution
+// batches (`nntmux_w606_*`) for ArchivedMediaEntry, ReleaseProcessingResult,
+// DownloadKind, MappingConfidence and MediaSourceResolver. Same contract as
+// Wave 59.6: strings are NUL-joined column after column (with a 0x01-joined
+// twin when one holds a NUL), integer columns are machine-order `int64_t`, and
+// the result is fixed-width `int64_t` words. Every export returns 1, -1 for
+// invalid input (PHP then computes the batch) or -2 when `out` is null,
+// misaligned or too small, and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+/// Base name after the last `/` or `\`.
+#[inline]
+fn w606_base(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/' || b == b'\\') {
+        Some(at) => &path[at + 1..],
+        None => path,
+    }
+}
+
+/// A `..` segment between `/` or `\` separators.
+#[inline]
+fn w606_traversal(path: &[u8]) -> bool {
+    path.split(|&b| b == b'/' || b == b'\\')
+        .any(|segment| segment == b"..")
+}
+
+/// Video containers 1-8 by lowercase extension, 0 otherwise.
+#[inline]
+fn w606_container(ext: &[u8]) -> i64 {
+    match ext {
+        b"mkv" => 1,
+        b"mp4" | b"m4v" => 2,
+        b"avi" => 3,
+        b"ts" | b"m2ts" | b"mts" => 4,
+        b"wmv" => 5,
+        b"mov" => 6,
+        b"mpg" | b"mpeg" | b"vob" => 7,
+        b"webm" => 8,
+        _ => 0,
+    }
+}
+
+/// PHP `str_replace('_', '-', strtolower(trim($value)))` into `buffer`.
+#[inline]
+fn w606_normalize_into(value: &[u8], buffer: &mut Vec<u8>) {
+    buffer.clear();
+    buffer.extend(w566_trim(value).iter().map(|&b| {
+        if b == b'_' {
+            b'-'
+        } else {
+            b.to_ascii_lowercase()
+        }
+    }));
+}
+
+// --- ArchivedMediaEntry::summarizeArchivedEntryBatch -------------------------
+
+pub(crate) const W606_ENTRY_HEADER: usize = 29;
+
+/// 1-8 video containers, 9 audio, 10 image, 11 text, 12 archive; others 0.
+#[inline]
+fn w606_entry_class(ext: &[u8]) -> i64 {
+    match ext {
+        b"mp3" | b"flac" | b"m4a" | b"ogg" | b"wav" => 9,
+        b"jpg" | b"jpeg" | b"png" | b"webp" => 10,
+        b"nfo" | b"txt" | b"srt" | b"sub" => 11,
+        b"rar" | b"zip" | b"7z" => 12,
+        _ => w606_container(ext),
+    }
+}
+
+/// Names with four integer columns (real size, held bytes, compression method,
+/// encrypted flag). Sizes clamp to 0..2^40-1; a non-zero method is compressed.
+/// `[0]` count, `[1]` video, `[2]` playable, `[3]` samples, `[4]` compressed,
+/// `[5]` encrypted, `[6]` unsafe, `[7]` complete, `[8]` size and `[9]` held
+/// totals (capped at 2^62), `[10]` main video index (-1) and `[11]` its size,
+/// `[12]` best sample index (-1) and `[13]` its size, `[14..27]` per class,
+/// `[27]` mean held percent, `[28]` FNV-1a digest; then per entry `class |
+/// sample << 4 | compressed << 5 | encrypted << 6 | unsafe << 7 | complete << 8
+/// | playable << 9 | percent << 10 | min(name bytes, 65535) << 17 | min(ext
+/// bytes, 255) << 33 | codec << 41 | hidden << 44`.
+pub(crate) fn w606_entry_batch(names: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+    let count = names.len();
+    let mut out = vec![0i64; W606_ENTRY_HEADER + count];
+    out[0] = count as i64;
+    out[10] = -1;
+    out[12] = -1;
+    let mut lower = Vec::new();
+    let mut percent_sum = 0i64;
+    for (at, &name) in names.iter().enumerate() {
+        let size = w47_clamp(ints[at]);
+        let held = w47_clamp(ints[count + at]);
+        let compressed = i64::from(ints[2 * count + at] != 0);
+        let encrypted = i64::from(ints[3 * count + at] != 0);
+        let base = w606_base(name);
+        w47_lower_into(base, &mut lower);
+        let (ext, _) = w47_extension(&lower);
+        let class = w606_entry_class(ext);
+        let sample = i64::from(w47_contains(&lower, b"sample"));
+        let unsafe_path = i64::from(
+            base.is_empty()
+                || matches!(name.first(), Some(b'/' | b'\\'))
+                || name.contains(&0)
+                || w606_traversal(name),
+        );
+        let complete = i64::from(held >= size);
+        let percent = if size > 0 {
+            (held * 100 / size).min(100)
+        } else {
+            100
+        };
+        let video = (1..=8).contains(&class);
+        let playable =
+            i64::from(video && compressed == 0 && encrypted == 0 && unsafe_path == 0 && size > 0);
+        out[1] += i64::from(video);
+        out[2] += playable;
+        out[3] += sample;
+        out[4] += compressed;
+        out[5] += encrypted;
+        out[6] += unsafe_path;
+        out[7] += complete;
+        out[8] = (out[8] + size).min(W47_TOTAL_CAP);
+        out[9] = (out[9] + held).min(W47_TOTAL_CAP);
+        if playable == 1 {
+            let slot = if sample == 0 { 10 } else { 12 };
+            if out[slot] < 0 || size > out[slot + 1] {
+                out[slot] = at as i64;
+                out[slot + 1] = size;
+            }
+        }
+        out[14 + class as usize] += 1;
+        percent_sum += percent;
+        out[W606_ENTRY_HEADER + at] = class
+            | sample << 4
+            | compressed << 5
+            | encrypted << 6
+            | unsafe_path << 7
+            | complete << 8
+            | playable << 9
+            | percent << 10
+            | (name.len().min(65_535) as i64) << 17
+            | (ext.len().min(255) as i64) << 33
+            | w47_codec_hint(&lower) << 41
+            | i64::from(base.first() == Some(&b'.')) << 44;
+    }
+    if count > 0 {
+        out[27] = percent_sum / count as i64;
+    }
+    out[28] = w526_digest(&out[W606_ENTRY_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w606_archived_entry_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let names = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                1,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 4, count)?;
+            Some(w606_entry_batch(&names, &ints))
+        })
+    }
+}
+
+// --- ReleaseProcessingResult::classifyResultBatch ----------------------------
+
+pub(crate) const W606_RESULT_HEADER: usize = 45;
+
+/// `ProcessingOutcome` backing value => case index; 12 is unknown.
+#[inline]
+fn w606_outcome(value: &[u8]) -> i64 {
+    match value {
+        b"completed" => 0,
+        b"no-useful-artifacts" => 1,
+        b"passworded" => 2,
+        b"group-unavailable" => 3,
+        b"temporary-workspace-unavailable" => 4,
+        b"timed-out" => 5,
+        b"deleted-after-timeout" => 6,
+        b"deleted-broken-nzb" => 7,
+        b"deleted-par2-only" => 8,
+        b"not-found" => 9,
+        b"awaiting-late-articles" => 10,
+        b"failed" => 11,
+        _ => 12,
+    }
+}
+
+/// Slowest stage: 0-9 known, 10 unknown, 11 empty.
+#[inline]
+fn w606_stage(value: &[u8]) -> i64 {
+    match value {
+        b"download" => 0,
+        b"archive" => 1,
+        b"par2" => 2,
+        b"media" => 3,
+        b"sample" => 4,
+        b"video" => 5,
+        b"audio" => 6,
+        b"image" => 7,
+        b"nfo" => 8,
+        b"persist" => 9,
+        b"" => 11,
+        _ => 10,
+    }
+}
+
+/// Outcome and slowest-stage columns with five integer columns (elapsed and
+/// staged microseconds, artifacts flag, files added, attempts). Disposition 0
+/// success, 1 retry, 2 retries exhausted, 3 deleted, 4 not found, 5 other.
+/// `[0]` count, `[1..14]` per outcome, `[14..20]` per disposition, `[20..32]`
+/// per stage, `[32]` artifacts, `[33]` files, `[34]` elapsed, `[35]` staged and
+/// `[36]` unaccounted totals, `[37]` overruns, `[38]` mismatches, `[39]`
+/// slowest elapsed and `[40]` its index (-1), `[41]` first retry and `[42]`
+/// first exhausted index (-1), `[43]` max backoff, `[44]` FNV-1a digest; then
+/// per result `case | disposition << 4 | stage << 7 | artifacts << 11 |
+/// mismatch << 12 | overrun << 13 | min(attempts, 255) << 14 | backoff << 22 |
+/// min(unaccounted, 2^29-1) << 34`.
+pub(crate) fn w606_result_batch(
+    fields: &[&[u8]],
+    ints: &[i64],
+    count: usize,
+    max_attempts: i64,
+) -> Vec<i64> {
+    let mut out = vec![0i64; W606_RESULT_HEADER + count];
+    out[0] = count as i64;
+    out[40] = -1;
+    out[41] = -1;
+    out[42] = -1;
+    for at in 0..count {
+        let case = w606_outcome(fields[at]);
+        let stage_class = w606_stage(fields[count + at]);
+        let elapsed = w47_clamp(ints[at]);
+        let staged = w47_clamp(ints[count + at]);
+        let artifacts = i64::from(ints[2 * count + at] != 0);
+        let files = w47_clamp(ints[3 * count + at]);
+        let attempts = ints[4 * count + at].clamp(0, 1_048_575);
+        let disposition: i64 = match case {
+            0..=2 => 0,
+            3 | 4 | 5 | 10 | 11 => {
+                if attempts < max_attempts {
+                    1
+                } else {
+                    2
+                }
+            }
+            6..=8 => 3,
+            9 => 4,
+            _ => 5,
+        };
+        let backoff = if disposition == 1 {
+            (30i64 << attempts.min(10)).min(3_600)
+        } else {
+            0
+        };
+        let unaccounted = if elapsed > staged {
+            elapsed - staged
+        } else {
+            0
+        };
+        let overrun = i64::from(staged > elapsed);
+        let mismatch = i64::from(disposition != 0 && (artifacts == 1 || files > 0));
+        out[1 + case as usize] += 1;
+        out[14 + disposition as usize] += 1;
+        out[20 + stage_class as usize] += 1;
+        out[32] += artifacts;
+        out[33] = (out[33] + files).min(W47_TOTAL_CAP);
+        out[34] = (out[34] + elapsed).min(W47_TOTAL_CAP);
+        out[35] = (out[35] + staged).min(W47_TOTAL_CAP);
+        out[36] = (out[36] + unaccounted).min(W47_TOTAL_CAP);
+        out[37] += overrun;
+        out[38] += mismatch;
+        if out[40] < 0 || elapsed > out[39] {
+            out[39] = elapsed;
+            out[40] = at as i64;
+        }
+        if disposition == 1 {
+            w586_first(&mut out[41], at);
+        } else if disposition == 2 {
+            w586_first(&mut out[42], at);
+        }
+        out[43] = out[43].max(backoff);
+        out[W606_RESULT_HEADER + at] = case
+            | disposition << 4
+            | stage_class << 7
+            | artifacts << 11
+            | mismatch << 12
+            | overrun << 13
+            | attempts.min(255) << 14
+            | backoff << 22
+            | unaccounted.min((1 << 29) - 1) << 34;
+    }
+    out[44] = w526_digest(&out[W606_RESULT_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w606_release_result_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    max_attempts: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let fields = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                2,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 5, count)?;
+            Some(w606_result_batch(&fields, &ints, count, max_attempts))
+        })
+    }
+}
+
+// --- DownloadKind::planDownloadKindBatch -------------------------------------
+
+pub(crate) const W606_KIND_HEADER: usize = 24;
+
+/// Article limit and timeout percent per case (7 unknown).
+const W606_KIND_LIMITS: [i64; 8] = [40, 8, 20, 4, 12, 2, 1, 0];
+const W606_KIND_TIMEOUT_PERCENT: [i64; 8] = [100, 50, 75, 25, 100, 25, 50, 0];
+
+#[inline]
+fn w606_kind_value(value: &[u8]) -> Option<i64> {
+    Some(match value {
+        b"sample" => 0,
+        b"media-info" => 1,
+        b"audio" => 2,
+        b"jpg" => 3,
+        b"compressed" => 4,
+        b"par2-index" => 5,
+        b"media-source" => 6,
+        _ => return None,
+    })
+}
+
+#[inline]
+fn w606_kind_name(value: &[u8]) -> Option<i64> {
+    Some(match value {
+        b"Sample" => 0,
+        b"MediaInfo" => 1,
+        b"Audio" => 2,
+        b"Jpg" => 3,
+        b"Compressed" => 4,
+        b"Par2Index" => 5,
+        b"MediaSource" => 6,
+        _ => return None,
+    })
+}
+
+#[inline]
+fn w606_kind_alias(value: &[u8]) -> Option<i64> {
+    Some(match value {
+        b"samples" => 0,
+        b"mediainfo" | b"info" => 1,
+        b"mp3" | b"music" => 2,
+        b"jpeg" | b"image" | b"preview" => 3,
+        b"archive" | b"rar" => 4,
+        b"par2" | b"par2index" | b"par" => 5,
+        b"source" | b"mediasource" | b"video" => 6,
+        _ => return None,
+    })
+}
+
+/// Kind column with requested article and byte columns. Kinds resolve by
+/// backing value (source 0), case name (1), normalized value (2), alias (3),
+/// else unknown case 7 (4). Articles clamp to 0..2^20-1 and bytes to
+/// 0..2^40-1; each download plans `min(requested, kind limit, remaining
+/// budget)` articles in order. `[0]` count, `[1..9]` per case, `[9..14]` per
+/// source, `[14]` previews, `[15]` requested and `[16]` planned articles,
+/// `[17]` truncated and `[18]` its first index (-1), `[19]` planned bytes,
+/// `[20]` remaining budget, `[21]` max and `[22]` total timeout ms, `[23]`
+/// FNV-1a digest; then per download `case | source << 3 | preview << 6 |
+/// truncated << 7 | planned << 8 | timeout ms << 29 | min(kind bytes, 31) << 58`.
+pub(crate) fn w606_kind_batch(
+    kinds: &[&[u8]],
+    ints: &[i64],
+    budget: i64,
+    timeout_seconds: i64,
+) -> Vec<i64> {
+    let count = kinds.len();
+    let mut out = vec![0i64; W606_KIND_HEADER + count];
+    out[0] = count as i64;
+    out[18] = -1;
+    let budget = budget.clamp(0, W47_VALUE_CAP);
+    let base = timeout_seconds.clamp(0, 86_400);
+    let mut used = 0i64;
+    let mut normalized = Vec::new();
+    for (at, &kind) in kinds.iter().enumerate() {
+        let (case, source) = match w606_kind_value(kind) {
+            Some(case) => (case, 0i64),
+            None => match w606_kind_name(kind) {
+                Some(case) => (case, 1),
+                None => {
+                    w606_normalize_into(kind, &mut normalized);
+                    match w606_kind_value(&normalized) {
+                        Some(case) => (case, 2),
+                        None => w606_kind_alias(&normalized).map_or((7, 4), |case| (case, 3)),
+                    }
+                }
+            },
+        };
+        let requested = ints[at].clamp(0, 1_048_575);
+        let size = w47_clamp(ints[count + at]);
+        let planned = requested
+            .min(W606_KIND_LIMITS[case as usize])
+            .min(budget - used);
+        used += planned;
+        let truncated = i64::from(planned < requested);
+        let per_article = if requested > 0 { size / requested } else { 0 };
+        let timeout = base * 1_000 * W606_KIND_TIMEOUT_PERCENT[case as usize] / 100 + planned * 250;
+        let preview = i64::from(matches!(case, 3 | 5 | 6));
+        out[1 + case as usize] += 1;
+        out[9 + source as usize] += 1;
+        out[14] += preview;
+        out[15] += requested;
+        out[16] += planned;
+        out[17] += truncated;
+        if truncated == 1 {
+            w586_first(&mut out[18], at);
+        }
+        out[19] = (out[19] + per_article * planned).min(W47_TOTAL_CAP);
+        out[21] = out[21].max(timeout);
+        out[22] += timeout;
+        out[W606_KIND_HEADER + at] = case
+            | source << 3
+            | preview << 6
+            | truncated << 7
+            | planned << 8
+            | timeout << 29
+            | (kind.len().min(31) as i64) << 58;
+    }
+    out[20] = budget - used;
+    out[23] = w526_digest(&out[W606_KIND_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w606_download_kind_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    article_budget: i64,
+    timeout_seconds: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let kinds = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                1,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w606_kind_batch(
+                &kinds,
+                &ints,
+                article_budget,
+                timeout_seconds,
+            ))
+        })
+    }
+}
+
+// --- MappingConfidence::planMappingConfidenceBatch ---------------------------
+
+pub(crate) const W606_MAPPING_HEADER: usize = 20;
+
+/// Values with PAR2, NFO and header evidence and size columns. Values resolve
+/// by backing value (source 0), case name (1), normalized value (2), else
+/// unknown case 2 (3). Evidence clamps to 0..255; score `min(1000, rank * 100
+/// + par2 * 40 + nfo * 15 + header * 25)`, tier 2 from 300, 1 from 150. `[0]`
+/// count, `[1..4]` per case, `[4..8]` per source, `[8..11]` per tier, `[11]`
+/// promotable, `[12]` conflicts, `[13]` score sum, `[14]` max score and `[15]`
+/// its first index (-1), `[16]` verified and `[17]` unique-size bytes, `[18]`
+/// mean score, `[19]` FNV-1a digest; then per mapping `case | source << 2 |
+/// tier << 4 | promotable << 6 | conflict << 7 | rank << 8 | score << 10 | par2
+/// << 20 | nfo << 28 | header << 36 | min(value bytes, 255) << 44`.
+pub(crate) fn w606_mapping_batch(values: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+    let count = values.len();
+    let mut out = vec![0i64; W606_MAPPING_HEADER + count];
+    out[0] = count as i64;
+    out[15] = -1;
+    let mut normalized = Vec::new();
+    for (at, &value) in values.iter().enumerate() {
+        let (case, source): (i64, i64) = match value {
+            b"verified" => (0, 0),
+            b"unique-size" => (1, 0),
+            b"Verified" => (0, 1),
+            b"UniqueSize" => (1, 1),
+            _ => {
+                w606_normalize_into(value, &mut normalized);
+                match normalized.as_slice() {
+                    b"verified" => (0, 2),
+                    b"unique-size" => (1, 2),
+                    _ => (2, 3),
+                }
+            }
+        };
+        let rank = 2 - case;
+        let par2 = ints[at].clamp(0, 255);
+        let nfo = ints[count + at].clamp(0, 255);
+        let header = ints[2 * count + at].clamp(0, 255);
+        let size = w47_clamp(ints[3 * count + at]);
+        let score = (rank * 100 + par2 * 40 + nfo * 15 + header * 25).min(1_000);
+        let tier: i64 = if score >= 300 {
+            2
+        } else if score >= 150 {
+            1
+        } else {
+            0
+        };
+        let promotable = i64::from(case == 1 && par2 > 0);
+        let conflict = i64::from(case == 0 && par2 == 0 && header == 0);
+        out[1 + case as usize] += 1;
+        out[4 + source as usize] += 1;
+        out[8 + tier as usize] += 1;
+        out[11] += promotable;
+        out[12] += conflict;
+        out[13] += score;
+        if out[15] < 0 || score > out[14] {
+            out[14] = score;
+            out[15] = at as i64;
+        }
+        if case < 2 {
+            out[16 + case as usize] = (out[16 + case as usize] + size).min(W47_TOTAL_CAP);
+        }
+        out[W606_MAPPING_HEADER + at] = case
+            | source << 2
+            | tier << 4
+            | promotable << 6
+            | conflict << 7
+            | rank << 8
+            | score << 10
+            | par2 << 20
+            | nfo << 28
+            | header << 36
+            | (value.len().min(255) as i64) << 44;
+    }
+    if count > 0 {
+        out[18] = out[13] / count as i64;
+    }
+    out[19] = w526_digest(&out[W606_MAPPING_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w606_mapping_confidence_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let values = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                1,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 4, count)?;
+            Some(w606_mapping_batch(&values, &ints))
+        })
+    }
+}
+
+// --- MediaSourceResolver::resolveMediaSourceBatch ----------------------------
+
+pub(crate) const W606_SOURCE_HEADER: usize = 33;
+
+/// Codec class after `trim(" \t")` and lowercasing: 1 AVC, 2 HEVC, 3 AV1, 4
+/// MPEG-4 ASP, 5 VP9, 6 unsupported.
+#[inline]
+fn w606_codec(lower: &[u8]) -> i64 {
+    match lower {
+        b"h264" | b"avc" | b"x264" | b"avc1" => 1,
+        b"hevc" | b"h265" | b"x265" | b"hvc1" => 2,
+        b"av1" => 3,
+        b"mpeg4" | b"xvid" | b"divx" => 4,
+        b"vp9" => 5,
+        _ => 6,
+    }
+}
+
+/// Kind 1 archive (not a later `.partN.rar` volume), 2 video, 3 image, 0 other.
+#[inline]
+fn w606_source_kind(lower: &[u8], ext: &[u8], dot: Option<usize>, container: i64) -> i64 {
+    if container > 0 {
+        return 2;
+    }
+    match ext {
+        b"rar" => {
+            let stem = &lower[..dot.unwrap_or(0)];
+            if let Some(part) = w47_rfind(stem, b".part") {
+                let digits = &stem[part + 5..];
+                let significant = &digits[digits
+                    .iter()
+                    .position(|&b| b != b'0')
+                    .unwrap_or(digits.len())..];
+                if w47_digits(digits) && significant != b"1" {
+                    return 0;
+                }
+            }
+            1
+        }
+        b"zip" | b"7z" | b"001" => 1,
+        b"jpg" | b"jpeg" | b"png" | b"webp" => 3,
+        _ => 0,
+    }
+}
+
+/// Path, size and codec columns. Reasons: 1 no usable kind, 2 below
+/// `min_bytes`, 4 above `max_bytes`, 8 unsupported codec, 16 sample, 32 unsafe
+/// path. Eligible sources are videos without reasons other than sample;
+/// priority 3 eligible video, 2 eligible sample, 1 safe archive. The best
+/// source has the highest priority, then size, then input position. `[0]`
+/// count, `[1..5]` per kind, `[5..12]` per codec, `[12..21]` per container,
+/// `[21]` eligible, `[22]` samples, `[23]` too small, `[24]` too large, `[25]`
+/// unsupported, `[26]` unsafe, `[27]` best index (-1), `[28]` its priority and
+/// `[29]` size, `[30]` eligible bytes, `[31]` first safe archive (-1), `[32]`
+/// FNV-1a digest; then per candidate `kind | container << 2 | codec << 6 |
+/// reasons << 9 | eligible << 15 | priority << 16 | codec from name << 18 |
+/// min(MiB, 2^20-1) << 19 | min(path bytes, 65535) << 39`.
+pub(crate) fn w606_source_batch(
+    fields: &[&[u8]],
+    sizes: &[i64],
+    count: usize,
+    min_bytes: i64,
+    max_bytes: i64,
+) -> Vec<i64> {
+    let mut out = vec![0i64; W606_SOURCE_HEADER + count];
+    out[0] = count as i64;
+    out[27] = -1;
+    out[31] = -1;
+    let (mut lower, mut codec_lower) = (Vec::new(), Vec::new());
+    for at in 0..count {
+        let path = fields[at];
+        let base = w606_base(path);
+        w47_lower_into(base, &mut lower);
+        let (ext, dot) = w47_extension(&lower);
+        let container = w606_container(ext);
+        let kind = w606_source_kind(&lower, ext, dot, container);
+        let codec_raw = w596_trim_blank(fields[count + at]);
+        let (codec, from_name) = if codec_raw.is_empty() {
+            (w47_codec_hint(&lower), 1i64)
+        } else {
+            w47_lower_into(codec_raw, &mut codec_lower);
+            (w606_codec(&codec_lower), 0)
+        };
+        let size = w47_clamp(sizes[at]);
+        let sample = w47_contains(&lower, b"sample");
+        let unsafe_path = base.is_empty() || path.contains(&0) || w606_traversal(path);
+        let reasons = i64::from(kind == 0)
+            | i64::from(size < min_bytes) << 1
+            | i64::from(size > max_bytes) << 2
+            | i64::from(codec == 6) << 3
+            | i64::from(sample) << 4
+            | i64::from(unsafe_path) << 5;
+        let eligible = kind == 2 && reasons & !16 == 0;
+        let priority: i64 = if eligible {
+            if sample { 2 } else { 3 }
+        } else if kind == 1 && !unsafe_path {
+            1
+        } else {
+            0
+        };
+        out[1 + kind as usize] += 1;
+        out[5 + codec as usize] += 1;
+        out[12 + container as usize] += 1;
+        out[21] += i64::from(eligible);
+        out[22] += i64::from(sample);
+        out[23] += reasons >> 1 & 1;
+        out[24] += reasons >> 2 & 1;
+        out[25] += reasons >> 3 & 1;
+        out[26] += i64::from(unsafe_path);
+        if priority > 0
+            && (out[27] < 0 || priority > out[28] || (priority == out[28] && size > out[29]))
+        {
+            out[27] = at as i64;
+            out[28] = priority;
+            out[29] = size;
+        }
+        if eligible {
+            out[30] = (out[30] + size).min(W47_TOTAL_CAP);
+        }
+        if kind == 1 && !unsafe_path {
+            w586_first(&mut out[31], at);
+        }
+        out[W606_SOURCE_HEADER + at] = kind
+            | container << 2
+            | codec << 6
+            | reasons << 9
+            | i64::from(eligible) << 15
+            | priority << 16
+            | from_name << 18
+            | (size >> 20).min(1_048_575) << 19
+            | (path.len().min(65_535) as i64) << 39;
+    }
+    out[32] = w526_digest(&out[W606_SOURCE_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w606_media_source_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    min_bytes: i64,
+    max_bytes: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let fields = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                2,
+                count,
+            )?;
+            let sizes = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+            Some(w606_source_batch(
+                &fields, &sizes, count, min_bytes, max_bytes,
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w606_entry_result_kind_mapping_source_tests {
+    use super::*;
+    use std::ptr::null;
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn w606_entry_batch_ranks_main_and_sample() {
+        let names: [&[u8]; 4] = [
+            b"Movie.2024.x265.mkv",
+            b"dir\\Movie.Sample.mkv",
+            b"../evil.mkv",
+            b"cover.JPG",
+        ];
+        let ints = [
+            8_000, 500, 900, 10, 8_000, 100, 900, 10, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        let out = w606_entry_batch(&names, &ints);
+        assert_eq!(&out[..4], &[4, 3, 2, 1]);
+        assert_eq!(
+            &out[5..14],
+            &[
+                1,
+                1,
+                3,
+                8_000 + 500 + 900 + 10,
+                8_000 + 100 + 900 + 10,
+                0,
+                8_000,
+                1,
+                500
+            ]
+        );
+        assert_eq!(out[14 + 1], 3);
+        assert_eq!(out[14 + 10], 1);
+        let row = out[W606_ENTRY_HEADER];
+        assert_eq!(row & 0xF, 1);
+        assert_eq!(row >> 9 & 1, 1);
+        assert_eq!(row >> 10 & 0x7F, 100);
+        assert_eq!(row >> 41 & 7, 2);
+        assert_eq!(out[W606_ENTRY_HEADER + 1] >> 10 & 0x7F, 20);
+        assert_eq!(out[W606_ENTRY_HEADER + 2] >> 7 & 1, 1);
+    }
+
+    #[test]
+    fn w606_result_batch_classifies_retry_and_terminal() {
+        let fields: [&[u8]; 6] = [
+            b"completed",
+            b"timed-out",
+            b"failed",
+            b"download",
+            b"bogus",
+            b"",
+        ];
+        let ints = [500, 900, 100, 400, 1_000, 300, 1, 1, 0, 2, 0, 0, 0, 1, 5];
+        let out = w606_result_batch(&fields, &ints, 3, 3);
+        assert_eq!(out[0], 3);
+        assert_eq!(&out[14..20], &[1, 1, 1, 0, 0, 0]);
+        assert_eq!(&out[39..44], &[900, 1, 1, 2, 60]);
+        assert_eq!(out[37], 2);
+        assert_eq!(out[38], 1);
+        let retry = out[W606_RESULT_HEADER + 1];
+        assert_eq!(retry >> 4 & 7, 1);
+        assert_eq!(retry >> 22 & 0xFFF, 60);
+        assert_eq!(retry >> 7 & 0xF, 10);
+    }
+
+    #[test]
+    fn w606_kind_batch_resolves_aliases_and_budget() {
+        let kinds: [&[u8]; 5] = [b"sample", b"MediaInfo", b" PAR2_INDEX ", b"jpeg", b"nope"];
+        let ints = [50, 4, 9, 3, 1, 4_000, 400, 900, 300, 100];
+        let out = w606_kind_batch(&kinds, &ints, 45, 60);
+        assert_eq!(&out[9..14], &[1, 1, 1, 1, 1]);
+        assert_eq!(
+            &out[15..21],
+            &[67, 45, 4, 0, 40 * 80 + 4 * 100 + 1 * 100, 0]
+        );
+        let row = out[W606_KIND_HEADER];
+        assert_eq!(row >> 8 & 0x1F_FFFF, 40);
+        assert_eq!(row >> 29 & 0x1FFF_FFFF, 60_000 + 40 * 250);
+        assert_eq!(out[W606_KIND_HEADER + 4] & 7, 7);
+    }
+
+    #[test]
+    fn w606_mapping_batch_weights_evidence() {
+        let values: [&[u8]; 4] = [b"verified", b"UniqueSize", b" UNIQUE_SIZE\n", b"guess"];
+        let ints = [0, 2, 0, 9, 0, 0, 3, 0, 0, 0, 0, 0, 10, 20, 30, 40];
+        let out = w606_mapping_batch(&values, &ints);
+        assert_eq!(&out[1..8], &[1, 2, 1, 1, 1, 1, 1]);
+        assert_eq!(&out[11..16], &[1, 1, 200 + 180 + 145 + 360, 360, 3]);
+        assert_eq!(&out[16..18], &[10, 50]);
+    }
+
+    #[test]
+    fn w606_source_batch_selects_best() {
+        let fields: [&[u8]; 10] = [
+            b"a/Movie.mkv",
+            b"Movie.sample.mp4",
+            b"show.part02.rar",
+            b"show.part001.rar",
+            b"x.wmv",
+            b"",
+            b"x264",
+            b"vp8",
+            b"",
+            b"",
+        ];
+        let sizes = [5 << 20, 3 << 20, 1 << 20, 1 << 20, 4 << 20];
+        let out = w606_source_batch(&fields, &sizes, 5, 1 << 20, i64::MAX);
+        assert_eq!(&out[1..5], &[1, 1, 3, 0]);
+        assert_eq!(&out[21..27], &[3, 1, 0, 0, 1, 0]);
+        assert_eq!(&out[27..32], &[0, 3, 5 << 20, 12 << 20, 3]);
+        assert_eq!(out[W606_SOURCE_HEADER] >> 18 & 1, 1);
+        assert_eq!(out[W606_SOURCE_HEADER + 4] >> 9 & 0x3F, 0);
+    }
+
+    #[test]
+    fn w606_exports_report_status() {
+        let mut out = [0i64; 64];
+        let ints = packed(&[1, 2, 3, 4]);
+        let status = unsafe {
+            nntmux_w606_archived_entry_batch(
+                b"a.mkv".as_ptr(),
+                5,
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, 1);
+        assert_eq!(out[0], 1);
+        let status = unsafe {
+            nntmux_w606_archived_entry_batch(
+                b"a.mkv".as_ptr(),
+                5,
+                null(),
+                0,
+                ints.as_ptr(),
+                8,
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+        let status = unsafe {
+            nntmux_w606_mapping_confidence_batch(
+                b"x".as_ptr(),
+                1,
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                1,
+                out.as_mut_ptr(),
+                4,
+            )
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w606_download_kind_batch(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                0,
+                0,
+                0,
+                null::<i64>().cast_mut(),
+                64,
+            )
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w606_release_result_batch(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                0,
+                3,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, 1);
+        let status = unsafe {
+            nntmux_w606_media_source_batch(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                0,
+                0,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, 1);
+    }
+}

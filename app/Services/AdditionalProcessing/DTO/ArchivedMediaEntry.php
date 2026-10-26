@@ -374,4 +374,274 @@ final readonly class ArchivedMediaEntry
 
         return $ffi;
     }
+
+    // Rust is the default only while the paired W60.6 benchmark clears 1.5x on all four metrics.
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    private const string W60_ENTRY_FFI_CDEF = <<<'C'
+        int32_t nntmux_w606_archived_entry_batch(const char *strings, size_t strings_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W60_ENTRY_HEADER = 29;
+
+    private const int W60_MAX_ITEMS = 1_048_576;
+
+    private const int W60_VALUE_CAP = (1 << 40) - 1;
+
+    private const int W60_TOTAL_CAP = 1 << 62;
+
+    /** 1-8 video containers, 9 audio, 10 image, 11 text, 12 archive; others are 0. */
+    private const array W60_ENTRY_CLASSES = [
+        'mkv' => 1, 'mp4' => 2, 'm4v' => 2, 'avi' => 3, 'ts' => 4, 'm2ts' => 4, 'mts' => 4, 'wmv' => 5, 'mov' => 6,
+        'mpg' => 7, 'mpeg' => 7, 'vob' => 7, 'webm' => 8, 'mp3' => 9, 'flac' => 9, 'm4a' => 9, 'ogg' => 9, 'wav' => 9,
+        'jpg' => 10, 'jpeg' => 10, 'png' => 10, 'webp' => 10, 'nfo' => 11, 'txt' => 11, 'srt' => 11, 'sub' => 11,
+        'rar' => 12, 'zip' => 12, '7z' => 12,
+    ];
+
+    /**
+     * Classify archived entries by base name (after the last `/` or `\`), sizes (clamped to 0..2^40-1),
+     * compression method (non-zero is compressed) and encryption flag, and pick the largest playable
+     * (safe, stored, unencrypted, non-empty video) main entry and sample, first on ties. An entry is unsafe
+     * with an empty base name, a leading separator, a NUL byte or a `..` segment.
+     *
+     * Layout: `[0]` count, `[1]` video, `[2]` playable, `[3]` samples, `[4]` compressed, `[5]` encrypted,
+     * `[6]` unsafe, `[7]` complete, `[8]` size and `[9]` held totals (capped at 2^62), `[10]` main video
+     * index (-1) and `[11]` its size, `[12]` best sample index (-1) and `[13]` its size, `[14..26]` per
+     * class, `[27]` mean held percent, `[28]` FNV-1a digest; then per entry `class | sample << 4 |
+     * compressed << 5 | encrypted << 6 | unsafe << 7 | complete << 8 | playable << 9 | percent << 10 |
+     * min(name bytes, 65535) << 17 | min(ext bytes, 255) << 33 | codec << 41 | hidden << 44`.
+     *
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, int>  $realSizes
+     * @param  array<array-key, int>  $heldBytes
+     * @param  array<array-key, int>  $methods
+     * @param  array<array-key, int>  $encrypted
+     * @return list<int>
+     */
+    public static function summarizeArchivedEntryBatch(array $names, array $realSizes, array $heldBytes, array $methods, array $encrypted): array
+    {
+        return (self::usesW60RustFfi() ? self::summarizeArchivedEntryBatchNative($names, $realSizes, $heldBytes, $methods, $encrypted) : null)
+            ?? self::summarizeArchivedEntryBatchPhp($names, $realSizes, $heldBytes, $methods, $encrypted);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, int>  $realSizes
+     * @param  array<array-key, int>  $heldBytes
+     * @param  array<array-key, int>  $methods
+     * @param  array<array-key, int>  $encrypted
+     * @return list<int>
+     */
+    public static function summarizeArchivedEntryBatchPhp(array $names, array $realSizes, array $heldBytes, array $methods, array $encrypted): array
+    {
+        $names = array_values($names);
+        $realSizes = array_values($realSizes);
+        $heldBytes = array_values($heldBytes);
+        $methods = array_values($methods);
+        $encrypted = array_values($encrypted);
+        $count = \count($names);
+        $cap = self::W60_VALUE_CAP;
+        $totalCap = self::W60_TOTAL_CAP;
+        $out = array_fill(0, self::W60_ENTRY_HEADER, 0);
+        $out[0] = $count;
+        $out[10] = $out[12] = -1;
+        $digest = 2_166_136_261;
+        $percentSum = 0;
+        $rows = [];
+        foreach ($names as $at => $name) {
+            $name = (string) $name;
+            $size = min(max((int) ($realSizes[$at] ?? 0), 0), $cap);
+            $held = min(max((int) ($heldBytes[$at] ?? 0), 0), $cap);
+            $compressed = (int) ($methods[$at] ?? 0) !== 0 ? 1 : 0;
+            $locked = (int) ($encrypted[$at] ?? 0) !== 0 ? 1 : 0;
+            $normalized = strtr($name, '\\', '/');
+            $slash = strrpos($normalized, '/');
+            $base = $slash === false ? $name : substr($name, $slash + 1);
+            $lower = strtolower($base);
+            $dot = strrpos($lower, '.');
+            $ext = $dot === false ? '' : substr($lower, $dot + 1);
+            $class = self::W60_ENTRY_CLASSES[$ext] ?? 0;
+            $sample = str_contains($lower, 'sample') ? 1 : 0;
+            $unsafe = $base === '' || $normalized[0] === '/' || str_contains($name, "\0") || str_contains('/'.$normalized.'/', '/../') ? 1 : 0;
+            $complete = $held >= $size ? 1 : 0;
+            $percent = $size > 0 ? min(100, intdiv($held * 100, $size)) : 100;
+            $video = $class >= 1 && $class <= 8;
+            $playable = $video && $compressed === 0 && $locked === 0 && $unsafe === 0 && $size > 0 ? 1 : 0;
+            $out[1] += (int) $video;
+            $out[2] += $playable;
+            $out[3] += $sample;
+            $out[4] += $compressed;
+            $out[5] += $locked;
+            $out[6] += $unsafe;
+            $out[7] += $complete;
+            $out[8] = min($out[8] + $size, $totalCap);
+            $out[9] = min($out[9] + $held, $totalCap);
+            if ($playable === 1) {
+                $slot = $sample === 0 ? 10 : 12;
+                if ($out[$slot] < 0 || $size > $out[$slot + 1]) {
+                    $out[$slot] = $at;
+                    $out[$slot + 1] = $size;
+                }
+            }
+            $out[14 + $class]++;
+            $percentSum += $percent;
+            $row = $class | $sample << 4 | $compressed << 5 | $locked << 6 | $unsafe << 7 | $complete << 8 | $playable << 9 | $percent << 10
+                | min(\strlen($name), 65_535) << 17 | min(\strlen($ext), 255) << 33 | self::w47CodecHint($lower) << 41
+                | (int) ($base !== '' && $base[0] === '.') << 44;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        if ($count > 0) {
+            $out[27] = intdiv($percentSum, $count);
+        }
+        $out[28] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust summary, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, int>  $realSizes
+     * @param  array<array-key, int>  $heldBytes
+     * @param  array<array-key, int>  $methods
+     * @param  array<array-key, int>  $encrypted
+     * @return list<int>|null
+     */
+    public static function summarizeArchivedEntryBatchNative(array $names, array $realSizes, array $heldBytes, array $methods, array $encrypted): ?array
+    {
+        $count = \count($names);
+        if ($count > self::W60_MAX_ITEMS) {
+            return null;
+        }
+        [$joined, $twin] = self::w60Strings(array_values($names));
+        $ints = pack('q*', ...self::w60Column($realSizes, $count), ...self::w60Column($heldBytes, $count),
+            ...self::w60Column($methods, $count), ...self::w60Column($encrypted, $count));
+        $fields = self::W60_ENTRY_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w60Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w606_archived_entry_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 60.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        $forced = self::w60RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 60.6 routing and binding in function statics (readonly classes cannot declare static properties).
+     * No `$op` returns the forced routing (null for the default); `'set'` replaces it with `$val` and returns
+     * the previous value; `'binding'` returns the cached binding and an output buffer of at least `$val`
+     * values, or null.
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w606', self::W60_ENTRY_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 60.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w60Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w60RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Values NUL-joined and, when one holds a NUL, the same values joined with 0x01 so Rust finds the
+     * separators where the two differ.
+     *
+     * @param  list<string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w60Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
+    }
+
+    /**
+     * Values by position, cut or padded with `$pad` to `$count`.
+     *
+     * @template T of int|string
+     *
+     * @param  array<array-key, T>  $values
+     * @param  T  $pad
+     * @return list<T>
+     */
+    private static function w60Column(array $values, int $count, int|string $pad = 0): array
+    {
+        $values = array_values($values);
+
+        return \count($values) === $count ? $values : array_pad(\array_slice($values, 0, $count), $count, $pad);
+    }
 }
