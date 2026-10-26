@@ -43940,3 +43940,707 @@ pub mod w581_grafana_bounded_article_runners {
         }
     }
 }
+
+pub mod w591_enums_backfill_days_group_scan_nzb_import_par2_rename_tmux_backfill {
+    //! Wave 59.1 per-row batch kernels for the BackfillDaysMode, GroupScanMode, NzbImportStatus,
+    //! Par2RenameOutcome and TmuxBackfillMode enums. Every export reads NUL-joined,
+    //! tab-separated rows, writes a fixed number of `i64` words per row followed by a fixed
+    //! rollup tail into `out` and returns the row count, `SHORT_CAPACITY` when `out_cap` (in
+    //! words) is too small, or -1 for a malformed batch (a row holding a NUL byte splits into
+    //! extra rows, so PHP falls back).
+
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+    pub const SHORT_CAPACITY: isize = -2;
+
+    /// How a mode token resolved, `<< SOURCE_SHIFT`: 0 unknown, then exact value, case name and
+    /// alias. Names and aliases match the trimmed, ASCII-lowercased token without `_`, `-`, ` `.
+    pub const SOURCE_SHIFT: u32 = 4;
+    pub const SOURCE_VALUE: i64 = 1;
+    pub const SOURCE_NAME: i64 = 2;
+    pub const SOURCE_ALIAS: i64 = 3;
+
+    /// BackfillDaysMode words for `mode\tgroup_days\tsafe_days\tage_days\tnow`:
+    /// `value | source | flags`, target days (1-36500), days left to the target and the window
+    /// cutoff timestamp (`now - target * 86400`). Unknown modes resolve to days per group.
+    pub const DAYS_WORDS: usize = 4;
+    pub const DAYS_VALID: i64 = 64;
+    pub const DAYS_GROUP_TARGET: i64 = 128;
+    pub const DAYS_SAFE_DATE: i64 = 256;
+    pub const DAYS_REACHED: i64 = 512;
+    pub const DAYS_CLAMPED: i64 = 1024;
+    pub const DAYS_MALFORMED: i64 = 2048;
+    const DAYS_VALUES: &[i64] = &[1, 2];
+    const DAYS_NAMES: &[(&[u8], i64)] = &[(b"dayspergroup", 1), (b"safedate", 2)];
+    const DAYS_ALIASES: &[(&[u8], i64)] = &[
+        (b"days", 1),
+        (b"group", 1),
+        (b"pergroup", 1),
+        (b"groupdays", 1),
+        (b"safe", 2),
+        (b"date", 2),
+        (b"safebackfill", 2),
+        (b"backfilldate", 2),
+    ];
+
+    /// GroupScanMode words for `mode\tdays\tmessages\tfirst\tlast\tbatch_limit`:
+    /// `value | source | flags | batch limit << SCAN_LIMIT_SHIFT`, scan target, first header,
+    /// header count and batch count. Unknown modes resolve to posts.
+    pub const SCAN_WORDS: usize = 5;
+    pub const SCAN_VALID: i64 = 64;
+    pub const SCAN_DAYS_UNIT: i64 = 128;
+    pub const SCAN_TARGET_CLAMPED: i64 = 256;
+    pub const SCAN_LIMIT_ADJUSTED: i64 = 512;
+    pub const SCAN_EMPTY_RANGE: i64 = 1024;
+    pub const SCAN_MALFORMED: i64 = 2048;
+    pub const SCAN_LIMIT_SHIFT: u32 = 16;
+    const SCAN_VALUES: &[i64] = &[0, 1];
+    const SCAN_NAMES: &[(&[u8], i64)] = &[(b"posts", 0), (b"days", 1)];
+    const SCAN_ALIASES: &[(&[u8], i64)] = &[
+        (b"post", 0),
+        (b"messages", 0),
+        (b"message", 0),
+        (b"count", 0),
+        (b"articles", 0),
+        (b"headers", 0),
+        (b"day", 1),
+        (b"date", 1),
+        (b"age", 1),
+        (b"time", 1),
+    ];
+    const UINT32_MAX: i64 = 4_294_967_295;
+
+    /// NzbImportStatus words for `status\tattempts\tmax_attempts`: `code | source | flags`
+    /// (code is the case position plus one, 0 unknown) and attempts left for retry classes.
+    /// The tail counts rows per code (0-8), then success, terminal, retryable, duplicate,
+    /// pending and malformed rows.
+    pub const NZB_WORDS: usize = 2;
+    pub const NZB_TAIL: usize = 15;
+    pub const NZB_SUCCESS: i64 = 1 << 8;
+    pub const NZB_TERMINAL: i64 = 1 << 9;
+    pub const NZB_RETRYABLE: i64 = 1 << 10;
+    pub const NZB_EXHAUSTED: i64 = 1 << 11;
+    pub const NZB_DUPLICATE: i64 = 1 << 12;
+    pub const NZB_PENDING: i64 = 1 << 13;
+    pub const NZB_MALFORMED: i64 = 1 << 14;
+    const NZB_VALUES: &[&[u8]] = &[
+        b"inserted",
+        b"queued",
+        b"metadata_ignored",
+        b"metadata_deferred",
+        b"duplicate",
+        b"blacklisted",
+        b"nogroup",
+        b"failed",
+    ];
+    const NZB_NAMES: &[(&[u8], i64)] = &[
+        (b"inserted", 1),
+        (b"queued", 2),
+        (b"metadataignored", 3),
+        (b"metadatadeferred", 4),
+        (b"duplicate", 5),
+        (b"blacklisted", 6),
+        (b"nogroup", 7),
+        (b"failed", 8),
+    ];
+    const NZB_ALIASES: &[(&[u8], i64)] = &[
+        (b"insert", 1),
+        (b"added", 1),
+        (b"imported", 1),
+        (b"ok", 1),
+        (b"success", 1),
+        (b"queue", 2),
+        (b"pending", 2),
+        (b"enqueued", 2),
+        (b"ignored", 3),
+        (b"metaignored", 3),
+        (b"deferred", 4),
+        (b"metadefer", 4),
+        (b"metadatadefer", 4),
+        (b"dupe", 5),
+        (b"dup", 5),
+        (b"exists", 5),
+        (b"alreadyexists", 5),
+        (b"blacklist", 6),
+        (b"blocked", 6),
+        (b"banned", 6),
+        (b"missinggroup", 7),
+        (b"unknowngroup", 7),
+        (b"group", 7),
+        (b"fail", 8),
+        (b"error", 8),
+        (b"failure", 8),
+        (b"invalid", 8),
+    ];
+
+    /// Par2RenameOutcome words for `outcome[\treason]`: `code | source | bucket << 8 |
+    /// reason class << 12 | flags` and the trimmed reason length. The tail counts rows per code
+    /// (0-4), per bucket (success, skip, failure), per reason class (0-7), then requeued rows.
+    pub const PAR2_WORDS: usize = 2;
+    pub const PAR2_TAIL: usize = 17;
+    pub const PAR2_BUCKET_SHIFT: u32 = 8;
+    pub const PAR2_REASON_SHIFT: u32 = 12;
+    pub const PAR2_REQUEUE: i64 = 1 << 16;
+    pub const PAR2_VALID: i64 = 1 << 17;
+    pub const BUCKET_SUCCESS: i64 = 1;
+    pub const BUCKET_SKIP: i64 = 2;
+    pub const BUCKET_FAILURE: i64 = 3;
+    pub const REASON_NONE: i64 = 0;
+    pub const REASON_TIMEOUT: i64 = 1;
+    pub const REASON_CORRUPT: i64 = 2;
+    pub const REASON_MISSING: i64 = 3;
+    pub const REASON_LOCKED: i64 = 4;
+    pub const REASON_PERMISSION: i64 = 5;
+    pub const REASON_COLLISION: i64 = 6;
+    pub const REASON_OTHER: i64 = 7;
+    const PAR2_VALUES: &[&[u8]] = &[b"renamed", b"no_match", b"retryable", b"deferred"];
+    const PAR2_NAMES: &[(&[u8], i64)] = &[(b"renamed", 1), (b"nomatch", 2), (b"retryable", 3), (b"deferred", 4)];
+    const PAR2_ALIASES: &[(&[u8], i64)] = &[
+        (b"rename", 1),
+        (b"ok", 1),
+        (b"success", 1),
+        (b"done", 1),
+        (b"fixed", 1),
+        (b"none", 2),
+        (b"unmatched", 2),
+        (b"skip", 2),
+        (b"skipped", 2),
+        (b"miss", 2),
+        (b"retry", 3),
+        (b"transient", 3),
+        (b"error", 3),
+        (b"failed", 3),
+        (b"fail", 3),
+        (b"defer", 4),
+        (b"later", 4),
+        (b"pending", 4),
+        (b"wait", 4),
+        (b"postponed", 4),
+    ];
+    /// Reason classes 1-6 by case-insensitive needle, first match wins; anything else is other.
+    const REASON_NEEDLES: &[&[&[u8]]] = &[
+        &[b"timeout", b"timed out"],
+        &[b"crc", b"checksum", b"corrupt", b"damaged"],
+        &[b"missing", b"not found", b"no such"],
+        &[b"lock", b"busy"],
+        &[b"permission", b"denied", b"read-only"],
+        &[b"exists", b"duplicate", b"collision"],
+    ];
+
+    /// TmuxBackfillMode words for `mode\tquantity\tgroup_count\tprocesses`:
+    /// `value | source | flags | order << TMUX_ORDER_SHIFT`, articles per group, groups per pass
+    /// (1-uint32 for all, 1 for safe, 0 disabled), chunk count and chunk size.
+    pub const TMUX_WORDS: usize = 5;
+    pub const TMUX_VALID: i64 = 64;
+    pub const TMUX_ENABLED: i64 = 128;
+    pub const TMUX_QTY_DEFAULTED: i64 = 256;
+    pub const TMUX_QTY_CLAMPED: i64 = 512;
+    pub const TMUX_PROCESSES_CLAMPED: i64 = 1024;
+    pub const TMUX_MALFORMED: i64 = 2048;
+    pub const TMUX_ORDER_SHIFT: u32 = 12;
+    pub const ORDER_ROUND_ROBIN: i64 = 1;
+    pub const ORDER_OLDEST_FIRST: i64 = 2;
+    const TMUX_VALUES: &[i64] = &[0, 1, 4];
+    const TMUX_NAMES: &[(&[u8], i64)] = &[(b"disabled", 0), (b"all", 1), (b"safe", 4)];
+    const TMUX_ALIASES: &[(&[u8], i64)] = &[
+        (b"off", 0),
+        (b"none", 0),
+        (b"no", 0),
+        (b"false", 0),
+        (b"disable", 0),
+        (b"allgroups", 1),
+        (b"full", 1),
+        (b"backfill", 1),
+        (b"on", 1),
+        (b"enabled", 1),
+        (b"safebackfill", 4),
+        (b"oldest", 4),
+        (b"single", 4),
+        (b"onebyone", 4),
+    ];
+
+    fn overlaps(input: *const u8, len: usize, out: *mut i64, words: usize) -> bool {
+        let (a, b, b_len) = (input as usize, out as usize, words.saturating_mul(8));
+        len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(len)
+    }
+
+    /// Writes `per_row` words from `row(entry, dst, tail)` for each of exactly `count` rows,
+    /// then the `tail` rollup words (zeroed first).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        input: *const u8,
+        len: usize,
+        count: usize,
+        per_row: usize,
+        tail: usize,
+        out: *mut i64,
+        out_cap: usize,
+        mut row: impl FnMut(&[u8], &mut [i64], &mut [i64]),
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+                || len > MAX_INPUT
+                || (len != 0 && input.is_null())
+            {
+                return -1;
+            }
+            let row_words = count * per_row;
+            let words = row_words + tail;
+            if words > out_cap {
+                return SHORT_CAPACITY;
+            }
+            if overlaps(input, len, out, words) {
+                return -1;
+            }
+            // A null pointer is never sliced, even for an empty batch.
+            let bytes: &[u8] = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(input, len) } };
+            if count == 0 && !bytes.is_empty() {
+                return -1;
+            }
+            // `words` words, checked against `out_cap` above; disjoint from the input.
+            let dst = unsafe { std::slice::from_raw_parts_mut(out, words) };
+            let (rows_dst, tail_dst) = dst.split_at_mut(row_words);
+            tail_dst.fill(0);
+            if count == 0 {
+                return 0;
+            }
+            let mut n = 0;
+            for entry in bytes.split(|&b| b == 0) {
+                if n < count {
+                    row(entry, &mut rows_dst[n * per_row..(n + 1) * per_row], tail_dst);
+                }
+                n += 1;
+            }
+            if n == count { n as isize } else { -1 }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Exactly `N` tab-separated fields, as PHP `explode("\t", $row)` with `count() === N`.
+    fn fields<const N: usize>(row: &[u8]) -> Option<[&[u8]; N]> {
+        let mut out = [&row[..0]; N];
+        let mut it = row.split(|&b| b == b'\t');
+        for slot in &mut out {
+            *slot = it.next()?;
+        }
+        if it.next().is_some() { None } else { Some(out) }
+    }
+
+    /// PHP `preg_match('/\A-?[0-9]{1,18}\z/')` then `(int)`.
+    fn strict_int(s: &[u8]) -> Option<i64> {
+        let digits = s.strip_prefix(b"-").unwrap_or(s);
+        if digits.is_empty() || digits.len() > 18 || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let v = digits.iter().fold(0i64, |a, &d| a * 10 + i64::from(d - b'0'));
+        Some(if digits.len() != s.len() { -v } else { v })
+    }
+
+    /// PHP `trim()` without a character list.
+    fn php_trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    /// ASCII case-insensitive substring search with a lowercase needle (PHP 8 `stripos`).
+    fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+        hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+    }
+
+    fn flag(on: bool, bit: i64) -> i64 {
+        if on { bit } else { 0 }
+    }
+
+    /// PHP `str_replace(['_', '-', ' '], '', strtolower($token))` table lookup: names first,
+    /// then aliases. Keys longer than the buffer cannot match any table entry.
+    fn lookup(token: &[u8], names: &[(&[u8], i64)], aliases: &[(&[u8], i64)]) -> Option<(i64, i64)> {
+        let mut buf = [0u8; 24];
+        let mut n = 0;
+        for &b in token {
+            if matches!(b, b'_' | b'-' | b' ') {
+                continue;
+            }
+            *buf.get_mut(n)? = b.to_ascii_lowercase();
+            n += 1;
+        }
+        let key = &buf[..n];
+        let find = |table: &[(&[u8], i64)]| table.iter().find(|(k, _)| *k == key).map(|&(_, v)| v);
+        find(names).map(|v| (v, SOURCE_NAME)).or_else(|| find(aliases).map(|v| (v, SOURCE_ALIAS)))
+    }
+
+    /// Int-backed mode token: a strict integer must be a case value; anything else is looked up.
+    fn resolve_int(token: &[u8], values: &[i64], names: &[(&[u8], i64)], aliases: &[(&[u8], i64)]) -> Option<(i64, i64)> {
+        let t = php_trim(token);
+        match strict_int(t) {
+            Some(v) => values.contains(&v).then_some((v, SOURCE_VALUE)),
+            None => lookup(t, names, aliases),
+        }
+    }
+
+    /// String-backed token: an exact case value, else a lookup; the code is the case position
+    /// plus one (0 unknown).
+    fn resolve_str(raw: &[u8], values: &[&[u8]], names: &[(&[u8], i64)], aliases: &[(&[u8], i64)]) -> (i64, i64) {
+        match values.iter().position(|v| *v == raw) {
+            Some(i) => (i as i64 + 1, SOURCE_VALUE),
+            None => lookup(php_trim(raw), names, aliases).unwrap_or((0, 0)),
+        }
+    }
+
+    pub fn days_words(row: &[u8], dst: &mut [i64], _tail: &mut [i64]) {
+        let parsed = fields::<5>(row).and_then(|[mode, group, safe, age, now]| {
+            Some((mode, strict_int(group)?, strict_int(safe)?, strict_int(age)?, strict_int(now)?))
+        });
+        let Some((mode, group, safe, age, now)) = parsed else {
+            dst.copy_from_slice(&[DAYS_MALFORMED, 0, 0, 0]);
+            return;
+        };
+        let resolved = resolve_int(mode, DAYS_VALUES, DAYS_NAMES, DAYS_ALIASES);
+        let (value, source) = resolved.unwrap_or((1, 0));
+        let raw = if value == 1 { group } else { safe };
+        let target = raw.clamp(1, 36_500);
+        let age = age.clamp(0, 36_500);
+        dst.copy_from_slice(&[
+            value
+                | source << SOURCE_SHIFT
+                | flag(resolved.is_some(), DAYS_VALID)
+                | if value == 1 { DAYS_GROUP_TARGET } else { DAYS_SAFE_DATE }
+                | flag(age >= target, DAYS_REACHED)
+                | flag(target != raw, DAYS_CLAMPED),
+            target,
+            (target - age).max(0),
+            now - target * 86_400,
+        ]);
+    }
+
+    pub fn scan_words(row: &[u8], dst: &mut [i64], _tail: &mut [i64]) {
+        let parsed = fields::<6>(row).and_then(|[mode, days, messages, first, last, limit]| {
+            Some((mode, strict_int(days)?, strict_int(messages)?, strict_int(first)?, strict_int(last)?, strict_int(limit)?))
+        });
+        let Some((mode, days, messages, first, last, limit)) = parsed else {
+            dst.copy_from_slice(&[SCAN_MALFORMED, 0, 0, 0, 0]);
+            return;
+        };
+        let resolved = resolve_int(mode, SCAN_VALUES, SCAN_NAMES, SCAN_ALIASES);
+        let (value, source) = resolved.unwrap_or((0, 0));
+        let (raw, target) = if value == 1 { (days, days.clamp(1, 36_500)) } else { (messages, messages.clamp(0, UINT32_MAX)) };
+        let mut flags = value
+            | source << SOURCE_SHIFT
+            | flag(resolved.is_some(), SCAN_VALID)
+            | flag(value == 1, SCAN_DAYS_UNIT)
+            | flag(raw != target, SCAN_TARGET_CLAMPED);
+        let limit = if limit < 1 {
+            flags |= SCAN_LIMIT_ADJUSTED;
+            20_000
+        } else if limit > 1_000_000 {
+            flags |= SCAN_LIMIT_ADJUSTED;
+            1_000_000
+        } else {
+            limit
+        };
+        let (start, headers) = if first < 1 || last < first {
+            flags |= SCAN_EMPTY_RANGE;
+            (0, 0)
+        } else if value == 1 {
+            (first, last - first + 1)
+        } else {
+            let headers = (last - first + 1).min(target);
+            (last - headers + 1, headers)
+        };
+        dst.copy_from_slice(&[flags | limit << SCAN_LIMIT_SHIFT, target, start, headers, (headers + limit - 1) / limit]);
+    }
+
+    pub fn nzb_words(row: &[u8], dst: &mut [i64], tail: &mut [i64]) {
+        let parsed = fields::<3>(row).and_then(|[status, attempts, max]| Some((status, strict_int(attempts)?, strict_int(max)?)));
+        let Some((status, attempts, max)) = parsed else {
+            dst.copy_from_slice(&[NZB_MALFORMED, 0]);
+            tail[0] += 1;
+            tail[14] += 1;
+            return;
+        };
+        let (code, source) = resolve_str(status, NZB_VALUES, NZB_NAMES, NZB_ALIASES);
+        let (attempts, max) = (attempts.max(0), max.clamp(0, 1000));
+        let retry_class = code == 7 || code == 8;
+        let state = if code == 2 || code == 4 {
+            NZB_PENDING
+        } else if retry_class && attempts < max {
+            NZB_RETRYABLE
+        } else if retry_class {
+            NZB_TERMINAL | NZB_EXHAUSTED
+        } else if code != 0 {
+            NZB_TERMINAL
+        } else {
+            0
+        };
+        let flags = state | flag((1..=4).contains(&code), NZB_SUCCESS) | flag(code == 5, NZB_DUPLICATE);
+        dst.copy_from_slice(&[code | source << SOURCE_SHIFT | flags, if retry_class { (max - attempts).max(0) } else { 0 }]);
+        tail[code as usize] += 1;
+        tail[9] += i64::from(flags & NZB_SUCCESS != 0);
+        tail[10] += i64::from(flags & NZB_TERMINAL != 0);
+        tail[11] += i64::from(flags & NZB_RETRYABLE != 0);
+        tail[12] += i64::from(flags & NZB_DUPLICATE != 0);
+        tail[13] += i64::from(flags & NZB_PENDING != 0);
+    }
+
+    fn reason_class(reason: &[u8]) -> i64 {
+        if reason.is_empty() {
+            return REASON_NONE;
+        }
+        REASON_NEEDLES
+            .iter()
+            .position(|needles| needles.iter().any(|n| contains_ci(reason, n)))
+            .map_or(REASON_OTHER, |i| i as i64 + 1)
+    }
+
+    pub fn par2_words(row: &[u8], dst: &mut [i64], tail: &mut [i64]) {
+        let mut it = row.splitn(2, |&b| b == b'\t');
+        let outcome = it.next().unwrap_or_default();
+        let reason = php_trim(it.next().unwrap_or_default());
+        let (code, source) = resolve_str(outcome, PAR2_VALUES, PAR2_NAMES, PAR2_ALIASES);
+        let bucket = match code {
+            1 => BUCKET_SUCCESS,
+            2 | 4 => BUCKET_SKIP,
+            _ => BUCKET_FAILURE,
+        };
+        let class = reason_class(reason);
+        let requeue = code == 3 || code == 4;
+        dst.copy_from_slice(&[
+            code | source << SOURCE_SHIFT
+                | bucket << PAR2_BUCKET_SHIFT
+                | class << PAR2_REASON_SHIFT
+                | flag(requeue, PAR2_REQUEUE)
+                | flag(code != 0, PAR2_VALID),
+            reason.len() as i64,
+        ]);
+        tail[code as usize] += 1;
+        tail[4 + bucket as usize] += 1;
+        tail[8 + class as usize] += 1;
+        tail[16] += i64::from(requeue);
+    }
+
+    pub fn tmux_words(row: &[u8], dst: &mut [i64], _tail: &mut [i64]) {
+        let parsed = fields::<4>(row)
+            .and_then(|[mode, qty, groups, processes]| Some((mode, strict_int(qty)?, strict_int(groups)?, strict_int(processes)?)));
+        let Some((mode, qty, groups, processes)) = parsed else {
+            dst.copy_from_slice(&[TMUX_MALFORMED, 0, 0, 0, 0]);
+            return;
+        };
+        let resolved = resolve_int(mode, TMUX_VALUES, TMUX_NAMES, TMUX_ALIASES);
+        let (value, source) = resolved.unwrap_or((0, 0));
+        let mut flags = value | source << SOURCE_SHIFT | flag(resolved.is_some(), TMUX_VALID) | flag(value != 0, TMUX_ENABLED);
+        let qty = if qty < 1 {
+            flags |= TMUX_QTY_DEFAULTED;
+            20_000
+        } else if qty > 10_000_000 {
+            flags |= TMUX_QTY_CLAMPED;
+            10_000_000
+        } else {
+            qty
+        };
+        let (per_pass, order) = match value {
+            1 => (groups.clamp(1, UINT32_MAX), ORDER_ROUND_ROBIN),
+            4 => (1, ORDER_OLDEST_FIRST),
+            _ => (0, 0),
+        };
+        let clamped = processes.clamp(1, 32);
+        flags |= flag(clamped != processes, TMUX_PROCESSES_CLAMPED);
+        let chunks = per_pass.min(clamped);
+        let size = if chunks == 0 { 0 } else { (per_pass + chunks - 1) / chunks };
+        dst.copy_from_slice(&[flags | order << TMUX_ORDER_SHIFT, qty, per_pass, chunks, size]);
+    }
+
+    /// Writes [`DAYS_WORDS`] words per NUL-joined BackfillDaysMode row.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w591_backfill_days_plan_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, DAYS_WORDS, 0, out, out_cap, days_words) }
+    }
+
+    /// Writes [`SCAN_WORDS`] words per NUL-joined GroupScanMode row.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w591_group_scan_plan_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, SCAN_WORDS, 0, out, out_cap, scan_words) }
+    }
+
+    /// Writes [`NZB_WORDS`] words per NUL-joined NzbImportStatus row, then [`NZB_TAIL`] rollup
+    /// words.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w591_nzb_import_rollup_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, NZB_WORDS, NZB_TAIL, out, out_cap, nzb_words) }
+    }
+
+    /// Writes [`PAR2_WORDS`] words per NUL-joined Par2RenameOutcome row, then [`PAR2_TAIL`]
+    /// summary words.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w591_par2_rename_summary_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, PAR2_WORDS, PAR2_TAIL, out, out_cap, par2_words) }
+    }
+
+    /// Writes [`TMUX_WORDS`] words per NUL-joined TmuxBackfillMode row.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w591_tmux_backfill_plan_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, TMUX_WORDS, 0, out, out_cap, tmux_words) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn w591_mode_tokens_resolve() {
+            assert_eq!(resolve_int(b" 2 ", DAYS_VALUES, DAYS_NAMES, DAYS_ALIASES), Some((2, SOURCE_VALUE)));
+            assert_eq!(resolve_int(b"Days_Per-Group", DAYS_VALUES, DAYS_NAMES, DAYS_ALIASES), Some((1, SOURCE_NAME)));
+            assert_eq!(resolve_int(b"SAFE", DAYS_VALUES, DAYS_NAMES, DAYS_ALIASES), Some((2, SOURCE_ALIAS)));
+            assert_eq!(resolve_int(b"3", DAYS_VALUES, DAYS_NAMES, DAYS_ALIASES), None);
+            assert_eq!(resolve_int(b"-0", TMUX_VALUES, TMUX_NAMES, TMUX_ALIASES), Some((0, SOURCE_VALUE)));
+            assert_eq!(resolve_int(b"--1", TMUX_VALUES, TMUX_NAMES, TMUX_ALIASES), None);
+            assert_eq!(resolve_int(&[b'a'; 40], TMUX_VALUES, TMUX_NAMES, TMUX_ALIASES), None);
+            assert_eq!(resolve_str(b"no_match", PAR2_VALUES, PAR2_NAMES, PAR2_ALIASES), (2, SOURCE_VALUE));
+            assert_eq!(resolve_str(b" No Match", PAR2_VALUES, PAR2_NAMES, PAR2_ALIASES), (2, SOURCE_NAME));
+            assert_eq!(resolve_str(b"Dupe", NZB_VALUES, NZB_NAMES, NZB_ALIASES), (5, SOURCE_ALIAS));
+            assert_eq!(resolve_str(b"\xff", NZB_VALUES, NZB_NAMES, NZB_ALIASES), (0, 0));
+        }
+
+        #[test]
+        fn w591_days_scan_and_tmux_words_plan() {
+            let mut d = [0i64; 5];
+            let mut t: [i64; 0] = [];
+            days_words(b"1\t30\t90\t10\t1700000000", &mut d[..4], &mut t);
+            assert_eq!(d[..4], [1 | SOURCE_VALUE << SOURCE_SHIFT | DAYS_VALID | DAYS_GROUP_TARGET, 30, 20, 1_700_000_000 - 30 * 86_400]);
+            days_words(b"safe\t30\t0\t10\t0", &mut d[..4], &mut t);
+            assert_eq!(d[..4], [2 | SOURCE_ALIAS << SOURCE_SHIFT | DAYS_VALID | DAYS_SAFE_DATE | DAYS_REACHED | DAYS_CLAMPED, 1, 0, -86_400]);
+            days_words(b"9\t40000\t1\t-5\t0", &mut d[..4], &mut t);
+            assert_eq!(d[..4], [1 | DAYS_GROUP_TARGET | DAYS_CLAMPED, 36_500, 36_500, -36_500 * 86_400]);
+            days_words(b"1\t1", &mut d[..4], &mut t);
+            assert_eq!(d[..4], [DAYS_MALFORMED, 0, 0, 0]);
+
+            scan_words(b"0\t3\t50000\t1000\t200000\t20000", &mut d, &mut t);
+            let flags = SOURCE_VALUE << SOURCE_SHIFT | SCAN_VALID;
+            assert_eq!(d, [flags | 20_000 << SCAN_LIMIT_SHIFT, 50_000, 150_001, 50_000, 3]);
+            scan_words(b"Days\t0\t1\t10\t20\t0", &mut d, &mut t);
+            let flags = 1 | SOURCE_NAME << SOURCE_SHIFT | SCAN_VALID | SCAN_DAYS_UNIT | SCAN_TARGET_CLAMPED | SCAN_LIMIT_ADJUSTED;
+            assert_eq!(d, [flags | 20_000 << SCAN_LIMIT_SHIFT, 1, 10, 11, 1]);
+            scan_words(b"x\t1\t-1\t0\t5\t2000000", &mut d, &mut t);
+            let flags = SCAN_TARGET_CLAMPED | SCAN_LIMIT_ADJUSTED | SCAN_EMPTY_RANGE;
+            assert_eq!(d, [flags | 1_000_000 << SCAN_LIMIT_SHIFT, 0, 0, 0, 0]);
+
+            tmux_words(b"1\t0\t10\t3", &mut d, &mut t);
+            let flags = 1 | SOURCE_VALUE << SOURCE_SHIFT | TMUX_VALID | TMUX_ENABLED | TMUX_QTY_DEFAULTED;
+            assert_eq!(d, [flags | ORDER_ROUND_ROBIN << TMUX_ORDER_SHIFT, 20_000, 10, 3, 4]);
+            tmux_words(b"oldest\t99999999\t10\t0", &mut d, &mut t);
+            let flags = 4 | SOURCE_ALIAS << SOURCE_SHIFT | TMUX_VALID | TMUX_ENABLED | TMUX_QTY_CLAMPED | TMUX_PROCESSES_CLAMPED;
+            assert_eq!(d, [flags | ORDER_OLDEST_FIRST << TMUX_ORDER_SHIFT, 10_000_000, 1, 1, 1]);
+            tmux_words(b"2\t5\t5\t5", &mut d, &mut t);
+            assert_eq!(d, [0, 5, 0, 0, 0]);
+            tmux_words(b"2\t5\t5", &mut d, &mut t);
+            assert_eq!(d, [TMUX_MALFORMED, 0, 0, 0, 0]);
+        }
+
+        #[test]
+        fn w591_nzb_and_par2_words_roll_up() {
+            let mut d = [0i64; 2];
+            let mut tail = [0i64; NZB_TAIL];
+            nzb_words(b"failed\t1\t3", &mut d, &mut tail);
+            assert_eq!(d, [8 | SOURCE_VALUE << SOURCE_SHIFT | NZB_RETRYABLE, 2]);
+            nzb_words(b"No Group\t5\t3", &mut d, &mut tail);
+            assert_eq!(d, [7 | SOURCE_NAME << SOURCE_SHIFT | NZB_TERMINAL | NZB_EXHAUSTED, 0]);
+            nzb_words(b"queued\t0\t0", &mut d, &mut tail);
+            assert_eq!(d, [2 | SOURCE_VALUE << SOURCE_SHIFT | NZB_PENDING | NZB_SUCCESS, 0]);
+            nzb_words(b"dupe\t0\t0", &mut d, &mut tail);
+            assert_eq!(d, [5 | SOURCE_ALIAS << SOURCE_SHIFT | NZB_TERMINAL | NZB_DUPLICATE, 0]);
+            nzb_words(b"x\t0", &mut d, &mut tail);
+            assert_eq!(d, [NZB_MALFORMED, 0]);
+            assert_eq!(tail, [1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 2, 1, 1, 1, 1]);
+
+            let mut tail = [0i64; PAR2_TAIL];
+            par2_words(b"renamed", &mut d, &mut tail);
+            assert_eq!(d, [1 | SOURCE_VALUE << SOURCE_SHIFT | BUCKET_SUCCESS << PAR2_BUCKET_SHIFT | PAR2_VALID, 0]);
+            par2_words(b"retry\t  Read TIMED OUT\tx ", &mut d, &mut tail);
+            let word = 3 | SOURCE_ALIAS << SOURCE_SHIFT | BUCKET_FAILURE << PAR2_BUCKET_SHIFT | REASON_TIMEOUT << PAR2_REASON_SHIFT;
+            assert_eq!(d, [word | PAR2_REQUEUE | PAR2_VALID, 16]);
+            par2_words(b"?\tfile exists", &mut d, &mut tail);
+            assert_eq!(d, [BUCKET_FAILURE << PAR2_BUCKET_SHIFT | REASON_COLLISION << PAR2_REASON_SHIFT, 11]);
+            assert_eq!(tail, [1, 1, 0, 1, 0, 1, 0, 2, 1, 1, 0, 0, 0, 0, 1, 0, 1]);
+            assert_eq!(reason_class(b"zzz"), REASON_OTHER);
+            assert_eq!(reason_class(b"Bad CRC; file missing"), REASON_CORRUPT);
+        }
+
+        #[test]
+        fn w591_exports_guard_counts_capacity_and_tail() {
+            type Export = unsafe extern "C" fn(*const u8, usize, usize, *mut i64, usize) -> isize;
+            let rows = b"a\tb\0c";
+            let exports: [(Export, usize, usize); 5] = [
+                (nntmux_w591_backfill_days_plan_batch, DAYS_WORDS, 0),
+                (nntmux_w591_group_scan_plan_batch, SCAN_WORDS, 0),
+                (nntmux_w591_nzb_import_rollup_batch, NZB_WORDS, NZB_TAIL),
+                (nntmux_w591_par2_rename_summary_batch, PAR2_WORDS, PAR2_TAIL),
+                (nntmux_w591_tmux_backfill_plan_batch, TMUX_WORDS, 0),
+            ];
+            for (export, per_row, tail) in exports {
+                let mut out = vec![7i64; 8 * per_row + tail];
+                unsafe {
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, out.as_mut_ptr(), out.len()), 2);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, out.as_mut_ptr(), 2 * per_row + tail - 1), SHORT_CAPACITY);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 3, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 0, out.as_mut_ptr(), out.len()), -1);
+                    out.fill(7);
+                    assert_eq!(export(std::ptr::null(), 0, 0, out.as_mut_ptr(), out.len()), 0);
+                    assert!(out[..tail].iter().all(|&w| w == 0));
+                    assert_eq!(export(std::ptr::null(), 0, 1, out.as_mut_ptr(), out.len()), 1);
+                    assert_eq!(export(std::ptr::null(), 2, 1, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, std::ptr::null_mut(), 8), -1);
+                }
+            }
+        }
+    }
+}
