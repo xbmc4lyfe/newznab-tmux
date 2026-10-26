@@ -589,4 +589,304 @@ class TvLookupOutcomeWriter
             }
         }
     }
+
+    // ========================================================================
+    // WAVE 62.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three paired runs reached 2.23x common mean, 2.01x common p99, 1.99x uncommon mean and 1.64x uncommon p99; see RustTvMazeTvdbPipeOutcomeWriterPosterResolverRunStateW62ParityTest. */
+    public const bool W62_RUST_FFI_DEFAULT = true;
+
+    private const string W62_OUTCOME_WRITER_FFI_CDEF = 'ssize_t nntmux_w624_tv_lookup_outcome_plan_row_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per lookupOutcomePlanRowBatch() record. */
+    public const int W62_ROW_WORDS = 5;
+
+    /** int64 summary words after the lookupOutcomePlanRowBatch() records (none for an empty batch). */
+    public const int W62_TRAILER_WORDS = 8;
+
+    private const array W62_STATUSES = [
+        TvProcessingResult::STATUS_MATCHED => 0,
+        TvProcessingResult::STATUS_SEASON_PACK => 1,
+        TvProcessingResult::STATUS_EPISODE_MISSING => 2,
+        TvProcessingResult::STATUS_NOT_FOUND => 3,
+        TvProcessingResult::STATUS_PARSE_FAILED => 4,
+        TvProcessingResult::STATUS_TRANSIENT => 5,
+        TvProcessingResult::STATUS_SKIPPED => 6,
+        TvProcessingResult::STATUS_PENDING => 7,
+    ];
+
+    private const array W62_PROVIDERS = ['tvdb' => 1, 'tvmaze' => 2, 'tmdb' => 3, 'trakt' => 4, 'local db' => 5];
+
+    private const int W62_MAX_ATTEMPTS = 1_000_000;
+
+    private const int W62_MAX_RETRY_AFTER = 604_800;
+
+    /**
+     * TV lookup outcome plan rows for [status, provider, previous videos id, previous
+     * tv_episodes_id status, previous attempts, videos id, episode id, transient, retry after] items.
+     *
+     * Statuses are trimmed and lowercased (code 0-7 as TvProcessingResult, -1 unknown, stored + 1);
+     * providers are trimmed and lowercased (0 empty, 1 tvdb, 2 tvmaze, 3 tmdb, 4 trakt, 5 local db,
+     * 6 other). Previous attempts clamp to 0..1000000 and retry after to 0..604800; the outcome
+     * follows resolveOutcomePhp() with negative videos ids linked as 0. Transition: 1 retry
+     * scheduled, 2 terminal, 3 matched episode, 4 episode missing without a retry.
+     *
+     * Rows [status code + 1 | provider << 4 | transition << 8 | flags << 12 (1 link changed, 2 cache
+     * bump, 4 invalid input, 8 transient, 16 attempts exhausted), videos id, tv_episodes_id,
+     * attempts, retry delay (-1)], then the trailer [retries, terminal, matched, invalid, link
+     * changes, cache bumps, max delay (-1), FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function lookupOutcomePlanRowBatch(array $items): array
+    {
+        return self::usesW62RustFfi() ? self::lookupOutcomePlanRowBatchNative($items) : self::lookupOutcomePlanRowBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function lookupOutcomePlanRowBatchPhp(array $items): array
+    {
+        self::w62Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $summary = [0, 0, 0, 0, 0, 0, -1, 0];
+        $digest = 2_166_136_261;
+        $pending = TvLookupStatus::Pending->value;
+        $missing = TvLookupStatus::EpisodeMissing->value;
+        $notFound = TvLookupStatus::ShowNotFound->value;
+        foreach ($items as [$status, $provider, $previousVideoId, $previousStatus, $previousAttempts, $videoId, $episodeId, $transient, $retryAfter]) {
+            $code = self::W62_STATUSES[strtolower(trim($status))] ?? -1;
+            $name = strtolower(trim($provider));
+            if ($name === '') {
+                $providerClass = $providerHash = 0;
+            } else {
+                $providerClass = self::W62_PROVIDERS[$name] ?? 6;
+                $providerHash = self::w62Fnv($name);
+            }
+            $previousAttempts = max(0, min(self::W62_MAX_ATTEMPTS, $previousAttempts));
+            $retryAfter = max(0, min(self::W62_MAX_RETRY_AFTER, $retryAfter));
+            $transient = $transient !== 0;
+            $linked = max(0, $videoId);
+            $flags = 0;
+            $attempts = 0;
+            $delay = -1;
+            if ($code === 0) {
+                $newVideoId = $linked;
+                $newStatus = $episodeId;
+            } elseif ($code === 1) {
+                $newVideoId = $linked;
+                $newStatus = TvLookupStatus::SeasonPack->value;
+            } elseif ($code === 2) {
+                $newVideoId = $linked;
+                $newStatus = $missing;
+                $attempts = $previousStatus === $missing ? $previousAttempts + 1 : 1;
+                if ($transient) {
+                    $delay = max($retryAfter, TvProcessingCandidateQuery::KNOWN_SHOW_TRANSIENT_DELAY);
+                } elseif ($attempts < TvProcessingCandidateQuery::MAX_EPISODE_ATTEMPTS) {
+                    $delay = TvProcessingCandidateQuery::episodeDelayPhp($attempts);
+                } else {
+                    $flags = 16;
+                }
+            } elseif ($code === 5) {
+                $newVideoId = 0;
+                $attempts = $previousStatus === $pending ? $previousAttempts + 1 : 1;
+                if ($attempts >= TvProcessingCandidateQuery::MAX_TRANSIENT_ATTEMPTS) {
+                    $newStatus = $notFound;
+                    $attempts = 0;
+                    $flags = 16;
+                } else {
+                    $newStatus = $pending;
+                    $delay = TvProcessingCandidateQuery::transientDelayPhp($attempts, $retryAfter);
+                }
+            } elseif ($code === 4) {
+                $newVideoId = 0;
+                $newStatus = TvLookupStatus::ParseFailed->value;
+            } else {
+                $newVideoId = 0;
+                $newStatus = $notFound;
+            }
+            $link = self::hasLinkChangedPhp($previousVideoId, $previousStatus, $newVideoId, $newStatus);
+            $bump = $link && ($code === 0 || $code === 1);
+            $invalid = $videoId < 0 || $code < 0 || ($code === 0 && $episodeId <= 0) || ($code <= 2 && $videoId === 0);
+            $flags |= ($link ? 1 : 0) | ($bump ? 2 : 0) | ($invalid ? 4 : 0) | ($transient ? 8 : 0);
+            $transition = $delay >= 0 ? 1 : ($newStatus > 0 ? 3 : ($newStatus === $missing ? 4 : 2));
+            $word = ($code + 1) | $providerClass << 4 | $transition << 8 | $flags << 12;
+            array_push($out, $word, $newVideoId, $newStatus, $attempts, $delay);
+            $summary[$transition === 1 ? 0 : ($transition === 3 ? 2 : 1)]++;
+            $summary[3] += $invalid ? 1 : 0;
+            $summary[4] += $link ? 1 : 0;
+            $summary[5] += $bump ? 1 : 0;
+            $summary[6] = max($summary[6], $delay);
+            $value = $word ^ $newStatus << 16 ^ $delay ^ $providerHash << 40;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $summary[7] = $digest;
+
+        return [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function lookupOutcomePlanRowBatchNative(array $items): array
+    {
+        self::w62Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w62Join([array_column($items, 0), array_column($items, 1)], $count);
+        $ints = pack('P*', ...array_column($items, 2), ...array_column($items, 3), ...array_column($items, 4), ...array_column($items, 5), ...array_column($items, 6), ...array_column($items, 7), ...array_column($items, 8));
+
+        return self::w62Call($blob, $twin, $ints, $count, $count * self::W62_ROW_WORDS + self::W62_TRAILER_WORDS)
+            ?? self::lookupOutcomePlanRowBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w62Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W62 TV lookup outcome plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 9 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_int($item[2]) || ! \is_int($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5]) || ! \is_int($item[6]) || ! \is_int($item[7]) || ! \is_int($item[8])) {
+                throw new InvalidArgumentException('W62 TV lookup outcome plan batch items must be [string status, string provider, int previous videos id, int previous status, int previous attempts, int videos id, int episode id, int transient, int retry after] lists.');
+            }
+        }
+    }
+
+    public static function usesW62RustFfi(): bool
+    {
+        $enabled = self::w62RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W62_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W62 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w62RustFfiState('enabled');
+        self::w62RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w62RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w62Join(array $columns, int $count): array
+    {
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\0", $column);
+        }
+        $joined = implode("\0", $parts);
+        if (substr_count($joined, "\0") === \count($columns) * $count - 1) {
+            return [$joined, ''];
+        }
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\x01", $column);
+        }
+
+        return [$joined, implode("\x01", $parts)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w62Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w62RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w62', self::W62_OUTCOME_WRITER_FFI_CDEF) ?? false;
+            self::w62RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w62RustFfiState('out', $out);
+                self::w62RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W62_OUTCOME_WRITER_FFI_CDEF.)
+            $written = $ffi->nntmux_w624_tv_lookup_outcome_plan_row_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w62RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W62 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static: no arguments returns the state, one argument reads a key ('reset'
+     * clears everything) and two arguments write a key.
+     */
+    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int. */
+    private static function w62Fnv(string $bytes): int
+    {
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
+    }
 }
