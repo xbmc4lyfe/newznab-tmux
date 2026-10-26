@@ -66808,3 +66808,1615 @@ mod w664_tests {
         assert_eq!(twin_mismatch, -1);
     }
 }
+
+pub mod w674_batch {
+    use super::w594_batch::{fnv, split};
+    use super::w644_batch::{fnv32, php_trim};
+    use std::collections::HashMap;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// Record body: blob values (field-major), the int64 columns, the record count, output.
+    type Body = fn(&[&[u8]], &[i64], usize, &mut [i64]);
+
+    pub(crate) const MAX_RECORDS: usize = 1 << 20;
+
+    const FNV_BASIS: i64 = 2_166_136_261;
+
+    const FNV_PRIME: u32 = 16_777_619;
+
+    /// Latest IGDB release timestamp read as a date (2099-12-31T23:59:59Z).
+    pub(crate) const RELEASE_MAX: i64 = 4_102_444_799;
+
+    /// Invitation clocks clamp to [0, 2^40] seconds so differences cannot overflow.
+    pub(crate) const CLOCK_MAX: i64 = 1 << 40;
+
+    /// Column `k` of the packed int64 words for record `i`.
+    #[inline(always)]
+    fn col(ints: &[i64], count: usize, k: usize, i: usize) -> i64 {
+        ints[k * count + i]
+    }
+
+    #[inline(always)]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point to `len` readable bytes unless `len` is zero.
+    unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Validate the frame, split the blob and run `body`. Returns the words written, -1 for a
+    /// malformed frame or panic and `-needed` when `out_cap` is too small.
+    ///
+    /// # Safety
+    ///
+    /// See the exported functions.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        fields: usize,
+        columns: usize,
+        words: usize,
+        trailer: usize,
+        body: Body,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(blob as usize, blob_len, out as usize, out_bytes)
+                || overlaps(twin as usize, twin_len, out as usize, out_bytes)
+                || overlaps(ints as usize, ints_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(blob), Some(twin), Some(ints)) = (
+                unsafe { bytes(blob, blob_len) },
+                unsafe { bytes(twin, twin_len) },
+                unsafe { bytes(ints, ints_len) },
+            ) else {
+                return -1;
+            };
+            if ints.len() != count * columns * 8 {
+                return -1;
+            }
+            if count == 0 {
+                return if blob.is_empty() && twin.is_empty() {
+                    0
+                } else {
+                    -1
+                };
+            }
+            let all: Vec<i64> = ints
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|w| i64::from_le_bytes(*w))
+                .collect();
+            let mut values: Vec<&[u8]> = Vec::with_capacity(count * fields);
+            if !split(blob, twin, count * fields, &mut values) {
+                return -1;
+            }
+            let need = count * words + trailer;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from every input.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            body(&values, &all, count, out);
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Word-at-a-time multiplicative hasher for the per-batch integer keys.
+    #[derive(Default)]
+    struct Fx(u64);
+
+    impl Hasher for Fx {
+        #[inline(always)]
+        fn write(&mut self, bytes: &[u8]) {
+            for b in bytes {
+                self.write_u64(u64::from(*b));
+            }
+        }
+
+        #[inline(always)]
+        fn write_u64(&mut self, n: u64) {
+            self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+
+        #[inline(always)]
+        fn write_i64(&mut self, n: i64) {
+            self.write_u64(n as u64);
+        }
+
+        #[inline(always)]
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+
+    type IntMap<V> = HashMap<i64, V, BuildHasherDefault<Fx>>;
+
+    #[inline(always)]
+    fn int_map<V>(count: usize) -> IntMap<V> {
+        HashMap::with_capacity_and_hasher(count, BuildHasherDefault::default())
+    }
+
+    /// IGDB model whitespace: " \t\n\r\0\x0B\x0C".
+    #[inline(always)]
+    pub(crate) fn ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b | 0x0c)
+    }
+
+    /// PHP `trim($s, " \t\n\r\0\x0B\x0C")`.
+    #[inline(always)]
+    pub(crate) fn ws_trim(s: &[u8]) -> &[u8] {
+        let start = s.iter().position(|b| !ws(*b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(*b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// `preg_replace('/[ \t\n\r\0\x0B\x0C]+/', ' ', trim($s, WHITESPACE))` into `buf`.
+    #[inline]
+    pub(crate) fn collapse(s: &[u8], buf: &mut Vec<u8>) {
+        buf.clear();
+        let mut gap = false;
+        for &b in ws_trim(s) {
+            if ws(b) {
+                gap = true;
+            } else {
+                if gap {
+                    buf.push(b' ');
+                    gap = false;
+                }
+                buf.push(b);
+            }
+        }
+    }
+
+    /// FNV-1a 32 of `s` with each byte mapped by `f`, 0 for an empty string.
+    #[inline(always)]
+    fn fnv32_by(s: &[u8], f: impl Fn(u8) -> u8) -> i64 {
+        if s.is_empty() {
+            return 0;
+        }
+        let mut h: u32 = 2_166_136_261;
+        for b in s {
+            h = (h ^ u32::from(f(*b))).wrapping_mul(FNV_PRIME);
+        }
+        i64::from(h)
+    }
+
+    /// FNV-1a 32 of the `ranges` of `buf` joined by `sep`, 0 when there are none.
+    #[inline]
+    fn fnv32_joined(buf: &[u8], ranges: &[(usize, usize)], sep: u8) -> i64 {
+        if ranges.is_empty() {
+            return 0;
+        }
+        let mut h: u32 = 2_166_136_261;
+        for (k, (a, b)) in ranges.iter().enumerate() {
+            if k > 0 {
+                h = (h ^ u32::from(sep)).wrapping_mul(FNV_PRIME);
+            }
+            for c in &buf[*a..*b] {
+                h = (h ^ u32::from(*c)).wrapping_mul(FNV_PRIME);
+            }
+        }
+        i64::from(h)
+    }
+
+    /// Lower-case `s` into `buf` and record its maximal `[a-z0-9]` runs as ranges.
+    #[inline]
+    fn alnum_runs(s: &[u8], buf: &mut Vec<u8>, ranges: &mut Vec<(usize, usize)>) {
+        buf.clear();
+        ranges.clear();
+        let mut start = usize::MAX;
+        for (k, b) in s.iter().enumerate() {
+            let l = b.to_ascii_lowercase();
+            buf.push(l);
+            if l.is_ascii_lowercase() || l.is_ascii_digit() {
+                if start == usize::MAX {
+                    start = k;
+                }
+            } else if start != usize::MAX {
+                ranges.push((start, k));
+                start = usize::MAX;
+            }
+        }
+        if start != usize::MAX {
+            ranges.push((start, s.len()));
+        }
+    }
+
+    #[inline(always)]
+    fn digits(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |a, d| a * 10 + i64::from(d - b'0'))
+    }
+
+    /// 1 to `max` ASCII digits as a number.
+    #[inline(always)]
+    pub(crate) fn number(s: &[u8], max: usize) -> Option<i64> {
+        (!s.is_empty() && s.len() <= max && s.iter().all(u8::is_ascii_digit)).then(|| digits(s))
+    }
+
+    // -- IGDB Company -----------------------------------------------------------------------------
+
+    /// Company::W48_SUFFIXES.
+    #[inline(always)]
+    pub(crate) fn company_suffix(s: &[u8]) -> bool {
+        matches!(
+            s,
+            b"ab"
+                | b"ag"
+                | b"bv"
+                | b"co"
+                | b"corp"
+                | b"corporation"
+                | b"gmbh"
+                | b"inc"
+                | b"kk"
+                | b"limited"
+                | b"llc"
+                | b"ltd"
+                | b"oy"
+                | b"plc"
+                | b"sa"
+                | b"srl"
+        )
+    }
+
+    /// Company::W48_KNOWN_PUBLISHERS.
+    const KNOWN_PUBLISHERS: [&[u8]; 16] = [
+        b"activision",
+        b"bandai-namco",
+        b"bethesda",
+        b"capcom",
+        b"devolver",
+        b"electronic-arts",
+        b"konami",
+        b"microsoft",
+        b"nintendo",
+        b"sega",
+        b"sony",
+        b"square-enix",
+        b"take-two",
+        b"thq",
+        b"ubisoft",
+        b"warner-bros",
+    ];
+
+    /// Index + 1 of the first known publisher equal to `canonical` or prefixing it with `-`.
+    #[inline]
+    pub(crate) fn known_publisher(canonical: &[u8]) -> i64 {
+        KNOWN_PUBLISHERS
+            .iter()
+            .position(|p| {
+                canonical.starts_with(p)
+                    && (canonical.len() == p.len() || canonical[p.len()] == b'-')
+            })
+            .map_or(0, |k| k as i64 + 1)
+    }
+
+    /// 0 none, 1 developer only, 2 publisher only, 3 both, 4 porting/supporting only.
+    #[inline(always)]
+    pub(crate) fn role_class(roles: i64) -> i64 {
+        if roles & 3 == 3 {
+            3
+        } else if roles & 1 != 0 {
+            1
+        } else if roles & 2 != 0 {
+            2
+        } else if roles & 12 != 0 {
+            4
+        } else {
+            0
+        }
+    }
+
+    pub(crate) const PARENT_DEPTH_MAX: i64 = 8;
+
+    fn company_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 4);
+        let mut by_id: IntMap<usize> = int_map(count);
+        for i in 0..count {
+            let id = col(ints, count, 0, i);
+            if id > 0 {
+                by_id.entry(id).or_insert(i);
+            }
+        }
+        let mut t = [0i64; 10];
+        t[0] = count as i64;
+        let mut digest = FNV_BASIS;
+        let mut name = Vec::new();
+        let mut slug = Vec::new();
+        let mut ends: Vec<usize> = Vec::new();
+        for (i, row) in rows.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            collapse(v[i], &mut name);
+            slug.clear();
+            ends.clear();
+            let mut gap = false;
+            for b in &name {
+                let l = b.to_ascii_lowercase();
+                if l.is_ascii_lowercase() || l.is_ascii_digit() {
+                    if gap && !slug.is_empty() {
+                        ends.push(slug.len());
+                        slug.push(b'-');
+                    }
+                    gap = false;
+                    slug.push(l);
+                } else {
+                    gap = true;
+                }
+            }
+            ends.push(slug.len());
+            // Segment k spans (ends[k-1] + 1)..ends[k]; strip suffixes while another remains.
+            let mut kept = ends.len();
+            while kept > 1 {
+                let start = ends[kept - 2] + 1;
+                if !company_suffix(&slug[start..ends[kept - 1]]) {
+                    break;
+                }
+                kept -= 1;
+            }
+            let stripped = kept < ends.len();
+            let canonical = &slug[..ends[kept - 1]];
+            let publisher = known_publisher(canonical);
+            let given = ws_trim(v[count + i]);
+            let slug_match = !given.is_empty() && given.eq_ignore_ascii_case(&slug);
+            let id = col(ints, count, 0, i);
+            let roles = col(ints, count, 2, i) & 15;
+            let country = col(ints, count, 3, i);
+            let (mut decision, mut depth, mut cur) = (0i64, 0i64, i);
+            if col(ints, count, 1, i) > 0 {
+                loop {
+                    let p = col(ints, count, 1, cur);
+                    if p <= 0 {
+                        decision = 1;
+                        break;
+                    }
+                    let Some(&j) = by_id.get(&p) else {
+                        decision = 2;
+                        break;
+                    };
+                    if j == i {
+                        decision = 3;
+                        break;
+                    }
+                    cur = j;
+                    depth += 1;
+                    if depth == PARENT_DEPTH_MAX {
+                        decision = 4;
+                        break;
+                    }
+                }
+            }
+            let root = if depth > 0 { cur as i64 } else { -1 };
+            let class = role_class(roles);
+            let word = class
+                | publisher << 3
+                | i64::from(stripped) << 8
+                | i64::from(slug_match) << 9
+                | i64::from((1..=999).contains(&country)) << 10
+                | i64::from(id > 0) << 11
+                | i64::from(id > 0 && !name.is_empty()) << 12
+                | decision << 13
+                | depth << 16
+                | (name.len().min(0xFFFF) as i64) << 20
+                | (slug.len().min(0xFFFF) as i64) << 36
+                | (canonical.len().min(0x3FF) as i64) << 52;
+            let canon_hash = fnv32::<false>(canonical);
+            *row = [word, canon_hash, root, fnv32::<false>(&name)];
+            t[1] += roles & 1;
+            t[2] += roles >> 1 & 1;
+            t[3] += i64::from(class == 3);
+            t[4] += i64::from(class == 4);
+            t[5] += i64::from(roles == 0);
+            t[6] += i64::from(publisher > 0);
+            t[7] += i64::from(decision == 1);
+            t[8] += i64::from(decision >= 2);
+            digest = fnv(digest, word ^ canon_hash << 8 ^ root);
+        }
+        t[9] = digest;
+        trailer.copy_from_slice(&t);
+    }
+
+    // -- IGDB Game --------------------------------------------------------------------------------
+
+    /// Gregorian year of a Unix timestamp in [1, RELEASE_MAX], else 0.
+    #[inline]
+    pub(crate) fn release_year(ts: i64) -> i64 {
+        if !(1..=RELEASE_MAX).contains(&ts) {
+            return 0;
+        }
+        let z = ts / 86_400 + 719_468;
+        let era = z / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        yoe + era * 400 + i64::from(mp >= 10)
+    }
+
+    /// Lower-cased IGDB genre name bits; 0 for an unknown genre.
+    #[inline]
+    pub(crate) fn genre_bit(g: &[u8]) -> i64 {
+        const GENRES: [(&[u8], i64); 17] = [
+            (b"adventure", 1),
+            (b"arcade", 2),
+            (b"fighting", 4),
+            (b"hack and slash/beat 'em up", 4),
+            (b"indie", 8),
+            (b"platform", 16),
+            (b"puzzle", 32),
+            (b"racing", 64),
+            (b"role-playing (rpg)", 128),
+            (b"rpg", 128),
+            (b"shooter", 256),
+            (b"simulator", 512),
+            (b"sport", 1024),
+            (b"strategy", 2048),
+            (b"real time strategy (rts)", 2048),
+            (b"turn-based strategy (tbs)", 2048),
+            (b"tactical", 2048),
+        ];
+        GENRES
+            .iter()
+            .find(|(name, _)| g.eq_ignore_ascii_case(name))
+            .map_or(0, |(_, bit)| *bit)
+    }
+
+    fn game_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 4);
+        let mut t = [0i64; 9];
+        t[0] = count as i64;
+        let mut digest = FNV_BASIS;
+        let (mut tb, mut qb) = (Vec::new(), Vec::new());
+        let (mut tr, mut qr) = (Vec::new(), Vec::new());
+        for (i, row) in rows.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            alnum_runs(v[i], &mut tb, &mut tr);
+            alnum_runs(v[count + i], &mut qb, &mut qr);
+            let (title_tokens, query_tokens) = (tr.len(), qr.len());
+            let title_hash = fnv32_joined(&tb, &tr, b' ');
+            let same = |a: &(usize, usize), b: &(usize, usize)| tb[a.0..a.1] == qb[b.0..b.1];
+            let exact = query_tokens > 0
+                && title_tokens == query_tokens
+                && tr.iter().zip(&qr).all(|(a, b)| same(a, b));
+            let prefix = query_tokens > 0
+                && query_tokens < title_tokens
+                && tr.iter().zip(&qr).all(|(a, b)| same(a, b));
+            tr.sort_unstable_by(|a, b| tb[a.0..a.1].cmp(&tb[b.0..b.1]));
+            tr.dedup_by(|a, b| tb[a.0..a.1] == tb[b.0..b.1]);
+            qr.sort_unstable_by(|a, b| qb[a.0..a.1].cmp(&qb[b.0..b.1]));
+            qr.dedup_by(|a, b| qb[a.0..a.1] == qb[b.0..b.1]);
+            let (mut x, mut y, mut inter) = (0usize, 0usize, 0i64);
+            while x < tr.len() && y < qr.len() {
+                match tb[tr[x].0..tr[x].1].cmp(&qb[qr[y].0..qr[y].1]) {
+                    std::cmp::Ordering::Less => x += 1,
+                    std::cmp::Ordering::Greater => y += 1,
+                    std::cmp::Ordering::Equal => {
+                        inter += 1;
+                        x += 1;
+                        y += 1;
+                    }
+                }
+            }
+            let union = (tr.len() + qr.len()) as i64 - inter;
+            let similarity = if union > 0 { inter * 1000 / union } else { 0 };
+
+            let year = release_year(col(ints, count, 0, i));
+            let query_year = col(ints, count, 1, i);
+            let year_code: i64 = if !(1..=9999).contains(&query_year) {
+                0
+            } else if year == 0 {
+                1
+            } else {
+                match (year - query_year).abs() {
+                    0 => 2,
+                    1 => 3,
+                    _ => 4,
+                }
+            };
+
+            let query_platform = col(ints, count, 2, i);
+            let (mut platforms, mut invalid, mut platform_match) = (0i64, 0i64, false);
+            for p in v[2 * count + i].split(|b| *b == b',') {
+                let p = php_trim(p);
+                if p.is_empty() {
+                    continue;
+                }
+                match number(p, 6) {
+                    Some(id) => {
+                        platforms += 1;
+                        platform_match |= query_platform > 0 && id == query_platform;
+                    }
+                    None => invalid += 1,
+                }
+            }
+
+            let (mut genres, mut unknown) = (0i64, 0i64);
+            for g in v[3 * count + i].split(|b| *b == b',') {
+                let g = php_trim(g);
+                if g.is_empty() {
+                    continue;
+                }
+                match genre_bit(g) {
+                    0 => unknown += 1,
+                    bit => genres |= bit,
+                }
+            }
+
+            let cover = php_trim(v[4 * count + i]);
+            let cover_code: i64 = if cover.is_empty() {
+                0
+            } else if cover.len() <= 32
+                && cover
+                    .iter()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            {
+                1
+            } else {
+                2
+            };
+
+            let rating = col(ints, count, 3, i);
+            let votes = col(ints, count, 4, i);
+            let tier: i64 = if votes <= 0 || !(0..=10_000).contains(&rating) {
+                0
+            } else if votes < 5 {
+                1
+            } else if votes < 50 {
+                2
+            } else {
+                3
+            };
+            let weighted = if tier == 0 {
+                0
+            } else {
+                rating * votes.min(100) / 100
+            };
+
+            let score = similarity
+                + match year_code {
+                    2 => 100,
+                    3 => 50,
+                    4 => -200,
+                    _ => 0,
+                }
+                + if platform_match { 100 } else { 0 }
+                + if cover_code == 1 { 20 } else { 0 };
+            let decision: i64 = if title_tokens == 0 {
+                1
+            } else if query_tokens == 0 {
+                2
+            } else if score >= 800 {
+                3
+            } else if score >= 500 {
+                4
+            } else {
+                5
+            };
+            let word = decision
+                | year_code << 3
+                | i64::from(platform_match) << 6
+                | cover_code << 7
+                | tier << 9
+                | i64::from(exact) << 11
+                | i64::from(prefix) << 12
+                | similarity << 13
+                | year << 24
+                | weighted << 36
+                | (title_tokens.min(255) as i64) << 50
+                | (query_tokens.min(31) as i64) << 58;
+            let detail =
+                genres | unknown.min(255) << 16 | platforms.min(255) << 24 | invalid.min(255) << 32;
+            *row = [word, score, detail, title_hash];
+            t[decision as usize] += 1;
+            t[6] += i64::from(exact);
+            t[7] += i64::from(platform_match);
+            digest = fnv(digest, word ^ score << 4 ^ title_hash);
+        }
+        t[8] = digest;
+        trailer.copy_from_slice(&t);
+    }
+
+    // -- IGDB Platform ----------------------------------------------------------------------------
+
+    /// Alias key (lower-case `[a-z0-9]` only) => (family, generation, handheld, NNTmux category).
+    /// Families: 1 Sony, 2 Microsoft, 3 Nintendo, 4 Sega, 5 PC, 6 mobile.
+    #[inline]
+    pub(crate) fn platform_alias(key: &[u8]) -> Option<(i64, i64, bool, i64)> {
+        Some(match key {
+            b"ps1" | b"psx" | b"playstation" => (1, 5, false, 1999),
+            b"ps2" | b"playstation2" => (1, 6, false, 1999),
+            b"ps3" | b"playstation3" => (1, 7, false, 1080),
+            b"ps4" | b"playstation4" => (1, 8, false, 1180),
+            b"ps5" | b"playstation5" => (1, 9, false, 1999),
+            b"psp" | b"playstationportable" => (1, 7, true, 1020),
+            b"vita" | b"psvita" | b"playstationvita" => (1, 8, true, 1120),
+            b"xbox" => (2, 6, false, 1040),
+            b"x360" | b"xbox360" => (2, 7, false, 1050),
+            b"xone" | b"xboxone" | b"xb1" => (2, 8, false, 1140),
+            b"xsx" | b"xboxseriesx" | b"xboxseriesxs" => (2, 9, false, 1999),
+            b"nes" | b"famicom" | b"nintendoentertainmentsystem" => (3, 3, false, 1999),
+            b"snes" | b"supernintendo" | b"supernintendoentertainmentsystem" | b"superfamicom" => {
+                (3, 4, false, 1999)
+            }
+            b"n64" | b"nintendo64" => (3, 5, false, 1999),
+            b"gc" | b"ngc" | b"gamecube" | b"nintendogamecube" => (3, 6, false, 1999),
+            b"wii" => (3, 7, false, 1030),
+            b"wiiu" => (3, 8, false, 1130),
+            b"switch" | b"nintendoswitch" | b"ns" => (3, 8, true, 1999),
+            b"gb" | b"gameboy" => (3, 4, true, 1999),
+            b"gba" | b"gameboyadvance" => (3, 6, true, 1999),
+            b"ds" | b"nds" | b"nintendods" => (3, 7, true, 1010),
+            b"3ds" | b"nintendo3ds" => (3, 8, true, 1110),
+            b"sms" | b"mastersystem" | b"segamastersystem" => (4, 3, false, 1999),
+            b"md" | b"genesis" | b"megadrive" | b"segagenesis" | b"segamegadrive" => {
+                (4, 4, false, 1999)
+            }
+            b"saturn" | b"segasaturn" => (4, 5, false, 1999),
+            b"dc" | b"dreamcast" | b"segadreamcast" => (4, 6, false, 1999),
+            b"gg" | b"gamegear" | b"segagamegear" => (4, 4, true, 1999),
+            b"pc" | b"win" | b"windows" | b"pcmicrosoftwindows" | b"linux" | b"dos" => {
+                (5, 0, false, 4050)
+            }
+            b"mac" | b"macos" => (5, 0, false, 4030),
+            b"ios" | b"iphone" | b"ipad" => (6, 0, true, 4060),
+            b"android" => (6, 0, true, 4070),
+            _ => return None,
+        })
+    }
+
+    /// Alias lookup for `s` reduced to lower-case `[a-z0-9]`; keys over 40 bytes match nothing.
+    #[inline]
+    fn alias_of(s: &[u8]) -> Option<(i64, i64, bool, i64)> {
+        let mut key = [0u8; 40];
+        let mut n = 0;
+        for b in s {
+            let l = b.to_ascii_lowercase();
+            if l.is_ascii_lowercase() || l.is_ascii_digit() {
+                if n == key.len() {
+                    return None;
+                }
+                key[n] = l;
+                n += 1;
+            }
+        }
+        platform_alias(&key[..n])
+    }
+
+    /// 0 unknown, 1 retro (up to 5), 2 legacy (6-7), 3 current (8-9), 4 next (10+).
+    #[inline(always)]
+    pub(crate) fn generation_tier(g: i64) -> i64 {
+        match g {
+            0 => 0,
+            1..=5 => 1,
+            6..=7 => 2,
+            8..=9 => 3,
+            _ => 4,
+        }
+    }
+
+    fn platform_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 3);
+        let mut t = [0i64; 11];
+        t[0] = count as i64;
+        let mut digest = FNV_BASIS;
+        let (mut name, mut abbr) = (Vec::new(), Vec::new());
+        for (i, row) in rows.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            collapse(v[i], &mut name);
+            collapse(v[count + i], &mut abbr);
+            let (source, alias) = match alias_of(v[count + i]) {
+                Some(a) => (1i64, Some(a)),
+                None => match alias_of(v[2 * count + i]) {
+                    Some(a) => (2, Some(a)),
+                    None => match alias_of(v[i]) {
+                        Some(a) => (3, Some(a)),
+                        None => (0, None),
+                    },
+                },
+            };
+            let id = col(ints, count, 0, i);
+            let igdb_category = col(ints, count, 1, i);
+            let given = col(ints, count, 2, i);
+            let (family, alias_gen, handheld, mapped) = alias.unwrap_or((0, 0, false, -1));
+            let generation = if alias_gen > 0 {
+                alias_gen
+            } else {
+                given.clamp(0, 15)
+            };
+            let gen_code: i64 = if alias_gen > 0 && given > 0 {
+                if given == alias_gen { 1 } else { 2 }
+            } else {
+                0
+            };
+            let portable = handheld || igdb_category == 5;
+            let category = if mapped >= 0 {
+                mapped
+            } else {
+                match igdb_category {
+                    4 | 6 => 4050,
+                    1 | 2 | 5 => 1999,
+                    _ => 0,
+                }
+            };
+            let (label, upper) = if abbr.is_empty() {
+                (&name, false)
+            } else {
+                (&abbr, true)
+            };
+            let label_hash = if upper {
+                fnv32_by(label, |b| b.to_ascii_uppercase())
+            } else {
+                fnv32::<false>(label)
+            };
+            let word = source
+                | family << 2
+                | generation << 5
+                | generation_tier(generation) << 9
+                | i64::from(portable) << 12
+                | gen_code << 13
+                | i64::from(id > 0 && !name.is_empty()) << 15
+                | (label.len().min(255) as i64) << 16
+                | (name.len().min(0xFFFF) as i64) << 24;
+            *row = [word, category, label_hash];
+            if family > 0 {
+                t[family as usize] += 1;
+            } else {
+                t[7] += 1;
+            }
+            t[8] += i64::from(portable);
+            t[9] += i64::from(gen_code == 2);
+            digest = fnv(digest, word ^ category << 20 ^ label_hash);
+        }
+        t[10] = digest;
+        trailer.copy_from_slice(&t);
+    }
+
+    // -- InvitationService ------------------------------------------------------------------------
+
+    /// Trimmed, case-insensitive inviter role => (code, quota; -1 unlimited): 1 admin, 2
+    /// moderator (25), 3 friend (10), 4 user (3), 5 disabled (0), else 0 unknown (0).
+    #[inline]
+    pub(crate) fn inviter_role(role: &[u8]) -> (i64, i64) {
+        let r = php_trim(role);
+        [
+            (b"admin".as_slice(), -1i64),
+            (b"moderator", 25),
+            (b"friend", 10),
+            (b"user", 3),
+            (b"disabled", 0),
+        ]
+        .iter()
+        .position(|(name, _)| r.eq_ignore_ascii_case(name))
+        .map_or((0, 0), |k| (k as i64 + 1, [-1, 25, 10, 3, 0][k]))
+    }
+
+    /// 0 empty, 1 64 ASCII alphanumerics (Str::random(64)), 2 wrong length, 3 bad character.
+    #[inline(always)]
+    pub(crate) fn token_code(t: &[u8]) -> i64 {
+        if t.is_empty() {
+            0
+        } else if t.len() != 64 {
+            2
+        } else if t.iter().all(u8::is_ascii_alphanumeric) {
+            1
+        } else {
+            3
+        }
+    }
+
+    /// InvitationService W50 plausibility of a trimmed, lower-cased email.
+    #[inline]
+    pub(crate) fn plausible_email(e: &[u8]) -> bool {
+        let Some(sign) = e.iter().position(|b| *b == b'@') else {
+            return false;
+        };
+        sign > 0
+            && !e[sign + 1..].contains(&b'@')
+            && e.len() - sign > 3
+            && e[sign + 1] != b'.'
+            && e[e.len() - 1] != b'.'
+            && e[sign + 2..].contains(&b'.')
+            && !e.iter().any(|b| *b <= 0x20 || *b == 0x7f)
+    }
+
+    fn invitation_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 3);
+        let mut t = [0i64; 10];
+        t[0] = count as i64;
+        let mut digest = FNV_BASIS;
+        let mut sent: IntMap<i64> = int_map(count.min(1024));
+        for (i, row) in rows.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let token = token_code(v[i]);
+            let raw = v[count + i];
+            let email = php_trim(raw);
+            let (role, quota) = inviter_role(v[2 * count + i]);
+            let clock = |k: usize| col(ints, count, k, i).clamp(0, CLOCK_MAX);
+            let (now, created, expires, used) = (clock(0), clock(1), clock(2), clock(3));
+            let active = col(ints, count, 4, i) != 0;
+            let inviter = col(ints, count, 5, i);
+            let invites = col(ints, count, 6, i);
+            let expiry: i64 = if expires == 0 {
+                0
+            } else if expires < now {
+                1
+            } else if expires - now < 86_400 {
+                2
+            } else {
+                3
+            };
+            let hours = if expires > now {
+                ((expires - now) / 3600).min(0xFFFF)
+            } else {
+                0
+            };
+            let inconsistent = created > 0 && expires > 0 && created > expires;
+            let days = if created > 0 && expires >= created {
+                (expires - created) / 86_400
+            } else {
+                0
+            };
+            let available = if quota < 0 {
+                -1
+            } else {
+                quota.min(invites.max(0))
+            };
+            let mut ordinal = -1i64;
+            let status: i64 = if used > 0 {
+                3
+            } else if !active {
+                4
+            } else if expiry == 1 {
+                2
+            } else if token != 1 {
+                5
+            } else {
+                let n = sent.entry(inviter).or_insert(0);
+                ordinal = *n;
+                *n += 1;
+                if available >= 0 && ordinal >= available {
+                    6
+                } else {
+                    1
+                }
+            };
+            let lower_same = !email.iter().any(u8::is_ascii_uppercase);
+            let plausible = !email.is_empty() && {
+                if lower_same {
+                    plausible_email(email)
+                } else {
+                    plausible_email(&email.to_ascii_lowercase())
+                }
+            };
+            let unnormalized = email.len() != raw.len() || !lower_same;
+            let word = status
+                | token << 3
+                | expiry << 5
+                | i64::from(inconsistent) << 7
+                | i64::from(days > 30) << 8
+                | role << 9
+                | i64::from(plausible) << 12
+                | i64::from(unnormalized) << 13
+                | hours << 14
+                | days.min(0xFFFF) << 30
+                | (available + 1) << 46;
+            let email_hash = fnv32::<true>(email);
+            *row = [word, email_hash, ordinal];
+            t[status as usize] += 1;
+            t[7] += i64::from(plausible);
+            digest = fnv(digest, word ^ email_hash << 8 ^ ordinal);
+        }
+        t[8] = sent.len() as i64;
+        t[9] = digest;
+        trailer.copy_from_slice(&t);
+    }
+
+    // -- IsbnDbService ----------------------------------------------------------------------------
+
+    /// `[0-9Xx]` bytes of a raw ISBN, upper-cased: (kind, ISBN-13 value, ISBN-10 check digit).
+    /// Kinds: 0 empty, 1 valid ISBN-10, 2 valid ISBN-13, 3 bad ISBN-10 checksum, 4 bad ISBN-13
+    /// checksum, 5 malformed. The value is 0 and the check digit 15 when not applicable.
+    pub(crate) fn isbn_parse(raw: &[u8]) -> (i64, i64, i64) {
+        let mut d = [0u8; 13];
+        let mut n = 0usize;
+        for b in raw {
+            let c = b.to_ascii_uppercase();
+            if c.is_ascii_digit() || c == b'X' {
+                if n == 13 {
+                    return (5, 0, 15);
+                }
+                d[n] = c;
+                n += 1;
+            }
+        }
+        let num = |c: u8| i64::from(c - b'0');
+        match n {
+            0 => (0, 0, 15),
+            10 => {
+                if !d[..9].iter().all(u8::is_ascii_digit) {
+                    return (5, 0, 15);
+                }
+                let check = if d[9] == b'X' { 10 } else { num(d[9]) };
+                let sum: i64 = d[..9]
+                    .iter()
+                    .enumerate()
+                    .map(|(k, c)| (10 - k as i64) * num(*c))
+                    .sum::<i64>()
+                    + check;
+                if sum % 11 != 0 {
+                    return (3, 0, 15);
+                }
+                let mut s13 = 9 + 7 * 3 + 8;
+                let mut value = 978i64;
+                for (k, c) in d[..9].iter().enumerate() {
+                    s13 += num(*c) * if (k + 3) % 2 == 0 { 1 } else { 3 };
+                    value = value * 10 + num(*c);
+                }
+                (1, value * 10 + (10 - s13 % 10) % 10, check)
+            }
+            13 => {
+                if !d.iter().all(u8::is_ascii_digit)
+                    || !(d.starts_with(b"978") || d.starts_with(b"979"))
+                {
+                    return (5, 0, 15);
+                }
+                let sum: i64 = d
+                    .iter()
+                    .enumerate()
+                    .map(|(k, c)| num(*c) * if k % 2 == 0 { 1 } else { 3 })
+                    .sum();
+                if sum % 10 != 0 {
+                    return (4, 0, 15);
+                }
+                let value = d.iter().fold(0i64, |a, c| a * 10 + num(*c));
+                let check = if d.starts_with(b"978") {
+                    let s: i64 = d[3..12]
+                        .iter()
+                        .enumerate()
+                        .map(|(k, c)| (10 - k as i64) * num(*c))
+                        .sum();
+                    (11 - s % 11) % 11
+                } else {
+                    15
+                };
+                (2, value, check)
+            }
+            _ => (5, 0, 15),
+        }
+    }
+
+    /// Trailing publisher tokens dropped while another token remains.
+    #[inline(always)]
+    pub(crate) fn publisher_suffix(s: &[u8]) -> bool {
+        matches!(
+            s,
+            b"inc"
+                | b"ltd"
+                | b"llc"
+                | b"co"
+                | b"corp"
+                | b"publishing"
+                | b"publishers"
+                | b"publisher"
+                | b"press"
+                | b"books"
+                | b"group"
+                | b"limited"
+                | b"gmbh"
+                | b"plc"
+        )
+    }
+
+    /// Trimmed publish date: (precision, year). Precision 0 empty, 1 `YYYY`, 2 `YYYY-MM`, 3
+    /// `YYYY-MM-DD...`, 4 malformed (year 0). Years below 1000 are malformed.
+    pub(crate) fn publish_date(raw: &[u8]) -> (i64, i64) {
+        let d = php_trim(raw);
+        if d.is_empty() {
+            return (0, 0);
+        }
+        let Some(year) = d.get(..4).and_then(|y| number(y, 4)) else {
+            return (4, 0);
+        };
+        if year < 1000 {
+            return (4, 0);
+        }
+        if d.len() == 4 {
+            return (1, year);
+        }
+        let month = d.get(5..7).and_then(|m| number(m, 2));
+        if d.len() < 7 || d[4] != b'-' || !matches!(month, Some(1..=12)) {
+            return (4, 0);
+        }
+        if d.len() == 7 {
+            return (2, year);
+        }
+        let day = d.get(8..10).and_then(|m| number(m, 2));
+        if d.len() < 10 || d[7] != b'-' || !matches!(day, Some(1..=31)) {
+            return (4, 0);
+        }
+        (3, year)
+    }
+
+    fn isbndb_row(v: &[&[u8]], ints: &[i64], count: usize, out: &mut [i64]) {
+        let (rows, trailer) = out.split_at_mut(count * 4);
+        let mut t = [0i64; 10];
+        t[0] = count as i64;
+        let mut digest = FNV_BASIS;
+        let mut pb = Vec::new();
+        let mut pr = Vec::new();
+        for (i, row) in rows.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (kind, isbn13, check10) = isbn_parse(v[i]);
+            let title_empty = php_trim(v[count + i]).is_empty();
+            let (mut authors, mut comma, mut first) = (0i64, false, 0i64);
+            for a in v[2 * count + i].split(|b| *b == b'|') {
+                let a = php_trim(a);
+                if a.is_empty() {
+                    continue;
+                }
+                if authors == 0 {
+                    first = fnv32::<true>(a);
+                }
+                authors += 1;
+                comma |= a.contains(&b',');
+            }
+            alnum_runs(v[3 * count + i], &mut pb, &mut pr);
+            let total = pr.len();
+            let mut kept = total;
+            while kept > 1 && publisher_suffix(&pb[pr[kept - 1].0..pr[kept - 1].1]) {
+                kept -= 1;
+            }
+            let stripped = kept < total;
+            let publisher = fnv32_joined(&pb, &pr[..kept], b' ');
+            let (precision, year) = publish_date(v[4 * count + i]);
+            let pages = col(ints, count, 0, i);
+            let cover = col(ints, count, 1, i) != 0;
+            let query_year = col(ints, count, 2, i).clamp(0, 9999);
+            let valid = kind == 1 || kind == 2;
+            let mask = i64::from(valid)
+                | i64::from(!title_empty) << 1
+                | i64::from(authors > 0) << 2
+                | i64::from(kept > 0) << 3
+                | i64::from((1..=3).contains(&precision)) << 4
+                | i64::from(pages > 0) << 5
+                | i64::from(cover) << 6;
+            let fields = i64::from(mask.count_ones() as u8);
+            let completeness = fields * 100 / 7;
+            let decision: i64 = if !valid && title_empty {
+                1
+            } else if fields < 4 {
+                2
+            } else if fields < 6 {
+                3
+            } else {
+                4
+            };
+            let edition = completeness
+                + if query_year > 0 && year > 0 {
+                    (50 - (year - query_year).abs().min(5) * 10).max(0)
+                } else {
+                    0
+                };
+            let word = kind
+                | check10 << 3
+                | precision << 7
+                | year << 10
+                | mask << 24
+                | completeness << 31
+                | decision << 38
+                | authors.min(255) << 41
+                | i64::from(comma) << 49
+                | i64::from(stripped) << 50
+                | edition << 51
+                | i64::from(title_empty) << 59;
+            *row = [word, isbn13, publisher, first];
+            t[1] += i64::from(valid);
+            t[2] += i64::from(kind == 3 || kind == 4);
+            t[2 + decision as usize] += 1;
+            t[7] += i64::from(cover);
+            t[8] += i64::from(stripped);
+            digest = fnv(digest, word ^ isbn13 ^ publisher << 4 ^ first);
+        }
+        t[9] = digest;
+        trailer.copy_from_slice(&t);
+    }
+
+    macro_rules! export674 {
+        ($name:ident, $fields:literal, $columns:literal, $words:literal, $trailer:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `blob` must point to `blob_len` readable bytes (`count * fields` NUL-joined
+            /// values, field-major), `twin` to `twin_len` readable bytes (empty, or the same
+            /// values joined by 0x01), `ints` to `ints_len` readable bytes (`columns` columns
+            /// of `count` packed little-endian int64 words) and `out` to `out_cap` writable,
+            /// aligned int64 words that overlap no input; null pointers are accepted only with
+            /// zero lengths. Bad shapes return -1 before writing, a short output returns
+            /// `-needed` without writing and panics map to -1.
+            #[unsafe(no_mangle)]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                twin: *const u8,
+                twin_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                const BODY: Body = $body;
+                unsafe {
+                    run(
+                        blob, blob_len, twin, twin_len, ints, ints_len, count, out, out_cap,
+                        $fields, $columns, $words, $trailer, BODY,
+                    )
+                }
+            }
+        };
+    }
+
+    export674!(
+        nntmux_w674_igdb_company_plan_batch,
+        2,
+        4,
+        4,
+        10,
+        company_row
+    );
+    export674!(nntmux_w674_igdb_game_plan_batch, 5, 5, 4, 9, game_row);
+    export674!(
+        nntmux_w674_igdb_platform_plan_batch,
+        3,
+        3,
+        3,
+        11,
+        platform_row
+    );
+    export674!(
+        nntmux_w674_invitation_service_plan_batch,
+        3,
+        7,
+        3,
+        10,
+        invitation_row
+    );
+    export674!(
+        nntmux_w674_isbndb_service_plan_batch,
+        5,
+        3,
+        4,
+        10,
+        isbndb_row
+    );
+}
+
+#[cfg(test)]
+mod w674_tests {
+    use super::w644_batch::fnv32;
+    use super::w674_batch::*;
+
+    type Export = unsafe extern "C" fn(
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        usize,
+        *mut i64,
+        usize,
+    ) -> isize;
+
+    /// Field-major frame (0x01 twin when a value holds a NUL), then the int columns.
+    fn call(export: Export, fields: &[&[&[u8]]], columns: &[&[i64]], out: &mut [i64]) -> isize {
+        let count = fields[0].len();
+        let values: Vec<&[u8]> = fields.iter().flat_map(|f| f.iter()).copied().collect();
+        let blob = values.join(&0u8);
+        let twin = if values.iter().any(|v| v.contains(&0)) {
+            values.join(&1u8)
+        } else {
+            Vec::new()
+        };
+        let ints: Vec<u8> = columns
+            .iter()
+            .flat_map(|c| c.iter())
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        unsafe {
+            export(
+                blob.as_ptr(),
+                blob.len(),
+                if twin.is_empty() {
+                    std::ptr::null()
+                } else {
+                    twin.as_ptr()
+                },
+                twin.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn w674_classifiers() {
+        assert_eq!(ws_trim(b"\x0c a \x0b"), b"a");
+        let mut buf = Vec::new();
+        collapse(b"  Big \t\x0c Studio\0Inc ", &mut buf);
+        assert_eq!(buf, b"Big Studio Inc");
+        assert!(company_suffix(b"gmbh"));
+        assert!(!company_suffix(b"GmbH"));
+        assert_eq!(known_publisher(b"sony"), 11);
+        assert_eq!(known_publisher(b"sony-interactive"), 11);
+        assert_eq!(known_publisher(b"sonyx"), 0);
+        assert_eq!(known_publisher(b"bandai-namco"), 2);
+        assert_eq!(role_class(3), 3);
+        assert_eq!(role_class(8), 4);
+        assert_eq!(role_class(0), 0);
+        assert_eq!(release_year(0), 0);
+        assert_eq!(release_year(1), 1970);
+        assert_eq!(release_year(951_782_400), 2000); // 2000-02-29
+        assert_eq!(release_year(978_307_199), 2000); // 2000-12-31T23:59:59Z
+        assert_eq!(release_year(978_307_200), 2001);
+        assert_eq!(release_year(RELEASE_MAX), 2099);
+        assert_eq!(release_year(RELEASE_MAX + 1), 0);
+        assert_eq!(genre_bit(b"Role-playing (RPG)"), 128);
+        assert_eq!(genre_bit(b"rpgs"), 0);
+        assert_eq!(platform_alias(b"ps4"), Some((1, 8, false, 1180)));
+        assert_eq!(platform_alias(b"android"), Some((6, 0, true, 4070)));
+        assert_eq!(platform_alias(b"PS4"), None);
+        assert_eq!(generation_tier(5), 1);
+        assert_eq!(generation_tier(10), 4);
+        assert_eq!(inviter_role(b" Admin "), (1, -1));
+        assert_eq!(inviter_role(b"user"), (4, 3));
+        assert_eq!(inviter_role(b"guest"), (0, 0));
+        assert_eq!(token_code(&[b'a'; 64]), 1);
+        assert_eq!(token_code(&[b'-'; 64]), 3);
+        assert_eq!(token_code(b"abc"), 2);
+        assert_eq!(token_code(b""), 0);
+        assert!(plausible_email(b"a@b.co"));
+        assert!(!plausible_email(b"a@.co"));
+        assert!(!plausible_email(b"a b@c.co"));
+        assert!(!plausible_email(b"@b.co"));
+        assert_eq!(isbn_parse(b"0-306-40615-2"), (1, 9_780_306_406_157, 2));
+        assert_eq!(isbn_parse(b"080442957x"), (1, 9_780_804_429_573, 10));
+        assert_eq!(isbn_parse(b"0306406153"), (3, 0, 15));
+        assert_eq!(isbn_parse(b"978-0-306-40615-7"), (2, 9_780_306_406_157, 2));
+        assert_eq!(isbn_parse(b"9790000000001"), (2, 9_790_000_000_001, 15));
+        assert_eq!(isbn_parse(b"9780306406158"), (4, 0, 15));
+        assert_eq!(isbn_parse(b"97803064061570"), (5, 0, 15));
+        assert_eq!(isbn_parse(b"X306406152"), (5, 0, 15));
+        assert_eq!(isbn_parse(b""), (0, 0, 15));
+        assert!(publisher_suffix(b"press"));
+        assert_eq!(publish_date(b" 2019 "), (1, 2019));
+        assert_eq!(publish_date(b"2019-07"), (2, 2019));
+        assert_eq!(publish_date(b"2019-07-04T00:00:00"), (3, 2019));
+        assert_eq!(publish_date(b"2019-13"), (4, 0));
+        assert_eq!(publish_date(b"0999"), (4, 0));
+        assert_eq!(publish_date(b"20190"), (4, 0));
+        assert_eq!(publish_date(b""), (0, 0));
+    }
+
+    #[test]
+    fn w674_rows() {
+        let mut out = vec![0i64; 3 * 4 + 10];
+        let written = call(
+            nntmux_w674_igdb_company_plan_batch,
+            &[
+                &[b"Sony Interactive Inc", b" Studio  Ltd ", b"Loop"],
+                &[b"sony-interactive-inc", b"", b""],
+            ],
+            &[&[1, 2, 3], &[0, 1, 3], &[3, 1, 8], &[392, 0, 1000]],
+            &mut out,
+        );
+        assert_eq!(written, 22);
+        assert_eq!(
+            &out[..4],
+            &[
+                3 | 11 << 3
+                    | 1 << 8
+                    | 1 << 9
+                    | 1 << 10
+                    | 1 << 11
+                    | 1 << 12
+                    | 20 << 20
+                    | 20 << 36
+                    | 16 << 52,
+                fnv32::<false>(b"sony-interactive"),
+                -1,
+                fnv32::<false>(b"Sony Interactive Inc")
+            ]
+        );
+        assert_eq!(
+            out[4],
+            1 | 1 << 8 | 1 << 11 | 1 << 12 | 1 << 13 | 1 << 16 | 10 << 20 | 10 << 36 | 6 << 52
+        );
+        assert_eq!(out[6], 0);
+        assert_eq!(
+            out[8],
+            4 | 1 << 11 | 1 << 12 | 3 << 13 | 4 << 20 | 4 << 36 | 4 << 52
+        );
+        assert_eq!(out[10], -1);
+        assert_eq!(&out[12..21], &[3, 2, 1, 1, 1, 0, 1, 1, 1]);
+
+        let mut out = vec![0i64; 4 + 9];
+        let written = call(
+            nntmux_w674_igdb_game_plan_batch,
+            &[
+                &[b"The Legend of Zelda: Breath of the Wild"],
+                &[b"legend of zelda"],
+                &[b"130, 41,x"],
+                &[b"Adventure, Role-playing (RPG), Weird"],
+                &[b"co3p2d"],
+            ],
+            &[&[1_488_499_200], &[2017], &[130], &[9_100], &[200]],
+            &mut out,
+        );
+        assert_eq!(written, 13);
+        // Unique title tokens {the, legend, of, zelda, breath, wild} vs {legend, of, zelda}.
+        let similarity = 3 * 1000 / 6;
+        assert_eq!(
+            &out[..4],
+            &[
+                4 | 2 << 3
+                    | 1 << 6
+                    | 1 << 7
+                    | 3 << 9
+                    | similarity << 13
+                    | 2017 << 24
+                    | 9_100 << 36
+                    | 8 << 50
+                    | 3 << 58,
+                similarity + 220,
+                129 | 1 << 16 | 2 << 24 | 1 << 32,
+                fnv32::<false>(b"the legend of zelda breath of the wild")
+            ]
+        );
+        assert_eq!(&out[4..12], &[1, 0, 0, 0, 1, 0, 0, 1]);
+
+        let mut out = vec![0i64; 2 * 3 + 11];
+        let written = call(
+            nntmux_w674_igdb_platform_plan_batch,
+            &[
+                &[b"PlayStation  4", b"Arcade"],
+                &[b" ps4 ", b""],
+                &[b"ps4", b"arcade"],
+            ],
+            &[&[48, 52], &[1, 2], &[9, 0]],
+            &mut out,
+        );
+        assert_eq!(written, 17);
+        assert_eq!(
+            &out[..3],
+            &[
+                1 | 1 << 2 | 8 << 5 | 3 << 9 | 2 << 13 | 1 << 15 | 3 << 16 | 13 << 24,
+                1180,
+                fnv32::<false>(b"PS4")
+            ]
+        );
+        assert_eq!(
+            &out[3..6],
+            &[1 << 15 | 6 << 16 | 6 << 24, 1999, fnv32::<false>(b"Arcade")]
+        );
+        assert_eq!(&out[6..16], &[2, 1, 0, 0, 0, 0, 0, 1, 0, 1]);
+
+        let token = [b'A'; 64];
+        let mut out = vec![0i64; 3 * 3 + 10];
+        let written = call(
+            nntmux_w674_invitation_service_plan_batch,
+            &[
+                &[&token, &token, b"short"],
+                &[b" Bob@Example.com", b"a@b.co", b"x"],
+                &[b"user", b"user", b"admin"],
+            ],
+            &[
+                &[1000, 1000, 1000],
+                &[500, 500, 500],
+                &[200_000, 2000, 2000],
+                &[0, 0, 0],
+                &[1, 1, 1],
+                &[7, 7, 8],
+                &[1, 1, 5],
+            ],
+            &mut out,
+        );
+        assert_eq!(written, 19);
+        assert_eq!(
+            &out[..3],
+            &[
+                1 | 1 << 3 | 3 << 5 | 4 << 9 | 1 << 12 | 1 << 13 | 55 << 14 | 2 << 30 | 2 << 46,
+                fnv32::<true>(b"Bob@Example.com"),
+                0
+            ]
+        );
+        assert_eq!(out[3], 6 | 1 << 3 | 2 << 5 | 4 << 9 | 1 << 12 | 2 << 46);
+        assert_eq!(out[5], 1);
+        assert_eq!(out[6], 5 | 2 << 3 | 2 << 5 | 1 << 9);
+        assert_eq!(out[8], -1);
+        assert_eq!(&out[9..18], &[3, 1, 0, 0, 0, 1, 1, 2, 1]);
+
+        let mut out = vec![0i64; 4 + 10];
+        let written = call(
+            nntmux_w674_isbndb_service_plan_batch,
+            &[
+                &[b"0-306-40615-2"],
+                &[b"A Title"],
+                &[b" Doe, Jane | | Smith "],
+                &[b"Big House Publishing Group, Inc."],
+                &[b"2019-07-04"],
+            ],
+            &[&[320], &[1], &[2018]],
+            &mut out,
+        );
+        assert_eq!(written, 14);
+        assert_eq!(
+            &out[..4],
+            &[
+                1 | 2 << 3
+                    | 3 << 7
+                    | 2019 << 10
+                    | 127 << 24
+                    | 100 << 31
+                    | 4 << 38
+                    | 2 << 41
+                    | 1 << 49
+                    | 1 << 50
+                    | 140 << 51,
+                9_780_306_406_157,
+                fnv32::<false>(b"big house"),
+                fnv32::<true>(b"Doe, Jane")
+            ]
+        );
+        assert_eq!(&out[4..13], &[1, 1, 0, 0, 0, 0, 1, 1, 1]);
+    }
+
+    #[test]
+    fn w674_frames() {
+        let mut short = vec![0i64; 3];
+        let need = call(
+            nntmux_w674_igdb_platform_plan_batch,
+            &[&[b"a"], &[b"b"], &[b"c"]],
+            &[&[1], &[1], &[0]],
+            &mut short,
+        );
+        assert_eq!(need, -14);
+        let mut nul = vec![0i64; 3 + 11];
+        let written = call(
+            nntmux_w674_igdb_platform_plan_batch,
+            &[&[b"a\0b"], &[b"ps\x004"], &[b"\0"]],
+            &[&[1], &[1], &[0]],
+            &mut nul,
+        );
+        assert_eq!(written, 14);
+        assert_eq!(nul[1], 1180);
+        let mut out = vec![0i64; 32];
+        let empty = unsafe {
+            nntmux_w674_igdb_company_plan_batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(empty, 0);
+        let bad = unsafe {
+            nntmux_w674_igdb_game_plan_batch(
+                b"a".as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(bad, -1);
+        let fields = unsafe {
+            nntmux_w674_isbndb_service_plan_batch(
+                b"a\0b".as_ptr(),
+                3,
+                std::ptr::null(),
+                0,
+                [0u8; 24].as_ptr(),
+                24,
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(fields, -1);
+        let base = out.as_mut_ptr() as *const u8;
+        let overlap = unsafe {
+            nntmux_w674_invitation_service_plan_batch(
+                base,
+                8,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(overlap, -1);
+        let misaligned = unsafe {
+            nntmux_w674_invitation_service_plan_batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                (out.as_mut_ptr() as *mut u8).add(1) as *mut i64,
+                4,
+            )
+        };
+        assert_eq!(misaligned, -1);
+        let null_out = unsafe {
+            nntmux_w674_igdb_company_plan_batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(null_out, -1);
+        let twin_mismatch = unsafe {
+            nntmux_w674_igdb_company_plan_batch(
+                b"a\0b".as_ptr(),
+                3,
+                b"a\x01".as_ptr(),
+                2,
+                [0u8; 32].as_ptr(),
+                32,
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(twin_mismatch, -1);
+    }
+}

@@ -567,4 +567,305 @@ class Company extends BaseModel
 
         return $state[$op] ?? null;
     }
+
+    // ========================================================================
+    // WAVE 67.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of four 1000-round paired runs reached 4.15x common mean, 3.40x common p99, 3.90x uncommon mean and 3.80x uncommon p99; see RustIgdbCompanyGamePlatformInvitationIsbnDbW67ParityTest. */
+    public const bool W67_RUST_FFI_DEFAULT = true;
+
+    private const string W67_FFI_CDEF = 'ssize_t nntmux_w674_igdb_company_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w67IgdbCompanyPlanBatch() record. */
+    public const int W67_ROW_WORDS = 4;
+
+    /** int64 summary words after the w67IgdbCompanyPlanBatch() records (none for an empty batch). */
+    public const int W67_TRAILER_WORDS = 10;
+
+    /** Parent links followed before a chain is reported as too deep. */
+    private const int W67_PARENT_DEPTH_MAX = 8;
+
+    /**
+     * Company plan rows for [name, slug, ID, parent ID, role bits, country] items.
+     *
+     * The name collapses WHITESPACE runs to one space; the slug lower-cases it and joins its
+     * ASCII alphanumeric runs with '-'; trailing W48_SUFFIXES segments are stripped while another
+     * remains (the canonical slug), which is matched against W48_KNOWN_PUBLISHERS (equal or a
+     * '-' prefix). Role bits (1 developer, 2 publisher, 4 porting, 8 supporting) give the class:
+     * 3 developer and publisher, 1 developer, 2 publisher, 4 porting/supporting only, 0 none.
+     * The parent chain follows parent IDs through the first record holding each positive ID:
+     * decision 0 no parent, 1 reaches a root, 2 parent not in the batch, 3 cycles back to the
+     * record, 4 stops at depth 8; the root is the last record reached (-1 at depth 0).
+     *
+     * Rows [class | publisher index + 1 << 3 | suffix stripped << 8 | given slug matches << 9 |
+     * country 1-999 << 10 | positive ID << 11 | positive ID with a name << 12 | decision << 13 |
+     * depth << 16 | name length << 20 | slug length << 36 | canonical length << 52,
+     * fnv1a32(canonical), root record index, fnv1a32(name)], then the trailer [records,
+     * developers, publishers, both, porting/supporting only, no roles, known publishers, rooted
+     * chains, broken chains, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function w67IgdbCompanyPlanBatch(array $items): array
+    {
+        return self::usesW67RustFfi() ? self::w67IgdbCompanyPlanBatchNative($items) : self::w67IgdbCompanyPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function w67IgdbCompanyPlanBatchPhp(array $items): array
+    {
+        self::w67Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $byId = [];
+        foreach ($items as $i => $item) {
+            if ($item[2] > 0 && ! isset($byId[$item[2]])) {
+                $byId[$item[2]] = $i;
+            }
+        }
+        $out = [];
+        $t = [\count($items), 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        foreach ($items as $i => [$rawName, $givenSlug, $id, $parent, $roles, $country]) {
+            $name = preg_replace('/[ \t\n\r\0\x0B\x0C]+/', ' ', trim($rawName, self::WHITESPACE)) ?? '';
+            $slug = trim(preg_replace('/[^a-z0-9]+/', '-', strtolower($name)) ?? '', '-');
+            $segments = explode('-', $slug);
+            $total = \count($segments);
+            $kept = $total;
+            while ($kept > 1 && isset(self::W48_SUFFIXES[$segments[$kept - 1]])) {
+                $kept--;
+            }
+            $stripped = $kept < $total;
+            $canonical = $stripped ? implode('-', \array_slice($segments, 0, $kept)) : $slug;
+            $publisher = 0;
+            foreach (self::W48_KNOWN_PUBLISHERS as $k => $known) {
+                if ($canonical === $known || str_starts_with($canonical, $known.'-')) {
+                    $publisher = $k + 1;
+                    break;
+                }
+            }
+            $given = trim($givenSlug, self::WHITESPACE);
+            $slugMatch = $given !== '' && strtolower($given) === $slug;
+            $roles &= 15;
+            $decision = $depth = 0;
+            $cur = $i;
+            if ($parent > 0) {
+                while (true) {
+                    $p = $items[$cur][3];
+                    if ($p <= 0) {
+                        $decision = 1;
+                        break;
+                    }
+                    $j = $byId[$p] ?? null;
+                    if ($j === null) {
+                        $decision = 2;
+                        break;
+                    }
+                    if ($j === $i) {
+                        $decision = 3;
+                        break;
+                    }
+                    $cur = $j;
+                    if (++$depth === self::W67_PARENT_DEPTH_MAX) {
+                        $decision = 4;
+                        break;
+                    }
+                }
+            }
+            $root = $depth > 0 ? $cur : -1;
+            $class = ($roles & 3) === 3 ? 3 : (($roles & 1) !== 0 ? 1 : (($roles & 2) !== 0 ? 2 : (($roles & 12) !== 0 ? 4 : 0)));
+            $word = $class | $publisher << 3 | (int) $stripped << 8 | (int) $slugMatch << 9 | (int) ($country >= 1 && $country <= self::COUNTRY_MAX) << 10
+                | (int) ($id > 0) << 11 | (int) ($id > 0 && $name !== '') << 12 | $decision << 13 | $depth << 16 | min(\strlen($name), 0xFFFF) << 20
+                | min(\strlen($slug), 0xFFFF) << 36 | min(\strlen($canonical), 0x3FF) << 52;
+            $canonHash = self::w67Fnv($canonical);
+            array_push($out, $word, $canonHash, $root, self::w67Fnv($name));
+            $t[1] += $roles & 1;
+            $t[2] += $roles >> 1 & 1;
+            $t[3] += (int) ($class === 3);
+            $t[4] += (int) ($class === 4);
+            $t[5] += (int) ($roles === 0);
+            $t[6] += (int) ($publisher > 0);
+            $t[7] += (int) ($decision === 1);
+            $t[8] += (int) ($decision >= 2);
+            $value = $word ^ $canonHash << 8 ^ $root;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $t[9] = $digest;
+
+        return [...$out, ...$t];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int, 5: int}>  $items
+     * @return list<int>
+     */
+    public static function w67IgdbCompanyPlanBatchNative(array $items): array
+    {
+        self::w67Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w67Join([array_column($items, 0), array_column($items, 1)]);
+        $ints = pack('P*', ...array_column($items, 2), ...array_column($items, 3), ...array_column($items, 4), ...array_column($items, 5));
+
+        return self::w67Call($blob, $twin, $ints, $count, $count * self::W67_ROW_WORDS + self::W67_TRAILER_WORDS)
+            ?? self::w67IgdbCompanyPlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w67Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new \InvalidArgumentException('W67 IGDB company plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 6 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_int($item[2])
+                || ! \is_int($item[3]) || ! \is_int($item[4]) || ! \is_int($item[5])) {
+                throw new \InvalidArgumentException('W67 IGDB company plan batch items must be [string name, string slug, int ID, int parent ID, int role bits, int country] lists.');
+            }
+        }
+    }
+
+    public static function usesW67RustFfi(): bool
+    {
+        $enabled = self::w67RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W67_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW67RustFfi(): void
+    {
+        self::w67RustFfiState('enabled', true);
+    }
+
+    public static function disableW67RustFfi(): void
+    {
+        self::w67RustFfiState('enabled', false);
+    }
+
+    /** Drop the W67 override, binding, output buffer and declined-call count; routing returns to W67_RUST_FFI_DEFAULT. */
+    public static function resetW67RustFfi(): void
+    {
+        self::w67RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W67 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW67RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w67RustFfiState('enabled');
+        self::w67RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w67RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w67Join(array $columns): array
+    {
+        $values = array_merge(...$columns);
+        $joined = implode("\0", $values);
+
+        return substr_count($joined, "\0") === \count($values) - 1 ? [$joined, ''] : [$joined, implode("\x01", $values)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w67Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w67RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w67', self::W67_FFI_CDEF) ?? false;
+            self::w67RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w67RustFfiState('out', $out);
+                self::w67RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W67_FFI_CDEF.)
+            $written = $ffi->nntmux_w674_igdb_company_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w67RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W67 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w67RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int, 0 for an empty string. */
+    private static function w67Fnv(string $bytes): int
+    {
+        if ($bytes === '') {
+            return 0;
+        }
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
+    }
 }
