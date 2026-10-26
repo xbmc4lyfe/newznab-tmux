@@ -501,4 +501,297 @@ final class DownloadMetrics
 
         return $values === false ? null : array_values($values);
     }
+
+    // ========================================================================
+    // WAVE 64.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 9.66x, p99 8.71x; uncommon mean 7.67x, p99 6.64x); see RustAdditionalDownloadMetricsArchiveImageMappedNzbSourceHintsW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    public const string W64_DOWNLOAD_METRICS_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w643_download_metrics_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 64.3 batch. */
+    public const int W64_DOWNLOAD_METRICS_TRAILER = 18;
+
+    /** Cap for the Wave 64.3 running totals. */
+    private const int W64_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /** Lower-cased article status => code (empty 0, anything else 5). */
+    private const array W64_METRIC_STATUSES = ['ok' => 1, 'missing' => 2, 'crc' => 3, 'timeout' => 4];
+
+    private const string W64_CONTROL_CHARS = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F";
+
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restores W64_RUST_FFI_DEFAULT and drops the cached library handle and scratch buffers. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $override = self::w64RustFfiState();
+
+        return \is_bool($override) ? $override : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the DownloadMetrics Wave 64 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 64.3 NNTP article download byte, segment, duration, throughput and error metrics. Each item is
+     * `bytes|segments|expectedSegments|durationMicros|errors|status|provider`. Bytes and duration are 0 empty, 1 up to 12
+     * trimmed ASCII digits, 2 other; segments, expected segments and errors the same with up to 6 digits (invalid values
+     * count as 0). The trimmed status is 0 empty, 1 `ok`, 2 `missing`, 3 `crc`, 4 `timeout` (any case) or 5 other; the
+     * trimmed provider is 0 empty, 1 up to 255 bytes without control bytes, 2 otherwise. Completeness is the per-mille
+     * segments / expected (capped at 1000, 0 without expected segments), the error rate errors per mille of segments +
+     * errors and the throughput bytes per second >> 10 (KiB/s, capped at 2^20 - 1, 0 without a duration). The grade is 3
+     * invalid (any state 2 or status 5), 2 failed (status 2-4, or expected segments and none downloaded), 0 complete
+     * (expected segments, completeness 1000 and no errors), else 1 partial. Per item `bytesState | segmentsState << 2 |
+     * expectedState << 4 | durationState << 6 | errorsState << 8 | status << 10 | providerState << 13 | grade << 15 |
+     * completeness << 17 | errorRate << 27 | throughput << 37`. Then the four grade counts, the six status counts, the
+     * byte, segment, expected, duration and error totals (each capped at 2^62), the aggregate KiB/s (bytes capped at
+     * 2^43 - 1), the 1-based index of the first strictly slowest positive duration (0 when none) and the distinct valid
+     * providers (case-insensitive).
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64DownloadMetricsPlanBatch(array $items): array
+    {
+        return self::usesW64RustFfi() ? self::w64DownloadMetricsPlanBatchNative($items) : self::w64DownloadMetricsPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64DownloadMetricsPlanBatchNative(array $items): array
+    {
+        return self::w64Invoke($items, \count($items) + self::W64_DOWNLOAD_METRICS_TRAILER) ?? self::w64DownloadMetricsPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64DownloadMetricsPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $grades = [0, 0, 0, 0];
+        $statuses = [0, 0, 0, 0, 0, 0];
+        $bytesSum = $segmentsSum = $expectedSum = $durationSum = $errorsSum = 0;
+        $slowest = $slowestDuration = $index = 0;
+        $providers = [];
+        foreach ($items as $item) {
+            $index++;
+            [$rawBytes, $rawSegments, $rawExpected, $rawDuration, $rawErrors, $rawStatus, $rawProvider]
+                = explode('|', (string) $item, 7) + ['', '', '', '', '', '', ''];
+            [$bytesState, $bytes] = self::w64Count($rawBytes, 12);
+            [$segmentsState, $segments] = self::w64Count($rawSegments, 6);
+            [$expectedState, $expected] = self::w64Count($rawExpected, 6);
+            [$durationState, $duration] = self::w64Count($rawDuration, 12);
+            [$errorsState, $errors] = self::w64Count($rawErrors, 6);
+            $statusText = strtolower(trim($rawStatus));
+            $status = $statusText === '' ? 0 : (self::W64_METRIC_STATUSES[$statusText] ?? 5);
+            $provider = trim($rawProvider);
+            $length = \strlen($provider);
+            $providerState = $length === 0 ? 0 : ($length <= 255 && strcspn($provider, self::W64_CONTROL_CHARS) === $length ? 1 : 2);
+            $completeness = $expected > 0 ? min(intdiv($segments * 1000, $expected), 1000) : 0;
+            $attempts = $segments + $errors;
+            $errorRate = $attempts > 0 ? intdiv($errors * 1000, $attempts) : 0;
+            $throughput = $duration > 0 ? min(intdiv($bytes * 1_000_000, $duration) >> 10, 1_048_575) : 0;
+            if ($bytesState === 2 || $segmentsState === 2 || $expectedState === 2 || $durationState === 2 || $errorsState === 2 || $status === 5 || $providerState === 2) {
+                $grade = 3;
+            } elseif ($status >= 2 || ($expected > 0 && $segments === 0)) {
+                $grade = 2;
+            } elseif ($expected > 0 && $completeness === 1000 && $errors === 0) {
+                $grade = 0;
+            } else {
+                $grade = 1;
+            }
+            $grades[$grade]++;
+            $statuses[$status]++;
+            $bytesSum = min($bytesSum + $bytes, self::W64_TOTAL_CAP);
+            $segmentsSum = min($segmentsSum + $segments, self::W64_TOTAL_CAP);
+            $expectedSum = min($expectedSum + $expected, self::W64_TOTAL_CAP);
+            $durationSum = min($durationSum + $duration, self::W64_TOTAL_CAP);
+            $errorsSum = min($errorsSum + $errors, self::W64_TOTAL_CAP);
+            if ($duration > $slowestDuration) {
+                $slowest = $index;
+                $slowestDuration = $duration;
+            }
+            if ($providerState === 1) {
+                $providers[strtolower($provider)] = true;
+            }
+            $out[] = $bytesState | $segmentsState << 2 | $expectedState << 4 | $durationState << 6 | $errorsState << 8 | $status << 10
+                | $providerState << 13 | $grade << 15 | $completeness << 17 | $errorRate << 27 | $throughput << 37;
+        }
+        $aggregate = $durationSum > 0 ? intdiv(min($bytesSum, 8_796_093_022_207) * 1_000_000, $durationSum) >> 10 : 0;
+        array_push($out, ...$grades, ...$statuses);
+        array_push($out, $bytesSum, $segmentsSum, $expectedSum, $durationSum, $errorsSum, $aggregate, $slowest, \count($providers));
+
+        return $out;
+    }
+
+    /**
+     * (0 empty, 1 one to $max ASCII digits, 2 other; the value) for the trimmed field.
+     *
+     * @return array{int, int}
+     */
+    private static function w64Count(string $text, int $max): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $value = self::w64Digits($text, 1, $max);
+
+        return $value === null ? [2, 0] : [1, $value];
+    }
+
+    /** $min to $max ASCII digits as their value, else null. */
+    private static function w64Digits(string $text, int $min, int $max): ?int
+    {
+        $length = \strlen($text);
+
+        return $length >= $min && $length <= $max && strspn($text, '0123456789') === $length ? (int) $text : null;
+    }
+
+    /**
+     * Wave 64 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and returns the
+     * previous override, 'reset' clears the override, library handle and buffers, 'ffi' resolves the library
+     * (null when unavailable) and 'out' and 'lens' return `int64_t` output and length-column buffers of at least
+     * $val words.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w643', self::W64_DOWNLOAD_METRICS_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 64.3 DownloadMetrics export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call declines
+     * or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w64Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w64RustFfiState('ffi');
+            $out = self::w64RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w64RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W64_DOWNLOAD_METRICS_FFI_CDEF.)
+            $written = $ffi->nntmux_w643_download_metrics_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

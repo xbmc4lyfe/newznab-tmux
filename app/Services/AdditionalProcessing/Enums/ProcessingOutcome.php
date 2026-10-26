@@ -550,4 +550,288 @@ enum ProcessingOutcome: string
 
         return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
     }
+
+    // Rust is the default only while the paired W64.6 benchmark clears 1.5x on all four metrics.
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    private const string W64_OUTCOME_FFI_CDEF = <<<'C'
+        int32_t nntmux_w646_processing_outcome_batch(const char *strings, size_t strings_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t max_attempts, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W64_OUTCOME_HEADER = 30;
+
+    private const int W64_MAX_ITEMS = 1_048_576;
+
+    /** Attempt limit for a limit at or below 0, attempt clamp (2^16 - 1) and retry delay cap (7 days). */
+    private const int W64_OUTCOME_ATTEMPTS = 5;
+
+    private const int W64_OUTCOME_ATTEMPT_CAP = 65_535;
+
+    private const int W64_OUTCOME_DELAY_CAP = 604_800;
+
+    /** Case name => declaration index. */
+    private const array W64_OUTCOME_NAMES = [
+        'Completed' => 0, 'NoUsefulArtifacts' => 1, 'Passworded' => 2, 'GroupUnavailable' => 3, 'TemporaryWorkspaceUnavailable' => 4,
+        'TimedOut' => 5, 'DeletedAfterTimeout' => 6, 'DeletedBrokenNzb' => 7, 'DeletedPar2Only' => 8, 'NotFound' => 9,
+        'AwaitingLateArticles' => 10, 'Failed' => 11,
+    ];
+
+    /** Base retry delay in seconds per case (0 for a case that never retries). */
+    private const array W64_OUTCOME_BACKOFF = [0, 0, 0, 3_600, 60, 900, 0, 0, 0, 0, 1_800, 300, 0];
+
+    /**
+     * Plan the retry or terminal disposition of stored outcomes. Outcomes resolve by backing value (source 0),
+     * case name (1), the backing value of `strtr(strtolower(trim($outcome)), '_ ', '--')` (2), else unknown case
+     * 12 (3). Attempts clamp to 0..2^16-1; the limit is 5 at or below 0, else capped at 2^16-1. Action 0
+     * complete (cases 0-2), 1 purge (deleted 6-8), 2 drop (not found), 3 retry (unavailable group or workspace,
+     * timed out, awaiting late articles or failed, below the limit), 4 give up (at or above it), 5 invalid. A
+     * retry waits its base delay (group 3,600, workspace 60, timed out 900, late articles 1,800, failed 300
+     * seconds) doubled per attempt (at most 16 doublings), capped at 7 days.
+     *
+     * Layout: `[0]` count, `[1..14]` per case, `[14..18]` per source, `[18..24]` per action, `[24]` successful,
+     * `[25]` deleted, `[26]` total retry delay, `[27]` first retry and `[28]` first invalid index (-1), `[29]`
+     * FNV-1a digest; then per outcome `case | source << 4 | action << 6 | successful << 9 | deleted << 10 |
+     * attempts << 11 | delay << 27 | min(token bytes, 255) << 47`.
+     *
+     * @param  array<array-key, string>  $outcomes
+     * @param  array<array-key, int>  $attempts
+     * @return list<int>
+     */
+    public static function w64ProcessingOutcomePlanBatch(array $outcomes, array $attempts, int $maxAttempts = 0): array
+    {
+        return (self::usesW64RustFfi() ? self::w64ProcessingOutcomePlanBatchNative($outcomes, $attempts, $maxAttempts) : null)
+            ?? self::w64ProcessingOutcomePlanBatchPhp($outcomes, $attempts, $maxAttempts);
+    }
+
+    /**
+     * @param  array<array-key, string>  $outcomes
+     * @param  array<array-key, int>  $attempts
+     * @return list<int>
+     */
+    public static function w64ProcessingOutcomePlanBatchPhp(array $outcomes, array $attempts, int $maxAttempts = 0): array
+    {
+        $outcomes = array_values($outcomes);
+        $count = \count($outcomes);
+        $attempts = self::w64Column($attempts, $count);
+        $limit = $maxAttempts <= 0 ? self::W64_OUTCOME_ATTEMPTS : min($maxAttempts, self::W64_OUTCOME_ATTEMPT_CAP);
+        $out = array_fill(0, self::W64_OUTCOME_HEADER, 0);
+        $out[0] = $count;
+        $out[27] = $out[28] = -1;
+        $digest = 2_166_136_261;
+        $rows = [];
+        foreach ($outcomes as $at => $outcome) {
+            $outcome = (string) $outcome;
+            $source = 0;
+            $case = self::W50_CASE_INDEX[$outcome] ?? null;
+            if ($case === null) {
+                $source = 1;
+                $case = self::W64_OUTCOME_NAMES[$outcome] ?? null;
+            }
+            if ($case === null) {
+                $case = self::W50_CASE_INDEX[strtr(strtolower(trim($outcome)), '_ ', '--')] ?? 12;
+                $source = $case === 12 ? 3 : 2;
+            }
+            $tries = max(0, min((int) $attempts[$at], self::W64_OUTCOME_ATTEMPT_CAP));
+            $successful = $case <= 2 ? 1 : 0;
+            $deleted = $case >= 6 && $case <= 8 ? 1 : 0;
+            [$action, $delay] = match (true) {
+                $case <= 2 => [0, 0],
+                $deleted === 1 => [1, 0],
+                $case === 9 => [2, 0],
+                $case === 12 => [5, 0],
+                $tries >= $limit => [4, 0],
+                default => [3, min(self::W64_OUTCOME_BACKOFF[$case] << min($tries, 16), self::W64_OUTCOME_DELAY_CAP)],
+            };
+            $out[1 + $case]++;
+            $out[14 + $source]++;
+            $out[18 + $action]++;
+            $out[24] += $successful;
+            $out[25] += $deleted;
+            $out[26] += $delay;
+            if ($action === 3 && $out[27] < 0) {
+                $out[27] = $at;
+            }
+            if ($action === 5 && $out[28] < 0) {
+                $out[28] = $at;
+            }
+            $row = $case | $source << 4 | $action << 6 | $successful << 9 | $deleted << 10 | $tries << 11 | $delay << 27 | min(\strlen($outcome), 255) << 47;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[29] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust plan, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $outcomes
+     * @param  array<array-key, int>  $attempts
+     * @return list<int>|null
+     */
+    public static function w64ProcessingOutcomePlanBatchNative(array $outcomes, array $attempts, int $maxAttempts = 0): ?array
+    {
+        $count = \count($outcomes);
+        if ($count > self::W64_MAX_ITEMS) {
+            return null;
+        }
+        [$joined, $twin] = self::w64Strings(array_values($outcomes));
+        $ints = pack('q*', ...self::w64Column($attempts, $count));
+        $words = self::W64_OUTCOME_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w64Call($words, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w646_processing_outcome_batch($joined, \strlen($joined), $twin, \strlen($twin), $ints, \strlen($ints), $count, $maxAttempts, $out, $words));
+    }
+
+    /**
+     * Route the Wave 64.6 batch plan through Rust for the rest of the process.
+     */
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    /**
+     * Route the Wave 64.6 batch plan through PHP for the rest of the process.
+     */
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /**
+     * Restore the default Wave 64.6 routing and drop the cached binding and scratch buffer.
+     */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $forced = self::w64RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run `$callback` with the Wave 64.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 64.6 routing and binding in function statics (enums cannot declare properties). No `$op` returns
+     * the forced routing (null for the default); `'set'` replaces it with `$val` and returns the previous
+     * value; `'reset'` clears the routing, binding and buffer; `'binding'` returns the cached binding and an
+     * output buffer of at least `$val` values, or null.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $enabled = $ffi = $buffer = null;
+            $capacity = 0;
+
+            return null;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w646', self::W64_OUTCOME_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 64.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w64Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w64RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Values NUL-joined and, when one holds a NUL, the same values joined with 0x01 so Rust finds the
+     * separators where the two differ.
+     *
+     * @param  list<int|string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w64Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
+    }
+
+    /**
+     * Values by position, cut or padded with `$pad` to `$count`.
+     *
+     * @template T of int|string
+     *
+     * @param  array<array-key, T>  $values
+     * @param  T  $pad
+     * @return list<T>
+     */
+    private static function w64Column(array $values, int $count, int|string $pad = 0): array
+    {
+        $values = array_values($values);
+
+        return \count($values) === $count ? $values : array_pad(\array_slice($values, 0, $count), $count, $pad);
+    }
 }
