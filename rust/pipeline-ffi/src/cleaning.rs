@@ -41025,3 +41025,914 @@ pub mod w541_header_storage_collection_cleanup_gdpr_app_collector {
         }
     }
 }
+
+pub mod w551_regex_release_cleaning_remover_nntp_framer {
+    //! Wave 55.1 per-row batch kernels for collection file counters, release-cleaning subject
+    //! shapes, release-remover name patterns, NNTP verification message-id plans and verification
+    //! framer article-id checks. Every export reads `count` NUL-joined rows, writes one `i64` word
+    //! per row into `out` and returns `count`, `SHORT_CAPACITY` when `out_cap` (in words) is below
+    //! `count`, or -1 for a malformed batch (a row holding a NUL byte splits into extra rows and is
+    //! malformed, so PHP falls back to its own implementation).
+
+    use super::w461_regex_nntp_framer_yenc_decoder::{Separator, file_count};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+    pub const SHORT_CAPACITY: isize = -2;
+
+    /// File counter word: `current << COUNTER_SHIFT | total << TOTAL_SHIFT | separator`, or -1.
+    pub const COUNTER_SHIFT: u32 = 20;
+    pub const TOTAL_SHIFT: u32 = 2;
+    pub const SEPARATOR_SLASH: i64 = 0;
+    pub const SEPARATOR_OF: i64 = 1;
+    pub const SEPARATOR_DASH: i64 = 2;
+
+    pub const CLEAN_COUNTER_FILE: i64 = 1;
+    pub const CLEAN_SCRAMBLED: i64 = 2;
+    pub const CLEAN_YENC_TAIL: i64 = 4;
+    pub const CLEAN_MULTI_SPACE: i64 = 8;
+    pub const CLEAN_NON_PRINTABLE: i64 = 16;
+    pub const CLEAN_NAME_PREFIX: i64 = 32;
+    pub const CLEAN_MARKER_SUFFIX: i64 = 64;
+
+    pub const REMOVE_GIBBERISH: i64 = 1;
+    pub const REMOVE_HASHED: i64 = 2;
+    pub const REMOVE_SHORT: i64 = 4;
+    pub const REMOVE_PASSWORDED: i64 = 8;
+    pub const REMOVE_SCR: i64 = 16;
+    pub const REMOVE_SAMPLE: i64 = 32;
+    pub const REMOVE_EXE: i64 = 64;
+    pub const REMOVE_INSTALL_BIN: i64 = 128;
+    pub const REMOVE_PASSWORD_URL: i64 = 256;
+    pub const REMOVE_NZB: i64 = 512;
+
+    /// Message-id word: `reason | within_budget << 2 | needs_format << 3 | (first_invalid + 1) << 4`.
+    pub const MESSAGE_ID_WITHIN: i64 = 4;
+    pub const MESSAGE_ID_NEEDS_FORMAT: i64 = 8;
+    pub const MESSAGE_ID_INVALID_SHIFT: u32 = 4;
+
+    /// RustVerificationFramer::MAX_INIT_BYTES, the longest article ID it accepts.
+    pub const MAX_ARTICLE_ID_BYTES: usize = 131072;
+    pub const ARTICLE_ID_VALID: i64 = 0;
+    pub const ARTICLE_ID_EMPTY: i64 = 1;
+    pub const ARTICLE_ID_OVERSIZE: i64 = 2;
+    pub const ARTICLE_ID_INVALID_UTF8: i64 = 3;
+    pub const ARTICLE_ID_REJECTED: i64 = 4;
+    pub const ARTICLE_ID_SPACE: i64 = 8;
+    pub const ARTICLE_ID_CONTROL: i64 = 16;
+    pub const ARTICLE_ID_BRACKET: i64 = 32;
+
+    fn overlaps(input: *const u8, len: usize, out: *mut i64, words: usize) -> bool {
+        let (a, b, b_len) = (input as usize, out as usize, words.saturating_mul(8));
+        len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(len)
+    }
+
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+
+    /// The high bit of exactly the `byte` bytes of `v`.
+    fn eq(v: u64, byte: u8) -> u64 {
+        let x = v ^ (u64::from(byte) * LO);
+        !(((x & LOW7).wrapping_add(LOW7)) | x | LOW7)
+    }
+
+    /// The high bit of exactly the bytes of `v` below `n` (`1..=0x80`).
+    fn lt(v: u64, n: u8) -> u64 {
+        !(((v & LOW7).wrapping_add(u64::from(0x80 - n) * LO)) | v) & HI
+    }
+
+    /// The high bit of exactly the PCRE `\s` bytes (tab through CR, space) of `v`.
+    fn spaces(v: u64) -> u64 {
+        eq(v, b' ') | (!lt(v, b'\t') & lt(v, 0x0e))
+    }
+
+    /// The high bit of exactly the ASCII alphanumeric bytes of `v`.
+    fn alnum(v: u64) -> u64 {
+        let folded = v | (0x20 * LO);
+        (!lt(v, b'0') & lt(v, b'9' + 1)) | (!lt(folded, b'a') & lt(folded, b'z' + 1))
+    }
+
+    /// `s` as little-endian words, the short tail padded with `pad` bytes.
+    fn words(s: &[u8], pad: u8) -> impl Iterator<Item = (usize, u64)> + '_ {
+        let (chunks, tail) = s.as_chunks::<8>();
+        let mut last = [pad; 8];
+        last[..tail.len()].copy_from_slice(tail);
+        let tail = (!tail.is_empty()).then_some((chunks.len() * 8, u64::from_le_bytes(last)));
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(c, chunk)| (c * 8, u64::from_le_bytes(*chunk)))
+            .chain(tail)
+    }
+
+    /// Calls `visit` for each NUL-separated row of `bytes` (one empty row for empty bytes), found
+    /// eight bytes at a time.
+    fn for_each_row(bytes: &[u8], mut visit: impl FnMut(&[u8])) {
+        let mut start = 0;
+        for (at, v) in words(bytes, 1) {
+            let mut z = eq(v, 0);
+            while z != 0 {
+                let p = at + (z.trailing_zeros() / 8) as usize;
+                visit(&bytes[start..p]);
+                start = p + 1;
+                z &= z - 1;
+            }
+        }
+        visit(&bytes[start..]);
+    }
+
+    /// Validates the batch and output window, then writes `row(entry)` for each of exactly `count`
+    /// NUL-separated rows straight into `out`.
+    unsafe fn run(
+        input: *const u8,
+        len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        mut row: impl FnMut(&[u8]) -> i64,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+                || len > MAX_INPUT
+                || (len != 0 && input.is_null())
+            {
+                return -1;
+            }
+            if count > out_cap {
+                return SHORT_CAPACITY;
+            }
+            if overlaps(input, len, out, count) {
+                return -1;
+            }
+            // A null pointer is never sliced, even for an empty batch.
+            let bytes: &[u8] = if len == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, len) }
+            };
+            if count == 0 {
+                return if bytes.is_empty() { 0 } else { -1 };
+            }
+            // `count` words, checked against `out_cap` above; disjoint from the input.
+            let words = unsafe { std::slice::from_raw_parts_mut(out, count) };
+            let mut n = 0;
+            for_each_row(bytes, |entry| {
+                if n < count {
+                    words[n] = row(entry);
+                }
+                n += 1;
+            });
+            if n == count { n as isize } else { -1 }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// PCRE `\s` outside UTF mode: space, tab, LF, VT, FF and CR.
+    fn pcre_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    /// PCRE word bytes outside UTF mode with the default C tables.
+    fn word(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    fn digit_value(digits: &[u8]) -> i64 {
+        digits
+            .iter()
+            .fold(0i64, |v, &d| v * 10 + i64::from(d - b'0'))
+    }
+
+    /// RegexService::FILE_COUNT_PATTERN encoded as a file counter word, or -1 without a match.
+    pub fn file_counter(s: &[u8]) -> i64 {
+        let Some((separator, total)) = file_count(s) else {
+            return -1;
+        };
+        // `total` borrows `s`; the current count is the digit run ending before the separator.
+        let q = total.as_ptr() as usize - s.as_ptr() as usize;
+        let (sep, sep_len) = match separator {
+            Separator::Slash => (SEPARATOR_SLASH, 1),
+            Separator::Of => (SEPARATOR_OF, 4),
+            Separator::Dash => (SEPARATOR_DASH, 1),
+        };
+        let end = q - sep_len;
+        let start = end
+            - s[..end]
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+        (digit_value(&s[start..end]) << COUNTER_SHIFT) | (digit_value(total) << TOTAL_SHIFT) | sep
+    }
+
+    fn skip_space(s: &[u8], mut at: usize) -> usize {
+        while s.get(at).is_some_and(|&b| pcre_space(b)) {
+            at += 1;
+        }
+        at
+    }
+
+    fn digits(s: &[u8], at: usize) -> usize {
+        s.get(at..)
+            .map_or(0, |r| r.iter().take_while(|b| b.is_ascii_digit()).count())
+    }
+
+    /// The length of a `"` or `#34;` quote at `at`.
+    fn quote(s: &[u8], at: usize) -> Option<usize> {
+        if s.get(at) == Some(&b'"') {
+            Some(1)
+        } else if s.get(at..at + 4) == Some(b"#34;") {
+            Some(4)
+        } else {
+            None
+        }
+    }
+
+    /// The end of ReleaseCleaningService::COUNTER_FILE_SUBJECT's match:
+    /// `^\[\s*\d+\s*\/\s*\d+\s*\]\s*-?\s*(?:"|#34;)(?:(?!"|#34;).){4,}(?:"|#34;)`. The file name
+    /// is greedy up to the first quote, LF or end, so only that stop can close it.
+    pub fn counter_file_end(s: &[u8]) -> Option<usize> {
+        if s.first() != Some(&b'[') {
+            return None;
+        }
+        let mut at = skip_space(s, 1);
+        let d = digits(s, at);
+        if d == 0 {
+            return None;
+        }
+        at = skip_space(s, at + d);
+        if s.get(at) != Some(&b'/') {
+            return None;
+        }
+        at = skip_space(s, at + 1);
+        let d = digits(s, at);
+        if d == 0 {
+            return None;
+        }
+        at = skip_space(s, at + d);
+        if s.get(at) != Some(&b']') {
+            return None;
+        }
+        at = skip_space(s, at + 1);
+        if s.get(at) == Some(&b'-') {
+            at += 1;
+        }
+        at = skip_space(s, at);
+        let start = at + quote(s, at)?;
+        let mut p = start;
+        while p < s.len() {
+            if let Some(close) = quote(s, p) {
+                return (p - start >= 4).then_some(p + close);
+            }
+            if s[p] == b'\n' {
+                return None;
+            }
+            p += 1;
+        }
+        None
+    }
+
+    /// `/\blRap\b/i`.
+    fn scrambled(s: &[u8]) -> bool {
+        s.windows(4).enumerate().any(|(i, w)| {
+            w.eq_ignore_ascii_case(b"lrap")
+                && (i == 0 || !word(s[i - 1]))
+                && s.get(i + 4).is_none_or(|&b| !word(b))
+        })
+    }
+
+    fn ends_ci(s: &[u8], suffix: &[u8]) -> bool {
+        s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+
+    /// The subjects a PCRE `$` (end, or before a final LF) can end.
+    fn dollar_ends(s: &[u8]) -> [&[u8]; 2] {
+        match s.split_last() {
+            Some((b'\n', head)) => [s, head],
+            _ => [s, s],
+        }
+    }
+
+    /// The `CLEAN_*` mask of one subject (see ReleaseCleaningService::subjectCleaningMasksPhp()).
+    pub fn cleaning_mask(s: &[u8]) -> i64 {
+        let mut mask = 0;
+        if let Some(end) = counter_file_end(s) {
+            mask |= CLEAN_COUNTER_FILE;
+            if scrambled(&s[end..]) {
+                mask |= CLEAN_SCRAMBLED;
+            }
+        }
+        let ends = dollar_ends(s);
+        if ends.iter().any(|t| t.ends_with(b"yEnc")) {
+            mask |= CLEAN_YENC_TAIL;
+        }
+        let (mut multi, mut wide, mut carry) = (0u64, 0u64, 0u64);
+        for (_, v) in words(s, b'a') {
+            let ws = spaces(v);
+            multi |= (ws & (ws >> 8)) | (carry & ws);
+            carry = ws >> 56;
+            wide |= lt(v, 0x20) | (v & HI);
+        }
+        if multi != 0 {
+            mask |= CLEAN_MULTI_SPACE;
+        }
+        if wide != 0 {
+            mask |= CLEAN_NON_PRINTABLE;
+        }
+        if (s.len() >= 12 && s[..12].eq_ignore_ascii_case(b"release name"))
+            || (s.len() >= 7 && s[..6].eq_ignore_ascii_case(b"sample") && matches!(s[6], b'-' | b'_'))
+        {
+            mask |= CLEAN_NAME_PREFIX;
+        }
+        if ends.iter().any(|t| {
+            [&b"sample"[..], b"proof", b"thumbs", b"thumb"].iter().any(|m| {
+                t.len() > m.len()
+                    && ends_ci(t, m)
+                    && matches!(t[t.len() - m.len() - 1], b'.' | b'-' | b'_')
+            })
+        }) {
+            mask |= CLEAN_MARKER_SUFFIX;
+        }
+        mask
+    }
+
+    /// Whether `s` holds a word that exempts a `passwor` name (advanced, no password, not
+    /// password, recovery, reset, unlocker), checked only at `a`, `n`, `r` and `u` bytes.
+    fn password_exempt(s: &[u8]) -> bool {
+        words(s, 0).any(|(at, v)| {
+            let f = v | (0x20 * LO);
+            let mut t = eq(f, b'a') | eq(f, b'n') | eq(f, b'r') | eq(f, b'u');
+            while t != 0 {
+                let i = at + (t.trailing_zeros() / 8) as usize;
+                let hit = match s[i] | 0x20 {
+                    b'a' => at_ci(s, i, b"advanced"),
+                    b'n' => at_ci(s, i, b"no password") || at_ci(s, i, b"not password"),
+                    b'r' => at_ci(s, i, b"recovery") || at_ci(s, i, b"reset"),
+                    _ => at_ci(s, i, b"unlocker"),
+                };
+                if hit {
+                    return true;
+                }
+                t &= t - 1;
+            }
+            false
+        })
+    }
+
+    fn at_ci(s: &[u8], at: usize, needle: &[u8]) -> bool {
+        s.get(at..at + needle.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(needle))
+    }
+
+    /// A `passwor` hit, cleared before the mask is returned.
+    const PASSWOR: i64 = 1 << 40;
+
+    /// The pattern bits a `.`, `p` or `P` trigger byte at `i` completes.
+    fn removal_trigger(s: &[u8], i: usize) -> i64 {
+        let mut mask = 0;
+        if s[i] == b'.' {
+            if at_ci(s, i + 1, b"scr") && matches!(s.get(i + 4), Some(b'$' | b' ' | b'"')) {
+                mask |= REMOVE_SCR;
+            }
+            if at_ci(s, i + 1, b"nzb") {
+                mask |= REMOVE_NZB;
+            }
+            if i >= 7 && at_ci(s, i - 7, b"install.bin") {
+                mask |= REMOVE_INSTALL_BIN;
+            }
+        } else {
+            if at_ci(s, i, b"passwor") {
+                mask |= PASSWOR;
+                if at_ci(s, i + 7, b"d.url") {
+                    mask |= REMOVE_PASSWORD_URL;
+                }
+            }
+            if i >= 3 && at_ci(s, i - 3, b"sample") {
+                mask |= REMOVE_SAMPLE;
+            }
+        }
+        mask
+    }
+
+    /// The `REMOVE_*` mask of one release name (see ReleaseRemoverService::removalPatternMasksPhp()),
+    /// from one pass over eight-byte words: alphanumeric runs carry across words, and only `.`,
+    /// `p` and `P` bytes start the substring checks.
+    pub fn removal_mask(s: &[u8]) -> i64 {
+        let (mut all, mut run, mut hashed, mut mask) = (true, 0usize, false, 0i64);
+        let (chunks, tail) = s.as_chunks::<8>();
+        for (c, chunk) in chunks.iter().enumerate() {
+            let v = u64::from_le_bytes(*chunk);
+            let non = !alnum(v) & HI;
+            if non == 0 {
+                run += 8;
+            } else {
+                all = false;
+                hashed |= run + (non.trailing_zeros() / 8) as usize >= 25;
+                run = (non.leading_zeros() / 8) as usize;
+            }
+            hashed |= run >= 25;
+            let mut t = eq(v, b'.') | eq(v | (0x20 * LO), b'p');
+            while t != 0 {
+                mask |= removal_trigger(s, c * 8 + (t.trailing_zeros() / 8) as usize);
+                t &= t - 1;
+            }
+        }
+        for (k, &b) in tail.iter().enumerate() {
+            if b.is_ascii_alphanumeric() {
+                run += 1;
+                hashed |= run >= 25;
+            } else {
+                all = false;
+                run = 0;
+            }
+            if b == b'.' || b | 0x20 == b'p' {
+                mask |= removal_trigger(s, chunks.len() * 8 + k);
+            }
+        }
+        mask |= REMOVE_GIBBERISH * i64::from(all && s.len() >= 15);
+        mask |= REMOVE_HASHED * i64::from(hashed);
+        mask |= REMOVE_SHORT * i64::from(all && s.len() <= 5);
+        mask |= REMOVE_EXE * i64::from(ends_ci(s, b".exe"));
+        if mask & PASSWOR != 0 && !password_exempt(s) {
+            mask |= REMOVE_PASSWORDED;
+        }
+        mask & !PASSWOR
+    }
+
+    /// NNTPService::planVerificationMessageIdPhp() and _formatMessageID() as a message-id word.
+    pub fn message_id_code(s: &[u8], budget: i64) -> i64 {
+        let bracket = |b: u8| b == b'<' || b == b'>';
+        let start = s.iter().position(|&b| !bracket(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|&b| !bracket(b)).map_or(start, |i| i + 1);
+        let id = &s[start..end];
+        let first_invalid = words(id, b'a')
+            .find_map(|(at, v)| {
+                let bad = lt(v, 0x21) | eq(v, 0x7f) | eq(v, b'<') | eq(v, b'>');
+                (bad != 0).then(|| (at + (bad.trailing_zeros() / 8) as usize) as i64)
+            })
+            .unwrap_or(-1);
+        let reason = if budget < 1 {
+            1
+        } else if id.is_empty() {
+            2
+        } else if first_invalid >= 0 {
+            3
+        } else {
+            0
+        };
+        let within = reason == 0 && (id.len() as i64).saturating_add(2) <= budget;
+        let needs = !s.is_empty() && (s[0] != b'<' || s[s.len() - 1] != b'>');
+        reason
+            | MESSAGE_ID_WITHIN * i64::from(within)
+            | MESSAGE_ID_NEEDS_FORMAT * i64::from(needs)
+            | ((first_invalid + 1) << MESSAGE_ID_INVALID_SHIFT)
+    }
+
+    /// `(*UCP)\s` under PCRE2: tab through CR, space, NEL, NBSP, U+1680, U+180E, U+2000 to U+200A,
+    /// U+2028, U+2029, U+202F, U+205F and U+3000. The oracle for [`wide_flags`].
+    #[cfg(test)]
+    fn ucp_space(c: char) -> bool {
+        matches!(
+            c,
+            '\t'..='\r'
+                | ' '
+                | '\u{85}'
+                | '\u{a0}'
+                | '\u{1680}'
+                | '\u{180e}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+        )
+    }
+
+    /// The `(*UCP)\s` and C1 control flags of the non-ASCII characters of valid UTF-8 `s`. Every
+    /// such character starts with a C2, E1, E2 or E3 lead byte, which a continuation byte never is.
+    fn wide_flags(s: &[u8]) -> (bool, bool) {
+        let (mut space, mut control) = (false, false);
+        for (at, v) in words(s, 0) {
+            let mut t = eq(v, 0xc2) | eq(v, 0xe1) | eq(v, 0xe2) | eq(v, 0xe3);
+            while t != 0 {
+                let i = at + (t.trailing_zeros() / 8) as usize;
+                let b1 = s.get(i + 1).copied().unwrap_or(0);
+                let b2 = s.get(i + 2).copied().unwrap_or(0);
+                match s[i] {
+                    0xc2 => {
+                        control |= b1 <= 0x9f;
+                        space |= b1 == 0x85 || b1 == 0xa0;
+                    }
+                    0xe1 => space |= (b1, b2) == (0x9a, 0x80) || (b1, b2) == (0xa0, 0x8e),
+                    0xe2 => {
+                        space |= (b1 == 0x80 && matches!(b2, 0x80..=0x8a | 0xa8 | 0xa9 | 0xaf))
+                            || (b1, b2) == (0x81, 0x9f);
+                    }
+                    _ => space |= (b1, b2) == (0x80, 0x80),
+                }
+                t &= t - 1;
+            }
+        }
+        (space, control)
+    }
+
+    /// RustVerificationFramer::validateConnection()'s article ID check as an `ARTICLE_ID_*` code.
+    pub fn article_id_code(s: &[u8]) -> i64 {
+        if s.is_empty() {
+            return ARTICLE_ID_EMPTY;
+        }
+        if s.len() > MAX_ARTICLE_ID_BYTES {
+            return ARTICLE_ID_OVERSIZE;
+        }
+        let (mut space, mut control, mut bracket, mut wide) = (0u64, 0u64, 0u64, 0u64);
+        for (_, v) in words(s, b'a') {
+            space |= spaces(v);
+            control |= lt(v, 0x20) | eq(v, 0x7f);
+            bracket |= eq(v, b'<') | eq(v, b'>');
+            wide |= v & HI;
+        }
+        let (mut space, mut control, bracket) = (space != 0, control != 0, bracket != 0);
+        if wide != 0 {
+            if std::str::from_utf8(s).is_err() {
+                return ARTICLE_ID_INVALID_UTF8;
+            }
+            let (wide_space, wide_control) = wide_flags(s);
+            space |= wide_space;
+            control |= wide_control;
+        }
+        if !(space || control || bracket) {
+            return ARTICLE_ID_VALID;
+        }
+        ARTICLE_ID_REJECTED
+            | ARTICLE_ID_SPACE * i64::from(space)
+            | ARTICLE_ID_CONTROL * i64::from(control)
+            | ARTICLE_ID_BRACKET * i64::from(bracket)
+    }
+
+    /// Writes one file counter word (or -1) per NUL-joined subject.
+    ///
+    /// # Safety
+    /// `subjects` must be readable for `subjects_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w551_regex_file_counter_batch(
+        subjects: *const u8,
+        subjects_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(subjects, subjects_len, count, out, out_cap, file_counter) }
+    }
+
+    /// Writes one `CLEAN_*` mask per NUL-joined subject.
+    ///
+    /// # Safety
+    /// `subjects` must be readable for `subjects_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w551_release_cleaning_mask_batch(
+        subjects: *const u8,
+        subjects_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(subjects, subjects_len, count, out, out_cap, cleaning_mask) }
+    }
+
+    /// Writes one `REMOVE_*` mask per NUL-joined release name.
+    ///
+    /// # Safety
+    /// `names` must be readable for `names_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w551_removal_pattern_mask_batch(
+        names: *const u8,
+        names_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(names, names_len, count, out, out_cap, removal_mask) }
+    }
+
+    /// Writes one message-id word per NUL-joined message-id under one byte budget.
+    ///
+    /// # Safety
+    /// `ids` must be readable for `ids_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w551_message_id_code_batch(
+        ids: *const u8,
+        ids_len: usize,
+        count: usize,
+        maximum_bytes: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(ids, ids_len, count, out, out_cap, |s| {
+                message_id_code(s, maximum_bytes)
+            })
+        }
+    }
+
+    /// Writes one `ARTICLE_ID_*` code per NUL-joined article ID.
+    ///
+    /// # Safety
+    /// `ids` must be readable for `ids_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w551_article_id_code_batch(
+        ids: *const u8,
+        ids_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(ids, ids_len, count, out, out_cap, article_id_code) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, usize, *mut i64, usize) -> isize;
+
+        fn call(export: Export, rows: &[&[u8]]) -> (isize, Vec<i64>) {
+            let joined = rows.join(&0u8);
+            let mut out = vec![0i64; rows.len().max(1)];
+            let written =
+                unsafe { export(joined.as_ptr(), joined.len(), rows.len(), out.as_mut_ptr(), out.len()) };
+            out.truncate(rows.len());
+            (written, out)
+        }
+
+        #[test]
+        fn w551_file_counter_encodes_current_total_and_separator() {
+            let code = |cur: i64, total: i64, sep: i64| (cur << COUNTER_SHIFT) | (total << TOTAL_SHIFT) | sep;
+            assert_eq!(file_counter(b"Show [01/10] - \"a.rar\""), code(1, 10, SEPARATOR_SLASH));
+            assert_eq!(file_counter(b"x (3 of 7) yEnc"), code(3, 7, SEPARATOR_OF));
+            assert_eq!(file_counter(b"x 2_OF_9 y"), code(2, 9, SEPARATOR_OF));
+            assert_eq!(file_counter(b"x [12-99999]"), code(12, 99999, SEPARATOR_DASH));
+            assert_eq!(file_counter(b"x [123456/7]"), -1);
+            assert_eq!(file_counter(b"x [1/2"), -1);
+            assert_eq!(file_counter(b"x [1/2$"), code(1, 2, SEPARATOR_SLASH));
+            assert_eq!(file_counter(b"[1/2] (00003/00009)"), code(1, 2, SEPARATOR_SLASH));
+            assert_eq!(file_counter(b"a1/2 (00003/00009)"), code(3, 9, SEPARATOR_SLASH));
+            assert_eq!(file_counter(b""), -1);
+        }
+
+        #[test]
+        fn w551_counter_file_subject_follows_pattern() {
+            assert_eq!(counter_file_end(b"[01/10] - \"abcd\" yEnc"), Some(16));
+            assert_eq!(counter_file_end(b"[ 1 / 2 ]\"abcd\""), Some(15));
+            assert_eq!(counter_file_end(b"[1/2] #34;file.ext#34; x"), Some(22));
+            assert_eq!(counter_file_end(b"[1/2] \"abc\""), None);
+            assert_eq!(counter_file_end(b"[1/2] \"ab\ncd\""), None);
+            assert_eq!(counter_file_end(b"[1/2] \"ab#34cd\""), Some(15));
+            assert_eq!(counter_file_end(b"[1/2] -- \"abcd\""), None);
+            assert_eq!(counter_file_end(b" [1/2] \"abcd\""), None);
+            let m = cleaning_mask(b"[1/2] - \"Fubj.ext\" lRap");
+            assert_eq!(m & (CLEAN_COUNTER_FILE | CLEAN_SCRAMBLED), CLEAN_COUNTER_FILE | CLEAN_SCRAMBLED);
+            assert_eq!(cleaning_mask(b"[1/2] - \"abcd\" xlrap") & CLEAN_SCRAMBLED, 0);
+            assert_eq!(cleaning_mask(b"[1/2] - \"lrap\" x") & CLEAN_SCRAMBLED, 0);
+        }
+
+        #[test]
+        fn w551_cleaning_mask_flags() {
+            assert_eq!(cleaning_mask(b"Name - yEnc"), CLEAN_YENC_TAIL);
+            assert_eq!(cleaning_mask(b"Name yEnc\n"), CLEAN_YENC_TAIL | CLEAN_NON_PRINTABLE);
+            assert_eq!(cleaning_mask(b"Name yenc"), 0);
+            assert_eq!(cleaning_mask(b"a  b"), CLEAN_MULTI_SPACE);
+            assert_eq!(cleaning_mask("caf\u{e9}".as_bytes()), CLEAN_NON_PRINTABLE);
+            assert_eq!(cleaning_mask(b"\x7f"), 0);
+            assert_eq!(cleaning_mask(b"RELEASE NAME x"), CLEAN_NAME_PREFIX);
+            assert_eq!(cleaning_mask(b"Sample_x"), CLEAN_NAME_PREFIX);
+            assert_eq!(cleaning_mask(b"samplex"), 0);
+            assert_eq!(cleaning_mask(b"x.Thumbs"), CLEAN_MARKER_SUFFIX);
+            assert_eq!(cleaning_mask(b"x-thumb"), CLEAN_MARKER_SUFFIX);
+            assert_eq!(cleaning_mask(b"x_proof\n"), CLEAN_MARKER_SUFFIX | CLEAN_NON_PRINTABLE);
+            assert_eq!(cleaning_mask(b"proof"), 0);
+            assert_eq!(cleaning_mask(b"x.sample\n\n"), CLEAN_MULTI_SPACE | CLEAN_NON_PRINTABLE);
+        }
+
+        #[test]
+        fn w551_removal_mask_flags() {
+            let m = removal_mask;
+            assert_eq!(m(b"abcdefghij12345"), REMOVE_GIBBERISH);
+            assert_eq!(m(b"abcdefghijklmnopqrstuvwxy"), REMOVE_GIBBERISH | REMOVE_HASHED);
+            assert_eq!(m(b"x.abcdefghijklmnopqrstuvwxy"), REMOVE_HASHED);
+            assert_eq!(m(b""), REMOVE_SHORT);
+            assert_eq!(m(b"ab12"), REMOVE_SHORT);
+            assert_eq!(m(b"ab.12"), 0);
+            assert_eq!(m(b"My.PASSWORD.Here"), REMOVE_PASSWORDED);
+            assert_eq!(m(b"Password.Reset.Tool"), 0);
+            assert_eq!(m(b"x.SCR y"), REMOVE_SCR);
+            assert_eq!(m(b"x.scr"), 0);
+            assert_eq!(m(b"Movie.Sample.mkv"), REMOVE_SAMPLE);
+            assert_eq!(m(b"setup.EXE"), REMOVE_EXE);
+            assert_eq!(m(b"Install.Bin.x"), REMOVE_INSTALL_BIN);
+            assert_eq!(m(b"password.url"), REMOVE_PASSWORDED | REMOVE_PASSWORD_URL);
+            assert_eq!(m(b"a.NZB.b"), REMOVE_NZB);
+        }
+
+        #[test]
+        fn w551_message_id_codes() {
+            let code = |reason: i64, within: bool, needs: bool, first: i64| {
+                reason | (i64::from(within) << 2) | (i64::from(needs) << 3) | ((first + 1) << 4)
+            };
+            assert_eq!(message_id_code(b"<a@b>", 10), code(0, true, false, -1));
+            assert_eq!(message_id_code(b"a@b", 4), code(0, false, true, -1));
+            assert_eq!(message_id_code(b"a@b", 0), code(1, false, true, -1));
+            assert_eq!(message_id_code(b"<>", 10), code(2, false, false, -1));
+            assert_eq!(message_id_code(b"", 10), code(2, false, false, -1));
+            assert_eq!(message_id_code(b"<a b>", 10), code(3, false, false, 1));
+            assert_eq!(message_id_code(b"<<a<b", 10), code(3, false, true, 1));
+            assert_eq!(message_id_code(b"a\x7f", 1), code(3, false, true, 1));
+        }
+
+        #[test]
+        fn w551_article_id_codes() {
+            assert_eq!(article_id_code(b"abc@d"), ARTICLE_ID_VALID);
+            assert_eq!(article_id_code(b""), ARTICLE_ID_EMPTY);
+            assert_eq!(article_id_code(&vec![b'a'; MAX_ARTICLE_ID_BYTES + 1]), ARTICLE_ID_OVERSIZE);
+            assert_eq!(article_id_code(&vec![b'a'; MAX_ARTICLE_ID_BYTES]), ARTICLE_ID_VALID);
+            assert_eq!(article_id_code(b"\xff"), ARTICLE_ID_INVALID_UTF8);
+            assert_eq!(article_id_code(b"a b"), ARTICLE_ID_REJECTED | ARTICLE_ID_SPACE);
+            assert_eq!(article_id_code(b"a\tb"), ARTICLE_ID_REJECTED | ARTICLE_ID_SPACE | ARTICLE_ID_CONTROL);
+            assert_eq!(article_id_code(b"a\x1fb"), ARTICLE_ID_REJECTED | ARTICLE_ID_CONTROL);
+            assert_eq!(article_id_code(b"<ab>"), ARTICLE_ID_REJECTED | ARTICLE_ID_BRACKET);
+            assert_eq!(article_id_code("a\u{3000}b".as_bytes()), ARTICLE_ID_REJECTED | ARTICLE_ID_SPACE);
+            assert_eq!(article_id_code("a\u{85}b".as_bytes()), ARTICLE_ID_REJECTED | ARTICLE_ID_SPACE | ARTICLE_ID_CONTROL);
+            assert_eq!(article_id_code("caf\u{e9}".as_bytes()), ARTICLE_ID_VALID);
+        }
+
+        #[test]
+        fn w551_swar_helpers_match_scalar_oracles() {
+            for b in 0..=255u8 {
+                let v = u64::from_le_bytes([b'a', b, 0x80, b, 0xff, b, 0, b]);
+                let at = |m: u64, k: usize| (m >> (8 * k + 7)) & 1 == 1;
+                for k in [1, 3, 5, 7] {
+                    assert_eq!(at(eq(v, b'.'), k), b == b'.');
+                    assert_eq!(at(lt(v, 0x21), k), b < 0x21);
+                    assert_eq!(at(lt(v, 0x80), k), b < 0x80);
+                    assert_eq!(at(spaces(v), k), pcre_space(b));
+                    assert_eq!(at(alnum(v), k), b.is_ascii_alphanumeric());
+                }
+            }
+            let mut rows = Vec::new();
+            for_each_row(b"ab\0\0cdefghijk\0lmnopqrstu\0", |r| rows.push(r.to_vec()));
+            assert_eq!(rows, [&b"ab"[..], b"", b"cdefghijk", b"lmnopqrstu", b""]);
+            let mut n = 0;
+            for_each_row(b"", |r| {
+                assert!(r.is_empty());
+                n += 1;
+            });
+            assert_eq!(n, 1);
+        }
+
+        /// Naive per-pattern ports, the oracle for the one-pass scanners.
+        fn naive_removal(s: &[u8]) -> i64 {
+            let all = s.iter().all(u8::is_ascii_alphanumeric);
+            let longest = s
+                .split(|b| !b.is_ascii_alphanumeric())
+                .map(<[u8]>::len)
+                .max()
+                .unwrap_or(0);
+            let l = s.to_ascii_lowercase();
+            let has = |n: &[u8]| l.windows(n.len()).any(|w| w == n);
+            let mut m = 0;
+            m |= REMOVE_GIBBERISH * i64::from(all && s.len() >= 15);
+            m |= REMOVE_HASHED * i64::from(longest >= 25);
+            m |= REMOVE_SHORT * i64::from(all && s.len() <= 5);
+            let excluded = [&b"advanced"[..], b"no password", b"not password", b"recovery", b"reset", b"unlocker"]
+                .iter()
+                .any(|n| has(n));
+            m |= REMOVE_PASSWORDED * i64::from(has(b"passwor") && !excluded);
+            m |= REMOVE_SCR * i64::from(has(b".scr$") || has(b".scr ") || has(b".scr\""));
+            m |= REMOVE_SAMPLE * i64::from(has(b"sample"));
+            m |= REMOVE_EXE * i64::from(l.ends_with(b".exe"));
+            m |= REMOVE_INSTALL_BIN * i64::from(has(b"install.bin"));
+            m |= REMOVE_PASSWORD_URL * i64::from(has(b"password.url"));
+            m |= REMOVE_NZB * i64::from(has(b".nzb"));
+            m
+        }
+
+        #[test]
+        fn w551_scanners_match_naive_oracles_on_generated_rows() {
+            let parts: [&[u8]; 16] = [
+                b"a", b"Z9", b".", b"p", b"P", b"assword", b".url", b"sam", b"ple", b"install",
+                b".bin", b".scr", b" ", b"\"", b"no ", b"0123456789abcdefghijklmn",
+            ];
+            let mut seed = 0x9E37_79B9u64;
+            for _ in 0..20_000 {
+                let mut row = Vec::new();
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let mut x = seed;
+                for _ in 0..(x % 12) {
+                    x = x.rotate_left(5) ^ 0xA5;
+                    row.extend_from_slice(parts[(x % 16) as usize]);
+                }
+                if x & 1 == 1 {
+                    row.extend_from_slice(b".EXE");
+                }
+                assert_eq!(removal_mask(&row), naive_removal(&row), "{:?}", String::from_utf8_lossy(&row));
+                let naive_multi = row.windows(2).any(|w| pcre_space(w[0]) && pcre_space(w[1]));
+                assert_eq!(cleaning_mask(&row) & CLEAN_MULTI_SPACE != 0, naive_multi);
+            }
+        }
+
+        fn naive_article(s: &[u8]) -> i64 {
+            if s.is_empty() {
+                return ARTICLE_ID_EMPTY;
+            }
+            let Ok(text) = std::str::from_utf8(s) else {
+                return ARTICLE_ID_INVALID_UTF8;
+            };
+            let (sp, c, b) = text.chars().fold((false, false, false), |(s, c, b), ch| {
+                (s || ucp_space(ch), c || ch.is_control(), b || ch == '<' || ch == '>')
+            });
+            if !(sp || c || b) {
+                return ARTICLE_ID_VALID;
+            }
+            ARTICLE_ID_REJECTED
+                | ARTICLE_ID_SPACE * i64::from(sp)
+                | ARTICLE_ID_CONTROL * i64::from(c)
+                | ARTICLE_ID_BRACKET * i64::from(b)
+        }
+
+        #[test]
+        fn w551_article_ids_match_char_oracle_for_every_code_point_class() {
+            let mut probes: Vec<char> = (0u32..0x3100).filter_map(char::from_u32).collect();
+            probes.extend(['\u{feff}', '\u{1f3ac}', '\u{10ffff}', '\u{e000}']);
+            for ch in probes {
+                for row in [format!("{ch}"), format!("ab{ch}cd.efgh"), format!("caf\u{e9}x{ch}")] {
+                    assert_eq!(article_id_code(row.as_bytes()), naive_article(row.as_bytes()), "U+{:04X}", ch as u32);
+                }
+            }
+            for bad in [&b"\xc2"[..], b"a\xe2\x80", b"\xed\xa0\x80", b"\xc0\xaf", b"ok\xff"] {
+                assert_eq!(article_id_code(bad), ARTICLE_ID_INVALID_UTF8);
+            }
+        }
+
+        #[test]
+        fn w551_exports_write_one_word_per_row() {
+            let rows: [&[u8]; 3] = [b"[1/2] - \"abcd\" yEnc", b"", b"x  y"];
+            let (n, out) = call(nntmux_w551_release_cleaning_mask_batch, &rows);
+            assert_eq!(n, 3);
+            assert_eq!(out, rows.iter().map(|r| cleaning_mask(r)).collect::<Vec<_>>());
+            let (n, out) = call(nntmux_w551_regex_file_counter_batch, &rows);
+            assert_eq!((n, out[1]), (3, -1));
+            let (n, out) = call(nntmux_w551_article_id_code_batch, &rows);
+            assert_eq!((n, out[1]), (3, ARTICLE_ID_EMPTY));
+            let (n, out) = call(nntmux_w551_removal_pattern_mask_batch, &rows);
+            assert_eq!((n, out[1]), (3, REMOVE_SHORT));
+            let joined = b"<a@b>\0c d";
+            let mut out = [0i64; 2];
+            let n = unsafe {
+                nntmux_w551_message_id_code_batch(joined.as_ptr(), joined.len(), 2, 100, out.as_mut_ptr(), 2)
+            };
+            assert_eq!((n, out), (2, [message_id_code(b"<a@b>", 100), message_id_code(b"c d", 100)]));
+        }
+
+        #[test]
+        fn w551_exports_guard_pointers_capacity_and_counts() {
+            let null = std::ptr::null::<u8>();
+            let mut out = [0i64; 4];
+            let p = out.as_mut_ptr();
+            let exports: [Export; 4] = [
+                nntmux_w551_regex_file_counter_batch,
+                nntmux_w551_release_cleaning_mask_batch,
+                nntmux_w551_removal_pattern_mask_batch,
+                nntmux_w551_article_id_code_batch,
+            ];
+            for export in exports {
+                unsafe {
+                    assert_eq!(export(b"a\0b".as_ptr(), 3, 2, std::ptr::null_mut(), 4), -1);
+                    assert_eq!(export(b"a\0b".as_ptr(), 3, 2, p, 1), SHORT_CAPACITY);
+                    assert_eq!(export(b"a\0b".as_ptr(), 3, 3, p, 4), -1);
+                    assert_eq!(export(b"a\0b".as_ptr(), 3, 1, p, 4), -1);
+                    assert_eq!(export(null, 0, 0, p, 0), 0);
+                    assert_eq!(export(null, 0, 1, p, 4), 1);
+                    assert_eq!(export(null, 3, 1, p, 4), -1);
+                    assert_eq!(export(b"a".as_ptr(), 1, 0, p, 4), -1);
+                    assert_eq!(export(null, 0, MAX_ITEMS + 1, p, 4), -1);
+                    assert_eq!(export(b"a".as_ptr(), MAX_INPUT + 1, 1, p, 4), -1);
+                    assert_eq!(export(b"a".as_ptr(), 1, 1, p.cast::<u8>().add(1).cast(), 4), -1);
+                    let overlap = p.cast::<u8>();
+                    assert_eq!(export(overlap, 8, 1, p, 4), -1);
+                }
+            }
+            unsafe {
+                assert_eq!(nntmux_w551_message_id_code_batch(null, 0, 1, 10, p, 4), 1);
+                assert_eq!(nntmux_w551_message_id_code_batch(null, 2, 1, 10, p, 4), -1);
+                assert_eq!(nntmux_w551_message_id_code_batch(b"a".as_ptr(), 1, 1, 10, p, 0), SHORT_CAPACITY);
+            }
+        }
+    }
+}
