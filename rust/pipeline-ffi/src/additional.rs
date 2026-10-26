@@ -49083,3 +49083,1194 @@ pub mod w646_enum_plans {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 65.6: API v1 release rows, XML response contexts, API category data,
+// release details data and release item data plans (`nntmux_w656_*`) for
+// ReleaseRows, XmlResponseContext, CategoryData, DetailsData and ReleaseData.
+// Same contract as Wave 64.6: strings are NUL-joined column after column (with
+// a 0x01-joined twin when one holds a NUL), integer columns are machine-order
+// `int64_t`, and the result is fixed-width `int64_t` words. Every export
+// returns 1, -1 for invalid input or an output range overlapping an input (PHP
+// then computes the batch) or -2 when `out` is null, misaligned or too small,
+// and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+pub mod w656_api_plans {
+    use super::*;
+
+    type W656Set = std::collections::HashSet<i64, std::hash::BuildHasherDefault<W526Hasher>>;
+
+    /// Validates `out` (-2), then rejects an output range overlapping any
+    /// input (-1) before running `compute` under `w49_run`.
+    unsafe fn w656_run(
+        out: *mut i64,
+        out_cap: usize,
+        inputs: &[(*const u8, usize)],
+        compute: impl FnOnce() -> Option<Vec<i64>>,
+    ) -> i32 {
+        if out.is_null() || !w17_aligned(out.cast_const(), out_cap) {
+            return -2;
+        }
+        let start = out as usize;
+        // `w17_aligned` proved `out_cap * 8` fits without wrapping.
+        let end = start + out_cap * std::mem::size_of::<i64>();
+        let disjoint = inputs.iter().all(|&(ptr, len)| {
+            len == 0 || ptr.is_null() || {
+                let from = ptr as usize;
+                from.saturating_add(len) <= start || from >= end
+            }
+        });
+        if !disjoint {
+            return -1;
+        }
+        // SAFETY: forwarded output contract.
+        unsafe { w49_run(out, out_cap, compute) }
+    }
+
+    /// `columns * count` items, as `w566_columns()`, but a non-empty twin is
+    /// compared a word at a time so long NUL-holding batches stay linear and
+    /// cheap.
+    fn w656_columns<'a>(
+        joined: &'a [u8],
+        twin: &[u8],
+        columns: usize,
+        count: usize,
+    ) -> Option<Vec<&'a [u8]>> {
+        if twin.is_empty() || count > W47_MAX_ITEMS {
+            return w566_columns(joined, twin, columns, count);
+        }
+        let count = columns.checked_mul(count)?;
+        if twin.len() != joined.len() || count == 0 || count > W47_MAX_ITEMS {
+            return None;
+        }
+        let mut parts = Vec::with_capacity(count);
+        let mut start = 0;
+        let mut split = |at: usize, parts: &mut Vec<&'a [u8]>| -> Option<()> {
+            if joined[at] != 0 || twin[at] != 1 || parts.len() + 1 >= count {
+                return None;
+            }
+            parts.push(&joined[start..at]);
+            start = at + 1;
+            Some(())
+        };
+        let (blocks, _) = joined.as_chunks::<64>();
+        let (twins, _) = twin.as_chunks::<64>();
+        for (index, (block, other)) in blocks.iter().zip(twins).enumerate() {
+            if block == other {
+                continue;
+            }
+            let (words, _) = block.as_chunks::<8>();
+            let (others, _) = other.as_chunks::<8>();
+            for (slot, (word, other)) in words.iter().zip(others).enumerate() {
+                let base = index * 64 + slot * 8;
+                let mut diff = u64::from_le_bytes(*word) ^ u64::from_le_bytes(*other);
+                while diff != 0 {
+                    let byte = (diff.trailing_zeros() / 8) as usize;
+                    split(base + byte, &mut parts)?;
+                    diff &= !(0xffu64 << (byte * 8));
+                }
+            }
+        }
+        for at in blocks.len() * 64..joined.len() {
+            if joined[at] != twin[at] {
+                split(at, &mut parts)?;
+            }
+        }
+        parts.push(&joined[start..]);
+        (parts.len() == count).then_some(parts)
+    }
+
+    /// Bytes `htmlspecialchars(ENT_XML1 | ENT_QUOTES)` adds: 4 per `&`, 3 per
+    /// `<` or `>` and 5 per `"` or `'`. Long values sum 64 `u8` lanes over at
+    /// most 51 blocks (51 * 5 fits a byte), so the loop vectorizes.
+    #[inline]
+    fn w656_escape_extra(value: &[u8]) -> i64 {
+        #[inline(always)]
+        fn weight(b: u8) -> u8 {
+            (u8::from(b == b'&') << 2)
+                | (u8::from(b == b'<' || b == b'>') * 3)
+                | (u8::from(b == b'"' || b == b'\'') * 5)
+        }
+        let (blocks, tail) = value.as_chunks::<64>();
+        let mut total: i64 = tail.iter().map(|&b| i64::from(weight(b))).sum();
+        for group in blocks.chunks(51) {
+            let mut lanes = [0u8; 64];
+            for block in group {
+                for (lane, &b) in lanes.iter_mut().zip(block) {
+                    *lane += weight(b);
+                }
+            }
+            total += lanes.iter().map(|&lane| i64::from(lane)).sum::<i64>();
+        }
+        total
+    }
+
+    /// Byte size clamp (2^50), count clamp (2^31 - 1) and running total cap (2^62).
+    const W656_SIZE_CAP: i64 = 1 << 50;
+    const W656_COUNT_CAP: i64 = (1 << 31) - 1;
+    const W656_SUM_CAP: i64 = 1 << 62;
+
+    /// A 40-byte lowercase hex release GUID (branch-free so it vectorizes).
+    #[inline]
+    fn w656_guid(raw: &[u8]) -> bool {
+        raw.len() == 40
+            && raw.iter().fold(true, |ok, &b| {
+                ok & ((b.wrapping_sub(b'0') < 10) | (b.wrapping_sub(b'a') < 6))
+            })
+    }
+
+    /// `(int)` of a 1-18 byte `ctype_digit()` string.
+    #[inline]
+    fn w656_digits(raw: &[u8]) -> Option<i64> {
+        (!raw.is_empty() && raw.len() <= 18 && raw.iter().all(u8::is_ascii_digit)).then(|| {
+            raw.iter()
+                .fold(0i64, |value, &digit| value * 10 + i64::from(digit - b'0'))
+        })
+    }
+
+    /// PHP `preg_match('/[\x80-\xff]/')`.
+    #[inline]
+    fn w656_high(raw: &[u8]) -> bool {
+        raw.iter().any(|&b| b >= 0x80)
+    }
+
+    #[inline]
+    fn w656_len(raw: &[u8], cap: i64) -> i64 {
+        (raw.len() as i64).min(cap)
+    }
+
+    /// 1 for `Category::MOVIES_GROUP`, 2 for `Category::TV_GROUP`, else 0.
+    #[inline]
+    fn w656_media_group(category: i64) -> i64 {
+        match category {
+            2000 | 2010 | 2030 | 2040 | 2045 | 2050 | 2060 | 2070 | 2080 | 2090 | 2999 => 1,
+            5000 | 5010 | 5020 | 5030 | 5040 | 5045 | 5060 | 5070 | 5080 | 5090 | 5999 => 2,
+            _ => 0,
+        }
+    }
+
+    // --- ReleaseRows::w65ReleaseRowsPlanBatch --------------------------------
+
+    pub(crate) const W656_ROWS_HEADER: usize = 22;
+
+    /// API v1 page size for a limit at or below 0, and its cap.
+    const W656_ROWS_LIMIT: i64 = 100;
+
+    /// Release rows (GUID and `_totalrows` columns) with `categories_id`,
+    /// `size`, `grabs` and `comments` columns. The total is the first row's
+    /// `_totalrows` when it is 1-18 digits, else the row count; the offset
+    /// clamps to 0..total and the page holds min(rows, limit) rows. `[0]`
+    /// count, `[1]` total, `[2]` offset, `[3]` page rows, `[4]` more pages,
+    /// `[5..15]` per root (`intdiv(category, 1000)` for 1000-9999, else 0),
+    /// `[15]` valid GUIDs, `[16]` total size, `[17]` grabs, `[18]` comments,
+    /// `[19]` largest size, `[20]` first invalid GUID index (-1), `[21]` FNV-1a
+    /// digest; then per row `root | mask << 4 | min(grabs, 2^20-1) << 10 |
+    /// min(comments, 2^16-1) << 30 | min(GUID bytes, 255) << 46` (mask: 1 size,
+    /// 2 grabs, 4 comments, 8 valid GUID, 16 on the page, 32 numeric total).
+    pub(crate) fn w656_rows_batch(
+        guids: &[&[u8]],
+        totals: &[&[u8]],
+        ints: &[i64],
+        offset: i64,
+        limit: i64,
+    ) -> Vec<i64> {
+        let count = guids.len();
+        let limit = if limit <= 0 {
+            W656_ROWS_LIMIT
+        } else {
+            limit.min(W656_ROWS_LIMIT)
+        };
+        let total = totals
+            .first()
+            .and_then(|raw| w656_digits(raw))
+            .unwrap_or(count as i64);
+        let offset = offset.max(0).min(total);
+        let page = (count as i64).min(limit);
+        let mut out = vec![0i64; W656_ROWS_HEADER + count];
+        out[0] = count as i64;
+        out[1] = total;
+        out[2] = offset;
+        out[3] = page;
+        out[4] = i64::from(offset + page < total);
+        out[20] = -1;
+        for (at, &guid) in guids.iter().enumerate() {
+            let category = ints[at];
+            let size = ints[count + at].clamp(0, W656_SIZE_CAP);
+            let grabs = ints[2 * count + at].clamp(0, W656_COUNT_CAP);
+            let comments = ints[3 * count + at].clamp(0, W656_COUNT_CAP);
+            let root = if (1000..10_000).contains(&category) {
+                category / 1000
+            } else {
+                0
+            };
+            let valid = w656_guid(guid);
+            let mask = i64::from(size > 0)
+                | i64::from(grabs > 0) << 1
+                | i64::from(comments > 0) << 2
+                | i64::from(valid) << 3
+                | i64::from((at as i64) < page) << 4
+                | i64::from(w656_digits(totals[at]).is_some()) << 5;
+            out[5 + root as usize] += 1;
+            out[15] += i64::from(valid);
+            out[16] = (out[16] + size).min(W656_SUM_CAP);
+            out[17] += grabs;
+            out[18] += comments;
+            out[19] = out[19].max(size);
+            if !valid {
+                w586_first(&mut out[20], at);
+            }
+            out[W656_ROWS_HEADER + at] = root
+                | mask << 4
+                | grabs.min(0xF_FFFF) << 10
+                | comments.min(0xFFFF) << 30
+                | w656_len(guid, 255) << 46;
+        }
+        out[21] = w526_digest(&out[W656_ROWS_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w656_release_rows_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        offset: i64,
+        limit: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w656_run(out, out_cap, &inputs, || {
+                let items = w656_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    2,
+                    count,
+                )?;
+                let values = w47_ints(w15_input(ints, ints_len)?, 4, count)?;
+                let (guids, totals) = items.split_at(count);
+                Some(w656_rows_batch(guids, totals, &values, offset, limit))
+            })
+        }
+    }
+
+    // --- XmlResponseContext::w65XmlResponseContextPlanBatch ------------------
+
+    pub(crate) const W656_XML_HEADER: usize = 21;
+
+    /// Offset, total and item count clamps.
+    const W656_XML_OFFSET_CAP: i64 = (1 << 31) - 1;
+    const W656_XML_TOTAL_CAP: i64 = 1 << 40;
+    const W656_XML_ITEMS_CAP: i64 = (1 << 20) - 1;
+
+    /// Response type of `strtolower(trim($type))`: 0 caps, 1 search, 2
+    /// tvsearch, 3 movie, 4 music, 5 book, 6 details, 7 register, 8 unknown.
+    #[inline]
+    fn w656_xml_type(raw: &[u8], lower: &mut Vec<u8>) -> i64 {
+        w616_lower_trim_into(raw, lower);
+        match lower.as_slice() {
+            b"caps" | b"c" => 0,
+            b"search" | b"s" => 1,
+            b"tvsearch" | b"tv" => 2,
+            b"movie" | b"m" => 3,
+            b"music" => 4,
+            b"book" => 5,
+            b"details" | b"d" => 6,
+            b"register" | b"r" => 7,
+            _ => 8,
+        }
+    }
+
+    /// Byte allowed in a server host (`[A-Za-z0-9.:\[\]-]`).
+    #[inline]
+    fn w656_host_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
+    }
+
+    /// Response types and server URLs with `offset`, `total` and `items`
+    /// columns. Mode 0 envelope only (caps, register), 1 paginated feed
+    /// (search to book), 2 single item (details), 3 error (unknown). Scheme 2
+    /// https, 1 http, 0 other (case-insensitive prefix); the host runs to the
+    /// first `/` after it. Offsets clamp to 0..2^31-1, totals to 0..2^40 and
+    /// items to 0..2^20-1. A feed is consistent when offset + items fit the
+    /// total, a single item holds at most one item and an envelope none. Flags:
+    /// 1 valid host, 2 trailing slash, 4 non-ASCII URL, 8 consistent, 16 offset
+    /// past a non-zero total, 32 valid (scheme, host, known type, consistent).
+    /// `[0]` count, `[1..10]` per type, `[10..14]` per mode, `[14]` valid,
+    /// `[15]` https, `[16]` total items, `[17]` largest total, `[18]`
+    /// inconsistent, `[19]` first invalid index (-1), `[20]` FNV-1a digest;
+    /// then per context `type | mode << 4 | scheme << 6 | flags << 8 | items <<
+    /// 14 | min(offset, 2^24-1) << 34 | min(URL bytes, 31) << 58`.
+    pub(crate) fn w656_xml_batch(types: &[&[u8]], servers: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+        let count = types.len();
+        let mut out = vec![0i64; W656_XML_HEADER + count];
+        out[0] = count as i64;
+        out[19] = -1;
+        let mut lower = Vec::new();
+        for (at, &raw) in types.iter().enumerate() {
+            let kind = w656_xml_type(raw, &mut lower);
+            let mode: i64 = match kind {
+                0 | 7 => 0,
+                6 => 2,
+                8 => 3,
+                _ => 1,
+            };
+            let url = servers[at];
+            let scheme: i64 = if url.len() >= 8 && url[..8].eq_ignore_ascii_case(b"https://") {
+                2
+            } else if url.len() >= 7 && url[..7].eq_ignore_ascii_case(b"http://") {
+                1
+            } else {
+                0
+            };
+            let host = if scheme == 0 {
+                &url[..0]
+            } else {
+                let rest = &url[6 + scheme as usize..];
+                match rest.iter().position(|&b| b == b'/') {
+                    Some(slash) => &rest[..slash],
+                    None => rest,
+                }
+            };
+            let host_valid = !host.is_empty() && host.iter().all(|&b| w656_host_byte(b));
+            let offset = ints[at].clamp(0, W656_XML_OFFSET_CAP);
+            let total = ints[count + at].clamp(0, W656_XML_TOTAL_CAP);
+            let items = ints[2 * count + at].clamp(0, W656_XML_ITEMS_CAP);
+            let consistent = match mode {
+                0 => items == 0,
+                1 => offset <= total && items <= total - offset,
+                2 => items <= 1,
+                _ => false,
+            };
+            let past_end = mode == 1 && total > 0 && offset >= total;
+            let valid = scheme > 0 && host_valid && consistent;
+            let flags = i64::from(host_valid)
+                | i64::from(url.last() == Some(&b'/')) << 1
+                | i64::from(w656_high(url)) << 2
+                | i64::from(consistent) << 3
+                | i64::from(past_end) << 4
+                | i64::from(valid) << 5;
+            out[1 + kind as usize] += 1;
+            out[10 + mode as usize] += 1;
+            out[14] += i64::from(valid);
+            out[15] += i64::from(scheme == 2);
+            out[16] += items;
+            out[17] = out[17].max(total);
+            out[18] += i64::from(!consistent);
+            if !valid {
+                w586_first(&mut out[19], at);
+            }
+            out[W656_XML_HEADER + at] = kind
+                | mode << 4
+                | scheme << 6
+                | flags << 8
+                | items << 14
+                | offset.min(0xFF_FFFF) << 34
+                | w656_len(url, 31) << 58;
+        }
+        out[20] = w526_digest(&out[W656_XML_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w656_xml_context_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w656_run(out, out_cap, &inputs, || {
+                let items = w656_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    2,
+                    count,
+                )?;
+                let values = w47_ints(w15_input(ints, ints_len)?, 3, count)?;
+                let (types, servers) = items.split_at(count);
+                Some(w656_xml_batch(types, servers, &values))
+            })
+        }
+    }
+
+    // --- CategoryData::w65CategoryDataPlanBatch ------------------------------
+
+    pub(crate) const W656_CATEGORY_HEADER: usize = 17;
+
+    /// Largest category id the tree accepts.
+    const W656_CATEGORY_ID_CAP: i64 = 99_999;
+
+    /// `Category::ROOT_CATEGORIES`: `OTHER_ROOT` (1) and the thousands 1000-9000.
+    #[inline]
+    fn w656_root_id(id: i64) -> bool {
+        id == 1 || ((1000..=9000).contains(&id) && id % 1000 == 0)
+    }
+
+    /// Category titles with `id`, `parentid` and `status` columns. Roots are
+    /// root ids without a parent (parent at or below 0). Kind 0 root, 1
+    /// sub-category (its parent is a root in the batch, it shares the parent's
+    /// thousand and differs from it), 2 orphan (its parent is no root in the
+    /// batch), 3 invalid (id at or below 0 or above 99999, a parentless
+    /// non-root id or a sub-category outside its parent's range). Status 0
+    /// inactive, 1 active, 2 disabled, 3 unknown. Flags: 1 duplicate id, 2
+    /// blank title (after `trim()`), 4 non-ASCII title, 8 visible (active root
+    /// or sub-category). `[0]` count, `[1..5]` per kind, `[5..9]` per status,
+    /// `[9]` distinct roots, `[10]` duplicates, `[11]` blank titles, `[12]` most
+    /// sub-categories of one parent, `[13]` parents with sub-categories, `[14]`
+    /// first invalid and `[15]` first orphan index (-1), `[16]` FNV-1a digest;
+    /// then per category `kind | status << 2 | flags << 4 | min(intdiv(id,
+    /// 1000), 15) << 8 | min(title bytes, 255) << 12 | id (0..2^31-1) << 20`.
+    pub(crate) fn w656_category_batch(titles: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+        let count = titles.len();
+        let (ids, rest) = ints.split_at(count);
+        let (parents, statuses) = rest.split_at(count);
+        let mut out = vec![0i64; W656_CATEGORY_HEADER + count];
+        out[0] = count as i64;
+        out[14] = -1;
+        out[15] = -1;
+        let mut roots = W656Set::default();
+        for (&id, &parent) in ids.iter().zip(parents) {
+            if parent <= 0 && w656_root_id(id) {
+                roots.insert(id);
+            }
+        }
+        let mut seen = W656Set::default();
+        let mut children = W526Map::<i64>::default();
+        for (at, &title) in titles.iter().enumerate() {
+            let (id, parent) = (ids[at], parents[at]);
+            let kind: i64 = if id <= 0 || id > W656_CATEGORY_ID_CAP {
+                3
+            } else if parent <= 0 {
+                if w656_root_id(id) { 0 } else { 3 }
+            } else if !roots.contains(&parent) {
+                2
+            } else if id / 1000 == parent / 1000 && id != parent {
+                1
+            } else {
+                3
+            };
+            let status = match statuses[at] {
+                value @ 0..=2 => value,
+                _ => 3,
+            };
+            let duplicate = !seen.insert(id);
+            let blank = w566_trim(title).is_empty();
+            let flags = i64::from(duplicate)
+                | i64::from(blank) << 1
+                | i64::from(w656_high(title)) << 2
+                | i64::from(status == 1 && kind <= 1) << 3;
+            if kind == 1 {
+                *children.entry(parent).or_insert(0) += 1;
+            }
+            out[1 + kind as usize] += 1;
+            out[5 + status as usize] += 1;
+            out[10] += i64::from(duplicate);
+            out[11] += i64::from(blank);
+            if kind == 3 {
+                w586_first(&mut out[14], at);
+            }
+            if kind == 2 {
+                w586_first(&mut out[15], at);
+            }
+            out[W656_CATEGORY_HEADER + at] = kind
+                | status << 2
+                | flags << 4
+                | (id.max(0) / 1000).min(15) << 8
+                | w656_len(title, 255) << 12
+                | id.clamp(0, W656_COUNT_CAP) << 20;
+        }
+        out[9] = roots.len() as i64;
+        out[12] = children.values().copied().max().unwrap_or(0) as i64;
+        out[13] = children.len() as i64;
+        out[16] = w526_digest(&out[W656_CATEGORY_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w656_category_data_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w656_run(out, out_cap, &inputs, || {
+                let titles = w656_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    1,
+                    count,
+                )?;
+                let values = w47_ints(w15_input(ints, ints_len)?, 3, count)?;
+                Some(w656_category_batch(&titles, &values))
+            })
+        }
+    }
+
+    // --- DetailsData::w65DetailsDataPlanBatch --------------------------------
+
+    pub(crate) const W656_DETAILS_HEADER: usize = 19;
+
+    /// Days in `month` of `year` (Gregorian).
+    #[inline]
+    fn w656_month_days(year: i64, month: i64) -> i64 {
+        match month {
+            2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        }
+    }
+
+    /// UTC epoch of a `Y-m-d H:i:s` postdate in 1970-2099 (PHP `checkdate()`
+    /// and `gmmktime()`), else None.
+    fn w656_postdate(raw: &[u8]) -> Option<i64> {
+        if raw.len() != 19 {
+            return None;
+        }
+        for (at, &byte) in raw.iter().enumerate() {
+            let ok = match at {
+                4 | 7 => byte == b'-',
+                10 => byte == b' ',
+                13 | 16 => byte == b':',
+                _ => byte.is_ascii_digit(),
+            };
+            if !ok {
+                return None;
+            }
+        }
+        let num = |from: usize, to: usize| {
+            raw[from..to]
+                .iter()
+                .fold(0i64, |value, &digit| value * 10 + i64::from(digit - b'0'))
+        };
+        let (year, month, day) = (num(0, 4), num(5, 7), num(8, 10));
+        let (hour, minute, second) = (num(11, 13), num(14, 16), num(17, 19));
+        if !(1970..=2099).contains(&year)
+            || !(1..=12).contains(&month)
+            || day < 1
+            || day > w656_month_days(year, month)
+            || hour > 23
+            || minute > 59
+            || second > 59
+        {
+            return None;
+        }
+        let y = if month <= 2 { year - 1 } else { year };
+        let era = y / 400;
+        let yoe = y - era * 400;
+        let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    }
+
+    /// Release details (GUID and postdate columns) with `categories_id`,
+    /// `size`, `totalpart`, `grabs`, `comments`, `imdbid`, `tvdb` and `tmdb`
+    /// columns and the current epoch (`now` at or below 0 skips ages and
+    /// future checks). Group 1 movies, 2 TV, 0 other. Sizes clamp to 0..2^50
+    /// and counts to 0..2^31-1. A movie without an IMDb id or a TV release
+    /// without a TVDB id misses its expected id. `[0]` count, `[1]` valid
+    /// GUIDs, `[2]` valid postdates, `[3]` future, `[4..7]` per group, `[7]`
+    /// IMDb, `[8]` TVDB and `[9]` TMDB ids, `[10]` missing expected ids, `[11]`
+    /// total size, `[12]` grabs, `[13]` comments, `[14]` files, `[15]` newest
+    /// and `[16]` oldest postdate epoch (0 without one), `[17]` first index
+    /// with an invalid GUID or postdate (-1), `[18]` FNV-1a digest; then per
+    /// release `guid | date << 1 | future << 2 | group << 3 | ids << 5 |
+    /// missing << 8 | min(age days, 2^16-1) << 9 | min(files, 2^16-1) << 25 |
+    /// min(grabs, 2^16-1) << 41`.
+    pub(crate) fn w656_details_batch(
+        guids: &[&[u8]],
+        postdates: &[&[u8]],
+        ints: &[i64],
+        now: i64,
+    ) -> Vec<i64> {
+        let count = guids.len();
+        let column = |index: usize, at: usize| ints[index * count + at];
+        let mut out = vec![0i64; W656_DETAILS_HEADER + count];
+        out[0] = count as i64;
+        out[17] = -1;
+        let (mut newest, mut oldest): (Option<i64>, Option<i64>) = (None, None);
+        for (at, &guid) in guids.iter().enumerate() {
+            let valid = w656_guid(guid);
+            let epoch = w656_postdate(postdates[at]);
+            let future = now > 0 && epoch.is_some_and(|value| value > now);
+            let age = match epoch {
+                Some(value) if now > 0 => (now - value).max(0) / 86_400,
+                _ => 0,
+            };
+            let group = w656_media_group(column(0, at));
+            let size = column(1, at).clamp(0, W656_SIZE_CAP);
+            let files = column(2, at).clamp(0, W656_COUNT_CAP);
+            let grabs = column(3, at).clamp(0, W656_COUNT_CAP);
+            let comments = column(4, at).clamp(0, W656_COUNT_CAP);
+            let (imdb, tvdb, tmdb) = (column(5, at) > 0, column(6, at) > 0, column(7, at) > 0);
+            let ids = i64::from(imdb) | i64::from(tvdb) << 1 | i64::from(tmdb) << 2;
+            let missing = (group == 1 && !imdb) || (group == 2 && !tvdb);
+            out[1] += i64::from(valid);
+            out[2] += i64::from(epoch.is_some());
+            out[3] += i64::from(future);
+            out[4 + group as usize] += 1;
+            out[7] += i64::from(imdb);
+            out[8] += i64::from(tvdb);
+            out[9] += i64::from(tmdb);
+            out[10] += i64::from(missing);
+            out[11] = (out[11] + size).min(W656_SUM_CAP);
+            out[12] += grabs;
+            out[13] += comments;
+            out[14] += files;
+            if let Some(value) = epoch {
+                newest = Some(newest.map_or(value, |seen| seen.max(value)));
+                oldest = Some(oldest.map_or(value, |seen| seen.min(value)));
+            }
+            if !valid || epoch.is_none() {
+                w586_first(&mut out[17], at);
+            }
+            out[W656_DETAILS_HEADER + at] = i64::from(valid)
+                | i64::from(epoch.is_some()) << 1
+                | i64::from(future) << 2
+                | group << 3
+                | ids << 5
+                | i64::from(missing) << 8
+                | age.min(0xFFFF) << 9
+                | files.min(0xFFFF) << 25
+                | grabs.min(0xFFFF) << 41;
+        }
+        out[15] = newest.unwrap_or(0);
+        out[16] = oldest.unwrap_or(0);
+        out[18] = w526_digest(&out[W656_DETAILS_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w656_details_data_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        now: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w656_run(out, out_cap, &inputs, || {
+                let items = w656_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    2,
+                    count,
+                )?;
+                let values = w47_ints(w15_input(ints, ints_len)?, 8, count)?;
+                let (guids, postdates) = items.split_at(count);
+                Some(w656_details_batch(guids, postdates, &values, now))
+            })
+        }
+    }
+
+    // --- ReleaseData::w65ReleaseDataPlanBatch --------------------------------
+
+    pub(crate) const W656_RELEASE_HEADER: usize = 24;
+
+    /// Enclosure size class bounds: 100 MiB, 1 GiB and 10 GiB.
+    const W656_RELEASE_SIZE_BOUNDS: [i64; 3] = [104_857_600, 1_073_741_824, 10_737_418_240];
+
+    /// Release items (GUID and title columns) with `categories_id`, `size`,
+    /// `grabs`, `comments`, `passwordstatus`, `imdbid`, `tmdbid`, `traktid`,
+    /// `tvdb` and `tvmaze` columns. Group 1 movies, 2 TV, 0 other. The id mask
+    /// holds the external ids the DTO emits (movies IMDb 1, TMDB 2, Trakt 4;
+    /// TV also TVDB 8 and TVmaze 16) that `nullIfZero()` keeps (non-zero). The
+    /// enclosure length is the size clamped to 0..2^50, classed 0 empty, 1
+    /// under 100 MiB, 2 under 1 GiB, 3 under 10 GiB, 4 larger. Password 0 none,
+    /// 1 possible, 2 passworded (2 and up), 3 unknown (negative). The escaped
+    /// title adds 4 bytes per `&`, 3 per `<` or `>` and 5 per `"` or `'`. `[0]`
+    /// count, `[1..4]` per group, `[4..9]` per id bit, `[9..14]` per size
+    /// class, `[14..18]` per password status, `[18]` valid GUIDs, `[19]`
+    /// enclosure bytes, `[20]` escaped title bytes, `[21]` titles needing
+    /// escapes, `[22]` first invalid GUID index (-1), `[23]` FNV-1a digest;
+    /// then per item `group | ids << 2 | size class << 7 | password << 10 |
+    /// grabs << 12 | comments << 13 | valid GUID << 14 | min(escaped title,
+    /// 2^16-1) << 15 | MiB << 31` (grabs and comments: non-zero).
+    pub(crate) fn w656_release_batch(guids: &[&[u8]], titles: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+        let count = guids.len();
+        let column = |index: usize, at: usize| ints[index * count + at];
+        let mut out = vec![0i64; W656_RELEASE_HEADER + count];
+        out[0] = count as i64;
+        out[22] = -1;
+        for (at, &guid) in guids.iter().enumerate() {
+            let group = w656_media_group(column(0, at));
+            let size = column(1, at).clamp(0, W656_SIZE_CAP);
+            let grabs = column(2, at) != 0;
+            let comments = column(3, at) != 0;
+            let password: i64 = match column(4, at) {
+                value if value < 0 => 3,
+                value @ 0..=1 => value,
+                _ => 2,
+            };
+            let emitted: i64 = match group {
+                1 => 0b00111,
+                2 => 0b11111,
+                _ => 0,
+            };
+            let ids = (0..5).fold(0i64, |mask, bit| {
+                mask | i64::from(column(5 + bit, at) != 0) << bit
+            }) & emitted;
+            let class = if size == 0 {
+                0
+            } else {
+                1 + W656_RELEASE_SIZE_BOUNDS
+                    .iter()
+                    .filter(|&&bound| size >= bound)
+                    .count() as i64
+            };
+            let title = titles[at];
+            let escaped = title.len() as i64 + w656_escape_extra(title);
+            let valid = w656_guid(guid);
+            out[1 + group as usize] += 1;
+            for bit in 0..5 {
+                out[4 + bit] += ids >> bit & 1;
+            }
+            out[9 + class as usize] += 1;
+            out[14 + password as usize] += 1;
+            out[18] += i64::from(valid);
+            out[19] = (out[19] + size).min(W656_SUM_CAP);
+            out[20] += escaped;
+            out[21] += i64::from(escaped != title.len() as i64);
+            if !valid {
+                w586_first(&mut out[22], at);
+            }
+            out[W656_RELEASE_HEADER + at] = group
+                | ids << 2
+                | class << 7
+                | password << 10
+                | i64::from(grabs) << 12
+                | i64::from(comments) << 13
+                | i64::from(valid) << 14
+                | escaped.min(0xFFFF) << 15
+                | (size >> 20) << 31;
+        }
+        out[23] = w526_digest(&out[W656_RELEASE_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w656_release_data_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w656_run(out, out_cap, &inputs, || {
+                let items = w656_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    2,
+                    count,
+                )?;
+                let values = w47_ints(w15_input(ints, ints_len)?, 10, count)?;
+                let (guids, titles) = items.split_at(count);
+                Some(w656_release_batch(guids, titles, &values))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr::null;
+
+        fn tokens<'a>(values: &[&'a str]) -> Vec<&'a [u8]> {
+            values.iter().map(|value| value.as_bytes()).collect()
+        }
+
+        const GUID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+        #[test]
+        fn w656_columns_split_twins_like_w566() {
+            let items: [&[u8]; 6] = [b"a\0b", b"", b"\0", b"long\0value\0x", b"\x01", b"z"];
+            let joined = items.join(&0u8);
+            let twin = items.join(&1u8);
+            let split = w656_columns(&joined, &twin, 2, 3).unwrap();
+            assert_eq!(split, items.to_vec());
+            assert_eq!(split, w566_columns(&joined, &twin, 2, 3).unwrap());
+            assert!(w656_columns(&joined, &twin, 1, 5).is_none());
+            assert!(w656_columns(&joined, &twin, 1, 7).is_none());
+            assert!(w656_columns(&joined, &twin[1..], 2, 3).is_none());
+            let mut bad = twin.clone();
+            bad[0] = b'q';
+            assert!(w656_columns(&joined, &bad, 2, 3).is_none());
+            assert!(w656_columns(b"x", b"x", 0, 0).is_none());
+            assert_eq!(w656_columns(b"a\0b", b"", 1, 2).unwrap(), vec![b"a".as_slice(), b"b"]);
+        }
+
+        #[test]
+        fn w656_columns_and_escapes_match_on_long_batches() {
+            let long = "&<>\"'".repeat(60).repeat(4);
+            let mut items: Vec<String> = (0..384)
+                .map(|i| match i % 8 {
+                    0 => long[..(i * 37) % long.len()].to_string(),
+                    1 => format!("Title.{i}.\0x"),
+                    _ => format!("Title.{i}"),
+                })
+                .collect();
+            items.extend((0..384).map(|i| format!("{i:040}")));
+            let joined = items.join("\0");
+            let twin = items.join("\x01");
+            let split = w656_columns(joined.as_bytes(), twin.as_bytes(), 2, 384).unwrap();
+            assert_eq!(split, w566_columns(joined.as_bytes(), twin.as_bytes(), 2, 384).unwrap());
+            let expected: i64 = joined
+                .bytes()
+                .map(|b| match b {
+                    b'&' => 4,
+                    b'<' | b'>' => 3,
+                    b'"' | b'\'' => 5,
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(w656_escape_extra(joined.as_bytes()), expected);
+        }
+
+        #[test]
+        fn w656_escape_extra_counts_long_values() {
+            let value = "&<>\"'x".repeat(300);
+            assert_eq!(w656_escape_extra(value.as_bytes()), 20 * 300);
+            assert_eq!(w656_escape_extra(b""), 0);
+        }
+
+        #[test]
+        fn w656_rows_batch_pages_and_summarizes() {
+            let guids = tokens(&[GUID, "XYZ", GUID]);
+            let totals = tokens(&["250", "", "x"]);
+            let ints = [2040, 5030, -5, 1_000, 0, 7, 3, 0, 2_000_000, 0, 1, 2];
+            let out = w656_rows_batch(&guids, &totals, &ints, 240, 2);
+            assert_eq!(&out[..5], &[3, 250, 240, 2, 1]);
+            assert_eq!((out[7], out[10], out[5]), (1, 1, 1));
+            assert_eq!(&out[15..21], &[2, 1_007, 2_000_003, 3, 1_000, 1]);
+            assert_eq!(
+                out[W656_ROWS_HEADER],
+                2 | (1 | 2 | 8 | 16 | 32) << 4 | 3 << 10 | 40 << 46
+            );
+            let empty = w656_rows_batch(&[], &[], &[], -9, 0);
+            assert_eq!(&empty[..5], &[0, 0, 0, 0, 0]);
+            assert_eq!(empty[20], -1);
+            let clamp = w656_rows_batch(&tokens(&[GUID]), &tokens(&["5"]), &[0, 0, 0, 0], 99, 500);
+            assert_eq!(&clamp[..5], &[1, 5, 5, 1, 0]);
+        }
+
+        #[test]
+        fn w656_xml_batch_validates_envelopes() {
+            let types = tokens(&[" Caps ", "search", "TV", "d", "register", "bogus"]);
+            let servers = tokens(&[
+                "https://indexer.example/",
+                "HTTP://idx:8080/api",
+                "ftp://x",
+                "https://h\u{e9}st/",
+                "http://",
+                "https://ok",
+            ]);
+            let ints = [0, 10, 5, 0, 0, 0, 0, 100, 3, 0, 0, 0, 0, 5, 1, 2, 0, 0];
+            let out = w656_xml_batch(&types, &servers, &ints);
+            assert_eq!(&out[1..10], &[1, 1, 1, 0, 0, 0, 1, 1, 1]);
+            assert_eq!(&out[10..14], &[2, 2, 1, 1]);
+            assert_eq!(&out[14..20], &[2, 3, 8, 100, 3, 2]);
+            assert_eq!(
+                out[W656_XML_HEADER + 1],
+                1 | 1 << 4 | 1 << 6 | (1 | 8 | 32) << 8 | 5 << 14 | 10 << 34 | 19 << 58
+            );
+            assert_eq!(out[W656_XML_HEADER + 3] >> 8 & 0x3f, 2 | 4);
+        }
+
+        #[test]
+        fn w656_category_batch_groups_tree() {
+            let titles = tokens(&["Movies", "HD", "SD", " ", "Lost", "Bad", "TV", "Fïlm", "HD"]);
+            let ints = [
+                2000, 2040, 2030, 0, 5040, 3010, 5000, 2050, 2040, //
+                0, 2000, 2000, 0, 7000, 2000, -1, 2000, 2000, //
+                1, 1, 0, 9, 1, 2, 1, 1, 1,
+            ];
+            let out = w656_category_batch(&titles, &ints);
+            assert_eq!(&out[1..5], &[2, 4, 1, 2]);
+            assert_eq!(&out[5..9], &[1, 6, 1, 1]);
+            assert_eq!(&out[9..16], &[2, 1, 1, 4, 1, 3, 4]);
+            assert_eq!(
+                out[W656_CATEGORY_HEADER + 8],
+                1 | 1 << 2 | (1 | 8) << 4 | 2 << 8 | 2 << 12 | 2040 << 20
+            );
+        }
+
+        #[test]
+        fn w656_postdate_matches_gmmktime() {
+            assert_eq!(w656_postdate(b"1970-01-01 00:00:00"), Some(0));
+            assert_eq!(w656_postdate(b"2000-02-29 12:34:56"), Some(951_827_696));
+            assert_eq!(w656_postdate(b"2024-12-31 23:59:59"), Some(1_735_689_599));
+            assert_eq!(w656_postdate(b"2023-02-29 00:00:00"), None);
+            assert_eq!(w656_postdate(b"1969-12-31 23:59:59"), None);
+            assert_eq!(w656_postdate(b"2020-01-01T00:00:00"), None);
+            assert_eq!(w656_postdate(b"2020-01-01 24:00:00"), None);
+        }
+
+        #[test]
+        fn w656_details_batch_summarizes() {
+            let guids = tokens(&[GUID, GUID, "bad"]);
+            let dates = tokens(&["2020-01-01 00:00:00", "2030-01-01 00:00:00", "nope"]);
+            let now = 1_600_000_000;
+            let ints = [
+                2040, 5030, 10, // categories
+                100, 200, -1, // size
+                5, 70_000, 0, // files
+                1, 2, 3, // grabs
+                0, 4, 0, // comments
+                0, 0, 7, // imdb
+                0, 9, 0, // tvdb
+                3, 0, 0, // tmdb
+            ];
+            let out = w656_details_batch(&guids, &dates, &ints, now);
+            assert_eq!(&out[1..11], &[2, 2, 1, 1, 1, 1, 1, 1, 1, 1]);
+            assert_eq!(&out[11..19][..6], &[300, 6, 4, 70_005, 1_893_456_000, 1_577_836_800]);
+            assert_eq!(out[17], 2);
+            assert_eq!(
+                out[W656_DETAILS_HEADER],
+                1 | 2 | 1 << 3 | 4 << 5 | 1 << 8 | 256 << 9 | 5 << 25 | 1 << 41
+            );
+        }
+
+        #[test]
+        fn w656_release_batch_masks_ids() {
+            let guids = tokens(&[GUID, "", GUID]);
+            let titles = tokens(&["A & B <x>", "plain", "it's \"q\""]);
+            let ints = [
+                2040, 5030, 1, // categories
+                0, 2_147_483_648, 104_857_600, // size
+                0, 3, -1, // grabs
+                5, 0, 0, // comments
+                -1, 0, 3, // password
+                1, 0, 1, // imdb
+                0, 2, 1, // tmdb
+                0, 0, 0, // trakt
+                9, 9, 9, // tvdb
+                0, -4, 0, // tvmaze
+            ];
+            let out = w656_release_batch(&guids, &titles, &ints);
+            assert_eq!(&out[1..4], &[1, 1, 1]);
+            assert_eq!(&out[4..9], &[1, 1, 0, 1, 1]);
+            assert_eq!(&out[9..14], &[1, 0, 1, 1, 0]);
+            assert_eq!(&out[14..18], &[1, 0, 1, 1]);
+            assert_eq!(&out[18..23], &[2, 2_252_341_248, 19 + 5 + 23, 2, 1]);
+            assert_eq!(
+                out[W656_RELEASE_HEADER + 1],
+                2 | 0b11010 << 2 | 3 << 7 | 1 << 12 | 5 << 15 | 2_048 << 31
+            );
+        }
+
+        #[test]
+        fn w656_exports_validate_buffers() {
+            let mut out = vec![0i64; 64];
+            let status = unsafe {
+                nntmux_w656_release_rows_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!((status, out[0], out[20]), (1, 0, -1));
+            let status = unsafe {
+                nntmux_w656_xml_context_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    64,
+                )
+            };
+            assert_eq!(status, -2);
+            let status = unsafe {
+                nntmux_w656_category_data_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    3,
+                )
+            };
+            assert_eq!(status, -2);
+            let misaligned = unsafe { (out.as_mut_ptr() as *mut u8).add(1) as *mut i64 };
+            let status = unsafe {
+                nntmux_w656_release_data_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    misaligned,
+                    32,
+                )
+            };
+            assert_eq!(status, -2);
+            out[0] = 77;
+            // Input bytes aliasing the output range are rejected.
+            let alias = out.as_ptr() as *const u8;
+            let status = unsafe {
+                nntmux_w656_category_data_batch(
+                    alias,
+                    8,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    1,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(status, -1);
+            // A null input with a length, a short integer column and a bad twin are invalid.
+            let title = b"Movies";
+            let ints: Vec<u8> = [2000i64, 0, 1].iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let status = unsafe {
+                nntmux_w656_category_data_batch(
+                    null(),
+                    4,
+                    null(),
+                    0,
+                    ints.as_ptr(),
+                    24,
+                    1,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(status, -1);
+            let status = unsafe {
+                nntmux_w656_category_data_batch(
+                    title.as_ptr(),
+                    title.len(),
+                    null(),
+                    0,
+                    ints.as_ptr(),
+                    16,
+                    1,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(status, -1);
+            let twin = b"Movies\x02";
+            let status = unsafe {
+                nntmux_w656_category_data_batch(
+                    title.as_ptr(),
+                    title.len(),
+                    twin.as_ptr(),
+                    twin.len(),
+                    ints.as_ptr(),
+                    24,
+                    1,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(status, -1);
+            // Two string columns need exactly `2 * count` items.
+            let status = unsafe {
+                nntmux_w656_details_data_batch(
+                    title.as_ptr(),
+                    title.len(),
+                    null(),
+                    0,
+                    [0u8; 64].as_ptr(),
+                    64,
+                    1,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(status, -1);
+            assert_eq!(out[0], 77);
+            let status = unsafe {
+                nntmux_w656_category_data_batch(
+                    title.as_ptr(),
+                    title.len(),
+                    null(),
+                    0,
+                    ints.as_ptr(),
+                    24,
+                    1,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!((status, out[0], out[1], out[9]), (1, 1, 1, 1));
+        }
+    }
+}

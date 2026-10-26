@@ -446,4 +446,303 @@ final class ReleaseSearchSyncCoordinator
             return null;
         }
     }
+
+    // ---- Wave 65.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 8.63x/6.74x, uncommon 8.28x/4.92x); see RustAdditionalNzbParserFileManagerArchiveFallbackProcessorSyncW65ParityTest. */
+    public const bool W65_RUST_FFI_DEFAULT = true;
+
+    private const string W65_SEARCH_SYNC_COORDINATOR_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w652_search_sync_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W65_SEARCH_SYNC_COORDINATOR_TAIL = 35;
+
+    /**
+     * Wave 65 routing, binding and output buffer, kept in function-local statics (no static or
+     * instance properties). Operations: null reads the routing override, 'set' replaces it
+     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
+     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
+     * (null without the library).
+     */
+    private static function w65RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'reset':
+                $previous = $enabled;
+                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w65', self::W65_SEARCH_SYNC_COORDINATOR_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w65RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    /** Routes w65SearchSyncCoordinatorPlanBatch() to Rust until reset. */
+    public static function enableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', true);
+    }
+
+    /** Routes w65SearchSyncCoordinatorPlanBatch() to PHP until reset. */
+    public static function disableW65RustFfi(): void
+    {
+        self::w65RustFfiState('set', false);
+    }
+
+    /** Restores W65_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
+    public static function resetW65RustFfi(): void
+    {
+        self::w65RustFfiState('reset');
+    }
+
+    public static function usesW65RustFfi(): bool
+    {
+        $enabled = self::w65RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W65_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w65SearchSyncCoordinatorPlanBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW65RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w65RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w65RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w65SearchSyncCoordinatorPlanBatch(array $rows): array
+    {
+        return self::usesW65RustFfi() ? self::w65SearchSyncCoordinatorPlanBatchNative($rows) : self::w65SearchSyncCoordinatorPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w65SearchSyncCoordinatorPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W65_SEARCH_SYNC_COORDINATOR_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w65RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w65SearchSyncCoordinatorPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W65_SEARCH_SYNC_COORDINATOR_FFI_CDEF.)
+            $written = $ffi->nntmux_w652_search_sync_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w65SearchSyncCoordinatorPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w65Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w65Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /**
+     * Known-token bit mask and unknown-token count of a comma list (trimmed, non-empty tokens
+     * looked up case-insensitively in $names, token => bit).
+     *
+     * @param  array<string, int>  $names
+     * @return array{int, int}
+     */
+    private static function w65Tokens(string $list, array $names): array
+    {
+        $mask = $unknown = 0;
+        foreach (explode(',', $list) as $token) {
+            $token = trim($token);
+            if ($token === '') {
+                continue;
+            }
+            $bit = $names[strtolower($token)] ?? null;
+            if ($bit === null) {
+                $unknown++;
+            } else {
+                $mask |= 1 << $bit;
+            }
+        }
+
+        return [$mask, $unknown];
+    }
+
+    /** Operation token => code (4 unknown). */
+    private const array W65_SYNC_OPS = ['update' => 0, 'insert' => 1, 'delete' => 2, 'flush' => 3];
+
+    /** Search document field => dirty bit. */
+    private const array W65_SYNC_FIELDS = ['name' => 0, 'searchname' => 1, 'fromname' => 2, 'categories_id' => 3, 'filename' => 4, 'size' => 5, 'postdate' => 6,
+        'adddate' => 7, 'nfo' => 8, 'imdbid' => 9, 'tvdb' => 10, 'haspreview' => 11, 'passwordstatus' => 12];
+
+    private const int W65_SYNC_ALL_FIELDS = 8191;
+
+    /** Pending releases or payload bytes that flush a dispatch batch. */
+    private const int W65_SYNC_FLUSH_RELEASES = 100;
+
+    private const int W65_SYNC_FLUSH_BYTES = 1_048_576;
+
+    /**
+     * Wave 65.2 search sync plan. Per `release_id\top\tfields\tbytes` row `action | op << 3 |
+     * dirty_mask << 6 | pending_mask << 19 | flushed << 32 | min(batches, 65535) << 33 |
+     * min(pending, 1023) << 49 | min(unknown_fields, 15) << 59`. Ops (trimmed, case-insensitive):
+     * 0 update, 1 insert (every field dirty), 2 delete, 3 flush, 4 unknown; fields are a w65Tokens()
+     * list of W65_SYNC_FIELDS; release id and bytes are w65Int() fields of 12 and 9 digits. An
+     * unknown op, unparsable bytes or (except for a flush) no positive release id is malformed
+     * (action 0). Otherwise: flush 6; delete 2 when it cancels a pending release (dropping its
+     * bytes), else 3; an update or insert of a pending release 4 when it adds dirty fields, else 5
+     * (redundant); a new one 1 (queued), or 7 (no-op) without a dirty field. The pending mask is the
+     * release's merged mask after a queue, coalesce or redundant row. A flush, W65_SYNC_FLUSH_RELEASES
+     * pending releases or W65_SYNC_FLUSH_BYTES pending bytes dispatch the pending releases as one
+     * batch (when any). Then eight action, five op and 13 field counts (valid updates and inserts),
+     * batches, dispatched releases, releases and bytes still pending, the largest batch, malformed
+     * rows, distinct releases, total valid bytes and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w65SearchSyncCoordinatorPlanBatchPhp(array $rows): array
+    {
+        $out = $pending = $ids = [];
+        $actions = array_fill(0, 8, 0);
+        $ops = array_fill(0, 5, 0);
+        $fieldCounts = array_fill(0, 13, 0);
+        $batches = $flushedReleases = $pendingBytes = $maxBatch = $malformedRows = $totalBytes = 0;
+        foreach ($rows as $row) {
+            [$rid, $op, $list, $bytes] = explode("\t", (string) $row, 4) + ['', '', '', ''];
+            $rid = self::w65Int($rid, 12);
+            $bytes = self::w65Int($bytes, 9);
+            $op = self::W65_SYNC_OPS[strtolower(trim($op))] ?? 4;
+            [$mask, $unknown] = self::w65Tokens($list, self::W65_SYNC_FIELDS);
+            if ($op === 1) {
+                $mask = self::W65_SYNC_ALL_FIELDS;
+            }
+            $id = \is_int($rid) && $rid > 0 ? $rid : 0;
+            $malformed = $op === 4 || $bytes === false || ($op !== 3 && $id === 0);
+            $size = \is_int($bytes) ? $bytes : 0;
+            $merged = 0;
+            if ($malformed) {
+                $action = 0;
+            } elseif ($op === 3) {
+                $action = 6;
+            } elseif ($op === 2) {
+                if (isset($pending[$id])) {
+                    $pendingBytes -= $pending[$id][1];
+                    unset($pending[$id]);
+                    $action = 2;
+                } else {
+                    $action = 3;
+                }
+            } elseif (isset($pending[$id])) {
+                [$held, $heldBytes] = $pending[$id];
+                $merged = $held | $mask;
+                $action = $merged === $held ? 5 : 4;
+                $pending[$id] = [$merged, $heldBytes + $size];
+                $pendingBytes += $size;
+            } elseif ($mask === 0) {
+                $action = 7;
+            } else {
+                $pending[$id] = [$mask, $size];
+                $pendingBytes += $size;
+                $merged = $mask;
+                $action = 1;
+            }
+            if (! $malformed) {
+                $totalBytes += $size;
+                if ($op !== 3) {
+                    $ids[$id] = true;
+                }
+                if ($op <= 1) {
+                    for ($k = 0; $k < 13; $k++) {
+                        $fieldCounts[$k] += $mask >> $k & 1;
+                    }
+                }
+            }
+            $flushed = ! $malformed && ($op === 3 || \count($pending) >= self::W65_SYNC_FLUSH_RELEASES || $pendingBytes >= self::W65_SYNC_FLUSH_BYTES) && $pending !== [];
+            if ($flushed) {
+                $batches++;
+                $flushedReleases += \count($pending);
+                $maxBatch = max($maxBatch, \count($pending));
+                $pending = [];
+                $pendingBytes = 0;
+            }
+            $actions[$action]++;
+            $ops[$op]++;
+            $malformedRows += (int) $malformed;
+            $out[] = $action | $op << 3 | $mask << 6 | $merged << 19 | (int) $flushed << 32 | min($batches, 0xFFFF) << 33 | min(\count($pending), 0x3FF) << 49
+                | min($unknown, 15) << 59;
+        }
+        array_push($out, ...$actions, ...$ops, ...$fieldCounts);
+        array_push($out, $batches, $flushedReleases, \count($pending), $pendingBytes, $maxBatch, $malformedRows, \count($ids), $totalBytes);
+        $out[] = self::w65Digest($out);
+
+        return $out;
+    }
 }
