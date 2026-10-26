@@ -9,9 +9,11 @@ use App\Models\AnidbInfo;
 use App\Models\AnidbTitle;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\ClientException;
 use GuzzleHttp\Exception\GuzzleException;
+use InvalidArgumentException;
 use Throwable;
 
 class PopulateAniListService
@@ -1093,5 +1095,261 @@ class PopulateAniListService
         } catch (Throwable) {
             return null;
         }
+    }
+
+    // ========================================================================
+    // WAVE 61.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of four paired runs reached 1.75x common mean, 1.60x common p99, 1.63x uncommon mean and 1.66x uncommon p99; see RustUpdateLockPasswordBreachAniListRecaptchaRegistrationLogW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    private const string W61_ANILIST_FFI_CDEF = 'ssize_t nntmux_w614_anilist_population_plan_row_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per aniListPopulationPlanRowBatch() record. */
+    public const int W61_ROW_WORDS = 7;
+
+    /** int64 summary words after the aniListPopulationPlanRowBatch() records (none for an empty batch). */
+    public const int W61_TRAILER_WORDS = 8;
+
+    private const int W61_ID_MAX = 2_147_483_647;
+
+    private const array W61_STATUSES = ['FINISHED' => 1, 'RELEASING' => 2, 'NOT_YET_RELEASED' => 3, 'CANCELLED' => 4, 'HIATUS' => 5];
+
+    private const array W61_FORMATS = ['TV' => 1, 'TV_SHORT' => 2, 'MOVIE' => 3, 'SPECIAL' => 4, 'OVA' => 5, 'ONA' => 6, 'MUSIC' => 7];
+
+    private const string W61_CONTROL = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f";
+
+    /**
+     * AniList population plan rows for [romaji title, english title, native title, status,
+     * format, anilist id, mal id, episodes, season year] items. Titles are trimmed; status and
+     * format are trimmed and uppercased (status 1 FINISHED, 2 RELEASING, 3 NOT_YET_RELEASED, 4
+     * CANCELLED, 5 HIATUS; format 1 TV, 2 TV_SHORT, 3 MOVIE, 4 SPECIAL, 5 OVA, 6 ONA, 7 MUSIC; 0
+     * empty, 15 other). The anilist id must be 1..2^31-1 (else -1), the mal id 0 (none) or
+     * 1..2^31-1, episodes 0..10000 and the season year 0 (none) or 1940..2100 (else -1). The
+     * primary title is english, then romaji, then native (source 1-3, 0 none).
+     *
+     * Status: 1 invalid anilist id, 2 untitled, 3 a title is not UTF-8, 4 needs review (unknown
+     * status or format, or an invalid mal id, episode count or year), 0 ready. Completeness
+     * scores 20 id + 15 romaji + 15 english + 10 native + 10 mal + 10 episodes + 10 year + 5
+     * status + 5 format. Rows [status | source << 4 | media status << 8 | format << 12 | flags
+     * << 16 (1 romaji, 2 english, 4 native, 8 native non-ASCII, 16 english equals romaji
+     * case-insensitively, 32 control byte, 64 not UTF-8, 128 movie with several episodes),
+     * anilist id, mal id, episodes, season year, primary title bytes, completeness], then the
+     * trailer [ready, invalid id, untitled, bad encoding, review, completeness sum, max primary
+     * bytes, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function aniListPopulationPlanRowBatch(array $items): array
+    {
+        return self::usesW61RustFfi() ? self::aniListPopulationPlanRowBatchNative($items) : self::aniListPopulationPlanRowBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function aniListPopulationPlanRowBatchPhp(array $items): array
+    {
+        self::w61Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $summary = [0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        foreach ($items as [$romaji, $english, $native, $mediaStatus, $format, $anilist, $mal, $episodes, $year]) {
+            $romaji = trim($romaji);
+            $english = trim($english);
+            $native = trim($native);
+            $mediaStatus = strtoupper(trim($mediaStatus));
+            $statusCode = $mediaStatus === '' ? 0 : (self::W61_STATUSES[$mediaStatus] ?? 15);
+            $format = strtoupper(trim($format));
+            $formatCode = $format === '' ? 0 : (self::W61_FORMATS[$format] ?? 15);
+            $anilist = $anilist >= 1 && $anilist <= self::W61_ID_MAX ? $anilist : -1;
+            $mal = $mal === 0 || ($mal >= 1 && $mal <= self::W61_ID_MAX) ? $mal : -1;
+            $episodes = $episodes >= 0 && $episodes <= 10_000 ? $episodes : -1;
+            $year = $year === 0 || ($year >= 1940 && $year <= 2100) ? $year : -1;
+            $r = \strlen($romaji);
+            $e = \strlen($english);
+            $n = \strlen($native);
+            $badUtf8 = ! mb_check_encoding($romaji, 'UTF-8') || ! mb_check_encoding($english, 'UTF-8') || ! mb_check_encoding($native, 'UTF-8');
+            $flags = ($r > 0 ? 1 : 0) | ($e > 0 ? 2 : 0) | ($n > 0 ? 4 : 0) | (mb_check_encoding($native, 'ASCII') ? 0 : 8)
+                | ($e > 0 && strcasecmp($english, $romaji) === 0 ? 16 : 0)
+                | (strcspn($romaji, self::W61_CONTROL) !== $r || strcspn($english, self::W61_CONTROL) !== $e || strcspn($native, self::W61_CONTROL) !== $n ? 32 : 0)
+                | ($badUtf8 ? 64 : 0) | ($formatCode === 3 && $episodes > 1 ? 128 : 0);
+            [$source, $primary] = $e > 0 ? [1, $e] : ($r > 0 ? [2, $r] : ($n > 0 ? [3, $n] : [0, 0]));
+            $status = match (true) {
+                $anilist === -1 => 1,
+                $source === 0 => 2,
+                $badUtf8 => 3,
+                $statusCode === 15 || $formatCode === 15 || $mal === -1 || $episodes === -1 || $year === -1 => 4,
+                default => 0,
+            };
+            $score = ($anilist > 0 ? 20 : 0) + ($r > 0 ? 15 : 0) + ($e > 0 ? 15 : 0) + ($n > 0 ? 10 : 0) + ($mal > 0 ? 10 : 0)
+                + ($episodes > 0 ? 10 : 0) + ($year > 0 ? 10 : 0) + ($statusCode >= 1 && $statusCode <= 5 ? 5 : 0)
+                + ($formatCode >= 1 && $formatCode <= 7 ? 5 : 0);
+            $word = $status | $source << 4 | $statusCode << 8 | $formatCode << 12 | $flags << 16;
+            array_push($out, $word, $anilist, $mal, $episodes, $year, $primary, $score);
+            $summary[$status]++;
+            $summary[5] += $score;
+            $summary[6] = max($summary[6], $primary);
+            $value = $word ^ $anilist << 24 ^ $score;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $summary[7] = $digest;
+
+        return [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: int, 6: int, 7: int, 8: int}>  $items
+     * @return list<int>
+     */
+    public static function aniListPopulationPlanRowBatchNative(array $items): array
+    {
+        self::w61Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w61Join([array_column($items, 0), array_column($items, 1), array_column($items, 2), array_column($items, 3), array_column($items, 4)], $count);
+        $ints = pack('P*', ...array_column($items, 5), ...array_column($items, 6), ...array_column($items, 7), ...array_column($items, 8));
+
+        return self::w61Call($blob, $twin, $ints, $count, $count * self::W61_ROW_WORDS + self::W61_TRAILER_WORDS)
+            ?? self::aniListPopulationPlanRowBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w61Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new InvalidArgumentException('W61 AniList population plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 9 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_string($item[2]) || ! \is_string($item[3]) || ! \is_string($item[4]) || ! \is_int($item[5]) || ! \is_int($item[6]) || ! \is_int($item[7]) || ! \is_int($item[8])) {
+                throw new InvalidArgumentException('W61 AniList population plan batch items must be [string romaji, string english, string native, string status, string format, int anilist id, int mal id, int episodes, int season year] lists.');
+            }
+        }
+    }
+
+    public static function usesW61RustFfi(): bool
+    {
+        $enabled = self::w61RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W61 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('enabled');
+        self::w61RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w61Join(array $columns, int $count): array
+    {
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\0", $column);
+        }
+        $joined = implode("\0", $parts);
+        if (substr_count($joined, "\0") === \count($columns) * $count - 1) {
+            return [$joined, ''];
+        }
+        $parts = [];
+        foreach ($columns as $column) {
+            $parts[] = implode("\x01", $column);
+        }
+
+        return [$joined, implode("\x01", $parts)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w61Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w61RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w61', self::W61_ANILIST_FFI_CDEF) ?? false;
+            self::w61RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w61RustFfiState('out', $out);
+                self::w61RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W61_ANILIST_FFI_CDEF.)
+            $written = $ffi->nntmux_w614_anilist_population_plan_row_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w61RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W61 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static: no arguments returns the state, one argument reads a key ('reset'
+     * clears everything) and two arguments write a key.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
     }
 }
