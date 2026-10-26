@@ -7,6 +7,7 @@ namespace App\Providers;
 use App\Support\RustPipelineLibrary;
 use BackedEnum;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Gate;
 use Laravel\Horizon\HorizonApplicationServiceProvider;
 use Throwable;
@@ -191,5 +192,302 @@ class HorizonServiceProvider extends HorizonApplicationServiceProvider
         Gate::define('viewHorizon', function ($user = null) {
             return $user && $user->hasRole('Admin');
         });
+    }
+
+    // ========================================================================
+    // WAVE 59.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 7.37x, p99 6.24x; uncommon mean 7.29x, p99 5.43x); see RustSeriesControllerAdminLogRequestsHorizonProviderHttpFeedW59ParityTest. */
+    public const bool W59_RUST_FFI_DEFAULT = true;
+
+    public const string W59_HORIZON_SERVICE_PROVIDER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w593_horizon_access_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Known application environments, indexed from 1 (0 absent, 5 other). */
+    public const array W59_HORIZON_ENVIRONMENTS = ['local' => 1, 'production' => 2, 'staging' => 3, 'testing' => 4];
+
+    /** Trailer words after the per-item words of w59HorizonAccessBatch(). */
+    public const int W59_HORIZON_TRAILER = 19;
+
+    public static function usesW59RustFfi(): bool
+    {
+        $override = self::w59RustFfiState();
+
+        return \is_bool($override) ? $override : self::W59_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 59 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW59RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w59RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w59RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 59.3 Horizon access checks. Each item is `environment|userId|roles|email|ip|waitSeconds` (missing
+     * fields are empty, every field is trimmed). Per item `env | uidState << 3 | admin << 5 | adminCaseMismatch
+     * << 6 | min(roles, 15) << 7 | emailState << 11 | internalEmail << 13 | ipClass << 14 | waitClass << 18 | gate
+     * << 21 | allowed << 22 | reason << 23 | min(wait, 2^20 - 1) << 25 | min(uidLength, 31) << 45`: env is 0
+     * empty, 1-4 W59_HORIZON_ENVIRONMENTS (exact) or 5 other; uid state is 0 guest, 1 up to 19 digits
+     * (authenticated) and 2 malformed (guest); roles are comma separated, admin needs the exact `Admin` role
+     * and the mismatch flag marks another spelling; email state is 0 empty, 1 one `@` after a non-empty local
+     * part, a dotted domain not starting or ending with `.` and printable ASCII only, else 2, with internal
+     * marking a `.local`, `.lan` or `.internal` domain; ip class is w59HorizonIpClass(); the wait class is 0
+     * empty, 1 below 60 seconds, 2 below 300, 3 longer and 4 invalid (over nine digits or non-numeric). The gate
+     * (viewHorizon) passes an authenticated admin and Horizon also allows the exact `local` environment; reason
+     * is 0 denied guest, 1 denied non-admin, 2 allowed by the gate and 3 allowed only as local. Then four reason,
+     * eight ip class and five wait class counts, the largest valid wait and the distinct allowed user IDs.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w59HorizonAccessBatch(array $items): array
+    {
+        return self::usesW59RustFfi() ? self::w59HorizonAccessBatchNative($items) : self::w59HorizonAccessBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w59HorizonAccessBatchNative(array $items): array
+    {
+        return self::w59Invoke($items, \count($items) + self::W59_HORIZON_TRAILER) ?? self::w59HorizonAccessBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w59HorizonAccessBatchPhp(array $items): array
+    {
+        $out = [];
+        $reasons = [0, 0, 0, 0];
+        $ips = array_fill(0, 8, 0);
+        $metrics = [0, 0, 0, 0, 0];
+        $maxWait = 0;
+        $uids = [];
+        foreach ($items as $item) {
+            $f = explode('|', (string) $item, 6) + ['', '', '', '', '', ''];
+            $env = trim($f[0]);
+            $envIdx = $env === '' ? 0 : (self::W59_HORIZON_ENVIRONMENTS[$env] ?? 5);
+            $uid = trim($f[1]);
+            $uidState = $uid === '' ? 0 : (\strlen($uid) <= 19 && strspn($uid, '0123456789') === \strlen($uid) ? 1 : 2);
+            $admin = $mismatch = false;
+            $roles = 0;
+            foreach (explode(',', $f[2]) as $role) {
+                $role = trim($role);
+                if ($role === '') {
+                    continue;
+                }
+                $roles++;
+                if ($role === 'Admin') {
+                    $admin = true;
+                } elseif (strtolower($role) === 'admin') {
+                    $mismatch = true;
+                }
+            }
+            $email = trim($f[3]);
+            $emailState = 0;
+            $internal = false;
+            if ($email !== '') {
+                $at = strpos($email, '@');
+                $domain = $at === false ? '' : strtolower(substr($email, $at + 1));
+                $valid = $at !== false && $at > 0 && substr_count($email, '@') === 1 && $domain !== '' && str_contains($domain, '.')
+                    && $domain[0] !== '.' && $domain[-1] !== '.' && preg_match('/\A[\x21-\x7e]+\z/', $email) === 1;
+                $emailState = $valid ? 1 : 2;
+                $internal = $valid && (str_ends_with($domain, '.local') || str_ends_with($domain, '.lan') || str_ends_with($domain, '.internal'));
+            }
+            $ip = self::w59HorizonIpClass(trim($f[4]));
+            $wait = trim($f[5]);
+            if ($wait === '') {
+                [$metric, $waitValue] = [0, 0];
+            } elseif (\strlen($wait) <= 9 && strspn($wait, '0123456789') === \strlen($wait)) {
+                $waitValue = (int) $wait;
+                $metric = $waitValue < 60 ? 1 : ($waitValue < 300 ? 2 : 3);
+            } else {
+                [$metric, $waitValue] = [4, 0];
+            }
+            $gate = $uidState === 1 && $admin;
+            $allowed = $gate || $env === 'local';
+            $reason = $allowed ? ($gate ? 2 : 3) : ($uidState === 1 ? 1 : 0);
+            $reasons[$reason]++;
+            $ips[$ip]++;
+            $metrics[$metric]++;
+            if ($metric >= 1 && $metric <= 3) {
+                $maxWait = max($maxWait, $waitValue);
+            }
+            if ($allowed && $uidState === 1) {
+                $uids[$uid] = true;
+            }
+            $out[] = $envIdx | $uidState << 3 | ($admin ? 1 : 0) << 5 | ($mismatch ? 1 : 0) << 6 | min($roles, 15) << 7 | $emailState << 11
+                | ($internal ? 1 : 0) << 13 | $ip << 14 | $metric << 18 | ($gate ? 1 : 0) << 21 | ($allowed ? 1 : 0) << 22 | $reason << 23
+                | min($waitValue, (1 << 20) - 1) << 25 | min(\strlen($uid), 31) << 45;
+        }
+        array_push($out, ...$reasons);
+        array_push($out, ...$ips);
+        array_push($out, ...$metrics);
+        array_push($out, $maxWait, \count($uids));
+
+        return $out;
+    }
+
+    /**
+     * 0 empty; dotted-quad IPv4 as 1 loopback (127/8), 2 private (10/8, 172.16/12, 192.168/16), 3 link local
+     * (169.254/16) or 4 public; IPv6 (`:` plus hex digits, `:` and `.`, at most 45 bytes and one `::`) as 1 `::1`,
+     * 3 `fe80:`, 2 `fc`/`fd` or 6 other; 7 invalid.
+     */
+    private static function w59HorizonIpClass(string $ip): int
+    {
+        if ($ip === '') {
+            return 0;
+        }
+        $length = \strlen($ip);
+        if (strspn($ip, '0123456789.') === $length) {
+            $parts = explode('.', $ip);
+            if (\count($parts) !== 4) {
+                return 7;
+            }
+            foreach ($parts as $part) {
+                if ($part === '' || \strlen($part) > 3 || (int) $part > 255) {
+                    return 7;
+                }
+            }
+            [$a, $b] = [(int) $parts[0], (int) $parts[1]];
+
+            return match (true) {
+                $a === 127 => 1,
+                $a === 10 || ($a === 172 && $b >= 16 && $b <= 31) || ($a === 192 && $b === 168) => 2,
+                $a === 169 && $b === 254 => 3,
+                default => 4,
+            };
+        }
+        $lower = strtolower($ip);
+        if (! str_contains($lower, ':') || $length > 45 || strspn($lower, '0123456789abcdef:.') !== $length || substr_count($lower, '::') > 1) {
+            return 7;
+        }
+
+        return match (true) {
+            $lower === '::1' => 1,
+            str_starts_with($lower, 'fe80:') => 3,
+            str_starts_with($lower, 'fc') || str_starts_with($lower, 'fd') => 2,
+            default => 6,
+        };
+    }
+
+    /**
+     * Wave 59 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w59RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w593', self::W59_HORIZON_SERVICE_PROVIDER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w59RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w59RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 59.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w59Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w59RustFfiState('ffi');
+            $out = self::w59RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w59RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W59_HORIZON_SERVICE_PROVIDER_FFI_CDEF.)
+            $written = $ffi->nntmux_w593_horizon_access_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

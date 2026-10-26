@@ -8,6 +8,7 @@ use App\Services\Predb\Feeds\Contracts\PredbFeedSource;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\RequestException;
@@ -456,6 +457,344 @@ abstract class HttpFeedSource implements PredbFeedSource
             }
 
             return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    // ========================================================================
+    // WAVE 59.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 5.58x, p99 2.57x; uncommon mean 5.38x, p99 4.33x); see RustSeriesControllerAdminLogRequestsHorizonProviderHttpFeedW59ParityTest. */
+    public const bool W59_RUST_FFI_DEFAULT = true;
+
+    /** Distinct from the subclasses' FFI declaration constants. */
+    public const string W59_HTTP_FEED_SOURCE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w593_http_feed_response_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Feed content types w59HttpFeedResponseBatch() classifies as XML. */
+    public const array W59_HTTP_FEED_XML_TYPES = ['application/xml' => true, 'text/xml' => true, 'application/rss+xml' => true,
+        'application/atom+xml' => true];
+
+    /** Largest Content-Length w59HttpFeedResponseBatch() accepts. */
+    public const int W59_HTTP_FEED_MAX_PAYLOAD = 1048576;
+
+    /** Trailer words after the per-item words of w59HttpFeedResponseBatch(). */
+    public const int W59_HTTP_FEED_TRAILER = 14;
+
+    public static function usesW59RustFfi(): bool
+    {
+        $override = self::w59RustFfiState();
+
+        return \is_bool($override) ? $override : self::W59_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 59 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW59RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w59RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w59RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 59.3 feed responses. Each item is `url|status|retryAfter|contentType|contentLength|contentEncoding`
+     * (missing fields are empty, every field is trimmed). Per item `urlState | https << 3 | query << 4 |
+     * customPort << 5 | statusClass << 6 | retryState << 9 | type << 11 | charset << 14 | lengthState << 17 |
+     * encoding << 20 | verdict << 23 | delay << 27 | min(hostLength, 255) << 44`: url state is
+     * w59HttpFeedUrl()'s; status class is 0 not a 100-599 three digit code, 1 2xx, 2 304, 3 429, 4 5xx, 5 other
+     * 4xx and 6 other; Retry-After is 0 absent, 1 up to ten digits, 2 an IMF-fixdate and 3 invalid; type is 0
+     * absent, 1 W59_HTTP_FEED_XML_TYPES, 2 JSON, 3 text/html, 4 text/plain, 5 octet-stream and 6 other, and
+     * charset 0 absent, 1 UTF-8, 2 Latin-1, 3 empty and 4 other; length is 0 absent, 1 zero, 2 within
+     * W59_HTTP_FEED_MAX_PAYLOAD, 3 larger and 4 invalid (over 15 digits or non-numeric); encoding is 0 identity, 1
+     * gzip, 2 deflate, 3 br and 4 unsupported. The verdict is 6 invalid URL, 7 invalid status, 1 retry (429 or
+     * 5xx), 2 not modified, 3 rejected status, 4 unsupported encoding, 5 HTML, 8 oversized, 9 empty, 10 invalid
+     * length, else 0 accepted; a retry waits the Retry-After seconds (capped at a day), 60 seconds for a date or
+     * a bare 429 and 5 seconds otherwise. Then eleven verdict counts, the accepted payload bytes, the longest
+     * delay and the distinct lower-cased hosts of valid URLs.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w59HttpFeedResponseBatch(array $items): array
+    {
+        return self::usesW59RustFfi() ? self::w59HttpFeedResponseBatchNative($items) : self::w59HttpFeedResponseBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w59HttpFeedResponseBatchNative(array $items): array
+    {
+        return self::w59Invoke($items, \count($items) + self::W59_HTTP_FEED_TRAILER) ?? self::w59HttpFeedResponseBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w59HttpFeedResponseBatchPhp(array $items): array
+    {
+        $out = [];
+        $verdicts = array_fill(0, 11, 0);
+        $payloadSum = $maxDelay = 0;
+        $hosts = [];
+        foreach ($items as $item) {
+            $f = explode('|', (string) $item, 6) + ['', '', '', '', '', ''];
+            [$urlState, $https, $query, $customPort, $host] = self::w59HttpFeedUrl(trim($f[0]));
+            $status = trim($f[1]);
+            $code = \strlen($status) === 3 && strspn($status, '0123456789') === 3 ? (int) $status : 0;
+            $statusClass = match (true) {
+                $code < 100 || $code > 599 => 0,
+                $code >= 200 && $code < 300 => 1,
+                $code === 304 => 2,
+                $code === 429 => 3,
+                $code >= 500 => 4,
+                $code >= 400 => 5,
+                default => 6,
+            };
+            $retry = trim($f[2]);
+            $retryState = match (true) {
+                $retry === '' => 0,
+                \strlen($retry) <= 10 && strspn($retry, '0123456789') === \strlen($retry) => 1,
+                preg_match('/\A[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT\z/', $retry) === 1 => 2,
+                default => 3,
+            };
+            $contentType = strtolower(trim($f[3]));
+            $semi = strpos($contentType, ';');
+            $mime = trim($semi === false ? $contentType : substr($contentType, 0, $semi));
+            $type = match (true) {
+                $mime === '' => 0,
+                isset(self::W59_HTTP_FEED_XML_TYPES[$mime]) => 1,
+                $mime === 'application/json' || str_ends_with($mime, '+json') => 2,
+                $mime === 'text/html' => 3,
+                $mime === 'text/plain' => 4,
+                $mime === 'application/octet-stream' => 5,
+                default => 6,
+            };
+            $at = strpos($contentType, 'charset=');
+            if ($at === false) {
+                $charset = 0;
+            } else {
+                $value = substr($contentType, $at + 8);
+                $end = strpos($value, ';');
+                $value = trim(trim($end === false ? $value : substr($value, 0, $end)), "\"'");
+                $charset = match ($value) {
+                    'utf-8', 'utf8' => 1,
+                    'iso-8859-1', 'latin1' => 2,
+                    '' => 3,
+                    default => 4,
+                };
+            }
+            $length = trim($f[4]);
+            if ($length === '') {
+                [$lengthState, $bytes] = [0, 0];
+            } elseif (\strlen($length) <= 15 && strspn($length, '0123456789') === \strlen($length)) {
+                $bytes = (int) $length;
+                $lengthState = $bytes === 0 ? 1 : ($bytes > self::W59_HTTP_FEED_MAX_PAYLOAD ? 3 : 2);
+            } else {
+                [$lengthState, $bytes] = [4, 0];
+            }
+            $encoding = match (strtolower(trim($f[5]))) {
+                '', 'identity' => 0,
+                'gzip', 'x-gzip' => 1,
+                'deflate' => 2,
+                'br' => 3,
+                default => 4,
+            };
+            $verdict = match (true) {
+                $urlState !== 0 => 6,
+                $statusClass === 0 => 7,
+                $statusClass === 3 || $statusClass === 4 => 1,
+                $statusClass === 2 => 2,
+                $statusClass !== 1 => 3,
+                $encoding === 4 => 4,
+                $type === 3 => 5,
+                $lengthState === 3 => 8,
+                $lengthState === 1 => 9,
+                $lengthState === 4 => 10,
+                default => 0,
+            };
+            $delay = $verdict !== 1 ? 0 : match ($retryState) {
+                1 => min((int) $retry, 86400),
+                2 => 60,
+                default => $statusClass === 3 ? 60 : 5,
+            };
+            $verdicts[$verdict]++;
+            if ($verdict === 0 && $lengthState === 2) {
+                $payloadSum += $bytes;
+            }
+            $maxDelay = max($maxDelay, $delay);
+            if ($urlState === 0) {
+                $hosts[$host] = true;
+            }
+            $out[] = $urlState | $https << 3 | $query << 4 | $customPort << 5 | $statusClass << 6 | $retryState << 9 | $type << 11
+                | $charset << 14 | $lengthState << 17 | $encoding << 20 | $verdict << 23 | $delay << 27 | min(\strlen($host), 255) << 44;
+        }
+        array_push($out, ...$verdicts);
+        array_push($out, $payloadSum, $maxDelay, \count($hosts));
+
+        return $out;
+    }
+
+    /**
+     * [state (0 valid, 1 empty, 2 no `://`, 3 a scheme other than http(s), 4 a host outside W48_HOST_BYTES, empty,
+     * over 253 bytes or starting/ending with `.`/`-`, 5 a port other than 1-65535), https, query, non-default
+     * port, lower-cased host (valid URLs only)]. Userinfo up to the last `@` is dropped and the port follows
+     * the last `:`.
+     *
+     * @return array{int, int, int, int, string}
+     */
+    private static function w59HttpFeedUrl(string $url): array
+    {
+        if ($url === '') {
+            return [1, 0, 0, 0, ''];
+        }
+        $separator = strpos($url, '://');
+        if ($separator === false) {
+            return [2, 0, 0, 0, ''];
+        }
+        $scheme = strtolower(substr($url, 0, $separator));
+        $https = $scheme === 'https' ? 1 : 0;
+        if ($https === 0 && $scheme !== 'http') {
+            return [3, 0, 0, 0, ''];
+        }
+        $rest = substr($url, $separator + 3);
+        $end = strcspn($rest, '/?#');
+        $authority = substr($rest, 0, $end);
+        $at = strrpos($authority, '@');
+        if ($at !== false) {
+            $authority = substr($authority, $at + 1);
+        }
+        $colon = strrpos($authority, ':');
+        $host = $colon === false ? $authority : substr($authority, 0, $colon);
+        $length = \strlen($host);
+        if ($length === 0 || $length > 253 || strspn($host, self::W48_HOST_BYTES) !== $length || strpbrk($host[0].$host[-1], '.-') !== false) {
+            return [4, $https, 0, 0, ''];
+        }
+        $custom = 0;
+        if ($colon !== false) {
+            $port = substr($authority, $colon + 1);
+            if ($port === '' || \strlen($port) > 5 || strspn($port, '0123456789') !== \strlen($port) || (int) $port < 1 || (int) $port > 65535) {
+                return [5, $https, 0, 0, ''];
+            }
+            $custom = (int) $port !== ($https === 1 ? 443 : 80) ? 1 : 0;
+        }
+
+        return [0, $https, str_contains(substr($rest, $end), '?') ? 1 : 0, $custom, strtolower($host)];
+    }
+
+    /**
+     * Wave 59 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w59RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w593', self::W59_HTTP_FEED_SOURCE_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w59RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w59RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 59.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w59Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w59RustFfiState('ffi');
+            $out = self::w59RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w59RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W59_HTTP_FEED_SOURCE_FFI_CDEF.)
+            $written = $ffi->nntmux_w593_http_feed_response_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
         } catch (Throwable) {
             return null;
         }
