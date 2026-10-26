@@ -52772,3 +52772,1117 @@ pub mod wave65_2_additional_nzb_parser_file_manager_archive_fallback_processor_s
         }
     }
 }
+
+pub mod wave66_2_binaries_collection_header_parser_storage_tx_missed_part {
+    //! Wave 66.2 batch kernels for CollectionHandler, HeaderParser, HeaderStorageService,
+    //! HeaderStorageTransaction and MissedPartHandler in the Wave 49.2 framing: one `i64` word
+    //! per tab-separated row, a few summary words and one XXH64 digest of the preceding words
+    //! out. Every export takes one NUL-joined string column (exactly `count` rows) and returns
+    //! the word count, `-needed` when `out_cap` (in words) is short, or -1 for a null output, a
+    //! malformed batch, an output overlapping the input or a panic. Every rule is byte-level
+    //! ASCII, so the PHP twins agree under any `setlocale()`.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, span,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::io::Write;
+
+    type Set<T> = HashSet<T, FoldState>;
+    type Map<K, V> = HashMap<K, V, FoldState>;
+
+    fn set<T>(n: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    fn map<K, V>(n: usize) -> Map<K, V> {
+        HashMap::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// PHP `explode("\t", $row, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(row: &[u8]) -> [&[u8]; N] {
+        let mut out = [&row[..0]; N];
+        let mut rest = row;
+        for (k, slot) in out.iter_mut().enumerate() {
+            if k + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'\t') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// PHP `trim()` with its default character set.
+    fn trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    #[inline]
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    #[inline]
+    fn num(d: &[u8]) -> i64 {
+        d.iter()
+            .fold(0i64, |acc, &c| acc * 10 + i64::from(c - b'0'))
+    }
+
+    /// A trimmed field: `Ok(None)` when empty, `Ok(Some(n))` for 1 to `max` ASCII digits,
+    /// otherwise `Err(())` (PHP `w66Int()`: null, int or false).
+    #[inline]
+    fn int(v: &[u8], max: usize) -> Result<Option<i64>, ()> {
+        let v = trim(v);
+        if v.is_empty() {
+            return Ok(None);
+        }
+        if v.len() > max || !all_digits(v) {
+            return Err(());
+        }
+        Ok(Some(num(v)))
+    }
+
+    /// A positive value of an `int()` result, else 0.
+    #[inline]
+    fn positive(v: Result<Option<i64>, ()>) -> i64 {
+        match v {
+            Ok(Some(n)) if n > 0 => n,
+            _ => 0,
+        }
+    }
+
+    fn lower(s: &[u8]) -> Vec<u8> {
+        s.iter().map(u8::to_ascii_lowercase).collect()
+    }
+
+    /// PHP `str_contains($hay, $needle)` for a non-empty needle.
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn contains_any(hay: &[u8], needles: &[&[u8]]) -> bool {
+        needles.iter().any(|n| contains(hay, n))
+    }
+
+    /// 0 empty, false-ish; 1 yes/1/true; 2 other (case-insensitive, trimmed).
+    fn flag_state(v: &[u8]) -> i64 {
+        let v = trim(v);
+        if v.is_empty()
+            || [b"no".as_slice(), b"0", b"false"]
+                .iter()
+                .any(|t| v.eq_ignore_ascii_case(t))
+        {
+            0
+        } else if [b"yes".as_slice(), b"1", b"true"]
+            .iter()
+            .any(|t| v.eq_ignore_ascii_case(t))
+        {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Days since 1970-01-01 of a proleptic Gregorian date (year >= 1970).
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y / 400;
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    // ---- CollectionHandler -------------------------------------------------------------------
+
+    /// CollectionFileCheckStatus values in tail order.
+    const COLLECTION_STATUSES: [i64; 8] = [0, 1, 2, 3, 4, 5, 15, 16];
+
+    pub fn collection_handler_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 24);
+        let (mut actions, mut statuses) = ([0i64; 4], [0i64; 8]);
+        let (mut gibberish_rows, mut hex_rows, mut zero_rows, mut overflow_rows) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut transitioned_rows, mut malformed_rows, mut total_seen, mut total_expected) =
+            (0i64, 0i64, 0i64, 0i64);
+        let mut keys: Map<Vec<u8>, i64> = map(rows.len());
+        let mut posters: Set<Vec<u8>> = set(rows.len());
+        let mut groups: Set<i64> = set(64);
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        for (index, row) in rows.iter().enumerate() {
+            let [name, poster, group, total, seen, status] = fields::<6>(row);
+            let name = lower(trim(name));
+            let poster = lower(trim(poster));
+            let poster_empty = poster.is_empty();
+            let gid = positive(int(group, 9));
+            let (total, seen, status) = (int(total, 5), int(seen, 5), int(status, 2));
+            let st = status.ok().flatten().unwrap_or(0);
+            let known = COLLECTION_STATUSES.contains(&st);
+            let malformed = name.is_empty()
+                || gid == 0
+                || total.is_err()
+                || seen.is_err()
+                || status.is_err()
+                || !known;
+            let t = total.ok().flatten().unwrap_or(0);
+            let s = seen.ok().flatten().unwrap_or(0);
+            let (mut letters, mut vowels) = (0i64, 0i64);
+            for &b in &name {
+                if b.is_ascii_lowercase() {
+                    letters += 1;
+                    vowels += i64::from(matches!(b, b'a' | b'e' | b'i' | b'o' | b'u'));
+                }
+            }
+            let hex = name.len() >= 16
+                && name
+                    .iter()
+                    .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            let gibberish = !hex && letters >= 8 && vowels * 8 < letters;
+            let (mut action, mut next, mut leader, mut hash) = (0i64, 0i64, 0i64, 0i64);
+            let (mut zero, mut overflow, mut transitioned, mut pct) = (false, false, false, 0i64);
+            if !malformed {
+                zero = t == 0;
+                overflow = t > 0 && s > t;
+                next = if st == 4 || st == 5 {
+                    st
+                } else if zero {
+                    if st == 0 { 16 } else { st }
+                } else if s >= t && (st == 0 || st == 15) {
+                    1
+                } else {
+                    st
+                };
+                transitioned = next != st;
+                pct = if t > 0 { (s * 100 / t).min(100) } else { 0 };
+                buf.clear();
+                buf.extend_from_slice(&name);
+                buf.push(b':');
+                let _ = write!(buf, "{t}");
+                hash = i64::from(crc32(&buf)) & 0x7F_FFFF;
+                action = if st == 4 || st == 5 {
+                    3
+                } else {
+                    match keys.get(buf.as_slice()) {
+                        Some(&l) => {
+                            leader = l;
+                            2
+                        }
+                        None => {
+                            keys.insert(buf.clone(), index as i64);
+                            leader = index as i64;
+                            total_expected += t;
+                            1
+                        }
+                    }
+                };
+                if !poster_empty {
+                    posters.insert(poster);
+                }
+                groups.insert(gid);
+                total_seen += s;
+                let slot = COLLECTION_STATUSES
+                    .iter()
+                    .position(|&v| v == next)
+                    .unwrap_or(0);
+                statuses[slot] += 1;
+            }
+            actions[action as usize] += 1;
+            gibberish_rows += i64::from(gibberish);
+            hex_rows += i64::from(hex);
+            zero_rows += i64::from(zero);
+            overflow_rows += i64::from(overflow);
+            transitioned_rows += i64::from(transitioned);
+            malformed_rows += i64::from(malformed);
+            out.push(
+                action
+                    | next << 2
+                    | i64::from(transitioned) << 7
+                    | i64::from(gibberish) << 8
+                    | i64::from(hex) << 9
+                    | i64::from(zero) << 10
+                    | i64::from(overflow) << 11
+                    | pct << 12
+                    | leader.min(0xF_FFFF) << 19
+                    | hash << 39
+                    | i64::from(poster_empty) << 62,
+            );
+        }
+        out.extend(actions);
+        out.extend(statuses);
+        out.extend([
+            gibberish_rows,
+            hex_rows,
+            zero_rows,
+            overflow_rows,
+            transitioned_rows,
+            malformed_rows,
+            keys.len() as i64,
+            posters.len() as i64,
+            groups.len() as i64,
+            total_seen,
+            total_expected,
+        ]);
+        out
+    }
+
+    // ---- HeaderParser ------------------------------------------------------------------------
+
+    const MONTHS: [&[u8]; 12] = [
+        b"jan", b"feb", b"mar", b"apr", b"may", b"jun", b"jul", b"aug", b"sep", b"oct", b"nov",
+        b"dec",
+    ];
+
+    /// 0 missing, 1 Unix seconds (1 to 10 digits), 2 `[Day,] DD Mon YYYY HH:MM[:SS] [zone]`
+    /// (1970-2099, zone `+HHMM`/`-HHMM`/GMT/UTC/UT/Z), 3 invalid; with the epoch seconds.
+    fn xover_date(v: &[u8]) -> (i64, i64) {
+        let v = trim(v);
+        if v.is_empty() {
+            return (0, 0);
+        }
+        if v.len() <= 10 && all_digits(v) {
+            return (1, num(v));
+        }
+        let s = match v.iter().position(|&b| b == b',') {
+            Some(c) if c <= 4 => &v[c + 1..],
+            _ => v,
+        };
+        let mut tokens = [&s[..0]; 5];
+        let mut n = 0usize;
+        for token in s.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
+            if n == 5 {
+                return (3, 0);
+            }
+            tokens[n] = token;
+            n += 1;
+        }
+        if n < 4 {
+            return (3, 0);
+        }
+        let [day, mon, year, time, zone] = tokens;
+        if day.is_empty() || day.len() > 2 || !all_digits(day) {
+            return (3, 0);
+        }
+        let d = num(day);
+        let Some(m) = MONTHS.iter().position(|m| mon.eq_ignore_ascii_case(m)) else {
+            return (3, 0);
+        };
+        if year.len() != 4 || !all_digits(year) {
+            return (3, 0);
+        }
+        let y = num(year);
+        let digits2 = |a: &[u8]| (a.len() == 2 && all_digits(a)).then(|| num(a));
+        let (h, mi, sec) = match time.len() {
+            5 | 8 if time[2] == b':' && (time.len() == 5 || time[5] == b':') => {
+                let sec = if time.len() == 8 {
+                    digits2(&time[6..8])
+                } else {
+                    Some(0)
+                };
+                match (digits2(&time[0..2]), digits2(&time[3..5]), sec) {
+                    (Some(h), Some(mi), Some(sec)) => (h, mi, sec),
+                    _ => return (3, 0),
+                }
+            }
+            _ => return (3, 0),
+        };
+        let offset = if n == 4 {
+            0
+        } else if [b"gmt".as_slice(), b"utc", b"ut", b"z"]
+            .iter()
+            .any(|z| zone.eq_ignore_ascii_case(z))
+        {
+            0
+        } else if zone.len() == 5 && (zone[0] == b'+' || zone[0] == b'-') {
+            match (digits2(&zone[1..3]), digits2(&zone[3..5])) {
+                (Some(zh), Some(zm)) if zh <= 23 && zm <= 59 => {
+                    let o = zh * 3600 + zm * 60;
+                    if zone[0] == b'-' { -o } else { o }
+                }
+                _ => return (3, 0),
+            }
+        } else {
+            return (3, 0);
+        };
+        if !(1..=31).contains(&d) || !(1970..=2099).contains(&y) || h > 23 || mi > 59 || sec > 59 {
+            return (3, 0);
+        }
+        (
+            2,
+            days_from_civil(y, m as i64 + 1, d) * 86_400 + h * 3_600 + mi * 60 + sec - offset,
+        )
+    }
+
+    /// The last `(part/total)` of a subject, 1 to 6 digits each.
+    fn subject_part(s: &[u8]) -> Option<(i64, i64)> {
+        let open = s.iter().rposition(|&b| b == b'(')?;
+        let rest = &s[open + 1..];
+        let slash = rest.iter().position(|&b| b == b'/')?;
+        let close = rest.iter().position(|&b| b == b')')?;
+        if !(1..=6).contains(&slash) || close <= slash + 1 || close - slash - 1 > 6 {
+            return None;
+        }
+        let (a, b) = (&rest[..slash], &rest[slash + 1..close]);
+        (all_digits(a) && all_digits(b)).then(|| (num(a), num(b)))
+    }
+
+    /// 0 valid `<local@domain>`, 1 missing, 2 no angle brackets, 3 invalid.
+    fn message_id_state(mid: &[u8]) -> i64 {
+        if mid.is_empty() {
+            return 1;
+        }
+        if mid.len() < 3 || mid[0] != b'<' || mid[mid.len() - 1] != b'>' {
+            return 2;
+        }
+        let inner = &mid[1..mid.len() - 1];
+        let bad = inner
+            .iter()
+            .any(|&b| b <= 0x20 || b == 0x7F || b == b'<' || b == b'>');
+        let at = inner.iter().filter(|&&b| b == b'@').count();
+        if bad || at != 1 || inner[0] == b'@' || inner[inner.len() - 1] == b'@' {
+            3
+        } else {
+            0
+        }
+    }
+
+    /// 0 unknown, 1 under 1 KiB, 2 under 64 KiB, 3 under 1 MiB, 4 under 16 MiB, 5 larger.
+    fn byte_class(bytes: Option<i64>) -> i64 {
+        match bytes {
+            None => 0,
+            Some(b) if b < 1 << 10 => 1,
+            Some(b) if b < 1 << 16 => 2,
+            Some(b) if b < 1 << 20 => 3,
+            Some(b) if b < 1 << 24 => 4,
+            Some(_) => 5,
+        }
+    }
+
+    pub fn header_parser_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 22);
+        let (mut valid_rows, mut mid_states, mut date_states) = (0i64, [0i64; 4], [0i64; 4]);
+        let (mut yenc_rows, mut part_rows, mut dup_mid_rows, mut dup_num_rows) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut min_num, mut max_num, mut total_bytes, mut total_lines) = (0i64, 0i64, 0i64, 0i64);
+        let (mut min_epoch, mut max_epoch, mut dated) = (0i64, 0i64, false);
+        let mut mids: Set<&[u8]> = set(rows.len());
+        let mut nums: Set<i64> = set(rows.len());
+        for row in rows {
+            let [number, subject, from, date, mid, _refs, bytes, lines, xref] = fields::<9>(row);
+            let n = positive(int(number, 12));
+            let (subject, from, mid) = (trim(subject), trim(from), trim(mid));
+            let (date_state, epoch) = xover_date(date);
+            let mid_state = message_id_state(mid);
+            let (bytes, lines) = (int(bytes, 12), int(lines, 9));
+            let part = subject_part(subject);
+            let yenc =
+                subject.len() >= 4 && subject.windows(4).any(|w| w.eq_ignore_ascii_case(b"yenc"));
+            let xref_groups = trim(xref)
+                .split(|&b| b == b' ')
+                .filter(|t| !t.is_empty() && t.contains(&b':'))
+                .count() as i64;
+            let valid = n > 0
+                && !subject.is_empty()
+                && mid_state == 0
+                && bytes.is_ok()
+                && lines.is_ok()
+                && date_state != 3;
+            let dup_mid = mid_state == 0 && !mids.insert(mid);
+            let dup_num = n > 0 && !nums.insert(n);
+            if n > 0 {
+                if min_num == 0 {
+                    (min_num, max_num) = (n, n);
+                } else {
+                    min_num = min_num.min(n);
+                    max_num = max_num.max(n);
+                }
+            }
+            if date_state == 1 || date_state == 2 {
+                if dated {
+                    min_epoch = min_epoch.min(epoch);
+                    max_epoch = max_epoch.max(epoch);
+                } else {
+                    (min_epoch, max_epoch, dated) = (epoch, epoch, true);
+                }
+            }
+            if valid {
+                total_bytes += bytes.ok().flatten().unwrap_or(0);
+                total_lines += lines.ok().flatten().unwrap_or(0);
+            }
+            let (p, t) = part.unwrap_or((0, 0));
+            let mid_crc = if mid_state == 0 {
+                i64::from(crc32(mid)) & 0xFFF
+            } else {
+                0
+            };
+            valid_rows += i64::from(valid);
+            mid_states[mid_state as usize] += 1;
+            date_states[date_state as usize] += 1;
+            yenc_rows += i64::from(yenc);
+            part_rows += i64::from(part.is_some());
+            dup_mid_rows += i64::from(dup_mid);
+            dup_num_rows += i64::from(dup_num);
+            out.push(
+                i64::from(valid)
+                    | mid_state << 1
+                    | date_state << 3
+                    | i64::from(yenc) << 5
+                    | i64::from(part.is_some()) << 6
+                    | p.min(4095) << 7
+                    | t.min(4095) << 19
+                    | byte_class(bytes.ok().flatten()) << 31
+                    | i64::from(dup_mid) << 34
+                    | i64::from(dup_num) << 35
+                    | (subject.len() as i64).min(1023) << 36
+                    | i64::from(from.is_empty()) << 46
+                    | xref_groups.min(15) << 47
+                    | mid_crc << 51,
+            );
+        }
+        out.push(valid_rows);
+        out.push(rows.len() as i64 - valid_rows);
+        out.extend(mid_states);
+        out.extend(date_states);
+        out.extend([
+            yenc_rows,
+            part_rows,
+            dup_mid_rows,
+            dup_num_rows,
+            min_num,
+            max_num,
+            total_bytes,
+            total_lines,
+            min_epoch,
+            max_epoch,
+            mids.len() as i64,
+        ]);
+        out
+    }
+
+    // ---- HeaderStorageService ----------------------------------------------------------------
+
+    const STORAGE_CHUNK_PARTS: i64 = 500;
+    const STORAGE_CHUNK_BYTES: i64 = 8 << 20;
+    const STORAGE_CHUNK_COLLECTIONS: i64 = 100;
+
+    pub fn header_storage_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 15);
+        let mut actions = [0i64; 4];
+        let (mut flushes, mut pending_parts, mut pending_bytes, mut pending_colls) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut max_chunk, mut new_bytes, mut max_bin_parts) = (0i64, 0i64, 0i64);
+        let mut mids: Set<&[u8]> = set(rows.len());
+        let mut parts: Set<(&[u8], Vec<u8>, i64)> = set(rows.len());
+        let mut colls: Map<&[u8], i64> = map(rows.len());
+        let mut bins: Map<(&[u8], Vec<u8>), (i64, i64)> = map(rows.len());
+        for row in rows {
+            let [ck, bh, part, mid, bytes] = fields::<5>(row);
+            let (ck, mid) = (trim(ck), trim(mid));
+            let bh = lower(trim(bh));
+            let pn = positive(int(part, 6));
+            let bytes = int(bytes, 12);
+            let malformed =
+                ck.is_empty() || bh.is_empty() || pn == 0 || mid.is_empty() || bytes.is_err();
+            let b = bytes.ok().flatten().unwrap_or(0);
+            let (mut new_coll, mut new_bin, mut flushed, mut reason) = (false, false, false, 0i64);
+            let (mut coll_ord, mut bin_ord) = (0i64, 0i64);
+            let chunk = flushes;
+            let action = if malformed {
+                0
+            } else if !mids.insert(mid) {
+                2
+            } else if !parts.insert((ck, bh.clone(), pn)) {
+                3
+            } else {
+                let next = colls.len() as i64;
+                coll_ord = *colls.entry(ck).or_insert_with(|| {
+                    new_coll = true;
+                    next
+                });
+                let next = bins.len() as i64;
+                let entry = bins.entry((ck, bh)).or_insert_with(|| {
+                    new_bin = true;
+                    (next, 0)
+                });
+                entry.1 += 1;
+                bin_ord = entry.0;
+                max_bin_parts = max_bin_parts.max(entry.1);
+                pending_parts += 1;
+                pending_bytes += b;
+                pending_colls += i64::from(new_coll);
+                new_bytes += b;
+                reason = if pending_parts >= STORAGE_CHUNK_PARTS {
+                    1
+                } else if pending_bytes >= STORAGE_CHUNK_BYTES {
+                    2
+                } else if pending_colls >= STORAGE_CHUNK_COLLECTIONS {
+                    3
+                } else {
+                    0
+                };
+                if reason != 0 {
+                    flushed = true;
+                    flushes += 1;
+                    max_chunk = max_chunk.max(pending_parts);
+                    (pending_parts, pending_bytes, pending_colls) = (0, 0, 0);
+                }
+                1
+            };
+            actions[action as usize] += 1;
+            out.push(
+                action
+                    | i64::from(new_coll) << 2
+                    | i64::from(new_bin) << 3
+                    | i64::from(flushed) << 4
+                    | reason << 5
+                    | coll_ord.min(0xFFFF) << 7
+                    | bin_ord.min(0xFFFF) << 23
+                    | chunk.min(0xFFF) << 39
+                    | pn.min(0xFFF) << 51,
+            );
+        }
+        out.extend(actions);
+        out.extend([
+            colls.len() as i64,
+            bins.len() as i64,
+            flushes,
+            pending_parts,
+            pending_bytes,
+            pending_colls,
+            max_chunk,
+            new_bytes,
+            max_bin_parts,
+            mids.len() as i64,
+        ]);
+        out
+    }
+
+    // ---- HeaderStorageTransaction ------------------------------------------------------------
+
+    const TX_MAX_RETRIES: i64 = 10;
+    const TX_MAX_CHUNK: i64 = 500;
+    const TX_MAX_BACKOFF_MS: i64 = 5000;
+    const TX_SLOW_MS: i64 = 30_000;
+
+    /// 0 none, 1 deadlock, 2 lock wait timeout, 3 connection lost, 4 duplicate, 5 too large,
+    /// 6 foreign key, 7 other.
+    fn sql_error_class(e: &[u8]) -> i64 {
+        if e.is_empty() {
+            return 0;
+        }
+        let l = lower(e);
+        if contains_any(&l, &[b"deadlock", b"1213", b"40001"]) {
+            1
+        } else if contains_any(&l, &[b"lock wait timeout", b"1205"]) {
+            2
+        } else if contains_any(&l, &[b"gone away", b"lost connection", b"2006", b"2013"]) {
+            3
+        } else if contains_any(&l, &[b"duplicate entry", b"1062"]) {
+            4
+        } else if contains_any(&l, &[b"max_allowed_packet", b"too large", b"1153"]) {
+            5
+        } else if contains_any(&l, &[b"foreign key", b"1452"]) {
+            6
+        } else {
+            7
+        }
+    }
+
+    pub fn header_storage_tx_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 24);
+        let (mut outcomes, mut classes) = ([0i64; 6], [0i64; 8]);
+        let (mut committed, mut retried, mut split_chunks, mut total_backoff) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut max_attempt, mut total_elapsed, mut max_elapsed, mut slow_rows) =
+            (0i64, 0i64, 0i64, 0i64);
+        let (mut streak, mut max_streak) = (0i64, 0i64);
+        for row in rows {
+            let [count, error, attempt, elapsed] = fields::<4>(row);
+            let (count, attempt, elapsed) = (int(count, 9), int(attempt, 3), int(elapsed, 9));
+            let class = sql_error_class(trim(error));
+            let n = count.ok().flatten().unwrap_or(0);
+            let malformed = count.is_err() || n == 0 || attempt.is_err() || elapsed.is_err();
+            let a = attempt.ok().flatten().unwrap_or(0);
+            let ms = elapsed.ok().flatten().unwrap_or(0);
+            let retryable = (1..=3).contains(&class);
+            let outcome = if malformed {
+                5
+            } else if class == 0 {
+                0
+            } else if class == 4 {
+                4
+            } else if retryable && a < TX_MAX_RETRIES {
+                1
+            } else if (class == 5 || retryable) && n > 1 {
+                2
+            } else {
+                3
+            };
+            let backoff = if outcome == 1 {
+                ([0, 50, 200, 500][class as usize] << a.min(6)).min(TX_MAX_BACKOFF_MS)
+            } else {
+                0
+            };
+            let (chunk, chunks) = if outcome == 2 {
+                let chunk = TX_MAX_CHUNK.min((n + 1) >> 1);
+                (chunk, (n + chunk - 1) / chunk)
+            } else {
+                (0, 0)
+            };
+            let slow = ms > TX_SLOW_MS;
+            streak = if class == 1 { streak + 1 } else { 0 };
+            max_streak = max_streak.max(streak);
+            match outcome {
+                0 | 4 => committed += n,
+                1 => retried += n,
+                _ => {}
+            }
+            if !malformed {
+                max_attempt = max_attempt.max(a);
+                total_elapsed += ms;
+                max_elapsed = max_elapsed.max(ms);
+            }
+            outcomes[outcome as usize] += 1;
+            classes[class as usize] += 1;
+            split_chunks += chunks;
+            total_backoff += backoff;
+            slow_rows += i64::from(slow);
+            out.push(
+                outcome
+                    | class << 3
+                    | i64::from(retryable) << 6
+                    | a.min(255) << 7
+                    | backoff << 15
+                    | chunk << 31
+                    | chunks.min(0xF_FFFF) << 41
+                    | i64::from(slow) << 61,
+            );
+        }
+        out.extend(outcomes);
+        out.extend(classes);
+        out.extend([
+            committed,
+            retried,
+            split_chunks,
+            total_backoff,
+            max_attempt,
+            total_elapsed,
+            max_elapsed,
+            slow_rows,
+            max_streak,
+        ]);
+        out
+    }
+
+    // ---- MissedPartHandler -------------------------------------------------------------------
+
+    const MISSED_MAX_TRIES: i64 = 3;
+    const MISSED_REPAIR_LIMIT: i64 = 15_000;
+    const MISSED_REPAIR_BATCH: i64 = 100;
+
+    pub fn missed_part_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 15);
+        let mut actions = [0i64; 6];
+        let (mut ranges, mut longest, mut current, mut prev) = (0i64, 0i64, 0i64, 0i64);
+        let (mut min_num, mut max_num, mut retries, mut exhausted) = (0i64, 0i64, 0i64, 0i64);
+        let (mut ooo_rows, mut total_attempts) = (0i64, 0i64);
+        let mut seen: Set<i64> = set(rows.len());
+        for row in rows {
+            let [number, attempts, received] = fields::<3>(row);
+            let n = positive(int(number, 12));
+            let attempts = int(attempts, 3);
+            let recv = flag_state(received);
+            let malformed = n == 0 || attempts.is_err() || recv == 2;
+            let a = attempts.ok().flatten().unwrap_or(0);
+            let dup = !malformed && !seen.insert(n);
+            let (mut start, mut ooo, mut gap, mut range_ord) = (false, false, 0i64, 0i64);
+            if !malformed && !dup {
+                if ranges == 0 {
+                    (start, ranges, current) = (true, 1, 1);
+                    (min_num, max_num) = (n, n);
+                } else if n == prev + 1 {
+                    current += 1;
+                } else {
+                    start = true;
+                    ranges += 1;
+                    current = 1;
+                    if n > prev {
+                        gap = n - prev - 1;
+                    } else {
+                        ooo = true;
+                    }
+                }
+                min_num = min_num.min(n);
+                max_num = max_num.max(n);
+                longest = longest.max(current);
+                prev = n;
+                range_ord = ranges - 1;
+                total_attempts += a;
+            }
+            let (mut next, mut last, mut batch) = (0i64, false, 0i64);
+            let action = if malformed {
+                0
+            } else if dup {
+                4
+            } else if recv == 1 {
+                1
+            } else if a >= MISSED_MAX_TRIES {
+                3
+            } else if retries < MISSED_REPAIR_LIMIT {
+                next = a + 1;
+                last = next >= MISSED_MAX_TRIES;
+                batch = retries / MISSED_REPAIR_BATCH;
+                retries += 1;
+                2
+            } else {
+                5
+            };
+            actions[action as usize] += 1;
+            exhausted += i64::from(last);
+            ooo_rows += i64::from(ooo);
+            out.push(
+                action
+                    | next.min(255) << 3
+                    | i64::from(last) << 11
+                    | i64::from(start) << 12
+                    | range_ord.min(0xF_FFFF) << 13
+                    | batch.min(0x3FF) << 33
+                    | gap.min(0xFFFF) << 43
+                    | i64::from(ooo) << 59,
+            );
+        }
+        out.extend(actions);
+        out.extend([
+            ranges,
+            longest,
+            min_num,
+            max_num,
+            (retries + MISSED_REPAIR_BATCH - 1) / MISSED_REPAIR_BATCH,
+            exhausted,
+            ooo_rows,
+            total_attempts,
+        ]);
+        out
+    }
+
+    // ---- Exports -----------------------------------------------------------------------------
+
+    macro_rules! export {
+        ($name:ident, $plan:ident) => {
+            /// # Safety
+            /// `items` must be readable for `items_len` bytes and `out` writable for `out_cap`
+            /// words.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                items: *const u8,
+                items_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let inputs = [(items, items_len)];
+                unsafe {
+                    emit(out, out_cap, count, &inputs, || {
+                        Some($plan(&column(span(items, items_len)?, count)?))
+                    })
+                }
+            }
+        };
+    }
+
+    export!(
+        nntmux_w662_collection_handler_plan_batch,
+        collection_handler_plan
+    );
+    export!(nntmux_w662_header_parser_plan_batch, header_parser_plan);
+    export!(nntmux_w662_header_storage_plan_batch, header_storage_plan);
+    export!(
+        nntmux_w662_header_storage_tx_plan_batch,
+        header_storage_tx_plan
+    );
+    export!(nntmux_w662_missed_part_handler_plan_batch, missed_part_plan);
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn refs<'a>(v: &[&'a str]) -> Vec<&'a [u8]> {
+            v.iter().map(|s| s.as_bytes()).collect()
+        }
+
+        #[test]
+        fn w662_helpers_follow_php() {
+            assert_eq!(fields::<3>(b"a\tb\tc\td"), [b"a".as_slice(), b"b", b"c\td"]);
+            assert_eq!(int(b" 42 ", 3), Ok(Some(42)));
+            assert_eq!(int(b"1234", 3), Err(()));
+            assert_eq!(positive(int(b"0", 3)), 0);
+            assert_eq!(flag_state(b" TRUE "), 1);
+            assert_eq!(flag_state(b"No"), 0);
+            assert_eq!(flag_state(b"maybe"), 2);
+            assert_eq!(xover_date(b""), (0, 0));
+            assert_eq!(xover_date(b"1700000000"), (1, 1_700_000_000));
+            assert_eq!(
+                xover_date(b"Sat, 01 Jan 2022 10:20:30 +0100"),
+                (2, 1_641_028_830)
+            );
+            assert_eq!(
+                xover_date(b"Tue, 29 Feb 2000 23:59:59 -0530"),
+                (2, 951_888_599)
+            );
+            assert_eq!(xover_date(b"1 jan 1970 00:00"), (2, 0));
+            assert_eq!(xover_date(b"01 Jan 2022 10:20:30 +0100 (UTC)"), (3, 0));
+            assert_eq!(xover_date(b"32 Jan 2022 10:20:30"), (3, 0));
+            assert_eq!(xover_date(b"01 Jan 2022 10:20:30 +0160"), (3, 0));
+            assert_eq!(xover_date(b"01 Jan 2022 10:20:30 EST"), (3, 0));
+            assert_eq!(subject_part(b"a (3/40)"), Some((3, 40)));
+            assert_eq!(subject_part(b"a (/40)"), None);
+            assert_eq!(subject_part(b"a (1/1234567)"), None);
+            assert_eq!(message_id_state(b"<a@b>"), 0);
+            assert_eq!(message_id_state(b""), 1);
+            assert_eq!(message_id_state(b"a@b"), 2);
+            assert_eq!(message_id_state(b"<a b@c>"), 3);
+            assert_eq!(message_id_state(b"<a@b@c>"), 3);
+            assert_eq!(message_id_state(b"<@b>"), 3);
+            assert_eq!(byte_class(Some(65_535)), 2);
+            assert_eq!(sql_error_class(b"SQLSTATE[40001]: Deadlock found"), 1);
+            assert_eq!(sql_error_class(b"Lock wait timeout exceeded"), 2);
+            assert_eq!(sql_error_class(b"MySQL server has gone away"), 3);
+            assert_eq!(sql_error_class(b"Duplicate entry deadlock"), 1);
+            assert_eq!(sql_error_class(b"Unknown column"), 7);
+        }
+
+        #[test]
+        fn w662_collection_rows_plan_upserts() {
+            let words = collection_handler_plan(&refs(&[
+                "Movie Name\tposter@x\t5\t10\t10\t0",
+                "movie name\tPoster@X\t5\t10\t3\t\t",
+                "abcdef0123456789abcdef\t\t1\t0\t0\t",
+                "xzqrtplkmnbv\tp\t1\t5\t6\t15",
+                "bad\tp\t0\t1\t1\t1",
+                "x\tp\t1\t1\t1\t7",
+                "y\tp\t2\t3\t1\t4",
+            ]));
+            let low = |w: i64| w & ((1 << 39) - 1);
+            assert_eq!(low(words[0]), 1 | 1 << 2 | 1 << 7 | 100 << 12);
+            assert_eq!(low(words[1]), 2 | 30 << 12);
+            assert_eq!(
+                low(words[2]),
+                1 | 16 << 2 | 1 << 7 | 1 << 9 | 1 << 10 | 2 << 19
+            );
+            assert_eq!(
+                low(words[3]),
+                1 | 1 << 2 | 1 << 7 | 1 << 8 | 1 << 11 | 100 << 12 | 3 << 19
+            );
+            assert_eq!(low(words[6]), 3 | 4 << 2 | 33 << 12);
+            assert_eq!(
+                words[0] >> 39,
+                i64::from(crc32(b"movie name:10")) & 0x7F_FFFF
+            );
+            assert_eq!(words[2] >> 62 & 1, 1);
+            assert_eq!(
+                words[7..30],
+                [
+                    2, 3, 1, 1, 1, 2, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 3, 2, 3, 2, 3, 20, 15
+                ]
+            );
+        }
+
+        #[test]
+        fn w662_header_rows_parse_xover() {
+            let words = header_parser_plan(&refs(&[
+                "100\tMovie [1/5] - \"a.rar\" yEnc (3/40)\tposter <a@b>\tSat, 01 Jan 2022 10:20:30 +0100\t<abc@def>\t\t123456\t1000\tnews a.b.c:100 a.b.d:200",
+                "101\tx\t\t1700000000\t<abc@def>\t\t5\t1\t",
+                "0\t\t\tbad\tnope\t\tx\t\t",
+                "102\ts (1/2)\tf\t1 jan 1970 00:00\t<a@b>\t\t\t\t",
+            ]));
+            let low = |w: i64| w & ((1 << 51) - 1);
+            assert_eq!(
+                low(words[0]),
+                1 | 2 << 3 | 1 << 5 | 1 << 6 | 3 << 7 | 40 << 19 | 3 << 31 | 33 << 36 | 2 << 47
+            );
+            assert_eq!(
+                low(words[1]),
+                1 | 1 << 3 | 1 << 31 | 1 << 34 | 1 << 36 | 1 << 46
+            );
+            assert_eq!(low(words[2]), 2 << 1 | 3 << 3 | 1 << 46);
+            assert_eq!(
+                low(words[3]),
+                1 | 2 << 3 | 1 << 6 | 1 << 7 | 2 << 19 | 7 << 36
+            );
+            assert_eq!(words[0] >> 51, i64::from(crc32(b"<abc@def>")) & 0xFFF);
+            assert_eq!(
+                words[4..25],
+                [
+                    3, 1, 3, 0, 1, 0, 0, 1, 2, 1, 1, 2, 1, 0, 100, 102, 123461, 1001, 0,
+                    1700000000, 2
+                ]
+            );
+        }
+
+        #[test]
+        fn w662_storage_rows_dedup_and_flush() {
+            let words = header_storage_plan(&refs(&[
+                "c1\tABC\t1\t<m1>\t100",
+                "c1\tabc\t1\t<m2>\t100",
+                "c1\tabc\t2\t<m1>\t1",
+                "c2\tdef\t1\t<m3>\t9000000",
+                "\tx\t1\t<m4>\t1",
+            ]));
+            assert_eq!(words[0], 1 | 1 << 2 | 1 << 3 | 1 << 51);
+            assert_eq!(words[1], 3 | 1 << 51);
+            assert_eq!(words[2], 2 | 2 << 51);
+            assert_eq!(
+                words[3],
+                1 | 1 << 2 | 1 << 3 | 1 << 4 | 2 << 5 | 1 << 7 | 1 << 23 | 1 << 51
+            );
+            assert_eq!(words[4], 1 << 39 | 1 << 51);
+            assert_eq!(
+                words[5..19],
+                [1, 2, 1, 1, 2, 2, 1, 0, 0, 0, 2, 9000100, 1, 3]
+            );
+            let rows: Vec<String> = (1..=501).map(|i| format!("c\tb\t{i}\t<m{i}>\t1")).collect();
+            let words = header_storage_plan(&rows.iter().map(|r| r.as_bytes()).collect::<Vec<_>>());
+            assert_eq!((words[499] >> 4 & 1, words[499] >> 5 & 3), (1, 1));
+            assert_eq!(words[500] >> 39 & 0xFFF, 1);
+        }
+
+        #[test]
+        fn w662_tx_rows_classify_outcomes() {
+            let words = header_storage_tx_plan(&refs(&[
+                "500\t\t0\t10",
+                "500\tSQLSTATE[40001]: Deadlock found\t2\t100",
+                "1000\tGot a packet bigger than 'max_allowed_packet'\t0\t5",
+                "1\tdeadlock\t10\t1",
+                "3\tDuplicate entry\t0\t40000",
+                "x\t\t\t",
+            ]));
+            assert_eq!(words[0], 0);
+            assert_eq!(words[1], 1 | 1 << 3 | 1 << 6 | 2 << 7 | 200 << 15);
+            assert_eq!(words[2], 2 | 5 << 3 | 500 << 31 | 2 << 41);
+            assert_eq!(words[3], 3 | 1 << 3 | 1 << 6 | 10 << 7);
+            assert_eq!(words[4], 4 | 4 << 3 | 1 << 61);
+            assert_eq!(words[5], 5);
+            assert_eq!(
+                words[6..29],
+                [
+                    1, 1, 1, 1, 1, 1, 2, 2, 0, 0, 1, 1, 0, 0, 503, 500, 2, 200, 10, 40116, 40000,
+                    1, 1
+                ]
+            );
+        }
+
+        #[test]
+        fn w662_missed_rows_track_ranges_and_batches() {
+            let words = missed_part_plan(&refs(&[
+                "100\t0\t",
+                "101\t1\tno",
+                "102\t3\t",
+                "105\t2\tyes",
+                "103\t0\t",
+                "103\t0\t",
+                "x\t\t",
+                "7\t0\tmaybe",
+            ]));
+            assert_eq!(
+                words[..8],
+                [
+                    2 | 1 << 3 | 1 << 12,
+                    2 | 2 << 3,
+                    3,
+                    1 | 1 << 12 | 1 << 13 | 2 << 43,
+                    2 | 1 << 3 | 1 << 12 | 2 << 13 | 1 << 59,
+                    4,
+                    0,
+                    0
+                ]
+            );
+            assert_eq!(words[8..22], [2, 1, 3, 1, 1, 0, 3, 3, 100, 105, 1, 0, 1, 6]);
+            let rows: Vec<String> = (1..=15_002).map(|i| format!("{i}\t2\t")).collect();
+            let words = missed_part_plan(&rows.iter().map(|r| r.as_bytes()).collect::<Vec<_>>());
+            assert_eq!(words[14_999] >> 33 & 0x3FF, 149);
+            assert_eq!(words[15_000] & 7, 5);
+            assert_eq!(
+                words[15_002..15_016],
+                [
+                    0, 0, 15_000, 0, 0, 2, 1, 15_002, 1, 15_002, 150, 15_000, 0, 30_004
+                ]
+            );
+        }
+
+        #[test]
+        fn w662_exports_guard_null_short_and_malformed_batches() {
+            let mut out = [0i64; 64];
+            let o = out.as_mut_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w662_collection_handler_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    25
+                );
+                assert_eq!(
+                    nntmux_w662_collection_handler_plan_batch(b"a".as_ptr(), 1, 1, o, 24),
+                    -25
+                );
+                assert_eq!(
+                    nntmux_w662_header_parser_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w662_header_storage_plan_batch(std::ptr::null(), 0, 0, o, 64),
+                    15
+                );
+                assert_eq!(
+                    nntmux_w662_header_storage_tx_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        64
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w662_missed_part_handler_plan_batch(std::ptr::null(), 1, 1, o, 64),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w662_header_parser_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    23
+                );
+                assert_eq!(
+                    nntmux_w662_header_storage_tx_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    25
+                );
+                assert_eq!(
+                    nntmux_w662_missed_part_handler_plan_batch(b"a".as_ptr(), 1, 1, o, 64),
+                    16
+                );
+                // An output buffer overlapping the input is refused.
+                let mut shared = [0u8; 512];
+                let p = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w662_missed_part_handler_plan_batch(p, 1, 1, p as *mut i64, 64),
+                    -1
+                );
+                // Unaligned outputs are written byte-wise.
+                let mut raw = [0u8; 8 * 30];
+                let unaligned = raw.as_mut_ptr().add(1) as *mut i64;
+                assert_eq!(
+                    nntmux_w662_header_storage_plan_batch(b"a".as_ptr(), 1, 1, unaligned, 16),
+                    16
+                );
+            }
+        }
+    }
+}
