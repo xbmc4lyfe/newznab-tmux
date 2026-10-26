@@ -1230,4 +1230,354 @@ class TmuxLayoutBuilder
 
         return true;
     }
+
+    // ========================================================================
+    // WAVE 58.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean 8.29x, p99 10.67x; uncommon mean 15.40x, p99 15.60x); see RustTmuxLayoutMonitorOutputPaneSessionManagerW58ParityTest. */
+    public const bool W58_RUST_FFI_DEFAULT = true;
+
+    public const string W58_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w58_layout_plan_row_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** int64 words per layoutPlanRowBatch() record. */
+    public const int W58_ROW_WORDS = 11;
+
+    /** int64 summary words after the layoutPlanRowBatch() records (none for an empty batch). */
+    public const int W58_TRAILER_WORDS = 4;
+
+    /**
+     * Layout rows for tmux window_layout strings ("csum,WxH,X,Y" cells ending in ",ID" for a
+     * pane, "{cells}" for a left-right split or "[cells]" for a top-bottom split; numbers are
+     * 1-9 ASCII digits, nesting stops at depth 64) checked against the planCoreLayoutStepsPhp()
+     * pane count of their window. Each item is [layout, sequential mode, window index] and yields
+     * [status (-1 malformed, 0 valid, 1 checksum mismatch), width, height, panes, max pane depth,
+     * left-right splits, top-bottom splits, min pane area, shape (0 single, 1 left-right, 2
+     * top-bottom, 3 mixed; -1 malformed), expected panes, flags (1 pane count matches, 2
+     * checksum, 4 increasing pane IDs, 8 children tile their parent, 16 root at the origin)],
+     * followed by the trailer [valid, checksum ok, matching expected, total panes].
+     *
+     * @param  list<array{0: string, 1: int, 2: int}>  $items
+     * @return list<int>
+     */
+    public static function layoutPlanRowBatch(array $items): array
+    {
+        return self::usesW58RustFfi() ? self::layoutPlanRowBatchNative($items) : self::layoutPlanRowBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: int, 2: int}>  $items
+     * @return list<int>
+     */
+    public static function layoutPlanRowBatchPhp(array $items): array
+    {
+        self::w58Items($items);
+        $out = [];
+        $summary = [0, 0, 0, 0];
+        foreach ($items as [$layout, $mode, $window]) {
+            $expected = self::w58ExpectedPanes($mode, $window);
+            $parsed = self::w58ParseLayout($layout);
+            if ($parsed === null) {
+                array_push($out, -1, 0, 0, 0, 0, 0, 0, 0, -1, $expected, 0);
+
+                continue;
+            }
+            [$root, $stats, $checksum] = $parsed;
+            $matches = $stats['panes'] === $expected;
+            array_push(
+                $out,
+                $checksum ? 0 : 1,
+                $root[0],
+                $root[1],
+                $stats['panes'],
+                $stats['depth'],
+                $stats['h'],
+                $stats['v'],
+                $stats['min'],
+                ($stats['h'] > 0 ? 1 : 0) | ($stats['v'] > 0 ? 2 : 0),
+                $expected,
+                ($matches ? 1 : 0) | ($checksum ? 2 : 0) | ($stats['increasing'] ? 4 : 0) | ($stats['geometry'] ? 8 : 0)
+                    | ($root[2] === 0 && $root[3] === 0 ? 16 : 0),
+            );
+            $summary[0]++;
+            $summary[1] += $checksum ? 1 : 0;
+            $summary[2] += $matches ? 1 : 0;
+            $summary[3] += $stats['panes'];
+        }
+
+        return $items === [] ? [] : [...$out, ...$summary];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: int, 2: int}>  $items
+     * @return list<int>
+     */
+    public static function layoutPlanRowBatchNative(array $items): array
+    {
+        self::w58Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        $blob = '';
+        $lens = [];
+        $modes = [];
+        $windows = [];
+        foreach ($items as [$layout, $mode, $window]) {
+            $blob .= $layout;
+            $lens[] = \strlen($layout);
+            $modes[] = $mode;
+            $windows[] = $window;
+        }
+
+        return self::w58Call($blob, pack('P*', ...$lens, ...$modes, ...$windows), $count, $count * self::W58_ROW_WORDS + self::W58_TRAILER_WORDS)
+            ?? self::layoutPlanRowBatchPhp($items);
+    }
+
+    /** Panes planCoreLayoutStepsPhp() puts in a window; unknown modes plan as Full. */
+    private static function w58ExpectedPanes(int $mode, int $window): int
+    {
+        /** @var array<int, array<int, int>>|null $counts */
+        static $counts = null;
+        if ($counts === null) {
+            $counts = [];
+            foreach (TmuxMode::cases() as $case) {
+                foreach (self::planCoreLayoutStepsPhp($case->value) as $step) {
+                    $counts[$case->value][$step['window']] = ($counts[$case->value][$step['window']] ?? 0) + 1;
+                }
+            }
+        }
+
+        return $counts[(TmuxMode::tryFrom($mode) ?? TmuxMode::Full)->value][$window] ?? 0;
+    }
+
+    /**
+     * @return array{0: array{0: int, 1: int, 2: int, 3: int}, 1: array{panes: int, depth: int, h: int, v: int, min: int, last: int, increasing: bool, geometry: bool}, 2: bool}|null
+     */
+    private static function w58ParseLayout(string $layout): ?array
+    {
+        $length = \strlen($layout);
+        if ($length < 6 || $layout[4] !== ',' || strspn($layout, '0123456789abcdefABCDEF', 0, 4) !== 4) {
+            return null;
+        }
+        $stats = ['panes' => 0, 'depth' => 0, 'h' => 0, 'v' => 0, 'min' => PHP_INT_MAX, 'last' => -1, 'increasing' => true, 'geometry' => true];
+        $pos = 5;
+        $root = self::w58LayoutCell($layout, $pos, 0, $stats);
+        if ($root === null || $pos !== $length) {
+            return null;
+        }
+        // tmux layout_checksum() over the body after "csum,".
+        $sum = 0;
+        for ($i = 5; $i < $length; $i++) {
+            $sum = (($sum >> 1) + (($sum & 1) << 15) + \ord($layout[$i])) & 0xFFFF;
+        }
+
+        return [$root, $stats, hexdec(substr($layout, 0, 4)) === $sum];
+    }
+
+    /**
+     * @param  array{panes: int, depth: int, h: int, v: int, min: int, last: int, increasing: bool, geometry: bool}  $stats
+     * @return array{0: int, 1: int, 2: int, 3: int}|null [width, height, x, y]
+     */
+    private static function w58LayoutCell(string $s, int &$pos, int $depth, array &$stats): ?array
+    {
+        if ($depth > 64) {
+            return null;
+        }
+        $w = self::w58Digits($s, $pos);
+        if ($w === null || ($s[$pos] ?? '') !== 'x') {
+            return null;
+        }
+        $pos++;
+        $h = self::w58Digits($s, $pos);
+        if ($h === null || ($s[$pos] ?? '') !== ',') {
+            return null;
+        }
+        $pos++;
+        $x = self::w58Digits($s, $pos);
+        if ($x === null || ($s[$pos] ?? '') !== ',') {
+            return null;
+        }
+        $pos++;
+        $y = self::w58Digits($s, $pos);
+        $open = $s[$pos] ?? '';
+        if ($y === null || $open === '') {
+            return null;
+        }
+        $pos++;
+        if ($open === ',') {
+            $id = self::w58Digits($s, $pos);
+            if ($id === null) {
+                return null;
+            }
+            $stats['panes']++;
+            $stats['depth'] = max($stats['depth'], $depth);
+            $stats['min'] = min($stats['min'], $w * $h);
+            if ($id <= $stats['last']) {
+                $stats['increasing'] = false;
+            }
+            $stats['last'] = $id;
+
+            return [$w, $h, $x, $y];
+        }
+        if ($open !== '{' && $open !== '[') {
+            return null;
+        }
+        $horizontal = $open === '{';
+        $close = $horizontal ? '}' : ']';
+        $prev = null;
+        while (true) {
+            $c = self::w58LayoutCell($s, $pos, $depth + 1, $stats);
+            if ($c === null) {
+                return null;
+            }
+            $tiles = $horizontal
+                ? $c[1] === $h && $c[3] === $y && ($prev === null ? $c[2] === $x : $c[2] === $prev[2] + $prev[0] + 1)
+                : $c[0] === $w && $c[2] === $x && ($prev === null ? $c[3] === $y : $c[3] === $prev[3] + $prev[1] + 1);
+            if (! $tiles) {
+                $stats['geometry'] = false;
+            }
+            $prev = $c;
+            $next = $s[$pos] ?? '';
+            if ($next === '') {
+                return null;
+            }
+            $pos++;
+            if ($next === $close) {
+                break;
+            }
+            if ($next !== ',') {
+                return null;
+            }
+        }
+        if ($horizontal ? $x + $w !== $prev[2] + $prev[0] : $y + $h !== $prev[3] + $prev[1]) {
+            $stats['geometry'] = false;
+        }
+        if ($horizontal) {
+            $stats['h']++;
+        } else {
+            $stats['v']++;
+        }
+
+        return [$w, $h, $x, $y];
+    }
+
+    /** 1-9 ASCII digits at $pos, advancing it. */
+    private static function w58Digits(string $s, int &$pos): ?int
+    {
+        $n = strspn($s, '0123456789', $pos, 9);
+        if ($n === 0) {
+            return null;
+        }
+        $value = (int) substr($s, $pos, $n);
+        $pos += $n;
+
+        return $value;
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        $enabled = self::w58RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W58 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('enabled');
+        self::w58RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('enabled', $previous);
+        }
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w58Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new \InvalidArgumentException('W58 layout batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || ! array_is_list($item) || \count($item) !== 3 || ! \is_string($item[0]) || ! \is_int($item[1]) || ! \is_int($item[2])) {
+                throw new \InvalidArgumentException('W58 layout batch items must be [string layout, int mode, int window] lists.');
+            }
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w58Call(string $blob, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w58RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w58', self::W58_FFI_CDEF) ?? false;
+            self::w58RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w58RustFfiState('out', $out);
+                self::w58RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W58_FFI_CDEF.)
+            $written = $ffi->nntmux_w58_layout_plan_row_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w58RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W58 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static: no arguments returns the state, one argument reads a key ('reset'
+     * clears everything) and two arguments write a key.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
+    }
 }
