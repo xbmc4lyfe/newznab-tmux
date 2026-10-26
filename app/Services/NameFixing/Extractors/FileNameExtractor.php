@@ -365,4 +365,223 @@ class FileNameExtractor
 
         return null;
     }
+
+    // ---- Wave 58.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 4.06x/3.67x, uncommon 3.64x/3.59x); see RustConstrainedPredbFileNameNfoObfuscatedNameCheckerW58ParityTest. */
+    private const bool W58_RUST_FFI_DEFAULT = true;
+
+    private const string W58_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w58_filename_candidate_plan_batch(const char *names, size_t names_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 58 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w58', self::W58_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w58RustFfiState('ffi');
+                    $buffer = $resolved instanceof \FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        $enabled = self::w58RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planFileNameBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w58Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w58Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', \FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /** Leftmost archive suffix of the lowercased basename; group 1 marks part/volume suffixes. */
+    private const string W58_ARCHIVE = '/\.(?:(part[0-9]{1,4}\.rar|vol[0-9]{1,4}[+-][0-9]{1,4}\.par2|7z\.[0-9]{3}|r[0-9]{2,3}|z[0-9]{2}|[0-9]{3})|rar|zip|7z|par2|sfv|nzb)\z/';
+
+    private const array W58_MEDIA = ['mkv' => true, 'mp4' => true, 'avi' => true, 'm4v' => true, 'ts' => true, 'm2ts' => true,
+        'iso' => true, 'nfo' => true, 'srt' => true, 'idx' => true, 'sub' => true];
+
+    private const array W58_JUNK = ['sample' => true, 'proof' => true, 'subs' => true, 'thumbs' => true, 'screens' => true,
+        'cover' => true, 'extras' => true];
+
+    private const string W58_ALNUM = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+    /**
+     * Batch plan over inner archive filenames. The basename (after the last `/` or `\`) loses
+     * its leftmost archive suffix (flag 1; flag 16 for `.partN.rar`, `.volN+N.par2`, `.7z.NNN`,
+     * `.rNN`, `.zNN` and `.NNN` parts) and then one media extension (flag 2); `_` and spaces
+     * become dots, dot runs collapse and dots/dashes are trimmed (flag 64 when that changed the
+     * stem). Flag 4: a junk token (sample, proof, subs, thumbs, screens, cover, extras); 8
+     * generic (under 8 bytes, only hex digits, or fewer than two `[a-z0-9]` tokens); 32 a
+     * scene-shaped candidate (neither, with a `-GROUP` of 2-15 alphanumerics after offset 0).
+     * Per filename `flags | min(len, 0xFFFFFF) << 8 | crc32(candidate) << 32`; then the scene,
+     * junk, generic and archive counts, the distinct scene candidates and the XXH64 digest of
+     * all earlier words.
+     *
+     * @param  list<string>  $filenames
+     * @return list<int>
+     */
+    public static function planFileNameBatch(array $filenames): array
+    {
+        return self::usesW58RustFfi() ? self::planFileNameBatchNative($filenames) : self::planFileNameBatchPhp($filenames);
+    }
+
+    /**
+     * @param  list<string>  $filenames
+     * @return list<int>
+     */
+    public static function planFileNameBatchPhp(array $filenames): array
+    {
+        $out = $seen = [];
+        $scene = $junk = $generic = $archive = 0;
+        foreach ($filenames as $filename) {
+            $filename = (string) $filename;
+            $base = substr($filename, \strlen($filename) - strcspn(strrev($filename), '/\\'));
+            $lower = strtolower($base);
+            $flags = 0;
+            $cut = \strlen($base);
+            if (preg_match(self::W58_ARCHIVE, $lower, $m, PREG_OFFSET_CAPTURE) === 1) {
+                $cut = $m[0][1];
+                $flags |= isset($m[1]) && $m[1][1] >= 0 ? 17 : 1;
+            }
+            $dot = strrpos(substr($lower, 0, $cut), '.');
+            if ($dot !== false && isset(self::W58_MEDIA[substr($lower, $dot + 1, $cut - $dot - 1)])) {
+                $cut = $dot;
+                $flags |= 2;
+            }
+            $stem = substr($base, 0, $cut);
+            $candidate = trim((string) preg_replace('/\.{2,}/', '.', strtr($stem, '_ ', '..')), '.-');
+            if ($candidate !== $stem) {
+                $flags |= 64;
+            }
+            $candidateLower = strtolower($candidate);
+            $tokens = preg_split('/[^a-z0-9]+/', $candidateLower, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $isJunk = false;
+            foreach ($tokens as $token) {
+                if (isset(self::W58_JUNK[$token])) {
+                    $isJunk = true;
+                    break;
+                }
+            }
+            $length = \strlen($candidate);
+            $isGeneric = $length < 8 || strspn($candidateLower, '0123456789abcdef') === $length || \count($tokens) < 2;
+            if ($isJunk) {
+                $flags |= 4;
+                $junk++;
+            }
+            if ($isGeneric) {
+                $flags |= 8;
+                $generic++;
+            }
+            $p = strrpos($candidate, '-');
+            if (! $isJunk && ! $isGeneric && $p !== false && $p > 0 && ($g = $length - $p - 1) >= 2 && $g <= 15
+                && strspn($candidate, self::W58_ALNUM, $p + 1) === $g) {
+                $flags |= 32;
+                $scene++;
+                $seen[$candidate] = true;
+            }
+            $archive += $flags & 1;
+            $out[] = $flags | min($length, 0xFFFFFF) << 8 | crc32($candidate) << 32;
+        }
+        array_push($out, $scene, $junk, $generic, $archive, \count($seen));
+        $out[] = self::w58Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a filename holds a NUL byte or
+     * the column is not a list.
+     *
+     * @param  list<string>  $filenames
+     * @return list<int>
+     */
+    public static function planFileNameBatchNative(array $filenames): array
+    {
+        $count = \count($filenames);
+        $words = $count + 6;
+        /** @var array{\FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w58RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($filenames)) {
+            return self::planFileNameBatchPhp($filenames);
+        }
+        $blob = implode("\0", $filenames);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W58_FFI_CDEF.)
+            $written = $ffi->nntmux_w58_filename_candidate_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+
+        return self::w58Words($written, $out, $words) ?? self::planFileNameBatchPhp($filenames);
+    }
 }
