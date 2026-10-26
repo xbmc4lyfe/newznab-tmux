@@ -725,4 +725,315 @@ final class ImageCandidate
 
         return $values === false ? null : array_values($values);
     }
+
+    // ========================================================================
+    // WAVE 64.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 6.21x, p99 4.44x; uncommon mean 5.48x, p99 4.43x); see RustAdditionalDownloadMetricsArchiveImageMappedNzbSourceHintsW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    public const string W64_IMAGE_CANDIDATE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w643_image_candidate_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 64.3 batch. */
+    public const int W64_IMAGE_CANDIDATE_TRAILER = 16;
+
+    /** Cap for the Wave 64.3 running totals. */
+    private const int W64_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /** Lower-cased extension => format (1 JPEG, 2 PNG, 3 GIF, 4 WebP, 5 BMP). */
+    private const array W64_IMAGE_EXTENSIONS = ['jpg' => 1, 'jpeg' => 1, 'png' => 2, 'gif' => 3, 'webp' => 4, 'bmp' => 5];
+
+    private const array W64_COVER_WORDS = ['cover' => true, 'front' => true, 'poster' => true, 'folder' => true];
+
+    private const array W64_SAMPLE_WORDS = ['sample' => true, 'screen' => true, 'screens' => true, 'screenshot' => true, 'thumb' => true, 'proof' => true, 'back' => true];
+
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restores W64_RUST_FFI_DEFAULT and drops the cached library handle and scratch buffers. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $override = self::w64RustFfiState();
+
+        return \is_bool($override) ? $override : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the ImageCandidate Wave 64 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 64.3 image candidate format, dimension, byte size, aspect ratio and cover/sample priority plans. Each item is
+     * `name|width|height|bytes|head`, where the head (the rest of the item, raw bytes) is the image's first bytes. The
+     * extension format of the trimmed name is 1 jpg/jpeg, 2 png, 3 gif, 4 webp, 5 bmp (any case), else 0; the head format
+     * is 0 empty, 1 JPEG, 2 PNG, 3 GIF87a/89a, 4 RIFF....WEBP, 5 BM, 6 other. The format is the head's when known, the
+     * extension's without a head, else 0; the match is 0 without a head, 2 for an unknown head or a different known
+     * extension, else 1. Width and height (up to 6 digits) and bytes (up to 12) are 0 empty, 1 trimmed digits, 2 other;
+     * dimensions are valid when both are positive, the aspect is width * 1000 / height (capped at 65535). The role is 1
+     * when a lower-cased `[a-z0-9]+` name token is cover/front/poster/folder, else 2 for sample/screen/screens/screenshot/
+     * thumb/proof/back, else 0; tiny is valid bytes under 10240 or valid dimensions whose larger side is under 100. The
+     * score is 40 for a format + 30 cover + 20 when the smaller side is 300+ + 10 for an aspect of 600-800 + 10 for a match
+     * - 20 sample - 15 tiny - 25 for a mismatch, clamped to 0-127. Per item `extensionFormat | headFormat << 3 | format <<
+     * 6 | match << 9 | widthState << 11 | heightState << 13 | bytesState << 15 | role << 17 | tiny << 19 | score << 20 |
+     * aspect << 27 | min(tokens, 255) << 43 | min(nameLength, 255) << 51`. Then the six format counts, the three role
+     * counts, the tiny count, the 1-based index of the first strictly best positive cover score, of the first strictly
+     * best positive score and that score, the byte total (capped at 2^62), the distinct names (case-insensitive) and the
+     * items with valid dimensions.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64ImageCandidatePlanBatch(array $items): array
+    {
+        return self::usesW64RustFfi() ? self::w64ImageCandidatePlanBatchNative($items) : self::w64ImageCandidatePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64ImageCandidatePlanBatchNative(array $items): array
+    {
+        return self::w64Invoke($items, \count($items) + self::W64_IMAGE_CANDIDATE_TRAILER) ?? self::w64ImageCandidatePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64ImageCandidatePlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $formats = [0, 0, 0, 0, 0, 0];
+        $roles = [0, 0, 0];
+        $tinyCount = $cover = $coverScore = $best = $bestScore = $bytesSum = $sized = $index = 0;
+        $names = [];
+        foreach ($items as $item) {
+            $index++;
+            [$rawName, $rawWidth, $rawHeight, $rawBytes, $head] = explode('|', (string) $item, 5) + ['', '', '', '', ''];
+            $name = trim($rawName);
+            $lower = strtolower($name);
+            $dot = strrpos($lower, '.');
+            $extensionFormat = $dot === false ? 0 : (self::W64_IMAGE_EXTENSIONS[substr($lower, $dot + 1)] ?? 0);
+            $headFormat = self::w64ImageSignature($head);
+            $format = $headFormat >= 1 && $headFormat <= 5 ? $headFormat : ($headFormat === 0 ? $extensionFormat : 0);
+            $match = $headFormat === 0 ? 0 : ($headFormat !== 6 && ($extensionFormat === 0 || $extensionFormat === $headFormat) ? 1 : 2);
+            [$widthState, $width] = self::w64Count($rawWidth, 6);
+            [$heightState, $height] = self::w64Count($rawHeight, 6);
+            [$bytesState, $bytes] = self::w64Count($rawBytes, 12);
+            $dims = $widthState === 1 && $heightState === 1 && $width > 0 && $height > 0;
+            $aspect = $dims ? min(intdiv($width * 1000, $height), 65_535) : 0;
+            $tokens = preg_split('/[^a-z0-9]+/', $lower, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $isCover = $isSample = false;
+            foreach ($tokens as $token) {
+                $isCover = $isCover || isset(self::W64_COVER_WORDS[$token]);
+                $isSample = $isSample || isset(self::W64_SAMPLE_WORDS[$token]);
+            }
+            $role = $isCover ? 1 : ($isSample ? 2 : 0);
+            $tiny = ($bytesState === 1 && $bytes < 10_240) || ($dims && max($width, $height) < 100);
+            $score = max(0, min(127, ($format !== 0 ? 40 : 0) + ($role === 1 ? 30 : 0) + ($dims && min($width, $height) >= 300 ? 20 : 0)
+                + ($aspect >= 600 && $aspect <= 800 ? 10 : 0) + ($match === 1 ? 10 : 0) - ($role === 2 ? 20 : 0) - ($tiny ? 15 : 0)
+                - ($match === 2 ? 25 : 0)));
+            $formats[$format]++;
+            $roles[$role]++;
+            $tinyCount += $tiny ? 1 : 0;
+            if ($role === 1 && $score > $coverScore) {
+                $cover = $index;
+                $coverScore = $score;
+            }
+            if ($score > $bestScore) {
+                $best = $index;
+                $bestScore = $score;
+            }
+            $bytesSum = min($bytesSum + $bytes, self::W64_TOTAL_CAP);
+            $sized += $dims ? 1 : 0;
+            if ($name !== '') {
+                $names[$lower] = true;
+            }
+            $out[] = $extensionFormat | $headFormat << 3 | $format << 6 | $match << 9 | $widthState << 11 | $heightState << 13
+                | $bytesState << 15 | $role << 17 | ($tiny ? 1 : 0) << 19 | $score << 20 | $aspect << 27
+                | min(\count($tokens), 255) << 43 | min(\strlen($name), 255) << 51;
+        }
+        array_push($out, ...$formats, ...$roles);
+        array_push($out, $tinyCount, $cover, $best, $bestScore, $bytesSum, \count($names), $sized);
+
+        return $out;
+    }
+
+    /** 0 empty, 1 JPEG, 2 PNG, 3 GIF, 4 WebP, 5 BMP, 6 other. */
+    private static function w64ImageSignature(string $head): int
+    {
+        return match (true) {
+            $head === '' => 0,
+            str_starts_with($head, "\xff\xd8\xff") => 1,
+            str_starts_with($head, "\x89PNG\r\n\x1a\n") => 2,
+            str_starts_with($head, 'GIF87a') || str_starts_with($head, 'GIF89a') => 3,
+            \strlen($head) >= 12 && str_starts_with($head, 'RIFF') && substr($head, 8, 4) === 'WEBP' => 4,
+            str_starts_with($head, 'BM') => 5,
+            default => 6,
+        };
+    }
+
+    /**
+     * (0 empty, 1 one to $max ASCII digits, 2 other; the value) for the trimmed field.
+     *
+     * @return array{int, int}
+     */
+    private static function w64Count(string $text, int $max): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $value = self::w64Digits($text, 1, $max);
+
+        return $value === null ? [2, 0] : [1, $value];
+    }
+
+    /** $min to $max ASCII digits as their value, else null. */
+    private static function w64Digits(string $text, int $min, int $max): ?int
+    {
+        $length = \strlen($text);
+
+        return $length >= $min && $length <= $max && strspn($text, '0123456789') === $length ? (int) $text : null;
+    }
+
+    /**
+     * Wave 64 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and returns the
+     * previous override, 'reset' clears the override, library handle and buffers, 'ffi' resolves the library
+     * (null when unavailable) and 'out' and 'lens' return `int64_t` output and length-column buffers of at least
+     * $val words.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w643', self::W64_IMAGE_CANDIDATE_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 64.3 ImageCandidate export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call declines
+     * or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w64Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w64RustFfiState('ffi');
+            $out = self::w64RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w64RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W64_IMAGE_CANDIDATE_FFI_CDEF.)
+            $written = $ffi->nntmux_w643_image_candidate_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

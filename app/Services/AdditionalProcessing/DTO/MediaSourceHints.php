@@ -645,4 +645,294 @@ final readonly class MediaSourceHints
 
         return [implode('', $items), pack('V*', ...array_map(strlen(...), $items))];
     }
+
+    // ========================================================================
+    // WAVE 64.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 6.79x, p99 2.91x; uncommon mean 5.92x, p99 2.88x); see RustAdditionalDownloadMetricsArchiveImageMappedNzbSourceHintsW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    public const string W64_MEDIA_SOURCE_HINTS_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w643_media_source_hints_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 64.3 batch. */
+    public const int W64_MEDIA_SOURCE_HINTS_TRAILER = 16;
+
+    /** Cap for the Wave 64.3 running totals. */
+    private const int W64_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /** Lower-cased extension => container. */
+    private const array W64_CONTAINERS = ['mkv' => 1, 'mp4' => 2, 'm4v' => 2, 'avi' => 3, 'ts' => 4, 'm2ts' => 4, 'wmv' => 5, 'mov' => 6, 'mpg' => 7, 'mpeg' => 7];
+
+    /** Lower-cased name token => codec. */
+    private const array W64_CODECS = ['x264' => 1, 'h264' => 1, 'avc' => 1, 'x265' => 2, 'h265' => 2, 'hevc' => 2, 'xvid' => 3, 'divx' => 3, 'av1' => 4, 'vp9' => 5, 'mpeg2' => 6];
+
+    /** Lower-cased SourcePosition value => code (empty 0, anything else 3). */
+    private const array W64_POSITIONS = ['complete' => 0, 'head' => 1, 'mid' => 2];
+
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restores W64_RUST_FFI_DEFAULT and drops the cached library handle and scratch buffers. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $override = self::w64RustFfiState();
+
+        return \is_bool($override) ? $override : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the MediaSourceHints Wave 64 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 64.3 media source container, codec, sample/main role and byte-slice hint plans. Each item is `name|position|
+     * realSize|availableBytes|offset`. The container of the trimmed name's extension is 1 mkv, 2 mp4/m4v, 3 avi, 4 ts/m2ts,
+     * 5 wmv, 6 mov, 7 mpg/mpeg (any case), else 0; the codec is that of the first lower-cased `[a-z0-9]+` token naming one
+     * (1 x264/h264/avc, 2 x265/h265/hevc, 3 xvid/divx, 4 av1, 5 vp9, 6 mpeg2), else 0. The role is 2 with a `sample` token,
+     * 1 with a container, else 0. The trimmed position is 0 empty or `complete`, 1 `head`, 2 `mid` (any case), else 3.
+     * Sizes and the offset (up to 12 digits) are 0 empty, 1 trimmed digits, 2 other (invalid values count as 0). The
+     * fraction is 1000 for complete sources, else available bytes per mille of the real size (capped at 1000, 0 without
+     * one); the slice is 0 without a real size, 1 when offset + available bytes fit it, else 2. The probe is 0 skip (no
+     * role, an unknown position or an invalid number), 1 now (complete, a fraction of 50+ or 1 MiB available), else 2 more
+     * bytes. Per item `container | codec << 3 | role << 6 | position << 8 | realState << 10 | availableState << 12 |
+     * offsetState << 14 | slice << 16 | probe << 18 | fraction << 20 | min(available >> 10, 2^20 - 1) << 30 | min(tokens,
+     * 255) << 50`. Then the eight container counts, the three role counts, the three probe counts, the available byte
+     * total (capped at 2^62) and the 1-based index of the first strictly highest fraction among main sources to probe now.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64MediaSourceHintsPlanBatch(array $items): array
+    {
+        return self::usesW64RustFfi() ? self::w64MediaSourceHintsPlanBatchNative($items) : self::w64MediaSourceHintsPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64MediaSourceHintsPlanBatchNative(array $items): array
+    {
+        return self::w64Invoke($items, \count($items) + self::W64_MEDIA_SOURCE_HINTS_TRAILER) ?? self::w64MediaSourceHintsPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64MediaSourceHintsPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $containers = [0, 0, 0, 0, 0, 0, 0, 0];
+        $roles = [0, 0, 0];
+        $probes = [0, 0, 0];
+        $availableSum = $best = $index = 0;
+        $bestFraction = -1;
+        foreach ($items as $item) {
+            $index++;
+            [$rawName, $rawPosition, $rawReal, $rawAvailable, $rawOffset] = explode('|', (string) $item, 5) + ['', '', '', '', ''];
+            $lower = strtolower(trim($rawName));
+            $dot = strrpos($lower, '.');
+            $container = $dot === false ? 0 : (self::W64_CONTAINERS[substr($lower, $dot + 1)] ?? 0);
+            $tokens = preg_split('/[^a-z0-9]+/', $lower, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $codec = 0;
+            $sample = false;
+            foreach ($tokens as $token) {
+                if ($codec === 0) {
+                    $codec = self::W64_CODECS[$token] ?? 0;
+                }
+                $sample = $sample || $token === 'sample';
+            }
+            $role = $sample ? 2 : ($container !== 0 ? 1 : 0);
+            $positionText = strtolower(trim($rawPosition));
+            $position = $positionText === '' ? 0 : (self::W64_POSITIONS[$positionText] ?? 3);
+            [$realState, $real] = self::w64Count($rawReal, 12);
+            [$availableState, $available] = self::w64Count($rawAvailable, 12);
+            [$offsetState, $offset] = self::w64Count($rawOffset, 12);
+            $fraction = $position === 0 ? 1000 : ($real > 0 ? min(intdiv($available * 1000, $real), 1000) : 0);
+            $slice = $real === 0 ? 0 : ($offset + $available <= $real ? 1 : 2);
+            if ($role === 0 || $position === 3 || $realState === 2 || $availableState === 2 || $offsetState === 2) {
+                $probe = 0;
+            } else {
+                $probe = $position === 0 || $fraction >= 50 || $available >= 1_048_576 ? 1 : 2;
+            }
+            $containers[$container]++;
+            $roles[$role]++;
+            $probes[$probe]++;
+            $availableSum = min($availableSum + $available, self::W64_TOTAL_CAP);
+            if ($role === 1 && $probe === 1 && $fraction > $bestFraction) {
+                $best = $index;
+                $bestFraction = $fraction;
+            }
+            $out[] = $container | $codec << 3 | $role << 6 | $position << 8 | $realState << 10 | $availableState << 12 | $offsetState << 14
+                | $slice << 16 | $probe << 18 | $fraction << 20 | min($available >> 10, 1_048_575) << 30 | min(\count($tokens), 255) << 50;
+        }
+        array_push($out, ...$containers, ...$roles, ...$probes);
+        array_push($out, $availableSum, $best);
+
+        return $out;
+    }
+
+    /**
+     * (0 empty, 1 one to $max ASCII digits, 2 other; the value) for the trimmed field.
+     *
+     * @return array{int, int}
+     */
+    private static function w64Count(string $text, int $max): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $value = self::w64Digits($text, 1, $max);
+
+        return $value === null ? [2, 0] : [1, $value];
+    }
+
+    /** $min to $max ASCII digits as their value, else null. */
+    private static function w64Digits(string $text, int $min, int $max): ?int
+    {
+        $length = \strlen($text);
+
+        return $length >= $min && $length <= $max && strspn($text, '0123456789') === $length ? (int) $text : null;
+    }
+
+    /**
+     * Wave 64 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and returns the
+     * previous override, 'reset' clears the override, library handle and buffers, 'ffi' resolves the library
+     * (null when unavailable) and 'out' and 'lens' return `int64_t` output and length-column buffers of at least
+     * $val words.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w643', self::W64_MEDIA_SOURCE_HINTS_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 64.3 MediaSourceHints export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call declines
+     * or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w64Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w64RustFfiState('ffi');
+            $out = self::w64RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w64RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W64_MEDIA_SOURCE_HINTS_FFI_CDEF.)
+            $written = $ffi->nntmux_w643_media_source_hints_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

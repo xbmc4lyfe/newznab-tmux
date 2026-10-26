@@ -656,4 +656,355 @@ final readonly class DownloadedArchive
 
         return [implode('', $items), pack('V*', ...array_map(strlen(...), $items))];
     }
+
+    // ========================================================================
+    // WAVE 64.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 5.30x, p99 4.33x; uncommon mean 4.69x, p99 3.89x); see RustAdditionalDownloadMetricsArchiveImageMappedNzbSourceHintsW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    public const string W64_DOWNLOADED_ARCHIVE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w643_downloaded_archive_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 64.3 batch. */
+    public const int W64_DOWNLOADED_ARCHIVE_TRAILER = 18;
+
+    /** Cap for the Wave 64.3 running totals. */
+    private const int W64_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /** Name class => family (0 unknown, 1 RAR, 2 ZIP, 3 7z, 4 split, 5 compressed stream). */
+    private const array W64_CLASS_FAMILY = [0, 1, 1, 2, 3, 4, 5];
+
+    /** Payload signature => family (signature 8, unknown, matches no class). */
+    private const array W64_SIGNATURE_FAMILY = [0, 1, 1, 2, 3, 5, 5, 5, 9];
+
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restores W64_RUST_FFI_DEFAULT and drops the cached library handle and scratch buffers. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $override = self::w64RustFfiState();
+
+        return \is_bool($override) ? $override : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the DownloadedArchive Wave 64 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 64.3 downloaded archive payload signature, volume index, compression and extraction readiness plans. Each item
+     * is `name|size|flags|head`, where the head (the rest of the item, raw bytes) is the payload's first bytes. The trimmed
+     * name's class and volume (case-insensitive) are 1 `.rar` (volume 1, or N of `.partN.rar` with 1-4 digits), 2 `.rNN`
+     * (NN + 2), 3 `.zip` (1) or `.zNN` (NN + 1), 4 `.7z` (1) or `.7z.NNN` (NNN), 5 `.NNN` (NNN), 6 `.tar`/`.tgz`/`.gz`/
+     * `.bz2`/`.xz` (1), else 0 (volume 0); the set base is the name before that suffix. The signature is 0 empty, 1 RAR4,
+     * 2 RAR5, 3 ZIP, 4 7z, 5 gzip, 6 bzip2, 7 xz, 8 other; the ZIP method (ZIP heads of 10+ bytes) is 1 stored, 2 deflate,
+     * 3 other, else 0. The match is 0 without a head, 1 when a known signature fits the class's family (any known signature
+     * for classes 0 and 5), else 2. Size (up to 12 digits) and flags (up to 3) are 0 empty, 1 trimmed digits, 2 other;
+     * flag bit 0 is encrypted and bit 2 a directory. Readiness is 2 encrypted, 3 invalid (mismatch, invalid size or flags,
+     * a directory, or neither a class nor a head), 1 a continuation volume (volume > 1), else 0 ready. Per item `class |
+     * signature << 3 | match << 7 | sizeState << 9 | flagState << 11 | (flags & 7) << 13 | zipMethod << 16 | readiness << 18
+     * | min(volume, 65535) << 20 | min(nameLength, 255) << 36 | min(headLength, 255) << 44`. Then the four readiness counts,
+     * the nine signature counts, the first volumes, the highest capped volume, the ready bytes (capped at 2^62), the
+     * distinct set bases of named items (case-insensitive) and the 1-based index of the first ready first volume.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64DownloadedArchivePlanBatch(array $items): array
+    {
+        return self::usesW64RustFfi() ? self::w64DownloadedArchivePlanBatchNative($items) : self::w64DownloadedArchivePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64DownloadedArchivePlanBatchNative(array $items): array
+    {
+        return self::w64Invoke($items, \count($items) + self::W64_DOWNLOADED_ARCHIVE_TRAILER) ?? self::w64DownloadedArchivePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64DownloadedArchivePlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $readinessCounts = [0, 0, 0, 0];
+        $signatures = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $firstVolumes = $maxVolume = $readyBytes = $firstReady = $index = 0;
+        $sets = [];
+        foreach ($items as $item) {
+            $index++;
+            [$rawName, $rawSize, $rawFlags, $head] = explode('|', (string) $item, 4) + ['', '', '', ''];
+            $name = trim($rawName);
+            $lower = strtolower($name);
+            [$class, $volume, $base] = self::w64ArchiveName($lower);
+            $signature = self::w64ArchiveSignature($head);
+            [$sizeState, $size] = self::w64Count($rawSize, 12);
+            [$flagState, $flags] = self::w64Count($rawFlags, 3);
+            $zip = 0;
+            if ($signature === 3 && \strlen($head) >= 10) {
+                $method = \ord($head[8]) | \ord($head[9]) << 8;
+                $zip = $method === 0 ? 1 : ($method === 8 ? 2 : 3);
+            }
+            $match = $signature === 0 ? 0
+                : ($signature !== 8 && ($class === 0 || $class === 5 || self::W64_CLASS_FAMILY[$class] === self::W64_SIGNATURE_FAMILY[$signature]) ? 1 : 2);
+            if ($flagState === 1 && ($flags & 1) !== 0) {
+                $readiness = 2;
+            } elseif ($match === 2 || $sizeState === 2 || $flagState === 2 || ($flagState === 1 && ($flags & 4) !== 0) || ($class === 0 && $signature === 0)) {
+                $readiness = 3;
+            } elseif ($volume > 1) {
+                $readiness = 1;
+            } else {
+                $readiness = 0;
+            }
+            $readinessCounts[$readiness]++;
+            $signatures[$signature]++;
+            if ($volume === 1) {
+                $firstVolumes++;
+            }
+            $maxVolume = max($maxVolume, min($volume, 65_535));
+            if ($readiness === 0) {
+                $readyBytes = min($readyBytes + $size, self::W64_TOTAL_CAP);
+                if ($volume === 1 && $firstReady === 0) {
+                    $firstReady = $index;
+                }
+            }
+            if ($name !== '') {
+                $sets[substr($lower, 0, $base)] = true;
+            }
+            $out[] = $class | $signature << 3 | $match << 7 | $sizeState << 9 | $flagState << 11 | ($flags & 7) << 13 | $zip << 16
+                | $readiness << 18 | min($volume, 65_535) << 20 | min(\strlen($name), 255) << 36 | min(\strlen($head), 255) << 44;
+        }
+        array_push($out, ...$readinessCounts, ...$signatures);
+        array_push($out, $firstVolumes, $maxVolume, $readyBytes, \count($sets), $firstReady);
+
+        return $out;
+    }
+
+    /**
+     * (class, volume, base length) of a lower-cased trimmed archive name, as w64DownloadedArchivePlanBatch() documents.
+     *
+     * @return array{int, int, int}
+     */
+    private static function w64ArchiveName(string $name): array
+    {
+        $n = \strlen($name);
+        if (str_ends_with($name, '.rar')) {
+            $stem = $n - 4;
+            $run = strspn(strrev(substr($name, 0, $stem)), '0123456789');
+            if ($run >= 1 && $run <= 4 && $stem - $run >= 5 && substr($name, $stem - $run - 5, 5) === '.part') {
+                return [1, (int) substr($name, $stem - $run, $run), $stem - $run - 5];
+            }
+
+            return [1, 1, $stem];
+        }
+        if ($n >= 4 && $name[$n - 4] === '.' && $name[$n - 3] === 'r' && ($value = self::w64Digits(substr($name, $n - 2), 2, 2)) !== null) {
+            return [2, $value + 2, $n - 4];
+        }
+        if (str_ends_with($name, '.zip')) {
+            return [3, 1, $n - 4];
+        }
+        if ($n >= 4 && $name[$n - 4] === '.' && $name[$n - 3] === 'z' && ($value = self::w64Digits(substr($name, $n - 2), 2, 2)) !== null) {
+            return [3, $value + 1, $n - 4];
+        }
+        if (str_ends_with($name, '.7z')) {
+            return [4, 1, $n - 3];
+        }
+        if ($n >= 7 && substr($name, $n - 7, 4) === '.7z.' && ($value = self::w64Digits(substr($name, $n - 3), 3, 3)) !== null) {
+            return [4, $value, $n - 7];
+        }
+        if ($n >= 4 && $name[$n - 4] === '.' && ($value = self::w64Digits(substr($name, $n - 3), 3, 3)) !== null) {
+            return [5, $value, $n - 4];
+        }
+        foreach (['.tar', '.tgz', '.gz', '.bz2', '.xz'] as $suffix) {
+            if (str_ends_with($name, $suffix)) {
+                return [6, 1, $n - \strlen($suffix)];
+            }
+        }
+
+        return [0, 0, $n];
+    }
+
+    /** 0 empty, 1 RAR4, 2 RAR5, 3 ZIP, 4 7z, 5 gzip, 6 bzip2, 7 xz, 8 other. */
+    private static function w64ArchiveSignature(string $head): int
+    {
+        return match (true) {
+            $head === '' => 0,
+            str_starts_with($head, "Rar!\x1a\x07\x01\x00") => 2,
+            str_starts_with($head, "Rar!\x1a\x07\x00") => 1,
+            str_starts_with($head, "PK\x03\x04") => 3,
+            str_starts_with($head, "7z\xbc\xaf\x27\x1c") => 4,
+            str_starts_with($head, "\x1f\x8b") => 5,
+            str_starts_with($head, 'BZh') => 6,
+            str_starts_with($head, "\xfd7zXZ\x00") => 7,
+            default => 8,
+        };
+    }
+
+    /**
+     * (0 empty, 1 one to $max ASCII digits, 2 other; the value) for the trimmed field.
+     *
+     * @return array{int, int}
+     */
+    private static function w64Count(string $text, int $max): array
+    {
+        $text = trim($text);
+        if ($text === '') {
+            return [0, 0];
+        }
+        $value = self::w64Digits($text, 1, $max);
+
+        return $value === null ? [2, 0] : [1, $value];
+    }
+
+    /** $min to $max ASCII digits as their value, else null. */
+    private static function w64Digits(string $text, int $min, int $max): ?int
+    {
+        $length = \strlen($text);
+
+        return $length >= $min && $length <= $max && strspn($text, '0123456789') === $length ? (int) $text : null;
+    }
+
+    /**
+     * Wave 64 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and returns the
+     * previous override, 'reset' clears the override, library handle and buffers, 'ffi' resolves the library
+     * (null when unavailable) and 'out' and 'lens' return `int64_t` output and length-column buffers of at least
+     * $val words.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w643', self::W64_DOWNLOADED_ARCHIVE_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 64.3 DownloadedArchive export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call declines
+     * or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w64Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w64RustFfiState('ffi');
+            $out = self::w64RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w64RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W64_DOWNLOADED_ARCHIVE_FFI_CDEF.)
+            $written = $ffi->nntmux_w643_downloaded_archive_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
