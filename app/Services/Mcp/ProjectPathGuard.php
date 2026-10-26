@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Mcp;
 
+use App\Services\Nzb\NzbParserService;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
@@ -434,5 +435,211 @@ class ProjectPathGuard
 
             return null;
         }
+    }
+
+    // ---- Wave 57.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 4.99x/4.33x, uncommon 4.89x/4.38x); see RustMcpPathGuardRepoContextRedactorStatusTmuxCollectorW57ParityTest. */
+    private const bool W57_RUST_FFI_DEFAULT = true;
+
+    private const string W57_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w57_path_guard_plan_batch(const char *paths, size_t paths_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 57 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w57RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w57', self::W57_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w57RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW57RustFfi(): bool
+    {
+        $enabled = self::w57RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W57_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with classifyPathBatch() routed to Rust ($enabled) or PHP, then restores
+     * the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW57RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w57RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w57RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w57Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w57Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /**
+     * Batch safety classification under the default MCP path policy (the DEFAULT_* lists that
+     * mirror config/nntmux-mcp.php): normalizePhp()'s checks short of realpath(), without
+     * throwing. Per path: `status | min(length, 0xFFFFFF) << 8 | crc32(text) << 32`, text being
+     * the trimmed, slash-converted path (status 1-2) or its slash-collapsed form (otherwise).
+     * Status: 0 accepted, 1 empty or NUL, 2 absolute, 3 traversal, 4 outside the allowed roots,
+     * 5 denied segment, 6 environment file, 7 credential or private key. The eight status
+     * counts, the distinct accepted paths and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function classifyPathBatch(array $paths): array
+    {
+        return self::usesW57RustFfi() ? self::classifyPathBatchNative($paths) : self::classifyPathBatchPhp($paths);
+    }
+
+    /**
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function classifyPathBatchPhp(array $paths): array
+    {
+        $out = $accepted = [];
+        $counts = array_fill(0, 8, 0);
+        foreach ($paths as $path) {
+            $path = trim(str_replace('\\', '/', (string) $path));
+            if ($path === '' || str_contains($path, "\0")) {
+                $status = 1;
+            } elseif (str_starts_with($path, '/') || preg_match('/^[A-Za-z]:\//', $path) === 1) {
+                $status = 2;
+            } else {
+                $path = preg_replace('#/+#', '/', $path) ?? $path;
+                $status = self::w57PathStatus($path, explode('/', $path));
+                if ($status === 0) {
+                    $accepted[$path] = true;
+                }
+            }
+            $counts[$status]++;
+            $out[] = $status | min(\strlen($path), 0xFFFFFF) << 8 | crc32($path) << 32;
+        }
+        array_push($out, ...$counts);
+        $out[] = \count($accepted);
+        $out[] = self::w57Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * normalizePhp()'s traversal, location and sensitivity checks as a status (0, 3-7).
+     *
+     * @param  list<string>  $segments
+     */
+    private static function w57PathStatus(string $path, array $segments): int
+    {
+        if (\in_array('..', $segments, true) || \in_array('.', $segments, true)) {
+            return 3;
+        }
+        if (! \in_array($path, self::DEFAULT_ALLOWED_ROOT_FILES, true)) {
+            if (! \in_array($segments[0], self::DEFAULT_ALLOWED_ROOTS, true)) {
+                return 4;
+            }
+            foreach (self::DEFAULT_DENIED_SEGMENTS as $denied) {
+                if ($path === $denied || str_starts_with($path, $denied.'/') || str_contains($path, '/'.$denied.'/')) {
+                    return 5;
+                }
+            }
+        }
+        foreach ($segments as $segment) {
+            $lower = strtolower($segment);
+            if ($lower === '.env' || (str_starts_with($lower, '.env.') && $lower !== '.env.example')) {
+                return 6;
+            }
+            if (preg_match('/(?:credential|private[_-]?key|id_rsa|id_ed25519|\.pem$|\.p12$|\.pfx$)/i', $segment) === 1) {
+                return 7;
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a path holds a NUL byte, the
+     * column is not a list or PCRE runs with locale-specific character tables.
+     *
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function classifyPathBatchNative(array $paths): array
+    {
+        $count = \count($paths);
+        $words = $count + 10;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w57RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($paths) || ! NzbParserService::pcreUsesDefaultTables()) {
+            return self::classifyPathBatchPhp($paths);
+        }
+        $blob = implode("\0", $paths);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W57_FFI_CDEF.)
+            $written = $ffi->nntmux_w57_path_guard_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w57Words($written, $out, $words) ?? self::classifyPathBatchPhp($paths);
     }
 }

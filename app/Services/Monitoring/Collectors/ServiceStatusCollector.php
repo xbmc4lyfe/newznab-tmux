@@ -263,4 +263,200 @@ class ServiceStatusCollector implements MetricsCollector
 
         return true;
     }
+
+    // ---- Wave 57.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 4.92x/5.21x, uncommon 4.24x/3.92x); see RustMcpPathGuardRepoContextRedactorStatusTmuxCollectorW57ParityTest. */
+    private const bool W57_RUST_FFI_DEFAULT = true;
+
+    private const string W57_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w57_service_status_plan_batch(const char *statuses, size_t statuses_len, const char *ints, size_t ints_len, const char *nulls, size_t nulls_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 57 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w57RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w57', self::W57_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w57RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW57RustFfi(): bool
+    {
+        $enabled = self::w57RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W57_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planStatusBatch() routed to Rust ($enabled) or PHP, then restores
+     * the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW57RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w57RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w57RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w57Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w57Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /** ServiceStatusEnum values => case position plus one. */
+    private const array W57_STATUS_CODES = ['operational' => 1, 'degraded' => 2, 'partial_outage' => 3, 'major_outage' => 4, 'maintenance' => 5];
+
+    /**
+     * Batch rollup over stored service statuses and response times (ms, null when unmeasured),
+     * evaluated as evaluateServiceMetricsPhp() does. Per service: `code | up << 3 | timed << 4
+     * | (severity + 1) << 8 | clamp(ms, 0, 2^40 - 1) << 16`, code being the ServiceStatusEnum
+     * case position plus one (0 and severity -1 for an unknown status). The six code counts,
+     * up, down, incidents (severity >= 3), timed services, the saturating sum of non-negative
+     * response times, the largest response time (PHP_INT_MIN when none), the worst severity
+     * (-1 when none) and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $statuses
+     * @param  list<int|null>  $responseTimesMs
+     * @return list<int>
+     */
+    public static function planStatusBatch(array $statuses, array $responseTimesMs): array
+    {
+        return self::usesW57RustFfi() ? self::planStatusBatchNative($statuses, $responseTimesMs) : self::planStatusBatchPhp($statuses, $responseTimesMs);
+    }
+
+    /**
+     * @param  list<string>  $statuses
+     * @param  list<int|null>  $responseTimesMs
+     * @return list<int>
+     */
+    public static function planStatusBatchPhp(array $statuses, array $responseTimesMs): array
+    {
+        $responseTimesMs = array_values($responseTimesMs);
+        $out = [];
+        $codes = array_fill(0, 6, 0);
+        $up = $down = $incidents = $timed = $sum = 0;
+        $max = PHP_INT_MIN;
+        $worst = -1;
+        foreach (array_values($statuses) as $i => $status) {
+            $enum = ServiceStatusEnum::tryFrom((string) $status);
+            $code = $enum === null ? 0 : self::W57_STATUS_CODES[$enum->value];
+            $severity = $enum?->severityPhp() ?? -1;
+            $isUp = $enum !== null && $severity <= ServiceStatusEnum::Degraded->severityPhp();
+            $codes[$code]++;
+            $up += $isUp ? 1 : 0;
+            $down += $enum !== null && ! $isUp ? 1 : 0;
+            $incidents += $severity >= 3 ? 1 : 0;
+            $worst = max($worst, $severity);
+            $ms = $responseTimesMs[$i] ?? null;
+            $packed = 0;
+            if (\is_int($ms)) {
+                $timed++;
+                $positive = max(0, $ms);
+                $sum = $sum > PHP_INT_MAX - $positive ? PHP_INT_MAX : $sum + $positive;
+                $max = max($max, $ms);
+                $packed = min($positive, 0xFFFFFFFFFF);
+            }
+            $out[] = $code | ($isUp ? 8 : 0) | (\is_int($ms) ? 16 : 0) | ($severity + 1) << 8 | $packed << 16;
+        }
+        array_push($out, ...$codes);
+        array_push($out, $up, $down, $incidents, $timed, $sum, $max, $worst);
+        $out[] = self::w57Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a status holds a NUL byte, a
+     * response time is neither an integer nor null or the columns are not lists of one length.
+     *
+     * @param  list<string>  $statuses
+     * @param  list<int|null>  $responseTimesMs
+     * @return list<int>
+     */
+    public static function planStatusBatchNative(array $statuses, array $responseTimesMs): array
+    {
+        $count = \count($statuses);
+        $words = $count + 14;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 || \count($responseTimesMs) !== $count ? null : self::w57RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($statuses) || ! array_is_list($responseTimesMs)) {
+            return self::planStatusBatchPhp($statuses, $responseTimesMs);
+        }
+        foreach ($responseTimesMs as $ms) {
+            if ($ms !== null && ! \is_int($ms)) {
+                return self::planStatusBatchPhp($statuses, $responseTimesMs);
+            }
+        }
+        $blob = implode("\0", $statuses);
+        // pack() writes null as 0; the null indices travel separately.
+        $ints = pack('P*', ...$responseTimesMs);
+        $nulls = pack('P*', ...array_keys($responseTimesMs, null, true));
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W57_FFI_CDEF.)
+            $written = $ffi->nntmux_w57_service_status_plan_batch($blob, \strlen($blob), $ints, \strlen($ints), $nulls, \strlen($nulls), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w57Words($written, $out, $words) ?? self::planStatusBatchPhp($statuses, $responseTimesMs);
+    }
 }
