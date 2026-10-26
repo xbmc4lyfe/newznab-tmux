@@ -7,6 +7,7 @@ namespace App\Services\IGDB;
 use App\Services\IGDB\Models\BaseModel;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Collection;
 use InvalidArgumentException;
 use Throwable;
@@ -605,6 +606,380 @@ class QueryBuilder
             }
 
             return array_combine(self::W47_QUERY_CLAUSE_KEYS, $values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    // ========================================================================
+    // WAVE 63.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 6.72x, p99 6.53x; uncommon mean 4.57x, p99 4.45x); see RustIgdbDataNodeBaseModelQueryBuilderIrcClientScraperW63ParityTest. */
+    public const bool W63_RUST_FFI_DEFAULT = true;
+
+    public const string W63_QUERY_BUILDER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w631_query_builder_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w63QueryBuilderPlanBatch(). */
+    public const int W63_QUERY_BUILDER_TRAILER = 19;
+
+    public static function usesW63RustFfi(): bool
+    {
+        $override = self::w63RustFfiState();
+
+        return \is_bool($override) ? $override : self::W63_RUST_FFI_DEFAULT;
+    }
+
+    /** Forces the QueryBuilder Wave 63 Rust path on until reset. */
+    public static function enableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', true);
+    }
+
+    /** Forces the QueryBuilder Wave 63 PHP path until reset. */
+    public static function disableW63RustFfi(): void
+    {
+        self::w63RustFfiState('set', false);
+    }
+
+    /** Restores the benchmark default and drops the cached library handle and scratch buffers; earlier toggles are untouched. */
+    public static function resetW63RustFfi(): void
+    {
+        self::w63RustFfiState('reset');
+    }
+
+    /**
+     * Runs $callback with the QueryBuilder Wave 63 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW63RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w63RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w63RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 63.1 Apicalypse query compilation plans. Each item is `fields|search|where|sort|limit|offset`, compiled
+     * like toQueryPhp() into newline-joined `fields a,b;`, `search "..."` (addcslashes of `\` and `"`), `where c1 &
+     * c2;`, `sort field dir;`, `limit n;` and `offset n;` segments. Fields and `&`-separated where conditions are
+     * trimmed and deduplicated in order; an empty projection compiles to `*`. An empty field or one outside
+     * `[A-Za-z0-9_.*]` is invalid; a condition is `[A-Za-z0-9_.]+`, spaces, one of `!= >= <= = < > ~`, spaces and a
+     * non-empty value, whose `(a,b,...)` list counts its values. Sort splits at the last space (direction
+     * lowercased, default `asc`) and is valid for a `[A-Za-z0-9_.]` field with `asc` or `desc`. The limit is a
+     * signed integer raised to 1 and the offset 1-15 digits. Status: 5 every field empty, 1 invalid field, 2
+     * invalid condition, 3 invalid sort, 4 invalid limit or offset, else 0. Flags: 1 search, 2 escaped search, 4
+     * non-ASCII, 8 repeated field, 16 repeated condition, 32 descending, 64 limit over 500, 128 value list. Per
+     * item `status | flags << 3 | min(fields, 63) << 11 | min(conditions, 63) << 17 | min(segments, 7) << 23 |
+     * min(compiledLength, 65535) << 26 | bitLength(limit) << 42 | bitLength(offset) << 48 | min(listValues, 255) <<
+     * 54`; then 6 status counts, 8 flag counts, the compiled length, field and condition sums, the longest compiled
+     * query and the invalid field and condition sum.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w63QueryBuilderPlanBatch(array $items): array
+    {
+        return self::usesW63RustFfi() ? self::w63QueryBuilderPlanBatchNative($items) : self::w63QueryBuilderPlanBatchPhp($items);
+    }
+
+    /**
+     * Rust plan; falls back to the PHP reference when the library is missing or the call declines.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w63QueryBuilderPlanBatchNative(array $items): array
+    {
+        return self::w63Invoke($items, \count($items) + self::W63_QUERY_BUILDER_TRAILER) ?? self::w63QueryBuilderPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w63QueryBuilderPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W63_QUERY_BUILDER_TRAILER, 0);
+        foreach ($items as $item) {
+            $item = (string) $item;
+            [$rawFields, $search, $rawWhere, $rawSort, $rawLimit, $rawOffset] = explode('|', $item, 6) + ['', '', '', '', '', ''];
+            $projection = trim($rawFields);
+            $conditions = trim($rawWhere);
+            $sort = trim($rawSort);
+            $limitRaw = trim($rawLimit);
+            $offsetRaw = trim($rawOffset);
+            $flags = 0;
+            $invalidFields = 0;
+            $fieldList = [];
+            if ($projection === '') {
+                $fieldList[] = '*';
+            } else {
+                foreach (explode(',', $projection) as $rawSegment) {
+                    $segment = trim($rawSegment);
+                    if ($segment === '') {
+                        $invalidFields++;
+
+                        continue;
+                    }
+                    if (strspn($segment, self::W63_FIELD_CHARS.'*') !== \strlen($segment)) {
+                        $invalidFields++;
+                    }
+                    if (\in_array($segment, $fieldList, true)) {
+                        $flags |= 8;
+                    } else {
+                        $fieldList[] = $segment;
+                    }
+                }
+            }
+            $segments = ['fields '.implode(',', $fieldList).';'];
+            if ($search !== '') {
+                $escaped = addcslashes($search, '\\"');
+                $flags |= 1 | (\strlen($escaped) !== \strlen($search) ? 2 : 0);
+                $segments[] = 'search "'.$escaped.'";';
+            }
+            $invalidWhere = $listValues = 0;
+            $whereList = [];
+            if ($conditions !== '') {
+                foreach (explode('&', $conditions) as $rawCondition) {
+                    $condition = trim($rawCondition);
+                    if ($condition === '') {
+                        $invalidWhere++;
+
+                        continue;
+                    }
+                    $values = self::w63WhereCondition($condition);
+                    if ($values === null) {
+                        $invalidWhere++;
+                    } else {
+                        $listValues += $values;
+                        $flags |= $values > 0 ? 128 : 0;
+                    }
+                    if (\in_array($condition, $whereList, true)) {
+                        $flags |= 16;
+                    } else {
+                        $whereList[] = $condition;
+                    }
+                }
+            }
+            if ($whereList !== []) {
+                $segments[] = 'where '.implode(' & ', $whereList).';';
+            }
+            $sortInvalid = false;
+            if ($sort !== '') {
+                $space = strrpos($sort, ' ');
+                [$field, $direction] = $space === false ? [$sort, 'asc'] : [trim(substr($sort, 0, $space)), strtolower(trim(substr($sort, $space + 1)))];
+                $flags |= $direction === 'desc' ? 32 : 0;
+                $sortInvalid = $field === '' || strspn($field, self::W63_FIELD_CHARS) !== \strlen($field) || ($direction !== 'asc' && $direction !== 'desc');
+                $segments[] = 'sort '.$field.' '.$direction.';';
+            }
+            $pagingInvalid = false;
+            $limitBits = $offsetBits = 0;
+            if ($limitRaw !== '') {
+                $negative = $limitRaw[0] === '-';
+                $digits = $negative ? substr($limitRaw, 1) : $limitRaw;
+                $length = \strlen($digits);
+                if ($length === 0 || $length > 15 || strspn($digits, '0123456789') !== $length) {
+                    $pagingInvalid = true;
+                } else {
+                    $value = $negative ? -(int) $digits : (int) $digits;
+                    $limit = max(1, $value);
+                    $flags |= $value > 500 ? 64 : 0;
+                    $limitBits = self::w63BitLength($limit);
+                    $segments[] = 'limit '.$limit.';';
+                }
+            }
+            if ($offsetRaw !== '') {
+                $length = \strlen($offsetRaw);
+                if ($length <= 15 && strspn($offsetRaw, '0123456789') === $length) {
+                    $offset = (int) $offsetRaw;
+                    $offsetBits = self::w63BitLength($offset);
+                    $segments[] = 'offset '.$offset.';';
+                } else {
+                    $pagingInvalid = true;
+                }
+            }
+            $flags |= preg_match('/[\x80-\xff]/', $item) === 1 ? 4 : 0;
+            $compiled = \strlen(implode("\n", $segments));
+            $status = match (true) {
+                $projection === '' && $search === '' && $conditions === '' && $sort === '' && $limitRaw === '' && $offsetRaw === '' => 5,
+                $invalidFields > 0 => 1,
+                $invalidWhere > 0 => 2,
+                $sortInvalid => 3,
+                $pagingInvalid => 4,
+                default => 0,
+            };
+            $fieldCount = \count($fieldList);
+            $whereCount = \count($whereList);
+            $tail[$status]++;
+            for ($b = 0; $b < 8; $b++) {
+                $tail[6 + $b] += $flags >> $b & 1;
+            }
+            $tail[14] += $compiled;
+            $tail[15] += $fieldCount;
+            $tail[16] += $whereCount;
+            $tail[17] = max($tail[17], $compiled);
+            $tail[18] += $invalidFields + $invalidWhere;
+            $out[] = $status | $flags << 3 | min($fieldCount, 63) << 11 | min($whereCount, 63) << 17 | min(\count($segments), 7) << 23
+                | min($compiled, 65535) << 26 | $limitBits << 42 | $offsetBits << 48 | min($listValues, 255) << 54;
+        }
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    private const string W63_FIELD_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.';
+
+    /** A where condition's `(a,b,...)` value count (0 for a scalar value), or null when it is malformed. */
+    private static function w63WhereCondition(string $condition): ?int
+    {
+        $field = strspn($condition, self::W63_FIELD_CHARS);
+        if ($field === 0) {
+            return null;
+        }
+        $at = $field + strspn($condition, ' ', $field);
+        $operator = substr($condition, $at, 2);
+        if ($operator === '!=' || $operator === '>=' || $operator === '<=') {
+            $at += 2;
+        } elseif ($operator !== '' && str_contains('=<>~', $operator[0])) {
+            $at++;
+        } else {
+            return null;
+        }
+        $value = substr($condition, $at + strspn($condition, ' ', $at));
+        $length = \strlen($value);
+        if ($length === 0) {
+            return null;
+        }
+
+        return $length >= 2 && $value[0] === '(' && $value[$length - 1] === ')' ? substr_count($value, ',') + 1 : 0;
+    }
+
+    private static function w63BitLength(int $value): int
+    {
+        $bits = 0;
+        for (; $value > 0; $value >>= 1) {
+            $bits++;
+        }
+
+        return $bits;
+    }
+
+    /**
+     * Wave 63 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'reset' clears the override, library handle and buffers, 'ffi'
+     * resolves the library (null when unavailable) and 'out' and 'lens' return `int64_t` output and
+     * length-column buffers of at least $val words.
+     */
+    private static function w63RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('igdb_query_builder_w631', self::W63_QUERY_BUILDER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w63RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w63RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 63.1 QueryBuilder export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w63Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w63RustFfiState('ffi');
+            $out = self::w63RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w63RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W63_QUERY_BUILDER_FFI_CDEF.)
+            $written = $ffi->nntmux_w631_query_builder_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
         } catch (Throwable) {
             return null;
         }
