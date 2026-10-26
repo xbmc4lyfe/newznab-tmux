@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services\Monitoring;
 
 use App\Support\RustPipelineLibrary;
+use DateTimeImmutable;
+use DateTimeZone;
 use FFI;
 use FFI\CData;
 use Illuminate\Contracts\Cache\Repository as CacheRepository;
@@ -492,6 +494,144 @@ class TmuxMetricsSnapshot
             return \is_array($values) ? $values : null;
         } catch (Throwable) {
             return null;
+        }
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W56 parity test measures 15.627x common mean, 19.593x
+     * common p99, 6.922x uncommon mean and 4.546x uncommon p99 (per-metric minimum of three runs),
+     * above the 1.5x rule.
+     */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    private const string W56_FFI_CDEF = 'ssize_t nntmux_w561_tmux_snapshot_lag_batch(const char *rows, size_t rows_len, size_t count, int64_t now, int64_t *out, size_t out_cap);';
+
+    /** snapshotLagSeconds() clamps `$now` to `0..W56_MAX_NOW`. */
+    public const int W56_MAX_NOW = 1 << 62;
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 56 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Snapshot lag per stamp: `max(0, $now - stamp)` for a 1-12 digit Unix timestamp or a valid
+     * UTC `YYYY-MM-DD HH:MM:SS` (or `T`-separated) date-time, else -1. `$now` is clamped to
+     * `0..W56_MAX_NOW`.
+     *
+     * @param  array<array-key, string>  $stamps
+     * @return list<int>
+     */
+    public static function snapshotLagSeconds(array $stamps, int $now): array
+    {
+        return self::usesW56RustFfi() ? self::snapshotLagSecondsNative($stamps, $now) : self::snapshotLagSecondsPhp($stamps, $now);
+    }
+
+    /**
+     * @param  array<array-key, string>  $stamps
+     * @return list<int>
+     */
+    public static function snapshotLagSecondsPhp(array $stamps, int $now): array
+    {
+        static $utc = null;
+        $utc ??= new DateTimeZone('UTC');
+        $now = max(0, min($now, self::W56_MAX_NOW));
+        $lags = [];
+        foreach ($stamps as $stamp) {
+            if (preg_match('/\A\d{1,12}\z/', $stamp) === 1) {
+                $lags[] = max(0, $now - (int) $stamp);
+
+                continue;
+            }
+            if (preg_match('/\A(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\z/', $stamp, $m) !== 1
+                || ! checkdate((int) $m[2], (int) $m[3], (int) $m[1])
+                || (int) $m[4] > 23 || (int) $m[5] > 59 || (int) $m[6] > 59) {
+                $lags[] = -1;
+
+                continue;
+            }
+            $lags[] = max(0, $now - (new DateTimeImmutable("{$m[1]}-{$m[2]}-{$m[3]} {$m[4]}:{$m[5]}:{$m[6]}", $utc))->getTimestamp());
+        }
+
+        return $lags;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $stamps
+     * @return list<int>
+     */
+    public static function snapshotLagSecondsNative(array $stamps, int $now): array
+    {
+        $count = \count($stamps);
+        $words = $count;
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w56RustFfiState('out', $words);
+        if ($buffer === null) {
+            return self::snapshotLagSecondsPhp($stamps, $now);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $stamps);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w561_tmux_snapshot_lag_batch($joined, \strlen($joined), $count, $now, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        $codes = $written === $count ? unpack('P*', FFI::string($out, $words * 8)) : false;
+        if (! \is_array($codes)) {
+            return self::snapshotLagSecondsPhp($stamps, $now);
+        }
+
+        /** @var list<int> */
+        return array_values($codes);
+    }
+
+    /**
+     * Wave 56 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('tmux_snapshot_w56', self::W56_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
         }
     }
 }
