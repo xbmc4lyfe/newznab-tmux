@@ -14,6 +14,7 @@ use App\Services\Releases\Fingerprint\FingerprintDispatch;
 use App\Support\Data\NzbCreationResult;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
@@ -1244,5 +1245,191 @@ class NzbService
         }
 
         return $values;
+    }
+
+    /** Wave 56.2 paired benchmarks decide this default; see RustDirectorySyncCoverageCreationImportNzbServiceW56ParityTest. */
+    private const bool W56_RUST_FFI_DEFAULT = true;
+
+    private const string W56_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w56_nzb_storage_plan_batch(const char *guids, size_t guids_len, const char *subjects, size_t subjects_len, size_t count, int64_t levels, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 56 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w56', self::W56_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w56RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW56RustFfi(): bool
+    {
+        $enabled = self::w56RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planStorageBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w56RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w56RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w56Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w56Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /** XML entity escapes for NZB text nodes and attributes. */
+    private const array W56_XML_ESCAPES = ['&' => '&amp;', '<' => '&lt;', '>' => '&gt;', '"' => '&quot;', "'" => '&apos;'];
+
+    /**
+     * Batch storage plan over release guids and file subjects. Per release: `flags |
+     * min(subpath length, 0xFFFFFF) << 8 | crc32(subpath) << 32` for the storage subpath
+     * buildNzbPath() nests under the base path (`g[0]/…/g[L-1]/` with L = clamp($levels, 0,
+     * min(32, strlen(guid)))) plus `guid.nzb.gz`, and `min(escapes, 0xFFFFFFFF) | crc32(escaped
+     * subject) << 32` for the subject with `&<>"'` XML-escaped. Flags: 1 lowercase SHA-1 guid,
+     * 2 repeats an earlier guid, 4 the subject needs escaping. Valid guids, duplicates, subjects
+     * needing escapes, the saturating escape total, distinct top-level directories and the
+     * XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $guids
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planStorageBatch(array $guids, array $subjects, int $levels): array
+    {
+        return self::usesW56RustFfi() ? self::planStorageBatchNative($guids, $subjects, $levels) : self::planStorageBatchPhp($guids, $subjects, $levels);
+    }
+
+    /**
+     * @param  list<string>  $guids
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planStorageBatchPhp(array $guids, array $subjects, int $levels): array
+    {
+        $subjects = array_values($subjects);
+        $out = $seen = $tops = [];
+        $valid = $duplicates = $escaped = $escapes = 0;
+        foreach (array_values($guids) as $i => $guid) {
+            $subject = $subjects[$i] ?? '';
+            $depth = min(max(0, $levels), 32, \strlen($guid));
+            $path = '';
+            for ($l = 0; $l < $depth; $l++) {
+                $path .= $guid[$l].'/';
+            }
+            $path .= $guid.'.nzb.gz';
+            if ($depth > 0) {
+                $tops[$guid[0]] = true;
+            }
+            $sha1 = \strlen($guid) === 40 && strspn($guid, '0123456789abcdef') === 40;
+            $duplicate = isset($seen[$guid]);
+            $seen[$guid] = true;
+            $count = \strlen($subject) - \strlen(str_replace(['&', '<', '>', '"', "'"], '', $subject));
+            $valid += $sha1 ? 1 : 0;
+            $duplicates += $duplicate ? 1 : 0;
+            $escaped += $count > 0 ? 1 : 0;
+            $escapes = $escapes > PHP_INT_MAX - $count ? PHP_INT_MAX : $escapes + $count;
+            $flags = ($sha1 ? 1 : 0) | ($duplicate ? 2 : 0) | ($count > 0 ? 4 : 0);
+            array_push($out, $flags | min(\strlen($path), 0xFFFFFF) << 8 | crc32($path) << 32,
+                min($count, 0xFFFFFFFF) | crc32($count === 0 ? $subject : strtr($subject, self::W56_XML_ESCAPES)) << 32);
+        }
+        array_push($out, $valid, $duplicates, $escaped, $escapes, \count($tops));
+        $out[] = self::w56Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a guid or subject holds a NUL
+     * byte or the columns are not lists of one length.
+     *
+     * @param  list<string>  $guids
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planStorageBatchNative(array $guids, array $subjects, int $levels): array
+    {
+        $count = \count($guids);
+        $words = 2 * $count + 6;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 || \count($subjects) !== $count ? null : self::w56RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($guids) || ! array_is_list($subjects)) {
+            return self::planStorageBatchPhp($guids, $subjects, $levels);
+        }
+        $guidBlob = implode("\0", $guids);
+        $subjectBlob = implode("\0", $subjects);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
+            $written = $ffi->nntmux_w56_nzb_storage_plan_batch($guidBlob, \strlen($guidBlob), $subjectBlob, \strlen($subjectBlob), $count, $levels, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w56Words($written, $out, $words) ?? self::planStorageBatchPhp($guids, $subjects, $levels);
     }
 }
