@@ -46158,3 +46158,933 @@ pub mod wave59_2_tmux_enums_predb_identity_key_season_pack {
         }
     }
 }
+
+pub mod wave60_2_nzb_upload_staging_xml_elements_par2_recovery_fingerprint_store {
+    //! Wave 60.2 batch kernels for NzbUploadStagingService, NzbXmlElements,
+    //! Par2CandidateRecovery, Par2CandidateRecoveryResult and ReleaseArticleFingerprintStore in
+    //! the Wave 49.2 framing: one NUL-joined string column (exactly `count` tab-separated rows)
+    //! in, one `i64` word per row, a few summary words and one XXH64 digest of the preceding
+    //! words out. Each export returns the word count, `-needed` when `out_cap` (in words) is
+    //! short, or -1 for a null output, a malformed batch, an output overlapping the input or a
+    //! panic. Rows are borrowed from the input (no copies) and every rule is byte-level ASCII,
+    //! so the PHP twins agree under any `setlocale()`.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, span,
+    };
+    use std::collections::HashSet;
+
+    /// PHP `explode("\t", $row, N) + array_fill(0, N, '')`.
+    fn fields<const N: usize>(row: &[u8]) -> [&[u8]; N] {
+        let mut out = [&row[..0]; N];
+        let mut rest = row;
+        for (k, slot) in out.iter_mut().enumerate() {
+            if k + 1 == N {
+                *slot = rest;
+                break;
+            }
+            match rest.iter().position(|&b| b == b'\t') {
+                Some(p) => {
+                    *slot = &rest[..p];
+                    rest = &rest[p + 1..];
+                }
+                None => {
+                    *slot = rest;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// `" \t\r\n"`, the XML whitespace set.
+    #[inline]
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+    }
+
+    /// PHP `trim()`'s default character set.
+    #[inline]
+    fn is_php_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+    }
+
+    fn trim_by(s: &[u8], set: fn(u8) -> bool) -> &[u8] {
+        let start = s.iter().position(|&b| !set(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|&b| !set(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// 1 to `max` ASCII digits as an integer (PHP `(int)` of a digit string).
+    fn digits(v: &[u8], max: usize) -> Option<i64> {
+        if v.is_empty() || v.len() > max || !v.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            v.iter()
+                .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0')),
+        )
+    }
+
+    fn lower_into(s: &[u8], buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.extend(s.iter().map(u8::to_ascii_lowercase));
+    }
+
+    fn lower_crc(s: &[u8], buf: &mut Vec<u8>) -> i64 {
+        if s.iter().any(u8::is_ascii_uppercase) {
+            lower_into(s, buf);
+            i64::from(crc32(buf))
+        } else {
+            i64::from(crc32(s))
+        }
+    }
+
+    // ---- NzbUploadStagingService -------------------------------------------------------------
+
+    const MAX_NZB_BYTES: i64 = 67_108_864;
+    const MAX_NFO_BYTES: i64 = 65_535;
+    const STAGING_RETENTION: i64 = 86_400;
+
+    /// Per `filename\tsize\tage\thead` row `kind | name << 2 | size << 4 | stale << 6 |
+    /// bad_age << 7 | head << 8 | bom << 11 | action << 12 | min(len(base), 0x3FFFF) << 14 |
+    /// crc32(lower(base)) << 32`. Kind 2 for a `.nfo` extension, otherwise 1 (NZB). Name: 0
+    /// accepted, 1 unsafe, 2 wrong extension or blank basename. Size: 0 within the kind's
+    /// quota, 1 empty, 2 over quota, 3 not 1-18 digits. Stale: age over the staging retention.
+    /// Head: 0 empty, 1 gzip magic, 2 blank after an optional BOM, 3 `<?xml`, 4 `<!DOCTYPE`, 5
+    /// `<nzb` root, 6 another element, 7 text. Action: 0 accept, 1 reject, 2 purge (stale).
+    /// Then the accept, reject and purge counts, the NZB and NFO counts, the accepted bytes and
+    /// the distinct accepted lowercase basenames.
+    pub fn upload_staging_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 8);
+        let mut actions = [0i64; 3];
+        let (mut nzb, mut nfo, mut bytes) = (0i64, 0i64, 0i64);
+        let mut seen: HashSet<Vec<u8>, FoldState> = HashSet::default();
+        let mut buf = Vec::new();
+        for &row in rows {
+            let [name, size, age, head] = fields::<4>(row);
+            let (base, ext) = match name.iter().rposition(|&b| b == b'.') {
+                Some(d) => (&name[..d], &name[d + 1..]),
+                None => (name, &name[..0]),
+            };
+            let is_nfo = ext.eq_ignore_ascii_case(b"nfo");
+            let kind: i64 = if is_nfo { 2 } else { 1 };
+            let name_status: i64 = if name.is_empty()
+                || name == b"."
+                || name == b".."
+                || name.iter().any(|&b| b == b'/' || b == b'\\' || b == 0)
+            {
+                1
+            } else if !(is_nfo || ext.eq_ignore_ascii_case(b"nzb"))
+                || trim_by(base, is_php_trim).is_empty()
+            {
+                2
+            } else {
+                0
+            };
+            let parsed = digits(size, 18);
+            let size_status: i64 = match parsed {
+                None => 3,
+                Some(0) => 1,
+                Some(v) if v > if is_nfo { MAX_NFO_BYTES } else { MAX_NZB_BYTES } => 2,
+                Some(_) => 0,
+            };
+            let (stale, bad_age) = match digits(age, 18) {
+                Some(v) => (v > STAGING_RETENTION, false),
+                None => (false, true),
+            };
+            let (head_class, bom): (i64, i64) = if head.is_empty() {
+                (0, 0)
+            } else if head.starts_with(b"\x1f\x8b") {
+                (1, 0)
+            } else {
+                let bom = head.starts_with(b"\xef\xbb\xbf");
+                let rest = if bom { &head[3..] } else { head };
+                let rest = &rest[rest.iter().position(|&b| !is_ws(b)).unwrap_or(rest.len())..];
+                let class = if rest.is_empty() {
+                    2
+                } else if rest.starts_with(b"<?xml") {
+                    3
+                } else if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case(b"<!doctype") {
+                    4
+                } else if rest.starts_with(b"<nzb")
+                    && (rest.len() == 4
+                        || matches!(rest[4], b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/'))
+                {
+                    5
+                } else if rest[0] == b'<' {
+                    6
+                } else {
+                    7
+                };
+                (class, i64::from(bom))
+            };
+            let action: i64 = if stale {
+                2
+            } else if name_status != 0 || size_status != 0 || bad_age {
+                1
+            } else if (is_nfo && head_class >= 3) || (!is_nfo && (3..=5).contains(&head_class)) {
+                0
+            } else {
+                1
+            };
+            actions[action as usize] += 1;
+            if is_nfo {
+                nfo += 1;
+            } else {
+                nzb += 1;
+            }
+            if action == 0 {
+                bytes += parsed.unwrap_or(0);
+                lower_into(base, &mut buf);
+                if !seen.contains(buf.as_slice()) {
+                    seen.insert(buf.clone());
+                }
+            }
+            out.push(
+                kind | name_status << 2
+                    | size_status << 4
+                    | i64::from(stale) << 6
+                    | i64::from(bad_age) << 7
+                    | head_class << 8
+                    | bom << 11
+                    | action << 12
+                    | (base.len().min(0x3FFFF) as i64) << 14
+                    | lower_crc(base, &mut buf) << 32,
+            );
+        }
+        out.extend(actions);
+        out.extend([nzb, nfo, bytes, seen.len() as i64]);
+        out
+    }
+
+    // ---- NzbXmlElements ----------------------------------------------------------------------
+
+    const XML_KINDS: [&[u8]; 8] = [
+        b"file",
+        b"groups",
+        b"group",
+        b"segments",
+        b"segment",
+        b"meta",
+        b"head",
+        b"nzb",
+    ];
+
+    #[inline]
+    fn is_name(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'.' | b'-')
+    }
+
+    fn ws_run(s: &[u8], i: usize) -> usize {
+        s[i..]
+            .iter()
+            .position(|&b| !is_ws(b))
+            .unwrap_or(s.len() - i)
+    }
+
+    struct XmlElement {
+        word: i64,
+        kind: usize,
+        valid: bool,
+        bytes: i64,
+        number: i64,
+        password: bool,
+    }
+
+    /// One element string; None when the start tag is malformed.
+    fn xml_element<'a>(s: &'a [u8], attrs: &mut Vec<(&'a [u8], &'a [u8])>) -> Option<XmlElement> {
+        let n = s.len();
+        if n < 2 || s[0] != b'<' {
+            return None;
+        }
+        let len = s[1..].iter().position(|&b| !is_name(b)).unwrap_or(n - 1);
+        if len == 0 {
+            return None;
+        }
+        let name = &s[1..1 + len];
+        let local = match name.iter().rposition(|&b| b == b':') {
+            Some(c) => &name[c + 1..],
+            None => name,
+        };
+        if local.is_empty() {
+            return None;
+        }
+        let kind = XML_KINDS
+            .iter()
+            .position(|k| *k == local)
+            .map_or(9, |k| k + 1);
+        let mut i = 1 + len;
+        attrs.clear();
+        let (mut dup, mut count, self_closing) = (
+            false,
+            0usize,
+            loop {
+                let ws = ws_run(s, i);
+                i += ws;
+                if i >= n {
+                    return None;
+                }
+                match s[i] {
+                    b'>' => {
+                        i += 1;
+                        break false;
+                    }
+                    b'/' => {
+                        if i + 1 < n && s[i + 1] == b'>' {
+                            i += 2;
+                            break true;
+                        }
+                        return None;
+                    }
+                    _ => {}
+                }
+                if ws == 0 {
+                    return None;
+                }
+                let alen = s[i..].iter().position(|&b| !is_name(b)).unwrap_or(n - i);
+                if alen == 0 {
+                    return None;
+                }
+                let aname = &s[i..i + alen];
+                i += alen;
+                i += ws_run(s, i);
+                if i >= n || s[i] != b'=' {
+                    return None;
+                }
+                i += 1;
+                i += ws_run(s, i);
+                if i >= n || (s[i] != b'"' && s[i] != b'\'') {
+                    return None;
+                }
+                let quote = s[i];
+                let end = i + 1 + s[i + 1..].iter().position(|&b| b == quote)?;
+                let value = &s[i + 1..end];
+                i = end + 1;
+                if attrs.iter().any(|a| a.0 == aname) {
+                    // `dup` and `count` are tracked through the attribute list below.
+                    attrs.push((&s[..0], &s[..0]));
+                } else {
+                    attrs.push((aname, value));
+                }
+            },
+        );
+        for a in attrs.iter() {
+            count += 1;
+            dup |= a.0.is_empty();
+        }
+        let (text, unclosed) = if self_closing {
+            (&s[..0], s[i..].iter().any(|&b| !is_ws(b)))
+        } else {
+            match s[i..].windows(2).rposition(|w| w == b"</") {
+                None => (&s[i..], true),
+                Some(j) => {
+                    let j = i + j;
+                    let close = &s[j + 2..];
+                    let close =
+                        &close[..close.iter().rposition(|&b| !is_ws(b)).map_or(0, |p| p + 1)];
+                    let ok = close.len() == name.len() + 1
+                        && close.starts_with(name)
+                        && close[name.len()] == b'>';
+                    (&s[i..j], !ok)
+                }
+            }
+        };
+        let t = trim_by(text, is_ws);
+        let bad_text = match kind {
+            5 => {
+                t.is_empty()
+                    || t.iter()
+                        .any(|&b| b <= 0x20 || b == b'<' || b == b'>' || b == 0x7f)
+            }
+            3 => t.is_empty() || t.iter().any(|&b| is_ws(b)),
+            _ => false,
+        };
+        let get = |k: &[u8]| attrs.iter().find(|a| a.0 == k).map(|a| a.1);
+        let required: &[&[u8]] = match kind {
+            1 => &[b"poster", b"date", b"subject"],
+            5 => &[b"bytes", b"number"],
+            6 => &[b"type"],
+            _ => &[],
+        };
+        let missing = required.iter().any(|k| get(k).is_none());
+        let (mut bad_num, mut number, mut bytes) = (false, 0i64, 0i64);
+        if !missing {
+            match kind {
+                1 => bad_num = digits(get(b"date").unwrap_or_default(), 18).is_none(),
+                5 => match (
+                    digits(get(b"bytes").unwrap_or_default(), 18),
+                    digits(get(b"number").unwrap_or_default(), 18),
+                ) {
+                    (Some(b), Some(nr)) if nr >= 1 => {
+                        bytes = b;
+                        number = nr;
+                    }
+                    _ => bad_num = true,
+                },
+                _ => {}
+            }
+        }
+        let valid = !(missing || bad_num || dup || unclosed || bad_text);
+        let password = kind == 6 && valid && get(b"type") == Some(b"password".as_slice());
+        Some(XmlElement {
+            word: kind as i64
+                | i64::from(missing) << 5
+                | i64::from(bad_num) << 6
+                | i64::from(dup) << 7
+                | i64::from(unclosed) << 8
+                | i64::from(self_closing) << 9
+                | i64::from(bad_text) << 10
+                | (count.min(7) as i64) << 11
+                | number.min(0xFFFFF) << 14
+                | bytes.min(0x1FFF_FFFF) << 34,
+            kind,
+            valid,
+            bytes,
+            number,
+            password,
+        })
+    }
+
+    /// Per element string `kind | malformed << 4 | missing << 5 | bad_number << 6 |
+    /// duplicate << 7 | unclosed << 8 | self_closing << 9 | bad_text << 10 | min(attributes, 7)
+    /// << 11 | min(number, 0xFFFFF) << 14 | min(bytes, 0x1FFFFFFF) << 34`. Kind: 1 file, 2
+    /// groups, 3 group, 4 segments, 5 segment, 6 meta, 7 head, 8 nzb (by local name), 9 other,
+    /// 0 a malformed start tag (no other bits). Then the per-kind counts, the valid count, the
+    /// saturating bytes and largest number of valid segments and the valid password metas.
+    pub fn xml_element_summary(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 15);
+        let mut kinds = [0i64; 10];
+        let (mut valid, mut bytes, mut max_number, mut passwords) = (0i64, 0i64, 0i64, 0i64);
+        let mut attrs = Vec::new();
+        for &item in items {
+            match xml_element(item, &mut attrs) {
+                None => {
+                    kinds[0] += 1;
+                    out.push(1 << 4);
+                }
+                Some(e) => {
+                    kinds[e.kind] += 1;
+                    if e.valid {
+                        valid += 1;
+                        if e.kind == 5 {
+                            bytes = bytes.saturating_add(e.bytes);
+                            max_number = max_number.max(e.number);
+                        }
+                    }
+                    passwords += i64::from(e.password);
+                    out.push(e.word);
+                }
+            }
+        }
+        out.extend(kinds);
+        out.extend([valid, bytes, max_number, passwords]);
+        out
+    }
+
+    // ---- Par2CandidateRecovery ---------------------------------------------------------------
+
+    const PACKETS: [&[u8]; 5] = [b"main", b"filedesc", b"ifsc", b"recvslice", b"creator"];
+    const STATUS_BASE: [i64; 5] = [0, 100, 80, 10, 30];
+
+    /// Per `set_id\tfiles\tpackets\tneeded\tavailable\tname` row `status | coverage << 3 |
+    /// null_set << 8 | volume << 9 | par2 << 10 | min(unknown, 15) << 11 | score << 15 |
+    /// min(files, 0xFFFF) << 23 | (crc32(lower(set_id)) & 0xFFFFFF) << 39`. Status: 0 invalid
+    /// (set id not 32 hex digits or all zero, files not 1-32768, block counts not 1-9 digits),
+    /// 4 incomplete (no main or file description packet), 1 complete (no blocks needed), 2
+    /// repairable (enough recovery blocks and a recovery slice packet), 3 insufficient.
+    /// Coverage is the bitmask of the comma-separated packet types (main, filedesc, ifsc,
+    /// recvslice, creator; case-insensitive, space-trimmed, empty tokens skipped), unknown the
+    /// other tokens. Score: the status base plus 5 per covered type, minus 2 per unknown token
+    /// (up to 10), plus 7 for an index (no `.vol`) and 3 for a `.par2` name, within 0-255 (0
+    /// when invalid). Then the per-status counts, the distinct valid set ids, the needed and
+    /// available block totals of valid rows and the highest score.
+    pub fn candidate_recovery_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 10);
+        let mut statuses = [0i64; 5];
+        let (mut needed_total, mut available_total, mut max_score) = (0i64, 0i64, 0i64);
+        let mut seen: HashSet<[u8; 32], FoldState> = HashSet::default();
+        for &row in rows {
+            let [set, files, packets, needed, available, name] = fields::<6>(row);
+            let mut set_lower = [0u8; 32];
+            let set_ok = set.len() == 32 && set.iter().all(u8::is_ascii_hexdigit);
+            if set_ok {
+                for (d, s) in set_lower.iter_mut().zip(set) {
+                    *d = s.to_ascii_lowercase();
+                }
+            }
+            let null_set = set_ok && set.iter().all(|&b| b == b'0');
+            let file_count = digits(files, 6);
+            let files_ok = matches!(file_count, Some(1..=32768));
+            let need = digits(needed, 9);
+            let have = digits(available, 9);
+            let (mut coverage, mut unknown) = (0i64, 0i64);
+            for token in packets.split(|&b| b == b',') {
+                let token = trim_by(token, |b| b == b' ' || b == b'\t');
+                if token.is_empty() {
+                    continue;
+                }
+                match PACKETS.iter().position(|p| p.eq_ignore_ascii_case(token)) {
+                    Some(p) => coverage |= 1 << p,
+                    None => unknown += 1,
+                }
+            }
+            let par2 = name.len() >= 5 && name[name.len() - 5..].eq_ignore_ascii_case(b".par2");
+            let volume = name.windows(4).any(|w| w.eq_ignore_ascii_case(b".vol"));
+            let status: usize = match (set_ok && !null_set && files_ok, need, have) {
+                (true, Some(need), Some(have)) => {
+                    if coverage & 3 != 3 {
+                        4
+                    } else if need == 0 {
+                        1
+                    } else if need <= have && coverage & 8 != 0 {
+                        2
+                    } else {
+                        3
+                    }
+                }
+                _ => 0,
+            };
+            let score = if status == 0 {
+                0
+            } else {
+                (STATUS_BASE[status] + i64::from(coverage.count_ones() as u8) * 5
+                    - unknown.min(10) * 2
+                    + if volume { 0 } else { 7 }
+                    + if par2 { 3 } else { 0 })
+                .clamp(0, 255)
+            };
+            statuses[status] += 1;
+            if status != 0 {
+                seen.insert(set_lower);
+                needed_total += need.unwrap_or(0);
+                available_total += have.unwrap_or(0);
+                max_score = max_score.max(score);
+            }
+            let crc = if set_ok {
+                i64::from(crc32(&set_lower))
+            } else {
+                let mut buf = Vec::new();
+                lower_crc(set, &mut buf)
+            };
+            out.push(
+                status as i64
+                    | coverage << 3
+                    | i64::from(null_set) << 8
+                    | i64::from(volume) << 9
+                    | i64::from(par2) << 10
+                    | unknown.min(15) << 11
+                    | score << 15
+                    | file_count.unwrap_or(0).min(0xFFFF) << 23
+                    | (crc & 0xFF_FFFF) << 39,
+            );
+        }
+        out.extend(statuses);
+        out.extend([seen.len() as i64, needed_total, available_total, max_score]);
+        out
+    }
+
+    // ---- Par2CandidateRecoveryResult ---------------------------------------------------------
+
+    const OUTCOMES: [&[u8]; 4] = [b"renamed", b"no_match", b"retryable", b"deferred"];
+
+    /// Per `outcome\tprobes\tarticles\tconfidence\toriginal\trenamed` row `code | bad_counts <<
+    /// 3 | title << 4 | bucket << 7 | verdict << 9 | confidence << 12 | min(len(title), 0x1FFF)
+    /// << 19 | crc32(lower(title)) << 32`, where title is the whitespace-trimmed renamed title.
+    /// Code: the exact outcome value's case position plus one, 0 unknown. Bad counts: probes or
+    /// articles not 1-9 digits (counted as 0). Title: 0 empty, 1 the original title (ASCII
+    /// case-insensitive), 2 obfuscated (16+ hex digits), 3 dotted (two or more dots), 4 plain.
+    /// Confidence 0-100 (1-3 digits, otherwise 0 in bucket 0); bucket 1 below 40, 2 below 75, 3
+    /// otherwise. Verdict: 0 accepted (renamed with a title class of 2+ and bucket 2+), 1
+    /// review (other renames), 2 retry, 3 deferred, 4 dropped. Then the per-verdict counts, the
+    /// probe, article and valid-confidence totals and the distinct lowercase renamed titles.
+    pub fn recovery_result_summary(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 10);
+        let mut verdicts = [0i64; 5];
+        let (mut probes_total, mut articles_total, mut confidence_total) = (0i64, 0i64, 0i64);
+        let mut seen: HashSet<Vec<u8>, FoldState> = HashSet::default();
+        let mut buf = Vec::new();
+        for &row in rows {
+            let [outcome, probes, articles, confidence, original, renamed] = fields::<6>(row);
+            let code = OUTCOMES
+                .iter()
+                .position(|o| *o == outcome)
+                .map_or(0i64, |c| c as i64 + 1);
+            let (p, a) = (digits(probes, 9), digits(articles, 9));
+            let bad_counts = p.is_none() || a.is_none();
+            let title = trim_by(renamed, is_ws);
+            let original = trim_by(original, is_ws);
+            let class: i64 = if title.is_empty() {
+                0
+            } else if title.eq_ignore_ascii_case(original) {
+                1
+            } else if title.len() >= 16 && title.iter().all(u8::is_ascii_hexdigit) {
+                2
+            } else if title.iter().filter(|&&b| b == b'.').count() >= 2 {
+                3
+            } else {
+                4
+            };
+            let (conf, bucket): (i64, i64) = match digits(confidence, 3) {
+                Some(c) if c <= 100 => (
+                    c,
+                    if c < 40 {
+                        1
+                    } else if c < 75 {
+                        2
+                    } else {
+                        3
+                    },
+                ),
+                _ => (0, 0),
+            };
+            let verdict: i64 = match code {
+                1 if class >= 2 && bucket >= 2 => 0,
+                1 => 1,
+                3 => 2,
+                4 => 3,
+                _ => 4,
+            };
+            verdicts[verdict as usize] += 1;
+            probes_total += p.unwrap_or(0);
+            articles_total += a.unwrap_or(0);
+            if bucket != 0 {
+                confidence_total += conf;
+            }
+            if code == 1 && !title.is_empty() {
+                lower_into(title, &mut buf);
+                if !seen.contains(buf.as_slice()) {
+                    seen.insert(buf.clone());
+                }
+            }
+            out.push(
+                code | i64::from(bad_counts) << 3
+                    | class << 4
+                    | bucket << 7
+                    | verdict << 9
+                    | conf << 12
+                    | (title.len().min(0x1FFF) as i64) << 19
+                    | lower_crc(title, &mut buf) << 32,
+            );
+        }
+        out.extend(verdicts);
+        out.extend([
+            probes_total,
+            articles_total,
+            confidence_total,
+            seen.len() as i64,
+        ]);
+        out
+    }
+
+    // ---- ReleaseArticleFingerprintStore ------------------------------------------------------
+
+    const COLLISION_LIMIT: i64 = 8;
+    const STALE_DAYS: i64 = 30;
+
+    /// Per `fingerprint\tstored\tcount\tage_days` row `key | relation << 2 | collision << 4 |
+    /// heavy << 5 | stale << 6 | bad_number << 7 | duplicate << 8 | action << 9 |
+    /// min(count, 0xFFFF) << 12 | min(age, 0xFFFF) << 28 | (crc32(lower(fingerprint)) &
+    /// 0x7FFFF) << 44`. Key: 1 canonical (lowercase 40-hex), 2 40 hex digits with an uppercase
+    /// letter, 0 empty, 3 other. Relation to the stored value: 0 none stored, 1 identical, 2
+    /// equal ignoring ASCII case, 3 conflict. Count (1-9 digits) of releases sharing the key:
+    /// collision from 2, heavy above 8; stale above 30 days (1-6 digits); bad numbers count as 0.
+    /// Duplicate: a hex key already seen in the batch (case-insensitive). Action: 0 skip (key
+    /// 0 or 3), 5 quarantine (heavy), 4 replace (conflict), 1 store (none stored), 3 refresh
+    /// (case drift or stale), 2 keep. Then the per-action counts, the distinct hex keys and the
+    /// collision and stale counts.
+    pub fn fingerprint_store_plan(rows: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(rows.len() + 10);
+        let mut actions = [0i64; 6];
+        let (mut collisions, mut stales) = (0i64, 0i64);
+        let mut seen: HashSet<[u8; 40], FoldState> = HashSet::default();
+        let mut buf = Vec::new();
+        for &row in rows {
+            let [fp, stored, count, age] = fields::<4>(row);
+            let hex = fp.len() == 40 && fp.iter().all(u8::is_ascii_hexdigit);
+            let key: i64 = if hex {
+                if fp.iter().any(u8::is_ascii_uppercase) {
+                    2
+                } else {
+                    1
+                }
+            } else if fp.is_empty() {
+                0
+            } else {
+                3
+            };
+            let relation: i64 = if stored.is_empty() {
+                0
+            } else if stored == fp {
+                1
+            } else if stored.eq_ignore_ascii_case(fp) {
+                2
+            } else {
+                3
+            };
+            let (c, d) = (digits(count, 9), digits(age, 6));
+            let bad = c.is_none() || d.is_none();
+            let (c, d) = (c.unwrap_or(0), d.unwrap_or(0));
+            let (collision, heavy, stale) = (c >= 2, c > COLLISION_LIMIT, d > STALE_DAYS);
+            let mut dup = false;
+            let crc = if hex {
+                let mut lower = [0u8; 40];
+                for (l, b) in lower.iter_mut().zip(fp) {
+                    *l = b.to_ascii_lowercase();
+                }
+                dup = !seen.insert(lower);
+                i64::from(crc32(&lower))
+            } else {
+                lower_crc(fp, &mut buf)
+            };
+            let action: i64 = if !hex {
+                0
+            } else if heavy {
+                5
+            } else if relation == 3 {
+                4
+            } else if relation == 0 {
+                1
+            } else if relation == 2 || stale {
+                3
+            } else {
+                2
+            };
+            actions[action as usize] += 1;
+            collisions += i64::from(collision);
+            stales += i64::from(stale);
+            out.push(
+                key | relation << 2
+                    | i64::from(collision) << 4
+                    | i64::from(heavy) << 5
+                    | i64::from(stale) << 6
+                    | i64::from(bad) << 7
+                    | i64::from(dup) << 8
+                    | action << 9
+                    | c.min(0xFFFF) << 12
+                    | d.min(0xFFFF) << 28
+                    | (crc & 0x7FFFF) << 44,
+            );
+        }
+        out.extend(actions);
+        out.extend([seen.len() as i64, collisions, stales]);
+        out
+    }
+
+    // ---- Exports -----------------------------------------------------------------------------
+
+    macro_rules! export {
+        ($name:ident, $plan:ident) => {
+            /// # Safety
+            /// `items` must be readable for `items_len` bytes and `out` writable for `out_cap`
+            /// words.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                items: *const u8,
+                items_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let inputs = [(items, items_len)];
+                unsafe {
+                    emit(out, out_cap, count, &inputs, || {
+                        Some($plan(&column(span(items, items_len)?, count)?))
+                    })
+                }
+            }
+        };
+    }
+
+    export!(
+        nntmux_w602_nzb_upload_staging_plan_batch,
+        upload_staging_plan
+    );
+    export!(
+        nntmux_w602_nzb_xml_element_summary_batch,
+        xml_element_summary
+    );
+    export!(
+        nntmux_w602_par2_candidate_recovery_plan_batch,
+        candidate_recovery_plan
+    );
+    export!(
+        nntmux_w602_par2_recovery_result_summary_batch,
+        recovery_result_summary
+    );
+    export!(
+        nntmux_w602_release_article_fingerprint_store_plan_batch,
+        fingerprint_store_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn refs<'a>(v: &[&'a str]) -> Vec<&'a [u8]> {
+            v.iter().map(|s| s.as_bytes()).collect()
+        }
+
+        #[test]
+        fn fields_pad_and_keep_the_tail() {
+            assert_eq!(fields::<3>(b"a\tb\tc\td"), [b"a".as_slice(), b"b", b"c\td"]);
+            assert_eq!(fields::<3>(b"a"), [b"a".as_slice(), b"", b""]);
+            assert_eq!(fields::<2>(b""), [b"".as_slice(), b""]);
+        }
+
+        #[test]
+        fn upload_rows_classify_name_size_age_and_head() {
+            let words = upload_staging_plan(&[
+                b"Show.nzb\t100\t5\t<?xml version=\"1.0\"?>".as_slice(),
+                b"a/b.nzb\t1\t1\t<nzb>",
+                b"Notes.NFO\t70000\t0\ttext",
+                b"old.nzb\t5\t90000\t<nzb ",
+                b"x.nzb\t5\t1\t\x1f\x8bzz",
+            ]);
+            assert_eq!(words[0] & 0x3FFF, 1 | 3 << 8);
+            assert_eq!(words[0] >> 14 & 0x3FFFF, 4);
+            assert_eq!(words[0] >> 32 & 0xFFFF_FFFF, i64::from(crc32(b"show")));
+            assert_eq!(words[1] & 0x3FFF, 1 | 1 << 2 | 5 << 8 | 1 << 12);
+            assert_eq!(words[2] & 0x3FFF, 2 | 2 << 4 | 7 << 8 | 1 << 12);
+            assert_eq!(words[3] & 0x3FFF, 1 | 1 << 6 | 5 << 8 | 2 << 12);
+            assert_eq!(words[4] & 0x3FFF, 1 | 1 << 8 | 1 << 12);
+            assert_eq!(words[5..], [1, 3, 1, 4, 1, 100, 1]);
+        }
+
+        #[test]
+        fn xml_elements_parse_attributes_and_content() {
+            let words = xml_element_summary(&refs(&[
+                "<segment bytes=\"700\" number=\"3\">abc@def</segment>",
+                "<file poster='p' date='12' subject='s'/>",
+                "<meta type=\"password\">x</meta>",
+                "<group>alt.bin</group >",
+                "<segment bytes=\"7\" number=\"0\">a b</segment>",
+                "<x:meta a=\"1\" a=\"2\" type=\"t\">v</x:meta>",
+                "<file poster=\"p\"",
+                "nope",
+            ]));
+            assert_eq!(words[0], 5 | 2 << 11 | 3 << 14 | 700 << 34);
+            assert_eq!(words[1], 1 | 1 << 9 | 3 << 11);
+            assert_eq!(words[2], 6 | 1 << 11);
+            assert_eq!(words[3], 3 | 1 << 8);
+            assert_eq!(words[4], 5 | 1 << 6 | 1 << 10 | 2 << 11);
+            assert_eq!(words[5], 6 | 1 << 7 | 3 << 11);
+            assert_eq!(words[6], 1 << 4);
+            assert_eq!(words[7], 1 << 4);
+            assert_eq!(words[8..], [2, 1, 0, 1, 0, 2, 2, 0, 0, 0, 3, 700, 3, 1]);
+        }
+
+        #[test]
+        fn candidate_recovery_rows_score_coverage() {
+            let set = "0123456789ABCDEF0123456789abcdef";
+            let row = format!("{set}\t3\tmain, FileDesc,recvslice,odd\t4\t5\tx.vol01+02.par2");
+            let words = candidate_recovery_plan(&refs(&[
+                &row,
+                "zz\t3\tmain\t0\t0\tx",
+                &format!("{set}\t3\tmain,filedesc\t0\t0\tx.par2"),
+            ]));
+            assert_eq!(words[0] & 0x7FFF, 2 | 11 << 3 | 1 << 9 | 1 << 10 | 1 << 11);
+            assert_eq!(words[0] >> 15 & 0xFF, 80 + 15 - 2 + 3);
+            assert_eq!(words[0] >> 23 & 0xFFFF, 3);
+            assert_eq!(words[1] & 0x7, 0);
+            assert_eq!(words[2] >> 15 & 0xFF, 100 + 10 + 7 + 3);
+            assert_eq!(words[3..], [1, 1, 1, 0, 0, 1, 4, 5, 120]);
+        }
+
+        #[test]
+        fn recovery_results_classify_verdicts() {
+            let words = recovery_result_summary(&refs(&[
+                "renamed\t2\t10\t80\tabc\tShow.S01E01.Title-GRP",
+                "renamed\t1\t1\t90\tSame\t same ",
+                "retryable\tx\t3\t\t\t",
+                "deferred\t1\t1\t50\t\t",
+            ]));
+            assert_eq!(words[0] & 0x7FFFF, 1 | 3 << 4 | 3 << 7 | 80 << 12);
+            assert_eq!(words[1] & 0x7FFFF, 1 | 1 << 4 | 3 << 7 | 1 << 9 | 90 << 12);
+            assert_eq!(words[2] & 0x7FFFF, 3 | 1 << 3 | 2 << 9);
+            assert_eq!(words[3] & 0x7FFFF, 4 | 2 << 7 | 3 << 9 | 50 << 12);
+            assert_eq!(words[4..], [1, 1, 1, 1, 0, 4, 15, 220, 2]);
+        }
+
+        #[test]
+        fn fingerprints_plan_store_actions() {
+            let fp = "0123456789abcdef0123456789abcdef01234567";
+            let up = fp.to_uppercase();
+            let words = fingerprint_store_plan(&refs(&[
+                &format!("{fp}\t\t1\t0"),
+                &format!("{up}\t{fp}\t2\t40"),
+                &format!("{fp}\t{fp}\t9\t1"),
+                "\t\t0\t0",
+                "nothex\tx\t1\tz",
+            ]));
+            assert_eq!(words[0] & 0xFFF, 1 | 1 << 9);
+            assert_eq!(
+                words[1] & 0xFFF,
+                2 | 2 << 2 | 1 << 4 | 1 << 6 | 1 << 8 | 3 << 9
+            );
+            assert_eq!(
+                words[2] & 0xFFF,
+                1 | 1 << 2 | 1 << 4 | 1 << 5 | 1 << 8 | 5 << 9
+            );
+            assert_eq!(words[3] & 0xFFF, 0);
+            assert_eq!(words[4] & 0xFFF, 3 | 3 << 2 | 1 << 7);
+            assert_eq!(words[5..], [2, 1, 0, 1, 0, 1, 1, 2, 1]);
+        }
+
+        #[test]
+        fn exports_guard_null_short_and_malformed_batches() {
+            let mut out = [0i64; 32];
+            let o = out.as_mut_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w602_nzb_upload_staging_plan_batch(b"a".as_ptr(), 1, 1, o, 32),
+                    9
+                );
+                assert_eq!(
+                    nntmux_w602_nzb_upload_staging_plan_batch(b"a".as_ptr(), 1, 1, o, 8),
+                    -9
+                );
+                assert_eq!(
+                    nntmux_w602_nzb_xml_element_summary_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w602_par2_candidate_recovery_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 32),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w602_par2_recovery_result_summary_batch(std::ptr::null(), 0, 0, o, 32),
+                    10
+                );
+                assert_eq!(
+                    nntmux_w602_release_article_fingerprint_store_plan_batch(
+                        std::ptr::null(),
+                        3,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                let mut shared = [0u8; 128];
+                shared[0] = b'a';
+                assert_eq!(
+                    nntmux_w602_release_article_fingerprint_store_plan_batch(
+                        shared.as_ptr(),
+                        1,
+                        1,
+                        shared.as_mut_ptr() as *mut i64,
+                        16
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}

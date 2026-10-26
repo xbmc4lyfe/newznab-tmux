@@ -7,10 +7,12 @@ namespace App\Services\Nzb;
 use App\Exceptions\NzbUploadException;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Throwable;
 
 final class NzbUploadStagingService
 {
@@ -96,7 +98,7 @@ final class NzbUploadStagingService
             );
 
             $this->publish($stagingDirectory, $uploadDirectory);
-        } catch (\Throwable $exception) {
+        } catch (Throwable $exception) {
             if ($this->filesystem->isDirectory($stagingDirectory)
                 && ! $this->filesystem->deleteDirectory($stagingDirectory)) {
                 Log::channel('nzb_upload')->error('Failed to roll back partial API upload', [
@@ -194,7 +196,7 @@ final class NzbUploadStagingService
 
         try {
             $content = $file->getContent();
-        } catch (\Throwable) {
+        } catch (Throwable) {
             throw new NzbUploadException("Failed to read {$expectedExtension} upload", 400);
         }
 
@@ -346,7 +348,7 @@ final class NzbUploadStagingService
     {
         try {
             $moved = $this->filesystem->move($stagingPath, $publishedPath);
-        } catch (\Throwable) {
+        } catch (Throwable) {
             $moved = false;
         }
 
@@ -454,5 +456,241 @@ final class NzbUploadStagingService
 
         return ['filenames' => $count, 'invalid' => $invalid, 'unsafe' => $unsafe, 'wrong_extension' => $wrong, 'accepted' => $accepted,
             'basename_bytes' => $bytes];
+    }
+
+    // ---- Wave 60.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 5.00x/5.09x, uncommon 6.16x/6.40x); see RustNzbUploadStagingXmlElementsPar2RecoveryResultFingerprintStoreW60ParityTest. */
+    public const bool W60_RUST_FFI_DEFAULT = true;
+
+    private const string W60_UPLOAD_STAGING_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w602_nzb_upload_staging_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W60_UPLOAD_STAGING_TAIL = 8;
+
+    /**
+     * Wave 60 routing, binding and output buffer, kept in function-local statics (no new static properties).
+     * Operations: null reads the routing override, 'set' replaces it (returning the previous
+     * one), 'ffi' resolves the binding and 'out' returns `[binding, buffer, capacity]` with room
+     * for at least $val words (null without the library).
+     */
+    private static function w60RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w60', self::W60_UPLOAD_STAGING_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w60RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW60RustFfi(): bool
+    {
+        $enabled = self::w60RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W60_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planUploadStagingBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW60RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w60RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w60RustFfiState('set', $previous);
+        }
+    }
+
+    /** @param  list<int>  $out */
+    private static function w60Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /**
+     * The words the export wrote, or null when it declined (returning anything but $words).
+     *
+     * @return list<int>|null
+     */
+    private static function w60Words(mixed $written, CData $out, int $words): ?array
+    {
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /** 1 to $max ASCII digits as an integer, otherwise null. */
+    private static function w60Digits(string $value, int $max): ?int
+    {
+        $length = \strlen($value);
+
+        return $length > 0 && $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : null;
+    }
+
+    /** Byte quota for a staged NZB (NFOs keep MAX_NFO_SIZE). */
+    public const int W60_MAX_NZB_BYTES = 67108864;
+
+    /** Seconds an unpublished staging entry may age before it is purged. */
+    public const int W60_STAGING_RETENTION = 86400;
+
+    /**
+     * Per `filename\tsize\tage\thead` row `kind | name << 2 | size << 4 | stale << 6 | bad_age << 7 |
+     * head << 8 | bom << 11 | action << 12 | min(len(base), 0x3FFFF) << 14 | crc32(lower(base)) << 32`,
+     * where base and extension split at the last dot (pathinfo() for slash-free names). Kind 2 for
+     * a `.nfo` extension (any case), otherwise 1 (NZB). Name: 0 accepted, 1 unsafe (as
+     * validateFilenamePhp()), 2 wrong extension or blank basename. Size: 0 within the kind's quota
+     * (W60_MAX_NZB_BYTES or MAX_NFO_SIZE), 1 empty, 2 over quota, 3 not 1-18 digits. Stale: an
+     * age (1-18 digits, else bad_age) above W60_STAGING_RETENTION. Head: 0 empty, 1 gzip magic,
+     * then after an optional UTF-8 BOM and `[ \t\r\n]*`: 2 nothing, 3 `<?xml`, 4 `<!DOCTYPE` (any
+     * case), 5 a `<nzb` root, 6 another element, 7 text. Action: 2 purge (stale), 1 reject (bad
+     * name, size or age, or a head that is not 3-5 for an NZB or 3-7 for an NFO), 0 accept. Then
+     * the accept, reject and purge counts, the NZB and NFO counts, the accepted bytes, the
+     * distinct accepted lowercase basenames and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function planUploadStagingBatchPhp(array $rows): array
+    {
+        $out = $seen = [];
+        $actions = [0, 0, 0];
+        $nzb = $nfo = $bytes = 0;
+        foreach ($rows as $row) {
+            [$name, $size, $age, $head] = explode("\t", (string) $row, 4) + ['', '', '', ''];
+            $dot = strrpos($name, '.');
+            $base = $dot === false ? $name : substr($name, 0, $dot);
+            $extension = $dot === false ? '' : strtolower(substr($name, $dot + 1));
+            $isNfo = $extension === 'nfo';
+            if ($name === '' || $name === '.' || $name === '..' || strpbrk($name, "/\\\0") !== false) {
+                $nameStatus = 1;
+            } elseif ((! $isNfo && $extension !== 'nzb') || trim($base) === '') {
+                $nameStatus = 2;
+            } else {
+                $nameStatus = 0;
+            }
+            $parsed = self::w60Digits($size, 18);
+            $sizeStatus = match (true) {
+                $parsed === null => 3,
+                $parsed === 0 => 1,
+                $parsed > ($isNfo ? self::MAX_NFO_SIZE : self::W60_MAX_NZB_BYTES) => 2,
+                default => 0,
+            };
+            $ageValue = self::w60Digits($age, 18);
+            $stale = $ageValue !== null && $ageValue > self::W60_STAGING_RETENTION;
+            $bom = 0;
+            if ($head === '') {
+                $class = 0;
+            } elseif (str_starts_with($head, "\x1f\x8b")) {
+                $class = 1;
+            } else {
+                $bom = str_starts_with($head, "\xef\xbb\xbf") ? 1 : 0;
+                $rest = ltrim($bom === 1 ? substr($head, 3) : $head, " \t\r\n");
+                $class = match (true) {
+                    $rest === '' => 2,
+                    str_starts_with($rest, '<?xml') => 3,
+                    strncasecmp($rest, '<!doctype', 9) === 0 => 4,
+                    str_starts_with($rest, '<nzb') && (\strlen($rest) === 4 || str_contains(" \t\r\n>/", $rest[4])) => 5,
+                    $rest[0] === '<' => 6,
+                    default => 7,
+                };
+            }
+            if ($stale) {
+                $action = 2;
+            } elseif ($nameStatus !== 0 || $sizeStatus !== 0 || $ageValue === null) {
+                $action = 1;
+            } else {
+                $action = ($isNfo ? $class >= 3 : $class >= 3 && $class <= 5) ? 0 : 1;
+            }
+            $actions[$action]++;
+            $isNfo ? $nfo++ : $nzb++;
+            $lower = strtolower($base);
+            if ($action === 0) {
+                $bytes += (int) $parsed;
+                $seen[$lower] = true;
+            }
+            $out[] = ($isNfo ? 2 : 1) | $nameStatus << 2 | $sizeStatus << 4 | (int) $stale << 6 | ($ageValue === null ? 1 : 0) << 7 | $class << 8
+                | $bom << 11 | $action << 12 | min(\strlen($base), 0x3FFFF) << 14 | crc32($lower) << 32;
+        }
+        array_push($out, ...$actions);
+        array_push($out, $nzb, $nfo, $bytes, \count($seen));
+        $out[] = self::w60Digest($out);
+
+        return $out;
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function planUploadStagingBatch(array $rows): array
+    {
+        return self::usesW60RustFfi() ? self::planUploadStagingBatchNative($rows) : self::planUploadStagingBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function planUploadStagingBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W60_UPLOAD_STAGING_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w60RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::planUploadStagingBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W60_UPLOAD_STAGING_FFI_CDEF.)
+            $written = $ffi->nntmux_w602_nzb_upload_staging_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+
+        return self::w60Words($written, $out, $words) ?? self::planUploadStagingBatchPhp($rows);
     }
 }
