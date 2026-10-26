@@ -605,4 +605,321 @@ CDEF;
                 return $enabled;
         }
     }
+
+    // ========================================================================
+    // WAVE 66.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of four 1000-round paired runs reached 6.37x common mean, 5.93x common p99, 5.73x uncommon mean and 5.48x uncommon p99; see RustBooksProcessorCategorizationPipelineResultServicePipeW66ParityTest. */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    private const string W66_FFI_CDEF = 'ssize_t nntmux_w664_categorization_pipeline_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w66CategorizationPipelinePlanBatch() record. */
+    public const int W66_ROW_WORDS = 5;
+
+    /** int64 summary words after the w66CategorizationPipelinePlanBatch() records (none for an empty batch). */
+    public const int W66_TRAILER_WORDS = 10;
+
+    /** Pipe results considered per release; later valid lines count as overflow. */
+    public const int W66_MAX_PIPES = 32;
+
+    /**
+     * Pipeline resolution rows for [release name, pipe results, priority cutoff, locked to Misc]
+     * items, as categorize() runs the pipes through handle() and updateBestResult().
+     *
+     * Pipe results are LF-separated lines, each trimmed (empty ones skipped) and split into five
+     * `|` fields: pipe name, priority (1-6 digits), category ID (1-6 digits), confidence in basis
+     * points (1-5 digits, at most 10000) and matchedBy (the rest of the line). Other lines are
+     * malformed; valid lines after W66_MAX_PIPES overflow. Pipes run by ascending priority, then
+     * line order. A positive cutoff cuts pipes with a higher priority; a pipe is stopped while the
+     * release is locked to Misc or the best confidence is at least 9500; otherwise its result
+     * replaces the best (initially the no_match sentinel) when it is successful and overrides it
+     * (shouldOverridePhp() in basis points, 6000 protecting a Misc result). A protected result
+     * from the `misc` pipe locks the release. Decisions: 1 no valid pipe, 2 no match, 3 matched,
+     * 4 locked to a protected Misc result, 5 matched at stop confidence.
+     *
+     * Rows [decision | valid << 4 | evaluated << 10 | stopped << 16 | cut << 22 | malformed << 28
+     * | overflow << 36 (both clamped to 255) | updates << 44 | best line + 1 << 50 | empty name
+     * << 56 | locked << 57, best category, best confidence, fnv1a32(strtolower(best matchedBy)),
+     * fnv1a32(strtolower(trimmed name)) (0 when empty)], then the trailer [records, the five
+     * decision counts, valid pipes, malformed lines, stopped pipes, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: int, 3: int}>  $items
+     * @return list<int>
+     */
+    public static function w66CategorizationPipelinePlanBatch(array $items): array
+    {
+        return self::usesW66RustFfi() ? self::w66CategorizationPipelinePlanBatchNative($items) : self::w66CategorizationPipelinePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int}>  $items
+     * @return list<int>
+     */
+    public static function w66CategorizationPipelinePlanBatchPhp(array $items): array
+    {
+        self::w66Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $t = [\count($items), 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        foreach ($items as [$name, $results, $cutoff, $locked]) {
+            $name = trim($name);
+            $pipes = [];
+            $malformed = $overflow = 0;
+            foreach (explode("\n", $results) as $line) {
+                $line = trim($line);
+                if ($line === '') {
+                    continue;
+                }
+                $f = explode('|', $line, 5);
+                if (\count($f) !== 5 || ! self::w66Number($f[1], 6) || ! self::w66Number($f[2], 6) || ! self::w66Number($f[3], 5)) {
+                    $malformed++;
+
+                    continue;
+                }
+                if (\count($pipes) === self::W66_MAX_PIPES) {
+                    $overflow++;
+
+                    continue;
+                }
+                $pipes[] = [(int) $f[1], \count($pipes), strtolower(trim($f[0])) === 'misc', (int) $f[2], min((int) $f[3], 10_000), $f[4]];
+            }
+            $valid = \count($pipes);
+            usort($pipes, static fn (array $a, array $b): int => $a[0] <=> $b[0] ?: $a[1] <=> $b[1]);
+            $locked = $locked !== 0;
+            $bestCategory = Category::OTHER_MISC;
+            $bestConfidence = 0;
+            $bestBy = 'no_match';
+            $bestIndex = -1;
+            $bestProtected = false;
+            $evaluated = $stopped = $cut = $updates = 0;
+            foreach ($pipes as [$priority, $index, $misc, $category, $confidence, $matchedBy]) {
+                if ($cutoff > 0 && $priority > $cutoff) {
+                    $cut++;
+
+                    continue;
+                }
+                if ($locked || $bestConfidence >= 9500) {
+                    $stopped++;
+
+                    continue;
+                }
+                $evaluated++;
+                if ($confidence <= 0 || ($category === Category::OTHER_MISC && $matchedBy === 'no_match')) {
+                    continue;
+                }
+                if ($category !== Category::OTHER_MISC && $category !== Category::OTHER_HASHED && $bestProtected && $confidence < 6000) {
+                    $wins = false;
+                } elseif ($confidence !== $bestConfidence) {
+                    $wins = $confidence > $bestConfidence;
+                } else {
+                    $wins = $category !== Category::OTHER_MISC && $bestCategory === Category::OTHER_MISC;
+                }
+                if ($wins) {
+                    [$bestCategory, $bestConfidence, $bestBy, $bestIndex] = [$category, $confidence, $matchedBy, $index];
+                    $bestProtected = $category === Category::OTHER_HASHED || ($category === Category::OTHER_MISC && (str_starts_with($matchedBy, 'hash_')
+                        || str_starts_with($matchedBy, 'obfuscated_') || str_starts_with($matchedBy, 'gibberish_') || $matchedBy === 'group_only_low_signal'));
+                    $updates++;
+                    if ($misc && $bestProtected) {
+                        $locked = true;
+                    }
+                }
+            }
+            $decision = match (true) {
+                $locked && $bestProtected => 4,
+                $bestIndex < 0 => $valid === 0 ? 1 : 2,
+                $bestConfidence >= 9500 => 5,
+                default => 3,
+            };
+            $word = $decision | $valid << 4 | $evaluated << 10 | $stopped << 16 | $cut << 22 | min($malformed, 255) << 28 | min($overflow, 255) << 36
+                | $updates << 44 | ($bestIndex + 1) << 50 | ($name === '' ? 1 : 0) << 56 | ($locked ? 1 : 0) << 57;
+            array_push($out, $word, $bestCategory, $bestConfidence, self::w66Fnv(strtolower($bestBy)), self::w66Fnv(strtolower($name)));
+            $t[$decision]++;
+            $t[6] += $valid;
+            $t[7] += $malformed;
+            $t[8] += $stopped;
+            $value = $word ^ $bestCategory << 16 ^ $bestConfidence;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $t[9] = $digest;
+
+        return [...$out, ...$t];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int}>  $items
+     * @return list<int>
+     */
+    public static function w66CategorizationPipelinePlanBatchNative(array $items): array
+    {
+        self::w66Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w66Join([array_column($items, 0), array_column($items, 1)]);
+        $ints = pack('P*', ...array_column($items, 2), ...array_column($items, 3));
+
+        return self::w66Call($blob, $twin, $ints, $count, $count * self::W66_ROW_WORDS + self::W66_TRAILER_WORDS)
+            ?? self::w66CategorizationPipelinePlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w66Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new \InvalidArgumentException('W66 categorization pipeline plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 4 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_int($item[2]) || ! \is_int($item[3])) {
+                throw new \InvalidArgumentException('W66 categorization pipeline plan batch items must be [string release name, string pipe results, int priority cutoff, int locked] lists.');
+            }
+        }
+    }
+
+    /** 1 to $max ASCII digits. */
+    private static function w66Number(string $value, int $max): bool
+    {
+        return $value !== '' && \strlen($value) <= $max && ctype_digit($value);
+    }
+
+    public static function usesW66RustFfi(): bool
+    {
+        $enabled = self::w66RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W66_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('enabled', true);
+    }
+
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('enabled', false);
+    }
+
+    /** Drop the W66 override, binding, output buffer and declined-call count; routing returns to W66_RUST_FFI_DEFAULT. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W66 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('enabled');
+        self::w66RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w66Join(array $columns): array
+    {
+        $values = array_merge(...$columns);
+        $joined = implode("\0", $values);
+
+        return substr_count($joined, "\0") === \count($values) - 1 ? [$joined, ''] : [$joined, implode("\x01", $values)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w66Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w66RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w66', self::W66_FFI_CDEF) ?? false;
+            self::w66RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w66RustFfiState('out', $out);
+                self::w66RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W66_FFI_CDEF.)
+            $written = $ffi->nntmux_w664_categorization_pipeline_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (Throwable) {
+        }
+        self::w66RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W66 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int, 0 for an empty string. */
+    private static function w66Fnv(string $bytes): int
+    {
+        if ($bytes === '') {
+            return 0;
+        }
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
+    }
 }

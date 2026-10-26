@@ -764,4 +764,278 @@ class CategorizationService
                 return $enabled;
         }
     }
+
+    // ========================================================================
+    // WAVE 66.4 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of four 1000-round paired runs reached 1.75x common mean, 1.72x common p99, 1.75x uncommon mean and 1.85x uncommon p99; see RustBooksProcessorCategorizationPipelineResultServicePipeW66ParityTest. */
+    public const bool W66_RUST_FFI_DEFAULT = true;
+
+    private const string W66_FFI_CDEF = 'ssize_t nntmux_w664_categorization_service_plan_batch(const char *blob, size_t blob_len, const char *twin, size_t twin_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);';
+
+    /** int64 words per w66CategorizationServicePlanBatch() record. */
+    public const int W66_ROW_WORDS = 4;
+
+    /** int64 summary words after the w66CategorizationServicePlanBatch() records (none for an empty batch). */
+    public const int W66_TRAILER_WORDS = 13;
+
+    /** Lower-cased group name substrings and their category roots; the first match routes the group. */
+    private const array W66_GROUP_ROUTES = [
+        ['erotica', 6000], ['xxx', 6000], ['teevee', 5000], ['hdtv', 5000], ['moovee', 2000], ['movies', 2000], ['dvd', 2000], ['x264', 2000],
+        ['sounds', 3000], ['mp3', 3000], ['music', 3000], ['audiobook', 3000], ['e-book', 7000], ['ebook', 7000], ['comics', 7000],
+        ['games', 1000], ['console', 1000], ['nintendo', 1000], ['xbox', 1000], ['apps', 4000], ['mac', 4000],
+    ];
+
+    /**
+     * Routing rows for [release name, group name, cached category, pipeline category, legacy
+     * category] items, as batchCategorize() and compare() resolve one release each.
+     *
+     * Names and groups are trimmed and lower-cased; the pair is the in-batch cache key. A cached
+     * category from 0 to 8999 is a cache hit; a repeated key reuses its first record's category.
+     * The group route is the first W66_GROUP_ROUTES substring of the group (1-based, 0 none).
+     * Routes and final categories: 1 cache hit (the cached category), 2 batch hit (the first
+     * record's), 3 empty name (OTHER_MISC), 4 32 or 40 hex digit name (OTHER_HASHED), 5 pipeline
+     * (a valid category other than OTHER_MISC), 6 group route (its root + 999), 7 legacy (a valid
+     * category), 8 fallback (OTHER_MISC). Flags: 1 pipeline and legacy (both non-negative) match,
+     * 2 they differ, 4 hex name, 8 cached category above 8999, 16 empty group, 32 empty name.
+     *
+     * Rows [route | cache (0 miss, 1 hit, 2 batch hit) << 4 | group route << 6 | flags << 11 |
+     * first record + 1 for batch hits << 17 | name length (clamped to 2^16 - 1) << 38, final
+     * category, fnv1a32(name), fnv1a32(group) (both lower-cased, 0 when empty)], then the trailer
+     * [records, the eight route counts, matches, mismatches, distinct keys, FNV-1a digest].
+     *
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int}>  $items
+     * @return list<int>
+     */
+    public static function w66CategorizationServicePlanBatch(array $items): array
+    {
+        return self::usesW66RustFfi() ? self::w66CategorizationServicePlanBatchNative($items) : self::w66CategorizationServicePlanBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int}>  $items
+     * @return list<int>
+     */
+    public static function w66CategorizationServicePlanBatchPhp(array $items): array
+    {
+        self::w66Items($items);
+        if ($items === []) {
+            return [];
+        }
+        $out = [];
+        $t = [\count($items), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $digest = 2_166_136_261;
+        $seen = [];
+        $finals = [];
+        foreach ($items as $i => [$name, $group, $cached, $pipeline, $legacy]) {
+            $name = strtolower(trim($name));
+            $group = strtolower(trim($group));
+            $routeGroup = $root = 0;
+            foreach (self::W66_GROUP_ROUTES as $k => [$needle, $parent]) {
+                if (str_contains($group, $needle)) {
+                    [$routeGroup, $root] = [$k + 1, $parent];
+
+                    break;
+                }
+            }
+            $hashed = (\strlen($name) === 32 || \strlen($name) === 40) && ctype_xdigit($name);
+            $first = $seen[\strlen($name).':'.$name.$group] ??= $i;
+            $dup = $first === $i ? -1 : $first;
+            [$route, $cache, $category] = match (true) {
+                $cached >= 0 && $cached <= self::W403_MAX_CATEGORY_ID => [1, 1, $cached],
+                $dup >= 0 => [2, 2, $finals[$first]],
+                $name === '' => [3, 0, Category::OTHER_MISC],
+                $hashed => [4, 0, Category::OTHER_HASHED],
+                $pipeline >= 0 && $pipeline <= self::W403_MAX_CATEGORY_ID && $pipeline !== Category::OTHER_MISC => [5, 0, $pipeline],
+                $root > 0 => [6, 0, $root + 999],
+                $legacy >= 0 && $legacy <= self::W403_MAX_CATEGORY_ID => [7, 0, $legacy],
+                default => [8, 0, Category::OTHER_MISC],
+            };
+            $finals[] = $category;
+            $both = $pipeline >= 0 && $legacy >= 0;
+            $flags = ($both && $pipeline === $legacy ? 1 : 0) | ($both && $pipeline !== $legacy ? 2 : 0) | ($hashed ? 4 : 0) | ($cached > self::W403_MAX_CATEGORY_ID ? 8 : 0)
+                | ($group === '' ? 16 : 0) | ($name === '' ? 32 : 0);
+            $word = $route | $cache << 4 | $routeGroup << 6 | $flags << 11 | ($dup + 1) << 17 | min(\strlen($name), 0xFFFF) << 38;
+            $nameHash = self::w66Fnv($name);
+            array_push($out, $word, $category, $nameHash, self::w66Fnv($group));
+            $t[$route]++;
+            $t[9] += $flags & 1;
+            $t[10] += ($flags >> 1) & 1;
+            $value = $word ^ $category << 24 ^ $nameHash;
+            $digest = (($digest ^ (($value ^ ($value >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $t[11] = \count($seen);
+        $t[12] = $digest;
+
+        return [...$out, ...$t];
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int, 3: int, 4: int}>  $items
+     * @return list<int>
+     */
+    public static function w66CategorizationServicePlanBatchNative(array $items): array
+    {
+        self::w66Items($items);
+        $count = \count($items);
+        if ($count === 0) {
+            return [];
+        }
+        [$blob, $twin] = self::w66Join([array_column($items, 0), array_column($items, 1)]);
+        $ints = pack('P*', ...array_column($items, 2), ...array_column($items, 3), ...array_column($items, 4));
+
+        return self::w66Call($blob, $twin, $ints, $count, $count * self::W66_ROW_WORDS + self::W66_TRAILER_WORDS)
+            ?? self::w66CategorizationServicePlanBatchPhp($items);
+    }
+
+    /** @param array<array-key, mixed> $items */
+    private static function w66Items(array $items): void
+    {
+        if (! array_is_list($items)) {
+            throw new \InvalidArgumentException('W66 categorization service plan batch items must be a list.');
+        }
+        foreach ($items as $item) {
+            if (! \is_array($item) || \count($item) !== 5 || ! array_is_list($item) || ! \is_string($item[0]) || ! \is_string($item[1]) || ! \is_int($item[2])
+                || ! \is_int($item[3]) || ! \is_int($item[4])) {
+                throw new \InvalidArgumentException('W66 categorization service plan batch items must be [string release name, string group name, int cached category, int pipeline category, int legacy category] lists.');
+            }
+        }
+    }
+
+    public static function usesW66RustFfi(): bool
+    {
+        $enabled = self::w66RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W66_RUST_FFI_DEFAULT;
+    }
+
+    public static function enableW66RustFfi(): void
+    {
+        self::w66RustFfiState('enabled', true);
+    }
+
+    public static function disableW66RustFfi(): void
+    {
+        self::w66RustFfiState('enabled', false);
+    }
+
+    /** Drop the W66 override, binding, output buffer and declined-call count; routing returns to W66_RUST_FFI_DEFAULT. */
+    public static function resetW66RustFfi(): void
+    {
+        self::w66RustFfiState('reset');
+    }
+
+    /**
+     * Run $callback with the W66 dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w66RustFfiState('enabled');
+        self::w66RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w66RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * String columns NUL-joined field-major and, when a value holds a NUL, the same columns
+     * joined by 0x01 so Rust finds the real separators.
+     *
+     * @param  list<list<string>>  $columns
+     * @return array{0: string, 1: string}
+     */
+    private static function w66Join(array $columns): array
+    {
+        $values = array_merge(...$columns);
+        $joined = implode("\0", $values);
+
+        return substr_count($joined, "\0") === \count($values) - 1 ? [$joined, ''] : [$joined, implode("\x01", $values)];
+    }
+
+    /**
+     * One FFI crossing for the batch: $need int64 words back. Null when the library is missing
+     * or declines a malformed frame, so the caller falls back to PHP; a declined call with a
+     * resolved library is counted in the 'misses' state.
+     *
+     * @return list<int>|null
+     */
+    private static function w66Call(string $blob, string $twin, string $ints, int $count, int $need): ?array
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        $state = self::w66RustFfiState();
+        $ffi = $state['ffi'];
+        if ($ffi === null) {
+            $ffi = RustPipelineLibrary::resolveDomain('metadata_w66', self::W66_FFI_CDEF) ?? false;
+            self::w66RustFfiState('ffi', $ffi);
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+        try {
+            $out = $state['out'];
+            $cap = $state['cap'];
+            if (! $out instanceof CData || $cap < $need) {
+                $cap = max(4096, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w66RustFfiState('out', $out);
+                self::w66RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W66_FFI_CDEF.)
+            $written = $ffi->nntmux_w664_categorization_service_plan_batch($blob, \strlen($blob), $twin, \strlen($twin), $ints, \strlen($ints), $count, $out, $cap);
+            $values = $written === $need ? unpack('P*', FFI::string($out, $need * 8)) : false;
+            if ($values !== false) {
+                return array_values($values);
+            }
+        } catch (\Throwable) {
+        }
+        self::w66RustFfiState('misses', $state['misses'] + 1);
+
+        return null;
+    }
+
+    /**
+     * W66 routing override, cached binding, reusable output buffer and declined-call count, kept
+     * in a function static so the class declares no new property: no arguments returns the state,
+     * one argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int, misses: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0, 'misses' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+
+            return null;
+        }
+
+        return $state[$op] ?? null;
+    }
+
+    /** FNV-1a 32 of $bytes as an unsigned int, 0 for an empty string. */
+    private static function w66Fnv(string $bytes): int
+    {
+        if ($bytes === '') {
+            return 0;
+        }
+        /** @var array{1: int} $hash */
+        $hash = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $hash[1];
+    }
 }
