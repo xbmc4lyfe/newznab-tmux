@@ -48015,3 +48015,1071 @@ pub mod w636_enum_plans {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 64.6: user role, processing outcome, processing stage, source position
+// and video container plans (`nntmux_w646_*`) for UserRole, ProcessingOutcome,
+// ProcessingStage, SourcePosition and VideoContainer. Same contract as Wave
+// 63.6: strings are NUL-joined column after column (with a 0x01-joined twin
+// when one holds a NUL), integer columns are machine-order `int64_t`, and the
+// result is fixed-width `int64_t` words. Every export returns 1, -1 for invalid
+// input or an output range overlapping an input (PHP then computes the batch)
+// or -2 when `out` is null, misaligned or too small, and leaves `out` untouched
+// unless it returns 1.
+// ---------------------------------------------------------------------------
+
+pub mod w646_enum_plans {
+    use super::*;
+
+    /// Validates `out` (-2), then rejects an output range overlapping any
+    /// input (-1) before running `compute` under `w49_run`.
+    unsafe fn w646_run(
+        out: *mut i64,
+        out_cap: usize,
+        inputs: &[(*const u8, usize)],
+        compute: impl FnOnce() -> Option<Vec<i64>>,
+    ) -> i32 {
+        if out.is_null() || !w17_aligned(out.cast_const(), out_cap) {
+            return -2;
+        }
+        let start = out as usize;
+        // `w17_aligned` proved `out_cap * 8` fits without wrapping.
+        let end = start + out_cap * std::mem::size_of::<i64>();
+        let disjoint = inputs.iter().all(|&(ptr, len)| {
+            len == 0 || ptr.is_null() || {
+                let from = ptr as usize;
+                from.saturating_add(len) <= start || from >= end
+            }
+        });
+        if !disjoint {
+            return -1;
+        }
+        // SAFETY: forwarded output contract.
+        unsafe { w49_run(out, out_cap, compute) }
+    }
+
+    /// A token length saturated to 8 bits.
+    #[inline]
+    fn w646_len8(value: &[u8]) -> i64 {
+        value.len().min(255) as i64
+    }
+
+    /// PHP `strtolower(trim($value))` into `buffer` with `_` (and, when
+    /// `spaces`, ` `) turned into `-`.
+    #[inline]
+    fn w646_normalize_into(value: &[u8], buffer: &mut Vec<u8>, spaces: bool) {
+        w616_lower_trim_into(value, buffer);
+        for byte in buffer.iter_mut() {
+            if *byte == b'_' || (spaces && *byte == b' ') {
+                *byte = b'-';
+            }
+        }
+    }
+
+    // --- UserRole::w64UserRolePlanBatch --------------------------------------
+
+    pub(crate) const W646_ROLE_HEADER: usize = 22;
+
+    /// Requests per window for a quota at or below 0, and the quota cap (2^31).
+    const W646_ROLE_QUOTA: i64 = 100;
+    const W646_ROLE_QUOTA_CAP: i64 = 1 << 31;
+
+    /// Request clamp (2^32 - 1).
+    const W646_ROLE_REQUEST_CAP: i64 = (1 << 32) - 1;
+
+    /// `nntmux_signup_role_queue_flags` bits per case (unknown 0): known 1,
+    /// admin 2, moderator 4, disabled 8, elevated 16.
+    const W646_ROLE_FLAGS: [i64; 5] = [1, 19, 9, 21, 0];
+
+    /// Case 0 user, 1 admin, 2 disabled, 3 moderator, 4 unknown; source 0
+    /// backing value, 1 case name, 2 label, 3 alias of the lowercased trimmed
+    /// token, 4 unknown.
+    #[inline]
+    fn w646_role_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+        match raw {
+            b"1" => (0, 0),
+            b"2" => (1, 0),
+            b"3" => (2, 0),
+            b"4" => (3, 0),
+            b"USER" => (0, 1),
+            b"ADMIN" => (1, 1),
+            b"DISABLED" => (2, 1),
+            b"MODERATOR" => (3, 1),
+            b"User" => (0, 2),
+            b"Admin" => (1, 2),
+            b"Disabled" => (2, 2),
+            b"Moderator" => (3, 2),
+            _ => {
+                w616_lower_trim_into(raw, lower);
+                match lower.as_slice() {
+                    b"user" | b"users" | b"member" | b"regular" => (0, 3),
+                    b"admin" | b"admins" | b"administrator" | b"root" | b"superuser" => (1, 3),
+                    b"disabled" | b"banned" | b"suspended" | b"inactive" | b"locked" => (2, 3),
+                    b"moderator" | b"moderators" | b"mod" | b"mods" | b"staff" => (3, 3),
+                    _ => (4, 4),
+                }
+            }
+        }
+    }
+
+    /// Role tokens with a requests-in-window column and a base quota (at or
+    /// below 0 means 100, capped at 2^31). Requests clamp to 0..2^32-1. Users
+    /// get the base quota, moderators five times it, admins no limit. Action 0
+    /// allow, 1 throttle (requests at or above the limit), 2 deny (disabled), 3
+    /// reject (unknown). `[0]` count, `[1..6]` per case, `[6..11]` per source,
+    /// `[11..15]` per action, `[15]` elevated, `[16]` base quota, `[17]` total
+    /// requests, `[18]` first throttled and `[19]` first rejected index (-1),
+    /// `[20]` mask of known cases, `[21]` FNV-1a digest; then per role `case |
+    /// source << 3 | flags << 6 | action << 11 | min(token bytes, 255) << 13 |
+    /// requests << 21`.
+    pub(crate) fn w646_role_batch(roles: &[&[u8]], requests: &[i64], quota: i64) -> Vec<i64> {
+        let count = roles.len();
+        let base = if quota <= 0 {
+            W646_ROLE_QUOTA
+        } else {
+            quota.min(W646_ROLE_QUOTA_CAP)
+        };
+        let mut out = vec![0i64; W646_ROLE_HEADER + count];
+        out[0] = count as i64;
+        out[16] = base;
+        out[18] = -1;
+        out[19] = -1;
+        let mut lower = Vec::new();
+        for (at, &raw) in roles.iter().enumerate() {
+            let (case, source) = w646_role_case(raw, &mut lower);
+            let used = requests[at].clamp(0, W646_ROLE_REQUEST_CAP);
+            let action: i64 = match case {
+                1 => 0,
+                2 => 2,
+                4 => 3,
+                _ => {
+                    let limit = if case == 3 { base * 5 } else { base };
+                    i64::from(used >= limit)
+                }
+            };
+            let flags = W646_ROLE_FLAGS[case as usize];
+            out[1 + case as usize] += 1;
+            out[6 + source as usize] += 1;
+            out[11 + action as usize] += 1;
+            out[15] += flags >> 4 & 1;
+            out[17] += used;
+            if action == 1 {
+                w586_first(&mut out[18], at);
+            }
+            if action == 3 {
+                w586_first(&mut out[19], at);
+            }
+            if case < 4 {
+                out[20] |= 1 << case;
+            }
+            out[W646_ROLE_HEADER + at] =
+                case | source << 3 | flags << 6 | action << 11 | w646_len8(raw) << 13 | used << 21;
+        }
+        out[21] = w526_digest(&out[W646_ROLE_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w646_user_role_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        quota: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w646_run(out, out_cap, &inputs, || {
+                let roles = w566_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    1,
+                    count,
+                )?;
+                let requests = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+                Some(w646_role_batch(&roles, &requests, quota))
+            })
+        }
+    }
+
+    // --- ProcessingOutcome::w64ProcessingOutcomePlanBatch --------------------
+
+    pub(crate) const W646_OUTCOME_HEADER: usize = 30;
+
+    /// Attempt limit for a limit at or below 0, attempt clamp (2^16 - 1) and
+    /// retry delay cap (7 days).
+    const W646_OUTCOME_ATTEMPTS: i64 = 5;
+    const W646_OUTCOME_ATTEMPT_CAP: i64 = 65_535;
+    const W646_OUTCOME_DELAY_CAP: i64 = 604_800;
+
+    /// Base retry delay in seconds per case (0 for a case that never retries).
+    const W646_OUTCOME_BACKOFF: [i64; 13] = [0, 0, 0, 3_600, 60, 900, 0, 0, 0, 0, 1_800, 300, 0];
+
+    /// Case 0-11 in declaration order, 12 unknown; source 0 backing value, 1
+    /// case name, 2 backing value of the trimmed, lowercased token with `_` and
+    /// spaces turned into `-`, 3 unknown.
+    #[inline]
+    fn w646_outcome_case(raw: &[u8], key: &mut Vec<u8>) -> (i64, i64) {
+        let case = w566_outcome_case(raw);
+        if case < 12 {
+            return (case, 0);
+        }
+        let named = match raw {
+            b"Completed" => 0,
+            b"NoUsefulArtifacts" => 1,
+            b"Passworded" => 2,
+            b"GroupUnavailable" => 3,
+            b"TemporaryWorkspaceUnavailable" => 4,
+            b"TimedOut" => 5,
+            b"DeletedAfterTimeout" => 6,
+            b"DeletedBrokenNzb" => 7,
+            b"DeletedPar2Only" => 8,
+            b"NotFound" => 9,
+            b"AwaitingLateArticles" => 10,
+            b"Failed" => 11,
+            _ => 12,
+        };
+        if named < 12 {
+            return (named, 1);
+        }
+        w646_normalize_into(raw, key, true);
+        match w566_outcome_case(key) {
+            12 => (12, 3),
+            case => (case, 2),
+        }
+    }
+
+    /// Outcome tokens with an attempts-so-far column and an attempt limit (at
+    /// or below 0 means 5, capped at 2^16-1). Attempts clamp to 0..2^16-1.
+    /// Action 0 complete (cases 0-2), 1 purge (deleted 6-8), 2 drop (not
+    /// found), 3 retry (cases 3-5, 10 and 11 below the limit), 4 give up (at or
+    /// above it), 5 invalid. A retry waits its base delay doubled per attempt
+    /// (up to 16 doublings), capped at 7 days. `[0]` count, `[1..14]` per case,
+    /// `[14..18]` per source, `[18..24]` per action, `[24]` successful, `[25]`
+    /// deleted, `[26]` total retry delay, `[27]` first retry and `[28]` first
+    /// invalid index (-1), `[29]` FNV-1a digest; then per outcome `case |
+    /// source << 4 | action << 6 | successful << 9 | deleted << 10 | attempts
+    /// << 11 | delay << 27 | min(token bytes, 255) << 47`.
+    pub(crate) fn w646_outcome_batch(outcomes: &[&[u8]], attempts: &[i64], limit: i64) -> Vec<i64> {
+        let count = outcomes.len();
+        let limit = if limit <= 0 {
+            W646_OUTCOME_ATTEMPTS
+        } else {
+            limit.min(W646_OUTCOME_ATTEMPT_CAP)
+        };
+        let mut out = vec![0i64; W646_OUTCOME_HEADER + count];
+        out[0] = count as i64;
+        out[27] = -1;
+        out[28] = -1;
+        let mut key = Vec::new();
+        for (at, &raw) in outcomes.iter().enumerate() {
+            let (case, source) = w646_outcome_case(raw, &mut key);
+            let tries = attempts[at].clamp(0, W646_OUTCOME_ATTEMPT_CAP);
+            let successful = i64::from(case <= 2);
+            let deleted = i64::from((6..=8).contains(&case));
+            let (action, delay): (i64, i64) = match case {
+                0..=2 => (0, 0),
+                6..=8 => (1, 0),
+                9 => (2, 0),
+                12 => (5, 0),
+                _ if tries >= limit => (4, 0),
+                _ => (
+                    3,
+                    (W646_OUTCOME_BACKOFF[case as usize] << tries.min(16))
+                        .min(W646_OUTCOME_DELAY_CAP),
+                ),
+            };
+            out[1 + case as usize] += 1;
+            out[14 + source as usize] += 1;
+            out[18 + action as usize] += 1;
+            out[24] += successful;
+            out[25] += deleted;
+            out[26] += delay;
+            if action == 3 {
+                w586_first(&mut out[27], at);
+            }
+            if action == 5 {
+                w586_first(&mut out[28], at);
+            }
+            out[W646_OUTCOME_HEADER + at] = case
+                | source << 4
+                | action << 6
+                | successful << 9
+                | deleted << 10
+                | tries << 11
+                | delay << 27
+                | w646_len8(raw) << 47;
+        }
+        out[29] = w526_digest(&out[W646_OUTCOME_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w646_processing_outcome_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        max_attempts: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w646_run(out, out_cap, &inputs, || {
+                let outcomes = w566_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    1,
+                    count,
+                )?;
+                let attempts = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+                Some(w646_outcome_batch(&outcomes, &attempts, max_attempts))
+            })
+        }
+    }
+
+    // --- ProcessingStage::w64ProcessingStagePlanBatch ------------------------
+
+    pub(crate) const W646_STAGE_HEADER: usize = 32;
+
+    /// Elapsed clamp (2^31 - 1) and budget cap (2^50).
+    const W646_STAGE_ELAPSED_CAP: i64 = (1 << 31) - 1;
+    const W646_STAGE_BUDGET_CAP: i64 = 1 << 50;
+
+    /// Timeout in seconds per stage (unknown 0).
+    const W646_STAGE_TIMEOUT: [i64; 14] = [
+        30, 60, 30, 30, 60, 600, 1_800, 900, 1_200, 900, 60, 120, 60, 0,
+    ];
+
+    /// Case 0-12 in pipeline order (the case is its rank), 13 unknown; source 0
+    /// backing value, 1 case name, 2 label, 3 backing value of the trimmed,
+    /// lowercased token with `_` turned into `-`, 4 unknown.
+    #[inline]
+    fn w646_stage_case(raw: &[u8], key: &mut Vec<u8>) -> (i64, i64) {
+        let named = match raw {
+            b"WorkspacePreparation" => (0, 1),
+            b"NzbParsing" => (1, 1),
+            b"ReleaseInitialization" => (2, 1),
+            b"MessageIdSelection" => (3, 1),
+            b"MediaSourcePlanning" => (4, 1),
+            b"DirectDownloads" => (5, 1),
+            b"ArchiveDownloads" => (6, 1),
+            b"ExtractedFiles" => (7, 1),
+            b"MediaSources" => (8, 1),
+            b"ArchiveFallbacks" => (9, 1),
+            b"TimeoutHandling" => (10, 1),
+            b"Finalization" => (11, 1),
+            b"WorkspaceCleanup" => (12, 1),
+            b"Workspace preparation" => (0, 2),
+            b"NZB parsing" => (1, 2),
+            b"Release initialization" => (2, 2),
+            b"Message-ID selection" => (3, 2),
+            b"Media source planning" => (4, 2),
+            b"Direct downloads" => (5, 2),
+            b"Archive downloads" => (6, 2),
+            b"Extracted files" => (7, 2),
+            b"Media sources" => (8, 2),
+            b"Archive fallbacks" => (9, 2),
+            b"Timeout handling" => (10, 2),
+            b"Workspace cleanup" => (12, 2),
+            _ => (13, 4),
+        };
+        if named.0 < 13 {
+            return named;
+        }
+        let exact = w646_stage_value(raw);
+        if exact < 13 {
+            return (exact, 0);
+        }
+        w646_normalize_into(raw, key, false);
+        match w646_stage_value(key) {
+            13 => (13, 4),
+            case => (case, 3),
+        }
+    }
+
+    #[inline]
+    fn w646_stage_value(value: &[u8]) -> i64 {
+        match value {
+            b"workspace-preparation" => 0,
+            b"nzb-parsing" => 1,
+            b"release-initialization" => 2,
+            b"message-id-selection" => 3,
+            b"media-source-planning" => 4,
+            b"direct-downloads" => 5,
+            b"archive-downloads" => 6,
+            b"extracted-files" => 7,
+            b"media-sources" => 8,
+            b"archive-fallbacks" => 9,
+            b"timeout-handling" => 10,
+            b"finalization" => 11,
+            b"workspace-cleanup" => 12,
+            _ => 13,
+        }
+    }
+
+    /// Stage tokens in execution order with an elapsed-seconds column and a
+    /// total budget (at or below 0 means none, capped at 2^50). Elapsed clamps
+    /// to 0..2^31-1. State 0 advance (rank above every earlier one; gap when it
+    /// skips a rank), 1 repeat (equal to the highest), 2 regress (below it), 3
+    /// unknown. A known stage times out when elapsed exceeds its timeout; a
+    /// stage is over budget once the running elapsed total exceeds the budget.
+    /// `[0]` count, `[1..15]` per case, `[15..20]` per source, `[20..24]` per
+    /// state, `[24]` gaps, `[25]` timed out, `[26]` over budget, `[27]` total
+    /// elapsed, `[28]` highest rank (-1), `[29]` first regress and `[30]` first
+    /// timed-out index (-1), `[31]` FNV-1a digest; then per stage `case |
+    /// source << 4 | state << 7 | gap << 9 | timed out << 10 | over budget <<
+    /// 11 | timeout << 12 | elapsed << 23 | min(token bytes, 255) << 54`.
+    pub(crate) fn w646_stage_batch(stages: &[&[u8]], elapsed: &[i64], budget: i64) -> Vec<i64> {
+        let count = stages.len();
+        let budget = if budget <= 0 {
+            -1
+        } else {
+            budget.min(W646_STAGE_BUDGET_CAP)
+        };
+        let mut out = vec![0i64; W646_STAGE_HEADER + count];
+        out[0] = count as i64;
+        out[28] = -1;
+        out[29] = -1;
+        out[30] = -1;
+        let mut key = Vec::new();
+        let mut total = 0i64;
+        for (at, &raw) in stages.iter().enumerate() {
+            let (case, source) = w646_stage_case(raw, &mut key);
+            let seconds = elapsed[at].clamp(0, W646_STAGE_ELAPSED_CAP);
+            let timeout = W646_STAGE_TIMEOUT[case as usize];
+            let (state, gap): (i64, i64) = if case == 13 {
+                (3, 0)
+            } else if case > out[28] {
+                let gap = i64::from(case > out[28] + 1);
+                out[28] = case;
+                (0, gap)
+            } else if case == out[28] {
+                (1, 0)
+            } else {
+                (2, 0)
+            };
+            let timed_out = i64::from(case < 13 && seconds > timeout);
+            total += seconds;
+            let over = i64::from(budget > 0 && total > budget);
+            out[1 + case as usize] += 1;
+            out[15 + source as usize] += 1;
+            out[20 + state as usize] += 1;
+            out[24] += gap;
+            out[25] += timed_out;
+            out[26] += over;
+            if state == 2 {
+                w586_first(&mut out[29], at);
+            }
+            if timed_out == 1 {
+                w586_first(&mut out[30], at);
+            }
+            out[W646_STAGE_HEADER + at] = case
+                | source << 4
+                | state << 7
+                | gap << 9
+                | timed_out << 10
+                | over << 11
+                | timeout << 12
+                | seconds << 23
+                | w646_len8(raw) << 54;
+        }
+        out[27] = total;
+        out[31] = w526_digest(&out[W646_STAGE_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w646_processing_stage_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        budget: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w646_run(out, out_cap, &inputs, || {
+                let stages = w566_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    1,
+                    count,
+                )?;
+                let elapsed = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+                Some(w646_stage_batch(&stages, &elapsed, budget))
+            })
+        }
+    }
+
+    // --- SourcePosition::w64SourcePositionPlanBatch --------------------------
+
+    pub(crate) const W646_POSITION_HEADER: usize = 18;
+
+    /// Window for a window at or below 0 (1 MiB) and the window cap (2^30).
+    const W646_POSITION_WINDOW: i64 = 1 << 20;
+    const W646_POSITION_WINDOW_CAP: i64 = 1 << 30;
+
+    /// Size and offset clamp (2^40 - 1).
+    const W646_POSITION_SIZE_CAP: i64 = (1 << 40) - 1;
+
+    /// Case 0 complete, 1 head, 2 mid, 3 unknown; source 0 backing value, 1
+    /// case name, 2 label, 3 alias of the trimmed, lowercased token with `_`
+    /// turned into `-`, 4 unknown.
+    #[inline]
+    fn w646_position_case(raw: &[u8], key: &mut Vec<u8>) -> (i64, i64) {
+        match raw {
+            b"complete" => (0, 0),
+            b"head" => (1, 0),
+            b"mid" => (2, 0),
+            b"Complete" => (0, 1),
+            b"Head" => (1, 1),
+            b"Mid" => (2, 1),
+            b"Complete file" => (0, 2),
+            b"File head" => (1, 2),
+            b"Mid-file" => (2, 2),
+            _ => {
+                w646_normalize_into(raw, key, false);
+                match key.as_slice() {
+                    b"complete" | b"complete-file" | b"full" | b"whole" | b"entire" => (0, 3),
+                    b"head" | b"file-head" | b"start" | b"begin" | b"beginning" | b"first" => {
+                        (1, 3)
+                    }
+                    b"mid" | b"mid-file" | b"middle" | b"center" | b"centre" | b"tail" | b"end" => {
+                        (2, 3)
+                    }
+                    _ => (3, 4),
+                }
+            }
+        }
+    }
+
+    /// Position tokens with file size and requested offset columns and a read
+    /// window (at or below 0 means 1 MiB, capped at 2^30). Sizes and offsets
+    /// clamp to 0..2^40-1. A complete copy reads the whole file, a head the
+    /// first window, and a mid-file slice (including `middle`/`tail` aliases)
+    /// the window at the offset, moved back (clamped) so it ends inside the
+    /// file. Coverage is the read share of the file in ppm. `[0]` count,
+    /// `[1..5]` per case, `[5..10]` per source, `[10]` clamped, `[11]` empty
+    /// reads of known positions, `[12]` total read bytes, `[13]` total size,
+    /// `[14]` best rank (-1), `[15]` first unknown and `[16]` first clamped
+    /// index (-1), `[17]` FNV-1a digest; then per position `case | source << 2
+    /// | (rank + 1) << 5 | clamped << 7 | empty << 8 | coverage << 9 |
+    /// min(read, 2^30) << 29 | min(token bytes, 7) << 60`.
+    pub(crate) fn w646_position_batch(positions: &[&[u8]], ints: &[i64], window: i64) -> Vec<i64> {
+        let count = positions.len();
+        let window = if window <= 0 {
+            W646_POSITION_WINDOW
+        } else {
+            window.min(W646_POSITION_WINDOW_CAP)
+        };
+        let mut out = vec![0i64; W646_POSITION_HEADER + count];
+        out[0] = count as i64;
+        out[14] = -1;
+        out[15] = -1;
+        out[16] = -1;
+        let mut key = Vec::new();
+        for (at, &raw) in positions.iter().enumerate() {
+            let (case, source) = w646_position_case(raw, &mut key);
+            let size = ints[at].clamp(0, W646_POSITION_SIZE_CAP);
+            let offset = ints[count + at].clamp(0, W646_POSITION_SIZE_CAP);
+            let (read, clamped, rank): (i64, i64, i64) = match case {
+                0 => (size, 0, 2),
+                1 => (window.min(size), 0, 1),
+                2 => {
+                    let start = offset.min((size - window).max(0));
+                    (window.min(size - start), i64::from(start != offset), 0)
+                }
+                _ => (0, 0, -1),
+            };
+            let empty = i64::from(case < 3 && read == 0);
+            let coverage = if size > 0 { read * 1_000_000 / size } else { 0 };
+            out[1 + case as usize] += 1;
+            out[5 + source as usize] += 1;
+            out[10] += clamped;
+            out[11] += empty;
+            out[12] += read;
+            out[13] += size;
+            out[14] = out[14].max(rank);
+            if case == 3 {
+                w586_first(&mut out[15], at);
+            }
+            if clamped == 1 {
+                w586_first(&mut out[16], at);
+            }
+            out[W646_POSITION_HEADER + at] = case
+                | source << 2
+                | (rank + 1) << 5
+                | clamped << 7
+                | empty << 8
+                | coverage << 9
+                | read.min(W646_POSITION_WINDOW_CAP) << 29
+                | (raw.len().min(7) as i64) << 60;
+        }
+        out[17] = w526_digest(&out[W646_POSITION_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w646_source_position_batch(
+        strings: *const u8,
+        strings_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        window: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [(strings, strings_len), (twin, twin_len), (ints, ints_len)];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w646_run(out, out_cap, &inputs, || {
+                let positions = w566_columns(
+                    w15_input(strings, strings_len)?,
+                    w15_input(twin, twin_len)?,
+                    1,
+                    count,
+                )?;
+                let values = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+                Some(w646_position_batch(&positions, &values, window))
+            })
+        }
+    }
+
+    // --- VideoContainer::w64VideoContainerPlanBatch --------------------------
+
+    pub(crate) const W646_CONTAINER_HEADER: usize = 22;
+
+    /// Splice offset clamp (2^40 - 1) and its row field cap (2^22 - 1).
+    const W646_SPLICE_CAP: i64 = (1 << 40) - 1;
+    const W646_SPLICE_ROW_CAP: i64 = (1 << 22) - 1;
+
+    /// File names, first bytes (960-byte records as in Wave 49.6) and a
+    /// splice offset column (clamped to 0..2^40-1). Codes are the case index
+    /// plus 1 (0 none): header from the magic signature (`detectPhp()`), name
+    /// from the extension (`fromFileName()`), effective header first. Source 0
+    /// both agree, 1 header only, 2 name only, 3 conflict (header wins), 4
+    /// none. Strategy 0 skip (no container), 1 decode from the head (offset
+    /// 0), 2 splice mid-stream (Matroska, AVI, MPEG program or transport), 3
+    /// prefix the head before the chunk (MP4, ASF, Ogg). A transport stream
+    /// header carries its first packet offset plus 1. `[0]` count, `[1..9]` per
+    /// effective code, `[9..14]` per source, `[14..18]` per strategy, `[18]`
+    /// total spliced offset bytes, `[19]` first conflict and `[20]` first
+    /// skipped index (-1), `[21]` FNV-1a digest; then per file `header | name
+    /// << 3 | effective << 6 | source << 9 | strategy << 12 | packet << 14 |
+    /// min(head bytes, 960) << 22 | min(name bytes, 255) << 32 | min(offset,
+    /// 2^22-1) << 40`.
+    pub(crate) fn w646_container_batch(
+        names: &[&[u8]],
+        heads: &[&[u8]],
+        offsets: &[i64],
+    ) -> Vec<i64> {
+        let count = names.len();
+        let mut out = vec![0i64; W646_CONTAINER_HEADER + count];
+        out[0] = count as i64;
+        out[19] = -1;
+        out[20] = -1;
+        for (at, (&name, &head)) in names.iter().zip(heads).enumerate() {
+            let header = i64::from(detect_video_container(head));
+            let named = w49_name_container(name);
+            let effective = if header != 0 { header } else { named };
+            let source: i64 = match (header, named) {
+                (0, 0) => 4,
+                (0, _) => 2,
+                (_, 0) => 1,
+                _ if header == named => 0,
+                _ => 3,
+            };
+            let offset = offsets[at].clamp(0, W646_SPLICE_CAP);
+            let strategy: i64 = if effective == 0 {
+                0
+            } else if offset == 0 {
+                1
+            } else if effective <= 4 {
+                2
+            } else {
+                3
+            };
+            let packet = if header == 4 {
+                transport_stream_offset(head).map_or(0, |at| at as i64 + 1)
+            } else {
+                0
+            };
+            out[1 + effective as usize] += 1;
+            out[9 + source as usize] += 1;
+            out[14 + strategy as usize] += 1;
+            if strategy == 2 {
+                out[18] += offset;
+            }
+            if source == 3 {
+                w586_first(&mut out[19], at);
+            }
+            if strategy == 0 {
+                w586_first(&mut out[20], at);
+            }
+            out[W646_CONTAINER_HEADER + at] = header
+                | named << 3
+                | effective << 6
+                | source << 9
+                | strategy << 12
+                | packet << 14
+                | (head.len() as i64) << 22
+                | w646_len8(name) << 32
+                | offset.min(W646_SPLICE_ROW_CAP) << 40;
+        }
+        out[21] = w526_digest(&out[W646_CONTAINER_HEADER..]);
+        out
+    }
+
+    /// # Safety
+    /// Non-null inputs must be readable for their lengths; `out` must be aligned
+    /// and writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w646_video_container_batch(
+        names: *const u8,
+        names_len: usize,
+        name_twin: *const u8,
+        name_twin_len: usize,
+        heads: *const u8,
+        heads_len: usize,
+        head_lens: *const u8,
+        head_lens_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i32 {
+        let inputs = [
+            (names, names_len),
+            (name_twin, name_twin_len),
+            (heads, heads_len),
+            (head_lens, head_lens_len),
+            (ints, ints_len),
+        ];
+        // SAFETY: forwarded input and output contracts.
+        unsafe {
+            w646_run(out, out_cap, &inputs, || {
+                let names = w566_columns(
+                    w15_input(names, names_len)?,
+                    w15_input(name_twin, name_twin_len)?,
+                    1,
+                    count,
+                )?;
+                let heads = w49_heads(
+                    w15_input(heads, heads_len)?,
+                    w15_input(head_lens, head_lens_len)?,
+                    count,
+                )?;
+                let offsets = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+                Some(w646_container_batch(&names, &heads, &offsets))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod w646_enum_plan_tests {
+        use super::*;
+        use std::ptr::null;
+
+        fn tokens(values: &[&'static str]) -> Vec<&'static [u8]> {
+            values.iter().map(|value| value.as_bytes()).collect()
+        }
+
+        #[test]
+        fn w646_role_batch_throttles_tiers() {
+            let roles = tokens(&["1", "ADMIN", "Moderator", " banned ", "4", "nope", "user"]);
+            let out = w646_role_batch(&roles, &[100, 9_999, 499, 0, 500, 3, -5], 0);
+            assert_eq!(&out[1..6], &[2, 1, 1, 2, 1]);
+            assert_eq!(&out[6..11], &[2, 1, 1, 2, 1]);
+            assert_eq!(&out[11..21], &[3, 2, 1, 1, 3, 100, 11_101, 0, 5, 0b1111]);
+            assert_eq!(
+                out[W646_ROLE_HEADER + 1],
+                1 | 1 << 3 | 19 << 6 | 5 << 13 | 9_999 << 21
+            );
+            let capped = w646_role_batch(&roles, &[i64::MAX; 7], i64::MAX);
+            assert_eq!(capped[16], 1 << 31);
+            assert_eq!(capped[W646_ROLE_HEADER] >> 21, (1 << 32) - 1);
+        }
+
+        #[test]
+        fn w646_outcome_batch_schedules_retries() {
+            let outcomes = tokens(&[
+                "completed",
+                "TimedOut",
+                " Group_Unavailable ",
+                "deleted par2 only",
+                "not-found",
+                "failed",
+                "??",
+            ]);
+            let out = w646_outcome_batch(&outcomes, &[0, 2, 9, 0, 0, 30, 0], 0);
+            assert_eq!(&out[14..18], &[3, 1, 2, 1]);
+            assert_eq!(&out[18..24], &[1, 1, 1, 1, 2, 1]);
+            assert_eq!(&out[24..29], &[1, 1, 3_600, 1, 6]);
+            assert_eq!(
+                out[W646_OUTCOME_HEADER + 1],
+                5 | 1 << 4 | 3 << 6 | 2 << 11 | 3_600 << 27 | 8 << 47
+            );
+            let long = w646_outcome_batch(&tokens(&["group-unavailable"]), &[16], 100);
+            assert_eq!(long[26], 604_800);
+        }
+
+        #[test]
+        fn w646_stage_batch_orders_and_times() {
+            let stages = tokens(&[
+                "nzb-parsing",
+                "NzbParsing",
+                "Workspace preparation",
+                " MEDIA_SOURCES ",
+                "Finalization",
+                "x",
+            ]);
+            let out = w646_stage_batch(&stages, &[61, 5, 0, 1_201, 10, 100], 1_270);
+            assert_eq!(&out[15..20], &[1, 2, 1, 1, 1]);
+            assert_eq!(&out[20..31], &[3, 1, 1, 1, 3, 2, 2, 1_377, 11, 2, 0]);
+            assert_eq!(
+                out[W646_STAGE_HEADER + 4],
+                11 | 1 << 4 | 1 << 9 | 1 << 11 | 120 << 12 | 10 << 23 | 12 << 54
+            );
+        }
+
+        #[test]
+        fn w646_position_batch_windows_reads() {
+            let positions = tokens(&["complete", "Head", "Mid-file", " tail ", "middle", "???"]);
+            let ints = [1_000, 1_000, 5_000, 5_000, 0, 0, 0, 0, 4_500, 100, 9, 0];
+            let out = w646_position_batch(&positions, &ints, 2_000);
+            assert_eq!(&out[1..5], &[1, 1, 3, 1]);
+            assert_eq!(&out[10..17], &[2, 1, 6_000, 12_000, 2, 5, 2]);
+            assert_eq!(out[W646_POSITION_HEADER + 2] >> 29 & 0x7fff_ffff, 2_000);
+            assert_eq!(
+                out[W646_POSITION_HEADER + 3],
+                2 | 3 << 2 | 1 << 5 | 400_000 << 9 | 2_000 << 29 | 6 << 60
+            );
+        }
+
+        #[test]
+        fn w646_container_batch_plans_splices() {
+            let mut ts = vec![0u8; 960];
+            for packet in 0..5 {
+                ts[3 + packet * 188] = 0x47;
+            }
+            let mkv = b"\x1A\x45\xDF\xA3 header bytes".as_slice();
+            let names = tokens(&["movie.mkv", "clip.mp4", "stream.avi", "noext", "x.mkv"]);
+            let heads: Vec<&[u8]> = vec![mkv, b"", ts.as_slice(), b"", b"\x00\x00\x00\x18ftypisom"];
+            let out = w646_container_batch(&names, &heads, &[0, 4_096, 9, 7, 1]);
+            assert_eq!(&out[9..14], &[1, 0, 1, 2, 1]);
+            assert_eq!(&out[14..21], &[1, 1, 1, 2, 9, 2, 3]);
+            assert_eq!(out[W646_CONTAINER_HEADER + 2] >> 14 & 0xff, 4);
+            assert_eq!(
+                out[W646_CONTAINER_HEADER + 4] & 0xfff,
+                5 | 1 << 3 | 5 << 6 | 3 << 9
+            );
+        }
+
+        #[test]
+        fn w646_exports_validate_buffers() {
+            let mut out = vec![0i64; 64];
+            let status = unsafe {
+                nntmux_w646_user_role_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!((status, out[0], out[16], out[18]), (1, 0, 100, -1));
+            let status = unsafe {
+                nntmux_w646_processing_outcome_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    64,
+                )
+            };
+            assert_eq!(status, -2);
+            let status = unsafe {
+                nntmux_w646_processing_stage_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    3,
+                )
+            };
+            assert_eq!(status, -2);
+            let misaligned = unsafe { (out.as_mut_ptr() as *mut u8).add(1) as *mut i64 };
+            let status = unsafe {
+                nntmux_w646_source_position_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    0,
+                    misaligned,
+                    32,
+                )
+            };
+            assert_eq!(status, -2);
+            // Input bytes aliasing the output range are rejected.
+            let alias = out.as_ptr() as *const u8;
+            let status = unsafe {
+                nntmux_w646_user_role_batch(
+                    alias,
+                    8,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    1,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(status, -1);
+            // A null input with a length, a short integer column, a bad twin and short head records are invalid.
+            let role = b"Admin";
+            let value = 9i64.to_ne_bytes();
+            let status = unsafe {
+                nntmux_w646_user_role_batch(
+                    null(),
+                    4,
+                    null(),
+                    0,
+                    value.as_ptr(),
+                    8,
+                    1,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(status, -1);
+            let status = unsafe {
+                nntmux_w646_user_role_batch(
+                    role.as_ptr(),
+                    role.len(),
+                    null(),
+                    0,
+                    value.as_ptr(),
+                    4,
+                    1,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(status, -1);
+            let twin = b"Admin\x02";
+            let status = unsafe {
+                nntmux_w646_user_role_batch(
+                    role.as_ptr(),
+                    role.len(),
+                    twin.as_ptr(),
+                    twin.len(),
+                    value.as_ptr(),
+                    8,
+                    1,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(status, -1);
+            let lens = 0u32.to_le_bytes();
+            let status = unsafe {
+                nntmux_w646_video_container_batch(
+                    role.as_ptr(),
+                    role.len(),
+                    null(),
+                    0,
+                    role.as_ptr(),
+                    role.len(),
+                    lens.as_ptr(),
+                    4,
+                    value.as_ptr(),
+                    8,
+                    1,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(status, -1);
+            let status = unsafe {
+                nntmux_w646_user_role_batch(
+                    role.as_ptr(),
+                    role.len(),
+                    null(),
+                    0,
+                    value.as_ptr(),
+                    8,
+                    1,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(
+                (status, out[0], out[2], out[W646_ROLE_HEADER] >> 21),
+                (1, 1, 1, 9)
+            );
+        }
+    }
+}
