@@ -9,6 +9,7 @@ use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -522,5 +523,286 @@ CDEF;
         }
 
         return self::$w433RustFfiHandle === false ? null : self::$w433RustFfiHandle;
+    }
+
+    // ========================================================================
+    // WAVE 61.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 8.51x, p99 3.60x; uncommon mean 6.88x, p99 4.95x); see RustCategorizersMiscMovieMusicPcAnimeProcessorW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    public const string W61_PC_CATEGORIZER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w611_pc_token_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w61PcTokenBatch(). */
+    public const int W61_PC_CATEGORIZER_TRAILER = 37;
+
+    /**
+     * PC token flags: 1 software/architecture, 2 disc image, 4 Mac, 8 iOS, 16 Android, 32 game, 64 Windows, 128 Linux,
+     * 256 software brand, 1024 multi-language, 2048 course (blocks), 4096 crack/keygen, 8192 console (blocks) and
+     * 32768 0day (512 for `v` + 1-4 digits, 1024 for `multi` + 1-2 digits and 16384 for a 19xx/20xx year are
+     * detected by shape).
+     *
+     * @var array<string, int>
+     */
+    public const array W61_PC_TOKEN_FLAGS = ['x86' => 1, '32bit' => 1, 'win32' => 65, 'x64' => 1, 'amd64' => 1, '64bit' => 1, 'win64' => 65,
+        'arm64' => 1, 'aarch64' => 1, 'arm' => 1, 'portable' => 1, 'setup' => 1, 'installer' => 1, 'retail' => 1, 'final' => 1, 'build' => 1,
+        'pro' => 1, 'professional' => 1, 'enterprise' => 1, 'ultimate' => 1, 'iso' => 2, 'img' => 2, 'bin' => 2, 'cue' => 2, 'nrg' => 2,
+        'mdf' => 2, 'macos' => 4, 'osx' => 4, 'macosx' => 4, 'dmg' => 4, 'mac' => 4, 'ios' => 8, 'iphone' => 8, 'ipad' => 8, 'ipa' => 8,
+        'android' => 16, 'apk' => 16, 'xapk' => 16, 'game' => 32, 'games' => 32, 'gog' => 32, 'steam' => 32, 'fitgirl' => 32, 'dodi' => 32,
+        'codex' => 32, 'plaza' => 32, 'skidrow' => 32, 'reloaded' => 32, 'cpy' => 32, 'empress' => 32, 'razor1911' => 32, 'tenoke' => 32,
+        'flt' => 32, 'rune' => 32, 'elamigos' => 32, 'prophet' => 32, 'hoodlum' => 32, 'dlc' => 32, 'windows' => 64, 'win' => 64, 'win10' => 64,
+        'win11' => 64, 'winall' => 64, 'linux' => 128, 'ubuntu' => 128, 'debian' => 128, 'fedora' => 128, 'deb' => 128, 'rpm' => 128,
+        'appimage' => 128, 'office' => 256, 'adobe' => 256, 'photoshop' => 256, 'autocad' => 256, 'microsoft' => 256, 'vmware' => 256,
+        'multi' => 1024, 'multilingual' => 1024, 'tutorial' => 2048, 'course' => 2048, 'udemy' => 2048, 'lynda' => 2048, 'pluralsight' => 2048,
+        'training' => 2048, 'crack' => 4096, 'cracked' => 4096, 'keygen' => 4096, 'patch' => 4096, 'serial' => 4096, 'activator' => 4096,
+        'regged' => 4096, 'incl' => 4096, 'ps4' => 8192, 'ps5' => 8192, 'xbox' => 8192, 'switch' => 8192, 'nsp' => 8192, 'wii' => 8192,
+        'xci' => 8192, '0day' => 32768, 'zeroday' => 32768];
+
+    /**
+     * Architecture mask bits: 1 x86, 2 x64 and 4 ARM.
+     *
+     * @var array<string, int>
+     */
+    public const array W61_PC_ARCHITECTURES = ['x86' => 1, '32bit' => 1, 'win32' => 1, 'x64' => 2, 'amd64' => 2, '64bit' => 2, 'win64' => 2,
+        'arm64' => 4, 'aarch64' => 4, 'arm' => 4];
+
+    /**
+     * Category per w61PcTokenBatch() rule.
+     *
+     * @var list<int>
+     */
+    public const array W61_PC_RULE_CATEGORIES = [0, Category::PC_PHONE_IOS, Category::PC_PHONE_ANDROID, Category::PC_MAC, Category::PC_GAMES,
+        Category::PC_ISO, Category::PC_0DAY];
+
+    public static function usesW61RustFfi(): bool
+    {
+        $override = self::w61RustFfiState();
+
+        return \is_bool($override) ? $override : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the PcCategorizer Wave 61 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 61.1 PC software and game token plans. Each item is a release name (trimmed). Per item `rule | platform
+     * << 3 | arch << 6 | flags << 9 | version << 25 | confidenceMilli << 39 | min(tokens, 63) << 49 |
+     * min(nameLength, 255) << 55`: flags OR the W61_PC_TOKEN_FLAGS of every `[^a-z0-9]+`-separated lowercase token
+     * plus the shape flags; the architecture is 4 ARM, 3 x86 and x64, 2 x64, 1 x86 or 0 from the
+     * W61_PC_ARCHITECTURES mask; the platform is 4 iOS, 5 Android, 2 Mac, 3 Linux, 1 Windows (flag or x86/x64) or 0;
+     * the version is the first `v` + 1-4 digit token (0 none). The rule (W61_PC_RULE_CATEGORIES) is 0 with a course
+     * or console flag, else in order 1 iOS (0.9), 2 Android (0.9), 3 Mac (0.85), 4 game (0.85), 5 disc image (0.8),
+     * 6 0day (software, Windows, Linux, brand, version, crack or 0day flag; 0.8 with a crack, else 0.75), else 0.
+     * Then seven rule, six platform, five architecture and sixteen flag counts, the confidence sum, the largest
+     * version and the distinct versions of items with a version token.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61PcTokenBatch(array $items): array
+    {
+        return self::usesW61RustFfi() ? self::w61PcTokenBatchNative($items) : self::w61PcTokenBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61PcTokenBatchNative(array $items): array
+    {
+        return self::w61Invoke($items, \count($items) + self::W61_PC_CATEGORIZER_TRAILER) ?? self::w61PcTokenBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61PcTokenBatchPhp(array $items): array
+    {
+        $out = [];
+        $rules = array_fill(0, 7, 0);
+        $platforms = [0, 0, 0, 0, 0, 0];
+        $architectures = [0, 0, 0, 0, 0];
+        $flagCounts = array_fill(0, 16, 0);
+        $confidenceSum = $maxVersion = 0;
+        $versions = [];
+        foreach ($items as $item) {
+            $name = trim((string) $item);
+            $tokens = $name === '' ? [] : (preg_split('/[^a-z0-9]+/', strtolower($name), -1, PREG_SPLIT_NO_EMPTY) ?: []);
+            $flags = $mask = 0;
+            $version = null;
+            foreach ($tokens as $token) {
+                $flags |= self::W61_PC_TOKEN_FLAGS[$token] ?? 0;
+                $mask |= self::W61_PC_ARCHITECTURES[$token] ?? 0;
+                $tokenLength = \strlen($token);
+                if ($token[0] === 'v' && $tokenLength >= 2 && $tokenLength <= 5 && strspn($token, '0123456789', 1) === $tokenLength - 1) {
+                    $flags |= 512;
+                    $version ??= (int) substr($token, 1);
+                }
+                if ($tokenLength >= 6 && $tokenLength <= 7 && str_starts_with($token, 'multi') && strspn($token, '0123456789', 5) === $tokenLength - 5) {
+                    $flags |= 1024;
+                }
+                if ($tokenLength === 4 && strspn($token, '0123456789') === 4 && ($token[0].$token[1] === '19' || $token[0].$token[1] === '20')) {
+                    $flags |= 16384;
+                }
+            }
+            $architecture = ($mask & 4) !== 0 ? 4 : (($mask & 3) === 3 ? 3 : (($mask & 2) !== 0 ? 2 : $mask & 1));
+            $platform = match (true) {
+                ($flags & 8) !== 0 => 4,
+                ($flags & 16) !== 0 => 5,
+                ($flags & 4) !== 0 => 2,
+                ($flags & 128) !== 0 => 3,
+                ($flags & 64) !== 0 || ($mask & 3) !== 0 => 1,
+                default => 0,
+            };
+            [$rule, $confidence] = match (true) {
+                ($flags & (2048 | 8192)) !== 0 => [0, 0],
+                ($flags & 8) !== 0 => [1, 900],
+                ($flags & 16) !== 0 => [2, 900],
+                ($flags & 4) !== 0 => [3, 850],
+                ($flags & 32) !== 0 => [4, 850],
+                ($flags & 2) !== 0 => [5, 800],
+                ($flags & (1 | 64 | 128 | 256 | 512 | 4096 | 32768)) !== 0 => [6, ($flags & 4096) !== 0 ? 800 : 750],
+                default => [0, 0],
+            };
+            $rules[$rule]++;
+            $platforms[$platform]++;
+            $architectures[$architecture]++;
+            for ($i = 0; $i < 16; $i++) {
+                $flagCounts[$i] += $flags >> $i & 1;
+            }
+            $confidenceSum += $confidence;
+            $maxVersion = max($maxVersion, $version ?? 0);
+            if ($version !== null) {
+                $versions[$version] = true;
+            }
+            $out[] = $rule | $platform << 3 | $architecture << 6 | $flags << 9 | ($version ?? 0) << 25 | $confidence << 39
+                | min(\count($tokens), 63) << 49 | min(\strlen($name), 255) << 55;
+        }
+        array_push($out, ...$rules, ...$platforms, ...$architectures, ...$flagCounts);
+        array_push($out, $confidenceSum, $maxVersion, \count($versions));
+
+        return $out;
+    }
+
+    /**
+     * Wave 61 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w611', self::W61_PC_CATEGORIZER_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 61.1 PcCategorizer export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w61Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w61RustFfiState('ffi');
+            $out = self::w61RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w61RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W61_PC_CATEGORIZER_FFI_CDEF.)
+            $written = $ffi->nntmux_w611_pc_token_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
