@@ -44287,3 +44287,624 @@ pub mod name_fixing_checkers_abstract_app_game_movie_tv_w573 {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 58.3: PostProcessRunner, ReleasesRunner, CollectionDowntimeCompensator, Tmux and
+// TmuxCommand batch rows
+// ---------------------------------------------------------------------------
+
+/// Batch helpers for the tmux runners: postprocess work items, release work items, downtime
+/// compensation plans, pane status lines and tmux command arguments. Each export reads the
+/// items as zero-copy slices of one blob (NUL-joined, or tiled by a length column) and writes
+/// fixed-width int64 words plus a trailer, so a batch costs one FFI crossing. The PHP
+/// `w58*BatchPhp()` methods are the reference implementation.
+pub mod postprocess_releases_runner_downtime_tmux_command_w583 {
+    use super::release_image_browse_duplicate_group_management_w553::run_items;
+    use std::collections::HashSet;
+
+    /// `PostProcessRunner::W58_POSTPROCESS_MODE_WEIGHTS`, indexed by mode.
+    const MODE_WEIGHTS: [i64; 6] = [0, 40, 30, 50, 50, 20];
+
+    /// `ReleasesRunner::W58_RELEASE_STAGE_WEIGHTS`, indexed by stage.
+    const STAGE_WEIGHTS: [i64; 7] = [0, 60, 50, 20, 40, 30, 10];
+
+    /// `CollectionDowntimeCompensator::MIN_DOWNTIME_SECONDS`.
+    const MIN_DOWNTIME_SECONDS: i64 = 300;
+
+    /// `CollectionDowntimeCompensator::WINDOW_SECONDS`.
+    const WINDOW_SECONDS: i64 = 60;
+
+    /// `CollectionDowntimeCompensator::MAX_WINDOWS`.
+    const MAX_WINDOWS: i64 = 100_000;
+
+    /// `Tmux::W58_PANE_COLORS`, indexed by pane status.
+    const PANE_COLORS: [i64; 6] = [196, 160, 244, 33, 46, 250];
+
+    /// `TmuxCommand::W58_SUBCOMMANDS`.
+    const SUBCOMMANDS: [&[u8]; 14] = [
+        b"new-session",
+        b"kill-session",
+        b"has-session",
+        b"attach",
+        b"new-window",
+        b"select-window",
+        b"split-window",
+        b"select-pane",
+        b"respawn-pane",
+        b"list-panes",
+        b"send-keys",
+        b"set-option",
+        b"display-message",
+        b"kill-server",
+    ];
+
+    const FNV_OFFSET: u32 = 0x811C_9DC5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+
+    /// PHP `explode($sep, $item, 3)` as (first, second or empty, rest or empty).
+    #[inline]
+    fn three(item: &[u8], sep: u8) -> (&[u8], &[u8], &[u8]) {
+        let Some(a) = item.iter().position(|&b| b == sep) else {
+            return (item, &[], &[]);
+        };
+        let rest = &item[a + 1..];
+        match rest.iter().position(|&b| b == sep) {
+            Some(b) => (&item[..a], &rest[..b], &rest[b + 1..]),
+            None => (&item[..a], rest, &[]),
+        }
+    }
+
+    #[inline]
+    fn hex(b: u8) -> Option<i64> {
+        match b {
+            b'0'..=b'9' => Some(i64::from(b - b'0')),
+            b'a'..=b'f' => Some(i64::from(b - b'a' + 10)),
+            b'A'..=b'F' => Some(i64::from(b - b'A' + 10)),
+            _ => None,
+        }
+    }
+
+    /// Between `min` and `max` ASCII digits.
+    #[inline]
+    fn digits(t: &[u8], min: usize, max: usize) -> bool {
+        (min..=max).contains(&t.len()) && t.iter().all(u8::is_ascii_digit)
+    }
+
+    #[inline]
+    fn number(t: &[u8]) -> i64 {
+        t.iter().fold(0i64, |n, b| n * 10 + i64::from(b - b'0'))
+    }
+
+    /// `PostProcessRunner::w58PostProcessWorkBatchPhp()`.
+    fn postprocess_work(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 25);
+        let mut modes = [0i64; 6];
+        let mut buckets = [0i64; 17];
+        let (mut valid_count, mut max_score) = (0i64, 0i64);
+        for &item in items {
+            let (mode, guid, retry) = three(item, b':');
+            let mode = [&b"additional"[..], b"nfo", b"movie", b"tv", b"amazon"]
+                .iter()
+                .position(|m| m.eq_ignore_ascii_case(mode))
+                .map_or(0, |p| p + 1);
+            let bucket = guid.first().and_then(|&b| hex(b)).unwrap_or(16);
+            let valid = guid.len() == 40 && guid.iter().all(|&b| hex(b).is_some());
+            let numeric = !retry.is_empty() && retry.iter().all(u8::is_ascii_digit);
+            let retries = match (numeric, retry.len()) {
+                (false, _) => 0,
+                (true, n) if n > 2 => 99,
+                _ => number(retry),
+            };
+            let score = (MODE_WEIGHTS[mode]
+                + 20 * i64::from(valid)
+                + 5 * i64::from(bucket < 16)
+                - 5 * retries.min(10))
+            .max(0);
+            modes[mode] += 1;
+            buckets[bucket as usize] += 1;
+            valid_count += i64::from(valid);
+            max_score = max_score.max(score);
+            out.push(
+                mode as i64
+                    | bucket << 3
+                    | i64::from(valid) << 8
+                    | i64::from(numeric) << 9
+                    | retries << 10
+                    | score << 17
+                    | (item.len().min(1023) as i64) << 25,
+            );
+        }
+        out.extend(modes);
+        out.extend(buckets);
+        out.extend([valid_count, max_score]);
+        out
+    }
+
+    /// `ReleasesRunner::w58ReleaseWorkBatchPhp()`.
+    fn release_work(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 11);
+        let mut stages = [0i64; 7];
+        let (mut qualified_count, mut max_limit, mut total_score) = (0i64, 0i64, 0i64);
+        let mut groups = HashSet::new();
+        for &item in items {
+            let (group, stage, limit) = three(item, b':');
+            let stage = [
+                &b"releases"[..],
+                b"collections",
+                b"groups",
+                b"fixnames",
+                b"nzbs",
+                b"backfill",
+            ]
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(stage))
+            .map_or(0, |p| p + 1);
+            let group_valid = digits(group, 1, 9);
+            let id = if group_valid { number(group) } else { 0 };
+            let limit_valid = digits(limit, 1, 9);
+            let limit = if limit_valid {
+                number(limit).min(65_535)
+            } else {
+                0
+            };
+            let qualified = group_valid && id > 0 && stage != 0 && limit_valid;
+            let score = STAGE_WEIGHTS[stage] + 30 * i64::from(qualified) + limit.min(1000) / 100;
+            stages[stage] += 1;
+            if qualified {
+                qualified_count += 1;
+                groups.insert(id);
+            }
+            if limit_valid {
+                max_limit = max_limit.max(limit);
+            }
+            total_score += score;
+            out.push(
+                stage as i64
+                    | i64::from(group_valid) << 3
+                    | i64::from(limit_valid) << 4
+                    | i64::from(qualified) << 5
+                    | score << 6
+                    | limit << 13
+                    | id << 29,
+            );
+        }
+        out.extend(stages);
+        out.extend([qualified_count, groups.len() as i64, max_limit, total_score]);
+        out
+    }
+
+    /// `CollectionDowntimeCompensator::w58DowntimePlanBatchPhp()`.
+    fn downtime_plan(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(2 * items.len() + 8);
+        let mut classes = [0i64; 5];
+        let (mut total_extension, mut max_gap, mut total_windows) = (0i64, 0i64, 0i64);
+        for &item in items {
+            let mut fields = item.split(|&b| b == b',');
+            let parsed = match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                (Some(last), Some(now), Some(delay), None)
+                    if digits(last, 1, 10) && digits(now, 1, 10) && digits(delay, 1, 10) =>
+                {
+                    Some((number(last), number(now), number(delay).min(168)))
+                }
+                _ => None,
+            };
+            let (class, windows, delay, extension) = match parsed {
+                None => (0, 0, 0, 0),
+                Some((last, now, delay)) => {
+                    let gap = now - last;
+                    max_gap = max_gap.max(gap);
+                    if gap < 0 {
+                        (1, 0, delay, 0)
+                    } else if gap < MIN_DOWNTIME_SECONDS {
+                        (2, 0, delay, 0)
+                    } else {
+                        let windows = (gap + WINDOW_SECONDS - 1) / WINDOW_SECONDS;
+                        let class = if windows > MAX_WINDOWS { 4 } else { 3 };
+                        (class, windows.min(MAX_WINDOWS), delay, delay * 3600 + gap)
+                    }
+                }
+            };
+            classes[class as usize] += 1;
+            total_extension += extension;
+            total_windows += windows;
+            out.push(class | windows << 3 | delay << 20);
+            out.push(extension);
+        }
+        out.extend(classes);
+        out.extend([total_extension, max_gap, total_windows]);
+        out
+    }
+
+    #[inline]
+    fn session_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    }
+
+    /// `Tmux::w58PaneStatusBatchPhp()`.
+    fn pane_status(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 9);
+        let mut statuses = [0i64; 6];
+        let mut sessions: HashSet<&[u8]> = HashSet::new();
+        let (mut max_window, mut max_pane) = (0i64, 0i64);
+        for &item in items {
+            let (target, dead, command) = three(item, b' ');
+            let parsed = target.iter().rposition(|&b| b == b':').and_then(|c| {
+                let (session, rest) = (&target[..c], &target[c + 1..]);
+                let d = rest.iter().position(|&b| b == b'.')?;
+                let (window, pane) = (&rest[..d], &rest[d + 1..]);
+                ((1..=64).contains(&session.len())
+                    && session.iter().all(|&b| session_byte(b))
+                    && digits(window, 1, 3)
+                    && digits(pane, 1, 3))
+                .then(|| (session, number(window), number(pane)))
+            });
+            let dead = match dead {
+                b"0" => 0,
+                b"1" => 1,
+                _ => 2,
+            };
+            let command = command
+                .iter()
+                .position(|&b| b == b' ')
+                .map_or(command, |p| &command[..p]);
+            let base = command
+                .iter()
+                .rposition(|&b| b == b'/')
+                .map_or(command, |p| &command[p + 1..]);
+            let mut lower = [0u8; 8];
+            let name: &[u8] = if base.len() <= 8 {
+                for (d, s) in lower.iter_mut().zip(base) {
+                    *d = s.to_ascii_lowercase();
+                }
+                &lower[..base.len()]
+            } else {
+                b"-"
+            };
+            let class: i64 = match name {
+                b"" => 0,
+                b"bash" | b"sh" | b"zsh" | b"fish" => 1,
+                b"php" => 2,
+                b"sleep" => 3,
+                b"tmux" => 4,
+                b"python" | b"python3" => 5,
+                _ => 6,
+            };
+            let status: usize = match (parsed, dead, class) {
+                (None, _, _) => 0,
+                (_, 1, _) => 1,
+                (_, _, 1) => 2,
+                (_, _, 3) => 3,
+                (_, _, 2 | 5) => 4,
+                _ => 5,
+            };
+            let (valid, window, pane, session_len) = match parsed {
+                Some((session, window, pane)) => {
+                    sessions.insert(session);
+                    max_window = max_window.max(window);
+                    max_pane = max_pane.max(pane);
+                    (1, window, pane, session.len() as i64)
+                }
+                None => (0, 0, 0, 0),
+            };
+            statuses[status] += 1;
+            out.push(
+                status as i64
+                    | class << 3
+                    | valid << 6
+                    | dead << 7
+                    | window << 9
+                    | pane << 19
+                    | session_len << 29
+                    | PANE_COLORS[status] << 36,
+            );
+        }
+        out.extend(statuses);
+        out.extend([sessions.len() as i64, max_window, max_pane]);
+        out
+    }
+
+    #[inline]
+    fn safe_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'
+            )
+    }
+
+    /// `/\A[A-Za-z0-9_-]{1,64}:\d{1,3}(?:\.\d{1,3})?\z/`: 0 no match, 1 window target, 2 pane
+    /// target.
+    fn target_kind(arg: &[u8]) -> i64 {
+        let Some(c) = arg.iter().position(|&b| b == b':') else {
+            return 0;
+        };
+        let (session, rest) = (&arg[..c], &arg[c + 1..]);
+        if !(1..=64).contains(&session.len()) || !session.iter().all(|&b| session_byte(b)) {
+            return 0;
+        }
+        match rest.iter().position(|&b| b == b'.') {
+            None => i64::from(digits(rest, 1, 3)),
+            Some(d) if digits(&rest[..d], 1, 3) && digits(&rest[d + 1..], 1, 3) => 2,
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    fn fnv(h: u32, b: u8) -> u32 {
+        (h ^ u32::from(b)).wrapping_mul(FNV_PRIME)
+    }
+
+    /// `TmuxCommand::w58CommandLineBatchPhp()`.
+    fn command_line(items: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(items.len() + 8);
+        let mut classes = [0i64; 6];
+        let mut total = 0i64;
+        let mut h = FNV_OFFSET;
+        for (i, &arg) in items.iter().enumerate() {
+            let safe = !arg.is_empty() && arg.iter().all(|&b| safe_byte(b));
+            let quotes = arg.iter().filter(|&&b| b == b'\'').count();
+            let escaped = if safe {
+                arg.len()
+            } else {
+                2 + arg.len() + 3 * quotes
+            };
+            let kind = target_kind(arg);
+            let class: usize = if arg.is_empty() {
+                0
+            } else if arg.len() >= 2 && arg[0] == b'-' {
+                1
+            } else if SUBCOMMANDS.contains(&arg) {
+                3
+            } else if kind != 0 {
+                2
+            } else if safe {
+                4
+            } else {
+                5
+            };
+            if i > 0 {
+                h = fnv(h, b' ');
+                total += 1;
+            }
+            if safe {
+                for &b in arg {
+                    h = fnv(h, b);
+                }
+            } else {
+                h = fnv(h, b'\'');
+                for &b in arg {
+                    if b == b'\'' {
+                        for &q in b"'\\''" {
+                            h = fnv(h, q);
+                        }
+                    } else {
+                        h = fnv(h, b);
+                    }
+                }
+                h = fnv(h, b'\'');
+            }
+            total += escaped as i64;
+            classes[class] += 1;
+            out.push(
+                class as i64
+                    | i64::from(!safe) << 3
+                    | kind << 4
+                    | (quotes.min(255) as i64) << 6
+                    | (escaped.min((1 << 24) - 1) as i64) << 14
+                    | (arg.len().min((1 << 20) - 1) as i64) << 38,
+            );
+        }
+        out.extend(classes);
+        out.extend([total, i64::from(h)]);
+        out
+    }
+
+    macro_rules! w583_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// Items are NUL-joined in `blob`, or concatenated with their byte lengths in `lens`
+            /// when it is non-null. Returns the word count, `-needed` when `out_cap` is too small,
+            /// or `-1` when it declines (null `out`, null `blob` with a length, `count` other than
+            /// the number of NUL-separated items, or `lens` that do not tile `blob`).
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`lens` for `count` and `out` for
+            /// `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                lens: *const i64,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run_items(blob, blob_len, lens, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w583_export!(
+        /// `PostProcessRunner::w58PostProcessWorkBatch()`.
+        nntmux_w58_postprocess_runner_work_batch => postprocess_work
+    );
+    w583_export!(
+        /// `ReleasesRunner::w58ReleaseWorkBatch()`.
+        nntmux_w58_releases_runner_work_batch => release_work
+    );
+    w583_export!(
+        /// `CollectionDowntimeCompensator::w58DowntimePlanBatch()`.
+        nntmux_w58_downtime_compensator_plan_batch => downtime_plan
+    );
+    w583_export!(
+        /// `Tmux::w58PaneStatusBatch()`.
+        nntmux_w58_tmux_pane_status_batch => pane_status
+    );
+    w583_export!(
+        /// `TmuxCommand::w58CommandLineBatch()`.
+        nntmux_w58_tmux_command_line_batch => command_line
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const i64, usize, *mut i64, usize) -> isize;
+
+        /// Each export with the words an empty batch writes and the words per item.
+        const EXPORTS: [(Export, isize, isize); 5] = [
+            (nntmux_w58_postprocess_runner_work_batch, 25, 1),
+            (nntmux_w58_releases_runner_work_batch, 11, 1),
+            (nntmux_w58_downtime_compensator_plan_batch, 8, 2),
+            (nntmux_w58_tmux_pane_status_batch, 9, 1),
+            (nntmux_w58_tmux_command_line_batch, 8, 1),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.concat();
+            let lens: Vec<i64> = items.iter().map(|i| i.len() as i64).collect();
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            if items.iter().all(|i| !i.contains(&0)) {
+                let joined = items.join(&0u8);
+                let mut nul = vec![0i64; 4096];
+                let w = unsafe {
+                    f(
+                        joined.as_ptr(),
+                        joined.len(),
+                        ptr::null(),
+                        items.len(),
+                        nul.as_mut_ptr(),
+                        nul.len(),
+                    )
+                };
+                nul.truncate(w.max(0) as usize);
+                assert_eq!(nul, out, "NUL-joined and length-column calls differ");
+            }
+            out
+        }
+
+        #[test]
+        fn w583_postprocess_work_items() {
+            let guid = b"additional:0123456789abcdef0123456789ABCDEF01234567:3";
+            let out = call(
+                nntmux_w58_postprocess_runner_work_batch,
+                &[guid, b"TV:zz:x", b"nfo", b"amazon:f:123"],
+            );
+            assert_eq!(
+                out[0],
+                1 | 1 << 8 | 1 << 9 | 3 << 10 | 50 << 17 | (guid.len() as i64) << 25
+            );
+            assert_eq!(out[1], 4 | 16 << 3 | 50 << 17 | 7 << 25);
+            assert_eq!(out[2], 2 | 16 << 3 | 30 << 17 | 3 << 25);
+            assert_eq!(out[3], 5 | 15 << 3 | 1 << 9 | 99 << 10 | 12 << 25);
+            assert_eq!(&out[4..10], &[0, 1, 1, 0, 1, 1]);
+            assert_eq!(out[10], 1);
+            assert_eq!(&out[25..27], &[1, 2]);
+            assert_eq!(&out[27..], &[1, 50]);
+        }
+
+        #[test]
+        fn w583_release_work_items() {
+            let out = call(
+                nntmux_w58_releases_runner_work_batch,
+                &[b"42:Releases:500", b"42:nzbs:0", b"0:groups:5", b"x:bogus:"],
+            );
+            assert_eq!(out[0], 1 | 7 << 3 | 95 << 6 | 500 << 13 | 42 << 29);
+            assert_eq!(out[1], 5 | 7 << 3 | 60 << 6 | 42 << 29);
+            assert_eq!(out[2], 3 | 3 << 3 | 20 << 6 | 5 << 13);
+            assert_eq!(out[3], 0);
+            assert_eq!(&out[4..], &[1, 1, 0, 1, 0, 1, 0, 2, 1, 500, 175]);
+        }
+
+        #[test]
+        fn w583_downtime_plan_items() {
+            let out = call(
+                nntmux_w58_downtime_compensator_plan_batch,
+                &[b"1000,1100,2", b"1000,900,1", b"0,6000301,500", b"1,2", b"1000,1300,0"],
+            );
+            assert_eq!(&out[0..2], &[2 | 2 << 20, 0]);
+            assert_eq!(&out[2..4], &[1 | 1 << 20, 0]);
+            assert_eq!(&out[4..6], &[4 | 100_000 << 3 | 168 << 20, 168 * 3600 + 6_000_301]);
+            assert_eq!(&out[6..8], &[0, 0]);
+            assert_eq!(&out[8..10], &[3 | 5 << 3, 300]);
+            assert_eq!(
+                &out[10..],
+                &[1, 1, 1, 1, 1, 168 * 3600 + 6_000_601, 6_000_301, 100_005]
+            );
+        }
+
+        #[test]
+        fn w583_pane_status_items() {
+            let out = call(
+                nntmux_w58_tmux_pane_status_batch,
+                &[
+                    b"nntmux:0.1 0 /bin/bash",
+                    b"nntmux:2.3 1 php artisan",
+                    b"bad 0 sleep",
+                    b"other:10.0 0 /usr/bin/SLEEP 30",
+                ],
+            );
+            assert_eq!(out[0], 2 | 1 << 3 | 1 << 6 | 1 << 19 | 6 << 29 | 244 << 36);
+            assert_eq!(
+                out[1],
+                1 | 2 << 3 | 1 << 6 | 1 << 7 | 2 << 9 | 3 << 19 | 6 << 29 | 160 << 36
+            );
+            assert_eq!(out[2], 3 << 3 | 196 << 36);
+            assert_eq!(out[3], 3 | 3 << 3 | 1 << 6 | 10 << 9 | 5 << 29 | 33 << 36);
+            assert_eq!(&out[4..], &[1, 1, 1, 1, 0, 0, 2, 10, 3]);
+        }
+
+        #[test]
+        fn w583_command_line_items() {
+            let items: [&[u8]; 5] = [b"send-keys", b"-t", b"nntmux:0.1", b"it's", b""];
+            let out = call(nntmux_w58_tmux_command_line_batch, &items);
+            assert_eq!(out[0], 3 | 9 << 14 | 9 << 38);
+            assert_eq!(out[1], 1 | 2 << 14 | 2 << 38);
+            assert_eq!(out[2], 2 | 2 << 4 | 10 << 14 | 10 << 38);
+            assert_eq!(out[3], 5 | 1 << 3 | 1 << 6 | 9 << 14 | 4 << 38);
+            assert_eq!(out[4], 1 << 3 | 2 << 14);
+            assert_eq!(&out[5..11], &[1, 1, 1, 1, 0, 1]);
+            let line = b"send-keys -t nntmux:0.1 'it'\\''s' ''";
+            assert_eq!(out[11], line.len() as i64);
+            let h = line.iter().fold(FNV_OFFSET, |h, &b| fnv(h, b));
+            assert_eq!(out[12], i64::from(h));
+        }
+
+        #[test]
+        fn w583_exports_guard_their_buffers() {
+            let mut buf = [0i64; 64];
+            let o = buf.as_mut_ptr();
+            let n = ptr::null::<i64>();
+            for (f, trailer, words) in EXPORTS {
+                unsafe {
+                    assert_eq!(f(b"x".as_ptr(), 1, n, 1, ptr::null_mut(), 64), -1);
+                    assert_eq!(f(ptr::null(), 1, n, 1, o, 64), -1);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 1, o, 64), -1);
+                    assert_eq!(f(ptr::null(), 0, n, 0, o, 64), trailer);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, n, 2, o, 1), -(trailer + 2 * words));
+                    let lens = [1i64, 2];
+                    assert_eq!(
+                        f(b"a\0b".as_ptr(), 3, lens.as_ptr(), 2, o, 64),
+                        trailer + 2 * words
+                    );
+                    assert_eq!(f(b"a\0bc".as_ptr(), 4, lens.as_ptr(), 2, o, 64), -1);
+                }
+            }
+        }
+    }
+}

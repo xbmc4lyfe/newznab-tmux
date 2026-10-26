@@ -15,6 +15,7 @@ use App\Services\NfoService;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Throwable;
@@ -906,5 +907,259 @@ class Tmux
         );
 
         return (int) ($estimate->row_estimate ?? 0);
+    }
+
+    // ========================================================================
+    // WAVE 58.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 6.51x, p99 5.67x; uncommon mean 3.51x, p99 2.83x); see RustPostProcessReleasesRunnerDowntimeCompensatorTmuxCommandW58ParityTest. */
+    public const bool W58_RUST_FFI_DEFAULT = true;
+
+    public const string W58_TMUX_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w58_tmux_pane_status_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** ASCII-lowercased pane command basename => command class of w58PaneStatusBatch(); others are 6. */
+    public const array W58_PANE_COMMANDS = ['bash' => 1, 'sh' => 1, 'zsh' => 1, 'fish' => 1, 'php' => 2, 'sleep' => 3, 'tmux' => 4,
+        'python' => 5, 'python3' => 5];
+
+    /** Pane colour per status of w58PaneStatusBatch(). */
+    public const array W58_PANE_COLORS = [196, 160, 244, 33, 46, 250];
+
+    /** Bytes allowed in a tmux session name. */
+    public const string W58_SESSION_BYTES = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
+
+    /** Trailer words after the per-item words of w58PaneStatusBatch(). */
+    public const int W58_PANE_TRAILER = 9;
+
+    public static function usesW58RustFfi(): bool
+    {
+        $override = self::w58RustFfiState();
+
+        return \is_bool($override) ? $override : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 58 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 58.3 pane status lines `session:window.pane dead command [args]` (split as explode(' ', $line, 3)).
+     * Per line `status | command << 3 | valid << 6 | dead << 7 | window << 9 | pane << 19 | sessionLength << 29
+     * | colour << 36`: the target is valid with a 1-64 byte W58_SESSION_BYTES session before its last `:`, then
+     * 1-3 digit window and pane numbers around the first `.` (window, pane and session length are 0 when
+     * invalid); dead is 0 for `0`, 1 for `1` and 2 otherwise; command is the W58_PANE_COMMANDS class of the
+     * ASCII-lowercased basename of the command's first word (0 empty, 6 other). Status: 0 invalid target, 1
+     * dead, 2 idle shell, 3 sleeping, 4 running php/python, else 5; colour is W58_PANE_COLORS[status]. Then
+     * the six status counts, the distinct valid sessions and the max valid window and pane.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w58PaneStatusBatch(array $items): array
+    {
+        return self::usesW58RustFfi() ? self::w58PaneStatusBatchNative($items) : self::w58PaneStatusBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w58PaneStatusBatchNative(array $items): array
+    {
+        return self::w58Invoke($items, \count($items) + self::W58_PANE_TRAILER) ?? self::w58PaneStatusBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w58PaneStatusBatchPhp(array $items): array
+    {
+        $out = [];
+        $statuses = [0, 0, 0, 0, 0, 0];
+        $sessions = [];
+        $maxWindow = 0;
+        $maxPane = 0;
+        foreach ($items as $item) {
+            [$target, $dead, $command] = array_pad(explode(' ', (string) $item, 3), 3, '');
+            $valid = false;
+            $session = '';
+            $window = 0;
+            $pane = 0;
+            $colon = strrpos($target, ':');
+            if ($colon !== false) {
+                $session = substr($target, 0, $colon);
+                $rest = substr($target, $colon + 1);
+                $dot = strpos($rest, '.');
+                if ($dot !== false) {
+                    $windowText = substr($rest, 0, $dot);
+                    $paneText = substr($rest, $dot + 1);
+                    $length = \strlen($session);
+                    $valid = $length >= 1 && $length <= 64 && strspn($session, self::W58_SESSION_BYTES) === $length
+                        && self::w58Digits($windowText) && self::w58Digits($paneText);
+                    if ($valid) {
+                        $window = (int) $windowText;
+                        $pane = (int) $paneText;
+                    }
+                }
+            }
+            $dead = match ($dead) {
+                '0' => 0,
+                '1' => 1,
+                default => 2,
+            };
+            $space = strpos($command, ' ');
+            $command = $space === false ? $command : substr($command, 0, $space);
+            $slash = strrpos($command, '/');
+            $base = $slash === false ? $command : substr($command, $slash + 1);
+            $class = $base === '' ? 0 : (self::W58_PANE_COMMANDS[strtolower($base)] ?? 6);
+            $status = match (true) {
+                ! $valid => 0,
+                $dead === 1 => 1,
+                $class === 1 => 2,
+                $class === 3 => 3,
+                $class === 2 || $class === 5 => 4,
+                default => 5,
+            };
+            if ($valid) {
+                $sessions[$session] = true;
+                $maxWindow = max($maxWindow, $window);
+                $maxPane = max($maxPane, $pane);
+            }
+            $statuses[$status]++;
+            $out[] = $status | $class << 3 | ($valid ? 1 : 0) << 6 | $dead << 7 | $window << 9 | $pane << 19
+                | ($valid ? \strlen($session) : 0) << 29 | self::W58_PANE_COLORS[$status] << 36;
+        }
+        array_push($out, ...$statuses);
+        array_push($out, \count($sessions), $maxWindow, $maxPane);
+
+        return $out;
+    }
+
+    /** One to three ASCII digits. */
+    private static function w58Digits(string $value): bool
+    {
+        $length = \strlen($value);
+
+        return $length >= 1 && $length <= 3 && strspn($value, '0123456789') === $length;
+    }
+
+    /**
+     * Wave 58 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w58', self::W58_TMUX_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w58RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w58RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 58.3 export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w58Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w58RustFfiState('ffi');
+            $out = self::w58RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w58RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W58_TMUX_FFI_CDEF.)
+            $written = $ffi->nntmux_w58_tmux_pane_status_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
