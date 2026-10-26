@@ -47701,3 +47701,1068 @@ mod wave60_5_api_canonicalizer_query_params_v1_builder_v2_presenter_log_query {
         }
     }
 }
+
+/// Wave 61.5 batch helpers for `GoogleBooksService`, `IGDBService`, `ImdbScraper`, `ItunesService`
+/// and `LogIndexer`. Each entry reads `count` NUL-joined, tab-separated records in place and writes a
+/// fixed number of words per record.
+mod wave61_5_google_books_igdb_imdb_scraper_itunes_log_indexer {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Plan callback: record bytes and its output words.
+    type Plan = fn(&[u8], &mut [i64]);
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// 1-`max` ASCII digits as an integer (PHP `ctype_digit()` plus `(int)`); `max` is at most 18.
+    fn digits(field: &[u8], max: usize) -> Option<i64> {
+        if field.is_empty() || field.len() > max {
+            return None;
+        }
+        field.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// Up to `N` fields split on `separator` (missing fields empty) and the total field count.
+    fn fields<const N: usize>(record: &[u8], separator: u8) -> ([&[u8]; N], usize) {
+        let mut fields: [&[u8]; N] = [b""; N];
+        let mut total = 0usize;
+        for field in record.split(|&b| b == separator) {
+            if total < N {
+                fields[total] = field;
+            }
+            total += 1;
+        }
+        (fields, total)
+    }
+
+    /// Token bytes: ASCII alphanumerics and every non-ASCII byte.
+    fn is_word(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte >= 0x80
+    }
+
+    /// Maximal runs of [`is_word`] bytes (PHP `preg_split('/[^A-Za-z0-9\x80-\xff]+/')` without empties).
+    fn tokens(text: &[u8]) -> impl Iterator<Item = &[u8]> {
+        text.split(|&b| !is_word(b))
+            .filter(|token| !token.is_empty())
+    }
+
+    /// `[matched, total]` needle tokens found ASCII case-insensitively among the `haystacks` tokens.
+    fn overlap(needle: &[u8], haystacks: &[&[u8]]) -> (i64, i64) {
+        let (mut matched, mut total) = (0i64, 0i64);
+        for token in tokens(needle) {
+            total += 1;
+            if haystacks
+                .iter()
+                .any(|haystack| tokens(haystack).any(|other| other.eq_ignore_ascii_case(token)))
+            {
+                matched += 1;
+            }
+        }
+        (matched, total)
+    }
+
+    /// Whether both texts hold the same non-empty token sequence (ASCII case-insensitive).
+    fn same_tokens(a: &[u8], b: &[u8]) -> bool {
+        let mut left = tokens(a);
+        let mut right = tokens(b);
+        let mut any = false;
+        loop {
+            match (left.next(), right.next()) {
+                (None, None) => return any,
+                (Some(x), Some(y)) if x.eq_ignore_ascii_case(y) => any = true,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Byte length of the tokens joined by single spaces and the token count.
+    fn joined_len<'a>(parts: impl Iterator<Item = &'a [u8]>) -> (i64, i64) {
+        let (mut len, mut count) = (0i64, 0i64);
+        for part in parts {
+            len += part.len() as i64;
+            count += 1;
+        }
+        (if count > 0 { len + count - 1 } else { 0 }, count)
+    }
+
+    /// Validates the shared ABI and runs `plan` over each of the `count` NUL-joined records, writing
+    /// `width` words per record straight into `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        width: usize,
+        plan: Plan,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(records) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = records.len() * width;
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed == 0 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+            for (record, slot) in records.iter().zip(words.chunks_exact_mut(width)) {
+                plan(record, slot);
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `BookIsbn::normalizePhp()`: the uppercased `[0-9Xx]` bytes when they form a valid ISBN-10 or
+    /// ISBN-13 (978/979 prefix), as `(length, kept bytes)`, else `(0, kept bytes)`.
+    fn isbn(field: &[u8]) -> (i64, usize) {
+        let mut kept = [0u8; 13];
+        let mut len = 0usize;
+        for &b in field {
+            if b.is_ascii_digit() || b == b'X' || b == b'x' {
+                if len < 13 {
+                    kept[len] = b.to_ascii_uppercase();
+                }
+                len += 1;
+            }
+        }
+        let valid = match len {
+            10 => {
+                kept[..9].iter().all(u8::is_ascii_digit)
+                    && (kept[9].is_ascii_digit() || kept[9] == b'X')
+                    && kept[..10]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &b)| {
+                            let value = if b == b'X' { 10 } else { i64::from(b - b'0') };
+                            value * (10 - i as i64)
+                        })
+                        .sum::<i64>()
+                        % 11
+                        == 0
+            }
+            13 => {
+                kept.iter().all(u8::is_ascii_digit)
+                    && kept[..2] == *b"97"
+                    && matches!(kept[2], b'8' | b'9')
+                    && kept
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &b)| i64::from(b - b'0') * if i % 2 == 0 { 1 } else { 3 })
+                        .sum::<i64>()
+                        % 10
+                        == 0
+            }
+            _ => false,
+        };
+        (if valid { len as i64 } else { 0 }, len)
+    }
+
+    /// `GoogleBooksService::lookupPlanBatch()` over
+    /// `query\ttitle\tauthor\tisbn\tcandidate_title\tcandidate_author\tmax_results`: `[mode,
+    /// query_len, isbn_kind, title_score, author_score, max_results, title_tokens, flags]`. The ISBN
+    /// keeps `[0-9Xx]` bytes (uppercased) and is 10 or 13 when it passes its checksum, else 0. Mode
+    /// follows `buildSearchQueryPhp()` over the trimmed fields: 1 `isbn:`, 2 `intitle:`/`inauthor:`,
+    /// 3 plain query, 0 empty; the query length is that built string's. Scores are `100 * matched /
+    /// tokens` of the title (the query without one) against the candidate title and of the author
+    /// against the candidate author; tokens are ASCII alphanumeric or non-ASCII runs compared ASCII
+    /// case-insensitively. Max results (empty 10) are 1-3 digits clamped to 1..40. Flags: 1 empty
+    /// request, 2 invalid ISBN, 4 formatted ISBN, 8 clamped max results, 16 invalid max results, 32
+    /// exact title match, 64 empty candidate title, 128 non-ASCII title or author, 256 not exactly
+    /// seven fields.
+    fn google_books_plan(record: &[u8], words: &mut [i64]) {
+        let ([query, title, author, raw_isbn, cand_title, cand_author, max], total) =
+            fields::<7>(record, b'\t');
+        let mut flags = if total == 7 { 0 } else { 256 };
+        let (query, title, author) = (trim(query), trim(title), trim(author));
+        let (kind, kept) = isbn(raw_isbn);
+        let trimmed_isbn = trim(raw_isbn);
+        if kind == 0 && !trimmed_isbn.is_empty() {
+            flags |= 2;
+        }
+        if kind != 0 && kept != trimmed_isbn.len() {
+            flags |= 4;
+        }
+        let (mode, query_len) = if kind != 0 {
+            (1, 5 + kind)
+        } else if !title.is_empty() || !author.is_empty() {
+            let mut len = 0i64;
+            if !title.is_empty() {
+                len += 8 + title.len() as i64;
+            }
+            if !author.is_empty() {
+                len += 9 + author.len() as i64;
+            }
+            if !title.is_empty() && !author.is_empty() {
+                len += 1;
+            }
+            (2, len)
+        } else if !query.is_empty() {
+            (3, query.len() as i64)
+        } else {
+            flags |= 1;
+            (0, 0)
+        };
+        let needle = if title.is_empty() { query } else { title };
+        let (matched, title_tokens) = overlap(needle, &[cand_title]);
+        let title_score = if title_tokens > 0 {
+            100 * matched / title_tokens
+        } else {
+            0
+        };
+        let (matched, author_tokens) = overlap(author, &[cand_author]);
+        let author_score = if author_tokens > 0 {
+            100 * matched / author_tokens
+        } else {
+            0
+        };
+        let max = match trim(max) {
+            b"" => 10,
+            text => match digits(text, 3) {
+                Some(value) if value < 1 => {
+                    flags |= 8;
+                    1
+                }
+                Some(value) if value > 40 => {
+                    flags |= 8;
+                    40
+                }
+                Some(value) => value,
+                None => {
+                    flags |= 16;
+                    10
+                }
+            },
+        };
+        if same_tokens(needle, cand_title) {
+            flags |= 32;
+        }
+        if trim(cand_title).is_empty() {
+            flags |= 64;
+        }
+        if title.iter().chain(author).any(|&b| b >= 0x80) {
+            flags |= 128;
+        }
+        words.copy_from_slice(&[
+            mode,
+            query_len,
+            kind,
+            title_score,
+            author_score,
+            max,
+            title_tokens,
+            flags,
+        ]);
+    }
+
+    /// `IGDBService::PLATFORM_ALIASES`.
+    const PLATFORM_ALIASES: [(&[u8], &[u8]); 26] = [
+        (b"x360", b"xbox 360"),
+        (b"xbox360", b"xbox 360"),
+        (b"xbla", b"xbox 360"),
+        (b"xbox one", b"xbox one"),
+        (b"xboxone", b"xbox one"),
+        (b"x-box", b"xbox"),
+        (b"xbox", b"xbox"),
+        (b"dsi", b"nintendo ds"),
+        (b"nds", b"nintendo ds"),
+        (b"3ds", b"nintendo 3ds"),
+        (b"ps2", b"playstation2"),
+        (b"ps3", b"playstation 3"),
+        (b"ps4", b"playstation 4"),
+        (b"psp", b"sony psp"),
+        (b"psvita", b"playstation vita"),
+        (b"psx", b"playstation"),
+        (b"psx2psp", b"playstation"),
+        (b"wiiu", b"nintendo wii u"),
+        (b"wii", b"nintendo wii"),
+        (b"ngc", b"gamecube"),
+        (b"gc", b"gamecube"),
+        (b"n64", b"nintendo 64"),
+        (b"nes", b"nintendo nes"),
+        (b"super nintendo", b"snes"),
+        (b"nintendo super nes", b"snes"),
+        (b"snes", b"snes"),
+    ];
+
+    /// Canonical platforms in code order (1-based).
+    const PLATFORMS: [&[u8]; 18] = [
+        b"xbox 360",
+        b"xbox one",
+        b"xbox",
+        b"nintendo ds",
+        b"nintendo 3ds",
+        b"playstation2",
+        b"playstation 3",
+        b"playstation 4",
+        b"sony psp",
+        b"playstation vita",
+        b"playstation",
+        b"nintendo wii u",
+        b"nintendo wii",
+        b"gamecube",
+        b"nintendo 64",
+        b"nintendo nes",
+        b"snes",
+        b"pc",
+    ];
+
+    /// Trimmed platform hint resolved through the aliases (ASCII case-insensitive); the result
+    /// borrows either the alias target or the trimmed input.
+    fn platform(field: &[u8]) -> &[u8] {
+        let field = trim(field);
+        PLATFORM_ALIASES
+            .iter()
+            .find(|(alias, _)| field.eq_ignore_ascii_case(alias))
+            .map_or(field, |&(_, target)| target)
+    }
+
+    /// Trimmed 1-`max` digits (empty `0`); anything else sets `flag`.
+    fn number(field: &[u8], max: usize, flag: i64, flags: &mut i64) -> i64 {
+        match trim(field) {
+            b"" => 0,
+            text => digits(text, max).unwrap_or_else(|| {
+                *flags |= flag;
+                0
+            }),
+        }
+    }
+
+    /// `IGDBService::lookupPlanBatch()` over
+    /// `title\tplatform\ttoken_expires_at\tnow\trequests\twindow_started\tcandidate_platforms`:
+    /// `[title_len, word_count, platform_code, platform_match, token_state, token_ttl, allowed,
+    /// rate_wait, flags]`. The title length joins its tokens (ASCII alphanumeric or non-ASCII runs)
+    /// with single spaces. The trimmed platform resolves through `PLATFORM_ALIASES` (ASCII
+    /// case-insensitive) to a 1-based code over the alias targets plus `pc`, 0 empty, -1 unknown; the
+    /// match is the 1-based position of the first comma-separated candidate resolving to the same
+    /// (case-insensitive) platform. Times are 1-12 digit Unix seconds (empty 0): the token state is 0
+    /// missing, 1 valid beyond the 60 second refresh margin, 2 due for refresh, 3 expired, with its
+    /// remaining seconds. The rate window allows 4 requests (1-6 digits, empty 0) per 60 seconds and
+    /// reports the seconds until it reopens. Flags: 1 empty title, 2 unknown platform, 4 invalid
+    /// expiry, 8 invalid now, 16 invalid request count, 32 invalid window start, 64 window starting in
+    /// the future, 128 not exactly seven fields.
+    fn igdb_plan(record: &[u8], words: &mut [i64]) {
+        let ([title, hint, expires, now, requests, window, candidates], total) =
+            fields::<7>(record, b'\t');
+        let mut flags = if total == 7 { 0 } else { 128 };
+        let (title_len, word_count) = joined_len(tokens(title));
+        if word_count == 0 {
+            flags |= 1;
+        }
+        let hint = platform(hint);
+        let code = if hint.is_empty() {
+            0
+        } else {
+            match PLATFORMS
+                .iter()
+                .position(|name| hint.eq_ignore_ascii_case(name))
+            {
+                Some(at) => at as i64 + 1,
+                None => {
+                    flags |= 2;
+                    -1
+                }
+            }
+        };
+        let matched = if hint.is_empty() {
+            0
+        } else {
+            candidates
+                .split(|&b| b == b',')
+                .position(|candidate| platform(candidate).eq_ignore_ascii_case(hint))
+                .map_or(0, |at| at as i64 + 1)
+        };
+        let expires = number(expires, 12, 4, &mut flags);
+        let now = number(now, 12, 8, &mut flags);
+        let requests = number(requests, 6, 16, &mut flags);
+        let window = number(window, 12, 32, &mut flags);
+        let (state, ttl) = if expires == 0 {
+            (0, 0)
+        } else {
+            let remaining = expires - now;
+            let state = if remaining > 60 {
+                1
+            } else if remaining > 0 {
+                2
+            } else {
+                3
+            };
+            (state, remaining.max(0))
+        };
+        let (allowed, wait) = if window == 0 {
+            (1, 0)
+        } else {
+            let elapsed = if now < window {
+                flags |= 64;
+                0
+            } else {
+                now - window
+            };
+            if elapsed >= 60 || requests < 4 {
+                (1, 0)
+            } else {
+                (0, 60 - elapsed)
+            }
+        };
+        words.copy_from_slice(&[
+            title_len, word_count, code, matched, state, ttl, allowed, wait, flags,
+        ]);
+    }
+
+    /// `normalizeApiDevType()` TV spellings.
+    const TV_TYPES: [&[u8]; 11] = [
+        b"tvseries",
+        b"tv_series",
+        b"tv mini series",
+        b"tv_mini_series",
+        b"tvminiseries",
+        b"tvspecial",
+        b"tv_special",
+        b"tvmovie",
+        b"tv_movie",
+        b"tvepisode",
+        b"tv_episode",
+    ];
+
+    /// `ImdbScraper::scrapePlanBatch()` over
+    /// `id\ttitle\tyear\trating\tgenres\tdirectors\tactors\ttype`: `[imdb_num, id_kind, title_len,
+    /// year, rating_x10, genre_count, director_count, actor_count, type_code, flags]`. The trimmed id
+    /// takes an optional ASCII case-insensitive `tt` and 1-10 digits with a positive value; its kind
+    /// is 0 empty, 1 canonical (`tt` plus 7-8 digits), 2 other valid, 3 invalid. The year is the first
+    /// `(19|20)\d{2}` run (`extractYearFromText()`), else 0. The trimmed rating is `\d{1,2}(\.\d)?` up
+    /// to 10.0 in tenths, else -1. Genres (distinct ASCII case-insensitively), directors and actors
+    /// (capped at 10) count trimmed, non-empty comma-separated items. Type is 2 for the
+    /// `normalizeApiDevType()` TV spellings, else 1. Flags: 1 empty id, 2 invalid id, 4 empty title, 8
+    /// no year in a non-empty field, 16 invalid rating, 32 capped actors, 64 duplicate genre, 128
+    /// unknown type, 256 not exactly eight fields.
+    fn imdb_plan(record: &[u8], words: &mut [i64]) {
+        let ([id, title, year, rating, genres, directors, actors, kind], total) =
+            fields::<8>(record, b'\t');
+        let mut flags = if total == 8 { 0 } else { 256 };
+        let id = trim(id);
+        let (num, id_kind) = if id.is_empty() {
+            flags |= 1;
+            (0, 0)
+        } else {
+            let prefixed = id.len() >= 2 && id[..2].eq_ignore_ascii_case(b"tt");
+            let body = if prefixed { &id[2..] } else { id };
+            match digits(body, 10) {
+                Some(value) if value > 0 => {
+                    let canonical = id.starts_with(b"tt") && matches!(body.len(), 7 | 8);
+                    (value, if canonical { 1 } else { 2 })
+                }
+                _ => {
+                    flags |= 2;
+                    (0, 3)
+                }
+            }
+        };
+        let title_len = trim(title).len() as i64;
+        if title_len == 0 {
+            flags |= 4;
+        }
+        let year = year
+            .windows(4)
+            .find(|w| {
+                matches!(&w[..2], b"19" | b"20") && w[2].is_ascii_digit() && w[3].is_ascii_digit()
+            })
+            .map_or_else(
+                || {
+                    if !trim(year).is_empty() {
+                        flags |= 8;
+                    }
+                    0
+                },
+                |w| digits(w, 4).unwrap_or(0),
+            );
+        let rating = match trim(rating) {
+            b"" => -1,
+            text => {
+                let (whole, tenth) = match memchr(b'.', text) {
+                    Some(at) => (&text[..at], Some(&text[at + 1..])),
+                    None => (text, None),
+                };
+                let value = match (digits(whole, 2), tenth) {
+                    (Some(whole), None) => Some(whole * 10),
+                    (Some(whole), Some(tenth)) if tenth.len() == 1 => {
+                        digits(tenth, 1).map(|tenth| whole * 10 + tenth)
+                    }
+                    _ => None,
+                };
+                match value {
+                    Some(value) if value <= 100 => value,
+                    _ => {
+                        flags |= 16;
+                        -1
+                    }
+                }
+            }
+        };
+        let mut seen: Vec<&[u8]> = Vec::new();
+        for genre in genres.split(|&b| b == b',') {
+            let genre = trim(genre);
+            if genre.is_empty() {
+                continue;
+            }
+            if seen.iter().any(|other| other.eq_ignore_ascii_case(genre)) {
+                flags |= 64;
+            } else {
+                seen.push(genre);
+            }
+        }
+        let count = |list: &[u8]| {
+            list.split(|&b| b == b',')
+                .filter(|item| !trim(item).is_empty())
+                .count() as i64
+        };
+        let director_count = count(directors);
+        let mut actor_count = count(actors);
+        if actor_count > 10 {
+            actor_count = 10;
+            flags |= 32;
+        }
+        let kind = trim(kind);
+        let type_code = if TV_TYPES.iter().any(|name| kind.eq_ignore_ascii_case(name)) {
+            2
+        } else {
+            if !kind.is_empty() && !kind.eq_ignore_ascii_case(b"movie") {
+                flags |= 128;
+            }
+            1
+        };
+        words.copy_from_slice(&[
+            num,
+            id_kind,
+            title_len,
+            year,
+            rating,
+            seen.len() as i64,
+            director_count,
+            actor_count,
+            type_code,
+            flags,
+        ]);
+    }
+
+    /// iTunes entities and media in code order (1-based), matched ASCII case-insensitively.
+    const ENTITIES: [&[u8]; 5] = [b"album", b"song", b"musicartist", b"ebook", b"audiobook"];
+    const MEDIA: [&[u8]; 4] = [b"music", b"ebook", b"audiobook", b"all"];
+    const KINDS: [&[u8]; 5] = [b"track", b"collection", b"ebook", b"audiobook", b"artist"];
+
+    /// Trimmed, ASCII case-insensitive 1-based code in `names`; 0 empty, -1 unknown (sets `flag`).
+    fn code(field: &[u8], names: &[&[u8]], flag: i64, flags: &mut i64) -> i64 {
+        let field = trim(field);
+        if field.is_empty() {
+            return 0;
+        }
+        match names
+            .iter()
+            .position(|name| field.eq_ignore_ascii_case(name))
+        {
+            Some(at) => at as i64 + 1,
+            None => {
+                *flags |= flag;
+                -1
+            }
+        }
+    }
+
+    /// `ItunesService::lookupPlanBatch()` over
+    /// `term\tentity\tmedia\tcountry\tlimit\tresult_name\tresult_artist\tresult_kind`: `[term_len,
+    /// term_words, entity_code, media_code, country_code, limit, score, kind_code, flags]`. The term
+    /// splits on ASCII whitespace (space, tab, LF, CR, VT, FF) and its length joins the words with
+    /// single spaces. Entity codes are 1 album, 2 song, 3 musicArtist, 4 ebook, 5 audiobook; media 1
+    /// music, 2 ebook, 3 audiobook, 4 all; result kinds 1 track, 2 collection, 3 ebook, 4 audiobook, 5
+    /// artist (trimmed, ASCII case-insensitive, 0 empty, -1 unknown). The country is two ASCII letters
+    /// as `(A-Z) * 26 + (A-Z) + 1` (empty or invalid: US, 539). Limit (empty 10) is 1-3 digits clamped
+    /// to 1..200. The score is `100 * matched / tokens` of the term tokens (ASCII alphanumeric or
+    /// non-ASCII runs) found among the result name and artist tokens. Flags: 1 empty term, 2 unknown
+    /// entity, 4 unknown media, 8 entity outside its media, 16 invalid country, 32 clamped limit, 64
+    /// invalid limit, 128 exact name match, 256 unknown kind, 512 not exactly eight fields.
+    fn itunes_plan(record: &[u8], words: &mut [i64]) {
+        let ([term, entity, media, country, limit, name, artist, kind], total) =
+            fields::<8>(record, b'\t');
+        let mut flags = if total == 8 { 0 } else { 512 };
+        let (term_len, term_words) = joined_len(
+            term.split(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+                .filter(|word| !word.is_empty()),
+        );
+        if term_words == 0 {
+            flags |= 1;
+        }
+        let entity = code(entity, &ENTITIES, 2, &mut flags);
+        let media = code(media, &MEDIA, 4, &mut flags);
+        let expected = match entity {
+            1..=3 => 1,
+            4 => 2,
+            5 => 3,
+            _ => 0,
+        };
+        if expected > 0 && media > 0 && media != 4 && media != expected {
+            flags |= 8;
+        }
+        const US: i64 = 20 * 26 + 18 + 1;
+        let country = match trim(country) {
+            b"" => US,
+            [a, b] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() => {
+                i64::from(a.to_ascii_uppercase() - b'A') * 26
+                    + i64::from(b.to_ascii_uppercase() - b'A')
+                    + 1
+            }
+            _ => {
+                flags |= 16;
+                US
+            }
+        };
+        let limit = match trim(limit) {
+            b"" => 10,
+            text => match digits(text, 3) {
+                Some(value) if value < 1 => {
+                    flags |= 32;
+                    1
+                }
+                Some(value) if value > 200 => {
+                    flags |= 32;
+                    200
+                }
+                Some(value) => value,
+                None => {
+                    flags |= 64;
+                    10
+                }
+            },
+        };
+        let (matched, tokens) = overlap(term, &[name, artist]);
+        let score = if tokens > 0 {
+            100 * matched / tokens
+        } else {
+            0
+        };
+        if same_tokens(term, name) {
+            flags |= 128;
+        }
+        let kind = code(kind, &KINDS, 256, &mut flags);
+        words.copy_from_slice(&[
+            term_len, term_words, entity, media, country, limit, score, kind, flags,
+        ]);
+    }
+
+    /// `LogIndexer::MAX_BATCH_BYTES`.
+    const MAX_BATCH_BYTES: i64 = 8_388_608;
+
+    /// `LogIndexer::checkpointPlanBatch()` over
+    /// `size\tindexed_offset\tindexed_line\thead_length\tstored_inode\tinode\tmtime\tnow\tpending_bytes\tpending_entries\tbatch_size\tlag_tolerance`:
+    /// `[action, resume_offset, remaining, flush, chunk_bytes, state, active, head_refresh, chunks,
+    /// flags]`. Fields are trimmed 1-18 digits; empty or invalid ones take their default (0, batch
+    /// size 1000 floored at 1, lag tolerance 1048576). Action: 3 new (no stored inode), 2 reset (inode
+    /// changed or truncated below the offset), 1 index the unread tail, 0 caught up; resets resume at
+    /// 0. The remaining bytes are read in `MAX_BATCH_BYTES` chunks; the pending batch flushes at the
+    /// batch size or `MAX_BATCH_BYTES`. State is 0 none after a reset, 1 indexed within the lag
+    /// tolerance, 2 partial. Active means modified within the last 120 seconds; the head refreshes
+    /// after a reset or while shorter than 1024 bytes of a longer file. Flags: 1 invalid number, 2
+    /// truncated, 4 inode changed, 8 modified in the future, 16 offset without a line, 32 byte flush,
+    /// 64 entry flush, 128 not exactly twelve fields.
+    fn log_indexer_plan(record: &[u8], words: &mut [i64]) {
+        let (values, total) = fields::<12>(record, b'\t');
+        let mut flags = if total == 12 { 0 } else { 128 };
+        let mut parsed = [0i64; 12];
+        for (slot, field) in parsed.iter_mut().zip(values) {
+            *slot = match trim(field) {
+                b"" => -1,
+                text => digits(text, 18).unwrap_or_else(|| {
+                    flags |= 1;
+                    -1
+                }),
+            };
+        }
+        let value = |at: usize, default: i64| {
+            if parsed[at] < 0 { default } else { parsed[at] }
+        };
+        let (size, offset, line, head) = (value(0, 0), value(1, 0), value(2, 0), value(3, 0));
+        let (stored, inode, mtime, now) = (value(4, 0), value(5, 0), value(6, 0), value(7, 0));
+        let (bytes, entries) = (value(8, 0), value(9, 0));
+        let batch = value(10, 1000).max(1);
+        let lag = value(11, 1_048_576);
+        if size < offset {
+            flags |= 2;
+        }
+        if stored > 0 && inode > 0 && inode != stored {
+            flags |= 4;
+        }
+        let action = if stored == 0 {
+            3
+        } else if flags & 6 != 0 {
+            2
+        } else if offset < size {
+            1
+        } else {
+            0
+        };
+        let resume = if action >= 2 { 0 } else { offset };
+        let remaining = size - resume;
+        if entries >= batch {
+            flags |= 64;
+        }
+        if bytes >= MAX_BATCH_BYTES {
+            flags |= 32;
+        }
+        let flush = i64::from(flags & 96 != 0);
+        let chunk = remaining.min(MAX_BATCH_BYTES);
+        let chunks = (remaining + MAX_BATCH_BYTES - 1) / MAX_BATCH_BYTES;
+        let state = if action >= 2 {
+            0
+        } else if remaining <= lag {
+            1
+        } else {
+            2
+        };
+        if now > 0 && mtime > now {
+            flags |= 8;
+        }
+        let active = i64::from(mtime > 0 && now >= mtime && now - mtime < 120);
+        let refresh = i64::from(action >= 2 || (head < 1024 && size > head));
+        if offset > 0 && line == 0 {
+            flags |= 16;
+        }
+        words.copy_from_slice(&[
+            action, resume, remaining, flush, chunk, state, active, refresh, chunks, flags,
+        ]);
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $plan:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `flags` must be 0 and `ints` empty. Writes the
+            /// helper's fixed words per record and returns the words written, `-needed` when
+            /// `out_cap` is too small (nothing written), or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(
+                        count, flags, data, data_len, ints, ints_len, out, out_cap, $width, $plan,
+                    )
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `GoogleBooksService::lookupPlanBatch()` (see [`google_books_plan`]).
+        nntmux_w615_google_books_lookup_plan, 8, google_books_plan
+    );
+    entry!(
+        /// `IGDBService::lookupPlanBatch()` (see [`igdb_plan`]).
+        nntmux_w615_igdb_lookup_plan, 9, igdb_plan
+    );
+    entry!(
+        /// `ImdbScraper::scrapePlanBatch()` (see [`imdb_plan`]).
+        nntmux_w615_imdb_scrape_plan, 10, imdb_plan
+    );
+    entry!(
+        /// `ItunesService::lookupPlanBatch()` (see [`itunes_plan`]).
+        nntmux_w615_itunes_lookup_plan, 9, itunes_plan
+    );
+    entry!(
+        /// `LogIndexer::checkpointPlanBatch()` (see [`log_indexer_plan`]).
+        nntmux_w615_log_indexer_plan, 10, log_indexer_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [(Entry, usize); 5] = [
+            (nntmux_w615_google_books_lookup_plan, 8),
+            (nntmux_w615_igdb_lookup_plan, 9),
+            (nntmux_w615_imdb_scrape_plan, 10),
+            (nntmux_w615_itunes_lookup_plan, 9),
+            (nntmux_w615_log_indexer_plan, 10),
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Vec<i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        #[test]
+        fn w615_google_books_plans_build_queries_and_score() {
+            assert_eq!(
+                call(
+                    nntmux_w615_google_books_lookup_plan,
+                    &[
+                        b"\t\t\t978-0-306-40615-7\t\t\t",
+                        b"dune\tDune Messiah\tFrank Herbert\t\tdune messiah\tHerbert, Frank\t99",
+                        b"",
+                        b"Some Query\t\t\t12345\tsome other\t\tx",
+                    ]
+                ),
+                vec![
+                    1, 18, 13, 0, 0, 10, 0, 68, //
+                    2, 43, 0, 100, 100, 40, 2, 40, //
+                    0, 0, 0, 0, 0, 10, 0, 321, //
+                    3, 10, 0, 50, 0, 10, 2, 18,
+                ]
+            );
+        }
+
+        #[test]
+        fn w615_igdb_plans_resolve_platforms_and_windows() {
+            assert_eq!(
+                call(
+                    nntmux_w615_igdb_lookup_plan,
+                    &[
+                        b"  Halo: Reach!! \t X360 \t1000\t950\t4\t930\tpc,Xbox 360",
+                        b"",
+                        b"Zelda\tvirtual boy\t900\t1000\tx\t1100\tvirtual boy",
+                    ]
+                ),
+                vec![
+                    10, 2, 1, 2, 2, 50, 0, 40, 0, //
+                    0, 0, 0, 0, 0, 0, 1, 0, 129, //
+                    5, 1, -1, 1, 3, 0, 1, 0, 82,
+                ]
+            );
+        }
+
+        #[test]
+        fn w615_imdb_plans_validate_titles() {
+            assert_eq!(
+                call(
+                    nntmux_w615_imdb_scrape_plan,
+                    &[
+                        b"tt0111161\tThe Shawshank Redemption\t(1994)\t9.3\tDrama, drama,Crime\tFrank Darabont\ta,b,c,d,e,f,g,h,i,j,k\tmovie",
+                        b"",
+                        b"TT12\t \tunknown\t10.5\t\t\t\ttvSeries",
+                    ]
+                ),
+                vec![
+                    111161, 1, 24, 1994, 93, 2, 1, 10, 1, 96, //
+                    0, 0, 0, 0, -1, 0, 0, 0, 1, 261, //
+                    12, 2, 0, 0, -1, 0, 0, 0, 2, 28,
+                ]
+            );
+        }
+
+        #[test]
+        fn w615_itunes_plans_normalize_terms() {
+            assert_eq!(
+                call(
+                    nntmux_w615_itunes_lookup_plan,
+                    &[
+                        b" Abbey   Road \talbum\tmusic\tgb\t500\tAbbey Road\tThe Beatles\tcollection",
+                        b"",
+                        b"x\tebook\tmusic\tusa\t0\t\t\tpodcast",
+                    ]
+                ),
+                vec![
+                    10, 2, 1, 1, 6 * 26 + 1 + 1, 200, 100, 2, 160, //
+                    0, 0, 0, 0, 539, 10, 0, 0, 513, //
+                    1, 1, 4, 1, 539, 1, 0, -1, 312,
+                ]
+            );
+        }
+
+        #[test]
+        fn w615_log_indexer_plans_checkpoint() {
+            assert_eq!(
+                call(
+                    nntmux_w615_log_indexer_plan,
+                    &[
+                        b"20000000\t1000\t10\t1024\t7\t7\t950\t1000\t9000000\t5\t1000\t",
+                        b"",
+                        b"10\t500\t0\t0\t7\t8\t2000\t1000\t\t1000\t0\tx",
+                    ]
+                ),
+                vec![
+                    1, 1000, 19_999_000, 1, 8_388_608, 2, 1, 0, 3, 32, //
+                    3, 0, 0, 0, 0, 0, 0, 1, 0, 128, //
+                    2, 0, 10, 1, 10, 0, 0, 1, 1, 95,
+                ]
+            );
+        }
+
+        #[test]
+        fn w615_entries_validate_the_abi() {
+            for (entry, width) in ENTRIES {
+                let data = b"a\0b\0c";
+                let mut out = [7i64; 32];
+                let call = |count: usize, flags: i64, len: usize, cap: usize, out: *mut i64| unsafe {
+                    entry(
+                        count,
+                        flags,
+                        data.as_ptr(),
+                        len,
+                        std::ptr::null(),
+                        0,
+                        out,
+                        cap,
+                    )
+                };
+                let needed = (3 * width) as i64;
+                assert_eq!(call(3, 0, 5, 32, out.as_mut_ptr()), needed);
+                assert_eq!(call(3, 0, 5, 3 * width - 1, out.as_mut_ptr()), -needed);
+                assert_eq!(call(3, 1, 5, 32, out.as_mut_ptr()), -1);
+                assert_eq!(call(4, 0, 5, 32, out.as_mut_ptr()), -1);
+                assert_eq!(call(2, 0, 5, 32, out.as_mut_ptr()), -1);
+                assert_eq!(call(0, 0, 0, 0, std::ptr::null_mut()), 0);
+                assert_eq!(call(3, 0, 5, 4, std::ptr::null_mut()), -1);
+                let overlapping = unsafe {
+                    entry(
+                        1,
+                        0,
+                        out.as_ptr().cast(),
+                        8,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        32,
+                    )
+                };
+                assert_eq!(overlapping, -1);
+            }
+        }
+    }
+}

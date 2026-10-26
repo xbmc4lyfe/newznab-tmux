@@ -702,4 +702,259 @@ class ItunesService
             return null;
         }
     }
+
+    /** C signature of the Wave 61.5 {@see self::lookupPlanBatch()} helper. */
+    private const string W61_ITUNES_PLAN_FFI_CDEF = 'int64_t nntmux_w615_itunes_lookup_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * The Wave 61.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
+     * (min 6.14/5.29/4.11/3.11x); see tests/Unit/RustGoogleBooksIgdbImdbScraperItunesLogIndexerW61ParityTest.php.
+     */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    /** {@see self::lookupPlanBatch()} entity, media and result kind codes (1-based). */
+    private const array W61_ENTITIES = ['album', 'song', 'musicartist', 'ebook', 'audiobook'];
+
+    private const array W61_MEDIA = ['music', 'ebook', 'audiobook', 'all'];
+
+    private const array W61_KINDS = ['track', 'collection', 'ebook', 'audiobook', 'artist'];
+
+    /**
+     * Wave 61.5 routing and FFI cache, kept in function-local statics (no static properties). Without $op it
+     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
+     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
+     * with room for at least $val words, or null without the library.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w61_5', self::W61_ITUNES_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W61_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW61RustFfi(): bool
+    {
+        return self::w61RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with lookupPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 61.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w61Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w61RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w615_itunes_lookup_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch iTunes Store lookup plan over `term\tentity\tmedia\tcountry\tlimit\tresult_name\tresult_artist\tresult_kind`.
+     * Nine words per record: `[term_len, term_words, entity_code, media_code, country_code, limit, score, kind_code,
+     * flags]`. The term splits on ASCII whitespace (space, tab, LF, CR, VT, FF) and its length joins the words with
+     * single spaces. Entity codes are 1 album, 2 song, 3 musicArtist, 4 ebook, 5 audiobook; media 1 music, 2 ebook,
+     * 3 audiobook, 4 all; result kinds 1 track, 2 collection, 3 ebook, 4 audiobook, 5 artist (trimmed, ASCII
+     * case-insensitive, 0 empty, -1 unknown). The country is two ASCII letters as `(A-Z) * 26 + (A-Z) + 1` (empty or
+     * invalid: US, 539). Limit (empty 10) is 1-3 digits clamped to 1..200. The score is `100 * matched / tokens` of
+     * the term tokens (ASCII alphanumeric or non-ASCII runs) found among the result name and artist tokens. Flags:
+     * 1 empty term, 2 unknown entity, 4 unknown media, 8 entity outside its media, 16 invalid country, 32 clamped
+     * limit, 64 invalid limit, 128 exact name match, 256 unknown kind, 512 not exactly eight fields.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatch(array $records): array
+    {
+        return self::usesW61RustFfi() ? self::lookupPlanBatchNative($records) : self::lookupPlanBatchPhp($records);
+    }
+
+    /**
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatchPhp(array $records): array
+    {
+        $out = [];
+        foreach ($records as $record) {
+            $fields = explode("\t", $record);
+            $flags = \count($fields) === 8 ? 0 : 512;
+            $words = preg_split('/[ \t\n\r\x0b\x0c]+/', $fields[0], -1, PREG_SPLIT_NO_EMPTY);
+            $words = \is_array($words) ? $words : [];
+            $termLength = \strlen(implode(' ', $words));
+            if ($words === []) {
+                $flags |= 1;
+            }
+            $entity = self::w61Code($fields[1] ?? '', self::W61_ENTITIES, 2, $flags);
+            $media = self::w61Code($fields[2] ?? '', self::W61_MEDIA, 4, $flags);
+            $expected = match ($entity) {
+                1, 2, 3 => 1,
+                4 => 2,
+                5 => 3,
+                default => 0,
+            };
+            if ($expected > 0 && $media > 0 && $media !== 4 && $media !== $expected) {
+                $flags |= 8;
+            }
+            $country = 539;
+            $text = trim($fields[3] ?? '');
+            if (preg_match('/^[A-Za-z]{2}$/D', $text) === 1) {
+                $upper = strtoupper($text);
+                $country = (\ord($upper[0]) - 65) * 26 + \ord($upper[1]) - 65 + 1;
+            } elseif ($text !== '') {
+                $flags |= 16;
+            }
+            $limit = 10;
+            $text = trim($fields[4] ?? '');
+            if ($text !== '') {
+                $value = self::w61Digits($text, 3);
+                if ($value === null) {
+                    $flags |= 64;
+                } elseif ($value < 1 || $value > 200) {
+                    $limit = max(1, min(200, $value));
+                    $flags |= 32;
+                } else {
+                    $limit = $value;
+                }
+            }
+            $term = self::w61Tokens($fields[0]);
+            $name = self::w61Tokens($fields[5] ?? '');
+            $set = array_flip([...$name, ...self::w61Tokens($fields[6] ?? '')]);
+            $matched = 0;
+            foreach ($term as $token) {
+                if (isset($set[$token])) {
+                    $matched++;
+                }
+            }
+            $score = $term !== [] ? intdiv(100 * $matched, \count($term)) : 0;
+            if ($term !== [] && $term === $name) {
+                $flags |= 128;
+            }
+            $kind = self::w61Code($fields[7] ?? '', self::W61_KINDS, 256, $flags);
+            array_push($out, $termLength, \count($words), $entity, $media, $country, $limit, $score, $kind, $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Trimmed, ASCII case-insensitive 1-based code in $names; 0 empty, -1 unknown (sets $flag).
+     *
+     * @param  list<string>  $names
+     */
+    private static function w61Code(string $field, array $names, int $flag, int &$flags): int
+    {
+        $field = strtolower(trim($field));
+        if ($field === '') {
+            return 0;
+        }
+        $position = array_search($field, $names, true);
+        if ($position === false) {
+            $flags |= $flag;
+
+            return -1;
+        }
+
+        return $position + 1;
+    }
+
+    /**
+     * Lowercased runs of ASCII alphanumeric or non-ASCII bytes.
+     *
+     * @return list<string>
+     */
+    private static function w61Tokens(string $text): array
+    {
+        $tokens = preg_split('/[^a-z0-9\x80-\xff]+/', strtolower($text), -1, PREG_SPLIT_NO_EMPTY);
+
+        return \is_array($tokens) ? $tokens : [];
+    }
+
+    /** 1-$max ASCII digits as an integer, else null. */
+    private static function w61Digits(string $text, int $max): ?int
+    {
+        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
+    }
+
+    /**
+     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
+     * a NUL.
+     *
+     * @param  list<string>  $records
+     * @return list<int>
+     */
+    public static function lookupPlanBatchNative(array $records): array
+    {
+        $count = \count($records);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w61Words($count, implode("\0", $records), 9 * $count) ?? self::lookupPlanBatchPhp($records);
+    }
 }
