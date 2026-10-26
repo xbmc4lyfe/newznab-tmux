@@ -46220,3 +46220,808 @@ mod w616_blacklist_filecheck_domain_completion_image_tests {
         assert_eq!((status, out[22]), (1, -1));
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 62.6: incident impact, incident status, lookup mode, queue type and
+// registration status plans (`nntmux_w626_*`) for IncidentImpactEnum,
+// IncidentStatusEnum, LookupMode, QueueType and RegistrationStatus. Same
+// contract as Wave 61.6: strings are NUL-joined column after column (with a
+// 0x01-joined twin when one holds a NUL), integer columns are machine-order
+// `int64_t`, and the result is fixed-width `int64_t` words. Every export
+// returns 1, -1 for invalid input (PHP then computes the batch) or -2 when
+// `out` is null, misaligned or too small, and leaves `out` untouched unless it
+// returns 1.
+// ---------------------------------------------------------------------------
+
+/// A token length saturated to 8 bits.
+#[inline]
+fn w626_len8(value: &[u8]) -> i64 {
+    value.len().min(255) as i64
+}
+
+// --- IncidentImpactEnum::planIncidentImpactBatch ------------------------------
+
+pub(crate) const W626_IMPACT_HEADER: usize = 20;
+
+/// Response target minutes per case (unknown escalates like major).
+const W626_IMPACT_TARGETS: [i64; 5] = [0, 240, 60, 15, 60];
+
+/// Incident age clamp (2^31 - 1 minutes).
+const W626_AGE_CAP: i64 = (1 << 31) - 1;
+
+/// Case 0 none, 1 minor, 2 major, 3 critical, 4 unknown; source 0 backing
+/// value, 1 case name, 2 alias of the lowercased trimmed token, 3 unknown.
+#[inline]
+fn w626_impact_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+    match raw {
+        b"none" => (0, 0),
+        b"minor" => (1, 0),
+        b"major" => (2, 0),
+        b"critical" => (3, 0),
+        b"None" => (0, 1),
+        b"Minor" => (1, 1),
+        b"Major" => (2, 1),
+        b"Critical" => (3, 1),
+        _ => {
+            w616_lower_trim_into(raw, lower);
+            match lower.as_slice() {
+                b"none" | b"ok" | b"operational" | b"normal" | b"0" => (0, 2),
+                b"minor" | b"low" | b"degraded" | b"sev3" | b"p3" | b"1" => (1, 2),
+                b"major" | b"high" | b"partial" | b"partial-outage" | b"sev2" | b"p2" | b"2" => {
+                    (2, 2)
+                }
+                b"critical" | b"severe" | b"outage" | b"major-outage" | b"down" | b"sev1"
+                | b"p1" | b"3" => (3, 2),
+                _ => (4, 3),
+            }
+        }
+    }
+}
+
+/// Impact tokens with an age-in-minutes column. Ages clamp to 0..2^31-1;
+/// escalation is 0 within the case's response target (and always for none), 1
+/// past it, 2 past twice and 3 past four times it; notify when major,
+/// critical or escalation is at least 2. `[0]` count, `[1..6]` per case,
+/// `[6..10]` per source, `[10..14]` per escalation, `[14]` breaches, `[15]`
+/// notifications, `[16]` first breach (-1), `[17]` highest known severity
+/// (-1), `[18]` total age, `[19]` FNV-1a digest; then
+/// per incident `case | source << 3 | escalation << 5 | breach << 7 | notify
+/// << 8 | target << 9 | age << 18 | min(token bytes, 255) << 49`.
+pub(crate) fn w626_impact_batch(impacts: &[&[u8]], ages: &[i64]) -> Vec<i64> {
+    let count = impacts.len();
+    let mut out = vec![0i64; W626_IMPACT_HEADER + count];
+    out[0] = count as i64;
+    out[16] = -1;
+    out[17] = -1;
+    let mut lower = Vec::new();
+    for (at, &raw) in impacts.iter().enumerate() {
+        let (case, source) = w626_impact_case(raw, &mut lower);
+        let target = W626_IMPACT_TARGETS[case as usize];
+        let age = ages[at].clamp(0, W626_AGE_CAP);
+        let escalation: i64 = if target == 0 || age <= target {
+            0
+        } else if age <= 2 * target {
+            1
+        } else if age <= 4 * target {
+            2
+        } else {
+            3
+        };
+        let breach = i64::from(escalation > 0);
+        let notify = i64::from(case == 2 || case == 3 || escalation >= 2);
+        out[1 + case as usize] += 1;
+        out[6 + source as usize] += 1;
+        out[10 + escalation as usize] += 1;
+        out[14] += breach;
+        out[15] += notify;
+        if breach == 1 {
+            w586_first(&mut out[16], at);
+        }
+        if case < 4 {
+            out[17] = out[17].max(case);
+        }
+        out[18] += age;
+        out[W626_IMPACT_HEADER + at] = case
+            | source << 3
+            | escalation << 5
+            | breach << 7
+            | notify << 8
+            | target << 9
+            | age << 18
+            | w626_len8(raw) << 49;
+    }
+    out[19] = w526_digest(&out[W626_IMPACT_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w626_incident_impact_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let impacts = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                1,
+                count,
+            )?;
+            let ages = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+            Some(w626_impact_batch(&impacts, &ages))
+        })
+    }
+}
+
+// --- IncidentStatusEnum::planIncidentStatusBatch ------------------------------
+
+pub(crate) const W626_STATUS_HEADER: usize = 22;
+
+/// Case 0 investigating, 1 identified, 2 monitoring, 3 resolved, 4 unknown, 5
+/// blank; sources as [`w626_impact_case`].
+#[inline]
+fn w626_status_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+    match raw {
+        b"investigating" => (0, 0),
+        b"identified" => (1, 0),
+        b"monitoring" => (2, 0),
+        b"resolved" => (3, 0),
+        b"Investigating" => (0, 1),
+        b"Identified" => (1, 1),
+        b"Monitoring" => (2, 1),
+        b"Resolved" => (3, 1),
+        _ => {
+            w616_lower_trim_into(raw, lower);
+            match lower.as_slice() {
+                b"investigating" | b"open" | b"new" | b"triage" | b"acknowledged" => (0, 2),
+                b"identified" | b"diagnosed" | b"fixing" | b"root-caused" => (1, 2),
+                b"monitoring" | b"watching" | b"mitigated" | b"recovering" => (2, 2),
+                b"resolved" | b"closed" | b"fixed" | b"done" | b"completed" => (3, 2),
+                b"" => (5, 3),
+                _ => (4, 3),
+            }
+        }
+    }
+}
+
+/// Current status and requested target columns. A blank current status is
+/// unknown (4); a blank target requests nothing. Transitions: 0 none (blank or
+/// same target), 1 forward, 2 allowed regression (back to an earlier active
+/// stage, or reopening a resolved incident to investigating), 3 forbidden
+/// (resolved back to identified or monitoring), 4 unknown target, 5 unknown
+/// status. The effective case is the target after a forward or regression
+/// transition, else the current case. `[0]` count, `[1..6]` per case, `[6..10]`
+/// per source, `[10..16]` per transition, `[16]` active and `[17]` resolved,
+/// `[18]` effectively active, `[19]` reopened, `[20]` first forbidden (-1),
+/// `[21]` FNV-1a digest; then per incident `case | source << 3 | target << 5 |
+/// target source << 8 | transition << 10 | active << 13 | effective << 14 |
+/// effectively active << 17 | min(status bytes, 255) << 18 | min(target bytes,
+/// 255) << 26`.
+pub(crate) fn w626_status_batch(fields: &[&[u8]], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W626_STATUS_HEADER + count];
+    out[0] = count as i64;
+    out[20] = -1;
+    let mut lower = Vec::new();
+    for at in 0..count {
+        let raw = fields[at];
+        let raw_target = fields[count + at];
+        let (mut case, source) = w626_status_case(raw, &mut lower);
+        if case == 5 {
+            case = 4;
+        }
+        let (target, target_source) = w626_status_case(raw_target, &mut lower);
+        let transition: i64 = if case == 4 {
+            5
+        } else if target == 5 || target == case {
+            0
+        } else if target == 4 {
+            4
+        } else if target > case {
+            1
+        } else if case == 3 && target != 0 {
+            3
+        } else {
+            2
+        };
+        let effective = if transition == 1 || transition == 2 {
+            target
+        } else {
+            case
+        };
+        let active = i64::from(case <= 2);
+        let effective_active = i64::from(effective <= 2);
+        out[1 + case as usize] += 1;
+        out[6 + source as usize] += 1;
+        out[10 + transition as usize] += 1;
+        out[16] += active;
+        out[17] += i64::from(case == 3);
+        out[18] += effective_active;
+        out[19] += i64::from(case == 3 && transition == 2);
+        if transition == 3 {
+            w586_first(&mut out[20], at);
+        }
+        out[W626_STATUS_HEADER + at] = case
+            | source << 3
+            | target << 5
+            | target_source << 8
+            | transition << 10
+            | active << 13
+            | effective << 14
+            | effective_active << 17
+            | w626_len8(raw) << 18
+            | w626_len8(raw_target) << 26;
+    }
+    out[21] = w526_digest(&out[W626_STATUS_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w626_incident_status_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let fields = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                2,
+                count,
+            )?;
+            Some(w626_status_batch(&fields, count))
+        })
+    }
+}
+
+// --- LookupMode::planLookupModeBatch ------------------------------------------
+
+pub(crate) const W626_LOOKUP_HEADER: usize = 16;
+
+/// Candidate, renamed and limit clamp (2^24 - 1).
+const W626_SCOPE_CAP: i64 = (1 << 24) - 1;
+
+/// Case 0 disabled, 1 all, 2 renamed, 3 unknown; sources as
+/// [`w626_impact_case`].
+#[inline]
+fn w626_lookup_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+    match raw {
+        b"0" => (0, 0),
+        b"1" => (1, 0),
+        b"2" => (2, 0),
+        b"Disabled" => (0, 1),
+        b"All" => (1, 1),
+        b"Renamed" => (2, 1),
+        _ => {
+            w616_lower_trim_into(raw, lower);
+            match lower.as_slice() {
+                b"disabled" | b"disable" | b"off" | b"none" | b"false" | b"no" => (0, 2),
+                b"all" | b"all releases" | b"on" | b"true" | b"yes" | b"enabled" | b"every" => {
+                    (1, 2)
+                }
+                b"renamed"
+                | b"renamed releases only"
+                | b"renamed-only"
+                | b"renamed_only"
+                | b"rename" => (2, 2),
+                _ => (3, 3),
+            }
+        }
+    }
+}
+
+/// Mode tokens with candidate and renamed-candidate columns and a per-run
+/// limit. Counts and the limit clamp to 0..2^24-1 (limit 0 is unlimited). The
+/// scope is every candidate for all, the renamed ones (at most every
+/// candidate) for renamed, else none; the selection is the scope cut to the
+/// limit. `[0]` count, `[1..5]` per case, `[5..9]` per source, `[9]` enabled,
+/// `[10]` scope, `[11]` selected and `[12]` deferred candidates, `[13]`
+/// truncated runs and `[14]` the first truncated index (-1), `[15]` FNV-1a
+/// digest; then per run `case | source << 2 | enabled << 4 | truncated << 5 |
+/// selected << 6 | scope << 30 | min(token bytes, 255) << 54`.
+pub(crate) fn w626_lookup_batch(modes: &[&[u8]], ints: &[i64], limit: i64) -> Vec<i64> {
+    let count = modes.len();
+    let mut out = vec![0i64; W626_LOOKUP_HEADER + count];
+    out[0] = count as i64;
+    out[14] = -1;
+    let limit = limit.clamp(0, W626_SCOPE_CAP);
+    let mut lower = Vec::new();
+    for (at, &raw) in modes.iter().enumerate() {
+        let (case, source) = w626_lookup_case(raw, &mut lower);
+        let candidates = ints[at].clamp(0, W626_SCOPE_CAP);
+        let renamed = ints[count + at].clamp(0, W626_SCOPE_CAP);
+        let scope = match case {
+            1 => candidates,
+            2 => renamed.min(candidates),
+            _ => 0,
+        };
+        let selected = if limit > 0 { scope.min(limit) } else { scope };
+        let truncated = i64::from(selected < scope);
+        let enabled = i64::from(case == 1 || case == 2);
+        out[1 + case as usize] += 1;
+        out[5 + source as usize] += 1;
+        out[9] += enabled;
+        out[10] += scope;
+        out[11] += selected;
+        out[12] += scope - selected;
+        out[13] += truncated;
+        if truncated == 1 {
+            w586_first(&mut out[14], at);
+        }
+        out[W626_LOOKUP_HEADER + at] = case
+            | source << 2
+            | enabled << 4
+            | truncated << 5
+            | selected << 6
+            | scope << 30
+            | w626_len8(raw) << 54;
+    }
+    out[15] = w526_digest(&out[W626_LOOKUP_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w626_lookup_mode_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    limit: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let modes = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                1,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w626_lookup_batch(&modes, &ints, limit))
+        })
+    }
+}
+
+// --- QueueType::planQueueTypeBatch --------------------------------------------
+
+pub(crate) const W626_QUEUE_HEADER: usize = 19;
+
+/// Default and maximum concurrency, default and maximum timeout seconds per
+/// case (none and unknown never dispatch).
+const W626_QUEUE_POLICY: [[i64; 4]; 4] = [[0; 4], [4, 16, 120, 900], [8, 32, 90, 600], [0; 4]];
+
+/// Shortest requested timeout honoured, in seconds.
+const W626_TIMEOUT_FLOOR: i64 = 5;
+
+/// Case 0 none, 1 SABnzbd, 2 NZBGet, 3 unknown; source 0 backing value, 1 case
+/// name, 2 exact label, 3 alias of the lowercased trimmed token, 4 unknown.
+#[inline]
+fn w626_queue_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+    match raw {
+        b"0" => (0, 0),
+        b"1" => (1, 0),
+        b"2" => (2, 0),
+        b"NONE" => (0, 1),
+        b"SABNZBD" => (1, 1),
+        b"NZBGET" => (2, 1),
+        b"None" => (0, 2),
+        b"SABnzbd" => (1, 2),
+        b"NZBGet" => (2, 2),
+        _ => {
+            w616_lower_trim_into(raw, lower);
+            match lower.as_slice() {
+                b"none" | b"off" | b"disabled" | b"no" => (0, 3),
+                b"sabnzbd" | b"sab" | b"sabnzbd+" => (1, 3),
+                b"nzbget" | b"nzb-get" | b"nzb_get" => (2, 3),
+                _ => (3, 4),
+            }
+        }
+    }
+}
+
+/// Queue type tokens with requested concurrency and timeout columns. The
+/// Horizon supervisor is the case for SABnzbd (1) and NZBGet (2), else 0. A
+/// dispatchable type takes its default for a request at or below 0, else the
+/// request capped to its maximum; timeouts also rise to 5 seconds. Flags: 1
+/// unknown type, 2 concurrency capped, 4 timeout capped, 8 timeout raised.
+/// `[0]` count, `[1..5]` per case, `[5..10]` per source, `[10..13]` per
+/// supervisor, `[13]` dispatchable, `[14]` total concurrency, `[15]` longest
+/// timeout, `[16]` adjusted requests, `[17]` first unknown index (-1), `[18]`
+/// FNV-1a digest; then per queue `case | source << 2 | supervisor << 5 | flags
+/// << 7 | dispatchable << 11 | concurrency << 12 | timeout << 18 | min(token
+/// bytes, 255) << 28`.
+pub(crate) fn w626_queue_batch(types: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+    let count = types.len();
+    let mut out = vec![0i64; W626_QUEUE_HEADER + count];
+    out[0] = count as i64;
+    out[17] = -1;
+    let mut lower = Vec::new();
+    for (at, &raw) in types.iter().enumerate() {
+        let (case, source) = w626_queue_case(raw, &mut lower);
+        let dispatchable = i64::from(case == 1 || case == 2);
+        let supervisor = if dispatchable == 1 { case } else { 0 };
+        let (mut concurrency, mut timeout, mut flags) = (0i64, 0i64, i64::from(case == 3));
+        if dispatchable == 1 {
+            let [
+                default_concurrency,
+                max_concurrency,
+                default_timeout,
+                max_timeout,
+            ] = W626_QUEUE_POLICY[case as usize];
+            let requested = ints[at];
+            concurrency = if requested <= 0 {
+                default_concurrency
+            } else {
+                requested.min(max_concurrency)
+            };
+            flags |= i64::from(requested > max_concurrency) << 1;
+            let requested = ints[count + at];
+            timeout = if requested <= 0 {
+                default_timeout
+            } else {
+                requested.clamp(W626_TIMEOUT_FLOOR, max_timeout)
+            };
+            flags |= i64::from(requested > max_timeout) << 2
+                | i64::from(requested > 0 && requested < W626_TIMEOUT_FLOOR) << 3;
+        }
+        out[1 + case as usize] += 1;
+        out[5 + source as usize] += 1;
+        out[10 + supervisor as usize] += 1;
+        out[13] += dispatchable;
+        out[14] += concurrency;
+        out[15] = out[15].max(timeout);
+        out[16] += i64::from(flags & 14 != 0);
+        if case == 3 {
+            w586_first(&mut out[17], at);
+        }
+        out[W626_QUEUE_HEADER + at] = case
+            | source << 2
+            | supervisor << 5
+            | flags << 7
+            | dispatchable << 11
+            | concurrency << 12
+            | timeout << 18
+            | w626_len8(raw) << 28;
+    }
+    out[18] = w526_digest(&out[W626_QUEUE_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w626_queue_type_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let types = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                1,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w626_queue_batch(&types, &ints))
+        })
+    }
+}
+
+// --- RegistrationStatus::planRegistrationStatusBatch --------------------------
+
+pub(crate) const W626_REGISTRATION_HEADER: usize = 27;
+
+/// Case 0 open, 1 invite, 2 closed, 3 unknown; sources as
+/// [`w626_impact_case`].
+#[inline]
+fn w626_registration_case(raw: &[u8], lower: &mut Vec<u8>) -> (i64, i64) {
+    match raw {
+        b"0" => (0, 0),
+        b"1" => (1, 0),
+        b"2" => (2, 0),
+        b"Open" => (0, 1),
+        b"Invite" => (1, 1),
+        b"Closed" => (2, 1),
+        _ => {
+            w616_lower_trim_into(raw, lower);
+            match lower.as_slice() {
+                b"open" | b"public" | b"enabled" | b"yes" | b"true" | b"on" => (0, 2),
+                b"invite" | b"invite-only" | b"invite_only" | b"invitation" | b"invites" => (1, 2),
+                b"closed" | b"disabled" | b"off" | b"no" | b"false" | b"private" => (2, 2),
+                _ => (3, 3),
+            }
+        }
+    }
+}
+
+/// Registration status tokens with an invite state column (0 none, 1 valid, 2
+/// expired, 3 used, anything else 4 invalid) and `seats` remaining signups
+/// (negative unlimited, else clamped to 2^40-1) consumed in order. Gates: 0
+/// open, 1 invite accepted, 2 invite missing, 3 invite rejected, 4 closed, 5
+/// unknown status (fails closed), 6 no seats left; gates 0 and 1 are eligible
+/// and invite signups consume their invite. `[0]` count, `[1..5]` per case,
+/// `[5..9]` per source, `[9..14]` per invite state, `[14..21]` per gate, `[21]`
+/// eligible, `[22]` invites consumed, `[23]` first eligible and `[24]` first
+/// denied index (-1), `[25]` seats left (-1 unlimited), `[26]` FNV-1a digest;
+/// then per signup `case | source << 2 | invite << 4 | gate << 7 | eligible <<
+/// 10 | consumed << 11 | min(token bytes, 255) << 12 | (seats left + 1) <<
+/// 20`.
+pub(crate) fn w626_registration_batch(statuses: &[&[u8]], invites: &[i64], seats: i64) -> Vec<i64> {
+    let count = statuses.len();
+    let mut out = vec![0i64; W626_REGISTRATION_HEADER + count];
+    out[0] = count as i64;
+    out[23] = -1;
+    out[24] = -1;
+    let mut remaining = if seats < 0 { -1 } else { w47_clamp(seats) };
+    let mut lower = Vec::new();
+    for (at, &raw) in statuses.iter().enumerate() {
+        let (case, source) = w626_registration_case(raw, &mut lower);
+        let invite = if (0..=3).contains(&invites[at]) {
+            invites[at]
+        } else {
+            4
+        };
+        let mut gate: i64 = match case {
+            0 => 0,
+            1 => match invite {
+                1 => 1,
+                0 => 2,
+                _ => 3,
+            },
+            2 => 4,
+            _ => 5,
+        };
+        if gate <= 1 {
+            if remaining == 0 {
+                gate = 6;
+            } else if remaining > 0 {
+                remaining -= 1;
+            }
+        }
+        let eligible = i64::from(gate <= 1);
+        let consumed = i64::from(gate == 1);
+        out[1 + case as usize] += 1;
+        out[5 + source as usize] += 1;
+        out[9 + invite as usize] += 1;
+        out[14 + gate as usize] += 1;
+        out[21] += eligible;
+        out[22] += consumed;
+        w586_first(&mut out[if eligible == 1 { 23 } else { 24 }], at);
+        out[W626_REGISTRATION_HEADER + at] = case
+            | source << 2
+            | invite << 4
+            | gate << 7
+            | eligible << 10
+            | consumed << 11
+            | w626_len8(raw) << 12
+            | (remaining + 1) << 20;
+    }
+    out[25] = remaining;
+    out[26] = w526_digest(&out[W626_REGISTRATION_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w626_registration_status_batch(
+    strings: *const u8,
+    strings_len: usize,
+    twin: *const u8,
+    twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    seats: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let statuses = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(twin, twin_len)?,
+                1,
+                count,
+            )?;
+            let invites = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+            Some(w626_registration_batch(&statuses, &invites, seats))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w626_incident_lookup_queue_registration_tests {
+    use super::*;
+    use std::ptr::null;
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn w626_impact_batch_escalates() {
+        let impacts: [&[u8]; 5] = [b"none", b"Major", b" SEV1 ", b"minor", b"??"];
+        let out = w626_impact_batch(&impacts, &[9_999, 61, 61, -5, 300]);
+        assert_eq!(&out[1..6], &[1, 1, 1, 1, 1]);
+        assert_eq!(&out[6..14], &[2, 1, 1, 1, 2, 1, 0, 2]);
+        assert_eq!(&out[14..19], &[3, 3, 1, 3, 9_999 + 61 + 61 + 300]);
+        let row = out[W626_IMPACT_HEADER + 1];
+        assert_eq!((row & 7, row >> 5 & 3, row >> 9 & 0x1FF), (2, 1, 60));
+        assert_eq!(out[W626_IMPACT_HEADER + 2] >> 3 & 3, 2);
+        assert_eq!(out[W626_IMPACT_HEADER + 2] >> 5 & 3, 3);
+    }
+
+    #[test]
+    fn w626_status_batch_validates_lifecycle() {
+        let fields: [&[u8]; 12] = [
+            b"investigating",
+            b"Resolved",
+            b"resolved",
+            b" closed ",
+            b"",
+            b"monitoring",
+            b"monitoring",
+            b"investigating",
+            b"identified",
+            b"",
+            b"identified",
+            b"bogus",
+        ];
+        let out = w626_status_batch(&fields, 6);
+        assert_eq!(&out[1..6], &[1, 0, 1, 3, 1]);
+        assert_eq!(&out[10..16], &[1, 1, 1, 1, 1, 1]);
+        assert_eq!(&out[16..21], &[2, 3, 3, 1, 2]);
+        let reopen = out[W626_STATUS_HEADER + 1];
+        assert_eq!(
+            (reopen >> 10 & 7, reopen >> 14 & 7, reopen >> 17 & 1),
+            (2, 0, 1)
+        );
+    }
+
+    #[test]
+    fn w626_lookup_batch_limits_scope() {
+        let modes: [&[u8]; 4] = [b"1", b"Renamed", b" OFF ", b"x"];
+        let out = w626_lookup_batch(&modes, &[500, 500, 500, 500, 10, 900, 7, 7], 100);
+        assert_eq!(&out[1..5], &[1, 1, 1, 1]);
+        assert_eq!(&out[9..15], &[2, 1_000, 200, 800, 2, 0]);
+        let row = out[W626_LOOKUP_HEADER];
+        assert_eq!((row >> 6 & 0xFF_FFFF, row >> 30 & 0xFF_FFFF), (100, 500));
+    }
+
+    #[test]
+    fn w626_queue_batch_resolves_policy() {
+        let types: [&[u8]; 4] = [b"SABnzbd", b"2", b" nzb-get ", b"rtorrent"];
+        let out = w626_queue_batch(&types, &[0, 99, 3, 4, 2, 0, 9_000, 1]);
+        let row = out[W626_QUEUE_HEADER];
+        assert_eq!((row >> 12 & 63, row >> 18 & 0x3FF), (4, 5));
+        assert_eq!(row >> 7 & 15, 8);
+        assert_eq!(out[W626_QUEUE_HEADER + 1] >> 7 & 15, 2);
+        assert_eq!(out[W626_QUEUE_HEADER + 2] >> 18 & 0x3FF, 600);
+        assert_eq!(&out[13..18], &[3, 4 + 32 + 3, 600, 3, 3]);
+    }
+
+    #[test]
+    fn w626_registration_batch_gates_and_seats() {
+        let statuses: [&[u8]; 5] = [b"0", b"Invite", b"invite", b"2", b" Open "];
+        let out = w626_registration_batch(&statuses, &[0, 1, 2, 1, 9], 1);
+        assert_eq!(&out[14..21], &[1, 0, 0, 1, 1, 0, 2]);
+        assert_eq!(&out[21..26], &[1, 0, 0, 1, 0]);
+        let unlimited = w626_registration_batch(&statuses, &[0, 1, 2, 1, 9], -7);
+        assert_eq!(&unlimited[21..26], &[3, 1, 0, 2, -1]);
+    }
+
+    #[test]
+    fn w626_exports_report_status() {
+        let mut out = [0i64; 64];
+        let ints = packed(&[61, 5]);
+        let status = unsafe {
+            nntmux_w626_incident_impact_batch(
+                b"major\x00x".as_ptr(),
+                7,
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[14]), (1, 2, 1));
+        let status = unsafe {
+            nntmux_w626_incident_impact_batch(
+                b"major".as_ptr(),
+                5,
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+        let status = unsafe {
+            nntmux_w626_incident_status_batch(null(), 0, null(), 0, 0, std::ptr::null_mut(), 0)
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w626_lookup_mode_batch(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                0,
+                0,
+                out.as_mut_ptr(),
+                1,
+            )
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w626_queue_type_batch(null(), 0, null(), 0, null(), 0, 0, out.as_mut_ptr(), 64)
+        };
+        assert_eq!((status, out[17]), (1, -1));
+        let status = unsafe {
+            nntmux_w626_registration_status_batch(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                0,
+                -1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[25]), (1, -1));
+    }
+}
