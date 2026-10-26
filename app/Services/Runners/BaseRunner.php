@@ -7,6 +7,7 @@ namespace App\Services\Runners;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Symfony\Component\Process\Exception\ProcessTimedOutException;
@@ -18,6 +19,38 @@ abstract class BaseRunner
         ssize_t nntmux_tmux_runner_transform(uint32_t mode, const char *input, size_t input_len, char *out, size_t cap);
         double nntmux_runner_follow_up_deadline(double started_at, int64_t interval);
         C;
+
+    /**
+     * Enabled: the paired benchmark in the W58 parity test measures 3.77x common mean, 2.681x
+     * common p99, 2.398x uncommon mean and 2.419x uncommon p99 (per-metric minimum of four runs),
+     * above the 1.5x rule.
+     */
+    public const bool W58_RUST_FFI_DEFAULT = true;
+
+    public const string W58_BASE_RUNNER_FFI_CDEF = 'ssize_t nntmux_w581_runner_dispatch_batch(const char *rows, size_t rows_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public const int W58_DISPATCH_WORDS = 4;
+
+    public const int W58_DISPATCH_GROUP_VALID = 16;
+
+    public const int W58_DISPATCH_GROUP_NORMALIZED = 32;
+
+    public const int W58_DISPATCH_COMMAND_NORMALIZED = 64;
+
+    public const int W58_DISPATCH_LIMIT_CLAMPED = 128;
+
+    public const int W58_DISPATCH_LIMIT_DEFAULTED = 256;
+
+    public const int W58_DISPATCH_PROCESSES_CLAMPED = 512;
+
+    public const int W58_DISPATCH_NEEDS_GROUP = 1024;
+
+    public const int W58_DISPATCH_DISPATCHABLE = 2048;
+
+    public const int W58_DISPATCH_GROUP_SHIFT = 16;
+
+    /** buildDnrCommandPhp() commands; a dispatch code is the index plus one. */
+    public const array W58_RUNNER_COMMANDS = ['backfill', 'backfill_all_quantity', 'backfill_all_quick', 'get_range', 'part_repair', 'releases', 'update_group_headers', 'update_per_group', 'pp_additional', 'pp_nfo', 'pp_movie', 'pp_tv'];
 
     /** No Slice 2 candidate met all four 1.5x thresholds; see RustTmuxRunnersAndDrainParityTest. */
     private static ?bool $useRustFfi = null;
@@ -127,6 +160,174 @@ abstract class BaseRunner
             return (float) $ffi->nntmux_runner_follow_up_deadline($startedAt, $interval);
         } catch (\Throwable) {
             return null;
+        }
+    }
+
+    /** BaseRunner's own Wave 58 routing; subclasses override usesW58RustFfi() with their own. */
+    public static function usesBaseRunnerW58RustFfi(): bool
+    {
+        $enabled = self::w58RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W58_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with BaseRunner's Wave 58 batch routed to Rust or PHP, then restores it. */
+    public static function withBaseRunnerW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w58RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w58RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW58RustFfi(): bool
+    {
+        return self::usesBaseRunnerW58RustFfi();
+    }
+
+    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
+    {
+        return self::withBaseRunnerW58RustFfi($enabled, $callback);
+    }
+
+    /**
+     * Four words per `command\tgroup\tlimit\titems\tprocesses` row: the command code
+     * (W58_RUNNER_COMMANDS index plus one; 0 when unknown) of the trimmed, lower-cased command with
+     * the group, normalization, clamp, needs-group and dispatchable flags plus the normalized
+     * group length `<< W58_DISPATCH_GROUP_SHIFT`; then the limit (default 100, at most 100000),
+     * the chunk count (items spread over 1-64 processes) and the chunk size. A row without exactly
+     * five fields yields four zeros.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function dispatchPlanBatch(array $rows): array
+    {
+        return self::usesBaseRunnerW58RustFfi() ? self::dispatchPlanBatchNative($rows) : self::dispatchPlanBatchPhp($rows);
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function dispatchPlanBatchPhp(array $rows): array
+    {
+        $words = [];
+        foreach ($rows as $row) {
+            $fields = explode("\t", $row);
+            if (\count($fields) !== 5) {
+                array_push($words, 0, 0, 0, 0);
+
+                continue;
+            }
+            [$command, $group, $limit, $items, $processes] = $fields;
+            $normalizedCommand = strtolower(trim($command));
+            $index = array_search($normalizedCommand, self::W58_RUNNER_COMMANDS, true);
+            $code = $index === false ? 0 : $index + 1;
+            $normalizedGroup = strtolower(trim($group));
+            $flags = 0;
+            $limit = trim($limit);
+            $limit = preg_match('/\A-?[0-9]{1,18}\z/', $limit) === 1 ? (int) $limit : 0;
+            if ($limit <= 0) {
+                $limit = 100;
+                $flags |= self::W58_DISPATCH_LIMIT_DEFAULTED;
+            } elseif ($limit > 100000) {
+                $limit = 100000;
+                $flags |= self::W58_DISPATCH_LIMIT_CLAMPED;
+            }
+            $items = trim($items);
+            $items = preg_match('/\A-?[0-9]{1,18}\z/', $items) === 1 ? max(0, (int) $items) : 0;
+            $processes = trim($processes);
+            $processes = preg_match('/\A-?[0-9]{1,18}\z/', $processes) === 1 ? (int) $processes : 0;
+            if ($processes < 1) {
+                $processes = 1;
+                $flags |= self::W58_DISPATCH_PROCESSES_CLAMPED;
+            } elseif ($processes > 64) {
+                $processes = 64;
+                $flags |= self::W58_DISPATCH_PROCESSES_CLAMPED;
+            }
+            $chunks = min($items, $processes);
+            $groupValid = preg_match('/\A[a-z0-9][a-z0-9.+_-]{0,254}\z/', $normalizedGroup) === 1;
+            $needsGroup = \in_array($code, [1, 2, 3, 4, 5, 7, 8], true);
+            $words[] = $code | $flags
+                | ($groupValid ? self::W58_DISPATCH_GROUP_VALID : 0)
+                | ($normalizedGroup !== $group ? self::W58_DISPATCH_GROUP_NORMALIZED : 0)
+                | ($normalizedCommand !== $command ? self::W58_DISPATCH_COMMAND_NORMALIZED : 0)
+                | ($needsGroup ? self::W58_DISPATCH_NEEDS_GROUP : 0)
+                | ($code > 0 && (! $needsGroup || $groupValid) && $items > 0 ? self::W58_DISPATCH_DISPATCHABLE : 0)
+                | \strlen($normalizedGroup) << self::W58_DISPATCH_GROUP_SHIFT;
+            $words[] = $limit;
+            $words[] = $chunks;
+            $words[] = $chunks === 0 ? 0 : intdiv($items + $chunks - 1, $chunks);
+        }
+
+        return $words;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or Rust declines the batch (a
+     * row holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function dispatchPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
+        $buffer = $count === 0 ? null : self::w58RustFfiState('out', $count * self::W58_DISPATCH_WORDS);
+        if ($buffer === null) {
+            return self::dispatchPlanBatchPhp($rows);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $rows);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w581_runner_dispatch_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        $words = $written === $count ? unpack('q*', FFI::string($out, $count * self::W58_DISPATCH_WORDS * 8)) : false;
+        if (! \is_array($words)) {
+            return self::dispatchPlanBatchPhp($rows);
+        }
+
+        /** @var list<int> */
+        return array_values($words);
+    }
+
+    /**
+     * Wave 58 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('base_runner_w58', self::W58_BASE_RUNNER_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(1024, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
         }
     }
 

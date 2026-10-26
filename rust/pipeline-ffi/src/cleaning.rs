@@ -43187,3 +43187,756 @@ pub mod w571_configuration_runtime_horizon_verification {
         }
     }
 }
+
+pub mod w581_grafana_bounded_article_runners {
+    //! Wave 58.1 per-row batch kernels for Grafana embed URLs (GrafanaEmbedService), bounded NNTP
+    //! article results (BoundedArticleResult), runner dispatch plans (BaseRunner), backfill work
+    //! items (BackfillRunner) and binaries work items (BinariesRunner). Every export reads
+    //! NUL-joined, tab-separated rows, writes a fixed number of `i64` words per row into `out` and
+    //! returns the row count, `SHORT_CAPACITY` when `out_cap` (in words) is too small, or -1 for a
+    //! malformed batch (a row holding a NUL byte splits into extra rows, so PHP falls back).
+
+    use super::w571_configuration_runtime_horizon_verification::crc32;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+    pub const SHORT_CAPACITY: isize = -2;
+
+    /// GrafanaEmbedService words: `kind | flags | URL length << EMBED_LENGTH_SHIFT`, PHP
+    /// `crc32()` of the URL, then the query-string length. A row without exactly seven fields
+    /// writes zeros.
+    pub const EMBED_WORDS: usize = 3;
+    pub const EMBED_DASHBOARD: i64 = 1;
+    pub const EMBED_PANEL: i64 = 2;
+    pub const EMBED_UID_VALID: i64 = 4;
+    pub const EMBED_SLUG_VALID: i64 = 8;
+    pub const EMBED_ORG_VALID: i64 = 16;
+    pub const EMBED_PANEL_VALID: i64 = 32;
+    pub const EMBED_RANGE_VALID: i64 = 64;
+    pub const EMBED_REFRESH_VALID: i64 = 128;
+    pub const EMBED_ABSOLUTE: i64 = 256;
+    pub const EMBED_TRAILING_SLASH: i64 = 512;
+    pub const EMBED_LENGTH_SHIFT: u32 = 16;
+
+    /// BoundedArticleResult words: `outcome | flags | error class << ARTICLE_ERROR_SHIFT`, body
+    /// bytes (-1 without a body), then the leading three-digit NNTP status of the error (or 0).
+    pub const ARTICLE_WORDS: usize = 3;
+    pub const ARTICLE_FAILURE: i64 = 0;
+    pub const ARTICLE_SUCCESS: i64 = 1;
+    pub const ARTICLE_OVERSIZED: i64 = 2;
+    pub const ARTICLE_IS_SUCCESS: i64 = 4;
+    pub const ARTICLE_METADATA: i64 = 8;
+    pub const ARTICLE_EXCEEDS: i64 = 16;
+    pub const ARTICLE_MALFORMED: i64 = 32;
+    pub const ARTICLE_TRUNCATED: i64 = 64;
+    pub const ARTICLE_ERROR_SHIFT: u32 = 8;
+    pub const ERROR_NONE: i64 = 0;
+    pub const ERROR_TIMEOUT: i64 = 1;
+    pub const ERROR_MISSING: i64 = 2;
+    pub const ERROR_CONNECTION: i64 = 3;
+    pub const ERROR_OVERSIZED: i64 = 4;
+    pub const ERROR_DECODE: i64 = 5;
+    pub const ERROR_AUTH: i64 = 6;
+    pub const ERROR_OTHER: i64 = 7;
+    pub const ERROR_EMPTY: i64 = 8;
+
+    /// BaseRunner words: `command code | flags | normalized group length << DISPATCH_GROUP_SHIFT`,
+    /// normalized limit, chunk count, then chunk size. A row without exactly five fields writes
+    /// zeros.
+    pub const DISPATCH_WORDS: usize = 4;
+    pub const DISPATCH_GROUP_VALID: i64 = 16;
+    pub const DISPATCH_GROUP_NORMALIZED: i64 = 32;
+    pub const DISPATCH_COMMAND_NORMALIZED: i64 = 64;
+    pub const DISPATCH_LIMIT_CLAMPED: i64 = 128;
+    pub const DISPATCH_LIMIT_DEFAULTED: i64 = 256;
+    pub const DISPATCH_PROCESSES_CLAMPED: i64 = 512;
+    pub const DISPATCH_NEEDS_GROUP: i64 = 1024;
+    pub const DISPATCH_DISPATCHABLE: i64 = 2048;
+    pub const DISPATCH_GROUP_SHIFT: u32 = 16;
+    pub const DISPATCH_DEFAULT_LIMIT: i64 = 100;
+    pub const DISPATCH_MAX_LIMIT: i64 = 100_000;
+    pub const DISPATCH_MAX_PROCESSES: i64 = 64;
+    /// `buildDnrCommandPhp()` commands; the code is the index plus one.
+    pub const COMMANDS: [&[u8]; 12] = [
+        b"backfill",
+        b"backfill_all_quantity",
+        b"backfill_all_quick",
+        b"get_range",
+        b"part_repair",
+        b"releases",
+        b"update_group_headers",
+        b"update_per_group",
+        b"pp_additional",
+        b"pp_nfo",
+        b"pp_movie",
+        b"pp_tv",
+    ];
+
+    /// BackfillRunner words: `flags | clamped threads << 8`, queue count, lowest queued article
+    /// and the work-item score.
+    pub const BACKFILL_WORDS: usize = 4;
+    pub const BACKFILL_NEEDED: i64 = 1;
+    pub const BACKFILL_TARGET_REACHED: i64 = 2;
+    pub const BACKFILL_COMPRESSED: i64 = 4;
+    pub const BACKFILL_THREADS_CLAMPED: i64 = 8;
+    pub const BACKFILL_MALFORMED: i64 = 16;
+    pub const BACKFILL_MESSAGES_ADJUSTED: i64 = 32;
+    pub const BACKFILL_GROUP_VALID: i64 = 64;
+    pub const BACKFILL_THREADS_SHIFT: u32 = 8;
+
+    /// BinariesRunner words: `mode | flags | min(ranges, 0xFFFF) << 16`, range count, end article
+    /// and the work-item score.
+    pub const BINARIES_WORDS: usize = 4;
+    pub const BINARIES_INACTIVE: i64 = 0;
+    pub const BINARIES_UPDATE_HEADERS: i64 = 1;
+    pub const BINARIES_RANGES: i64 = 2;
+    pub const BINARIES_MALFORMED: i64 = 3;
+    pub const BINARIES_ACTIVE: i64 = 4;
+    pub const BINARIES_HEADERS_ADJUSTED: i64 = 8;
+    pub const BINARIES_MESSAGES_ADJUSTED: i64 = 16;
+    pub const BINARIES_BEHIND: i64 = 32;
+    pub const BINARIES_GROUP_VALID: i64 = 64;
+    pub const BINARIES_RANGES_SHIFT: u32 = 16;
+
+    const MAX_MESSAGES: i64 = 1_000_000;
+    const DEFAULT_MESSAGES: i64 = 20_000;
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    fn overlaps(input: *const u8, len: usize, out: *mut i64, words: usize) -> bool {
+        let (a, b, b_len) = (input as usize, out as usize, words.saturating_mul(8));
+        len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(len)
+    }
+
+    /// Writes `per_row` words from `row(entry, dst)` for each of exactly `count` rows.
+    unsafe fn run(
+        input: *const u8,
+        len: usize,
+        count: usize,
+        per_row: usize,
+        out: *mut i64,
+        out_cap: usize,
+        mut row: impl FnMut(&[u8], &mut [i64]),
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+                || len > MAX_INPUT
+                || (len != 0 && input.is_null())
+            {
+                return -1;
+            }
+            let words = count * per_row;
+            if words > out_cap {
+                return SHORT_CAPACITY;
+            }
+            if overlaps(input, len, out, words) {
+                return -1;
+            }
+            // A null pointer is never sliced, even for an empty batch.
+            let bytes: &[u8] = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(input, len) } };
+            if count == 0 {
+                return if bytes.is_empty() { 0 } else { -1 };
+            }
+            // `words` words, checked against `out_cap` above; disjoint from the input.
+            let dst = unsafe { std::slice::from_raw_parts_mut(out, words) };
+            let mut n = 0;
+            for entry in bytes.split(|&b| b == 0) {
+                if n < count {
+                    row(entry, &mut dst[n * per_row..(n + 1) * per_row]);
+                }
+                n += 1;
+            }
+            if n == count { n as isize } else { -1 }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Exactly `N` tab-separated fields, as PHP `explode("\t", $row)` with `count() === N`.
+    fn fields<const N: usize>(row: &[u8]) -> Option<[&[u8]; N]> {
+        let mut out = [&row[..0]; N];
+        let mut it = row.split(|&b| b == b'\t');
+        for slot in &mut out {
+            *slot = it.next()?;
+        }
+        if it.next().is_some() { None } else { Some(out) }
+    }
+
+    /// PHP `preg_match('/\A-?[0-9]{1,18}\z/')` then `(int)`.
+    fn strict_int(s: &[u8]) -> Option<i64> {
+        let digits = s.strip_prefix(b"-").unwrap_or(s);
+        if digits.is_empty() || digits.len() > 18 || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let v = digits.iter().fold(0i64, |a, &d| a * 10 + i64::from(d - b'0'));
+        Some(if digits.len() != s.len() { -v } else { v })
+    }
+
+    /// PHP `preg_match('/\A[0-9]{1,18}\z/')` then `(int)`.
+    fn unsigned_int(s: &[u8]) -> Option<i64> {
+        if s.first() == Some(&b'-') { None } else { strict_int(s) }
+    }
+
+    /// `'0'` or `'1'`.
+    fn bit(s: &[u8]) -> Option<bool> {
+        match s {
+            b"0" => Some(false),
+            b"1" => Some(true),
+            _ => None,
+        }
+    }
+
+    /// PHP `trim()` without a character list.
+    fn php_trim(s: &[u8]) -> &[u8] {
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !ws(b)).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    /// `/\A[A-Za-z0-9][A-Za-z0-9.+_-]{0,254}\z/`.
+    fn group_name(s: &[u8]) -> bool {
+        match s.split_first() {
+            Some((first, rest)) => {
+                first.is_ascii_alphanumeric()
+                    && rest.len() <= 254
+                    && rest.iter().all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'_' | b'-'))
+            }
+            None => false,
+        }
+    }
+
+    /// ASCII case-insensitive substring search with a lowercase needle (PHP 8 `stripos`).
+    fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+        hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+    }
+
+    fn push_int(buf: &mut Vec<u8>, v: i64) {
+        let mut tmp = [0u8; 20];
+        let mut i = tmp.len();
+        let mut n = v.unsigned_abs();
+        loop {
+            i -= 1;
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if v < 0 {
+            buf.push(b'-');
+        }
+        buf.extend_from_slice(&tmp[i..]);
+    }
+
+    fn push_escaped(buf: &mut Vec<u8>, b: u8) {
+        buf.extend_from_slice(&[b'%', HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]);
+    }
+
+    /// PHP `rawurlencode()` (RFC 3986).
+    fn raw_url_encode(buf: &mut Vec<u8>, s: &[u8]) {
+        for &b in s {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                buf.push(b);
+            } else {
+                push_escaped(buf, b);
+            }
+        }
+    }
+
+    /// PHP `urlencode()`, as `http_build_query()` applies it to values.
+    fn url_encode(buf: &mut Vec<u8>, s: &[u8]) {
+        for &b in s {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+                buf.push(b);
+            } else if b == b' ' {
+                buf.push(b'+');
+            } else {
+                push_escaped(buf, b);
+            }
+        }
+    }
+
+    /// `/\A[a-z0-9]+(?:-[a-z0-9]+)*\z/`.
+    fn slug(s: &[u8]) -> bool {
+        !s.is_empty()
+            && s.split(|&b| b == b'-').all(|part| !part.is_empty() && part.iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+    }
+
+    /// `/\A(?:now(?:-[0-9]{1,6}[smhdwMy])?|[0-9]{10,13})\z/`.
+    fn time_range(s: &[u8]) -> bool {
+        if let Some(rest) = s.strip_prefix(b"now") {
+            return match rest {
+                [] => true,
+                [b'-', digits @ .., unit] => {
+                    (1..=6).contains(&digits.len())
+                        && digits.iter().all(u8::is_ascii_digit)
+                        && matches!(unit, b's' | b'm' | b'h' | b'd' | b'w' | b'M' | b'y')
+                }
+                _ => false,
+            };
+        }
+        (10..=13).contains(&s.len()) && s.iter().all(u8::is_ascii_digit)
+    }
+
+    /// `/\A(?:[0-9]{1,4}[smhd])?\z/`.
+    fn refresh(s: &[u8]) -> bool {
+        match s {
+            [] => true,
+            [digits @ .., unit] => {
+                (1..=4).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit) && matches!(unit, b's' | b'm' | b'h' | b'd')
+            }
+        }
+    }
+
+    /// GrafanaEmbedService embed words for `base\tuid\tslug\torg\tfrom\trefresh\tpanel`.
+    pub fn embed_words(row: &[u8], url: &mut Vec<u8>, dst: &mut [i64]) {
+        let Some([base, uid, slug_field, org, from, refresh_field, panel]) = fields::<7>(row) else {
+            dst.fill(0);
+            return;
+        };
+        let org_id = strict_int(org);
+        let panel_id = strict_int(panel);
+        let is_panel = panel_id.unwrap_or(0) > 0;
+        let trimmed_len = base.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+        let trimmed = &base[..trimmed_len];
+        url.clear();
+        url.extend_from_slice(trimmed);
+        url.extend_from_slice(if is_panel { b"/d-solo/" } else { b"/d/" });
+        raw_url_encode(url, uid);
+        url.push(b'/');
+        raw_url_encode(url, slug_field);
+        url.push(b'?');
+        let query_start = url.len();
+        url.extend_from_slice(b"orgId=");
+        push_int(url, org_id.unwrap_or(0));
+        url.extend_from_slice(b"&from=");
+        url_encode(url, from);
+        url.extend_from_slice(b"&to=now&refresh=");
+        url_encode(url, refresh_field);
+        if is_panel {
+            url.extend_from_slice(b"&panelId=");
+            push_int(url, panel_id.unwrap_or(0));
+        }
+        let query_len = url.len() - query_start;
+        if !is_panel {
+            url.extend_from_slice(b"&kiosk");
+        }
+        let uid_valid = (1..=40).contains(&uid.len()) && uid.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        let lower = |prefix: &[u8]| trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix);
+        dst[0] = (if is_panel { EMBED_PANEL } else { EMBED_DASHBOARD })
+            | (EMBED_UID_VALID * i64::from(uid_valid))
+            | (EMBED_SLUG_VALID * i64::from(slug(slug_field)))
+            | (EMBED_ORG_VALID * i64::from(org_id.is_some_and(|v| v > 0)))
+            | (EMBED_PANEL_VALID * i64::from(panel_id.is_some_and(|v| v >= 0)))
+            | (EMBED_RANGE_VALID * i64::from(time_range(from)))
+            | (EMBED_REFRESH_VALID * i64::from(refresh(refresh_field)))
+            | (EMBED_ABSOLUTE * i64::from(lower(b"http://") || lower(b"https://")))
+            | (EMBED_TRAILING_SLASH * i64::from(trimmed_len != base.len()))
+            | ((url.len() as i64) << EMBED_LENGTH_SHIFT);
+        dst[1] = i64::from(crc32(url));
+        dst[2] = query_len as i64;
+    }
+
+    /// BoundedArticleResult error class for an error message and its leading NNTP status.
+    pub fn error_class(error: Option<&[u8]>, status: i64) -> i64 {
+        let Some(e) = error else { return ERROR_NONE };
+        if e.is_empty() {
+            return ERROR_EMPTY;
+        }
+        if matches!(status, 420 | 423 | 430) {
+            return ERROR_MISSING;
+        }
+        if matches!(status, 480..=482) {
+            return ERROR_AUTH;
+        }
+        let any = |needles: &[&[u8]]| needles.iter().any(|n| contains_ci(e, n));
+        if any(&[b"timed out", b"timeout"]) {
+            ERROR_TIMEOUT
+        } else if any(&[b"no such article"]) {
+            ERROR_MISSING
+        } else if any(&[b"connection", b"socket", b"eof"]) {
+            ERROR_CONNECTION
+        } else if any(&[b"too large", b"exceed", b"limit"]) {
+            ERROR_OVERSIZED
+        } else if any(&[b"yenc", b"crc", b"decode"]) {
+            ERROR_DECODE
+        } else if any(&[b"auth"]) {
+            ERROR_AUTH
+        } else {
+            ERROR_OTHER
+        }
+    }
+
+    /// BoundedArticleResult words for `body_len\tlimit\toversized\thas_part[\terror]`, where a
+    /// `-` body length is a null body and a missing fifth field a null error.
+    pub fn article_words(row: &[u8], dst: &mut [i64]) {
+        let mut it = row.splitn(5, |&b| b == b'\t');
+        let (len, limit, oversized, part, error) = (it.next(), it.next(), it.next(), it.next(), it.next());
+        let parsed = (|| {
+            let len = len?;
+            let has_body = len != b"-";
+            let bytes = if has_body { unsigned_int(len)? } else { -1 };
+            Some((has_body, bytes, strict_int(limit?)?, bit(oversized?)?, bit(part?)?))
+        })();
+        let Some((has_body, bytes, limit, oversized, part)) = parsed else {
+            dst.copy_from_slice(&[ARTICLE_MALFORMED, -1, 0]);
+            return;
+        };
+        let status = match error {
+            Some(e) if e.len() >= 3 && e[..3].iter().all(u8::is_ascii_digit) && (e.len() == 3 || matches!(e[3], b' ' | b'\t')) => {
+                e[..3].iter().fold(0i64, |a, &d| a * 10 + i64::from(d - b'0'))
+            }
+            _ => 0,
+        };
+        let success = has_body && error.is_none();
+        let outcome = if success {
+            ARTICLE_SUCCESS
+        } else if oversized {
+            ARTICLE_OVERSIZED
+        } else {
+            ARTICLE_FAILURE
+        };
+        dst[0] = outcome
+            | (ARTICLE_IS_SUCCESS * i64::from(success))
+            | (ARTICLE_METADATA * i64::from(part))
+            | (ARTICLE_EXCEEDS * i64::from(has_body && bytes > limit))
+            | (ARTICLE_TRUNCATED * i64::from(oversized && has_body))
+            | (error_class(error, status) << ARTICLE_ERROR_SHIFT);
+        dst[1] = bytes;
+        dst[2] = status;
+    }
+
+    /// BaseRunner dispatch words for `command\tgroup\tlimit\titems\tprocesses`.
+    pub fn dispatch_words(row: &[u8], dst: &mut [i64]) {
+        let Some([command, group, limit, items, processes]) = fields::<5>(row) else {
+            dst.fill(0);
+            return;
+        };
+        let cmd = php_trim(command);
+        let code = COMMANDS.iter().position(|c| c.eq_ignore_ascii_case(cmd)).map_or(0, |i| i as i64 + 1);
+        let grp = php_trim(group);
+        let mut flags = 0;
+        let mut limit = match strict_int(php_trim(limit)) {
+            Some(v) if v > 0 => v,
+            _ => {
+                flags |= DISPATCH_LIMIT_DEFAULTED;
+                DISPATCH_DEFAULT_LIMIT
+            }
+        };
+        if limit > DISPATCH_MAX_LIMIT {
+            limit = DISPATCH_MAX_LIMIT;
+            flags |= DISPATCH_LIMIT_CLAMPED;
+        }
+        let items = strict_int(php_trim(items)).unwrap_or(0).max(0);
+        let processes = match strict_int(php_trim(processes)) {
+            Some(v) if (1..=DISPATCH_MAX_PROCESSES).contains(&v) => v,
+            Some(v) if v > DISPATCH_MAX_PROCESSES => {
+                flags |= DISPATCH_PROCESSES_CLAMPED;
+                DISPATCH_MAX_PROCESSES
+            }
+            _ => {
+                flags |= DISPATCH_PROCESSES_CLAMPED;
+                1
+            }
+        };
+        let chunks = items.min(processes);
+        let chunk_size = if chunks == 0 { 0 } else { (items + chunks - 1) / chunks };
+        let group_valid = group_name(grp);
+        let needs_group = matches!(code, 1..=5 | 7 | 8);
+        flags |= (DISPATCH_GROUP_VALID * i64::from(group_valid))
+            | (DISPATCH_GROUP_NORMALIZED * i64::from(grp.len() != group.len() || grp.iter().any(u8::is_ascii_uppercase)))
+            | (DISPATCH_COMMAND_NORMALIZED * i64::from(cmd.len() != command.len() || cmd.iter().any(u8::is_ascii_uppercase)))
+            | (DISPATCH_NEEDS_GROUP * i64::from(needs_group))
+            | (DISPATCH_DISPATCHABLE * i64::from(code > 0 && (!needs_group || group_valid) && items > 0));
+        dst.copy_from_slice(&[code | flags | ((grp.len() as i64) << DISPATCH_GROUP_SHIFT), limit, chunks, chunk_size]);
+    }
+
+    /// BackfillRunner words for
+    /// `group\tour_first\ttheir_first\tquantity\tthreads\tmax_messages\tpostdate_days\ttarget_days\tcompressed`.
+    pub fn backfill_words(row: &[u8], dst: &mut [i64]) {
+        let parsed = fields::<9>(row).and_then(|[group, our, their, qty, threads, messages, days, target, compressed]| {
+            Some((
+                group,
+                strict_int(our)?,
+                strict_int(their)?,
+                strict_int(qty)?,
+                strict_int(threads)?,
+                strict_int(messages)?,
+                strict_int(days)?,
+                strict_int(target)?,
+                bit(compressed)?,
+            ))
+        });
+        let Some((group, our, their, qty, threads, messages, days, target, compressed)) = parsed else {
+            dst.copy_from_slice(&[BACKFILL_MALFORMED, 0, 0, 0]);
+            return;
+        };
+        let clamped_threads = threads.clamp(1, 32);
+        let mut flags = (BACKFILL_COMPRESSED * i64::from(compressed))
+            | (BACKFILL_THREADS_CLAMPED * i64::from(clamped_threads != threads))
+            | (BACKFILL_GROUP_VALID * i64::from(group_name(group)));
+        let messages = if messages < 1 {
+            flags |= BACKFILL_MESSAGES_ADJUSTED;
+            DEFAULT_MESSAGES
+        } else if messages > MAX_MESSAGES {
+            flags |= BACKFILL_MESSAGES_ADJUSTED;
+            MAX_MESSAGES
+        } else {
+            messages
+        };
+        let qty = qty.clamp(0, 10_000_000);
+        let count = our - their;
+        let needed = count > 0;
+        let queues = if needed { (count.min(qty * clamped_threads) + messages - 1) / messages } else { 0 };
+        let (days, target) = (days.clamp(0, 36_500), target.clamp(0, 36_500));
+        let reached = days >= target;
+        flags |= (BACKFILL_NEEDED * i64::from(needed)) | (BACKFILL_TARGET_REACHED * i64::from(reached));
+        let score = if needed && !reached { (target - days) * 1_000_000 + count.min(999_999) } else { 0 };
+        dst.copy_from_slice(&[flags | (clamped_threads << BACKFILL_THREADS_SHIFT), queues, our - queues * messages, score]);
+    }
+
+    /// BinariesRunner words for `id\tgroup\tactive\tour_last\ttheir_last\tmax_headers\tmax_messages`.
+    pub fn binaries_words(row: &[u8], dst: &mut [i64]) {
+        let parsed = fields::<7>(row).and_then(|[id, group, active, our, their, headers, messages]| {
+            strict_int(id)?;
+            Some((group, bit(active)?, strict_int(our)?, strict_int(their)?, strict_int(headers)?, strict_int(messages)?))
+        });
+        let Some((group, active, our, their, headers, messages)) = parsed else {
+            dst.copy_from_slice(&[BINARIES_MALFORMED, 0, 0, 0]);
+            return;
+        };
+        let mut flags = BINARIES_GROUP_VALID * i64::from(group_name(group));
+        let headers = if headers <= 0 {
+            flags |= BINARIES_HEADERS_ADJUSTED;
+            1_000_000
+        } else if headers > 1_000_000_000 {
+            flags |= BINARIES_HEADERS_ADJUSTED;
+            1_000_000_000
+        } else {
+            headers
+        };
+        let messages = if messages < 1 {
+            flags |= BINARIES_MESSAGES_ADJUSTED;
+            DEFAULT_MESSAGES
+        } else if messages > MAX_MESSAGES {
+            flags |= BINARIES_MESSAGES_ADJUSTED;
+            MAX_MESSAGES
+        } else {
+            messages
+        };
+        let backlog = their - our;
+        flags |= BINARIES_BEHIND * i64::from(backlog > 0);
+        if !active {
+            dst.copy_from_slice(&[BINARIES_INACTIVE | flags, 0, our, 0]);
+            return;
+        }
+        flags |= BINARIES_ACTIVE;
+        let count = backlog - 20_000;
+        let (mode, ranges, end) = if our == 0 || count <= messages * 2 {
+            (BINARIES_UPDATE_HEADERS, 1, our)
+        } else {
+            let end = our + count.min(headers);
+            (BINARIES_RANGES, (end - our + messages - 1) / messages, end)
+        };
+        dst.copy_from_slice(&[
+            mode | flags | (ranges.min(0xFFFF) << BINARIES_RANGES_SHIFT),
+            ranges,
+            end,
+            backlog.clamp(0, 1_000_000_000_000_000),
+        ]);
+    }
+
+    /// Writes [`EMBED_WORDS`] words per NUL-joined Grafana embed row.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w581_grafana_embed_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let mut url = Vec::with_capacity(256);
+        unsafe { run(rows, rows_len, count, EMBED_WORDS, out, out_cap, |s, d| embed_words(s, &mut url, d)) }
+    }
+
+    /// Writes [`ARTICLE_WORDS`] words per NUL-joined bounded article row.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w581_bounded_article_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, ARTICLE_WORDS, out, out_cap, article_words) }
+    }
+
+    /// Writes [`DISPATCH_WORDS`] words per NUL-joined runner dispatch row.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w581_runner_dispatch_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, DISPATCH_WORDS, out, out_cap, dispatch_words) }
+    }
+
+    /// Writes [`BACKFILL_WORDS`] words per NUL-joined backfill work row.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w581_backfill_work_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, BACKFILL_WORDS, out, out_cap, backfill_words) }
+    }
+
+    /// Writes [`BINARIES_WORDS`] words per NUL-joined binaries work row.
+    ///
+    /// # Safety
+    /// `rows` must be readable for `rows_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w581_binaries_work_batch(
+        rows: *const u8,
+        rows_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { run(rows, rows_len, count, BINARIES_WORDS, out, out_cap, binaries_words) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn w581_embed_words_build_and_classify() {
+            let mut d = [0i64; 3];
+            let mut url = Vec::new();
+            embed_words(b"/grafana/\tnntmux-ops\tops\t1\tnow-6h\t1m\t0", &mut url, &mut d);
+            let expected: &[u8] = b"/grafana/d/nntmux-ops/ops?orgId=1&from=now-6h&to=now&refresh=1m&kiosk";
+            assert_eq!(url, expected);
+            let flags = EMBED_DASHBOARD
+                | EMBED_UID_VALID
+                | EMBED_SLUG_VALID
+                | EMBED_ORG_VALID
+                | EMBED_PANEL_VALID
+                | EMBED_RANGE_VALID
+                | EMBED_REFRESH_VALID
+                | EMBED_TRAILING_SLASH;
+            assert_eq!(d, [flags | (expected.len() as i64) << EMBED_LENGTH_SHIFT, i64::from(crc32(expected)), 37]);
+            embed_words(b"HTTPS://g.example\ta b\tX\tx\tnow-1q\t\t7", &mut url, &mut d);
+            assert_eq!(url, b"HTTPS://g.example/d-solo/a%20b/X?orgId=0&from=now-1q&to=now&refresh=&panelId=7");
+            assert_eq!(d[0] & 0xffff, EMBED_PANEL | EMBED_PANEL_VALID | EMBED_REFRESH_VALID | EMBED_ABSOLUTE);
+            embed_words(b"a\tb", &mut url, &mut d);
+            assert_eq!(d, [0, 0, 0]);
+            embed_words(b"\tu~v\ts\t1\t1700000000000\t9999d\t-3", &mut url, &mut d);
+            assert_eq!(url, b"/d/u~v/s?orgId=1&from=1700000000000&to=now&refresh=9999d&kiosk");
+            assert_eq!(d[0] & EMBED_PANEL_VALID, 0);
+        }
+
+        #[test]
+        fn w581_article_words_classify_errors() {
+            let mut d = [0i64; 3];
+            article_words(b"100\t50\t0\t1", &mut d);
+            assert_eq!(d, [ARTICLE_SUCCESS | ARTICLE_IS_SUCCESS | ARTICLE_METADATA | ARTICLE_EXCEEDS, 100, 0]);
+            article_words(b"-\t50\t1\t0\t430 No Such Article", &mut d);
+            assert_eq!(d, [ARTICLE_OVERSIZED | ERROR_MISSING << ARTICLE_ERROR_SHIFT, -1, 430]);
+            article_words(b"10\t50\t1\t0\tRead TIMEOUT", &mut d);
+            assert_eq!(d, [ARTICLE_OVERSIZED | ARTICLE_TRUNCATED | ERROR_TIMEOUT << ARTICLE_ERROR_SHIFT, 10, 0]);
+            article_words(b"-\t0\t0\t0\t", &mut d);
+            assert_eq!(d, [ERROR_EMPTY << ARTICLE_ERROR_SHIFT, -1, 0]);
+            article_words(b"-\t0\t0\t0\t481\tbad", &mut d);
+            assert_eq!(d, [ERROR_AUTH << ARTICLE_ERROR_SHIFT, -1, 481]);
+            article_words(b"-1\t0\t0\t0", &mut d);
+            assert_eq!(d, [ARTICLE_MALFORMED, -1, 0]);
+            article_words(b"1\t0\t2\t0", &mut d);
+            assert_eq!(d, [ARTICLE_MALFORMED, -1, 0]);
+        }
+
+        #[test]
+        fn w581_dispatch_words_normalize_and_chunk() {
+            let mut d = [0i64; 4];
+            dispatch_words(b" Get_Range \talt.binaries.TEST\t500000\t10\t3", &mut d);
+            let flags = DISPATCH_GROUP_VALID
+                | DISPATCH_GROUP_NORMALIZED
+                | DISPATCH_COMMAND_NORMALIZED
+                | DISPATCH_LIMIT_CLAMPED
+                | DISPATCH_NEEDS_GROUP
+                | DISPATCH_DISPATCHABLE;
+            assert_eq!(d, [4 | flags | 17 << DISPATCH_GROUP_SHIFT, DISPATCH_MAX_LIMIT, 3, 4]);
+            dispatch_words(b"releases\t\tx\t0\t99", &mut d);
+            assert_eq!(d, [6 | DISPATCH_LIMIT_DEFAULTED | DISPATCH_PROCESSES_CLAMPED, DISPATCH_DEFAULT_LIMIT, 0, 0]);
+            dispatch_words(b"bogus", &mut d);
+            assert_eq!(d, [0, 0, 0, 0]);
+        }
+
+        #[test]
+        fn w581_backfill_and_binaries_words_plan() {
+            let mut d = [0i64; 4];
+            backfill_words(b"alt.test\t100000\t40000\t10000\t4\t20000\t10\t30\t1", &mut d);
+            let flags = BACKFILL_NEEDED | BACKFILL_COMPRESSED | BACKFILL_GROUP_VALID;
+            assert_eq!(d, [flags | 4 << BACKFILL_THREADS_SHIFT, 2, 60000, 20 * 1_000_000 + 60000]);
+            backfill_words(b"g\t1\t5\t1\t99\t0\t40\t30\t0", &mut d);
+            let flags = BACKFILL_TARGET_REACHED | BACKFILL_THREADS_CLAMPED | BACKFILL_MESSAGES_ADJUSTED | BACKFILL_GROUP_VALID;
+            assert_eq!(d, [flags | 32 << BACKFILL_THREADS_SHIFT, 0, 1, 0]);
+            backfill_words(b"g\t1", &mut d);
+            assert_eq!(d, [BACKFILL_MALFORMED, 0, 0, 0]);
+
+            binaries_words(b"7\talt.test\t1\t1000\t200000\t0\t20000", &mut d);
+            let flags = BINARIES_ACTIVE | BINARIES_HEADERS_ADJUSTED | BINARIES_BEHIND | BINARIES_GROUP_VALID;
+            assert_eq!(d, [BINARIES_RANGES | flags | 9 << BINARIES_RANGES_SHIFT, 9, 180000, 199000]);
+            binaries_words(b"7\talt.test\t1\t0\t200000\t0\t20000", &mut d);
+            assert_eq!(d[..3], [BINARIES_UPDATE_HEADERS | flags | 1 << BINARIES_RANGES_SHIFT, 1, 0]);
+            binaries_words(b"7\talt.test\t0\t10\t5\t10\t10", &mut d);
+            assert_eq!(d, [BINARIES_INACTIVE | BINARIES_GROUP_VALID, 0, 10, 0]);
+            binaries_words(b"x\tg\t1\t1\t1\t1\t1", &mut d);
+            assert_eq!(d, [BINARIES_MALFORMED, 0, 0, 0]);
+        }
+
+        #[test]
+        fn w581_exports_guard_counts_and_capacity() {
+            type Export = unsafe extern "C" fn(*const u8, usize, usize, *mut i64, usize) -> isize;
+            let rows = b"a\tb\0c";
+            let exports: [(Export, usize); 5] = [
+                (nntmux_w581_grafana_embed_batch, EMBED_WORDS),
+                (nntmux_w581_bounded_article_batch, ARTICLE_WORDS),
+                (nntmux_w581_runner_dispatch_batch, DISPATCH_WORDS),
+                (nntmux_w581_backfill_work_batch, BACKFILL_WORDS),
+                (nntmux_w581_binaries_work_batch, BINARIES_WORDS),
+            ];
+            for (export, per_row) in exports {
+                let mut out = vec![0i64; 8 * per_row];
+                unsafe {
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, out.as_mut_ptr(), out.len()), 2);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, out.as_mut_ptr(), 2 * per_row - 1), SHORT_CAPACITY);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 3, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(export(std::ptr::null(), 0, 0, out.as_mut_ptr(), out.len()), 0);
+                    assert_eq!(export(std::ptr::null(), 0, 1, out.as_mut_ptr(), out.len()), 1);
+                    assert_eq!(export(std::ptr::null(), 2, 1, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(export(rows.as_ptr(), rows.len(), 2, std::ptr::null_mut(), 8), -1);
+                }
+            }
+        }
+    }
+}
