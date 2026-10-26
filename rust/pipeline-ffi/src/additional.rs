@@ -41677,3 +41677,815 @@ mod w566_outcome_frame_guard_install_manifest_tests {
         assert_eq!((status, out[1], out[6]), (1, 1, 1));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 57.6: publication outbox windows, outbox entry summaries, publication
+// outcome tallies, publication timing summaries and release metadata
+// completeness (`nntmux_w576_*`) for PublicationOutbox, PublicationOutboxEntry,
+// PublicationOutcome, PublicationTiming and ReleaseMetadataResolver. Same
+// contract as Wave 56.6: strings are NUL-joined column after column (with a
+// 0x01-joined twin when one holds a NUL), integer columns are machine-order
+// `int64_t`, double columns little-endian, and the result is fixed-width
+// `int64_t` words. Every export returns 1, -1 for invalid input (PHP then
+// computes the batch) or -2 when `out` is null, misaligned or too small, and
+// leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+/// Largest attempt or deferral count a batch carries (2^31-1).
+const W576_COUNT_CAP: i64 = (1 << 31) - 1;
+/// Millisecond clamp for converted seconds (below 2^53, so exact in a double).
+const W576_MS_CAP: f64 = 4.5e15;
+
+/// `$seconds * 1000.0` truncated toward zero, NaN as 0, clamped to ±4.5e15.
+#[inline]
+fn w576_ms(seconds: f64) -> i64 {
+    let ms = seconds * 1000.0;
+    if ms.is_nan() {
+        0
+    } else {
+        ms.clamp(-W576_MS_CAP, W576_MS_CAP) as i64
+    }
+}
+
+/// `rows` columns of `count` machine-order doubles.
+fn w576_floats(packed: &[u8], rows: usize, count: usize) -> Option<Vec<f64>> {
+    if count > W47_MAX_ITEMS || packed.len() != rows.checked_mul(count)?.checked_mul(8)? {
+        return None;
+    }
+    Some(w466_f64s(packed)?.collect())
+}
+
+#[inline]
+fn w576_lower_hex(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Unsigned decimal of 1-18 ASCII digits.
+#[inline]
+fn w576_digits(bytes: &[u8]) -> Option<i64> {
+    if bytes.is_empty() || bytes.len() > 18 || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(
+        bytes
+            .iter()
+            .fold(0i64, |value, &b| value * 10 + i64::from(b - b'0')),
+    )
+}
+
+// --- PublicationOutbox::classifyEntryWindowBatch -----------------------------
+
+pub(crate) const W576_OUTBOX_HEADER: usize = 14;
+pub(crate) const W576_OUTBOX_WIDTH: usize = 2;
+
+/// Pending entries as `survey()`/`claim()` see them. `floats` holds the
+/// enqueued-at and not-before columns, `ints` the attempts and deferrals
+/// columns (each clamped to 0..2^31-1). State bits as `entryStatePhp()`: due
+/// 1, expired 2, retried 4. Class 0 waiting (not due), 1 fresh, 2 expired, 3
+/// retried; expired entries are always taken, due ones while fewer than `cap`
+/// were. `[0]` count, `[1]` due, `[2]` expired, `[3]` retried, `[4]` fresh,
+/// `[5]` waiting, `[6]` taken, `[7]` first expired and `[8]` first retried
+/// index, `[9]` oldest due unexpired index, `[10]` earliest wake index (-1
+/// when none), `[11]` earliest wake in ms from `now` (0 when none), `[12]`
+/// failures, `[13]` FNV-1a digest; then per entry `state | class << 3 | taken
+/// << 5 | min(failures, 2^20-1) << 6 | backoff_ms << 26` (the next backoff
+/// `min(max_backoff, 2 ** (failures + 1))` in ms, clamped to 0..2^36-1) and
+/// the wake in ms (`enqueued + max_age - margin`, or the earlier not-before,
+/// minus `now`; 0 when expired).
+pub(crate) fn w576_outbox_batch(
+    floats: &[f64],
+    ints: &[i64],
+    count: usize,
+    now: f64,
+    max_age: f64,
+    margin: f64,
+    max_backoff: f64,
+    cap: i64,
+) -> Vec<i64> {
+    let mut out = vec![0i64; W576_OUTBOX_HEADER + W576_OUTBOX_WIDTH * count];
+    out[0] = count as i64;
+    out[7..=10].fill(-1);
+    let (mut claimed, mut oldest, mut wake) = (0i64, 0f64, 0i64);
+    for at in 0..count {
+        let enqueued = floats[at];
+        let not_before = floats[count + at];
+        let attempts = ints[at].clamp(0, W576_COUNT_CAP);
+        let deferrals = ints[count + at].clamp(0, W576_COUNT_CAP);
+        let due = not_before <= now;
+        let expired = now - enqueued > max_age;
+        let retried = attempts > 0 || deferrals > 0;
+        let state = i64::from(due) | i64::from(expired) << 1 | i64::from(retried) << 2;
+        let (class, taken) = if expired {
+            out[2] += 1;
+            if out[7] < 0 {
+                out[7] = at as i64;
+            }
+            (2, 1)
+        } else if due {
+            let taken = i64::from(claimed < cap);
+            claimed += taken;
+            if retried {
+                out[3] += 1;
+                if out[8] < 0 {
+                    out[8] = at as i64;
+                }
+            } else {
+                out[4] += 1;
+            }
+            if out[9] < 0 || enqueued < oldest {
+                out[9] = at as i64;
+                oldest = enqueued;
+            }
+            (if retried { 3 } else { 1 }, taken)
+        } else {
+            out[5] += 1;
+            (0, 0)
+        };
+        out[1] += i64::from(due);
+        out[6] += taken;
+        let wake_ms = if expired {
+            0
+        } else {
+            let mut needs = enqueued + max_age - margin;
+            if !due && not_before < needs {
+                needs = not_before;
+            }
+            let ms = w576_ms(needs - now);
+            if out[10] < 0 || ms < wake {
+                out[10] = at as i64;
+                wake = ms;
+            }
+            ms
+        };
+        let failures = attempts + deferrals;
+        out[12] += failures;
+        let power = 2f64.powf((failures + 1) as f64);
+        let backoff = if power < max_backoff { power } else { max_backoff };
+        let backoff_ms = w576_ms(backoff).clamp(0, (1 << 36) - 1);
+        let row = W576_OUTBOX_HEADER + W576_OUTBOX_WIDTH * at;
+        out[row] = state
+            | class << 3
+            | taken << 5
+            | failures.min((1 << 20) - 1) << 6
+            | backoff_ms << 26;
+        out[row + 1] = wake_ms;
+    }
+    out[11] = wake;
+    out[13] = w526_digest(&out[W576_OUTBOX_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w576_outbox_window_batch(
+    floats: *const u8,
+    floats_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    now: f64,
+    max_age: f64,
+    margin: f64,
+    max_backoff: f64,
+    cap: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let floats = w576_floats(w15_input(floats, floats_len)?, 2, count)?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w576_outbox_batch(
+                &floats,
+                &ints,
+                count,
+                now,
+                max_age,
+                margin,
+                max_backoff,
+                cap,
+            ))
+        })
+    }
+}
+
+// --- PublicationOutboxEntry::summarizeEntryBatch -----------------------------
+
+pub(crate) const W576_ENTRY_HEADER: usize = 13;
+
+/// `<id>-<version>-<12 lowercase hex>.json` with 1-18 digit numbers.
+fn w576_entry_name(name: &[u8]) -> Option<(i64, i64)> {
+    let stem = name.strip_suffix(b".json")?;
+    if stem.len() < 16 || stem[stem.len() - 13] != b'-' || !w576_lower_hex(&stem[stem.len() - 12..]) {
+        return None;
+    }
+    let numbers = &stem[..stem.len() - 13];
+    let dash = numbers.iter().position(|&b| b == b'-')?;
+    Some((w576_digits(&numbers[..dash])?, w576_digits(&numbers[dash + 1..])?))
+}
+
+/// Manifest hash kind: 1 lowercase SHA-256 hex, 2 SHA-256 hex holding
+/// uppercase, 3 lowercase SHA-1 hex, 0 anything else.
+#[inline]
+fn w576_hash_kind(hash: &[u8]) -> i64 {
+    match hash.len() {
+        64 if w576_lower_hex(hash) => 1,
+        64 if hash.iter().all(u8::is_ascii_hexdigit) => 2,
+        40 if w576_lower_hex(hash) => 3,
+        _ => 0,
+    }
+}
+
+/// Outbox entries: `strings` holds the name, manifest hash and lease token
+/// columns, `ints` the id, version, attempts and deferrals columns. Flags: bit
+/// 0 valid, 1 well-formed name, 2 name id and 3 name version equal the claim's,
+/// 4 hash kind non-zero, 5 lease token of 1-255 printable ASCII bytes, 6 id > 0,
+/// 7 version >= 0, 8 attempts/deferrals needed clamping to 0..2^31-1, 9 tried
+/// before. `[0]` count, `[1]` valid, `[2]` bad name, `[3]` name/claim
+/// mismatch, `[4]` bad hash, `[5]` uppercase hash, `[6]` bad token, `[7]` bad
+/// id or version, `[8]` clamped counts, `[9]` total and `[10]` largest
+/// failures, `[11]` first invalid index (-1 when none), `[12]` FNV-1a digest;
+/// then per entry `flags | hash_kind << 10 | min(token bytes, 255) << 12 |
+/// min(failures, 2^20-1) << 20 | min(name bytes, 1023) << 40`.
+pub(crate) fn w576_entry_batch(strings: &[&[u8]], ints: &[i64], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W576_ENTRY_HEADER + count];
+    out[0] = count as i64;
+    out[11] = -1;
+    for at in 0..count {
+        let (name, hash, token) = (strings[at], strings[count + at], strings[2 * count + at]);
+        let (id, version) = (ints[at], ints[count + at]);
+        let (raw_attempts, raw_deferrals) = (ints[2 * count + at], ints[3 * count + at]);
+        let parsed = w576_entry_name(name);
+        let name_ok = parsed.is_some();
+        let name_id = parsed.is_some_and(|(n, _)| n == id);
+        let name_version = parsed.is_some_and(|(_, v)| v == version);
+        let kind = w576_hash_kind(hash);
+        let token_ok =
+            (1..=255).contains(&token.len()) && token.iter().all(|&b| (0x21..=0x7E).contains(&b));
+        let (id_ok, version_ok) = (id > 0, version >= 0);
+        let clamped = !(0..=W576_COUNT_CAP).contains(&raw_attempts)
+            || !(0..=W576_COUNT_CAP).contains(&raw_deferrals);
+        let failures =
+            raw_attempts.clamp(0, W576_COUNT_CAP) + raw_deferrals.clamp(0, W576_COUNT_CAP);
+        let valid = name_ok && name_id && name_version && kind != 0 && token_ok && id_ok && version_ok;
+        out[1] += i64::from(valid);
+        out[2] += i64::from(!name_ok);
+        out[3] += i64::from(name_ok && !(name_id && name_version));
+        out[4] += i64::from(kind == 0);
+        out[5] += i64::from(kind == 2);
+        out[6] += i64::from(!token_ok);
+        out[7] += i64::from(!(id_ok && version_ok));
+        out[8] += i64::from(clamped);
+        out[9] += failures;
+        out[10] = out[10].max(failures);
+        if !valid && out[11] < 0 {
+            out[11] = at as i64;
+        }
+        let flags = i64::from(valid)
+            | i64::from(name_ok) << 1
+            | i64::from(name_id) << 2
+            | i64::from(name_version) << 3
+            | i64::from(kind != 0) << 4
+            | i64::from(token_ok) << 5
+            | i64::from(id_ok) << 6
+            | i64::from(version_ok) << 7
+            | i64::from(clamped) << 8
+            | i64::from(failures > 0) << 9;
+        out[W576_ENTRY_HEADER + at] = flags
+            | kind << 10
+            | (token.len().min(255) as i64) << 12
+            | failures.min((1 << 20) - 1) << 20
+            | (name.len().min(1023) as i64) << 40;
+    }
+    out[12] = w526_digest(&out[W576_ENTRY_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w576_outbox_entry_batch(
+    strings: *const u8,
+    strings_len: usize,
+    string_twin: *const u8,
+    string_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let strings = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(string_twin, string_twin_len)?,
+                3,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 4, count)?;
+            Some(w576_entry_batch(&strings, &ints, count))
+        })
+    }
+}
+
+// --- PublicationOutcome::tallyOutcomeBatch -----------------------------------
+
+pub(crate) const W576_OUTCOME_HEADER: usize = 28;
+
+/// Declaration index of a wire status; 12 when it names none (exact bytes).
+fn w576_outcome_case(status: &[u8]) -> i64 {
+    match status {
+        b"published" => 0,
+        b"filtered" => 1,
+        b"metadata_review" => 2,
+        b"deferred" => 3,
+        b"stale" => 4,
+        b"paused" => 5,
+        b"retry" => 6,
+        b"invalid" => 7,
+        b"error" => 8,
+        b"unresolved" => 9,
+        b"transport" => 10,
+        b"no_release" => 11,
+        _ => 12,
+    }
+}
+
+/// Outcomes as the forwarder settles them: `ints` holds the release id
+/// absence (non-zero when null) and release id columns. Published needs a release id;
+/// terminal cases (dropped or finished) are 0-2, 4, 7-9 and 12, retryable
+/// (sent again) 5, 6 and 10. Cycle kind as `FORWARDING_CYCLE_KINDS`: 0
+/// forwarded, 1 duplicates, 2 settled, 3 transient, 4 failure. `[0]` count,
+/// `[1..=13]` per case (13 unknown), `[14]` published, `[15]` terminal, `[16]`
+/// retryable, `[17..=21]` per cycle kind, `[22]` published without a release
+/// id, `[23]` first failure and `[24]` first retryable index (-1 when none),
+/// `[25]` published ppm, `[26]` largest published release id (-1 when none),
+/// `[27]` FNV-1a digest; then per outcome `case | published << 4 | terminal
+/// << 5 | retryable << 6 | kind << 7 | present << 10 | min(bytes, 65535) << 11
+/// | clamp(release_id, 0, 2^36-1) << 27` (release id 0 when absent).
+pub(crate) fn w576_outcome_batch(statuses: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+    let count = statuses.len();
+    let mut out = vec![0i64; W576_OUTCOME_HEADER + count];
+    out[0] = count as i64;
+    out[23] = -1;
+    out[24] = -1;
+    out[26] = -1;
+    for (at, status) in statuses.iter().enumerate() {
+        let case = w576_outcome_case(status);
+        let present = ints[at] == 0;
+        let id = ints[count + at];
+        let published = case == 0 && present;
+        let terminal = matches!(case, 0..=2 | 4 | 7..=9 | 12);
+        let retryable = matches!(case, 5 | 6 | 10);
+        let kind: i64 = match case {
+            0 => 0,
+            4 => 1,
+            1..=3 | 9 | 11 => 2,
+            5 | 6 | 10 => 3,
+            _ => 4,
+        };
+        out[1 + case as usize] += 1;
+        out[14] += i64::from(published);
+        out[15] += i64::from(terminal);
+        out[16] += i64::from(retryable);
+        out[17 + kind as usize] += 1;
+        out[22] += i64::from(case == 0 && !present);
+        if kind == 4 && out[23] < 0 {
+            out[23] = at as i64;
+        }
+        if retryable && out[24] < 0 {
+            out[24] = at as i64;
+        }
+        if published && id > out[26] {
+            out[26] = id;
+        }
+        let stored = if present { id.clamp(0, (1 << 36) - 1) } else { 0 };
+        out[W576_OUTCOME_HEADER + at] = case
+            | i64::from(published) << 4
+            | i64::from(terminal) << 5
+            | i64::from(retryable) << 6
+            | kind << 7
+            | i64::from(present) << 10
+            | (status.len().min(65_535) as i64) << 11
+            | stored << 27;
+    }
+    if count > 0 {
+        out[25] = out[14] * 1_000_000 / count as i64;
+    }
+    out[27] = w526_digest(&out[W576_OUTCOME_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w576_outcome_tally_batch(
+    statuses: *const u8,
+    statuses_len: usize,
+    status_twin: *const u8,
+    status_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let statuses = w566_columns(
+                w15_input(statuses, statuses_len)?,
+                w15_input(status_twin, status_twin_len)?,
+                1,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w576_outcome_batch(&statuses, &ints))
+        })
+    }
+}
+
+// --- PublicationTiming::summarizeTimingBatch ---------------------------------
+
+pub(crate) const W576_TIMING_HEADER: usize = 21;
+/// Largest phase duration a batch carries (2^50-1 ns, about 13 days).
+const W576_NS_CAP: i64 = (1 << 50) - 1;
+
+/// Latency bucket: below 1 us, 10 us, 100 us, 1 ms, 10 ms, 100 ms, 1 s, else 7.
+#[inline]
+fn w576_bucket(ns: i64) -> i64 {
+    match ns {
+        ..1_000 => 0,
+        ..10_000 => 1,
+        ..100_000 => 2,
+        ..1_000_000 => 3,
+        ..10_000_000 => 4,
+        ..100_000_000 => 5,
+        ..1_000_000_000 => 6,
+        _ => 7,
+    }
+}
+
+/// Phase durations in ns (clamped to 0..2^50-1) against an SLA. `[0]` count,
+/// `[1]` over the SLA, `[2]` clamped, `[3]` total (capped at 2^62), `[4]` mean,
+/// `[5]` min and `[6]` max (0 when empty), `[7]` p50, `[8]` p90 and `[9]` p99
+/// (nearest rank), `[10]` within-SLA ppm, `[11]` first over-SLA index (-1 when
+/// none), `[12..=19]` per bucket, `[20]` FNV-1a digest; then per duration
+/// `ns | bucket << 51 | over << 54 | clamped << 55`.
+pub(crate) fn w576_timing_batch(durations: &[i64], sla: i64) -> Vec<i64> {
+    let count = durations.len();
+    let mut out = vec![0i64; W576_TIMING_HEADER + count];
+    out[0] = count as i64;
+    out[11] = -1;
+    let mut sorted = Vec::with_capacity(count);
+    for (at, &raw) in durations.iter().enumerate() {
+        let ns = raw.clamp(0, W576_NS_CAP);
+        let clamped = ns != raw;
+        let over = ns > sla;
+        let bucket = w576_bucket(ns);
+        out[1] += i64::from(over);
+        out[2] += i64::from(clamped);
+        out[3] = w47_add(out[3], ns);
+        out[12 + bucket as usize] += 1;
+        if over && out[11] < 0 {
+            out[11] = at as i64;
+        }
+        sorted.push(ns);
+        out[W576_TIMING_HEADER + at] =
+            ns | bucket << 51 | i64::from(over) << 54 | i64::from(clamped) << 55;
+    }
+    if count > 0 {
+        sorted.sort_unstable();
+        let rank = |percent: usize| sorted[(count * percent).div_ceil(100) - 1];
+        out[4] = out[3] / count as i64;
+        out[5] = sorted[0];
+        out[6] = sorted[count - 1];
+        out[7] = rank(50);
+        out[8] = rank(90);
+        out[9] = rank(99);
+        out[10] = (count as i64 - out[1]) * 1_000_000 / count as i64;
+    }
+    out[20] = w526_digest(&out[W576_TIMING_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w576_timing_summary_batch(
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    sla: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let durations = w47_ints(w15_input(ints, ints_len)?, 1, count)?;
+            Some(w576_timing_batch(&durations, sla))
+        })
+    }
+}
+
+// --- ReleaseMetadataResolver::scoreMetadataBatch -----------------------------
+
+pub(crate) const W576_METADATA_HEADER: usize = 23;
+const W576_SIZE_CAP: i64 = (1 << 50) - 1;
+
+/// `YYYY-MM-DD HH:MM:SS` with month 1-12, day 1-31, hour < 24, minute and
+/// second < 60: `(year, month)`.
+fn w576_postdate(value: &[u8]) -> Option<(i64, i64)> {
+    if value.len() != 19
+        || value[4] != b'-'
+        || value[7] != b'-'
+        || value[10] != b' '
+        || value[13] != b':'
+        || value[16] != b':'
+    {
+        return None;
+    }
+    let field = |from: usize, to: usize| w576_digits(&value[from..to]);
+    let (year, month, day) = (field(0, 4)?, field(5, 7)?, field(8, 10)?);
+    let (hour, minute, second) = (field(11, 13)?, field(14, 16)?, field(17, 19)?);
+    ((1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && hour < 24
+        && minute < 60
+        && second < 60)
+        .then_some((year, month))
+}
+
+/// Release metadata completeness: `strings` holds the guid, searchname and
+/// postdate columns, `ints` the category, size and totalpart columns. Fields:
+/// guid (40 hex; bit 4 when it holds uppercase), searchname (non-empty after
+/// PHP `trim()`; bit 6 when trimming changed it), category 10-9999 (bit 8 when
+/// below 1000), size > 0, totalpart > 0 and postdate; the score counts the six
+/// valid fields. `[0]` count, `[1]` complete, `[2]` guid, `[3]` uppercase guid,
+/// `[4]` searchname, `[5]` trimmed searchname, `[6]` category, `[7]` misc
+/// category, `[8]` size, `[9]` totalpart, `[10]` postdate, `[11]` total score,
+/// `[12]` score ppm of the maximum, `[13]` total valid size (sizes clamped to
+/// 2^50-1, total capped at 2^62), `[14]` first incomplete index (-1 when none),
+/// `[15..=21]` per score, `[22]` FNV-1a digest; then per release `score |
+/// guid << 3 | upper << 4 | name << 5 | trimmed << 6 | category << 7 | misc <<
+/// 8 | size << 9 | parts << 10 | date << 11 | min(trimmed bytes, 65535) << 12
+/// | min(dots, 255) << 28 | year << 36 | month << 50` (year and month 0 for an
+/// invalid postdate).
+pub(crate) fn w576_metadata_batch(strings: &[&[u8]], ints: &[i64], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W576_METADATA_HEADER + count];
+    out[0] = count as i64;
+    out[14] = -1;
+    for at in 0..count {
+        let (guid, name, date) = (strings[at], strings[count + at], strings[2 * count + at]);
+        let (category, size, parts) = (ints[at], ints[count + at], ints[2 * count + at]);
+        let guid_ok = guid.len() == 40 && guid.iter().all(u8::is_ascii_hexdigit);
+        let upper = guid_ok && guid.iter().any(u8::is_ascii_uppercase);
+        let trimmed = w566_trim(name);
+        let name_ok = !trimmed.is_empty();
+        let name_trimmed = trimmed.len() != name.len();
+        let category_ok = (10..=9999).contains(&category);
+        let misc = category_ok && category < 1000;
+        let size_ok = size > 0;
+        let parts_ok = parts > 0;
+        let posted = w576_postdate(date);
+        let date_ok = posted.is_some();
+        let (year, month) = posted.unwrap_or((0, 0));
+        let score = i64::from(guid_ok)
+            + i64::from(name_ok)
+            + i64::from(category_ok)
+            + i64::from(size_ok)
+            + i64::from(parts_ok)
+            + i64::from(date_ok);
+        let dots = trimmed.iter().filter(|&&b| b == b'.').count().min(255) as i64;
+        out[1] += i64::from(score == 6);
+        out[2] += i64::from(guid_ok);
+        out[3] += i64::from(upper);
+        out[4] += i64::from(name_ok);
+        out[5] += i64::from(name_trimmed);
+        out[6] += i64::from(category_ok);
+        out[7] += i64::from(misc);
+        out[8] += i64::from(size_ok);
+        out[9] += i64::from(parts_ok);
+        out[10] += i64::from(date_ok);
+        out[11] += score;
+        if size_ok {
+            out[13] = w47_add(out[13], size.min(W576_SIZE_CAP));
+        }
+        if score < 6 && out[14] < 0 {
+            out[14] = at as i64;
+        }
+        out[15 + score as usize] += 1;
+        out[W576_METADATA_HEADER + at] = score
+            | i64::from(guid_ok) << 3
+            | i64::from(upper) << 4
+            | i64::from(name_ok) << 5
+            | i64::from(name_trimmed) << 6
+            | i64::from(category_ok) << 7
+            | i64::from(misc) << 8
+            | i64::from(size_ok) << 9
+            | i64::from(parts_ok) << 10
+            | i64::from(date_ok) << 11
+            | (trimmed.len().min(65_535) as i64) << 12
+            | dots << 28
+            | year << 36
+            | month << 50;
+    }
+    if count > 0 {
+        out[12] = out[11] * 1_000_000 / (6 * count as i64);
+    }
+    out[22] = w526_digest(&out[W576_METADATA_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w576_metadata_score_batch(
+    strings: *const u8,
+    strings_len: usize,
+    string_twin: *const u8,
+    string_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let strings = w566_columns(
+                w15_input(strings, strings_len)?,
+                w15_input(string_twin, string_twin_len)?,
+                3,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 3, count)?;
+            Some(w576_metadata_batch(&strings, &ints, count))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w576_outbox_entry_outcome_timing_metadata_tests {
+    use super::*;
+    use std::ptr::{null, null_mut};
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_ne_bytes()).collect()
+    }
+
+    fn packed_floats(values: &[f64]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn w576_ms_truncates_and_clamps() {
+        assert_eq!(w576_ms(1.2345), 1234);
+        assert_eq!(w576_ms(-1.2345), -1234);
+        assert_eq!(w576_ms(f64::NAN), 0);
+        assert_eq!(w576_ms(f64::INFINITY), 4_500_000_000_000_000);
+        assert_eq!(w576_ms(f64::NEG_INFINITY), -4_500_000_000_000_000);
+    }
+
+    #[test]
+    fn w576_outbox_batch_classifies_windows() {
+        // fresh, retried, waiting, expired, fresh beyond the cap.
+        let floats = [100.0, 101.0, 102.0, 10.0, 103.0, 0.0, 0.0, 150.0, 0.0, 0.0];
+        let ints = [0, 2, 0, 0, 0, 0, 1, 0, 0, 0];
+        let out = w576_outbox_batch(&floats, &ints, 5, 120.0, 60.0, 5.0, 30.0, 2);
+        assert_eq!(&out[..13], &[5, 4, 1, 1, 2, 1, 3, 3, 1, 0, 2, 30_000, 3]);
+        let base = W576_OUTBOX_HEADER;
+        assert_eq!(out[base], 1 | 1 << 3 | 1 << 5 | 2_000 << 26);
+        assert_eq!(out[base + 1], 35_000);
+        assert_eq!(out[base + 2], 1 | 4 | 3 << 3 | 1 << 5 | 3 << 6 | 16_000 << 26);
+        assert_eq!(out[base + 4] & 63, 0);
+        assert_eq!(out[base + 5], 30_000);
+        assert_eq!(out[base + 6], 1 | 2 | 2 << 3 | 1 << 5 | 2_000 << 26);
+        assert_eq!(out[base + 7], 0);
+        assert_eq!(out[base + 8] & 63, 1 | 1 << 3);
+    }
+
+    #[test]
+    fn w576_entry_batch_validates_entries() {
+        let hash = [b'a'; 64];
+        let upper = [b'A'; 64];
+        let strings: [&[u8]; 9] = [
+            b"12-3-0123456789ab.json", b"12-4-0123456789ab.json", b"bad.json", //
+            &hash, &upper, b"xyz", //
+            b"token-1", b"", b"tok en",
+        ];
+        let ints = [12, 12, 5, 3, 3, -1, 0, 2, -4, 1, 0, 0];
+        let out = w576_entry_batch(&strings, &ints, 3);
+        assert_eq!(&out[..12], &[3, 1, 1, 1, 1, 1, 2, 1, 1, 3, 2, 1]);
+        let base = W576_ENTRY_HEADER;
+        assert_eq!(out[base], 0xFF | 1 << 9 | 1 << 10 | 7 << 12 | 1 << 20 | 22 << 40);
+        assert_eq!(out[base + 1] & 0x3FF, 0b10_1101_0110);
+        assert_eq!(w576_entry_name(b"007-0-ffffffffffff.json"), Some((7, 0)));
+        assert_eq!(w576_entry_name(b"1-2-FFFFFFFFFFFF.json"), None);
+        assert_eq!(w576_entry_name(b"-2-ffffffffffff.json"), None);
+        assert_eq!(w576_entry_name(b"1-2-ffffffffffff.json"), Some((1, 2)));
+        assert_eq!(w576_hash_kind(&[b'0'; 40]), 3);
+    }
+
+    #[test]
+    fn w576_outcome_batch_tallies() {
+        let statuses: [&[u8]; 6] = [b"published", b"published", b"transport", b"stale", b"bogus", b"no_release"];
+        let ints = [0, 1, 1, 1, 1, 1, 42, 0, 0, 0, 0, 0];
+        let out = w576_outcome_batch(&statuses, &ints);
+        assert_eq!(out[0], 6);
+        assert_eq!((out[1], out[11], out[5], out[13], out[12]), (2, 1, 1, 1, 1));
+        assert_eq!(&out[14..=26], &[1, 4, 1, 2, 1, 1, 1, 1, 1, 4, 2, 166_666, 42]);
+        assert_eq!(
+            out[W576_OUTCOME_HEADER],
+            1 << 4 | 1 << 5 | 1 << 10 | 9 << 11 | 42 << 27
+        );
+    }
+
+    #[test]
+    fn w576_timing_batch_summarizes() {
+        let out = w576_timing_batch(&[500, 5_000_000, -3, 2_000_000_000], 1_000_000);
+        assert_eq!(&out[..12], &[4, 2, 1, 2_005_000_500, 501_250_125, 0, 2_000_000_000, 500, 2_000_000_000, 2_000_000_000, 500_000, 1]);
+        assert_eq!(&out[12..20], &[2, 0, 0, 0, 1, 0, 0, 1]);
+        assert_eq!(out[W576_TIMING_HEADER + 2], 1 << 55);
+        let empty = w576_timing_batch(&[], 0);
+        assert_eq!((empty[0], empty[11], empty[20]), (0, -1, i64::from(W47_FNV_OFFSET)));
+    }
+
+    #[test]
+    fn w576_metadata_batch_scores() {
+        let guid = [b'a'; 40];
+        let strings: [&[u8]; 6] = [&guid, b"nope", b" Some.Release.1080p ", b"", b"2024-02-30 23:59:59", b"2024-13-01 00:00:00"];
+        let ints = [5040, 10, 1_000, 0, 50, 0];
+        let out = w576_metadata_batch(&strings, &ints, 2);
+        assert_eq!(&out[..15], &[2, 1, 1, 0, 1, 1, 2, 1, 1, 1, 1, 7, 583_333, 1_000, 1]);
+        assert_eq!(out[15 + 1], 1);
+        assert_eq!(out[15 + 6], 1);
+        let row = out[W576_METADATA_HEADER];
+        assert_eq!(row & 7, 6);
+        assert_eq!((row >> 12) & 0xFFFF, 18);
+        assert_eq!((row >> 28) & 0xFF, 2);
+        assert_eq!((row >> 36) & 0x3FFF, 2024);
+        assert_eq!(row >> 50, 2);
+    }
+
+    #[test]
+    fn w576_exports_validate_pointers_and_capacity() {
+        let mut out = [0i64; 64];
+        let statuses = b"published\0stale";
+        let ints = packed(&[0, 1, 9, 0]);
+        let status = unsafe {
+            nntmux_w576_outcome_tally_batch(statuses.as_ptr(), statuses.len(), null(), 0, ints.as_ptr(), ints.len(), 2, out.as_mut_ptr(), 64)
+        };
+        assert_eq!((status, out[0], out[14], out[26]), (1, 2, 1, 9));
+        let status = unsafe {
+            nntmux_w576_outcome_tally_batch(statuses.as_ptr(), statuses.len(), null(), 0, ints.as_ptr(), ints.len(), 2, null_mut(), 64)
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w576_outcome_tally_batch(statuses.as_ptr(), statuses.len(), null(), 0, ints.as_ptr(), ints.len(), 2, out.as_mut_ptr(), 4)
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w576_outcome_tally_batch(statuses.as_ptr(), statuses.len(), null(), 0, ints.as_ptr(), ints.len(), 3, out.as_mut_ptr(), 64)
+        };
+        assert_eq!(status, -1);
+        let misaligned = unsafe { out.as_mut_ptr().cast::<u8>().add(1).cast::<i64>() };
+        let status = unsafe { nntmux_w576_timing_summary_batch(null(), 0, 0, 0, misaligned, 32) };
+        assert_eq!(status, -2);
+        let floats = packed_floats(&[1.0, 0.0]);
+        let counts = packed(&[0, 0]);
+        let status = unsafe {
+            nntmux_w576_outbox_window_batch(floats.as_ptr(), floats.len(), counts.as_ptr(), counts.len(), 1, 2.0, 60.0, 0.0, 30.0, 10, out.as_mut_ptr(), 64)
+        };
+        assert_eq!((status, out[0], out[4]), (1, 1, 1));
+        out.fill(7);
+        for status in unsafe {
+            [
+                nntmux_w576_outbox_window_batch(null(), 0, null(), 0, 0, 0.0, 0.0, 0.0, 0.0, 0, out.as_mut_ptr(), 64),
+                nntmux_w576_outbox_entry_batch(null(), 0, null(), 0, null(), 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w576_outcome_tally_batch(null(), 0, null(), 0, null(), 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w576_timing_summary_batch(null(), 0, 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w576_metadata_score_batch(null(), 0, null(), 0, null(), 0, 0, out.as_mut_ptr(), 64),
+            ]
+        } {
+            assert_eq!(status, 1);
+        }
+        let status = unsafe {
+            nntmux_w576_outbox_window_batch(floats.as_ptr(), floats.len() - 1, counts.as_ptr(), counts.len(), 1, 0.0, 0.0, 0.0, 0.0, 0, out.as_mut_ptr(), 64)
+        };
+        assert_eq!(status, -1);
+    }
+}
