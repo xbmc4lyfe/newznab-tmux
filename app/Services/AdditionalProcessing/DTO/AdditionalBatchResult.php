@@ -883,4 +883,291 @@ final readonly class AdditionalBatchResult
     {
         return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, $default);
     }
+
+    // ---- Wave 64.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 8.98x/7.87x, uncommon 9.01x/8.16x); see RustAdditionalConfigConsoleBatchResultWorkPlanArchiveCandidateW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    private const string W64_ADDITIONAL_BATCH_RESULT_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w642_batch_result_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W64_ADDITIONAL_BATCH_RESULT_TAIL = 48;
+
+    /**
+     * Wave 64 routing, binding and output buffer, kept in function-local statics (no static or
+     * instance properties). Operations: null reads the routing override, 'set' replaces it
+     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
+     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
+     * (null without the library).
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'reset':
+                $previous = $enabled;
+                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w64', self::W64_ADDITIONAL_BATCH_RESULT_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w64RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    /** Routes w64BatchResultPlanBatch() to Rust until reset. */
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    /** Routes w64BatchResultPlanBatch() to PHP until reset. */
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restores W64_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $enabled = self::w64RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w64BatchResultPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w64BatchResultPlanBatch(array $rows): array
+    {
+        return self::usesW64RustFfi() ? self::w64BatchResultPlanBatchNative($rows) : self::w64BatchResultPlanBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w64BatchResultPlanBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W64_ADDITIONAL_BATCH_RESULT_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w64RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w64BatchResultPlanBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W64_ADDITIONAL_BATCH_RESULT_FFI_CDEF.)
+            $written = $ffi->nntmux_w642_batch_result_plan_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w64BatchResultPlanBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w64Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w64Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /** ProcessingOutcome values => codes 1-12 in case order. */
+    private const array W64_OUTCOMES = ['completed' => 1, 'no-useful-artifacts' => 2, 'passworded' => 3, 'group-unavailable' => 4,
+        'temporary-workspace-unavailable' => 5, 'timed-out' => 6, 'deleted-after-timeout' => 7, 'deleted-broken-nzb' => 8, 'deleted-par2-only' => 9,
+        'not-found' => 10, 'awaiting-late-articles' => 11, 'failed' => 12];
+
+    /** Extracted media artifact => bit. */
+    private const array W64_MEDIA = ['sample' => 0, 'jpg' => 1, 'video' => 2, 'audio' => 3, 'mediainfo' => 4, 'nfo' => 5, 'filelist' => 6];
+
+    private const array W64_PASSWORD = ['yes' => 1, '1' => 1, 'true' => 1, 'no' => 2, '0' => 2, 'false' => 2];
+
+    /** Elapsed-milliseconds bucket bounds. */
+    private const array W64_ELAPSED_BOUNDS = [1_000, 10_000, 60_000, 300_000];
+
+    private const int W64_MAX_ATTEMPTS = 3;
+
+    /** Error class: 0 none, 1 timeout, 2 connection, 3 missing article, 4 password, 5 corrupt, 6 other. */
+    private static function w64ErrorClass(string $error): int
+    {
+        $error = strtolower(trim($error));
+
+        return match (true) {
+            $error === '' => 0,
+            str_contains($error, 'timeout') || str_contains($error, 'timed out') => 1,
+            str_contains($error, 'connection') || str_contains($error, 'socket') => 2,
+            str_contains($error, 'no such article') || str_contains($error, '430') => 3,
+            str_contains($error, 'password') => 4,
+            str_contains($error, 'crc') || str_contains($error, 'corrupt') => 5,
+            default => 6,
+        };
+    }
+
+    /**
+     * Wave 64.2 release result rollup. Per `release_id\toutcome\telapsed_ms\tattempts\tpassword\t
+     * media\terror` row `outcome | error_class << 4 | password << 7 | media << 9 | flags << 16 |
+     * elapsed_bucket << 22 | min(attempts, 255) << 25 | min(elapsed_ms / 1000, 2^20 - 1) << 33 |
+     * min(unknown_media, 7) << 53`. The outcome is a trimmed, case-insensitive ProcessingOutcome
+     * value (W64_OUTCOMES, else 0); release_id, elapsed_ms and attempts are w64Int() fields (12, 9
+     * and 3 digits, empty or unparsable 0). Password: 0 empty, 1 yes/1/true, 2 no/0/false, 3
+     * other. Media: comma-separated, trimmed, case-insensitive W64_MEDIA names. Error class: see
+     * w64ErrorClass(). Flags: successful (completed, no useful artifacts, passworded), deleted
+     * (the three deleted outcomes), retryable (any other known outcome but not-found, with a
+     * timeout or connection error or a group, workspace, timeout or late-article outcome, under
+     * W64_MAX_ATTEMPTS attempts), password conflict (passworded but marked clear, or completed but
+     * marked passworded), duplicate (a positive release id seen earlier in the batch) and
+     * malformed (an unparsable number or an unknown outcome). Elapsed buckets split at
+     * W64_ELAPSED_BOUNDS. Then 13 outcome, seven error class, four password, seven media, six flag
+     * and five bucket counts, total and longest elapsed milliseconds, total attempts, distinct
+     * positive release ids, total media artifacts and the XXH64 digest of all earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w64BatchResultPlanBatchPhp(array $rows): array
+    {
+        $out = $ids = [];
+        $outcomes = array_fill(0, 13, 0);
+        $errors = $mediaCounts = array_fill(0, 7, 0);
+        $passwords = array_fill(0, 4, 0);
+        $flagCounts = array_fill(0, 6, 0);
+        $buckets = array_fill(0, 5, 0);
+        $totalElapsed = $maxElapsed = $totalAttempts = $artifacts = 0;
+        foreach ($rows as $row) {
+            [$id, $outcome, $elapsed, $attempts, $password, $media, $error] = explode("\t", (string) $row, 7) + array_fill(0, 7, '');
+            $id = self::w64Int($id, 12);
+            $elapsed = self::w64Int($elapsed, 9);
+            $attempts = self::w64Int($attempts, 3);
+            $outcome = self::W64_OUTCOMES[strtolower(trim($outcome))] ?? 0;
+            $errorClass = self::w64ErrorClass($error);
+            $password = trim($password);
+            $passwordState = $password === '' ? 0 : (self::W64_PASSWORD[strtolower($password)] ?? 3);
+            $mask = $unknown = 0;
+            foreach (explode(',', $media) as $token) {
+                $token = strtolower(trim($token));
+                if ($token === '') {
+                    continue;
+                }
+                $bit = self::W64_MEDIA[$token] ?? null;
+                if ($bit === null) {
+                    $unknown++;
+                } else {
+                    $mask |= 1 << $bit;
+                }
+            }
+            $ms = \is_int($elapsed) ? $elapsed : 0;
+            $tries = \is_int($attempts) ? $attempts : 0;
+            $successful = $outcome >= 1 && $outcome <= 3;
+            $deleted = $outcome >= 7 && $outcome <= 9;
+            $retryable = $outcome !== 0 && ! $successful && ! $deleted && $outcome !== 10
+                && ($errorClass === 1 || $errorClass === 2 || \in_array($outcome, [4, 5, 6, 11], true)) && $tries < self::W64_MAX_ATTEMPTS;
+            $conflict = ($outcome === 3 && $passwordState === 2) || ($outcome === 1 && $passwordState === 1);
+            $duplicate = false;
+            if (\is_int($id) && $id > 0) {
+                $duplicate = isset($ids[$id]);
+                $ids[$id] = true;
+            }
+            $malformed = $id === false || $elapsed === false || $attempts === false || $outcome === 0;
+            $flags = (int) $successful | (int) $deleted << 1 | (int) $retryable << 2 | (int) $conflict << 3 | (int) $duplicate << 4 | (int) $malformed << 5;
+            $bucket = 0;
+            foreach (self::W64_ELAPSED_BOUNDS as $bound) {
+                $bucket += (int) ($ms >= $bound);
+            }
+            $outcomes[$outcome]++;
+            $errors[$errorClass]++;
+            $passwords[$passwordState]++;
+            for ($k = 0; $k < 7; $k++) {
+                $mediaCounts[$k] += $mask >> $k & 1;
+            }
+            for ($k = 0; $k < 6; $k++) {
+                $flagCounts[$k] += $flags >> $k & 1;
+            }
+            $buckets[$bucket]++;
+            $totalElapsed += $ms;
+            $maxElapsed = max($maxElapsed, $ms);
+            $totalAttempts += $tries;
+            $artifacts += substr_count(decbin($mask), '1');
+            $out[] = $outcome | $errorClass << 4 | $passwordState << 7 | $mask << 9 | $flags << 16 | $bucket << 22 | min($tries, 255) << 25
+                | min(intdiv($ms, 1000), 0xFFFFF) << 33 | min($unknown, 7) << 53;
+        }
+        array_push($out, ...$outcomes, ...$errors, ...$passwords, ...$mediaCounts, ...$flagCounts, ...$buckets);
+        array_push($out, $totalElapsed, $maxElapsed, $totalAttempts, \count($ids), $artifacts);
+        $out[] = self::w64Digest($out);
+
+        return $out;
+    }
 }

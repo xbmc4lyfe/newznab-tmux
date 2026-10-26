@@ -777,4 +777,295 @@ final readonly class AdditionalWorkPlan
     {
         return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, $default);
     }
+
+    // ---- Wave 64.2 batch plan ----------------------------------------------------------------
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 14.82x/13.31x, uncommon 14.94x/13.91x); see RustAdditionalConfigConsoleBatchResultWorkPlanArchiveCandidateW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    private const string W64_ADDITIONAL_WORK_PLAN_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w642_work_plan_eval_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Summary words after the per-row words, the digest included. */
+    public const int W64_ADDITIONAL_WORK_PLAN_TAIL = 22;
+
+    /**
+     * Wave 64 routing, binding and output buffer, kept in function-local statics (no static or
+     * instance properties). Operations: null reads the routing override, 'set' replaces it
+     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
+     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
+     * (null without the library).
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'reset':
+                $previous = $enabled;
+                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w64', self::W64_ADDITIONAL_WORK_PLAN_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w64RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    /** Routes w64WorkPlanEvalBatch() to Rust until reset. */
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    /** Routes w64WorkPlanEvalBatch() to PHP until reset. */
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restores W64_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    public static function usesW64RustFfi(): bool
+    {
+        $enabled = self::w64RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with w64WorkPlanEvalBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w64WorkPlanEvalBatch(array $rows): array
+    {
+        return self::usesW64RustFfi() ? self::w64WorkPlanEvalBatchNative($rows) : self::w64WorkPlanEvalBatchPhp($rows);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
+     * column is not a list.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w64WorkPlanEvalBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $words = $count + self::W64_ADDITIONAL_WORK_PLAN_TAIL;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w64RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($rows)) {
+            return self::w64WorkPlanEvalBatchPhp($rows);
+        }
+        $blob = implode("\0", $rows);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W64_ADDITIONAL_WORK_PLAN_FFI_CDEF.)
+            $written = $ffi->nntmux_w642_work_plan_eval_batch($blob, \strlen($blob), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::w64WorkPlanEvalBatchPhp($rows);
+    }
+
+    /** @param  list<int>  $out */
+    private static function w64Digest(array $out): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+
+        return $digest[1];
+    }
+
+    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
+    private static function w64Int(string $value, int $max): int|false|null
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        $length = \strlen($value);
+
+        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
+    }
+
+    /** Audio extensions the audio-info stage accepts. */
+    private const array W64_AUDIO_EXTENSIONS = ['mp3' => true, 'flac' => true, 'ogg' => true, 'wav' => true, 'aac' => true, 'm4a' => true, 'wma' => true,
+        'ape' => true, 'opus' => true];
+
+    /** Flag letters: book flood, probe is the only file, mapped names, video disabled, audio disabled. */
+    private const string W64_FLAG_LETTERS = 'bpmva';
+
+    /** Bytes that cannot appear in a message id. */
+    private const string W64_ID_INVALID = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x7f<>";
+
+    /** Segments one evaluated plan may fetch before the rest is deferred. */
+    public const int W64_SEGMENT_LIMIT = 1000;
+
+    /** Message-id shape: 0 empty, 1 valid, 2 invalid (a byte <= 0x20, DEL, `<` or `>`). */
+    private static function w64IdState(string $id): int
+    {
+        if ($id === '') {
+            return 0;
+        }
+
+        return strcspn($id, self::W64_ID_INVALID) === \strlen($id) ? 1 : 2;
+    }
+
+    /**
+     * Wave 64.2 work plan evaluation. Per `samples\tjpgs\tmedia_info_id\taudio_info_id\taudio_ext\t
+     * archives\tprobes\tpar2\tbook_files\tsegment_budget\tflags` row `stages | min(needed, 2^20 - 1)
+     * << 8 | budget << 28 | flags << 35 | malformed << 40 | over_limit << 41 | supported << 42 |
+     * min(unknown_flags, 15) << 43 | audio_ext_known << 47 | media_id_state << 48 | audio_id_state
+     * << 50`. Counts are w64Int() fields (6 digits; unparsable sets malformed and counts 0); the
+     * budget has 9 digits, empty or 0 means 2 and it is capped at 100. Ids are trimmed (see
+     * w64IdState()); the audio extension is trimmed, loses one leading dot and is matched
+     * case-insensitively. Flag letters (W64_FLAG_LETTERS, case-insensitive; spaces and commas
+     * skipped, anything else unknown) set bits 0-4. Stages: 0 sample (samples, video on), 1 jpg,
+     * 2 media info (valid id, video on), 3 audio info (valid id, known extension, audio on), 4
+     * archive (archives, unless a book flood with book files), 5 probe (probes without archives),
+     * 6 PAR2 (par2 files, names not yet mapped), 7 NFO (archives or probes). Needed segments sum
+     * the enabled stages: samples, jpgs, one per info stage, archives * budget, probes and par2
+     * files; over_limit when they exceed W64_SEGMENT_LIMIT. Then eight stage and five flag counts,
+     * the supported, malformed and over-limit rows, total needed and deferred segments, the most
+     * needed, total archives, distinct valid media info ids (by crc32) and the XXH64 digest of all
+     * earlier words.
+     *
+     * @param  array<array-key, string>  $rows
+     * @return list<int>
+     */
+    public static function w64WorkPlanEvalBatchPhp(array $rows): array
+    {
+        $out = $mediaIds = [];
+        $stageCounts = array_fill(0, 8, 0);
+        $flagCounts = array_fill(0, 5, 0);
+        $supportedRows = $malformedRows = $overRows = $totalNeeded = $totalDeferred = $maxNeeded = $totalArchives = 0;
+        foreach ($rows as $row) {
+            $fields = explode("\t", (string) $row, 11) + array_fill(0, 11, '');
+            $malformed = false;
+            $counts = [];
+            foreach ([0, 1, 5, 6, 7, 8] as $k) {
+                $value = self::w64Int($fields[$k], 6);
+                if ($value === false) {
+                    $malformed = true;
+                }
+                $counts[] = \is_int($value) ? $value : 0;
+            }
+            [$samples, $jpgs, $archives, $probes, $par2, $books] = $counts;
+            $budget = self::w64Int($fields[9], 9);
+            if ($budget === false) {
+                $malformed = true;
+            }
+            $budget = \is_int($budget) && $budget > 0 ? min($budget, 100) : 2;
+            $media = trim($fields[2]);
+            $mediaState = self::w64IdState($media);
+            $audioState = self::w64IdState(trim($fields[3]));
+            $extension = trim($fields[4]);
+            if (str_starts_with($extension, '.')) {
+                $extension = substr($extension, 1);
+            }
+            $known = isset(self::W64_AUDIO_EXTENSIONS[strtolower($extension)]);
+            $letters = $unknown = 0;
+            $flags = strtolower($fields[10]);
+            for ($i = 0, $n = \strlen($flags); $i < $n; $i++) {
+                $char = $flags[$i];
+                if ($char === ' ' || $char === ',') {
+                    continue;
+                }
+                $bit = strpos(self::W64_FLAG_LETTERS, $char);
+                if ($bit === false) {
+                    $unknown++;
+                } else {
+                    $letters |= 1 << $bit;
+                }
+            }
+            $noVideo = ($letters & 8) !== 0;
+            $stages = (int) ($samples > 0 && ! $noVideo)
+                | (int) ($jpgs > 0) << 1
+                | (int) ($mediaState === 1 && ! $noVideo) << 2
+                | (int) ($audioState === 1 && $known && ($letters & 16) === 0) << 3
+                | (int) ($archives > 0 && ! (($letters & 1) !== 0 && $books > 0)) << 4
+                | (int) ($probes > 0 && $archives === 0) << 5
+                | (int) ($par2 > 0 && ($letters & 4) === 0) << 6
+                | (int) ($archives > 0 || $probes > 0) << 7;
+            $needed = (($stages & 1) !== 0 ? $samples : 0) + (($stages & 2) !== 0 ? $jpgs : 0) + ($stages >> 2 & 1) + ($stages >> 3 & 1)
+                + (($stages & 16) !== 0 ? $archives * $budget : 0) + (($stages & 32) !== 0 ? $probes : 0) + (($stages & 64) !== 0 ? $par2 : 0);
+            $over = $needed > self::W64_SEGMENT_LIMIT;
+            $supported = $stages !== 0;
+            for ($k = 0; $k < 8; $k++) {
+                $stageCounts[$k] += $stages >> $k & 1;
+            }
+            for ($k = 0; $k < 5; $k++) {
+                $flagCounts[$k] += $letters >> $k & 1;
+            }
+            $supportedRows += (int) $supported;
+            $malformedRows += (int) $malformed;
+            $overRows += (int) $over;
+            $totalNeeded += $needed;
+            $totalDeferred += max(0, $needed - self::W64_SEGMENT_LIMIT);
+            $maxNeeded = max($maxNeeded, $needed);
+            $totalArchives += $archives;
+            if ($mediaState === 1) {
+                $mediaIds[crc32($media)] = true;
+            }
+            $out[] = $stages | min($needed, 0xFFFFF) << 8 | $budget << 28 | $letters << 35 | (int) $malformed << 40 | (int) $over << 41 | (int) $supported << 42
+                | min($unknown, 15) << 43 | (int) $known << 47 | $mediaState << 48 | $audioState << 50;
+        }
+        array_push($out, ...$stageCounts, ...$flagCounts);
+        array_push($out, $supportedRows, $malformedRows, $overRows, $totalNeeded, $totalDeferred, $maxNeeded, $totalArchives, \count($mediaIds));
+        $out[] = self::w64Digest($out);
+
+        return $out;
+    }
 }
