@@ -57235,3 +57235,1141 @@ mod w584_tests {
         assert_eq!(&out[12..], &[2, 2, 1, 0]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 59.4: Verification lock state, worker lock inventory, verified article, verified NZB
+// writer and verified release publication rows
+// ---------------------------------------------------------------------------
+
+/// Batch row helpers for `VerificationLock`, `VerificationWorkerLocks`, `VerifiedArticle`,
+/// `VerifiedNzbWriter` and `VerifiedReleasePublisher`. They reuse the Wave 57.4 frame (`run`),
+/// but PHP passes the blob values field-major (every record's first string, then every
+/// record's second string, ...) so it can build the blob with one implode() per field: value
+/// `f` of record `i` is `values[f * count + i]`. The PHP `*BatchPhp()` methods are the
+/// reference implementation.
+pub mod w594_batch {
+    use super::w574_batch::{MAX_RECORDS, span};
+    use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// Record body: blob values (field-major), the int64 columns, output rows.
+    type Body = fn(&[&[u8]], &[i64], &mut [i64]);
+
+    /// Upper clamp for lease and heartbeat timestamps (ms).
+    const TIME_MAX: i64 = 1 << 42;
+
+    /// Largest article dimension: at most 18 decimal digits.
+    const DIM_MAX: i64 = 999_999_999_999_999_999;
+
+    /// Column `k` of the packed int64 words for record `i`.
+    #[inline(always)]
+    fn col(ints: &[i64], count: usize, k: usize, i: usize) -> i64 {
+        ints[k * count + i]
+    }
+
+    #[inline(always)]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point to `len` readable bytes unless `len` is zero.
+    unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Split `n` NUL-joined values into `out`. With a non-empty `twin` (the same values joined
+    /// by 0x01) only a NUL the twin holds as 0x01 separates values, so values may hold NULs.
+    /// The scan reads eight bytes at a time and inspects only words holding a NUL.
+    pub(crate) fn split<'a>(
+        blob: &'a [u8],
+        twin: &[u8],
+        n: usize,
+        out: &mut Vec<&'a [u8]>,
+    ) -> bool {
+        const LOW: u64 = 0x0101_0101_0101_0101;
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        if !twin.is_empty() && twin.len() != blob.len() {
+            return false;
+        }
+        let mut start = 0;
+        let mut separator = |p: usize, out: &mut Vec<&'a [u8]>| -> bool {
+            if twin.is_empty() || twin[p] == 1 {
+                if out.len() + 1 >= n {
+                    return false;
+                }
+                out.push(&blob[start..p]);
+                start = p + 1;
+            }
+            true
+        };
+        let (words, tail) = blob.as_chunks::<8>();
+        for (w, chunk) in words.iter().enumerate() {
+            let word = u64::from_le_bytes(*chunk);
+            if word.wrapping_sub(LOW) & !word & HIGH != 0 {
+                for (k, b) in chunk.iter().enumerate() {
+                    if *b == 0 && !separator(w * 8 + k, out) {
+                        return false;
+                    }
+                }
+            }
+        }
+        let base = words.len() * 8;
+        for (k, b) in tail.iter().enumerate() {
+            if *b == 0 && !separator(base + k, out) {
+                return false;
+            }
+        }
+        out.push(&blob[start..]);
+        out.len() == n
+    }
+
+    /// Validate the frame, split the blob and run `body`. Returns the words written, -1 for a
+    /// malformed frame or panic and `-needed` when `out_cap` is too small.
+    ///
+    /// # Safety
+    ///
+    /// See the exported functions.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        fields: usize,
+        columns: usize,
+        words: usize,
+        trailer: usize,
+        body: Body,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(blob as usize, blob_len, out as usize, out_bytes)
+                || overlaps(twin as usize, twin_len, out as usize, out_bytes)
+                || overlaps(ints as usize, ints_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(blob), Some(twin), Some(ints)) = (
+                unsafe { bytes(blob, blob_len) },
+                unsafe { bytes(twin, twin_len) },
+                unsafe { bytes(ints, ints_len) },
+            ) else {
+                return -1;
+            };
+            if ints.len() != count * columns * 8 {
+                return -1;
+            }
+            if count == 0 {
+                return if blob.is_empty() && twin.is_empty() {
+                    0
+                } else {
+                    -1
+                };
+            }
+            let all: Vec<i64> = ints
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|w| i64::from_le_bytes(*w))
+                .collect();
+            let mut values: Vec<&[u8]> = Vec::with_capacity(count * fields);
+            if !split(blob, twin, count * fields, &mut values) {
+                return -1;
+            }
+            let need = count * words + trailer;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from every input.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            body(&values, &all, out);
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// One FNV-1a (32-bit) step over the folded halves of `v`, as PHP computes it.
+    #[inline(always)]
+    pub(crate) fn fnv(digest: i64, v: i64) -> i64 {
+        ((digest ^ ((v ^ (v >> 32)) & 0xFFFF_FFFF)) * 16_777_619) & 0xFFFF_FFFF
+    }
+
+    const FNV_BASIS: i64 = 2_166_136_261;
+
+    /// All of `s` as 1-9 ASCII digits.
+    #[inline(always)]
+    fn number9(s: &[u8]) -> Option<i64> {
+        if s.is_empty() || s.len() > 9 || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(s.iter().fold(0i64, |a, d| a * 10 + i64::from(d - b'0')))
+    }
+
+    #[inline(always)]
+    fn lower_hex(b: &u8) -> bool {
+        matches!(b, b'0'..=b'9' | b'a'..=b'f')
+    }
+
+    #[inline(always)]
+    fn utf8(s: &[u8]) -> bool {
+        s.is_ascii() || std::str::from_utf8(s).is_ok()
+    }
+
+    /// Decimal length of PHP `(string) $n`.
+    #[inline(always)]
+    pub(crate) fn dec_len(n: i64) -> i64 {
+        let mut v = n.unsigned_abs();
+        let mut len = i64::from(n < 0) + 1;
+        while v >= 10 {
+            v /= 10;
+            len += 1;
+        }
+        len
+    }
+
+    /// (start, length) of PHP `trim($s, '<>')`.
+    #[inline(always)]
+    fn brackets(s: &[u8]) -> (usize, usize) {
+        let lead = s.iter().take_while(|b| matches!(b, b'<' | b'>')).count();
+        if lead == s.len() {
+            return (lead, 0);
+        }
+        let trail = s
+            .iter()
+            .rev()
+            .take_while(|b| matches!(b, b'<' | b'>'))
+            .count();
+        (lead, s.len() - lead - trail)
+    }
+
+    /// Small-number bitmap with a hash-set fallback: true when `n` is new.
+    struct Seen {
+        small: [u64; 16],
+        large: HashSet<i64>,
+    }
+
+    impl Seen {
+        fn new() -> Self {
+            Self {
+                small: [0; 16],
+                large: HashSet::new(),
+            }
+        }
+
+        #[inline(always)]
+        fn insert(&mut self, n: i64) -> bool {
+            if (0..1024).contains(&n) {
+                let (word, bit) = ((n >> 6) as usize, 1u64 << (n & 63));
+                let fresh = self.small[word] & bit == 0;
+                self.small[word] |= bit;
+                fresh
+            } else {
+                self.large.insert(n)
+            }
+        }
+    }
+
+    // -- Lock names and holders ----------------------------------------------------------------
+
+    /// (kind, number): 1 `worker`, 2 `worker-N`, 3 `candidate-N`, 4
+    /// `publication-forwarder-<12 lowercase hex>-N`, 5 `gc`, `expiry` or `preparation`, else
+    /// (0, -1); N is 1-9 ASCII digits.
+    pub(crate) fn lock_kind(name: &[u8]) -> (i64, i64) {
+        match name {
+            b"worker" => return (1, -1),
+            b"gc" | b"expiry" | b"preparation" => return (5, -1),
+            _ => {}
+        }
+        let (kind, rest) = if let Some(rest) = name.strip_prefix(b"worker-") {
+            (2, rest)
+        } else if let Some(rest) = name.strip_prefix(b"candidate-") {
+            (3, rest)
+        } else if let Some(rest) = name.strip_prefix(b"publication-forwarder-")
+            && rest.len() > 13
+            && rest[..12].iter().all(lower_hex)
+            && rest[12] == b'-'
+        {
+            (4, &rest[13..])
+        } else {
+            return (0, -1);
+        };
+        number9(rest).map_or((0, -1), |n| (kind, n))
+    }
+
+    /// (class, pid, host length) of `host:pid`: 0 valid (1-253 bytes of `[A-Za-z0-9.-]`, then
+    /// 1-9 digits after the last ':'), 1 empty, 2 malformed (pid -1, length 0).
+    pub(crate) fn holder(s: &[u8]) -> (i64, i64, i64) {
+        if s.is_empty() {
+            return (1, -1, 0);
+        }
+        let Some(p) = s.iter().rposition(|b| *b == b':') else {
+            return (2, -1, 0);
+        };
+        if p == 0
+            || p > 253
+            || !s[..p]
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        {
+            return (2, -1, 0);
+        }
+        number9(&s[p + 1..]).map_or((2, -1, 0), |pid| (0, pid, p as i64))
+    }
+
+    /// 0 for 32 lowercase hex digits, 1 for a lowercase UUID, 2 empty, 3 other.
+    pub(crate) fn token_class(t: &[u8]) -> i64 {
+        match t.len() {
+            0 => 2,
+            32 if t.iter().all(lower_hex) => 0,
+            36 if t.iter().enumerate().all(|(i, b)| {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    *b == b'-'
+                } else {
+                    lower_hex(b)
+                }
+            }) =>
+            {
+                1
+            }
+            _ => 3,
+        }
+    }
+
+    #[inline(always)]
+    fn key_byte(b: &u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'-')
+    }
+
+    // -- VerificationLock ----------------------------------------------------------------------
+
+    /// Rows [codes, name number, holder pid, remaining ms, holder host length, name length];
+    /// trailer [keep, renew, reclaim, fenced, invalid, soonest held index, its remaining ms,
+    /// digest].
+    fn lock_row(values: &[&[u8]], ints: &[i64], out: &mut [i64]) {
+        let count = values.len() / 3;
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut summary = [0i64; 8];
+        summary[5] = -1;
+        let mut digest = FNV_BASIS;
+        for (i, slot) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let (name, owner, token) = (values[i], values[count + i], values[2 * count + i]);
+            let name_class = if name.is_empty() {
+                1
+            } else if name.len() > 191 {
+                2
+            } else if name.iter().all(key_byte) {
+                0
+            } else {
+                3
+            };
+            let (kind, number) = if name_class == 0 {
+                lock_kind(name)
+            } else {
+                (0, -1)
+            };
+            let (owner_class, pid, host_len) = holder(owner);
+            let token_class = token_class(token);
+            let acquired = col(ints, count, 0, i).clamp(0, TIME_MAX);
+            let expires = col(ints, count, 1, i).clamp(0, TIME_MAX);
+            let now = col(ints, count, 2, i).clamp(0, TIME_MAX);
+            let (held, current) = (col(ints, count, 3, i), col(ints, count, 4, i));
+            let lease = if expires == 0 {
+                0
+            } else if acquired > expires {
+                4
+            } else if expires <= now {
+                2
+            } else if (expires - now) * 3 < expires - acquired {
+                3
+            } else {
+                1
+            };
+            let holding = lease == 1 || lease == 3;
+            let remaining = if holding { expires - now } else { 0 };
+            let fence = if held == current {
+                0
+            } else if held < current {
+                1
+            } else {
+                2
+            };
+            let outcome = if name_class != 0
+                || owner_class != 0
+                || token_class >= 2
+                || lease == 4
+                || fence == 2
+            {
+                4
+            } else if fence == 1 {
+                3
+            } else if lease == 0 || lease == 2 {
+                2
+            } else if lease == 3 {
+                1
+            } else {
+                0
+            };
+            let codes = outcome
+                | name_class << 3
+                | kind << 5
+                | owner_class << 8
+                | token_class << 10
+                | lease << 12
+                | fence << 15;
+            *slot = [codes, number, pid, remaining, host_len, name.len() as i64];
+            summary[outcome as usize] += 1;
+            if holding && (summary[5] < 0 || remaining < summary[6]) {
+                summary[5] = i as i64;
+                summary[6] = remaining;
+            }
+            digest = fnv(digest, codes ^ (remaining << 18));
+        }
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- VerificationWorkerLocks ---------------------------------------------------------------
+
+    const KIND_SCORE: [i64; 6] = [0, 50, 100, 40, 60, 30];
+
+    /// Rows [flags, name number, holder pid, heartbeat age, first slot << 16 | last slot,
+    /// score]; trailer [slot locks, in range, stale, duplicate slots, forwarders, reclaimable,
+    /// total score].
+    fn worker_row(values: &[&[u8]], ints: &[i64], out: &mut [i64]) {
+        let count = values.len() / 2;
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut summary = [0i64; 7];
+        let mut seen = Seen::new();
+        for (i, slot) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let (kind, number) = lock_kind(values[i]);
+            let (holder_class, pid, _) = holder(values[count + i]);
+            let holder_ok = holder_class == 0;
+            let slots = col(ints, count, 0, i).clamp(1, 64);
+            let first = col(ints, count, 1, i).min(256 - slots).max(0) + 1;
+            let last = first + slots - 1;
+            let in_range = kind == 2 && number >= first && number <= last;
+            let heartbeat = col(ints, count, 2, i).clamp(0, TIME_MAX);
+            let now = col(ints, count, 3, i).clamp(0, TIME_MAX);
+            let stale = col(ints, count, 4, i).clamp(1, 1 << 32);
+            let (state, age) = if heartbeat == 0 {
+                (2, 0)
+            } else if heartbeat > now {
+                (3, 0)
+            } else {
+                let age = now - heartbeat;
+                (i64::from(age > stale), age)
+            };
+            let duplicate = kind == 2 && !seen.insert(number);
+            let mut score = if !holder_ok || kind == 0 {
+                0
+            } else if kind == 2 && !in_range {
+                20
+            } else {
+                KIND_SCORE[kind as usize]
+            };
+            score = match state {
+                0 => score,
+                1 => score - score.min((age - stale) / (stale / 10).max(1)),
+                2 => score / 2,
+                _ => (score - 10).max(0),
+            };
+            if duplicate {
+                score /= 4;
+            }
+            let reclaimable = state == 1 && kind != 0;
+            *slot = [
+                kind | state << 3
+                    | i64::from(in_range) << 5
+                    | i64::from(holder_ok) << 6
+                    | i64::from(duplicate) << 7
+                    | i64::from(reclaimable) << 8,
+                number,
+                pid,
+                age,
+                first << 16 | last,
+                score,
+            ];
+            summary[0] += i64::from(kind == 2);
+            summary[1] += i64::from(in_range);
+            summary[2] += i64::from(state == 1);
+            summary[3] += i64::from(duplicate);
+            summary[4] += i64::from(kind == 4);
+            summary[5] += i64::from(reclaimable);
+            summary[6] += score;
+        }
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- VerifiedArticle -----------------------------------------------------------------------
+
+    /// VerifiedArticle::framingRejectionPhp()'s filename rule.
+    pub(crate) fn safe_name(name: &[u8]) -> bool {
+        !name.is_empty()
+            && name.len() <= 200
+            && name[0] != b'.'
+            && name[0] != b'-'
+            && !name
+                .iter()
+                .any(|b| *b < 0x20 || *b == 0x7f || *b == b'/' || *b == b'\\')
+            && utf8(name)
+    }
+
+    /// 3-250 bytes, an '@' neither first nor last, no space, control byte or angle bracket.
+    pub(crate) fn message_id_ok(t: &[u8]) -> bool {
+        (3..=250).contains(&t.len())
+            && t.iter()
+                .position(|b| *b == b'@')
+                .is_some_and(|at| at > 0 && at < t.len() - 1)
+            && !t
+                .iter()
+                .any(|b| *b <= 0x20 || *b == 0x7f || *b == b'<' || *b == b'>')
+    }
+
+    /// 1-8 hex digits (any case) as their value, else -1.
+    pub(crate) fn crc_value(s: &[u8]) -> i64 {
+        if s.is_empty() || s.len() > 8 {
+            return -1;
+        }
+        let mut value = 0i64;
+        for b in s {
+            let digit = match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                b'A'..=b'F' => b - b'A' + 10,
+                _ => return -1,
+            };
+            value = value << 4 | i64::from(digit);
+        }
+        value
+    }
+
+    /// Rows [status, offset, part bytes, crc32 or -1, message-id span, flags]; trailer [valid,
+    /// rejected, bytes, distinct parts, highest part, declared total, complete, digest].
+    fn article_row(values: &[&[u8]], ints: &[i64], out: &mut [i64]) {
+        let count = values.len() / 3;
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut summary = [0i64; 8];
+        let mut digest = FNV_BASIS;
+        let mut seen = Seen::new();
+        let mut previous: Option<i64> = None;
+        let mut mismatch = false;
+        let dim = |v: i64| (1..=DIM_MAX).contains(&v);
+        for (i, slot) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let (name, id, crc) = (values[i], values[count + i], values[2 * count + i]);
+            let part = col(ints, count, 0, i);
+            let total = col(ints, count, 1, i);
+            let begin = col(ints, count, 2, i);
+            let end = col(ints, count, 3, i);
+            let size = col(ints, count, 4, i);
+            let dims = dim(part)
+                && dim(begin)
+                && dim(size)
+                && (total == 0 || dim(total))
+                && end >= begin
+                && end <= size;
+            let crc = crc_value(crc);
+            let (start, len) = brackets(id);
+            let status = if !safe_name(name) {
+                1
+            } else if !dims {
+                2
+            } else if total > 0 && part > total {
+                3
+            } else if crc < 0 {
+                4
+            } else if !message_id_ok(&id[start..start + len]) {
+                5
+            } else {
+                0
+            };
+            let part_bytes = if dims { end - begin + 1 } else { 0 };
+            let mut flags = i64::from(total > 0) << 3
+                | i64::from(total > 0 && part == total) << 4
+                | i64::from(dims && begin == 1 && end == size) << 5;
+            if status == 0 {
+                let duplicate = !seen.insert(part);
+                flags |= i64::from(previous.map_or(part == 1, |p| part == p + 1))
+                    | i64::from(duplicate) << 1
+                    | i64::from(previous.is_some_and(|p| part <= p)) << 2;
+                previous = Some(part);
+                summary[0] += 1;
+                summary[2] = summary[2].saturating_add(part_bytes);
+                summary[3] += i64::from(!duplicate);
+                summary[4] = summary[4].max(part);
+                if total > 0 {
+                    if summary[5] == 0 {
+                        summary[5] = total;
+                    } else if total != summary[5] {
+                        mismatch = true;
+                    }
+                }
+            } else {
+                summary[1] += 1;
+            }
+            *slot = [
+                status,
+                if dims { begin - 1 } else { -1 },
+                part_bytes,
+                crc,
+                span(start, len),
+                flags,
+            ];
+            digest = fnv(digest, (crc << 16) ^ (flags << 3) ^ status);
+        }
+        summary[6] = i64::from(
+            summary[5] > 0 && summary[3] == summary[5] && summary[4] <= summary[5] && !mismatch,
+        );
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- VerifiedNzbWriter ---------------------------------------------------------------------
+
+    /// Valid UTF-8 without the C0 controls XML 1.0 forbids (tab, LF and CR are allowed).
+    pub(crate) fn xml_ok(s: &[u8]) -> bool {
+        !s.iter()
+            .any(|b| *b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r'))
+            && utf8(s)
+    }
+
+    /// Escaped attribute length (`& < > "` and tab, LF, CR as character references).
+    pub(crate) fn attr_len(s: &[u8]) -> i64 {
+        s.iter().fold(s.len() as i64, |n, b| {
+            n + match b {
+                b'&' | b'\n' | b'\r' => 4,
+                b'<' | b'>' | b'\t' => 3,
+                b'"' => 5,
+                _ => 0,
+            }
+        })
+    }
+
+    /// Escaped text length (`& < >` and CR).
+    pub(crate) fn text_len(s: &[u8]) -> i64 {
+        s.iter().fold(s.len() as i64, |n, b| {
+            n + match b {
+                b'&' | b'\r' => 4,
+                b'<' | b'>' => 3,
+                _ => 0,
+            }
+        })
+    }
+
+    /// Rows [flags, file index, segment line length, escaped subject attribute length, escaped
+    /// message-id length, verified bytes]; trailer [segments, files, bytes, invalid, out of
+    /// order, document estimate, digest].
+    fn nzb_row(values: &[&[u8]], ints: &[i64], out: &mut [i64]) {
+        let count = values.len() / 2;
+        let (rows, trailer) = out.split_at_mut(count * 6);
+        let mut summary = [0i64; 7];
+        let mut digest = FNV_BASIS;
+        let mut previous_number = 0i64;
+        for (i, slot) in rows.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+            let (subject, id) = (values[i], values[count + i]);
+            let total = col(ints, count, 0, i);
+            let number = col(ints, count, 1, i);
+            let bytes = col(ints, count, 2, i);
+            let subject_ok = xml_ok(subject);
+            let subject_len = attr_len(subject);
+            let escaped_subject = subject_len + 5 + dec_len(total);
+            let (start, len) = brackets(id);
+            let trimmed = &id[start..start + len];
+            let id_ok = len > 0 && xml_ok(trimmed);
+            let escaped_id = text_len(trimmed);
+            let number_ok = (1..=1_000_000).contains(&number);
+            let bytes_ok = (1..=67_108_864).contains(&bytes);
+            let new_file =
+                i == 0 || subject != values[i - 1] || total != col(ints, count, 0, i - 1);
+            if new_file {
+                summary[1] += 1;
+                previous_number = 0;
+            }
+            let in_order = number_ok && number == previous_number + 1;
+            previous_number = if number_ok { number } else { -1 };
+            let ok = subject_ok && id_ok && number_ok && bytes_ok && total >= 1;
+            let line = 38 + dec_len(bytes) + dec_len(number) + escaped_id;
+            let flags = i64::from(subject_ok)
+                | i64::from(id_ok) << 1
+                | i64::from(subject_len != subject.len() as i64) << 2
+                | i64::from(escaped_id != len as i64) << 3
+                | i64::from(number_ok) << 4
+                | i64::from(bytes_ok) << 5
+                | i64::from(new_file) << 6
+                | i64::from(in_order) << 7
+                | i64::from(len != id.len()) << 8
+                | i64::from(ok) << 9;
+            *slot = [
+                flags,
+                summary[1] - 1,
+                line,
+                escaped_subject,
+                escaped_id,
+                if ok { bytes } else { 0 },
+            ];
+            summary[0] += i64::from(ok);
+            if ok {
+                summary[2] += bytes;
+            }
+            summary[3] += i64::from(!ok);
+            summary[4] += i64::from(ok && !in_order);
+            summary[5] += line + if new_file { escaped_subject + 64 } else { 0 };
+            digest = fnv(digest, flags ^ (line << 10));
+        }
+        summary[6] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    // -- VerifiedReleasePublisher --------------------------------------------------------------
+
+    /// Rows [outcome, guard bits, category class | size class << 2, completion basis points,
+    /// name flags, name length, score]; trailer [publish, guard failed, incomplete, size
+    /// rejected, category rejected, name rejected, publishable bytes, digest].
+    fn publication_row(values: &[&[u8]], ints: &[i64], out: &mut [i64]) {
+        let count = values.len() / 7;
+        let (rows, trailer) = out.split_at_mut(count * 7);
+        let mut summary = [0i64; 8];
+        let mut digest = FNV_BASIS;
+        let v = |f: usize, i: usize| values[f * count + i];
+        for (i, slot) in rows.as_chunks_mut::<7>().0.iter_mut().enumerate() {
+            let name = v(0, i);
+            let lease = v(5, i);
+            let c = |k: usize| col(ints, count, k, i);
+            let guard = i64::from(c(0) == c(1))
+                | i64::from(v(1, i) == v(2, i)) << 1
+                | i64::from(v(3, i) == v(4, i)) << 2
+                | i64::from(!lease.is_empty()) << 3
+                | i64::from(!lease.is_empty() && lease >= v(6, i)) << 4;
+            let valid_utf8 = utf8(name);
+            let control = name.iter().any(|b| *b < 0x20 || *b == 0x7f);
+            let blank = name.iter().all(|b| *b == b' ');
+            let name_ok = name.len() <= 255 && valid_utf8 && !control && !blank;
+            let obfuscated =
+                matches!(name.len(), 16 | 32 | 40 | 64) && name.iter().all(u8::is_ascii_hexdigit);
+            let name_flags = i64::from(name_ok)
+                | i64::from(obfuscated) << 1
+                | i64::from(!valid_utf8) << 2
+                | i64::from(control) << 3
+                | i64::from(blank) << 4;
+            let category = c(2);
+            let category_class = if category == 10 || category == 20 {
+                2
+            } else if (1000..=9999).contains(&category) {
+                match category % 1000 {
+                    0 => 1,
+                    999 => 2,
+                    _ => 0,
+                }
+            } else {
+                3
+            };
+            let (size, min, max) = (c(3), c(4), c(5));
+            let size_class = if size < 1 {
+                3
+            } else if size < min {
+                1
+            } else if max > 0 && size > max {
+                2
+            } else {
+                0
+            };
+            let found = c(6).clamp(0, 1 << 40);
+            let expected = c(7).clamp(0, 1 << 40);
+            let basis = if expected == 0 {
+                0
+            } else {
+                (found * 10_000 / expected).min(10_000)
+            };
+            let complete = expected > 0 && basis >= c(8).clamp(0, 10_000);
+            let outcome = if guard != 31 {
+                1
+            } else if !name_ok {
+                5
+            } else if category_class == 1 || category_class == 3 {
+                4
+            } else if size_class != 0 {
+                3
+            } else if !complete {
+                2
+            } else {
+                0
+            };
+            let score = if outcome == 0 {
+                basis / 100
+                    + if obfuscated { 0 } else { 50 }
+                    + if category_class == 0 { 25 } else { 10 }
+            } else {
+                0
+            };
+            *slot = [
+                outcome,
+                guard,
+                category_class | size_class << 2,
+                basis,
+                name_flags,
+                name.len() as i64,
+                score,
+            ];
+            summary[outcome as usize] += 1;
+            if outcome == 0 {
+                summary[6] = summary[6].saturating_add(size);
+            }
+            digest = fnv(digest, outcome | guard << 3 | basis << 8 | name_flags << 22);
+        }
+        summary[7] = digest;
+        trailer.copy_from_slice(&summary);
+    }
+
+    macro_rules! export594 {
+        ($name:ident, $fields:literal, $columns:literal, $words:literal, $trailer:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `blob` must point to `blob_len` readable bytes (`count * fields` NUL-joined
+            /// values, field-major), `twin` to `twin_len` readable bytes (empty, or the same
+            /// values joined by 0x01), `ints` to `ints_len` readable bytes (`columns` columns
+            /// of `count` packed little-endian int64 words) and `out` to `out_cap` writable,
+            /// aligned int64 words that overlap no input; null pointers are accepted only with
+            /// zero lengths. Bad shapes return -1 before writing, a short output returns
+            /// `-needed` without writing and panics map to -1.
+            #[unsafe(no_mangle)]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                twin: *const u8,
+                twin_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                const BODY: Body = $body;
+                unsafe {
+                    run(
+                        blob, blob_len, twin, twin_len, ints, ints_len, count, out, out_cap,
+                        $fields, $columns, $words, $trailer, BODY,
+                    )
+                }
+            }
+        };
+    }
+
+    export594!(nntmux_w594_lock_state_row_batch, 3, 5, 6, 8, lock_row);
+    export594!(nntmux_w594_worker_lock_row_batch, 2, 5, 6, 7, worker_row);
+    export594!(
+        nntmux_w594_verified_article_row_batch,
+        3,
+        5,
+        6,
+        8,
+        article_row
+    );
+    export594!(nntmux_w594_nzb_writer_row_batch, 2, 3, 6, 7, nzb_row);
+    export594!(
+        nntmux_w594_publication_row_batch,
+        7,
+        9,
+        7,
+        8,
+        publication_row
+    );
+}
+
+#[cfg(test)]
+mod w594_tests {
+    use super::w574_batch::span;
+    use super::w594_batch::*;
+
+    type Export = unsafe extern "C" fn(
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        *const u8,
+        usize,
+        usize,
+        *mut i64,
+        usize,
+    ) -> isize;
+
+    fn join(fields: &[&[&[u8]]], separator: u8) -> Vec<u8> {
+        let mut blob = Vec::new();
+        for (i, value) in fields.iter().flat_map(|f| f.iter()).enumerate() {
+            if i > 0 {
+                blob.push(separator);
+            }
+            blob.extend_from_slice(value);
+        }
+        blob
+    }
+
+    /// Field-major frame: NUL-joined values (with a 0x01 twin when one holds a NUL), then the
+    /// int columns.
+    fn call(export: Export, fields: &[&[&[u8]]], columns: &[&[i64]], out: &mut [i64]) -> isize {
+        let count = fields.first().map_or(columns[0].len(), |f| f.len());
+        let blob = join(fields, 0);
+        let nul = fields.iter().flat_map(|f| f.iter()).any(|v| v.contains(&0));
+        let twin = if nul { join(fields, 1) } else { Vec::new() };
+        let ints: Vec<u8> = columns
+            .iter()
+            .flat_map(|c| c.iter())
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        unsafe {
+            export(
+                blob.as_ptr(),
+                blob.len(),
+                twin.as_ptr(),
+                twin.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn w594_split_and_frame() {
+        let mut out = Vec::new();
+        assert!(split(b"a\0\0b", b"", 3, &mut out));
+        assert_eq!(out, [&b"a"[..], b"", b"b"]);
+        out.clear();
+        assert!(split(b"a\0\0b", b"a\x01\0b", 2, &mut out));
+        assert_eq!(out, [&b"a"[..], b"\0b"]);
+        out.clear();
+        assert!(!split(b"a\0b", b"", 3, &mut out));
+        out.clear();
+        assert!(!split(b"a\0b\0c", b"", 2, &mut out));
+        out.clear();
+        assert!(!split(b"a\0b", b"a\x01", 2, &mut out));
+        let mut rows = vec![0i64; 6 + 8];
+        let ints = [0u8; 5 * 8];
+        let blob = b"gc\0h:1";
+        // Two values for a three-field record, then a short output buffer.
+        let shape = unsafe {
+            nntmux_w594_lock_state_row_batch(
+                blob.as_ptr(),
+                blob.len(),
+                std::ptr::null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                1,
+                rows.as_mut_ptr(),
+                rows.len(),
+            )
+        };
+        assert_eq!(shape, -1);
+        let blob = b"gc\0h:1\0";
+        let short = unsafe {
+            nntmux_w594_lock_state_row_batch(
+                blob.as_ptr(),
+                blob.len(),
+                std::ptr::null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                1,
+                rows.as_mut_ptr(),
+                4,
+            )
+        };
+        assert_eq!(short, -14);
+        let empty = unsafe {
+            nntmux_w594_lock_state_row_batch(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                rows.as_mut_ptr(),
+                rows.len(),
+            )
+        };
+        assert_eq!(empty, 0);
+    }
+
+    #[test]
+    fn w594_name_holder_token_helpers() {
+        assert_eq!(lock_kind(b"worker"), (1, -1));
+        assert_eq!(lock_kind(b"worker-12"), (2, 12));
+        assert_eq!(lock_kind(b"worker-"), (0, -1));
+        assert_eq!(lock_kind(b"worker-1234567890"), (0, -1));
+        assert_eq!(lock_kind(b"candidate-007"), (3, 7));
+        assert_eq!(lock_kind(b"publication-forwarder-0123456789ab-3"), (4, 3));
+        assert_eq!(lock_kind(b"publication-forwarder-0123456789AB-3"), (0, -1));
+        assert_eq!(lock_kind(b"publication-forwarder-0123456789ab-"), (0, -1));
+        assert_eq!(lock_kind(b"expiry"), (5, -1));
+        assert_eq!(holder(b"host-1.lan:4242"), (0, 4242, 10));
+        assert_eq!(holder(b"a:b:12"), (2, -1, 0));
+        assert_eq!(holder(b""), (1, -1, 0));
+        assert_eq!(holder(b":12"), (2, -1, 0));
+        assert_eq!(token_class(&[b'a'; 32]), 0);
+        assert_eq!(token_class(b"0123abcd-0123-4567-89ab-0123456789ab"), 1);
+        assert_eq!(token_class(b"0123abcd-0123-4567-89ab-0123456789AB"), 3);
+        assert_eq!(token_class(b""), 2);
+        assert_eq!(dec_len(0), 1);
+        assert_eq!(dec_len(-7), 2);
+        assert_eq!(dec_len(i64::MIN), 20);
+        assert_eq!(dec_len(i64::MAX), 19);
+        assert_eq!(crc_value(b"DEADbeef"), 0xdead_beef);
+        assert_eq!(crc_value(b"123456789"), -1);
+        assert!(message_id_ok(b"part1@example"));
+        assert!(!message_id_ok(b"@example"));
+        assert!(!message_id_ok(b"part 1@example"));
+        assert!(safe_name("é.bin".as_bytes()));
+        assert!(!safe_name(b"a/b"));
+        assert!(!safe_name(b"\xc3"));
+        assert_eq!(attr_len(b"a&\"\t"), 1 + 5 + 6 + 4);
+        assert_eq!(text_len(b"<a>\r"), 4 + 1 + 4 + 5);
+        assert!(xml_ok(b"a\tb") && !xml_ok(b"a\x01b") && xml_ok(b"\x7f"));
+        assert_eq!(
+            fnv(2_166_136_261, 0),
+            (2_166_136_261i64 * 16_777_619) & 0xFFFF_FFFF
+        );
+    }
+
+    #[test]
+    fn w594_lock_and_worker_rows() {
+        let token = [b'f'; 32];
+        let mut out = vec![0i64; 2 * 6 + 8];
+        assert_eq!(
+            call(
+                nntmux_w594_lock_state_row_batch,
+                &[
+                    &[b"worker-3", b"bad name"],
+                    &[b"h:1", b"h:1"],
+                    &[&token, &token]
+                ],
+                &[&[1000, 0], &[2000, 5], &[1900, 0], &[4, 4], &[4, 4]],
+                &mut out
+            ),
+            20
+        );
+        // (2000 - 1900) * 3 < 1000: renew; the second row has an invalid name but holds 5 ms.
+        assert_eq!(&out[..6], &[1 | 2 << 5 | 3 << 12, 3, 1, 100, 1, 8]);
+        assert_eq!(out[6] & 7, 4);
+        assert_eq!(&out[12..19], &[0, 1, 0, 0, 1, 1, 5]);
+
+        let mut out = vec![0i64; 2 * 6 + 7];
+        assert_eq!(
+            call(
+                nntmux_w594_worker_lock_row_batch,
+                &[&[b"worker-1", b"worker-1"], &[b"h:9", b"h:9"]],
+                &[&[2, 2], &[0, 0], &[100, 100], &[150, 1000], &[60, 60]],
+                &mut out
+            ),
+            19
+        );
+        assert_eq!(
+            &out[..6],
+            &[2 | 1 << 5 | 1 << 6, 1, 9, 50, 1 << 16 | 2, 100]
+        );
+        // Stale by 840 ms with a 6 ms step and duplicated: (100 - 100) / 4.
+        assert_eq!(out[6], 2 | 1 << 3 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 8);
+        assert_eq!(out[11], 0);
+        assert_eq!(&out[12..], &[2, 2, 1, 1, 0, 1, 100]);
+    }
+
+    #[test]
+    fn w594_article_nzb_and_publication_rows() {
+        let mut out = vec![0i64; 2 * 6 + 8];
+        assert_eq!(
+            call(
+                nntmux_w594_verified_article_row_batch,
+                &[
+                    &[b"a.bin", b"a.bin"],
+                    &[b"<p1@x>", b"<p2@x>"],
+                    &[b"ABC", b"1"]
+                ],
+                &[&[1, 2], &[2, 2], &[1, 11], &[10, 20], &[20, 20]],
+                &mut out
+            ),
+            20
+        );
+        assert_eq!(&out[..6], &[0, 0, 10, 0xabc, span(1, 4), 1 | 8]);
+        assert_eq!(&out[6..12], &[0, 10, 10, 1, span(1, 4), 1 | 8 | 16]);
+        assert_eq!(&out[12..19], &[2, 0, 20, 2, 2, 2, 1]);
+
+        let mut out = vec![0i64; 2 * 6 + 7];
+        assert_eq!(
+            call(
+                nntmux_w594_nzb_writer_row_batch,
+                &[&[b"s&t", b"s&t"], &[b"<a@b>", b"c@d"]],
+                &[&[2, 2], &[1, 3], &[500, 700]],
+                &mut out
+            ),
+            19
+        );
+        assert_eq!(
+            &out[..6],
+            &[
+                1 | 2 | 4 | 16 | 32 | 64 | 128 | 256 | 512,
+                0,
+                45,
+                13,
+                3,
+                500
+            ]
+        );
+        assert_eq!(out[6], 1 | 2 | 4 | 16 | 32 | 512);
+        assert_eq!(&out[12..18], &[2, 1, 1200, 0, 1, 45 + 13 + 64 + 45]);
+
+        let mut out = vec![0i64; 7 + 8];
+        let lease: &[u8] = b"2026-10-26 04:00:00";
+        let now: &[u8] = b"2026-10-26 03:00:00";
+        assert_eq!(
+            call(
+                nntmux_w594_publication_row_batch,
+                &[
+                    &[b"Some.Release"],
+                    &[b"h"],
+                    &[b"h"],
+                    &[b"t"],
+                    &[b"t"],
+                    &[lease],
+                    &[now]
+                ],
+                &[
+                    &[3],
+                    &[3],
+                    &[2040],
+                    &[100],
+                    &[1],
+                    &[0],
+                    &[9],
+                    &[10],
+                    &[9000]
+                ],
+                &mut out
+            ),
+            15
+        );
+        assert_eq!(&out[..7], &[0, 31, 0, 9000, 1, 12, 90 + 50 + 25]);
+        assert_eq!(&out[7..14], &[1, 0, 0, 0, 0, 0, 100]);
+    }
+}
