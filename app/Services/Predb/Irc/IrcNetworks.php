@@ -6,6 +6,7 @@ namespace App\Services\Predb\Irc;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use InvalidArgumentException;
 use Throwable;
 
@@ -758,5 +759,324 @@ final class IrcNetworks
             1 | ($tls ? 2 : 0) | $kind << 2 | $port << 8 | min($valid, 255) << 24 | min($invalid, 255) << 32,
             crc32(strtolower($host).':'.$port),
         ];
+    }
+
+    // ========================================================================
+    // WAVE 61.3 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 5.67x, p99 5.14x; uncommon mean 7.23x, p99 5.43x); see RustPredbFeedEntryImporterSourceFactoryIrcNetworksParserW61ParityTest. */
+    public const bool W61_RUST_FFI_DEFAULT = true;
+
+    public const string W61_IRC_NETWORKS_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w613_irc_networks_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of the Wave 61.3 batch. */
+    public const int W61_IRC_NETWORKS_TRAILER = 34;
+
+    /** Bot formats a network may name; positions plus one are the w61NetworkPlanBatch() format codes. */
+    public const array W61_FORMATS = ['corruptnet', 'zenet', 'predatabase', 'ngp', 'rizon', 'opentrackers', 'nntmux'];
+
+    private const string W61_NAME_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789_-';
+
+    private const string W61_LABEL_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-';
+
+    public static function usesW61RustFfi(): bool
+    {
+        $override = self::w61RustFfiState();
+
+        return \is_bool($override) ? $override : self::W61_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the IrcNetworks Wave 61 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW61RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w61RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w61RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 61.3 network plans. Each item is `name|host|port|tls|channels|format`, every field trimmed. Per item
+     * `nameState | legacy << 2 | duplicate << 3 | hostKind << 4 | portState << 6 | port << 8 | tlsState << 24 |
+     * tls << 26 | format << 27 | route << 31 | min(validChannels, 255) << 34 | min(invalidChannels, 255) << 42 |
+     * min(hostLength, 255) << 50`: the name is 0 empty, 1 up to 32 `[a-z0-9_-]` bytes after lower-casing (legacy
+     * when it is LEGACY, duplicate when an earlier valid name matched) or 2 invalid; the host is 0 empty, 1 a
+     * hostname, 2 a dotted IPv4 address (no leading zeros) or 3 invalid; tls is a boolean token (w61Flag()) and a
+     * `+` port prefix forces it; the port is 0 empty (6697 with TLS, else 6667), 1 a 1-5 digit port in 1-65535 or
+     * 2 malformed (0); channels are comma-separated, trimmed, and valid when they start with `#` or `&`, hold 2-50
+     * bytes and no blank, BEL, CR or LF; the format is 0 empty, 1-7 a W61_FORMATS entry or 8 unknown. The route
+     * is 0 unroutable (invalid name, host or port), 1 idle (no valid channel), 2 the legacy bot (LEGACY or
+     * nntmux), 3 the relay bot (opentrackers), 4 a scene pre bot and 5 an unknown format. Then the name, host,
+     * port, TLS, format and route counts, the TLS networks, the valid and invalid channel sums, the duplicates,
+     * the distinct valid hosts (case-insensitive) and the legacy count.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61NetworkPlanBatch(array $items): array
+    {
+        return self::usesW61RustFfi() ? self::w61NetworkPlanBatchNative($items) : self::w61NetworkPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61NetworkPlanBatchNative(array $items): array
+    {
+        return self::w61Invoke($items, \count($items) + self::W61_IRC_NETWORKS_TRAILER) ?? self::w61NetworkPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w61NetworkPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $nameStates = $portStates = $tlsStates = [0, 0, 0];
+        $hostKinds = [0, 0, 0, 0];
+        $formats = array_fill(0, 9, 0);
+        $routes = [0, 0, 0, 0, 0, 0];
+        $tlsOn = $validSum = $invalidSum = $duplicates = $legacySum = 0;
+        $names = $hosts = [];
+        foreach ($items as $item) {
+            [$rawName, $rawHost, $rawPort, $rawTls, $rawChannels, $rawFormat] = explode('|', (string) $item, 6) + ['', '', '', '', '', ''];
+            $name = strtolower(trim($rawName));
+            $nameLength = \strlen($name);
+            $nameState = $nameLength === 0 ? 0 : ($nameLength <= 32 && strspn($name, self::W61_NAME_CHARS) === $nameLength ? 1 : 2);
+            $legacy = $name === self::LEGACY ? 1 : 0;
+            $duplicate = 0;
+            if ($nameState === 1) {
+                if (isset($names[$name])) {
+                    $duplicate = 1;
+                } else {
+                    $names[$name] = true;
+                }
+            }
+            $host = trim($rawHost);
+            $kind = self::w61HostKind($host);
+            [$tlsState, $tls] = match (strtolower(trim($rawTls))) {
+                '' => [0, 0],
+                '1', 'true', 'yes', 'on' => [1, 1],
+                '0', 'false', 'no', 'off' => [1, 0],
+                default => [2, 0],
+            };
+            $portText = trim($rawPort);
+            $plus = $portText !== '' && $portText[0] === '+';
+            if ($plus) {
+                $tls = 1;
+                $portText = substr($portText, 1);
+            }
+            $portLength = \strlen($portText);
+            if ($portLength === 0 && ! $plus) {
+                $portState = 0;
+                $port = $tls === 1 ? 6697 : 6667;
+            } else {
+                $port = $portLength >= 1 && $portLength <= 5 && strspn($portText, '0123456789') === $portLength ? (int) $portText : 0;
+                $portState = $port >= 1 && $port <= 65535 ? 1 : 2;
+                if ($portState === 2) {
+                    $port = 0;
+                }
+            }
+            $valid = $invalid = 0;
+            $channels = trim($rawChannels);
+            if ($channels !== '') {
+                foreach (explode(',', $channels) as $channel) {
+                    $channel = trim($channel);
+                    $channelLength = \strlen($channel);
+                    if ($channelLength === 0) {
+                        continue;
+                    }
+                    if (($channel[0] === '#' || $channel[0] === '&') && $channelLength >= 2 && $channelLength <= 50 && strcspn($channel, " \x07\r\n\t") === $channelLength) {
+                        $valid++;
+                    } else {
+                        $invalid++;
+                    }
+                }
+            }
+            $formatName = strtolower(trim($rawFormat));
+            $position = $formatName === '' ? false : array_search($formatName, self::W61_FORMATS, true);
+            $format = $formatName === '' ? 0 : ($position === false ? 8 : $position + 1);
+            $route = match (true) {
+                $nameState !== 1 || ($kind !== 1 && $kind !== 2) || $portState === 2 => 0,
+                $valid === 0 => 1,
+                $legacy === 1 || $format === 7 => 2,
+                $format === 6 => 3,
+                $format >= 1 && $format <= 5 => 4,
+                default => 5,
+            };
+            if ($kind === 1 || $kind === 2) {
+                $hosts[strtolower($host)] = true;
+            }
+            $nameStates[$nameState]++;
+            $hostKinds[$kind]++;
+            $portStates[$portState]++;
+            $tlsStates[$tlsState]++;
+            $formats[$format]++;
+            $routes[$route]++;
+            $tlsOn += $tls;
+            $validSum += $valid;
+            $invalidSum += $invalid;
+            $duplicates += $duplicate;
+            $legacySum += $legacy;
+            $out[] = $nameState | $legacy << 2 | $duplicate << 3 | $kind << 4 | $portState << 6 | $port << 8 | $tlsState << 24 | $tls << 26
+                | $format << 27 | $route << 31 | min($valid, 255) << 34 | min($invalid, 255) << 42 | min(\strlen($host), 255) << 50;
+        }
+        array_push($out, ...$nameStates, ...$hostKinds, ...$portStates, ...$tlsStates, ...$formats, ...$routes);
+        array_push($out, $tlsOn, $validSum, $invalidSum, $duplicates, \count($hosts), $legacySum);
+
+        return $out;
+    }
+
+    /**
+     * 0 empty, 1 hostname (labels of 1-63 alphanumerics and inner hyphens, at most 253 bytes), 2 dotted IPv4, 3 invalid.
+     */
+    private static function w61HostKind(string $host): int
+    {
+        $length = \strlen($host);
+        if ($length === 0) {
+            return 0;
+        }
+        if (strspn($host, '0123456789.') === $length) {
+            $parts = explode('.', $host);
+            if (\count($parts) !== 4) {
+                return 3;
+            }
+            foreach ($parts as $part) {
+                $partLength = \strlen($part);
+                if ($partLength === 0 || $partLength > 3 || ($partLength > 1 && $part[0] === '0') || (int) $part > 255) {
+                    return 3;
+                }
+            }
+
+            return 2;
+        }
+        if ($length > 253) {
+            return 3;
+        }
+        foreach (explode('.', $host) as $label) {
+            $labelLength = \strlen($label);
+            if ($labelLength === 0 || $labelLength > 63 || $label[0] === '-' || $label[-1] === '-' || strspn($label, self::W61_LABEL_CHARS) !== $labelLength) {
+                return 3;
+            }
+        }
+
+        return 1;
+    }
+
+    /**
+     * Wave 61 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
+     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
+     */
+    private static function w61RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('predb_w613', self::W61_IRC_NETWORKS_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w61RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 61.3 IrcNetworks export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w61Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w61RustFfiState('ffi');
+            $out = self::w61RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w61RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W61_IRC_NETWORKS_FFI_CDEF.)
+            $written = $ffi->nntmux_w613_irc_networks_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
