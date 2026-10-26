@@ -994,4 +994,331 @@ final class AdditionalCandidateQuery
 
         return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
     }
+
+    // ========================================================================
+    // WAVE 64.1 BATCH HELPER
+    // ========================================================================
+
+    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 5.35x, p99 4.76x; uncommon mean 4.69x, p99 2.80x); see RustAdditionalQueryDiagnosticsOrchestratorPlannerExtractionW64ParityTest. */
+    public const bool W64_RUST_FFI_DEFAULT = true;
+
+    public const string W64_CANDIDATE_QUERY_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w641_candidate_query_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Trailer words after the per-item words of w64CandidateQueryPlanBatch(). */
+    public const int W64_CANDIDATE_QUERY_TRAILER = 44;
+
+    public static function usesW64RustFfi(): bool
+    {
+        $override = self::w64RustFfiState();
+
+        return \is_bool($override) ? $override : self::W64_RUST_FFI_DEFAULT;
+    }
+
+    /** Forces the AdditionalCandidateQuery Wave 64 Rust path on until reset. */
+    public static function enableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', true);
+    }
+
+    /** Forces the AdditionalCandidateQuery Wave 64 PHP path until reset. */
+    public static function disableW64RustFfi(): void
+    {
+        self::w64RustFfiState('set', false);
+    }
+
+    /** Restores the benchmark default and drops the cached library handle and scratch buffers; earlier toggles are untouched. */
+    public static function resetW64RustFfi(): void
+    {
+        self::w64RustFfiState('reset');
+    }
+
+    /**
+     * Runs $callback with the AdditionalCandidateQuery Wave 64 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW64RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w64RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w64RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 64.1 candidate query plans, one per release row `size|passwordstatus|haspreview|nzbstatus|disablepreview|retry|claim_age|guid|attempts`
+     * (trimmed fields). Size, disablepreview, claim age and attempts are 1-15 digits; the three statuses and the seconds
+     * until the archive retry is due are optionally signed. The reason mirrors applyPredicates() with the default size
+     * bounds, a 300-second claim TTL and three attempts: 0 eligible, 1 passwordstatus other than -1 or 0, 2 haspreview
+     * not -1, 3 nzbstatus not 1, 4 category previews disabled, 5 archive retry not due, 6 at or below the minimum size,
+     * 7 at or above the maximum size, 8 actively claimed, 9 attempts exhausted, 10 malformed (an empty size or status,
+     * or a bad number), 11 empty row. Bucket: the lowercased first GUID byte `0-9a-f` as 0-15, else 16. Priority of an
+     * eligible row: 3 under 100 MiB, 2 under 4 GiB, else 1. Flags: 1 40-hex GUID, 2 unchecked password (0), 4 stale
+     * claim, 8 retry due, 16 non-ASCII, 32 uppercase GUID, 64 GUID repeated in the batch, 128 control byte. Per item
+     * `reason | bucket << 4 | flags << 9 | priority << 17 | min(attempts, 15) << 19 | bitLength(size) << 23 |
+     * (fnv1a32(lowercase GUID) & 0xFFFF) << 29 | min(eligibleRank, 1023) << 45`; then 12 reason counts, 17 eligible
+     * bucket counts, 8 flag counts, 3 priority counts, the eligible size sum and maximum, the distinct GUIDs and the
+     * attempt sum.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64CandidateQueryPlanBatch(array $items): array
+    {
+        return self::usesW64RustFfi() ? self::w64CandidateQueryPlanBatchNative($items) : self::w64CandidateQueryPlanBatchPhp($items);
+    }
+
+    /**
+     * Rust plan; falls back to the PHP reference when the library is missing or the call declines.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64CandidateQueryPlanBatchNative(array $items): array
+    {
+        return self::w64Invoke($items, \count($items) + self::W64_CANDIDATE_QUERY_TRAILER) ?? self::w64CandidateQueryPlanBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, string>  $items
+     * @return list<int>
+     */
+    public static function w64CandidateQueryPlanBatchPhp(array $items): array
+    {
+        $out = [];
+        $tail = array_fill(0, self::W64_CANDIDATE_QUERY_TRAILER, 0);
+        $guids = [];
+        $eligibleRank = 0;
+        foreach ($items as $item) {
+            $item = (string) $item;
+            [$rawSize, $rawPassword, $rawPreview, $rawNzb, $rawCategory, $rawRetry, $rawClaim, $rawGuid, $rawAttempts] = explode('|', $item, 9)
+                + ['', '', '', '', '', '', '', '', ''];
+            $size = self::w64Uint($rawSize, -1);
+            $password = self::w64Sint(trim($rawPassword));
+            $preview = self::w64Sint(trim($rawPreview));
+            $nzb = self::w64Sint(trim($rawNzb));
+            $category = self::w64Uint($rawCategory, 0);
+            $retryRaw = trim($rawRetry);
+            $retry = $retryRaw === '' ? null : self::w64Sint($retryRaw);
+            $claim = self::w64Uint($rawClaim, -2);
+            $attempts = self::w64Uint($rawAttempts, 0);
+            $guid = trim($rawGuid);
+            $guidLength = \strlen($guid);
+            $lower = strtolower($guid);
+            $bucket = $lower === '' ? 16 : (self::W64_HEX_BUCKETS[$lower[0]] ?? 16);
+            $reason = match (true) {
+                trim($item) === '' => 11,
+                $size < 0 || $password === null || $preview === null || $nzb === null || $category < 0 || ($retryRaw !== '' && $retry === null)
+                    || $claim === -1 || $attempts < 0 => 10,
+                $password !== -1 && $password !== 0 => 1,
+                $preview !== -1 => 2,
+                $nzb !== 1 => 3,
+                $category !== 0 => 4,
+                $retry !== null && $retry > 0 => 5,
+                $size <= self::DEFAULT_MIN_SIZE_BYTES => 6,
+                $size >= self::DEFAULT_MAX_SIZE_BYTES => 7,
+                $attempts >= 3 => 9,
+                $claim >= 0 && $claim < 300 => 8,
+                default => 0,
+            };
+            $flags = ($guidLength === 40 && strspn($guid, '0123456789abcdefABCDEF') === 40 ? 1 : 0) | ($password === 0 ? 2 : 0)
+                | ($claim >= 300 ? 4 : 0) | ($retry !== null && $retry <= 0 ? 8 : 0) | (preg_match('/[\x80-\xff]/', $item) === 1 ? 16 : 0)
+                | (strcspn($guid, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') !== $guidLength ? 32 : 0)
+                | (strcspn($item, self::W64_CONTROL_BYTES) !== \strlen($item) ? 128 : 0);
+            if ($lower !== '') {
+                if (isset($guids[$lower])) {
+                    $flags |= 64;
+                } else {
+                    $guids[$lower] = true;
+                }
+            }
+            $eligible = $reason === 0;
+            $priority = match (true) {
+                ! $eligible => 0,
+                $size < 104857600 => 3,
+                $size < 4294967296 => 2,
+                default => 1,
+            };
+            $rank = $eligible ? ++$eligibleRank : 0;
+            $tail[$reason]++;
+            if ($eligible) {
+                $tail[12 + $bucket]++;
+                $tail[40] += min($size, 1 << 40);
+                $tail[41] = max($tail[41], $size);
+            }
+            for ($b = 0; $b < 8; $b++) {
+                $tail[29 + $b] += $flags >> $b & 1;
+            }
+            if ($priority > 0) {
+                $tail[36 + $priority]++;
+            }
+            $tail[43] += max(0, $attempts);
+            $out[] = $reason | $bucket << 4 | $flags << 9 | $priority << 17 | max(0, min($attempts, 15)) << 19 | self::w64BitLength($size) << 23
+                | ((int) hexdec(hash('fnv1a32', $lower)) & 0xFFFF) << 29 | min($rank, 1023) << 45;
+        }
+        $tail[42] = \count($guids);
+        array_push($out, ...$tail);
+
+        return $out;
+    }
+
+    /** @var array<int|string, int> */
+    private const array W64_HEX_BUCKETS = ['0' => 0, '1' => 1, '2' => 2, '3' => 3, '4' => 4, '5' => 5, '6' => 6, '7' => 7, '8' => 8, '9' => 9,
+        'a' => 10, 'b' => 11, 'c' => 12, 'd' => 13, 'e' => 14, 'f' => 15];
+
+    private const string W64_CONTROL_BYTES = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F";
+
+    private const string W64_DIGITS = '0123456789';
+
+    /** A trimmed field of 1-15 digits; empty is $empty, anything else -1. */
+    private static function w64Uint(string $raw, int $empty): int
+    {
+        $value = trim($raw);
+        if ($value === '') {
+            return $empty;
+        }
+        $length = \strlen($value);
+
+        return $length <= 15 && strspn($value, self::W64_DIGITS) === $length ? (int) $value : -1;
+    }
+
+    /** An optional `-` and 1-15 digits of an already trimmed field, else null. */
+    private static function w64Sint(string $value): ?int
+    {
+        $negative = str_starts_with($value, '-');
+        $digits = $negative ? substr($value, 1) : $value;
+        $length = \strlen($digits);
+        if ($length === 0 || $length > 15 || strspn($digits, self::W64_DIGITS) !== $length) {
+            return null;
+        }
+
+        return $negative ? -(int) $digits : (int) $digits;
+    }
+
+    private static function w64BitLength(int $value): int
+    {
+        $bits = 0;
+        for (; $value > 0; $value >>= 1) {
+            $bits++;
+        }
+
+        return $bits;
+    }
+
+    /**
+     * Wave 64 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'reset' clears the override, library handle and buffers, 'ffi'
+     * resolves the library (null when unavailable) and 'out' and 'lens' return `int64_t` output and
+     * length-column buffers of at least $val words.
+     */
+    private static function w64RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+        /** @var CData|null $lens */
+        static $lens = null;
+        /** @var int $lensCap */
+        static $lensCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'reset') {
+            $override = $ffi = $out = $lens = null;
+            $outCap = $lensCap = 0;
+
+            return null;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_candidate_query_w641', self::W64_CANDIDATE_QUERY_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+        if ($op === 'lens') {
+            $words = \is_int($val) ? $val : 0;
+            if ($lens === null || $lensCap < $words) {
+                $handle = self::w64RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $lensCap = max(256, $words * 2);
+                $lens = $handle->new('int64_t['.$lensCap.']');
+            }
+
+            return $lens;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 64.1 AdditionalCandidateQuery export with the NUL-joined $items, or with the items concatenated plus an
+     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
+     * declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    private static function w64Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w64RustFfiState('ffi');
+            $out = self::w64RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $count = \count($items);
+            $blob = implode("\0", $items);
+            $lens = null;
+            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
+                $blob = implode('', $items);
+                $column = self::w64RustFfiState('lens', $count);
+                if (! $column instanceof CData) {
+                    return null;
+                }
+                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
+                $lens = FFI::addr($column[0]);
+            }
+            // @phpstan-ignore method.notFound (Declared by W64_CANDIDATE_QUERY_FFI_CDEF.)
+            $written = $ffi->nntmux_w641_candidate_query_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
