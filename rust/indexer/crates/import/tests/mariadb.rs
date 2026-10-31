@@ -485,7 +485,7 @@ async fn tls_trusts_only_the_given_ca_and_checks_the_name() {
     };
     let (host, port) = target.split_once(':').unwrap();
     let port: u16 = port.parse().unwrap();
-    let connect = |host: &str, ca: &str| {
+    let connect = |host: &str, ca: &str, name: Option<&str>| {
         Source::connect(&SourceConfig {
             host: host.to_owned(),
             port,
@@ -494,7 +494,10 @@ async fn tls_trusts_only_the_given_ca_and_checks_the_name() {
                 user: "root".to_owned(),
                 password: Secret::new(root.clone()),
             },
-            tls: Tls::VerifyCa(ca.into()),
+            tls: Tls::VerifyCa {
+                ca: ca.into(),
+                name: name.map(str::to_owned),
+            },
             max_connections: 1,
         })
         .unwrap()
@@ -502,23 +505,40 @@ async fn tls_trusts_only_the_given_ca_and_checks_the_name() {
     let cipher = "SELECT VARIABLE_VALUE FROM information_schema.SESSION_STATUS \
                   WHERE VARIABLE_NAME = 'Ssl_cipher'";
 
-    let good = connect(host, &ca);
+    let good = connect(host, &ca, None);
     let ciphers: Vec<String> = good.select(cipher, ()).await.unwrap();
     assert!(!ciphers[0].is_empty(), "the session must be encrypted");
     good.disconnect().await.unwrap();
 
-    let result: anyhow::Result<Vec<String>> = connect(host, &wrong_ca).select(cipher, ()).await;
+    let result: anyhow::Result<Vec<String>> =
+        connect(host, &wrong_ca, None).select(cipher, ()).await;
     assert!(
         result.is_err(),
         "a certificate from another CA must be refused"
     );
 
     // The certificate names 127.0.0.1, not localhost.
-    let result: anyhow::Result<Vec<String>> = connect("localhost", &ca).select(cipher, ()).await;
+    let result: anyhow::Result<Vec<String>> =
+        connect("localhost", &ca, None).select(cipher, ()).await;
     assert!(
         result.is_err(),
         "a certificate for another name must be refused"
     );
+    let result: anyhow::Result<Vec<String>> = connect(host, &ca, Some("other.example"))
+        .select(cipher, ())
+        .await;
+    assert!(
+        result.is_err(),
+        "the name asked for must be on the certificate"
+    );
+
+    let named = connect("localhost", &ca, Some("127.0.0.1"));
+    let ciphers: Vec<String> = named.select(cipher, ()).await.unwrap();
+    assert!(
+        !ciphers[0].is_empty(),
+        "connecting by another address still checks the name"
+    );
+    named.disconnect().await.unwrap();
 }
 
 #[tokio::test]

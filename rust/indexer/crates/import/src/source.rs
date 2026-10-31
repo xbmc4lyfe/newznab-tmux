@@ -40,8 +40,10 @@ impl Credentials {
 
 #[derive(Clone, Debug)]
 pub enum Tls {
-    /// Trust only this CA, and require a certificate naming the host connected to.
-    VerifyCa(PathBuf),
+    /// Trust only this CA, and require a certificate naming `name`, or the host
+    /// connected to when there is none. Connecting by the container's own address
+    /// needs `name`, because the certificate names the machine.
+    VerifyCa { ca: PathBuf, name: Option<String> },
     /// Loopback test servers only.
     Disabled,
 }
@@ -95,11 +97,12 @@ impl Source {
                 "SET NAMES utf8mb4",
             ]);
         match &config.tls {
-            Tls::VerifyCa(ca) => {
+            Tls::VerifyCa { ca, name } => {
                 options = options.ssl_opts(
                     SslOpts::default()
                         .with_root_certs(vec![ca.clone().into()])
-                        .with_disable_built_in_roots(true),
+                        .with_disable_built_in_roots(true)
+                        .with_danger_tls_hostname_override(name.clone()),
                 );
             }
             Tls::Disabled => {

@@ -40,6 +40,9 @@ struct SourceArgs {
     /// The CA that issued the server's certificate.
     #[arg(long, global = true, env = "INDEXER_IMPORT_CA")]
     ca: Option<PathBuf>,
+    /// The name the server's certificate must carry, when it isn't --host.
+    #[arg(long, global = true)]
+    tls_name: Option<String>,
     /// For loopback test servers only.
     #[arg(long, global = true)]
     no_tls: bool,
@@ -77,7 +80,10 @@ fn source(args: &SourceArgs) -> Result<Source> {
     };
     let tls = match (&args.ca, args.no_tls) {
         (_, true) => Tls::Disabled,
-        (Some(ca), false) => Tls::VerifyCa(ca.clone()),
+        (Some(ca), false) => Tls::VerifyCa {
+            ca: ca.clone(),
+            name: args.tls_name.clone(),
+        },
         (None, false) => anyhow::bail!("--ca is required"),
     };
     Source::connect(&SourceConfig {
