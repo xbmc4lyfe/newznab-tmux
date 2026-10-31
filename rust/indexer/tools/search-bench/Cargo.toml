@@ -1,0 +1,27 @@
+# Benchmark of free-text release-name search. It stays outside the indexer
+# workspace, so its heavy dependencies don't slow the workspace build or CI.
+[package]
+name = "search-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+indexer-search = { path = "../../crates/search" }
+rayon = "1"
+regex = "1"
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tantivy = "0.27"
+ureq = { version = "3", features = ["json"] }
+
+[profile.release]
+codegen-units = 1
+debug = "line-tables-only"
+lto = "thin"

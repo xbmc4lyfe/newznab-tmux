@@ -7,3 +7,12 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+anyhow.workspace = true
+indexer-telemetry.workspace = true
+metrics.workspace = true
+tantivy.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
