@@ -9,15 +9,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::spec::{self, Table};
 
 const APP_STATE: &str = "old web app, user and admin state";
-const PIPELINE_STATE: &str = "old pipeline progress, which only the PHP app reads";
+const PIPELINE_STATE: &str = "old pipeline progress";
 const OTHER_MEDIA: &str = "metadata for media this indexer doesn't keep";
-const HEADERS: &str = "headers, emptied and downloadable again";
+const HEADERS: &str = "headers, which can be downloaded again";
+const EMPTY: &str = "empty, which verification checks";
 const SEEDED: &str = "reference data seeded from the repo";
 const REFETCHABLE: &str = "can be fetched again from TMDB and TVDB";
 const PER_RELEASE_APP: &str = "per-release activity in the old web app";
 
+/// Left out only because they hold nothing. PreDB CRCs are evidence that can't be
+/// fetched again, so a row appearing here must stop verification.
+static MUST_BE_EMPTY: &[&str] = &["predb_crcs"];
+
 /// Tables that aren't copied at all, by reason.
 static LEFT_TABLES: &[(&str, &[&str])] = &[
+    (EMPTY, MUST_BE_EMPTY),
     (
         APP_STATE,
         &[
@@ -107,7 +113,6 @@ static LEFT_TABLES: &[(&str, &[&str])] = &[
             "par2_rename_candidate_progress",
             "par2_rename_progress",
             "poster_renames",
-            "predb_crcs",
             "predb_identity_keys",
             "predb_identity_revisions",
             "predb_identity_state",
@@ -359,6 +364,25 @@ pub fn check(source_columns: &[(String, String)]) -> Coverage {
     }
 }
 
+/// Tables that have to be empty, of those the source has.
+pub fn must_be_empty(source_columns: &[(String, String)]) -> Vec<&'static str> {
+    MUST_BE_EMPTY
+        .iter()
+        .copied()
+        .filter(|table| source_columns.iter().any(|(name, _)| name == table))
+        .collect()
+}
+
+/// Copied tables the login can't see, which would mean the list is cut short.
+pub fn missing_copied_tables(source_columns: &[(String, String)]) -> Vec<&'static str> {
+    spec::all_tables()
+        .into_iter()
+        .map(source_table)
+        .chain(["release_nzb_contents"])
+        .filter(|table| !source_columns.iter().any(|(name, _)| name == table))
+        .collect()
+}
+
 /// `release_nzb_contents` is copied by its own statements, not a table spec.
 fn is_nzb_column(column: &str) -> bool {
     matches!(
@@ -410,6 +434,24 @@ mod tests {
         assert!(what.contains(&"releases.nzbstatus"));
         assert!(what.contains(&"release_nzb_contents.generation"));
         assert!(!what.contains(&"release_nzb_contents.body"));
+    }
+
+    #[test]
+    fn an_empty_or_short_list_of_source_tables_is_noticed() {
+        assert!(missing_copied_tables(&[]).contains(&"releases"));
+        assert!(missing_copied_tables(&[]).contains(&"release_nzb_contents"));
+        let all: Vec<(String, String)> = spec::all_tables()
+            .into_iter()
+            .map(source_table)
+            .chain(["release_nzb_contents"])
+            .map(|table| (table.to_owned(), "id".to_owned()))
+            .collect();
+        assert_eq!(missing_copied_tables(&all), Vec::<&str>::new());
+        assert_eq!(must_be_empty(&all), Vec::<&str>::new());
+        assert_eq!(
+            must_be_empty(&columns(&[("predb_crcs", "id")])),
+            ["predb_crcs"]
+        );
     }
 
     #[test]

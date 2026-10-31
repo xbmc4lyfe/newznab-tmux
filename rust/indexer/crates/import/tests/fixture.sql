@@ -162,7 +162,8 @@ INSERT INTO video_data VALUES (2, 'Matroska', '40000', '7200000', 'HEVC', 'V_MPE
 INSERT INTO audio_data VALUES (1, 2, 1, 'TrueHD', NULL, NULL, NULL, '8', '48000', NULL, 'en', 'Atmos');
 INSERT INTO release_subtitles VALUES (1, 2, 1, 'en');
 INSERT INTO release_unique VALUES (2, 'uid-2');
-INSERT INTO media_infos (id, releases_id, movie_name, file_name, unique_id) VALUES (1, 2, 'Avatar', 'a1.mkv', 'uid-2');
+INSERT INTO media_infos (id, releases_id, movie_name, file_name, unique_id)
+VALUES (1, 2, 'Avatar', 'a1.mkv', 'uid-2'), (2, 999, 'Deleted', 'gone.mkv', 'uid-999');
 INSERT INTO release_fingerprint_metadata VALUES (2, 'done', '{"a":1}', NULL, '2026-10-02 00:00:00');
 
 INSERT INTO predb (id, title, nfo, size, category, predate, imported_at, source, requestid, groups_id, nuked, nukereason, files, filename)

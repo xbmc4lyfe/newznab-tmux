@@ -196,6 +196,17 @@ impl Table {
         )
     }
 
+    /// Counts rows belonging to no release, which the size floor's join can't see.
+    pub fn select_orphans(&self) -> Option<String> {
+        (self.floor == SizeFloor::ReleaseSize).then(|| {
+            format!(
+                "SELECT COUNT(*) FROM {} LEFT JOIN releases fr ON fr.id = {} WHERE fr.id IS NULL",
+                self.from,
+                self.key(),
+            )
+        })
+    }
+
     pub fn dest_count(&self) -> String {
         format!("SELECT COUNT(*) FROM {}", self.dest)
     }
@@ -595,6 +606,20 @@ pub const SELECT_NZB_COUNT: &str = "SELECT COUNT(*) FROM release_nzb_contents n 
 pub const SELECT_RELEASES_BELOW_FLOOR: &str =
     "SELECT COUNT(*), CAST(COALESCE(SUM(size), 0) AS UNSIGNED) FROM releases WHERE size < ?";
 
+/// NZBs belonging to no release.
+pub const SELECT_NZB_ORPHANS: &str = "SELECT COUNT(*) FROM release_nzb_contents n \
+     LEFT JOIN releases r ON r.id = n.releases_id WHERE r.id IS NULL";
+
+pub const SELECT_DATABASE: &str = "SELECT DATABASE()";
+
+/// Whether this login can read the whole database. `information_schema` hides what
+/// a login can't read, so the coverage check is only sound if it can.
+pub const SELECT_DATABASE_GRANTS: &str = "SELECT COUNT(*) FROM information_schema.SCHEMA_PRIVILEGES \
+     WHERE TABLE_SCHEMA = DATABASE() AND PRIVILEGE_TYPE = 'SELECT'";
+
+pub const SELECT_GLOBAL_GRANTS: &str =
+    "SELECT COUNT(*) FROM information_schema.USER_PRIVILEGES WHERE PRIVILEGE_TYPE = 'SELECT'";
+
 /// Every table and column the source has.
 pub const SELECT_SOURCE_COLUMNS: &str = "SELECT CAST(table_name AS CHAR), CAST(column_name AS CHAR) \
      FROM information_schema.columns WHERE table_schema = DATABASE()";
@@ -650,9 +675,14 @@ mod tests {
             SELECT_RELEASE_TOTALS.to_owned(),
             SELECT_RELEASES_BELOW_FLOOR.to_owned(),
             SELECT_SOURCE_COLUMNS.to_owned(),
+            SELECT_NZB_ORPHANS.to_owned(),
+            SELECT_DATABASE.to_owned(),
+            SELECT_DATABASE_GRANTS.to_owned(),
+            SELECT_GLOBAL_GRANTS.to_owned(),
         ];
         for table in all_tables() {
             statements.extend(table.select_lost_dates().into_iter().map(|(_, sql)| sql));
+            statements.extend(table.select_orphans());
             statements.extend([
                 table.select_range(),
                 table.select_count(),

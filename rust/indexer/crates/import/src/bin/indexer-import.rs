@@ -160,6 +160,9 @@ async fn execute(cli: Cli) -> Result<bool> {
             for (kind, count) in &report.flagged_nzbs {
                 println!("flagged at import, bytes still exact, {kind}: {count}");
             }
+            for (kind, count) in &report.anomalies {
+                println!("flagged at import, kept anyway, {kind}: {count}");
+            }
             for problem in &report.problems {
                 println!("PROBLEM {problem}");
             }
@@ -171,17 +174,21 @@ async fn execute(cli: Cli) -> Result<bool> {
                 report.min_size / MB,
                 report.below_floor.1 as f64 / 1e12
             );
+            for (table, rows) in &report.orphans {
+                println!("NOT copied: {rows} rows of {table} that belong to no release");
+            }
             for left in &report.left_behind {
                 println!("NOT copied, {}: {}", left.reason, left.what.join(", "));
             }
-            println!(
-                "{}",
-                if report.clean() {
-                    "VERIFIED: everything copied matches. The list above is lost if MariaDB is dropped."
-                } else {
-                    "NOT VERIFIED"
-                }
-            );
+            if report.clean() {
+                println!(
+                    "VERIFIED: everything copied matches. Everything marked NOT copied is lost \
+                     if database {} is dropped.",
+                    report.database
+                );
+            } else {
+                println!("NOT VERIFIED");
+            }
             report.clean()
         }
     };

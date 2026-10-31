@@ -220,6 +220,17 @@ async fn imports_everything_above_the_floor_and_verifies_clean() {
             .iter()
             .all(|(_, expected, actual)| expected == actual)
     );
+    assert_eq!(check.below_floor, (1, 499_999_999));
+    assert_eq!(check.min_size, MIN_SIZE);
+    assert_eq!(check.orphans, [("media_infos".to_owned(), 1)]);
+    assert_eq!(check.anomalies["nzb_missing"], 1);
+    assert_eq!(check.database, fx.database);
+    let left: Vec<&str> = check
+        .left_behind
+        .iter()
+        .flat_map(|l| l.what.iter().map(String::as_str))
+        .collect();
+    assert!(left.contains(&"tv_episodes.summary"), "{left:?}");
 
     let catalog = fx.catalog();
     let got = catalog.release_by_id(1).unwrap().unwrap();
@@ -468,6 +479,74 @@ async fn a_source_table_nobody_decided_about_stops_verification() {
             .problems
             .iter()
             .any(|p| p.starts_with("predb.surprise:")),
+        "{check:#?}"
+    );
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_login_that_cannot_see_everything_cannot_verify() {
+    let Some(mut fx) = Fixture::start().await else {
+        return;
+    };
+    fx.import().await;
+    let user = format!("narrow_{}", &fx.database["import_test_".len()..]);
+    let tables: Vec<String> = fx.admin.query("SHOW TABLES").await.unwrap();
+    fx.admin
+        .query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'narrow'"))
+        .await
+        .unwrap();
+    for table in tables {
+        fx.admin
+            .query_drop(format!(
+                "GRANT SELECT ON {}.{table} TO '{user}'@'%'",
+                fx.database
+            ))
+            .await
+            .unwrap();
+    }
+    let narrow = source_for(&fx.host, fx.port, &fx.database, &user, "narrow");
+    let check = verify(&narrow, fx.dir.path(), 2, 1_000_000, 3)
+        .await
+        .unwrap();
+    assert!(!check.clean());
+    assert!(
+        check
+            .problems
+            .iter()
+            .any(|p| p.contains("can't read the whole database")),
+        "{check:#?}"
+    );
+    narrow.disconnect().await.unwrap();
+    fx.admin
+        .query_drop(format!("DROP USER '{user}'@'%'"))
+        .await
+        .unwrap();
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_table_left_out_as_empty_must_be_empty() {
+    let Some(mut fx) = Fixture::start().await else {
+        return;
+    };
+    fx.import().await;
+    fx.admin
+        .query_drop("CREATE TABLE predb_crcs (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    assert!(fx.check().await.clean());
+    fx.admin
+        .query_drop("INSERT INTO predb_crcs VALUES (1)")
+        .await
+        .unwrap();
+    let check = fx.check().await;
+    assert!(!check.clean());
+    assert!(
+        check
+            .problems
+            .iter()
+            .any(|p| p.starts_with("predb_crcs: left out as empty")),
         "{check:#?}"
     );
     fx.finish().await;

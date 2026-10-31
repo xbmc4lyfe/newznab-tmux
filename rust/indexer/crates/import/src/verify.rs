@@ -44,6 +44,12 @@ pub struct VerifyReport {
     pub min_size: u64,
     /// What else stays behind when the source goes away, by reason.
     pub left_behind: Vec<coverage::LeftBehind>,
+    /// Rows belonging to no release, which aren't copied, by source table.
+    pub orphans: Vec<(String, u64)>,
+    /// What the import flagged and kept, by kind.
+    pub anomalies: BTreeMap<String, u64>,
+    /// The one database these results cover.
+    pub database: String,
     pub elapsed: Duration,
 }
 
@@ -193,6 +199,7 @@ pub async fn verify(
     }
     check_lost_dates(source, releases.min_size, &mut report).await?;
     check_coverage(source, releases.min_size, &mut report).await?;
+    report.anomalies = read_anomalies(&catalog)?;
     report.elapsed = started.elapsed();
     Ok(report)
 }
@@ -262,18 +269,69 @@ async fn check_lost_dates(source: &Source, min_size: u64, report: &mut VerifyRep
 
 /// Comparing rows also can't see what was never selected, so every source table and
 /// column must be either copied or left out on purpose, for a stated reason.
+async fn count(source: &Source, sql: &str) -> Result<u64> {
+    let counts: Vec<u64> = source.select(sql, ()).await?;
+    Ok(counts.first().copied().unwrap_or(0))
+}
+
 async fn check_coverage(source: &Source, min_size: u64, report: &mut VerifyReport) -> Result<()> {
+    if count(source, spec::SELECT_DATABASE_GRANTS).await? == 0
+        && count(source, spec::SELECT_GLOBAL_GRANTS).await? == 0
+    {
+        report.problem(
+            "this login can't read the whole database, so what it left behind is unknown".into(),
+        );
+    }
+    let databases: Vec<String> = source.select(spec::SELECT_DATABASE, ()).await?;
+    report.database = databases.first().cloned().unwrap_or_default();
+
     let columns: Vec<(String, String)> = source.select(spec::SELECT_SOURCE_COLUMNS, ()).await?;
+    for table in coverage::missing_copied_tables(&columns) {
+        report.problem(format!(
+            "{table}: copied, but missing from the list of source tables"
+        ));
+    }
+    for table in coverage::must_be_empty(&columns) {
+        let rows = count(source, &format!("SELECT COUNT(*) FROM {table}")).await?;
+        if rows > 0 {
+            report.problem(format!("{table}: left out as empty, but has {rows} rows"));
+        }
+    }
     let coverage = coverage::check(&columns);
     for unlisted in coverage.unlisted {
         report.problem(format!("{unlisted}: neither copied nor listed as left out"));
     }
     report.left_behind = coverage.left_behind;
+
     let below: Vec<(u64, u64)> = source
         .select(spec::SELECT_RELEASES_BELOW_FLOOR, (min_size,))
         .await?;
     report.below_floor = below.first().copied().unwrap_or((0, 0));
+
+    for table in RELEASE_CHILDREN.iter().copied() {
+        let Some(sql) = table.select_orphans() else {
+            continue;
+        };
+        let rows = count(source, &sql).await?;
+        if rows > 0 {
+            report.orphans.push((table.dest.to_owned(), rows));
+        }
+    }
+    let rows = count(source, spec::SELECT_NZB_ORPHANS).await?;
+    if rows > 0 {
+        report.orphans.push(("nzbs".to_owned(), rows));
+    }
     Ok(())
+}
+
+fn read_anomalies(catalog: &Catalog) -> Result<BTreeMap<String, u64>> {
+    let mut statement = catalog
+        .conn()
+        .prepare("SELECT kind, COUNT(*) FROM import_anomalies GROUP BY kind")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+    })?;
+    Ok(rows.collect::<indexer_store::rusqlite::Result<_>>()?)
 }
 
 fn record_count(report: &mut VerifyReport, table: &str, expected: u64, actual: u64) {
