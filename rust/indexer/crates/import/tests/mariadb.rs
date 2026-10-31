@@ -196,6 +196,10 @@ async fn imports_everything_above_the_floor_and_verifies_clean() {
     assert_eq!(report.rows["releases"], 6);
     assert_eq!(report.rows["predb"], 2);
     assert_eq!(report.rows["usenet_groups"], 2);
+    assert_eq!(report.rows["legacy_videos"], 2);
+    assert_eq!(report.rows["legacy_tv_episodes"], 1);
+    assert_eq!(report.rows["legacy_movies"], 1);
+    assert_eq!(report.rows["par_file_hash_inventories"], 1);
     assert_eq!(
         report.rows["release_groups"], 2,
         "the small release's row stays behind"
@@ -248,6 +252,51 @@ async fn imports_everything_above_the_floor_and_verifies_clean() {
         xml(2)
     );
     assert!(nzbs.get(5).unwrap().is_none());
+
+    // Dates outside what UNIX_TIMESTAMP can hold keep their real value.
+    let time = |column: &str, id: i64| -> Option<i64> {
+        catalog
+            .conn()
+            .query_row(
+                &format!("SELECT {column} FROM releases WHERE id = ?1"),
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(time("posted_at", 7), Some(0));
+    assert_eq!(time("added_at", 7), Some(-1));
+    assert_eq!(time("posted_at", 8), Some(7_258_118_400));
+    let pre_at: Option<i64> = catalog
+        .conn()
+        .query_row("SELECT pre_at FROM predb WHERE id = 101", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(pre_at, Some(-144_720_000));
+    let started: String = catalog
+        .conn()
+        .query_row(
+            "SELECT started FROM legacy_videos WHERE id = 11",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(started, "1951-10-15 00:00:00");
+    let (fingerprint, inner): (Option<String>, i64) = catalog
+        .conn()
+        .query_row(
+            "SELECT legacy_video_id, inner_file_count FROM releases WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.map(|id| id.to_string()),
+                    row.get(1)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!((fingerprint.as_deref(), inner), (Some("10"), 0));
 
     assert_eq!(fx.checksums().await, before, "the source must not change");
     fx.finish().await;
@@ -362,6 +411,114 @@ async fn verify_catches_each_kind_of_damage() {
     );
     drop(nzbs);
     fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_date_that_cannot_be_represented_is_a_finding() {
+    let Some(mut fx) = Fixture::start().await else {
+        return;
+    };
+    fx.admin
+        .query_drop(
+            "SET SESSION sql_mode = '';
+             UPDATE releases SET postdate = '0000-00-00 00:00:00' WHERE id = 2;",
+        )
+        .await
+        .unwrap();
+    fx.admin
+        .query_drop("SET SESSION sql_mode = DEFAULT")
+        .await
+        .unwrap();
+    fx.import().await;
+    let check = fx.check().await;
+    assert!(!check.clean());
+    assert!(
+        check
+            .problems
+            .iter()
+            .any(|p| p.starts_with("releases.posted_at: 1 source dates")),
+        "{check:#?}"
+    );
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn a_source_table_nobody_decided_about_stops_verification() {
+    let Some(mut fx) = Fixture::start().await else {
+        return;
+    };
+    fx.import().await;
+    assert!(fx.check().await.clean());
+    fx.admin
+        .query_drop("CREATE TABLE surprise (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    fx.admin
+        .query_drop("ALTER TABLE predb ADD COLUMN surprise INT")
+        .await
+        .unwrap();
+    let check = fx.check().await;
+    assert!(!check.clean());
+    assert!(
+        check.problems.iter().any(|p| p.starts_with("surprise:")),
+        "{check:#?}"
+    );
+    assert!(
+        check
+            .problems
+            .iter()
+            .any(|p| p.starts_with("predb.surprise:")),
+        "{check:#?}"
+    );
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn tls_trusts_only_the_given_ca_and_checks_the_name() {
+    let (Ok(target), Ok(ca), Ok(wrong_ca), Ok(root)) = (
+        std::env::var("INDEXER_IMPORT_TEST_TLS_MARIADB"),
+        std::env::var("INDEXER_IMPORT_TEST_TLS_CA"),
+        std::env::var("INDEXER_IMPORT_TEST_TLS_WRONG_CA"),
+        std::env::var("INDEXER_IMPORT_TEST_ROOT_PASSWORD"),
+    ) else {
+        return;
+    };
+    let (host, port) = target.split_once(':').unwrap();
+    let port: u16 = port.parse().unwrap();
+    let connect = |host: &str, ca: &str| {
+        Source::connect(&SourceConfig {
+            host: host.to_owned(),
+            port,
+            database: "mysql".to_owned(),
+            credentials: Credentials {
+                user: "root".to_owned(),
+                password: Secret::new(root.clone()),
+            },
+            tls: Tls::VerifyCa(ca.into()),
+            max_connections: 1,
+        })
+        .unwrap()
+    };
+    let cipher = "SELECT VARIABLE_VALUE FROM information_schema.SESSION_STATUS \
+                  WHERE VARIABLE_NAME = 'Ssl_cipher'";
+
+    let good = connect(host, &ca);
+    let ciphers: Vec<String> = good.select(cipher, ()).await.unwrap();
+    assert!(!ciphers[0].is_empty(), "the session must be encrypted");
+    good.disconnect().await.unwrap();
+
+    let result: anyhow::Result<Vec<String>> = connect(host, &wrong_ca).select(cipher, ()).await;
+    assert!(
+        result.is_err(),
+        "a certificate from another CA must be refused"
+    );
+
+    // The certificate names 127.0.0.1, not localhost.
+    let result: anyhow::Result<Vec<String>> = connect("localhost", &ca).select(cipher, ()).await;
+    assert!(
+        result.is_err(),
+        "a certificate for another name must be refused"
+    );
 }
 
 #[tokio::test]

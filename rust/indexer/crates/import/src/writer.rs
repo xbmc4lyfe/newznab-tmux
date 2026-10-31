@@ -130,18 +130,15 @@ mod tests {
     use indexer_store::rusqlite::types::Value as SqlValue;
 
     use super::*;
-    use crate::spec::GROUPS;
+    use crate::spec::RELEASE_CHILDREN;
 
     fn batch(last_id: i64) -> Batch {
         Batch {
             step: "groups",
             last_id,
             tables: vec![TableRows {
-                table: &GROUPS,
-                rows: vec![vec![
-                    SqlValue::Integer(last_id),
-                    SqlValue::Text("alt.bin".into()),
-                ]],
+                table: RELEASE_CHILDREN[0],
+                rows: vec![vec![SqlValue::Integer(last_id), SqlValue::Integer(1)]],
             }],
             nzbs: Vec::new(),
             anomalies: vec![Anomaly {

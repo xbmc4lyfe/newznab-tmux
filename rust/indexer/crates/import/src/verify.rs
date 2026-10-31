@@ -14,11 +14,12 @@ use indexer_store::{Catalog, MAX_DECODED_BYTES, NzbStore, StorePaths, body_sha25
 use tokio::sync::mpsc;
 
 use crate::convert::{SqlRow, canonical, row_to_sql};
+use crate::coverage;
 use crate::legacy::legacy_digest;
 use crate::plan::IdRange;
-use crate::run::{STEP_GROUPS, STEP_PREDB, STEP_RELEASES, plan_ranges};
+use crate::run::{STEP_RELEASES, plan_ranges};
 use crate::source::Source;
-use crate::spec::{self, GROUPS, PREDB, RELEASE_CHILDREN, RELEASES, Table};
+use crate::spec::{self, RELEASE_CHILDREN, RELEASES, Table, WHOLE_TABLES};
 
 const KEYSET_PAGE: u64 = 20_000;
 /// Problems kept for the report. The count covers them all.
@@ -38,6 +39,11 @@ pub struct VerifyReport {
     pub problems: Vec<String>,
     /// False when the import behind this report stopped early.
     pub complete: bool,
+    /// Releases and bytes below the size floor, which were never copied.
+    pub below_floor: (u64, u64),
+    pub min_size: u64,
+    /// What else stays behind when the source goes away, by reason.
+    pub left_behind: Vec<coverage::LeftBehind>,
     pub elapsed: Duration,
 }
 
@@ -110,15 +116,19 @@ pub async fn verify(
     let Some(releases) = import_state(&catalog, STEP_RELEASES)? else {
         bail!("no release was imported into {}", paths.catalog.display());
     };
-    let finished =
-        |step| Ok::<_, anyhow::Error>(import_state(&catalog, step)?.is_some_and(|s| s.finished));
+    let mut complete = releases.finished;
+    for (_, step) in WHOLE_TABLES {
+        complete &= import_state(&catalog, step)?.is_some_and(|state| state.finished);
+    }
     let mut report = VerifyReport {
-        complete: releases.finished && finished(STEP_GROUPS)? && finished(STEP_PREDB)?,
+        complete,
+        min_size: releases.min_size,
         ..VerifyReport::default()
     };
 
-    compare_keyset(source, &catalog, &GROUPS, &mut report).await?;
-    compare_keyset(source, &catalog, &PREDB, &mut report).await?;
+    for (table, _) in WHOLE_TABLES.iter().copied() {
+        compare_keyset(source, &catalog, table, &mut report).await?;
+    }
 
     let concurrency = concurrency.max(1);
     let (range_tx, range_rx) = mpsc::channel(concurrency);
@@ -181,6 +191,8 @@ pub async fn verify(
         )
         .await?;
     }
+    check_lost_dates(source, releases.min_size, &mut report).await?;
+    check_coverage(source, releases.min_size, &mut report).await?;
     report.elapsed = started.elapsed();
     Ok(report)
 }
@@ -223,6 +235,44 @@ async fn compare_counts(
              catalog {rows} rows of {bytes} bytes"
         ));
     }
+    Ok(())
+}
+
+/// Comparing rows can't see a date the conversion lost, because both sides of the
+/// comparison went through it. This asks the source directly.
+async fn check_lost_dates(source: &Source, min_size: u64, report: &mut VerifyReport) -> Result<()> {
+    for table in spec::all_tables() {
+        for (column, sql) in table.select_lost_dates() {
+            let counts: Vec<u64> = if table.has_floor() {
+                source.select(&sql, (min_size,)).await?
+            } else {
+                source.select(&sql, ()).await?
+            };
+            let lost = counts.first().copied().unwrap_or(0);
+            if lost > 0 {
+                report.problem(format!(
+                    "{}.{column}: {lost} source dates can't be stored as a time",
+                    table.dest
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Comparing rows also can't see what was never selected, so every source table and
+/// column must be either copied or left out on purpose, for a stated reason.
+async fn check_coverage(source: &Source, min_size: u64, report: &mut VerifyReport) -> Result<()> {
+    let columns: Vec<(String, String)> = source.select(spec::SELECT_SOURCE_COLUMNS, ()).await?;
+    let coverage = coverage::check(&columns);
+    for unlisted in coverage.unlisted {
+        report.problem(format!("{unlisted}: neither copied nor listed as left out"));
+    }
+    report.left_behind = coverage.left_behind;
+    let below: Vec<(u64, u64)> = source
+        .select(spec::SELECT_RELEASES_BELOW_FLOOR, (min_size,))
+        .await?;
+    report.below_floor = below.first().copied().unwrap_or((0, 0));
     Ok(())
 }
 

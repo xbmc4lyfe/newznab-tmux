@@ -1,10 +1,22 @@
--- Catalog schema. Times are unix seconds in UTC. Absent IDs are NULL, never 0.
+-- Catalog schema. Times are unix seconds in UTC, and can be negative. Absent IDs
+-- are NULL, never 0.
 -- Text columns can hold a BLOB when the source bytes were not UTF-8, which keeps
 -- them exact; import_anomalies lists each case.
 
 CREATE TABLE usenet_groups (
-    id   INTEGER PRIMARY KEY,
-    name TEXT NOT NULL
+    id                 INTEGER PRIMARY KEY,
+    name               TEXT NOT NULL,
+    backfill_target    INTEGER NOT NULL,
+    first_record       INTEGER NOT NULL,
+    first_record_at    INTEGER,
+    last_record        INTEGER NOT NULL,
+    last_record_at     INTEGER,
+    last_updated_at    INTEGER,
+    min_files          INTEGER,
+    min_size           INTEGER,
+    active             INTEGER NOT NULL,
+    backfill           INTEGER NOT NULL,
+    description        TEXT
 );
 
 CREATE TABLE releases (
@@ -24,6 +36,16 @@ CREATE TABLE releases (
     password_status INTEGER NOT NULL,
     is_renamed      INTEGER NOT NULL,
     grabs           INTEGER NOT NULL,
+    inner_file_count INTEGER NOT NULL,
+    articles_found  INTEGER,
+    articles_expected INTEGER,
+    files_found     INTEGER,
+    files_expected  INTEGER,
+    article_fingerprint TEXT,
+    legacy_imdb_id  TEXT,
+    legacy_video_id INTEGER,
+    legacy_episode_id INTEGER,
+    legacy_movie_id INTEGER,
     media_title     TEXT,
     media_year      TEXT,
     imdb_id         TEXT,
@@ -81,6 +103,7 @@ CREATE INDEX par_hashes_hash16k ON par_hashes (hash16k);
 CREATE TABLE par_file_hashes (
     id         INTEGER PRIMARY KEY,
     release_id INTEGER NOT NULL,
+    release_guid TEXT NOT NULL,
     hash16k    TEXT NOT NULL,
     full_md5   TEXT NOT NULL,
     file_size  TEXT NOT NULL
@@ -89,9 +112,19 @@ CREATE INDEX par_file_hashes_release ON par_file_hashes (release_id);
 CREATE INDEX par_file_hashes_hash16k ON par_file_hashes (hash16k);
 CREATE INDEX par_file_hashes_full_md5 ON par_file_hashes (full_md5, file_size);
 
+-- How much hash evidence a release should have, so a gap can be told from none.
+CREATE TABLE par_file_hash_inventories (
+    release_id       INTEGER PRIMARY KEY,
+    release_guid     TEXT NOT NULL,
+    evidence_last_id INTEGER NOT NULL,
+    evidence_count   INTEGER NOT NULL,
+    proof_version    INTEGER NOT NULL
+);
+
 CREATE TABLE par2_descriptors (
     id                        INTEGER PRIMARY KEY,
     release_id                INTEGER NOT NULL,
+    release_guid              TEXT NOT NULL,
     packet_checksum           TEXT NOT NULL,
     recovery_set_id           TEXT NOT NULL,
     file_id                   TEXT NOT NULL,
@@ -108,6 +141,7 @@ CREATE INDEX par2_descriptors_release ON par2_descriptors (release_id);
 
 CREATE TABLE archive_naming_evidence (
     release_id    INTEGER PRIMARY KEY,
+    release_guid  TEXT NOT NULL,
     source_sha256 TEXT NOT NULL,
     proof_version INTEGER NOT NULL,
     scope         TEXT NOT NULL,
@@ -195,6 +229,53 @@ CREATE TABLE predb (
 );
 CREATE INDEX predb_title ON predb (title);
 CREATE INDEX predb_pre_at ON predb (pre_at);
+
+-- The old system's title records. Releases point at them through legacy_*_id, and
+-- their dates stay text because many are not valid timestamps.
+CREATE TABLE legacy_videos (
+    id           INTEGER PRIMARY KEY,
+    kind         INTEGER NOT NULL,
+    title        TEXT NOT NULL,
+    country      TEXT NOT NULL,
+    started      TEXT,
+    anidb_id     INTEGER NOT NULL,
+    imdb_id      TEXT NOT NULL,
+    tmdb_id      INTEGER NOT NULL,
+    trakt_id     INTEGER NOT NULL,
+    tvdb_id      INTEGER NOT NULL,
+    tvmaze_id    INTEGER NOT NULL,
+    tvrage_id    INTEGER NOT NULL,
+    source       INTEGER NOT NULL
+);
+CREATE TABLE legacy_tv_episodes (
+    id           INTEGER PRIMARY KEY,
+    video_id     INTEGER NOT NULL,
+    season       INTEGER NOT NULL,
+    episode      INTEGER NOT NULL,
+    se_complete  TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    first_aired  TEXT
+);
+CREATE INDEX legacy_tv_episodes_video ON legacy_tv_episodes (video_id, season, episode);
+CREATE TABLE legacy_movies (
+    id        INTEGER PRIMARY KEY,
+    imdb_id   TEXT NOT NULL,
+    tmdb_id   INTEGER NOT NULL,
+    trakt_id  INTEGER NOT NULL,
+    title     TEXT NOT NULL,
+    tagline   TEXT NOT NULL,
+    rating    TEXT NOT NULL,
+    rt_rating TEXT NOT NULL,
+    plot      TEXT NOT NULL,
+    year      TEXT NOT NULL,
+    genre     TEXT NOT NULL,
+    kind      TEXT NOT NULL,
+    director  TEXT NOT NULL,
+    actors    TEXT NOT NULL,
+    language  TEXT NOT NULL,
+    trailer   TEXT NOT NULL
+);
+CREATE INDEX legacy_movies_imdb ON legacy_movies (imdb_id);
 
 -- Resume point of each import step, committed with the rows it covers.
 CREATE TABLE import_state (

@@ -164,11 +164,13 @@ mod tests {
                 source: "a",
                 dest: "release_id",
                 kind: Kind::Int,
+                raw_date: None,
             },
             Column {
                 source: "b",
                 dest: "name",
                 kind: Kind::Text,
+                raw_date: None,
             },
         ];
         let mut anomalies = Vec::new();
@@ -190,6 +192,7 @@ mod tests {
             source: "a",
             dest: "x",
             kind: Kind::Int,
+            raw_date: None,
         }];
         assert!(row_to_sql("t", &columns, Vec::new(), &mut Vec::new()).is_err());
     }

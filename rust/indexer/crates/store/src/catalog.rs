@@ -125,9 +125,10 @@ mod tests {
                 .conn()
                 .execute(
                     "INSERT INTO releases (id, guid, name, search_name, size_bytes, completion,
-                         group_id, legacy_category, password_status, is_renamed, grabs, tvdb_id,
+                         group_id, legacy_category, password_status, is_renamed, grabs,
+                         inner_file_count, tvdb_id,
                          season, episode)
-                     VALUES (7, 'g', 'n', 's', 64424509440, 100, 1, 2000, 0, 0, 0, 121361, 1, 2)",
+                     VALUES (7, 'g', 'n', 's', 64424509440, 100, 1, 2000, 0, 0, 0, 0, 121361, 1, 2)",
                     [],
                 )
                 .unwrap();

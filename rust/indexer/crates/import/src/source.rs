@@ -40,8 +40,7 @@ impl Credentials {
 
 #[derive(Clone, Debug)]
 pub enum Tls {
-    /// Check the server's certificate against this CA. The server's certificate
-    /// is issued locally, so its name is not checked.
+    /// Trust only this CA, and require a certificate naming the host connected to.
     VerifyCa(PathBuf),
     /// Loopback test servers only.
     Disabled,
@@ -100,7 +99,7 @@ impl Source {
                 options = options.ssl_opts(
                     SslOpts::default()
                         .with_root_certs(vec![ca.clone().into()])
-                        .with_danger_skip_domain_validation(true),
+                        .with_disable_built_in_roots(true),
                 );
             }
             Tls::Disabled => {

@@ -4,9 +4,11 @@
 //! login should be SELECT-only, every session is `READ ONLY`, and [`Source`] only
 //! runs statements that start with `SELECT`. Rows and NZBs are copied in batches
 //! that commit with their resume point, so a stopped import continues where it
-//! left off. [`verify`] then compares every row and every NZB with the source.
+//! left off. [`verify`] then compares every row and every NZB with the source, and
+//! reports everything it is deliberately not copying.
 
 mod convert;
+mod coverage;
 mod legacy;
 mod plan;
 mod run;
@@ -15,6 +17,7 @@ mod spec;
 mod verify;
 mod writer;
 
+pub use coverage::LeftBehind;
 pub use run::{ImportOptions, ImportReport, probe, run};
 pub use source::{Credentials, Source, SourceConfig, Tls};
 pub use verify::{VerifyReport, verify};

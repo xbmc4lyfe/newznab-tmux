@@ -160,9 +160,18 @@ async fn execute(cli: Cli) -> Result<bool> {
             println!("problems: {}", report.problem_count);
             println!("complete import: {}", report.complete);
             println!(
+                "NOT copied: {} releases below {} MB ({:.2} TB)",
+                report.below_floor.0,
+                report.min_size / MB,
+                report.below_floor.1 as f64 / 1e12
+            );
+            for left in &report.left_behind {
+                println!("NOT copied, {}: {}", left.reason, left.what.join(", "));
+            }
+            println!(
                 "{}",
                 if report.clean() {
-                    "VERIFIED"
+                    "VERIFIED: everything copied matches. The list above is lost if MariaDB is dropped."
                 } else {
                     "NOT VERIFIED"
                 }

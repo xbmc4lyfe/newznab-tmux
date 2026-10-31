@@ -15,35 +15,47 @@ pub struct Column {
     pub source: &'static str,
     pub dest: &'static str,
     pub kind: Kind,
+    /// For a date stored as unix seconds: the source column, so that a date the
+    /// conversion can't represent is reported instead of silently becoming NULL.
+    pub raw_date: Option<&'static str>,
 }
 
-const fn int(source: &'static str, dest: &'static str) -> Column {
+const fn column(source: &'static str, dest: &'static str, kind: Kind) -> Column {
     Column {
         source,
         dest,
-        kind: Kind::Int,
+        kind,
+        raw_date: None,
     }
+}
+const fn int(source: &'static str, dest: &'static str) -> Column {
+    column(source, dest, Kind::Int)
 }
 const fn real(source: &'static str, dest: &'static str) -> Column {
-    Column {
-        source,
-        dest,
-        kind: Kind::Real,
-    }
+    column(source, dest, Kind::Real)
 }
 const fn text(source: &'static str, dest: &'static str) -> Column {
-    Column {
-        source,
-        dest,
-        kind: Kind::Text,
-    }
+    column(source, dest, Kind::Text)
 }
 const fn blob(source: &'static str, dest: &'static str) -> Column {
-    Column {
-        source,
-        dest,
-        kind: Kind::Blob,
-    }
+    column(source, dest, Kind::Blob)
+}
+
+/// Unix seconds from a date. `UNIX_TIMESTAMP` would turn anything outside 1970 to
+/// 2106 into NULL, so this counts seconds in a way that goes negative instead.
+macro_rules! date {
+    ($source:literal, $dest:literal) => {
+        Column {
+            source: concat!(
+                "TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', ",
+                $source,
+                ")"
+            ),
+            dest: $dest,
+            kind: Kind::Int,
+            raw_date: Some($source),
+        }
+    };
 }
 
 /// A table. The first column is the key that batches split on.
@@ -134,6 +146,27 @@ impl Table {
         )
     }
 
+    /// The date columns stored as unix seconds, with a statement counting the dates
+    /// each one could not represent. Binds: the floor if any.
+    pub fn select_lost_dates(&self) -> Vec<(&'static str, String)> {
+        let floor = self
+            .floor_test()
+            .map_or(String::new(), |test| format!(" AND {test}"));
+        self.columns
+            .iter()
+            .filter_map(|column| {
+                let raw = column.raw_date?;
+                let sql = format!(
+                    "SELECT COUNT(*) FROM {}{} WHERE {raw} IS NOT NULL AND {} IS NULL{floor}",
+                    self.from,
+                    self.release_join(),
+                    column.source,
+                );
+                Some((column.dest, sql))
+            })
+            .collect()
+    }
+
     /// Fails on a missing table or column without reading any rows.
     pub fn select_probe(&self) -> String {
         format!(
@@ -186,13 +219,23 @@ pub static RELEASES: Table = Table {
         real("c.completion", "completion"),
         int("c.groups_id", "group_id"),
         text("c.fromname", "poster"),
-        int("UNIX_TIMESTAMP(c.postdate)", "posted_at"),
-        int("UNIX_TIMESTAMP(c.adddate)", "added_at"),
+        date!("c.postdate", "posted_at"),
+        date!("c.adddate", "added_at"),
         int("c.categories_id", "legacy_category"),
         int("NULLIF(c.predb_id, 0)", "predb_id"),
         int("c.passwordstatus", "password_status"),
         int("c.isrenamed", "is_renamed"),
         int("c.grabs", "grabs"),
+        int("c.rarinnerfilecount", "inner_file_count"),
+        int("c.articles_found", "articles_found"),
+        int("c.articles_expected", "articles_expected"),
+        int("c.files_found", "files_found"),
+        int("c.files_expected", "files_expected"),
+        text("c.article_fingerprint", "article_fingerprint"),
+        text("c.imdbid", "legacy_imdb_id"),
+        int("NULLIF(c.videos_id, 0)", "legacy_video_id"),
+        int("NULLIF(c.tv_episodes_id, 0)", "legacy_episode_id"),
+        int("NULLIF(c.movieinfo_id, 0)", "legacy_movie_id"),
         text("COALESCE(v.title, NULLIF(m.title, ''))", "media_title"),
         text("NULLIF(m.year, '')", "media_year"),
         text(
@@ -271,9 +314,22 @@ pub static RELEASE_CHILDREN: &[&Table] = &[
         columns: &[
             int("c.releases_id", "release_id"),
             int("c.id", "id"),
+            text("c.release_guid", "release_guid"),
             text("c.hash16k", "hash16k"),
             text("c.full_md5", "full_md5"),
             text("c.file_size", "file_size"),
+        ],
+    },
+    &Table {
+        from: "par_file_hash_inventories c",
+        dest: "par_file_hash_inventories",
+        floor: SizeFloor::ReleaseSize,
+        columns: &[
+            int("c.releases_id", "release_id"),
+            text("c.release_guid", "release_guid"),
+            int("c.evidence_last_id", "evidence_last_id"),
+            int("c.evidence_count", "evidence_count"),
+            int("c.proof_version", "proof_version"),
         ],
     },
     &Table {
@@ -283,6 +339,7 @@ pub static RELEASE_CHILDREN: &[&Table] = &[
         columns: &[
             int("c.releases_id", "release_id"),
             int("c.id", "id"),
+            text("c.release_guid", "release_guid"),
             text("c.packet_checksum", "packet_checksum"),
             text("c.recovery_set_id", "recovery_set_id"),
             text("c.file_id", "file_id"),
@@ -302,11 +359,12 @@ pub static RELEASE_CHILDREN: &[&Table] = &[
         floor: SizeFloor::ReleaseSize,
         columns: &[
             int("c.releases_id", "release_id"),
+            text("c.release_guid", "release_guid"),
             text("c.source_sha256", "source_sha256"),
             int("c.proof_version", "proof_version"),
             text("c.scope", "scope"),
             text("c.episode_files", "episode_files"),
-            int("UNIX_TIMESTAMP(c.updated_at)", "updated_at"),
+            date!("c.updated_at", "updated_at"),
         ],
     },
     &Table {
@@ -387,7 +445,7 @@ pub static RELEASE_CHILDREN: &[&Table] = &[
             text("c.status", "status"),
             text("c.metadata", "metadata"),
             text("c.last_error", "last_error"),
-            int("UNIX_TIMESTAMP(c.collected_at)", "collected_at"),
+            date!("c.collected_at", "collected_at"),
         ],
     },
 ];
@@ -397,7 +455,81 @@ pub static GROUPS: Table = Table {
     from: "usenet_groups c",
     dest: "usenet_groups",
     floor: SizeFloor::None,
-    columns: &[int("c.id", "id"), text("c.name", "name")],
+    columns: &[
+        int("c.id", "id"),
+        text("c.name", "name"),
+        int("c.backfill_target", "backfill_target"),
+        int("c.first_record", "first_record"),
+        date!("c.first_record_postdate", "first_record_at"),
+        int("c.last_record", "last_record"),
+        date!("c.last_record_postdate", "last_record_at"),
+        date!("c.last_updated", "last_updated_at"),
+        int("c.minfilestoformrelease", "min_files"),
+        int("c.minsizetoformrelease", "min_size"),
+        int("c.active", "active"),
+        int("c.backfill", "backfill"),
+        text("c.description", "description"),
+    ],
+};
+
+pub static VIDEOS: Table = Table {
+    from: "videos c",
+    dest: "legacy_videos",
+    floor: SizeFloor::None,
+    columns: &[
+        int("c.id", "id"),
+        int("c.type", "kind"),
+        text("c.title", "title"),
+        text("c.countries_id", "country"),
+        text("CAST(c.started AS CHAR)", "started"),
+        int("c.anidb", "anidb_id"),
+        text("c.imdb", "imdb_id"),
+        int("c.tmdb", "tmdb_id"),
+        int("c.trakt", "trakt_id"),
+        int("c.tvdb", "tvdb_id"),
+        int("c.tvmaze", "tvmaze_id"),
+        int("c.tvrage", "tvrage_id"),
+        int("c.source", "source"),
+    ],
+};
+
+pub static TV_EPISODES: Table = Table {
+    from: "tv_episodes c",
+    dest: "legacy_tv_episodes",
+    floor: SizeFloor::None,
+    columns: &[
+        int("c.id", "id"),
+        int("c.videos_id", "video_id"),
+        int("c.series", "season"),
+        int("c.episode", "episode"),
+        text("c.se_complete", "se_complete"),
+        text("c.title", "title"),
+        text("CAST(c.firstaired AS CHAR)", "first_aired"),
+    ],
+};
+
+pub static MOVIES: Table = Table {
+    from: "movieinfo c",
+    dest: "legacy_movies",
+    floor: SizeFloor::None,
+    columns: &[
+        int("c.id", "id"),
+        text("c.imdbid", "imdb_id"),
+        int("c.tmdbid", "tmdb_id"),
+        int("c.traktid", "trakt_id"),
+        text("c.title", "title"),
+        text("c.tagline", "tagline"),
+        text("c.rating", "rating"),
+        text("c.rtrating", "rt_rating"),
+        text("c.plot", "plot"),
+        text("c.year", "year"),
+        text("c.genre", "genre"),
+        text("c.type", "kind"),
+        text("c.director", "director"),
+        text("c.actors", "actors"),
+        text("c.language", "language"),
+        text("c.trailer", "trailer"),
+    ],
 };
 
 pub static PREDB: Table = Table {
@@ -410,8 +542,8 @@ pub static PREDB: Table = Table {
         text("c.nfo", "nfo"),
         text("c.size", "size"),
         text("c.category", "category"),
-        int("UNIX_TIMESTAMP(c.predate)", "pre_at"),
-        int("UNIX_TIMESTAMP(c.imported_at)", "imported_at"),
+        date!("c.predate", "pre_at"),
+        date!("c.imported_at", "imported_at"),
         text("c.source", "source"),
         int("c.requestid", "request_id"),
         int("c.groups_id", "group_id"),
@@ -422,9 +554,19 @@ pub static PREDB: Table = Table {
     ],
 };
 
+/// Tables copied whole in key order, each with its resume step.
+pub static WHOLE_TABLES: &[(&Table, &str)] = &[
+    (&GROUPS, "groups"),
+    (&VIDEOS, "videos"),
+    (&TV_EPISODES, "tv_episodes"),
+    (&MOVIES, "movies"),
+    (&PREDB, "predb"),
+];
+
 /// Every table above, for probes and counts.
 pub fn all_tables() -> Vec<&'static Table> {
-    let mut tables = vec![&GROUPS, &PREDB, &RELEASES];
+    let mut tables: Vec<&'static Table> = WHOLE_TABLES.iter().map(|(table, _)| *table).collect();
+    tables.push(&RELEASES);
     tables.extend(RELEASE_CHILDREN.iter().copied());
     tables
 }
@@ -447,6 +589,15 @@ pub const SELECT_NZB_HASHES: &str = "SELECT n.releases_id, n.source_digest, n.de
 /// Counts the NZBs an import should copy. Binds: size floor.
 pub const SELECT_NZB_COUNT: &str = "SELECT COUNT(*) FROM release_nzb_contents n \
      JOIN releases r ON r.id = n.releases_id WHERE r.size >= ?";
+
+/// Row count and total bytes of releases below the floor, which stay behind.
+/// Binds: size floor.
+pub const SELECT_RELEASES_BELOW_FLOOR: &str =
+    "SELECT COUNT(*), CAST(COALESCE(SUM(size), 0) AS UNSIGNED) FROM releases WHERE size < ?";
+
+/// Every table and column the source has.
+pub const SELECT_SOURCE_COLUMNS: &str = "SELECT CAST(table_name AS CHAR), CAST(column_name AS CHAR) \
+     FROM information_schema.columns WHERE table_schema = DATABASE()";
 
 /// Row count and total bytes of releases at or above the floor. Binds: size floor.
 pub const SELECT_RELEASE_TOTALS: &str =
@@ -497,8 +648,11 @@ mod tests {
             SELECT_NZB_HASHES.to_owned(),
             SELECT_NZB_COUNT.to_owned(),
             SELECT_RELEASE_TOTALS.to_owned(),
+            SELECT_RELEASES_BELOW_FLOOR.to_owned(),
+            SELECT_SOURCE_COLUMNS.to_owned(),
         ];
         for table in all_tables() {
+            statements.extend(table.select_lost_dates().into_iter().map(|(_, sql)| sql));
             statements.extend([
                 table.select_range(),
                 table.select_count(),
@@ -538,6 +692,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dates_never_use_a_conversion_that_turns_old_dates_into_null() {
+        for table in all_tables() {
+            for column in table.columns {
+                assert!(!column.source.contains("UNIX_TIMESTAMP"), "{}", column.dest);
+            }
+        }
+        let lost = RELEASES.select_lost_dates();
+        assert_eq!(lost.len(), 2);
+        assert_eq!(lost[0].0, "posted_at");
+        assert!(
+            lost[0]
+                .1
+                .contains("c.postdate IS NOT NULL AND TIMESTAMPDIFF"),
+            "{}",
+            lost[0].1
+        );
+        assert!(lost[0].1.ends_with("AND c.size >= ?"), "{}", lost[0].1);
     }
 
     #[test]

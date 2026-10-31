@@ -17,11 +17,9 @@ use crate::convert::{Anomaly, SqlRow, row_to_sql};
 use crate::legacy::{SourceNzb, check_nzb};
 use crate::plan::{IdRange, Planner};
 use crate::source::Source;
-use crate::spec::{self, GROUPS, PREDB, RELEASE_CHILDREN, RELEASES, Table};
+use crate::spec::{self, RELEASE_CHILDREN, RELEASES, Table, WHOLE_TABLES};
 use crate::writer::{Batch, TableRows, Writer};
 
-pub(crate) const STEP_GROUPS: &str = "groups";
-pub(crate) const STEP_PREDB: &str = "predb";
 pub(crate) const STEP_RELEASES: &str = "releases";
 
 const PLAN_PAGE: u64 = 5_000;
@@ -100,8 +98,9 @@ pub async fn run(source: &Source, options: &ImportOptions) -> Result<ImportRepor
     let mut writer = commit_blocking(move || Writer::open(&data_dir, min_size)).await?;
     let mut report = ImportReport::default();
 
-    writer = copy_keyset(source, writer, &GROUPS, STEP_GROUPS, &mut report).await?;
-    writer = copy_keyset(source, writer, &PREDB, STEP_PREDB, &mut report).await?;
+    for (table, step) in WHOLE_TABLES.iter().copied() {
+        writer = copy_keyset(source, writer, table, step, &mut report).await?;
+    }
     let (writer, complete) = copy_releases(source, writer, options, &mut report).await?;
     commit_blocking(move || writer.checkpoint()).await?;
 
