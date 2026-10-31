@@ -1,6 +1,7 @@
 //! Runs against a real, disposable MariaDB, and only when one is named:
 //! `INDEXER_IMPORT_TEST_MARIADB=host:port` with `INDEXER_IMPORT_TEST_ROOT_PASSWORD`.
-//! Each test makes its own database. Never point this at a database you care about.
+//! Each test makes its own database, and its test logins share the root password.
+//! Never point this at a database you care about.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -18,7 +19,6 @@ use tempfile::TempDir;
 
 const MIN_SIZE: u64 = 500_000_000;
 const RO_USER: &str = "import_test_ro";
-const RO_PASSWORD: &str = "import-test-only";
 static NEXT_DB: AtomicU32 = AtomicU32::new(0);
 
 struct Fixture {
@@ -67,12 +67,12 @@ impl Fixture {
             .ip_or_hostname(host.to_owned())
             .tcp_port(port)
             .user(Some("root"))
-            .pass(Some(root));
+            .pass(Some(root.clone()));
         let mut admin = Conn::new(opts).await.unwrap();
         admin
             .query_drop(format!(
                 "CREATE DATABASE {database} CHARACTER SET utf8mb4;
-                 CREATE USER IF NOT EXISTS '{RO_USER}'@'%' IDENTIFIED BY '{RO_PASSWORD}';
+                 CREATE USER IF NOT EXISTS '{RO_USER}'@'%' IDENTIFIED BY '{root}';
                  GRANT SELECT ON {database}.* TO '{RO_USER}'@'%';
                  USE {database};
                  {}",
@@ -107,7 +107,7 @@ impl Fixture {
                 .unwrap();
         }
 
-        let source = source_for(host, port, &database, RO_USER, RO_PASSWORD);
+        let source = source_for(host, port, &database, RO_USER, &root);
         Some(Self {
             host: host.to_owned(),
             port,
@@ -490,10 +490,11 @@ async fn a_login_that_cannot_see_everything_cannot_verify() {
         return;
     };
     fx.import().await;
+    let root = std::env::var("INDEXER_IMPORT_TEST_ROOT_PASSWORD").unwrap();
     let user = format!("narrow_{}", &fx.database["import_test_".len()..]);
     let tables: Vec<String> = fx.admin.query("SHOW TABLES").await.unwrap();
     fx.admin
-        .query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'narrow'"))
+        .query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY '{root}'"))
         .await
         .unwrap();
     for table in tables {
@@ -505,7 +506,7 @@ async fn a_login_that_cannot_see_everything_cannot_verify() {
             .await
             .unwrap();
     }
-    let narrow = source_for(&fx.host, fx.port, &fx.database, &user, "narrow");
+    let narrow = source_for(&fx.host, fx.port, &fx.database, &user, &root);
     let check = verify(&narrow, fx.dir.path(), 2, 1_000_000, 3)
         .await
         .unwrap();
