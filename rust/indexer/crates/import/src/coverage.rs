@@ -14,16 +14,20 @@ const OTHER_MEDIA: &str = "metadata for media this indexer doesn't keep";
 const HEADERS: &str = "headers, which can be downloaded again";
 const EMPTY: &str = "empty, which verification checks";
 const SEEDED: &str = "reference data seeded from the repo";
+const REBUILT: &str = "rebuilt from the news server's group list";
+const PROVENANCE: &str = "which old regex named each release";
 const REFETCHABLE: &str = "can be fetched again from TMDB and TVDB";
 const PER_RELEASE_APP: &str = "per-release activity in the old web app";
 
-/// Left out only because they hold nothing. PreDB CRCs are evidence that can't be
-/// fetched again, so a row appearing here must stop verification.
-static MUST_BE_EMPTY: &[&str] = &["predb_crcs"];
+/// Left out only because they hold nothing. These would hold PreDB records and other
+/// evidence that can't be fetched again, so a row appearing here must stop verification.
+static MUST_BE_EMPTY: &[&str] = &["poster_renames", "predb_crcs", "predb_imports"];
 
 /// Tables that aren't copied at all, by reason.
 static LEFT_TABLES: &[(&str, &[&str])] = &[
     (EMPTY, MUST_BE_EMPTY),
+    (REBUILT, &["short_groups"]),
+    (PROVENANCE, &["release_regexes"]),
     (
         APP_STATE,
         &[
@@ -112,16 +116,13 @@ static LEFT_TABLES: &[(&str, &[&str])] = &[
             "par2_hash_retry",
             "par2_rename_candidate_progress",
             "par2_rename_progress",
-            "poster_renames",
             "predb_identity_keys",
             "predb_identity_revisions",
             "predb_identity_state",
-            "predb_imports",
             "release_fingerprint_connections",
             "release_fingerprint_jobs",
             "release_fingerprint_provider_state",
             "release_nzb_creation_failures",
-            "release_regexes",
             "release_stats",
             "release_verification_audit_retries",
             "release_verification_candidates",
@@ -179,7 +180,6 @@ static LEFT_TABLES: &[(&str, &[&str])] = &[
             "genres",
             "release_naming_regexes",
             "root_categories",
-            "short_groups",
         ],
     ),
     (REFETCHABLE, &["tv_info", "videos_aliases"]),

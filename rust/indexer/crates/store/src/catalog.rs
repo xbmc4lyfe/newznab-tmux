@@ -19,8 +19,11 @@ impl Catalog {
         let mut conn = Connection::open(path)
             .with_context(|| format!("opening catalog {}", path.display()))?;
         sqlite::set_wal(&conn)?;
+        // Plain fsync on macOS leaves writes in the drive's cache, and a checkpoint
+        // out of order could lose rows behind a resume point that survived.
         conn.execute_batch(
             "PRAGMA synchronous = NORMAL;
+             PRAGMA checkpoint_fullfsync = ON;
              PRAGMA busy_timeout = 10000;
              PRAGMA cache_size = -262144;
              PRAGMA temp_store = MEMORY;",
