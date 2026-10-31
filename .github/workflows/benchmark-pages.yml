@@ -18,8 +18,8 @@ concurrency:
 
 jobs:
   test:
-    # Avoid self-hosted workers that also advertise ubuntu-latest without Node.js installed.
-    runs-on: [spot, ubuntu-latest]
+    # Needs the Node.js that GitHub-hosted images provide.
+    runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.source.outputs.sha }}
     steps:
@@ -85,7 +85,7 @@ jobs:
         github.event.workflow_run.head_repository.full_name == github.repository &&
         github.event.workflow_run.head_branch == 'master')) &&
       (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/master')
-    runs-on: [spot, ubuntu-latest]
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read
@@ -175,7 +175,7 @@ jobs:
 
   deploy:
     needs: build
-    runs-on: [spot, ubuntu-latest]
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read

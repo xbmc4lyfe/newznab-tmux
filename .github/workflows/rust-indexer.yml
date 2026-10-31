@@ -27,7 +27,7 @@ jobs:
       matrix:
         include:
           - os: linux
-            runs-on: [spot, ubuntu-latest]
+            runs-on: ubuntu-latest
           # The indexer runs on an Apple Silicon Mac.
           - os: macos
             runs-on: macos-15

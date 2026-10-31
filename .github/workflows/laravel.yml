@@ -4,8 +4,8 @@ on: [push]
 
 jobs:
   tests:
-    # Avoid self-hosted workers that also advertise ubuntu-latest but have no Docker daemon.
-    runs-on: [spot, ubuntu-latest]
+    # Needs the Docker daemon that GitHub-hosted images provide.
+    runs-on: ubuntu-24.04
 
     strategy:
       fail-fast: true
