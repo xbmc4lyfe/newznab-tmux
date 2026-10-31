@@ -1,0 +1,33 @@
+# Ground-up Rust indexer: one binary (crates/indexer) over one library crate per
+# pipeline stage. Shared dependencies live here so every crate agrees on versions.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+indexer-config = { path = "crates/config" }
+indexer-core = { path = "crates/core" }
+indexer-telemetry = { path = "crates/telemetry" }
+
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+codegen-units = 1
+debug = "line-tables-only"
+lto = "thin"
