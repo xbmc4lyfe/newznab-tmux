@@ -88,6 +88,8 @@ catalog! {
 
     // Phase 1 speed numbers
     Counter IMPORT_ROWS = "indexer_import_rows_total", "Rows imported from MariaDB, by table.";
+    Counter IMPORT_NZB_BYTES = "indexer_import_nzb_bytes_total", "Compressed NZB bytes imported from MariaDB.";
+    Counter IMPORT_ANOMALIES = "indexer_import_anomalies_total", "Rows or NZBs kept that could not be vouched for, by kind.";
     Histogram SEARCH_QUERY_DURATION = "indexer_search_query_duration_seconds", "Text search latency, by engine.";
 }
 
