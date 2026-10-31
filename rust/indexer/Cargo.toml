@@ -1,0 +1,45 @@
+# Ground-up Rust indexer: one binary (crates/indexer) over one library crate per
+# pipeline stage. Shared dependencies live here so every crate agrees on versions.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+indexer-config = { path = "crates/config" }
+indexer-core = { path = "crates/core" }
+indexer-telemetry = { path = "crates/telemetry" }
+
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+clap = { version = "4", features = ["derive", "env"] }
+figment = { version = "0.10", features = ["env", "toml"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+opentelemetry = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "internal-logs", "reqwest-blocking-client", "trace"] }
+opentelemetry_sdk = "0.33"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.8"
+tracing = "0.1"
+tracing-opentelemetry = "0.34"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+codegen-units = 1
+debug = "line-tables-only"
+lto = "thin"
