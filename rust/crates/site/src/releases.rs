@@ -344,7 +344,7 @@ pub(crate) fn path_segment(text: &str) -> String {
 }
 
 const ROW_COLUMNS: &str = "CAST(r.id AS SIGNED) AS id, r.searchname, r.guid, r.postdate, r.adddate,
-    CAST(r.size AS SIGNED) AS size, CAST(r.totalpart AS SIGNED) AS totalpart, r.fromname, CAST(r.grabs AS SIGNED) AS grabs,
+    CAST(r.size AS SIGNED) AS size, CAST(COALESCE(r.totalpart, 0) AS SIGNED) AS totalpart, r.fromname, CAST(r.grabs AS SIGNED) AS grabs,
     CAST(r.comments AS SIGNED) AS comments, CAST(r.videos_id AS SIGNED) AS videos_id, CAST(r.haspreview AS SIGNED) AS haspreview,
     CAST(r.jpgstatus AS SIGNED) AS jpgstatus, CAST(r.nfostatus AS SIGNED) AS nfostatus, r.group_name,
     CONCAT(cp.title, ' > ', c.title) AS category_name,

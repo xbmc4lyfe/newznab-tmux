@@ -157,15 +157,20 @@ async fn build_list(
     let order = order_or_default(&input.str("ob"));
     let limit = per_page();
     let offset = input.page().saturating_sub(1).saturating_mul(limit);
-    let rows = browse_rows(
-        &ctx.db,
-        filter,
-        order,
-        limit,
-        offset,
-        signed_in.user.timezone.as_deref(),
-    )
-    .await?;
+    // A page past the end has nothing to show, so don't make the database walk to it.
+    let rows = if offset >= total {
+        Vec::new()
+    } else {
+        browse_rows(
+            &ctx.db,
+            filter,
+            order,
+            limit,
+            offset,
+            signed_in.user.timezone.as_deref(),
+        )
+        .await?
+    };
     Ok(ReleaseList::new(path, input, rows, total))
 }
 
@@ -381,6 +386,13 @@ impl GroupRow {
     fn short_name(&self) -> String {
         self.name.replace("alt.binaries", "a.b")
     }
+
+    fn browse_url(&self) -> String {
+        format!(
+            "/browse/group?g={}",
+            nntmux_webkit::config::encode_component(&self.name)
+        )
+    }
 }
 
 #[derive(Template)]
@@ -513,6 +525,9 @@ async fn cart(
     Ok(Html(page.render()?).into_response())
 }
 
+/// One basket click, not an unbounded list of queries.
+const MAX_CART_ADD: usize = 500;
+
 fn split_guids(text: &str) -> Vec<String> {
     let mut seen = Vec::new();
     for guid in text
@@ -534,7 +549,8 @@ async fn cart_add(
     CurrentUser(signed_in): CurrentUser,
 ) -> WebResult {
     let wants_json = headers.contains_key("x-requested-with") || guard::expects_json(&headers);
-    let guids = split_guids(&input.str("id"));
+    let mut guids = split_guids(&input.str("id"));
+    guids.truncate(MAX_CART_ADD);
     let mut release_ids: Vec<i64> = Vec::new();
     for guid in &guids {
         if let Some(id) =
@@ -649,12 +665,13 @@ async fn nfo(
             .fetch_optional(&ctx.db)
             .await?;
     let (id, name) = release.ok_or(WebError::NotFound)?;
-    let data: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT nfo FROM release_nfos WHERE releases_id = ?")
-            .bind(id)
-            .fetch_optional(&ctx.db)
-            .await?
-            .flatten();
+    let data: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT UNCOMPRESS(nfo) FROM release_nfos WHERE releases_id = ? AND nfo IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_optional(&ctx.db)
+    .await?
+    .flatten();
     let data = data.ok_or(WebError::NotFound)?;
     let text = cp437_to_utf8(&data);
     if input.has("modal") {

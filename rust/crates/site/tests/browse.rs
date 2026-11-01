@@ -201,7 +201,7 @@ async fn nfo_pages_convert_cp437() {
     add_user(&db.pool, &name, true, 1).await;
     let group = add_group(&db.pool, &unique("alt.binaries.nfo")).await;
     let (release, guid) = add_release(&db.pool, "Nfo.Release", 2040, group).await;
-    sqlx::query("INSERT INTO release_nfos (releases_id, nfo) VALUES (?, ?)")
+    sqlx::query("INSERT INTO release_nfos (releases_id, nfo) VALUES (?, COMPRESS(?))")
         .bind(release)
         .bind(vec![0x41u8, 0xDB])
         .execute(&db.pool)
