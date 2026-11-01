@@ -18,15 +18,31 @@ pub fn connect_options(config: &DatabaseConfig) -> MySqlConnectOptions {
         .username(&config.username)
         .password(&config.password)
         .database(&config.database)
-        .charset("utf8mb4");
+        .charset("utf8mb4")
+        .collation("utf8mb4_unicode_ci")
+        .pipes_as_concat(false);
     match &config.ssl_ca {
         Some(ca) => options.ssl_mode(MySqlSslMode::VerifyCa).ssl_ca(ca),
         None => options.ssl_mode(MySqlSslMode::Preferred),
     }
 }
 
+/// Every connection uses the SQL mode Laravel set (`strict => false`). Real Usenet data
+/// overflows columns such as `collections.fromname`, where PHP stored a truncated value and
+/// the server's strict default would raise an error.
+fn pool_options() -> MySqlPoolOptions {
+    MySqlPoolOptions::new().after_connect(|connection, _| {
+        Box::pin(async move {
+            sqlx::query("SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'")
+                .execute(connection)
+                .await?;
+            Ok(())
+        })
+    })
+}
+
 pub async fn connect(config: &DatabaseConfig) -> Result<MySqlPool> {
-    MySqlPoolOptions::new()
+    pool_options()
         .max_connections(config.max_connections)
         .acquire_timeout(Duration::from_secs(30))
         .connect_with(connect_options(config))
@@ -36,8 +52,12 @@ pub async fn connect(config: &DatabaseConfig) -> Result<MySqlPool> {
 
 /// Connects from a `mysql://` URL. Tests and one-off tools use this.
 pub async fn connect_url(url: &str) -> Result<MySqlPool> {
-    let options = MySqlConnectOptions::from_str(url).context("parsing the database URL")?;
-    MySqlPoolOptions::new()
+    let options = MySqlConnectOptions::from_str(url)
+        .context("parsing the database URL")?
+        .charset("utf8mb4")
+        .collation("utf8mb4_unicode_ci")
+        .pipes_as_concat(false);
+    pool_options()
         .max_connections(8)
         .connect_with(options)
         .await

@@ -2,10 +2,13 @@
 //! claim-work-commit loop.
 
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use futures_util::FutureExt;
 use nntmux_core::Config;
 use redis::aio::ConnectionManager;
 use sqlx::MySqlPool;
@@ -53,13 +56,13 @@ impl Ctx {
 #[derive(Clone, Debug, clap::Args)]
 pub struct RoleArgs {
     /// Concurrent work slots.
-    #[arg(long, env = "NNTMUX_CONCURRENCY", default_value_t = 4)]
+    #[arg(long, global = true, env = "NNTMUX_CONCURRENCY", default_value_t = 4)]
     pub concurrency: usize,
     /// Seconds to wait when there's no work.
-    #[arg(long, env = "NNTMUX_IDLE_SECONDS", default_value_t = 10)]
+    #[arg(long, global = true, env = "NNTMUX_IDLE_SECONDS", default_value_t = 10)]
     pub idle_seconds: u64,
     /// Do one pass over the available work, then exit.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub once: bool,
 }
 
@@ -106,8 +109,11 @@ impl Shutdown {
 }
 
 /// Runs `args.concurrency` copies of `work` until shutdown. `work` claims one unit, processes
-/// it and commits. It returns false when there was nothing to claim. An error is logged and
-/// counted, and that slot backs off, so one bad unit can't stop the role.
+/// it and commits. It returns false when there was nothing to claim. An error or panic is
+/// logged and counted, and that slot backs off, so one bad unit can't stop the role.
+///
+/// With `--once`, each slot stops at the first empty claim, error or pause, and the call fails
+/// if any unit failed, so a one-shot job reports it through its exit code.
 pub async fn run_slots<F, Fut>(
     ctx: Ctx,
     role: &'static str,
@@ -120,17 +126,44 @@ where
     Fut: Future<Output = Result<bool>> + Send + 'static,
 {
     let idle = Duration::from_secs(args.idle_seconds);
+    let failed = Arc::new(AtomicBool::new(false));
     let mut tasks = JoinSet::new();
     for slot in 0..args.concurrency {
-        let (ctx, stop, work) = (ctx.clone(), stop.clone(), work.clone());
+        let (ctx, stop, work, failed) = (ctx.clone(), stop.clone(), work.clone(), failed.clone());
         let once = args.once;
         tasks.spawn(async move {
             while !stop.requested() {
-                if ctx.paused().await.unwrap_or(false) {
-                    stop.sleep(Duration::from_secs(5)).await;
-                    continue;
+                match ctx.paused().await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        if once {
+                            info!(role, slot, "paused, leaving the one-shot pass");
+                            break;
+                        }
+                        stop.sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    // Unknown state: claim nothing until the database answers.
+                    Err(failure) => {
+                        error!(
+                            role,
+                            slot,
+                            error = format!("{failure:#}"),
+                            "can't read the pause flag"
+                        );
+                        failed.store(true, Ordering::Relaxed);
+                        if once {
+                            break;
+                        }
+                        stop.sleep(idle).await;
+                        continue;
+                    }
                 }
-                match work(ctx.clone(), slot).await {
+                let outcome = AssertUnwindSafe(work(ctx.clone(), slot))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|panic| Err(anyhow!(panic_message(panic.as_ref()))));
+                match outcome {
                     Ok(true) => {
                         metrics::counter!("nntmux_work_units_total", "role" => role).increment(1);
                     }
@@ -148,6 +181,7 @@ where
                             error = format!("{failure:#}"),
                             "work unit failed"
                         );
+                        failed.store(true, Ordering::Relaxed);
                         if once {
                             break;
                         }
@@ -160,5 +194,17 @@ where
     while let Some(joined) = tasks.join_next().await {
         joined.context("a work slot panicked")?;
     }
+    if args.once && failed.load(Ordering::Relaxed) {
+        bail!("the {role} pass had failures");
+    }
     Ok(())
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    let detail = panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string payload".to_owned());
+    format!("panicked: {detail}")
 }
