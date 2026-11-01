@@ -14,6 +14,7 @@ crc32fast.workspace = true
 hex.workspace = true
 md-5.workspace = true
 nntmux-core.workspace = true
+nntmux-nntp.workspace = true
 nntmux-namefix.workspace = true
 nntmux-nntp.workspace = true
 nntmux-metadata.workspace = true

@@ -2612,6 +2612,7 @@ dependencies = [
  "hex",
  "md-5 0.10.6",
  "nntmux-core",
+ "nntmux-nntp",
  "nntmux-namefix",
  "nntmux-nntp",
  "nntmux-metadata",
