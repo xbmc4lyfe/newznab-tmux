@@ -13,11 +13,6 @@ final class ScratchBudget
 {
     public function __construct(private readonly ?int $entryId = null) {}
 
-    public function forEntry(int $entryId): self
-    {
-        return new self($entryId);
-    }
-
     /** Bootstrap old physical scratch once, while every verifier and audit is excluded. */
     public function initialize(): bool
     {

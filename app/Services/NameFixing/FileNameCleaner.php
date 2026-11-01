@@ -454,26 +454,6 @@ class FileNameCleaner
     }
 
     /**
-     * Normalize quality indicators in filenames.
-     */
-    public function normalizeQualityIndicators(string $fileName): string
-    {
-        $qualityMap = [
-            '/\.4k$/i' => '.2160p',
-            '/\.fullhd$/i' => '.1080p',
-            '/\.hd$/i' => '.720p',
-            '/\.int$/i' => '.INTERNAL',
-            '/\.internal$/i' => '.INTERNAL',
-        ];
-
-        foreach ($qualityMap as $pattern => $replacement) {
-            $fileName = preg_replace($pattern, $replacement, $fileName);
-        }
-
-        return $fileName;
-    }
-
-    /**
      * Check if a filename looks like a scene release.
      *
      * @param  string  $filename  The filename to check

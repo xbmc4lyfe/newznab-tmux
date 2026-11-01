@@ -106,35 +106,6 @@ class NameCheckerService
     }
 
     /**
-     * Check using a specific checker by name.
-     *
-     * @param  string  $checkerName  The name of the checker to use
-     * @param  object  $release  The release object
-     * @param  string  $textstring  The text to check
-     * @return NameFixResult|null The result if matched, null otherwise
-     */
-    public function checkWith(string $checkerName, object $release, string $textstring): ?NameFixResult
-    {
-        $checker = $this->checkers->first(
-            fn (NameCheckerInterface $c) => strtolower($c->getName()) === strtolower($checkerName)
-        );
-
-        return $checker?->check($release, $textstring);
-    }
-
-    /**
-     * Get all registered checkers.
-     *
-     * @return Collection<int, NameCheckerInterface>
-     */
-    public function getCheckers(): Collection
-    {
-        $this->ensureSorted();
-
-        return $this->checkers;
-    }
-
-    /**
      * Get checker statistics.
      *
      * @return array<string, mixed>

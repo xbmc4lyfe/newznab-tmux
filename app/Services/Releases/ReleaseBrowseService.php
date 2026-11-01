@@ -676,29 +676,6 @@ class ReleaseBrowseService
     }
 
     /**
-     * @param  array<int, int>  $excludedCats
-     */
-    public function getShowsCount(mixed $userShows, int $maxAge = -1, array $excludedCats = []): int
-    {
-        return $this->getPagerCount(
-            sprintf(
-                'SELECT r.id
-				FROM releases r
-				WHERE %s %s
-				AND r.categories_id BETWEEN %d AND %d
-				AND r.passwordstatus %s
-				%s',
-                $this->uSQL($userShows, 'videos_id'),
-                (\count($excludedCats) ? ' AND r.categories_id NOT IN ('.implode(',', $excludedCats).')' : ''),
-                Category::TV_ROOT,
-                Category::TV_OTHER,
-                $this->showPasswords(),
-                ($maxAge > 0 ? sprintf(' AND r.postdate > NOW() - INTERVAL %d DAY ', $maxAge) : '')
-            )
-        );
-    }
-
-    /**
      * Creates part of a query for some functions.
      *
      * @param  array<string, mixed>  $userQuery
@@ -732,61 +709,6 @@ class ReleaseBrowseService
     private function getCacheVersion(): int
     {
         return (int) Cache::get(self::CACHE_VERSION_KEY, 1);
-    }
-
-    /**
-     * Search releases using the search index with category filtering.
-     * This method pre-filters results via the search index before hitting the database,
-     * significantly improving performance for searches with text terms.
-     *
-     * @param  string  $searchTerm  Search term to match
-     * @param  array<string, mixed>  $categories  Category IDs to filter by (optional)
-     * @param  int  $limit  Maximum number of results
-     * @return array<string, mixed> Array of release IDs matching the search criteria
-     */
-    public function searchByIndexWithCategories(string $searchTerm, array $categories = [], int $limit = 1000): array
-    {
-        if (empty($searchTerm) || ! Search::isAvailable()) {
-            return [];
-        }
-
-        $searchResult = Search::searchReleasesWithFuzzy(['searchname' => $searchTerm], $limit);
-        $releaseIds = $searchResult['ids'] ?? [];
-
-        if (empty($releaseIds)) {
-            return [];
-        }
-
-        // If categories are specified, filter the results by querying the database for just the IDs
-        if (! empty($categories) && ! in_array(-1, $categories, true)) {
-            $filteredIds = Release::query()
-                ->select('id')
-                ->whereIn('id', $releaseIds)
-                ->whereIn('categories_id', $categories)
-                ->pluck('id')
-                ->toArray();
-
-            return $filteredIds;
-        }
-
-        return $releaseIds;
-    }
-
-    /**
-     * Get releases by external media ID using search index.
-     * Useful for movie/TV browse pages that need to find all releases for a specific movie/show.
-     *
-     * @param  array<string, mixed>  $externalIds  Associative array of external IDs (e.g., ['imdbid' => 123456])
-     * @param  int  $limit  Maximum number of results
-     * @return array<string, mixed> Array of release IDs
-     */
-    public function getReleasesByExternalId(array $externalIds, int $limit = 100): array
-    {
-        if (empty($externalIds) || ! Search::isAvailable()) {
-            return [];
-        }
-
-        return Search::searchReleasesByExternalId($externalIds, $limit);
     }
 
     /**
