@@ -118,6 +118,7 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
             slot,
             max_seconds,
         } => {
+            worker::refuse_remote_publication()?;
             let worker = worker::Worker::new(&ctx, verify.clone()).await?;
             let source = worker::NntpSource::new(worker.nntp.clone(), &verify);
             let options = worker::RunOptions {

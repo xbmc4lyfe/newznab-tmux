@@ -1,10 +1,12 @@
 //! The candidate worker: claims candidates, spot checks them over NNTP and publishes the results.
 //!
 //! Spot checks stay in memory, so this writes no scratch directories. It still cleans up the ones
-//! earlier workers registered. Prefetching samples across candidates isn't ported: PHP only did it
+//! earlier workers registered, except a committed audit deletion's: its release's cleanup belongs to
+//! the audit port, which is what must take those entries. Prefetching samples across candidates isn't ported: PHP only did it
 //! when `RELEASE_VERIFICATION_SAMPLE_BATCH_SIZE` was raised above its default of one.
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -12,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use nntmux_categorize::Categorizer;
 use nntmux_core::{parsed_or, var_or};
 use nntmux_nntp::pipeline::{Batch, BatchError, Mode, verification_article_batch};
@@ -91,17 +94,24 @@ impl ArticleSource for NntpSource {
         if message_ids.len() > MAX_STAT_REQUESTS {
             bail!("Too many verification STAT requests.");
         }
+        // A sample may repeat an article, and manifests carry IDs with or without brackets.
+        let mut ids: Vec<String> = message_ids
+            .iter()
+            .map(|id| id.trim_matches(['<', '>']).to_owned())
+            .collect();
+        ids.sort();
+        ids.dedup();
         let mut client = self.client.lock().await;
         client.do_connect(false, false).await.map_err(fetch_error)?;
         let batch = Batch {
             client: &mut client,
-            ids: message_ids.to_vec(),
+            ids: ids.clone(),
         };
         let mut heartbeat = || Ok::<(), std::convert::Infallible>(());
         let mut results = verification_article_batch(
             vec![batch],
             1,
-            message_ids.len() as i64,
+            ids.len() as i64,
             Mode::Stat,
             &mut heartbeat,
         )
@@ -110,7 +120,7 @@ impl ArticleSource for NntpSource {
             BatchError::Invalid(failure) => anyhow!(failure),
             BatchError::Heartbeat(never) => match never {},
         })?;
-        for id in message_ids {
+        for id in &ids {
             match results.remove(id) {
                 Some(Ok(_)) => {}
                 Some(Err(failure)) => return Err(anyhow!(failure)),
@@ -130,6 +140,9 @@ pub struct Worker {
     pub nntp: Arc<NntpConfig>,
     /// Reads the operators' pause between candidates. Absent in tests.
     ctx: Option<Ctx>,
+    /// Fairness turns, which outlive a run's locks.
+    turns: AtomicI64,
+    expiry_first: AtomicBool,
     /// Where terminal scratch cleanup resumes, for this host's next maintenance turn.
     scratch_after: AtomicI64,
     scratch_ceiling: AtomicI64,
@@ -161,6 +174,8 @@ impl Worker {
             predb: PredbIndex::new(&ctx.config.manticore),
             nntp: Arc::new(NntpConfig::from_env()),
             ctx: Some(ctx.clone()),
+            turns: AtomicI64::new(0),
+            expiry_first: AtomicBool::new(false),
             scratch_after: AtomicI64::new(0),
             scratch_ceiling: AtomicI64::new(0),
         })
@@ -175,6 +190,8 @@ impl Worker {
             predb: PredbIndex::disabled(),
             nntp,
             ctx: None,
+            turns: AtomicI64::new(0),
+            expiry_first: AtomicBool::new(false),
             scratch_after: AtomicI64::new(0),
             scratch_ceiling: AtomicI64::new(0),
         })
@@ -239,7 +256,8 @@ impl Worker {
             {
                 break;
             }
-            let prefer_ready = locks.prefer_primary_queue(true);
+            // Four turns of five, so older queues still progress under a steady stream of new work.
+            let prefer_ready = self.turns.fetch_add(1, Ordering::Relaxed) % 5 != 4;
             let Some(claim) = candidates::claim(&self.verify, locks, prefer_ready).await? else {
                 break;
             };
@@ -257,7 +275,7 @@ impl Worker {
         // A slow maintenance backlog mustn't monopolize a verification slot.
         let deadline = Instant::now() + MAINTENANCE_BUDGET;
         let outcome = async {
-            let expiry_first = locks.prefer_expiry();
+            let expiry_first = self.expiry_first.fetch_xor(true, Ordering::Relaxed);
             // Each host cleans its own scratch. Expiry is shared, so another host may hold it.
             let expire = locks.try_expiry().await?;
             if expiry_first && expire {
@@ -428,8 +446,8 @@ impl Worker {
         }
     }
 
-    /// Recovers interrupted terminal cleanup without delaying claims indefinitely. Entries an audit
-    /// must still delete a release for are left to it.
+    /// Recovers interrupted terminal cleanup without delaying claims indefinitely. Entries with a
+    /// release still to delete wait for the audit port.
     async fn clean_terminal_scratch(
         &self,
         locks: &mut WorkerLocks,
@@ -652,7 +670,12 @@ impl LeaseRenewal {
         Self { task, lost }
     }
 
-    fn stop(self) {
+    fn stop(self) {}
+}
+
+/// Also on a panic: a renewal left running would keep the candidate leased until a restart.
+impl Drop for LeaseRenewal {
+    fn drop(&mut self) {
         self.task.abort();
     }
 }
@@ -682,6 +705,16 @@ impl RoleSettings {
             worker_seconds: parsed_or("RELEASE_VERIFICATION_WORKER_SECONDS", 300)?,
         })
     }
+}
+
+/// A remote host mustn't publish directly over the database.
+pub fn refuse_remote_publication() -> Result<()> {
+    if std::env::var("RELEASE_VERIFICATION_PUBLISH_URL").is_ok_and(|url| !url.is_empty()) {
+        bail!(
+            "Publishing through a primary host isn't ported yet; unset RELEASE_VERIFICATION_PUBLISH_URL."
+        );
+    }
+    Ok(())
 }
 
 /// The `verify` role: one loop per configured slot, and candidate preparation on the primary host.
@@ -741,7 +774,10 @@ pub async fn run_role(ctx: Ctx, args: RoleArgs, stop: Shutdown, verify: Verify) 
                         continue;
                     }
                 };
-                let run = worker.run(&source, options, &stop).await;
+                let run = AssertUnwindSafe(worker.run(&source, options, &stop))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("A verification run panicked.")));
                 drop(busy);
                 if let Err(failure) = &run {
                     error!(
