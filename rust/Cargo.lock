@@ -2537,6 +2537,7 @@ dependencies = [
  "clap",
  "hex",
  "nntmux-core",
+ "nntmux-metadata",
  "nntmux-runtime",
  "nntmux-testkit",
  "nntmux-verify",

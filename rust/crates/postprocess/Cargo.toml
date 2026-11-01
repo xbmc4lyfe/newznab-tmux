@@ -11,6 +11,7 @@ chrono.workspace = true
 clap.workspace = true
 hex.workspace = true
 nntmux-core.workspace = true
+nntmux-metadata.workspace = true
 nntmux-runtime.workspace = true
 nntmux-verify.workspace = true
 rand.workspace = true
