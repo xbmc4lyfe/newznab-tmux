@@ -373,7 +373,10 @@ async fn a_refused_group_keeps_the_previous_selection_and_is_asked_again() {
     nntp.select_group("alt.first", false).await.unwrap();
     for _ in 0..2 {
         assert_eq!(
-            nntp.select_group("alt.second", false).await.unwrap_err().code(),
+            nntp.select_group("alt.second", false)
+                .await
+                .unwrap_err()
+                .code(),
             Some(411)
         );
         assert_eq!(nntp.current_group(), "alt.first");
@@ -382,7 +385,11 @@ async fn a_refused_group_keeps_the_previous_selection_and_is_asked_again() {
 
 #[tokio::test]
 async fn a_status_line_cut_off_by_a_timeout_is_not_a_reply() {
-    let server = serve(vec![(ready(), vec![("BODY <a@b>", reply("222 0 <a@b> trunc"))])]).await;
+    let server = serve(vec![(
+        ready(),
+        vec![("BODY <a@b>", reply("222 0 <a@b> trunc"))],
+    )])
+    .await;
     let mut settings = config(server.port, None);
     settings.primary.socket_timeout = Duration::from_millis(100);
     let mut nntp = client(settings);
@@ -393,6 +400,28 @@ async fn a_status_line_cut_off_by_a_timeout_is_not_a_reply() {
         .unwrap_err();
     assert_eq!(error.to_string(), "Failed to read from socket...!");
     assert!(!nntp.is_connected().await);
+}
+
+/// Callers run these behind async_trait and tokio::spawn, so their futures must stay Send.
+#[tokio::test]
+async fn client_futures_can_be_spawned() {
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    let server = serve(vec![(
+        ready(),
+        vec![("GROUP alt.test", reply("211 1 1 1 alt.test\r\n"))],
+    )])
+    .await;
+    let mut nntp = client(config(server.port, None));
+    assert_send_sync(&nntp);
+    let summary = tokio::spawn(async move {
+        nntp.do_connect(false, false).await.unwrap();
+        nntp.is_connected().await;
+        nntp.select_group("alt.test", false).await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(summary.last, 1);
 }
 
 #[tokio::test]

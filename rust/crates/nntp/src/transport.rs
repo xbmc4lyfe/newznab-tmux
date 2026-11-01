@@ -19,8 +19,8 @@ use tokio_rustls::TlsConnector;
 
 use crate::config::{Provider, TlsOptions};
 
-pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> Io for T {}
 
 pub(crate) struct Transport {
     io: BufReader<Box<dyn Io>>,
