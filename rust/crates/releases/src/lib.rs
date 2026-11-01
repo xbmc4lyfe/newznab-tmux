@@ -70,7 +70,7 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
         let round = runner::run_round(&releases, &stop).await;
         // Staged uploads would otherwise wait for someone to run the import by hand, as they did.
         if let Some(folder) = upload_folder(None).ok().filter(|folder| folder.is_dir())
-            && let Err(failure) = import_uploads(&releases, folder).await
+            && let Err(failure) = import_uploads(&releases, folder, &stop).await
         {
             error!(error = format!("{failure:#}"), "upload import failed");
         }
@@ -153,6 +153,9 @@ pub enum Command {
         /// Delete the inputs once stored.
         #[arg(long)]
         delete: bool,
+        /// Delete the NFO of an upload whose NZB ended without a release.
+        #[arg(long)]
+        delete_failed: bool,
     },
     /// Copy retained NZBs into the database, preserving originals.
     ImportDatabase {
@@ -192,16 +195,21 @@ pub enum Command {
     },
 }
 
-/// One pass over the upload folder. Only inputs whose captured generation was accepted are removed.
-async fn import_uploads(releases: &Releases, folder: PathBuf) -> Result<()> {
+/// One pass over the staged uploads, as `import-nzbs --delete` and `import-nfos --delete --delete-failed`
+/// would run. A blacklisted, duplicate or groupless upload is deleted as `--delete` deletes it. An
+/// upload with nothing left to do loses its directory, so passes don't grow with every upload.
+async fn import_uploads(releases: &Releases, folder: PathBuf, stop: &Shutdown) -> Result<()> {
     let options = import::Options {
         folder: folder.clone(),
         use_filename: false,
         delete: true,
         delete_failed: false,
+        unattended: true,
+        stop: Some(stop.clone()),
     };
     import::import_folder(releases, &options).await?;
-    import::import_companions(releases, &folder, true).await?;
+    import::import_companions(releases, &folder, true, true, Some(stop)).await?;
+    upload_manifest::remove_finished(&folder, Some(stop));
     Ok(())
 }
 
@@ -276,6 +284,8 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 use_filename: filename,
                 delete,
                 delete_failed,
+                unattended: false,
+                stop: None,
             };
             let report = import::import_folder(&releases, &options).await?;
             println!(
@@ -284,10 +294,14 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
             );
             Ok(())
         }
-        Command::ImportNfos { folder, delete } => {
+        Command::ImportNfos {
+            folder,
+            delete,
+            delete_failed,
+        } => {
             let folder = upload_folder(folder)?;
             let (imported, skipped, failed) =
-                import::import_companions(&releases, &folder, delete).await?;
+                import::import_companions(&releases, &folder, delete, delete_failed, None).await?;
             println!("Processed {imported} NFOs, skipped {skipped}, failed {failed}.");
             if failed > 0 {
                 bail!("{failed} NFOs failed.");

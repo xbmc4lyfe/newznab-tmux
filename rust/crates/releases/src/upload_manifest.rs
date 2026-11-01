@@ -23,6 +23,7 @@ use nntmux_verify::locks::Admission;
 
 pub const FILENAME: &str = "nntmux-upload.json";
 const LOCK_FILENAME: &str = ".nntmux-upload.lock";
+const RETRY_COOLDOWN_SECONDS: i64 = 900;
 
 pub const STAGED: &str = "staged";
 pub const NZB_IMPORTED: &str = "nzb_imported";
@@ -43,6 +44,11 @@ const PHP_JOURNAL: [&str; 4] = [
     "delete_terminal_nfo",
     "custody_collision",
 ];
+
+/// The private copy of a source holds other bytes. Unlike a passing IO failure, retrying can't help.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct CustodyCollision(String);
 
 /// An import's outcome for one NZB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,10 +385,11 @@ fn retire_source(source: &Path, receipt: &Value) -> Result<bool> {
     }
     if fs::symlink_metadata(&payload).is_ok() {
         if !capture_matches(&payload, receipt, true) {
-            bail!(
+            return Err(CustodyCollision(format!(
                 "Custody of {} holds other bytes; explicit restaging is required.",
                 custody.display()
-            );
+            ))
+            .into());
         }
         fs::remove_file(&payload)?;
         sync_directory(&custody)?;
@@ -458,6 +465,7 @@ pub async fn delete_captured_input(
                     return Ok(true);
                 }
                 Ok(false) => return Ok(false),
+                Err(failure) if !failure.is::<CustodyCollision>() => return Err(failure),
                 Err(failure) => {
                     manifest["custody_collision"] = json!({"attempt": capture["attempt"]});
                     hold_for_review(&mut manifest, &format!("{failure:#}"));
@@ -656,12 +664,15 @@ async fn accepted_input_valid(pool: &MySqlPool, path: &Path, manifest: &Value) -
         }
     }
     let source = path.with_file_name(manifest["nzb"]["filename"].as_str().unwrap_or(""));
+    let custody = custody_directory(&source, accepted);
+    // An empty custody directory with the source gone: a crash came after the unlink and before
+    // the manifest could say so. The directory is only removed once the manifest has.
+    let retired = custody.is_dir()
+        && fs::symlink_metadata(custody.join("payload")).is_err()
+        && fs::symlink_metadata(&source).is_err();
     Ok(manifest["relinquished_attempt"] == accepted["attempt"]
-        || capture_matches(
-            &custody_directory(&source, accepted).join("payload"),
-            accepted,
-            true,
-        )
+        || retired
+        || capture_matches(&custody.join("payload"), accepted, true)
         || capture_matches(&source, accepted, false))
 }
 
@@ -796,11 +807,79 @@ async fn finish_input_deletion(
             Ok(())
         }
         Ok(false) => Ok(()),
+        Err(failure) if !failure.is::<CustodyCollision>() => Err(failure),
         Err(failure) => {
             manifest["custody_collision"] = json!({"attempt": accepted["attempt"]});
             hold_for_review(manifest, &format!("{failure:#}"));
             write(path, manifest)?;
             Err(failure)
+        }
+    }
+}
+
+/// Nothing is left to do for this upload.
+fn finished(manifest: &Value) -> bool {
+    let nzb_gone = !manifest["accepted_capture"].is_null()
+        && manifest["relinquished_attempt"] == manifest["accepted_capture"]["attempt"];
+    if !nzb_gone {
+        return false;
+    }
+    if manifest["nfo"].is_object() {
+        state(manifest) == NFO_IMPORTED
+            && manifest["nfo_relinquished_attempt"] == manifest["nfo_capture"]["attempt"]
+    } else {
+        state(manifest) == NZB_IMPORTED
+    }
+}
+
+/// Whether a retryable outcome is too recent for an unattended pass to read this upload again.
+pub fn cooling_down(nzb: &Path) -> bool {
+    let Some(manifest) = manifest_path_for(nzb).and_then(|path| read(&path).ok()) else {
+        return false;
+    };
+    if ![NZB_FAILED, METADATA_DEFERRED].contains(&state(&manifest)) {
+        return false;
+    }
+    manifest["updated_at"]
+        .as_str()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|at| {
+            Utc::now().signed_duration_since(at)
+                < chrono::TimeDelta::seconds(RETRY_COOLDOWN_SECONDS)
+        })
+}
+
+/// Removes the directories of uploads with nothing left to do, so a pass doesn't keep reading them.
+/// Only the manifest, its lock and any empty custody directories may be there: anything else stays.
+pub fn remove_finished(folder: &Path, stop: Option<&nntmux_runtime::Shutdown>) {
+    let Ok(found) = scan(folder) else {
+        return;
+    };
+    for path in found {
+        if stop.is_some_and(nntmux_runtime::Shutdown::requested) {
+            return;
+        }
+        if path.file_name().is_none_or(|name| name != FILENAME)
+            || !read(&path).is_ok_and(|manifest| finished(&manifest))
+        {
+            continue;
+        }
+        let Some(directory) = path.parent() else {
+            continue;
+        };
+        if directory == folder {
+            continue;
+        }
+        let _ = fs::remove_file(directory.join(LOCK_FILENAME));
+        if fs::read_dir(directory).is_ok_and(|entries| {
+            entries.flatten().all(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name == FILENAME
+                    || name.starts_with(".custody-") && fs::remove_dir(entry.path()).is_ok()
+            })
+        }) {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_dir(directory);
         }
     }
 }
@@ -818,6 +897,9 @@ pub async fn reconcile_pending(pool: &MySqlPool, path: &Path) -> Result<Value> {
             manifest["custody_collision"] = json!({"attempt": null});
             write(path, &manifest)?;
         }
+        return Ok(manifest);
+    }
+    if finished(&manifest) {
         return Ok(manifest);
     }
     let has_accepted = !manifest["accepted_capture"].is_null();
@@ -943,11 +1025,53 @@ fn zlib(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(stored)
 }
 
+/// The NZB ended without a release and is gone, so its NFO can't ever be used.
+async fn retire_terminal_companion(path: &Path) -> Result<()> {
+    let _guard = lock(path).await?;
+    let mut manifest = read(path)?;
+    let receipt = manifest["nfo_capture"].clone();
+    if receipt["protocol"] != json!(1)
+        || !manifest["custody_collision"].is_null()
+        || manifest["relinquished_attempt"].is_null()
+        || manifest["relinquished_attempt"] != manifest["outcome_capture"]["attempt"]
+    {
+        return Ok(());
+    }
+    let companion = path.with_file_name(receipt["filename"].as_str().unwrap_or(""));
+    if retire_source(&companion, &receipt)? {
+        manifest["nfo_relinquished_attempt"] = receipt["attempt"].clone();
+        write(path, &manifest)?;
+        forget_custody(&companion, &receipt);
+    }
+    Ok(())
+}
+
 /// Stores the upload's NFO on its release, and retires both inputs when asked. The NFO write and its
 /// receipt commit together, so a restart resumes only that exact operation.
-pub async fn import_companion(pool: &MySqlPool, path: &Path, delete: bool) -> Result<NfoOutcome> {
+pub async fn import_companion(
+    pool: &MySqlPool,
+    path: &Path,
+    delete: bool,
+    delete_failed: bool,
+) -> Result<NfoOutcome> {
+    let manifest = read(path)?;
+    // Retired already: its receipt may since have gone with a deleted release, and that's no reason
+    // to store it again.
+    if manifest["nfo_capture"].is_object()
+        && manifest["nfo_relinquished_attempt"] == manifest["nfo_capture"]["attempt"]
+    {
+        return Ok(NfoOutcome::Skipped("Companion already removed".to_owned()));
+    }
     let manifest = reconcile_pending(pool, path).await?;
     let current = state(&manifest).to_owned();
+    if [NZB_DUPLICATE, NZB_FAILED, NZB_REJECTED].contains(&current.as_str()) {
+        if delete_failed {
+            retire_terminal_companion(path).await?;
+        }
+        return Ok(NfoOutcome::Skipped(format!(
+            "NFO has no imported NZB release ({current})"
+        )));
+    }
     if current == NFO_IMPORTED && !delete {
         return Ok(NfoOutcome::Skipped("NFO was already imported".to_owned()));
     }

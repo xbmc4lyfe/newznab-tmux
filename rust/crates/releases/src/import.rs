@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use nntmux_core::pcre::Pcre;
 use nntmux_ingest::blacklist::{Blacklist, record_usage};
 use nntmux_ingest::header::Overview;
+use nntmux_runtime::Shutdown;
 use nntmux_verify::candidates::{AdmissionDeferred, enqueue_with_admission};
 use nntmux_verify::groups;
 use nntmux_verify::nzb::coverage::document_fingerprint;
@@ -33,12 +34,17 @@ static MEDIA: LazyLock<Pcre> = LazyLock::new(|| {
         .expect("valid")
 });
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Options {
     pub folder: PathBuf,
     pub use_filename: bool,
     pub delete: bool,
     pub delete_failed: bool,
+    /// Only staged uploads, on a cooldown after a failure. A dropped file has no capture to retire,
+    /// so an unattended pass would admit it again every round and bring back deleted releases.
+    pub unattended: bool,
+    /// Stops the scan between files.
+    pub stop: Option<Shutdown>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -142,25 +148,37 @@ async fn scan_document(
         };
         for name in &file.groups {
             let name = nntmux_verify::nzb::fingerprint::php_trim(name).to_owned();
-            let valid = groups::valid_group(&name);
+            // The name the blacklist is read for. A name already in the table needs no validating,
+            // and once a group is found the rest are checked as written.
+            let mut checked = Some(name.clone());
             if group == -1 {
-                let resolved = match known.get(&name) {
+                let existing = match known.get(&name) {
                     Some(id) => Some(*id),
-                    None if valid.is_some() => {
-                        let ids =
-                            groups::ids_by_name(&mut conn, std::slice::from_ref(&name)).await?;
-                        ids.get(&name).copied()
+                    None => {
+                        sqlx::query_scalar::<_, i64>(
+                            "SELECT CAST(id AS SIGNED) FROM usenet_groups WHERE name = ?",
+                        )
+                        .bind(&name)
+                        .fetch_optional(&mut *conn)
+                        .await?
                     }
-                    None => None,
                 };
-                if let Some(id) = resolved {
+                if let Some(id) = existing {
                     known.insert(name.clone(), id);
                     group = id;
+                } else if let Some(valid) = groups::valid_group(&name) {
+                    let ids = groups::ids_by_name(&mut conn, std::slice::from_ref(&name)).await?;
+                    if let Some(id) = ids.get(&name) {
+                        group = *id;
+                    }
+                    checked = Some(valid);
+                } else {
+                    checked = None;
                 }
             }
-            if let Some(valid) = valid
+            if let Some(checked) = checked
                 && blacklist
-                    .lists(pool, &valid)
+                    .lists(pool, &checked)
                     .await?
                     .is_blacklisted(&header, &mut matched)
             {
@@ -400,6 +418,11 @@ pub async fn import_folder(releases: &Releases, options: &Options) -> Result<Rep
         if !is_nzb(&path) {
             continue;
         }
+        if options.unattended
+            && (uploads::manifest_path_for(&path).is_none() || uploads::cooling_down(&path))
+        {
+            continue;
+        }
         let outcome = async {
             if uploads::should_import(pool, &path).await? {
                 import_one(releases, &mut blacklist, &path, options, &mut report).await
@@ -422,19 +445,24 @@ pub async fn import_companions(
     releases: &Releases,
     folder: &Path,
     delete: bool,
+    delete_failed: bool,
+    stop: Option<&Shutdown>,
 ) -> Result<(u64, u64, u64)> {
     if !folder.is_dir() {
         bail!("Folder path does not exist: {}", folder.display());
     }
     let (mut imported, mut skipped, mut failed) = (0, 0, 0);
     for path in uploads::scan(folder)? {
+        if stop.is_some_and(Shutdown::requested) {
+            break;
+        }
         if path
             .file_name()
             .is_none_or(|name| name != uploads::FILENAME)
         {
             continue;
         }
-        match uploads::import_companion(&releases.verify.db, &path, delete).await {
+        match uploads::import_companion(&releases.verify.db, &path, delete, delete_failed).await {
             Ok(uploads::NfoOutcome::Imported) => imported += 1,
             Ok(uploads::NfoOutcome::Skipped(_)) => skipped += 1,
             Err(failure) => {

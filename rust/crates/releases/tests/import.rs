@@ -93,6 +93,8 @@ impl Harness {
             use_filename: false,
             delete,
             delete_failed: false,
+            unattended: false,
+            stop: None,
         }
     }
 
@@ -210,7 +212,7 @@ async fn a_staged_upload_becomes_a_release_with_its_nfo() -> Result<()> {
 
     // Its NFO is stored with a receipt, and both inputs go.
     let (imported, skipped, failed) =
-        import::import_companions(&harness.releases, &harness.folder, true).await?;
+        import::import_companions(&harness.releases, &harness.folder, true, false, None).await?;
     assert_eq!((imported, skipped, failed), (1, 0, 0));
     assert_eq!(manifest_of(&directory)?["state"], "nfo_imported");
     assert!(!nzb.exists() && !nfo.exists());
@@ -231,7 +233,7 @@ async fn a_staged_upload_becomes_a_release_with_its_nfo() -> Result<()> {
 
     // A restart does nothing further.
     let (imported, skipped, failed) =
-        import::import_companions(&harness.releases, &harness.folder, true).await?;
+        import::import_companions(&harness.releases, &harness.folder, true, false, None).await?;
     assert_eq!((imported, failed), (0, 0));
     assert_eq!(skipped, 1);
     Ok(())
@@ -333,4 +335,145 @@ fn names_come_from_the_path_and_subject() {
     );
     assert_eq!(import::normalize_subject("a b (1/2)"), "a b yEnc");
     assert_eq!(import::normalize_subject("a yEnc (1/2) junk"), "a yEnc");
+}
+
+#[tokio::test]
+async fn a_group_in_the_table_needs_no_valid_name() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO usenet_groups (name, active, backfill) VALUES ('alt.binaries.c++', 1, 0)",
+    )
+    .execute(&harness.db.pool)
+    .await?;
+    let dropped = harness.folder.join("odd.nzb");
+    std::fs::write(
+        &dropped,
+        NZB.replace("alt.binaries.test", "alt.binaries.c++"),
+    )?;
+    let report = import::import_folder(&harness.releases, &harness.options(true)).await?;
+    assert_eq!(report.imported, 1);
+    assert!(dropped.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unattended_pass_leaves_dropped_files_and_cools_down() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let dropped = harness.folder.join("dropped.nzb");
+    std::fs::write(&dropped, NZB)?;
+    let options = Options {
+        unattended: true,
+        ..harness.options(true)
+    };
+    assert_eq!(
+        import::import_folder(&harness.releases, &options)
+            .await?
+            .imported,
+        0
+    );
+    assert_eq!(
+        harness
+            .scalar("SELECT COUNT(*) FROM release_verification_candidates")
+            .await?,
+        0
+    );
+    std::fs::remove_file(&dropped)?;
+
+    // An upload that can't import isn't read again straight away.
+    let directory = harness.stage(None)?;
+    let nzb = directory.join("Some.Release.nzb");
+    std::fs::write(&nzb, b"<nzb/>")?;
+    uploads::read(&directory.join(FILENAME))?;
+    import::import_folder(&harness.releases, &options).await?;
+    let manifest = manifest_of(&directory)?;
+    assert_eq!(manifest["state"], "nzb_failed");
+    let attempt = manifest["input_reservation"]["attempt"].clone();
+    import::import_folder(&harness.releases, &options).await?;
+    assert_eq!(
+        manifest_of(&directory)?["input_reservation"]["attempt"],
+        attempt
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_crash_after_the_unlink_still_finishes() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let directory = harness.stage(None)?;
+    let nzb = directory.join("Some.Release.nzb");
+    import::import_folder(&harness.releases, &harness.options(true)).await?;
+    harness.verify_and_publish().await?;
+    // The state a crash leaves: an empty custody directory, the source gone, and a manifest that
+    // doesn't know yet.
+    let manifest = manifest_of(&directory)?;
+    let locator = serde_json::to_string(&serde_json::json!([
+        "Some.Release.nzb",
+        manifest["accepted_capture"]
+    ]))?;
+    let custody = directory.join(format!(
+        ".custody-{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(locator))
+    ));
+    std::fs::create_dir(&custody)?;
+    std::fs::remove_file(&nzb)?;
+    import::import_folder(&harness.releases, &harness.options(true)).await?;
+    let manifest = manifest_of(&directory)?;
+    assert_eq!(manifest["state"], "nzb_imported");
+    assert_eq!(
+        manifest["relinquished_attempt"],
+        manifest["accepted_capture"]["attempt"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn finished_uploads_lose_their_directory_and_their_nfo_is_not_stored_twice() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let directory = harness.stage(Some(b"nfo"))?;
+    import::import_folder(&harness.releases, &harness.options(true)).await?;
+    let Outcome::Published(release) = harness.verify_and_publish().await? else {
+        panic!("published");
+    };
+    import::import_folder(&harness.releases, &harness.options(true)).await?;
+    import::import_companions(&harness.releases, &harness.folder, true, false, None).await?;
+
+    // The receipt goes with a deleted release, and the upload still isn't a failure.
+    sqlx::query("DELETE FROM releases WHERE id = ?")
+        .bind(release)
+        .execute(&harness.db.pool)
+        .await?;
+    let (_, _, failed) =
+        import::import_companions(&harness.releases, &harness.folder, true, false, None).await?;
+    assert_eq!(failed, 0);
+
+    uploads::remove_finished(&harness.folder, None);
+    assert!(!directory.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_terminal_uploads_nfo_goes_with_it() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO binaryblacklist (groupname, regex, msgcol, optype, status) VALUES ('alt.binaries.test', 'Some.Release', 1, 1, 1)",
+    )
+    .execute(&harness.db.pool)
+    .await?;
+    let directory = harness.stage(Some(b"nfo"))?;
+    import::import_folder(&harness.releases, &harness.options(true)).await?;
+    assert!(!directory.join("Some.Release.nzb").exists());
+    assert!(directory.join("Some.Release.nfo").exists());
+    import::import_companions(&harness.releases, &harness.folder, true, true, None).await?;
+    assert!(!directory.join("Some.Release.nfo").exists());
+    Ok(())
 }
