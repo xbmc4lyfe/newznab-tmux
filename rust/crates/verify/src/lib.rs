@@ -19,6 +19,7 @@ pub mod nzb;
 pub mod prepare;
 pub mod reader;
 pub mod releases;
+pub mod reset;
 pub mod spot_check;
 pub mod txn;
 
