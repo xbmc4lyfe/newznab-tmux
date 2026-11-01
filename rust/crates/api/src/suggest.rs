@@ -1,5 +1,6 @@
 //! `SearchSuggestController`: search-box autocomplete and "did you mean".
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use axum::Extension;
@@ -112,7 +113,7 @@ fn best(found: &[Suggestion]) -> J {
 }
 
 fn sorted_by_docs(mut found: Vec<Suggestion>) -> Vec<Suggestion> {
-    found.sort_by(|a, b| b.docs.cmp(&a.docs));
+    found.sort_by_key(|hit| Reverse(hit.docs));
     found
 }
 

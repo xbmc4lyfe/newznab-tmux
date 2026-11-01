@@ -216,6 +216,7 @@ macro_rules! ok_or_reply {
     };
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn filters(
     ctx: &Ctx,
     settings: &Arc<Settings>,

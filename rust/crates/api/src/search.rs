@@ -15,7 +15,7 @@ use tracing::warn;
 
 use crate::category;
 use crate::db::row_json;
-use crate::input::{is_numeric, php_int};
+use crate::input::php_int;
 use crate::json::J;
 use crate::rows::{Row, imdb_id_is_valid};
 
@@ -175,16 +175,6 @@ fn quote(value: &str) -> String {
 
 fn id_list(ids: &[i64]) -> String {
     ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
-}
-
-/// `$value > 0` for a request string: numeric strings compare as numbers; PHP 8 compares anything
-/// else with "0" as text.
-fn php_positive(value: &str) -> bool {
-    if is_numeric(value) {
-        value.trim().parse::<f64>().is_ok_and(|number| number > 0.0)
-    } else {
-        value > "0"
-    }
 }
 
 fn from_timestamp(timestamp: i64) -> J {
@@ -925,9 +915,14 @@ impl TvIds {
         ]
     }
 
+    /// The IMDb id's digits. `videos.imdb` holds no `tt`, and clients often send one.
+    fn imdb_digits(&self) -> String {
+        self.imdb.chars().filter(char::is_ascii_digit).collect()
+    }
+
     fn external(&self) -> Vec<ExternalId> {
         let mut external = Vec::new();
-        let number = |value: &str| php_positive(value).then(|| php_int(value));
+        let number = |value: &str| Some(php_int(value)).filter(|id| *id > 0);
         if let Some(id) = number(&self.tvdb) {
             external.push(ExternalId::Tvdb(id));
         }
@@ -940,8 +935,8 @@ impl TvIds {
         if let Some(id) = number(&self.tvmaze) {
             external.push(ExternalId::Tvmaze(id));
         }
-        if !self.imdb.is_empty() && imdb_id_is_valid(&self.imdb) {
-            external.push(ExternalId::ImdbId(self.imdb.clone()));
+        if imdb_id_is_valid(&self.imdb) {
+            external.push(ExternalId::ImdbId(self.imdb_digits()));
         }
         if let Some(id) = number(&self.tmdb) {
             external.push(ExternalId::TmdbId(id));
@@ -951,17 +946,32 @@ impl TvIds {
 
     /// `hasTvLookupIdentifiers`.
     fn strict(&self) -> bool {
-        (!self.imdb.is_empty() && imdb_id_is_valid(&self.imdb))
-            || self.columns().iter().any(|(_, value)| php_int(value) > 0)
+        imdb_id_is_valid(&self.imdb) || self.columns().iter().any(|(_, value)| php_int(value) > 0)
     }
 
-    /// `v.column = n` for each id, with the integer cast the PHP's `%d` applied.
+    /// `v.column = n` for each usable id. PHP's `$id > 0` let junk through and `%d` made it 0, which
+    /// matched every show still holding the column's default.
     fn site_sql(&self) -> Vec<String> {
+        let digits = self.imdb_digits();
         self.columns()
             .iter()
-            .filter(|(_, value)| php_positive(value))
+            .map(|(column, value)| {
+                (
+                    *column,
+                    if *column == "imdb" {
+                        digits.as_str()
+                    } else {
+                        *value
+                    },
+                )
+            })
+            .filter(|(_, value)| php_int(value) > 0)
             .map(|(column, value)| format!("v.{column} = {}", php_int(value)))
             .collect()
+    }
+
+    fn has_site(&self) -> bool {
+        !self.site_sql().is_empty()
     }
 }
 
@@ -1134,7 +1144,7 @@ impl Searcher<'_> {
         }
 
         if !from_external && !strict && !php_empty(name) {
-            let has_site = ids.columns().iter().any(|(_, value)| php_positive(value));
+            let has_site = ids.has_site();
             let mut text = name.to_owned();
             if !has_site {
                 if numeric_season(series) {
@@ -1499,11 +1509,20 @@ mod tests {
     }
 
     #[test]
-    fn positive_compares_like_php() {
-        assert!(php_positive("5"));
-        assert!(!php_positive("0"));
-        assert!(!php_positive("-1"));
-        assert!(php_positive("abc"));
-        assert!(!php_positive(""));
+    fn junk_site_ids_select_nothing() {
+        let ids = TvIds {
+            imdb: "tt0944947".to_owned(),
+            tvrage: "abc".to_owned(),
+            tvdb: "73".to_owned(),
+            ..TvIds::default()
+        };
+        assert_eq!(ids.site_sql(), ["v.tvdb = 73", "v.imdb = 944947"]);
+        let junk = TvIds {
+            imdb: "x".to_owned(),
+            id: "0".to_owned(),
+            ..TvIds::default()
+        };
+        assert!(junk.site_sql().is_empty());
+        assert!(!junk.strict());
     }
 }
