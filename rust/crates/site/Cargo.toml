@@ -12,6 +12,7 @@ axum.workspace = true
 base64.workspace = true
 bcrypt.workspace = true
 chrono.workspace = true
+chrono-tz = "0.10"
 form_urlencoded.workspace = true
 hex.workspace = true
 hickory-resolver.workspace = true
@@ -19,6 +20,7 @@ md-5.workspace = true
 nntmux-core.workspace = true
 nntmux-runtime.workspace = true
 nntmux-webkit.workspace = true
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -31,6 +33,7 @@ tower-http.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 nntmux-testkit.workspace = true
 redis.workspace = true
 tower.workspace = true

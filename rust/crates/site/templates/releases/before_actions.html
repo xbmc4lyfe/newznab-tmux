@@ -1,0 +1,14 @@
+<div class="flex min-w-0 flex-wrap items-center gap-3">
+{% if let Some(rss) = list.tv_rss_url %}
+<div class="flex flex-wrap gap-2 text-sm">
+    <a href="/series" class="text-primary-600 dark:text-primary-400 hover:text-primary-800 dark:hover:text-primary-300" title="View available TV series">TV Series</a>
+    <span class="text-gray-400 dark:text-gray-500">|</span>
+    <a href="/trending-tv" class="text-orange-600 dark:text-orange-400 hover:text-orange-800 dark:hover:text-orange-300" title="View trending TV shows">Trending</a>
+    <span class="text-gray-400 dark:text-gray-500">|</span>
+    <a href="/myshows" class="text-primary-600 dark:text-primary-400 hover:text-primary-800 dark:hover:text-primary-300" title="Manage your shows">My Shows</a>
+    <span class="text-gray-400 dark:text-gray-500">|</span>
+    <a href="{{ rss }}" class="text-primary-600 dark:text-primary-400 hover:text-primary-800 dark:hover:text-primary-300" title="All releases in your shows as an RSS feed">RSS</a>
+</div>
+{% endif %}
+{% if let Some(cover_url) = list.cover_view_url %}{% include "releases/view_toggle.html" %}{% endif %}
+</div>

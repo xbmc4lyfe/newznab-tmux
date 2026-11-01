@@ -18,6 +18,10 @@ use nntmux_webkit::{Input, Session, guard, throttle};
 
 use crate::guest::Captcha;
 
+pub(crate) use register::registration_status;
+pub(crate) use two_factor::verify_code;
+pub(crate) use verify::send_verification;
+
 pub fn router() -> Router<Ctx> {
     let guest_forms = Router::new()
         .route("/login", get(login::show).post(login::submit))

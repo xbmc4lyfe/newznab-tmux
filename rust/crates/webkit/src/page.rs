@@ -372,9 +372,20 @@ pub struct Layout {
     pub show_adult: bool,
     pub show_books: bool,
     pub upgrade_label: Option<&'static str>,
+    session: Session,
 }
 
 impl Layout {
+    /// The first flashed validation error for a form field.
+    pub fn error(&self, field: &str) -> Option<String> {
+        self.session.error(field)
+    }
+
+    /// A field from the last submission, or an empty string.
+    pub fn old(&self, field: &str) -> String {
+        self.session.old(field)
+    }
+
     /// Sets the page title, the description and the keywords.
     pub fn titled(
         mut self,
@@ -505,6 +516,7 @@ impl FromRequestParts<Ctx> for Layout {
             show_adult: false,
             show_books: false,
             upgrade_label: None,
+            session,
         };
 
         if let Some(auth) = auth {
