@@ -1,0 +1,455 @@
+[
+    {
+        "name": "unique sizes",
+        "nzb": [
+            {
+                "size": 1030000,
+                "segments": 3,
+                "filecount": 1
+            },
+            {
+                "size": 52000000,
+                "segments": 70,
+                "filecount": 1
+            },
+            {
+                "size": 10300,
+                "segments": 1,
+                "filecount": 1
+            }
+        ],
+        "files": [
+            {
+                "name": "Movie.mkv",
+                "size": 50000000,
+                "hash16k": ""
+            },
+            {
+                "name": "Movie.nfo",
+                "size": 10000,
+                "hash16k": ""
+            },
+            {
+                "name": "Movie.srt",
+                "size": 1000000,
+                "hash16k": ""
+            }
+        ],
+        "article_part_size": null,
+        "verified": {},
+        "mapped": [
+            {
+                "source_index": 0,
+                "file_index": 2,
+                "confidence": "unique-size"
+            },
+            {
+                "source_index": 1,
+                "file_index": 0,
+                "confidence": "unique-size"
+            },
+            {
+                "source_index": 2,
+                "file_index": 1,
+                "confidence": "unique-size"
+            }
+        ],
+        "candidates": [
+            [
+                1
+            ],
+            [
+                2
+            ],
+            [
+                0
+            ]
+        ]
+    },
+    {
+        "name": "equal volumes stay unmatched",
+        "nzb": [
+            {
+                "size": 52000000,
+                "segments": 70,
+                "filecount": 1
+            },
+            {
+                "size": 52000000,
+                "segments": 70,
+                "filecount": 1
+            },
+            {
+                "size": 30000000,
+                "segments": 40,
+                "filecount": 1
+            }
+        ],
+        "files": [
+            {
+                "name": "a.part01.rar",
+                "size": 50000000,
+                "hash16k": ""
+            },
+            {
+                "name": "a.part02.rar",
+                "size": 50000000,
+                "hash16k": ""
+            },
+            {
+                "name": "a.part03.rar",
+                "size": 29000000,
+                "hash16k": ""
+            }
+        ],
+        "article_part_size": null,
+        "verified": {},
+        "mapped": [
+            {
+                "source_index": 2,
+                "file_index": 2,
+                "confidence": "unique-size"
+            }
+        ],
+        "candidates": [
+            [
+                0,
+                1
+            ],
+            [
+                0,
+                1
+            ],
+            [
+                2
+            ]
+        ]
+    },
+    {
+        "name": "verified volume frees the rest",
+        "nzb": [
+            {
+                "size": 52000000,
+                "segments": 70,
+                "filecount": 1
+            },
+            {
+                "size": 52000000,
+                "segments": 70,
+                "filecount": 1
+            }
+        ],
+        "files": [
+            {
+                "name": "a.part01.rar",
+                "size": 50000000,
+                "hash16k": ""
+            },
+            {
+                "name": "a.part02.rar",
+                "size": 50000000,
+                "hash16k": ""
+            }
+        ],
+        "article_part_size": null,
+        "verified": {
+            "0": 1
+        },
+        "mapped": [
+            {
+                "source_index": 0,
+                "file_index": 1,
+                "confidence": "verified"
+            },
+            {
+                "source_index": 1,
+                "file_index": 0,
+                "confidence": "unique-size"
+            }
+        ],
+        "candidates": [
+            [
+                0,
+                1
+            ],
+            [
+                0,
+                1
+            ]
+        ]
+    },
+    {
+        "name": "segment counts decide",
+        "nzb": [
+            {
+                "size": 52000000,
+                "segments": 70,
+                "filecount": 1
+            },
+            {
+                "size": 52000000,
+                "segments": 71,
+                "filecount": 1
+            }
+        ],
+        "files": [
+            {
+                "name": "x.mkv",
+                "size": 50000000,
+                "hash16k": ""
+            }
+        ],
+        "article_part_size": 716800,
+        "verified": {},
+        "mapped": [
+            {
+                "source_index": 0,
+                "file_index": 0,
+                "confidence": "unique-size"
+            }
+        ],
+        "candidates": [
+            [
+                0
+            ]
+        ]
+    },
+    {
+        "name": "segment counts decide both",
+        "nzb": [
+            {
+                "size": 52000000,
+                "segments": 70,
+                "filecount": 1
+            },
+            {
+                "size": 52100000,
+                "segments": 71,
+                "filecount": 1
+            }
+        ],
+        "files": [
+            {
+                "name": "x.mkv",
+                "size": 50000000,
+                "hash16k": ""
+            },
+            {
+                "name": "y.mkv",
+                "size": 50300000,
+                "hash16k": ""
+            }
+        ],
+        "article_part_size": 716800,
+        "verified": {},
+        "mapped": [
+            {
+                "source_index": 0,
+                "file_index": 0,
+                "confidence": "unique-size"
+            },
+            {
+                "source_index": 1,
+                "file_index": 1,
+                "confidence": "unique-size"
+            }
+        ],
+        "candidates": [
+            [
+                0
+            ],
+            [
+                1
+            ]
+        ]
+    },
+    {
+        "name": "merged entries are skipped",
+        "nzb": [
+            {
+                "size": 52000000,
+                "segments": 70,
+                "filecount": 2
+            },
+            {
+                "size": 1000,
+                "segments": 1,
+                "filecount": 1
+            }
+        ],
+        "files": [
+            {
+                "name": "x.mkv",
+                "size": 50000000,
+                "hash16k": ""
+            }
+        ],
+        "article_part_size": null,
+        "verified": {},
+        "mapped": [],
+        "candidates": [
+            []
+        ]
+    },
+    {
+        "name": "decoded posted size",
+        "nzb": [
+            {
+                "size": 50000000,
+                "segments": 70,
+                "filecount": 1
+            }
+        ],
+        "files": [
+            {
+                "name": "x.mkv",
+                "size": 50049000,
+                "hash16k": ""
+            }
+        ],
+        "article_part_size": null,
+        "verified": {},
+        "mapped": [
+            {
+                "source_index": 0,
+                "file_index": 0,
+                "confidence": "unique-size"
+            }
+        ],
+        "candidates": [
+            [
+                0
+            ]
+        ]
+    },
+    {
+        "name": "too much bigger",
+        "nzb": [
+            {
+                "size": 50000000,
+                "segments": 70,
+                "filecount": 1
+            }
+        ],
+        "files": [
+            {
+                "name": "x.mkv",
+                "size": 50100000,
+                "hash16k": ""
+            }
+        ],
+        "article_part_size": null,
+        "verified": {},
+        "mapped": [],
+        "candidates": [
+            []
+        ]
+    },
+    {
+        "name": "too small",
+        "nzb": [
+            {
+                "size": 50000000,
+                "segments": 70,
+                "filecount": 1
+            }
+        ],
+        "files": [
+            {
+                "name": "x.mkv",
+                "size": 44000000,
+                "hash16k": ""
+            }
+        ],
+        "article_part_size": null,
+        "verified": {},
+        "mapped": [],
+        "candidates": [
+            []
+        ]
+    },
+    {
+        "name": "zero and empty",
+        "nzb": [
+            {
+                "size": 0,
+                "segments": 1,
+                "filecount": 1
+            },
+            {
+                "size": 500,
+                "segments": 0,
+                "filecount": 1
+            },
+            {
+                "size": 1000,
+                "segments": 1,
+                "filecount": 1
+            }
+        ],
+        "files": [
+            {
+                "name": "z.bin",
+                "size": 980,
+                "hash16k": ""
+            },
+            {
+                "name": "n.bin",
+                "size": 0,
+                "hash16k": ""
+            }
+        ],
+        "article_part_size": null,
+        "verified": {},
+        "mapped": [
+            {
+                "source_index": 2,
+                "file_index": 0,
+                "confidence": "unique-size"
+            }
+        ],
+        "candidates": [
+            [
+                2
+            ],
+            []
+        ]
+    },
+    {
+        "name": "one remux",
+        "nzb": [
+            {
+                "size": 61500000000,
+                "segments": 83706,
+                "filecount": 1
+            }
+        ],
+        "files": [
+            {
+                "name": "Film.2160p.BluRay.REMUX.mkv",
+                "size": 60000000000,
+                "hash16k": ""
+            },
+            {
+                "name": "Film.nfo",
+                "size": 4000,
+                "hash16k": ""
+            }
+        ],
+        "article_part_size": 716800,
+        "verified": {},
+        "mapped": [
+            {
+                "source_index": 0,
+                "file_index": 0,
+                "confidence": "unique-size"
+            }
+        ],
+        "candidates": [
+            [
+                0
+            ],
+            []
+        ]
+    }
+]

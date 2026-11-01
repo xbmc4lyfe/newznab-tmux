@@ -2605,16 +2605,22 @@ name = "nntmux-postprocess"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "crc32fast",
  "hex",
  "md-5 0.10.6",
  "nntmux-core",
+ "nntmux-namefix",
+ "nntmux-nntp",
  "nntmux-metadata",
+ "rust-native
  "nntmux-runtime",
  "nntmux-testkit",
  "nntmux-verify",
+ "nntmux-yenc",
+ "quick-xml",
  "rand 0.9.5",
  "serde",
  "serde_json",
