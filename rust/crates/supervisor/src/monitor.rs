@@ -6,12 +6,10 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::Utc;
 use nntmux_core::parsed_or;
+use nntmux_ops::runtime_state::heartbeat_key;
 use nntmux_runtime::{Ctx, Shutdown, downtime};
 use redis::AsyncCommands;
 use tracing::{info, warn};
-
-/// When the monitor last ran, for `nntmux-ctl ops health-check`.
-pub const HEARTBEAT_KEY: &str = "nntmux:supervisor:heartbeat";
 
 const DEFAULT_DELAY_HOURS: i64 = 2;
 
@@ -63,7 +61,8 @@ pub async fn run(ctx: Ctx, stop: Shutdown) {
 /// marker, so the paused time counts as downtime, as it did when the monitor exited on the flag.
 async fn beat(ctx: &Ctx, stop: &Shutdown) {
     let mut redis = ctx.redis.clone();
-    let heartbeat: redis::RedisResult<()> = redis.set(HEARTBEAT_KEY, Utc::now().timestamp()).await;
+    let heartbeat: redis::RedisResult<()> =
+        redis.set(heartbeat_key(ctx), Utc::now().timestamp()).await;
     if let Err(failure) = heartbeat {
         warn!(error = %failure, "unable to record the supervisor heartbeat");
     }
