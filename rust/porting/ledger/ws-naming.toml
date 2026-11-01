@@ -78,3 +78,10 @@ kind = "command"
 id = "releases:recategorize-onlyfans"
 source = "app/Console/Commands/RecategorizeOnlyFans.php"
 status = "ported"
+
+[[entry]]
+kind = "command"
+id = "nntmux:find-size-mismatches"
+source = "app/Console/Commands/FindSizeMismatchedReleases.php"
+status = "todo"
+note = "Moved from ws-ops: it renames through the name fixer and its season pack check."
