@@ -100,7 +100,7 @@ status = "todo"
 kind = "command"
 id = "releases:verification-barrier"
 source = "app/Console/Commands/ReleaseVerificationBarrier.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -118,7 +118,7 @@ status = "todo"
 kind = "command"
 id = "verification:import-manifests"
 source = "app/Console/Commands/ImportVerificationManifests.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "job"
