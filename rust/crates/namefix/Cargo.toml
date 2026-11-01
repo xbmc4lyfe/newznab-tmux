@@ -14,6 +14,7 @@ nntmux-categorize.workspace = true
 nntmux-core.workspace = true
 nntmux-predb.workspace = true
 nntmux-runtime.workspace = true
+nntmux-search.workspace = true
 redis.workspace = true
 regex.workspace = true
 serde_json.workspace = true

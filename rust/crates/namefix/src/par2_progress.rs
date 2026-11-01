@@ -9,6 +9,7 @@ use crate::release::Snapshot;
 /// replacement release may already have new candidate buffers by the time this runs.
 pub async fn forget_completed_snapshot(db: &MySqlPool, snapshot: &Snapshot) -> Result<bool> {
     let mut tx = db.begin().await?;
+    #[allow(clippy::type_complexity)]
     let row: Option<(String, Option<String>, Option<String>, i64, i32, i32)> = sqlx::query_as(
         "SELECT guid, name, searchname, CAST(predb_id AS SIGNED), isrenamed, proc_par2 FROM releases WHERE id = ? FOR UPDATE",
     )

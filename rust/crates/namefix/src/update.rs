@@ -193,7 +193,7 @@ impl ReleaseUpdater {
                 return Ok(());
             }
             let current = release.searchname.as_deref().unwrap_or("");
-            if new_name.to_ascii_lowercase() != current.to_ascii_lowercase() {
+            if !new_name.eq_ignore_ascii_case(current) {
                 if renames_season_pack_to_episode(current, &new_name) {
                     self.done = true;
                     return Ok(());
@@ -464,6 +464,7 @@ impl ReleaseUpdater {
             .push(", isrenamed = 1, iscategorized = 1, proc_pp = 1 WHERE predb_id = 0 AND");
         release.push_snapshot(&mut update);
         update.build().execute(&mut *tx).await?;
+        #[allow(clippy::type_complexity)]
         let after: Option<(String, Option<String>, Option<String>, i64, i32, i32, i32, i32)> = sqlx::query_as(
             "SELECT guid, name, searchname, CAST(predb_id AS SIGNED), categories_id, isrenamed, iscategorized, proc_pp \
              FROM releases WHERE id = ? FOR UPDATE",
@@ -641,7 +642,7 @@ impl ReleaseUpdater {
             self.committed = None;
             return Ok(false);
         }
-        if let Some(guard) = guard.as_deref_mut()
+        if let Some(guard) = guard
             && !guard.accepted(&mut tx).await?
         {
             self.committed = None;
@@ -916,7 +917,7 @@ impl ReleaseUpdater {
         {
             return Ok(false);
         }
-        if let Some(guard) = guard.as_deref_mut()
+        if let Some(guard) = guard
             && !guard.accepted(&mut tx).await?
         {
             return Ok(false);

@@ -2,18 +2,20 @@
 //! `match:prefiles` and `releases:fix-nzbsplit`, and the `fixnames` role.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use nntmux_categorize::Categorizer;
 use nntmux_categorize::names::unwrap_nzbsplit;
 use nntmux_runtime::{Ctx, RoleArgs, Shutdown, run_slots};
+use nntmux_search::SearchClient;
 use redis::AsyncCommands;
 
 use crate::queries::{self, FixNamesConfig, PredbTitle};
 use crate::release::Release;
-use crate::service::{CandidateSearch, IncompleteMatch, NameFixer, Par2Outcome, Par2Probe};
+use crate::service::{
+    CandidatePage, CandidateSearch, IncompleteMatch, NameFixer, Par2Outcome, Par2Probe,
+};
 use crate::update::{FixerCleaner, ReleaseSearch, ReleaseUpdater};
 
 const LEFT_GUIDS: [&str; 16] = [
@@ -83,25 +85,47 @@ struct Backends {
     cleaner: FixerCleaner,
 }
 
-fn backends(_ctx: &Ctx) -> Result<Backends> {
+fn backends(ctx: &Ctx) -> Result<Backends> {
+    let client = Arc::new(SearchBackend {
+        client: SearchClient::from_ctx(ctx)?,
+        db: ctx.db.clone(),
+    });
     Ok(Backends {
-        search: Arc::new(crate::update::NoSearch),
-        candidates: Arc::new(Unavailable),
+        search: client.clone(),
+        candidates: client,
         cleaner: nntmux_predb::filename::fixer_cleaner,
     })
 }
 
-struct Unavailable;
+struct SearchBackend {
+    client: SearchClient,
+    db: sqlx::MySqlPool,
+}
 
 #[async_trait::async_trait]
-impl CandidateSearch for Unavailable {
+impl ReleaseSearch for SearchBackend {
+    async fn update_release(&self, release_id: i64) {
+        // False means a retry row was recorded, which the search workers pick up.
+        self.client.update_release(&self.db, release_id).await;
+    }
+}
+
+#[async_trait::async_trait]
+impl CandidateSearch for SearchBackend {
     async fn release_candidates_page(
         &self,
-        _title: &str,
-        _limit: u64,
-        _after: i64,
-    ) -> Result<crate::service::CandidatePage> {
-        bail!("The configured search backend is unavailable for paged PreDB matching.")
+        title: &str,
+        limit: u64,
+        after: i64,
+    ) -> Result<CandidatePage> {
+        let page = self
+            .client
+            .search_release_candidates_page(title, limit, after)
+            .await?;
+        Ok(CandidatePage {
+            ids: page.ids,
+            has_more: page.has_more,
+        })
     }
 }
 
@@ -626,7 +650,6 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
             let workers = threads.clamp(1, 16);
             let worker = (slot as i64 % workers) + 1;
             let (processed, _) = predbft_pass(&ctx, worker, workers, per_run, &backends).await?;
-            tokio::time::sleep(Duration::from_millis(0)).await;
             Ok(checked > 0 || processed > 0)
         }
     })

@@ -506,7 +506,10 @@ async fn standard_batch_walks_sources_and_marks_them_done() {
     };
     let pool = &db.pool;
     insert_release(pool, 1, GUID, "abc", "abc", 100).await;
-    sqlx::query("UPDATE releases SET passwordstatus = 0, nfostatus = 0 WHERE id = 1").execute(pool).await.expect("status");
+    sqlx::query("UPDATE releases SET passwordstatus = 0, nfostatus = 0 WHERE id = 1")
+        .execute(pool)
+        .await
+        .expect("status");
     certify(pool).await;
     let config = FixNamesConfig::from_env();
     let batch = queries::standard_candidate_batch(

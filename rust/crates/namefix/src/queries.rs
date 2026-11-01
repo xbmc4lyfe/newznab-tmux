@@ -169,6 +169,7 @@ fn push_candidate_where(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn candidate_batch(
     db: &MySqlPool,
     config: &FixNamesConfig,
