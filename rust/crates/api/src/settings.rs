@@ -1,0 +1,80 @@
+//! Values the API reads from the environment. The names match Laravel's `config/` files.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use nntmux_core::{parsed_or, var_or};
+
+use crate::json::J;
+
+pub struct Settings {
+    pub app_name: String,
+    pub mail_from: String,
+    pub max_limit: i64,
+    pub default_limit: i64,
+    pub query_max_body_bytes: usize,
+    pub access_update_interval: u64,
+    /// Prefixes every Redis key, so parallel tests can't collide. Empty in production.
+    pub redis_prefix: String,
+    /// Small read-mostly values such as the v1 server menu, which every XML response needs.
+    local: Mutex<HashMap<String, (Instant, J)>>,
+}
+
+impl Settings {
+    pub fn from_env() -> Result<Self> {
+        Ok(Self::new(
+            var_or("APP_NAME", "NNTmux"),
+            var_or("MAIL_FROM_ADDRESS", "hello@example.com"),
+            parsed_or("API_MAX_LIMIT", 500)?,
+            parsed_or("API_DEFAULT_LIMIT", 250)?,
+            parsed_or("API_QUERY_MAX_BODY_BYTES", 8192)?,
+            parsed_or("API_ACCESS_UPDATE_INTERVAL", 60)?,
+            var_or("NNTMUX_API_REDIS_PREFIX", ""),
+        ))
+    }
+
+    pub fn new(
+        app_name: String,
+        mail_from: String,
+        max_limit: i64,
+        default_limit: i64,
+        query_max_body_bytes: usize,
+        access_update_interval: u64,
+        redis_prefix: String,
+    ) -> Self {
+        Self {
+            app_name,
+            mail_from,
+            max_limit,
+            default_limit,
+            query_max_body_bytes,
+            access_update_interval,
+            redis_prefix,
+            local: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `ApiQueryParameters::maxLimit`.
+    pub fn limit_max(&self) -> i64 {
+        self.max_limit.max(1)
+    }
+
+    /// `ApiQueryParameters::defaultLimit`.
+    pub fn limit_default(&self) -> i64 {
+        self.default_limit.min(self.limit_max()).max(1)
+    }
+
+    pub fn local_get(&self, key: &str) -> Option<J> {
+        let cache = self.local.lock().ok()?;
+        let (expires, value) = cache.get(key)?;
+        (*expires > Instant::now()).then(|| value.clone())
+    }
+
+    pub fn local_put(&self, key: &str, ttl: Duration, value: J) {
+        if let Ok(mut cache) = self.local.lock() {
+            cache.insert(key.to_owned(), (Instant::now() + ttl, value));
+        }
+    }
+}

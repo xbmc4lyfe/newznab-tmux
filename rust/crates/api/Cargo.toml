@@ -6,9 +6,30 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 axum.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+hex.workspace = true
+md-5.workspace = true
+nntmux-core.workspace = true
 nntmux-runtime.workspace = true
 nntmux-webkit.workspace = true
+rand.workspace = true
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1 = "0.10"
+sha2.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+regex.workspace = true
+nntmux-testkit.workspace = true
+tower.workspace = true
 
 [lints]
 workspace = true
