@@ -14,6 +14,8 @@ on:
       - 'tests/Unit/test_verify_benchmark_pages.py'
       - 'github-pages/docs/**'
       - 'scripts/build-docs.py'
+      - 'scripts/rewrite-metrics/**'
+      - 'tests/Unit/test_rewrite_progress.py'
       - 'tests/Unit/test_docs_site.py'
       - 'scripts/check-docs.py'
       - 'tests/Unit/test_docs_links.py'
@@ -83,6 +85,7 @@ jobs:
           python3 -B tests/Unit/test_benchmark_utility_extended.py
           python3 -B tests/Unit/test_benchmark_resource_limits.py
           python3 -B tests/Unit/test_docs_site.py
+          python3 -B tests/Unit/test_rewrite_progress.py
           python3 -B tests/Unit/test_docs_links.py
       - name: Check Google style with pinned Vale
         shell: bash
@@ -133,6 +136,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BUILD_SHA: ${{ steps.identity.outputs.sha }}
         run: python3 -B scripts/benchmark-pages.py --sha="$BUILD_SHA" --output=benchmark-site
+      # The rewrite lands on rust-native, which dispatches this workflow on each push.
+      # A failure here leaves the front page saying progress is unavailable.
+      - name: Check out rust-native for the rewrite ledgers
+        continue-on-error: true
+        uses: actions/checkout@v5
+        with:
+          ref: rust-native
+          path: rewrite-rust-native
+          persist-credentials: false
+      - name: Set up the PHP that app/ is written for
+        continue-on-error: true
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          coverage: none
+      - name: Measure rewrite progress
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          progress=(python3 -B scripts/rewrite-metrics/progress.py --master=. --output=benchmark-site/rewrite-progress.json)
+          if [[ -d rewrite-rust-native/.git ]]; then
+            progress+=(--rust-native=rewrite-rust-native)
+          fi
+          "${progress[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Build documentation around current and historical evidence
         run: |
           python3 -B scripts/build-docs.py --output=benchmark-site

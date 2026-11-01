@@ -18,6 +18,7 @@ PAGES = (
 )
 SLUGS = tuple(slug for _, items in PAGES for slug, _ in items)
 REPOSITORY = 'https://github.com/xbmc4lyfe/newznab-tmux'
+REWRITE_PROGRESS_MARKER = '<!-- rewrite-progress -->'
 
 
 class FragmentText(HTMLParser):
@@ -73,6 +74,36 @@ def safe_file(path):
     return path
 
 
+def commit_link(commit):
+    return f'<a href="{REPOSITORY}/commit/{escape(commit, quote=True)}"><code>{escape(commit)}</code></a>'
+
+
+def rewrite_progress(report_path):
+    """Render scripts/rewrite-metrics/progress.py's report, or say that this build has none."""
+    safe_file(report_path)
+    if not report_path.is_file():
+        return '<p>Rewrite progress is unavailable in this build.</p>'
+    report = json.loads(report_path.read_text(encoding='utf-8'))
+    headline = float(report['headline_pct'])
+    baseline, entries, master, rust_native = (report[key] for key in ('baseline', 'entries', 'master', 'rust_native'))
+    rows = ''.join(
+        f'<tr><td>{escape(row["title"])}</td><td>{float(row["ported_pct"]):.1f}%</td><td>{int(row["baseline_live"]):,}</td>'
+        f'<td>{int(row["master_live"]):,}</td><td>{int(row["rust_lines"]):,}</td></tr>' for row in report['subsystems'])
+    branch = ''
+    if rust_native:
+        branch = (f' <code>rust-native</code> at {commit_link(rust_native["commit"])} has {int(rust_native["live_php"]):,} lines of live PHP '
+                  f'and {int(rust_native["rust_lines"]):,} lines of Rust in its crates, because its PHP was deleted before the port began.')
+    return (
+        f'<p class="rewrite-figure"><strong>{headline:.1f}%</strong> of the way to replacing PHP with Rust</p>'
+        f'<progress class="rewrite-bar" max="100" value="{headline:.1f}" aria-label="Rust rewrite progress">{headline:.1f}%</progress>'
+        f'<p>This is the share of the {int(baseline["live_lines"]):,} live PHP lines at {commit_link(baseline["commit"])} whose entry points are done. '
+        f'Each subsystem counts by the share of its entry points that are ported or dropped: {int(entries["done"]):,} of {int(entries["total"]):,} so far. '
+        f'Shared code follows the average of the others.</p>'
+        f'<p><code>master</code> at {commit_link(master["commit"])} still has {int(master["live_php"]):,} lines of live PHP, {float(master["removed_pct"]):.1f}% fewer than the baseline.{branch}</p>'
+        '<table><thead><tr><th>Subsystem</th><th>Entry points done</th><th>PHP at baseline</th><th>PHP on master</th><th>Rust on rust-native</th></tr></thead>'
+        f'<tbody>{rows}</tbody></table>')
+
+
 def build(source, output, benchmark_page=None):
     source, output = Path(source).absolute(), Path(output).absolute()
     if source.is_symlink() or output.is_symlink():
@@ -93,6 +124,8 @@ def build(source, output, benchmark_page=None):
     documents = []
     for slug in SLUGS:
         fragment = safe_file(source / 'content' / f'{slug}.html').read_text(encoding='utf-8')
+        if REWRITE_PROGRESS_MARKER in fragment:
+            fragment = fragment.replace(REWRITE_PROGRESS_MARKER, rewrite_progress(output / 'rewrite-progress.json'))
         parsed = FragmentText()
         parsed.feed(fragment)
         title = ' '.join(''.join(parsed.title).split())

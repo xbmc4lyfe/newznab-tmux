@@ -144,3 +144,7 @@ docker/Justfile		-binary text eol=lf
 
 # Everything under the new indexer workspace is source and must stay reviewable and mergeable.
 /rust/indexer/** -binary text eol=lf
+scripts/rewrite-metrics/progress.py -binary text eol=lf
+scripts/rewrite-metrics/rewrite_metrics.py -binary text eol=lf
+scripts/rewrite-metrics/subsystems.toml -binary text eol=lf
+tests/Unit/test_rewrite_progress.py -binary text eol=lf
