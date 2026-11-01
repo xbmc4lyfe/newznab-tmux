@@ -1,0 +1,180 @@
+[
+ {
+  "name": "rss_missing_token",
+  "path": "/rss/full-feed"
+ },
+ {
+  "name": "rss_bad_token",
+  "path": "/rss/full-feed?api_token=nope"
+ },
+ {
+  "name": "rss_disabled",
+  "path": "/rss/full-feed?api_token=tokendisabled"
+ },
+ {
+  "name": "rss_limit_exact_passes",
+  "path": "/rss/full-feed?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_requests (users_id, request, timestamp) SELECT 1, 'x', NOW() FROM seq_1_to_10;"
+  ]
+ },
+ {
+  "name": "rss_limit_over",
+  "path": "/rss/full-feed?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_requests (users_id, request, timestamp) SELECT 1, 'x', NOW() FROM seq_1_to_11;"
+  ]
+ },
+ {
+  "name": "rss_full",
+  "path": "/rss/full-feed?api_token=tokenalice"
+ },
+ {
+  "name": "rss_full_post",
+  "method": "POST",
+  "path": "/rss/full-feed",
+  "headers": {
+   "Content-Type": "application/x-www-form-urlencoded"
+  },
+  "body": "api_token=tokenalice"
+ },
+ {
+  "name": "rss_full_json",
+  "path": "/rss/full-feed?o=json&api_token=tokenalice"
+ },
+ {
+  "name": "rss_full_dl",
+  "path": "/rss/full-feed?dl=1&del=1&num=1&api_token=tokenposter"
+ },
+ {
+  "name": "rss_limit_param",
+  "path": "/rss/full-feed?limit=2&api_token=tokenalice"
+ },
+ {
+  "name": "rss_limit_nonnumeric",
+  "path": "/rss/full-feed?limit=x&api_token=tokenalice"
+ },
+ {
+  "name": "rss_show",
+  "path": "/rss/full-feed?show=70&api_token=tokenalice"
+ },
+ {
+  "name": "rss_anidb",
+  "path": "/rss/full-feed?anidb=93&api_token=tokenalice"
+ },
+ {
+  "name": "rss_airdate",
+  "path": "/rss/full-feed?airdate=100000&api_token=tokenalice"
+ },
+ {
+  "name": "rss_cart_empty",
+  "path": "/rss/cart?api_token=tokenalice"
+ },
+ {
+  "name": "rss_cart",
+  "path": "/rss/cart?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO users_releases (users_id, releases_id) VALUES (1,2),(1,1);"
+  ]
+ },
+ {
+  "name": "rss_cart_no_token",
+  "path": "/rss/cart"
+ },
+ {
+  "name": "rss_category_missing",
+  "path": "/rss/category"
+ },
+ {
+  "name": "rss_category_bad",
+  "path": "/rss/category?id=x&api_token=tokenalice"
+ },
+ {
+  "name": "rss_category_missing_auth_order",
+  "path": "/rss/category?id=2040"
+ },
+ {
+  "name": "rss_category",
+  "path": "/rss/category?id=2040&api_token=tokenalice"
+ },
+ {
+  "name": "rss_category_root",
+  "path": "/rss/category?id=5000,7020&api_token=tokenalice"
+ },
+ {
+  "name": "rss_category_all",
+  "path": "/rss/category?id=-1&api_token=tokenalice"
+ },
+ {
+  "name": "rss_category_cart",
+  "path": "/rss/category?id=-2&api_token=tokenalice"
+ },
+ {
+  "name": "rss_mymovies_empty",
+  "path": "/rss/mymovies?api_token=tokenalice"
+ },
+ {
+  "name": "rss_mymovies",
+  "path": "/rss/mymovies?num=5&api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_movies (users_id, imdbid, categories) VALUES (1, '1234567', NULL);"
+  ]
+ },
+ {
+  "name": "rss_mymovies_cat_filter",
+  "path": "/rss/mymovies?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_movies (users_id, imdbid, categories) VALUES (1, '1234567', '2030|2050');"
+  ]
+ },
+ {
+  "name": "rss_myshows",
+  "path": "/rss/myshows?num=5&api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_series (users_id, videos_id, categories) VALUES (1, 70, '');"
+  ]
+ },
+ {
+  "name": "rss_myshows_airdate",
+  "path": "/rss/myshows?airdate=1&api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_series (users_id, videos_id, categories) VALUES (1, 70, 'NULL');"
+  ]
+ },
+ {
+  "name": "rss_trending_movies_empty",
+  "path": "/rss/trending-movies?api_token=tokenalice"
+ },
+ {
+  "name": "rss_trending_movies",
+  "path": "/rss/trending-movies?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_downloads (users_id, releases_id, timestamp) VALUES (4, 1, NOW());"
+  ]
+ },
+ {
+  "name": "rss_trending_shows",
+  "path": "/rss/trending-shows?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_downloads (users_id, releases_id, timestamp) VALUES (4, 2, NOW());"
+  ]
+ },
+ {
+  "name": "rss_excludes_passworded_row",
+  "path": "/rss/category?id=10&api_token=tokenalice"
+ },
+ {
+  "name": "rss_passworded_allowed",
+  "path": "/rss/category?id=10&api_token=tokenalice",
+  "setup": [
+   "UPDATE releases SET passwordstatus = 1 WHERE id = 9;",
+   "UPDATE ingestion_configurations SET show_passworded_releases = 1;"
+  ]
+ },
+ {
+  "name": "rss_method",
+  "method": "DELETE",
+  "path": "/rss/cart",
+  "ignore_body": true
+ }
+]

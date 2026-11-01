@@ -17,7 +17,8 @@ use crate::cache;
 use crate::reply::{Reply, json_error, xml_error};
 use crate::request::ApiRequest;
 use crate::settings::Settings;
-use crate::{caps, getnzb, misc, v1, v2};
+use crate::rss::{self, Feed};
+use crate::{abuse, caps, getnzb, misc, v1, v2};
 
 const DEFAULT_RATE_LIMIT: i64 = 60;
 
@@ -39,6 +40,7 @@ pub enum Endpoint {
     Fallback,
     RssHealth,
     GetNzb,
+    Rss(Feed),
 }
 
 /// What a route accepts. `allowed` is the `Allow` of a 405 and `options` the explicit handler's list.
@@ -107,6 +109,13 @@ impl Endpoint {
                 implicit_options: "GET,HEAD,POST",
                 query: QueryRule::None,
                 token_limit: false,
+            },
+            Self::Rss(_) => RouteSpec {
+                methods: &["GET", "HEAD", "POST"],
+                allowed: "GET, HEAD, POST",
+                implicit_options: "GET,HEAD,POST",
+                token_limit: true,
+                ..READ_ROUTE
             },
             Self::GetNzb => RouteSpec {
                 methods: &["GET", "HEAD", "POST"],
@@ -196,6 +205,12 @@ async fn respond(
         return Ok(preflight(&request));
     }
 
+    let mut api = ApiRequest::read(request).await?;
+    // Global middleware runs before routing, so it also sees requests that end in a 405.
+    if let Some(reply) = abuse::check(ctx, settings, &api).await {
+        return Ok(reply);
+    }
+
     let mut spec = endpoint.spec();
     // The nzbadd path is POST only; reads belong to the catch-all route.
     if endpoint == Endpoint::V2NzbAdd && matches!(method.as_str(), "GET" | "HEAD") {
@@ -215,7 +230,6 @@ async fn respond(
                 reply.set_header("allow", allow);
                 reply.set_header("accept-query", "application/json");
                 reply.set_header("vary", "Access-Control-Request-Method");
-                let api = ApiRequest::read(request).await?;
                 return throttle_group(ctx, settings, &api, reply).await;
             }
         }
@@ -230,7 +244,6 @@ async fn respond(
         return Ok(Reply::exception(405, &message).header("allow", spec.allowed));
     }
 
-    let mut api = ApiRequest::read(request).await?;
     // Only the web group's /getnzb runs outside the API throttle.
     if endpoint == Endpoint::GetNzb {
         return getnzb::web(ctx, &api, route_id.as_deref()).await;
@@ -320,6 +333,7 @@ async fn handle(
         Endpoint::MediaInfo => misc::media_info(ctx, route_id.as_deref().unwrap_or_default()).await,
         Endpoint::Fallback => Ok(misc::fallback()),
         Endpoint::RssHealth => Ok(misc::rss_health()),
+        Endpoint::Rss(feed) => rss::feed(ctx, settings, api, feed).await,
         Endpoint::GetNzb => unreachable!("handled before the API throttle"),
     }
 }

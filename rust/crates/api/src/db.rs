@@ -31,7 +31,7 @@ pub fn column_json(row: &MySqlRow, index: usize) -> Result<J> {
                 .to_string(),
         ),
         "VARCHAR" | "CHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM"
-        | "DECIMAL" => J::Str(row.try_get(index)?),
+        => J::Str(row.try_get(index)?),
         other => bail!("no JSON form for column type {other}"),
     })
 }

@@ -17,11 +17,12 @@ INSERT INTO model_has_permissions (permission_id, model_type, model_id)
   SELECT id, 'App\\Models\\User', 1 FROM permissions WHERE name IN ('view console', 'view movies', 'view audio', 'view pc', 'view tv', 'view books', 'view other');
 INSERT INTO model_has_permissions (permission_id, model_type, model_id)
   SELECT id, 'App\\Models\\User', 4 FROM permissions WHERE name LIKE 'view %';
+DELETE FROM releases;
+DELETE FROM usenet_groups WHERE id >= 9000 OR name IN ('alt.binaries.teevee', 'alt.binaries.moovee');
 UPDATE usenet_groups SET active = 0;
 INSERT INTO usenet_groups (id, name, description, active, last_updated) VALUES
   (9001, 'alt.binaries.teevee', 'TV & "more" <here>', 1, '2026-02-03 04:05:06'),
-  (9002, 'alt.binaries.moovee', NULL, 1, NULL)
-  ON DUPLICATE KEY UPDATE active = VALUES(active);
+  (9002, 'alt.binaries.moovee', NULL, 1, NULL);
 TRUNCATE user_requests;
 TRUNCATE user_downloads;
 DELETE FROM release_informs;

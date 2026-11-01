@@ -14,6 +14,7 @@ const MAX_QUERY_PARAMETERS: usize = 64;
 pub struct ApiRequest {
     pub method: String,
     pub path: String,
+    query_string: Option<String>,
     pub input: Input,
     pub headers: HeaderMap,
     pub raw_body: bytes::Bytes,
@@ -28,6 +29,7 @@ impl ApiRequest {
         let mut this = Self {
             method,
             path: parts.uri.path().to_owned(),
+            query_string: parts.uri.query().map(str::to_owned),
             input: Input {
                 query,
                 body: Bag::new(),
@@ -98,6 +100,14 @@ impl ApiRequest {
             .find(|ip| !is_private(ip))
             .or_else(|| hops.first().and_then(parsed))
             .map(|ip| ip.to_string())
+    }
+
+    /// `$request->getRequestUri()`: the path and raw query.
+    pub fn request_uri(&self) -> String {
+        match &self.query_string {
+            Some(query) => format!("{}?{query}", self.path),
+            None => self.path.clone(),
+        }
     }
 
     pub fn is_query_method(&self) -> bool {

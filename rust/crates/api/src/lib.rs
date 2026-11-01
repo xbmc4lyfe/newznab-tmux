@@ -5,9 +5,11 @@
 // Helpers the release, RSS and download endpoints use arrive in the next PRs of this workstream.
 #![allow(dead_code)]
 
+mod abuse;
 mod auth;
 mod cache;
 mod caps;
+mod category;
 mod db;
 mod filename;
 mod getnzb;
@@ -21,6 +23,7 @@ mod present_v1;
 mod present_v2;
 mod reply;
 mod request;
+mod rss;
 mod rows;
 mod settings;
 pub mod usage;
@@ -35,6 +38,8 @@ use axum::{Extension, Router};
 use nntmux_runtime::Ctx;
 
 use crate::pipeline::{Endpoint, dispatch};
+use crate::rss::Feed;
+pub use crate::abuse::AbuseConfig;
 pub use crate::settings::Settings;
 
 pub fn router() -> Router<Ctx> {
@@ -62,6 +67,13 @@ pub fn router_with(settings: Settings) -> Router<Ctx> {
         .route("/api/release/{id}/mediainfo", route(Endpoint::MediaInfo))
         .route("/api/{*rest}", route(Endpoint::Fallback))
         .route("/rss/health", route(Endpoint::RssHealth))
+        .route("/rss/mymovies", route(Endpoint::Rss(Feed::MyMovies)))
+        .route("/rss/myshows", route(Endpoint::Rss(Feed::MyShows)))
+        .route("/rss/full-feed", route(Endpoint::Rss(Feed::Full)))
+        .route("/rss/cart", route(Endpoint::Rss(Feed::Cart)))
+        .route("/rss/category", route(Endpoint::Rss(Feed::Category)))
+        .route("/rss/trending-movies", route(Endpoint::Rss(Feed::TrendingMovies)))
+        .route("/rss/trending-shows", route(Endpoint::Rss(Feed::TrendingShows)))
         .route("/getnzb", route(Endpoint::GetNzb))
         .route("/getnzb/{guid}", route(Endpoint::GetNzb))
         .layer(Extension(Arc::new(settings)))

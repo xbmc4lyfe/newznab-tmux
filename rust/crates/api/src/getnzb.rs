@@ -1,5 +1,6 @@
 //! `GetNzbController`: NZB downloads for `/getnzb` and both API versions.
 
+use std::collections::HashSet;
 use std::io::{Cursor, Write};
 
 use anyhow::Result;
@@ -309,6 +310,8 @@ async fn zip_download(
     }
 
     let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    // Reposts can share a name. ZipStream skips later entries, comparing case-insensitively.
+    let mut names = HashSet::new();
     for guid in &guids {
         let Some(xml) = nzb::read(ctx, guid).await? else {
             continue;
@@ -322,7 +325,11 @@ async fn zip_download(
                 .fetch_optional(&ctx.db)
                 .await?;
         let name = stored.unwrap_or_else(|| (*guid).to_owned());
-        archive.start_file(format!("{name}{SUFFIX}"), SimpleFileOptions::default())?;
+        let entry = format!("{name}{SUFFIX}");
+        if !names.insert(entry.to_lowercase()) {
+            continue;
+        }
+        archive.start_file(entry, SimpleFileOptions::default())?;
         archive.write_all(&xml)?;
     }
     let bytes = archive.finish()?.into_inner();

@@ -60,7 +60,7 @@ async fn run_sql(pool: &MySqlPool, sql: &str) -> Result<()> {
 
 fn settings() -> Settings {
     let prefix: u64 = rand::rng().random();
-    Settings::new(
+    let mut settings = Settings::new(
         "NNTmux".to_owned(),
         "admin@example.test".to_owned(),
         500,
@@ -68,7 +68,9 @@ fn settings() -> Settings {
         8192,
         60,
         format!("t{prefix:016x}:"),
-    )
+    );
+    settings.abuse.asn_lookup = false;
+    settings
 }
 
 fn app(ctx: &Ctx) -> Router {
@@ -433,5 +435,75 @@ async fn zip_download_contains_each_nzb() -> Result<()> {
     let mut contents = String::new();
     std::io::Read::read_to_string(&mut file, &mut contents)?;
     assert!(contents.contains("file poster=\"a@b\""));
+    db.drop_database().await
+}
+
+/// `limit` is left out: PHP passes the raw string to an `int` parameter under strict types, so any
+/// numeric `limit` answers 500 there. Rust honors it, which `rss_limit_is_honored` covers.
+#[tokio::test]
+async fn rss_matches_php() -> Result<()> {
+    replay("golden_rss.json", &["rss_limit_param"]).await
+}
+
+/// PHP crashes on a numeric `limit`; the feed should simply honor it.
+#[tokio::test]
+async fn rss_limit_is_honored() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL")) else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    let request = Request::builder()
+        .uri("/rss/full-feed?limit=2&api_token=tokenalice")
+        .header("host", "x.test")
+        .body(Body::empty())?;
+    let response = app(&ctx).oneshot(request).await?;
+    assert_eq!(response.status(), 200);
+    let body = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
+    assert_eq!(body.matches("<item>").count(), 2);
+    db.drop_database().await
+}
+
+/// Same score PHP's detector gives: the UA pair (25) and IP correlation (20) alone stay under the
+/// default threshold of 50, and the indexer Referer (30) tips it over.
+#[tokio::test]
+async fn proxy_detection_scores_like_php() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL")) else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    let mut settings = settings();
+    settings.abuse.detection_enabled = true;
+    let app = router_with(settings).with_state(ctx.clone());
+    let call = |uri: &str, referer: Option<&str>| {
+        let mut builder = Request::builder()
+            .uri(uri)
+            .header("host", "x.test")
+            .header("user-agent", "Prowlarr/1.0")
+            .header("x-forwarded-for", "203.0.113.9");
+        if let Some(referer) = referer {
+            builder = builder.header("referer", referer);
+        }
+        app.clone().oneshot(builder.body(Body::empty()).expect("static request"))
+    };
+    let response = call("/api/v1/api?t=caps&apikey=tokenalice", None).await?;
+    assert_eq!(response.status(), 200);
+    let download = "/api/v1/api?t=g&apikey=tokenalice&id=nope";
+    assert_eq!(call(download, None).await?.status(), 404);
+    let refused = call(download, Some("http://hydra.local:5076/")).await?;
+    assert_eq!(refused.status(), 403);
+    let body = to_bytes(refused.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(body.to_vec())?.contains("Proxying NZB downloads"));
     db.drop_database().await
 }
