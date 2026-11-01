@@ -40,13 +40,13 @@ status = "ported"
 kind = "command"
 id = "predb:check"
 source = "app/Console/Commands/PredbCheck.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "predb:identity-rebuild"
 source = "app/Console/Commands/PredbIdentityRebuildCommand.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
