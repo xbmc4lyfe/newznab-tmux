@@ -2,9 +2,6 @@
 //!
 //! Owner: ws-api. See `rust/WORKSTREAMS.md`.
 
-// Helpers the release, RSS and download endpoints use arrive in the next PRs of this workstream.
-#![allow(dead_code)]
-
 mod abuse;
 mod auth;
 mod cache;
@@ -22,11 +19,14 @@ mod params;
 mod pipeline;
 mod present_v1;
 mod present_v2;
+mod release_cache;
 mod reply;
 mod request;
 mod rows;
 mod rss;
+mod search;
 mod settings;
+mod suggest;
 mod upload;
 pub mod usage;
 mod v1;
