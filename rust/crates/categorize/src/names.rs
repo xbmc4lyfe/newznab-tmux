@@ -245,7 +245,9 @@ pub fn unwrap_nzbsplit(value: &str) -> Option<String> {
         for re in subject {
             let updated = replace_all(re, &title, "");
             if updated != title {
-                title = trim_chars(&updated, " \t\n\r\0\x0B\"'").to_owned();
+                title = updated
+                    .trim_end_matches(|c| " \t\n\r\0\x0B\"'".contains(c))
+                    .to_owned();
                 did_strip = true;
             }
         }

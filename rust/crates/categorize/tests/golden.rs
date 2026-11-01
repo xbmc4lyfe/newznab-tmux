@@ -5,8 +5,17 @@ use serde_json::Value;
 
 #[test]
 fn matches_the_php_pipeline() {
+    check(include_str!("fixtures/golden.jsonl"), 1000);
+}
+
+/// One input for each rule outcome the broad corpus rarely reaches.
+#[test]
+fn matches_the_php_pipeline_for_each_branch() {
+    check(include_str!("fixtures/golden_branches.jsonl"), 200);
+}
+
+fn check(golden: &str, minimum: usize) {
     let mut failures = Vec::new();
-    let golden = include_str!("fixtures/golden.jsonl");
     let mut cases = 0;
     for line in golden.lines() {
         let row: Value = serde_json::from_str(line).expect("golden row");
@@ -43,12 +52,13 @@ fn matches_the_php_pipeline() {
                 || decision.matched_by != case["m"].as_str().expect("m")
                 || decision.confidence != case["v"].as_f64().expect("v")
                 || decision.locked_to_misc != case["l"].as_bool().expect("l")
+                || case["e"].as_str().is_some_and(|name| decision.name != name)
             {
                 failures.push(format!("{name:?} {case}: got {decision:?}"));
             }
         }
     }
-    assert!(cases > 1000, "corpus too small: {cases}");
+    assert!(cases > minimum, "corpus too small: {cases}");
     assert!(
         failures.is_empty(),
         "{} of {cases} differ:\n{}",

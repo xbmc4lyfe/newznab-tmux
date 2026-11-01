@@ -1,6 +1,8 @@
 <?php
 // Regenerates golden.jsonl. Run from anywhere after rust/porting/php-ref-setup.sh:
 //   php generate_golden.php <php-final checkout> < corpus.txt > golden.jsonl
+//   php generate_golden.php <php-final checkout> < branches.txt > golden_branches.jsonl
+// branches.txt names one input for each rule outcome; its rows also record the cleaned name.
 declare(strict_types=1);
 
 $ref = $argv[1];
@@ -37,7 +39,7 @@ $extractor = new ObfuscatedSubjectExtractor;
 
 $line = 0;
 while (($raw = fgets(STDIN)) !== false) {
-    $name = str_replace(['\\n', '\\\\'], ["\n", '\\'], rtrim($raw, "\n"));
+    $name = preg_replace_callback('/\\\\(n|\\\\)/', static fn (array $m): string => $m[1] === 'n' ? "\n" : '\\', rtrim($raw, "\n"));
     $line++;
     $names = ['n' => $name, 'h' => $hashed->isHashedOrGibberish($name), 'u' => $unwrapper->unwrap($name), 'x' => $extractor->extract($name), 'r' => []];
     $group = $groups[$line % count($groups)];
@@ -49,6 +51,7 @@ while (($raw = fgets(STDIN)) !== false) {
             'f' => $foreign, 'w' => $webDl, 'g' => $g === '' ? '' : $g.'.golden', 'p' => $p,
             'c' => $result['categories_id'], 'm' => $result['debug']['matched_by'],
             'v' => $result['debug']['final_confidence'], 'l' => $result['debug']['locked_to_misc'],
+            'e' => $result['debug']['release_name'],
         ];
     }
     echo json_encode($names, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR), "\n";
