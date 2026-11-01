@@ -1,0 +1,18 @@
+# HELP nntmux_up Whether the NNTmux metrics exporter ran.
+# TYPE nntmux_up gauge
+nntmux_up 1
+# HELP nntmux_help Help with a \\ backslash\nand a newline.
+# TYPE nntmux_help gauge
+nntmux_help 0.5
+# HELP nntmux_values Float rendering.
+# TYPE nntmux_values gauge
+nntmux_values{kind="whole"} 1
+nntmux_values{kind="rounded"} 0.123457
+nntmux_values{kind="large"} 1234567.5
+nntmux_values{kind="negative zero"} 0
+nntmux_values{kind="nan"} NaN
+nntmux_values{kind="inf"} +Inf
+nntmux_values{kind="neg inf"} -Inf
+# HELP nntmux_labels Label escaping.
+# TYPE nntmux_labels gauge
+nntmux_labels{a="quote \" here",b="back \\ slash",c="new\nline"} 2
