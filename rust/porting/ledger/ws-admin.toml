@@ -1,0 +1,1063 @@
+# Entry points owned by ws-admin. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "command"
+id = "admin:warm-dashboard"
+source = "app/Console/Commands/WarmAdminDashboard.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "captcha:status"
+source = "app/Console/Commands/CaptchaStatus.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "cloudflare:reload"
+source = "app/Console/Commands/CloudflareReload.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "gdpr:purge-expired-exports"
+source = "app/Console/Commands/GdprPurgeExpiredExports.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "gdpr:purge-expired-exports"
+source = "app/Console/Commands/PurgeExpiredGdprExports.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "mail:preview"
+source = "app/Console/Commands/MailPreview.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:delete-unverified-users"
+source = "app/Console/Commands/NntmuxDeleteUnVerifiedUsers.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:purge-deleted-accounts"
+source = "app/Console/Commands/NntmuxPurgeDeletedAccounts.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "role:manage"
+source = "app/Console/Commands/ManageRoleStacking.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "PurgeDeletedAccounts"
+source = "app/Jobs/PurgeDeletedAccounts.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "RemoveInactiveAccounts"
+source = "app/Jobs/RemoveInactiveAccounts.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "SendAccountChangedEmail"
+source = "app/Jobs/SendAccountChangedEmail.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "SendAccountDeletedEmail"
+source = "app/Jobs/SendAccountDeletedEmail.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "SendAccountExpiredEmail"
+source = "app/Jobs/SendAccountExpiredEmail.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "SendAccountWillExpireEmail"
+source = "app/Jobs/SendAccountWillExpireEmail.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "SendContactUsEmail"
+source = "app/Jobs/SendContactUsEmail.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "SendNewRegisteredAccountMail"
+source = "app/Jobs/SendNewRegisteredAccountMail.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "SendPasswordForgottenEmail"
+source = "app/Jobs/SendPasswordForgottenEmail.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "SendWelcomeEmail"
+source = "app/Jobs/SendWelcomeEmail.php"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "DELETE /admin/category-delete"
+source = "App\\Http\\Controllers\\Admin\\AdminCategoryController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "DELETE /admin/logs"
+source = "App\\Http\\Controllers\\Admin\\AdminLogViewerController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "DELETE /admin/promotions/{id}"
+source = "App\\Http\\Controllers\\Admin\\AdminPromotionController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "DELETE /admin/registrations/periods/{period}"
+source = "App\\Http\\Controllers\\Admin\\AdminRegistrationController@destroyPeriod"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "DELETE /admin/status/{incident}"
+source = "App\\Http\\Controllers\\Admin\\AdminStatusController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "DELETE /admin/user-passkey/{passkey}"
+source = "App\\Http\\Controllers\\Admin\\AdminUserController@destroyPasskey"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/anidb-edit/{id}"
+source = "App\\Http\\Controllers\\Admin\\AdminAnidbController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/anidb-list"
+source = "App\\Http\\Controllers\\Admin\\AdminAnidbController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/api/dashboard-data"
+source = "App\\Http\\Controllers\\Admin\\AdminPageController@getDashboardData"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/api/system-metrics/current"
+source = "App\\Http\\Controllers\\Admin\\AdminPageController@getCurrentMetrics"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/api/system-metrics/historical"
+source = "App\\Http\\Controllers\\Admin\\AdminPageController@getHistoricalMetrics"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/api/user-activity/minutes"
+source = "App\\Http\\Controllers\\Admin\\AdminPageController@getUserActivityMinutes"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/api/user-activity/recent"
+source = "App\\Http\\Controllers\\Admin\\AdminPageController@getRecentActivity"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/binaryblacklist-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminBlacklistController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/binaryblacklist-list"
+source = "App\\Http\\Controllers\\Admin\\AdminBlacklistController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/book-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminBookController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/book-list"
+source = "App\\Http\\Controllers\\Admin\\AdminBookController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/category-add"
+source = "App\\Http\\Controllers\\Admin\\AdminCategoryController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/category-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminCategoryController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/category-list"
+source = "App\\Http\\Controllers\\Admin\\AdminCategoryController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/category_regexes-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminCategoryRegexesController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/category_regexes-list"
+source = "App\\Http\\Controllers\\Admin\\AdminCategoryRegexesController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/collection_regexes-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminCollectionRegexesController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/collection_regexes-list"
+source = "App\\Http\\Controllers\\Admin\\AdminCollectionRegexesController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/comments-list"
+source = "App\\Http\\Controllers\\Admin\\AdminCommentsController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/console-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminConsoleController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/console-list"
+source = "App\\Http\\Controllers\\Admin\\AdminConsoleController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/content-add"
+source = "App\\Http\\Controllers\\Admin\\AdminContentController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/content-list"
+source = "App\\Http\\Controllers\\Admin\\AdminContentController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/deleted-users"
+source = "App\\Http\\Controllers\\Admin\\DeletedUsersController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/failrel-list"
+source = "App\\Http\\Controllers\\Admin\\AdminFailedReleasesController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/game-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminGameController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/game-list"
+source = "App\\Http\\Controllers\\Admin\\AdminGameController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/gdpr-requests"
+source = "App\\Http\\Controllers\\Admin\\GdprRequestController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/gdpr-requests/{gdprRequest}"
+source = "App\\Http\\Controllers\\Admin\\GdprRequestController@show"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/group-bulk"
+source = "App\\Http\\Controllers\\Admin\\AdminGroupController@createBulk"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/group-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminGroupController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/group-list"
+source = "App\\Http\\Controllers\\Admin\\AdminGroupController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/group-list-active"
+source = "App\\Http\\Controllers\\Admin\\AdminGroupController@active"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/group-list-inactive"
+source = "App\\Http\\Controllers\\Admin\\AdminGroupController@inactive"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/index"
+source = "App\\Http\\Controllers\\Admin\\AdminPageController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/invitations"
+source = "App\\Http\\Controllers\\Admin\\AdminInvitationController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/invitations/{id}"
+source = "App\\Http\\Controllers\\Admin\\AdminInvitationController@show"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/logs"
+source = "App\\Http\\Controllers\\Admin\\AdminLogViewerController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/logs/download"
+source = "App\\Http\\Controllers\\Admin\\AdminLogViewerController@download"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/logs/entries"
+source = "App\\Http\\Controllers\\Admin\\AdminLogViewerController@entries"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/logs/entry"
+source = "App\\Http\\Controllers\\Admin\\AdminLogViewerController@entry"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/logs/facets"
+source = "App\\Http\\Controllers\\Admin\\AdminLogViewerController@facets"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/logs/files"
+source = "App\\Http\\Controllers\\Admin\\AdminLogViewerController@files"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/logs/search"
+source = "App\\Http\\Controllers\\Admin\\AdminLogViewerController@search"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/monitoring"
+source = "App\\Http\\Controllers\\Admin\\AdminMonitoringController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/monitoring/grafana-auth"
+source = "App\\Http\\Controllers\\Admin\\AdminMonitoringController@authorizeGrafana"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/monitoring/grafana-token"
+source = "App\\Http\\Controllers\\Admin\\AdminMonitoringController@token"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/movie-add"
+source = "App\\Http\\Controllers\\Admin\\AdminMovieController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/movie-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminMovieController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/movie-list"
+source = "App\\Http\\Controllers\\Admin\\AdminMovieController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/music-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminMusicController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/music-list"
+source = "App\\Http\\Controllers\\Admin\\AdminMusicController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/payment-list"
+source = "App\\Http\\Controllers\\Admin\\AdminPaymentController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/predb"
+source = "App\\Http\\Controllers\\Admin\\AdminPredbController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/promotions"
+source = "App\\Http\\Controllers\\Admin\\AdminPromotionController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/promotions/create"
+source = "App\\Http\\Controllers\\Admin\\AdminPromotionController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/promotions/statistics"
+source = "App\\Http\\Controllers\\Admin\\AdminPromotionController@statistics"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/promotions/{id}/edit"
+source = "App\\Http\\Controllers\\Admin\\AdminPromotionController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/promotions/{id}/statistics"
+source = "App\\Http\\Controllers\\Admin\\AdminPromotionController@showStatistics"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/registrations"
+source = "App\\Http\\Controllers\\Admin\\AdminRegistrationController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/release-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminReleasesController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/release-list"
+source = "App\\Http\\Controllers\\Admin\\AdminReleasesController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/release-reports"
+source = "App\\Http\\Controllers\\Admin\\AdminReleaseReportController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/release_naming_regexes-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminReleaseNamingRegexesController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/release_naming_regexes-list"
+source = "App\\Http\\Controllers\\Admin\\AdminReleaseNamingRegexesController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/role-add"
+source = "App\\Http\\Controllers\\Admin\\AdminRoleController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/role-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminRoleController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/role-list"
+source = "App\\Http\\Controllers\\Admin\\AdminRoleController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/settings/{domain}"
+source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@show"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/show-add"
+source = "App\\Http\\Controllers\\Admin\\AdminShowsController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/show-add/lookup"
+source = "App\\Http\\Controllers\\Admin\\AdminShowsController@lookup"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/show-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminShowsController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/show-list"
+source = "App\\Http\\Controllers\\Admin\\AdminShowsController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/site-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@legacySite"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/site-stats"
+source = "App\\Http\\Controllers\\Admin\\AdminSiteController@stats"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/status"
+source = "App\\Http\\Controllers\\Admin\\AdminStatusController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/status/create"
+source = "App\\Http\\Controllers\\Admin\\AdminStatusController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/status/{incident}/edit"
+source = "App\\Http\\Controllers\\Admin\\AdminStatusController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/tmux-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@legacyTmux"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/user-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminUserController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/user-list"
+source = "App\\Http\\Controllers\\Admin\\AdminUserController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/user-role-history"
+source = "App\\Http\\Controllers\\Admin\\AdminUserRoleHistoryController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /admin/user-role-history/{userId}"
+source = "App\\Http\\Controllers\\Admin\\AdminUserRoleHistoryController@show"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /btcpay"
+source = "Closure"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "PATCH /admin/promotions/{id}/toggle"
+source = "App\\Http\\Controllers\\Admin\\AdminPromotionController@toggle"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/ajax"
+source = "App\\Http\\Controllers\\Admin\\AdminAjaxController@ajaxAction"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/anidb-delete/{id}"
+source = "App\\Http\\Controllers\\Admin\\AdminAnidbController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/anidb-edit/{id}"
+source = "App\\Http\\Controllers\\Admin\\AdminAnidbController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/binaryblacklist-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminBlacklistController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/book-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminBookController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/category-add"
+source = "App\\Http\\Controllers\\Admin\\AdminCategoryController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/category-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminCategoryController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/category_regexes-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminCategoryRegexesController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/collection_regexes-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminCollectionRegexesController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/comments-delete/{id}"
+source = "App\\Http\\Controllers\\Admin\\AdminCommentsController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/console-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminConsoleController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/content-add"
+source = "App\\Http\\Controllers\\Admin\\AdminContentController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/content-delete"
+source = "App\\Http\\Controllers\\Admin\\AdminContentController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/content-reorder"
+source = "App\\Http\\Controllers\\Admin\\AdminContentController@reorder"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/content-toggle-status"
+source = "App\\Http\\Controllers\\Admin\\AdminContentController@toggleStatus"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/deleted-users/bulk"
+source = "App\\Http\\Controllers\\Admin\\DeletedUsersController@bulkAction"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/deleted-users/permanent-delete/{id}"
+source = "App\\Http\\Controllers\\Admin\\DeletedUsersController@permanentDelete"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/deleted-users/restore/{id}"
+source = "App\\Http\\Controllers\\Admin\\DeletedUsersController@restore"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/game-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminGameController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/gdpr-requests/{gdprRequest}/complete-erasure"
+source = "App\\Http\\Controllers\\Admin\\GdprRequestController@completeErasure"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/gdpr-requests/{gdprRequest}/generate-export"
+source = "App\\Http\\Controllers\\Admin\\GdprRequestController@generateExport"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/gdpr-requests/{gdprRequest}/reject"
+source = "App\\Http\\Controllers\\Admin\\GdprRequestController@reject"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/group-bulk"
+source = "App\\Http\\Controllers\\Admin\\AdminGroupController@createBulk"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/group-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminGroupController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/invitations/bulk"
+source = "App\\Http\\Controllers\\Admin\\AdminInvitationController@bulkAction"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/invitations/cleanup"
+source = "App\\Http\\Controllers\\Admin\\AdminInvitationController@cleanup"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/invitations/{id}/cancel"
+source = "App\\Http\\Controllers\\Admin\\AdminInvitationController@cancel"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/invitations/{id}/resend"
+source = "App\\Http\\Controllers\\Admin\\AdminInvitationController@resend"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/logs/truncate"
+source = "App\\Http\\Controllers\\Admin\\AdminLogViewerController@truncate"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/movie-add"
+source = "App\\Http\\Controllers\\Admin\\AdminMovieController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/movie-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminMovieController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/music-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminMusicController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/promotions"
+source = "App\\Http\\Controllers\\Admin\\AdminPromotionController@store"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/registrations/periods"
+source = "App\\Http\\Controllers\\Admin\\AdminRegistrationController@storePeriod"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/registrations/periods/{period}/toggle"
+source = "App\\Http\\Controllers\\Admin\\AdminRegistrationController@togglePeriod"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/registrations/status"
+source = "App\\Http\\Controllers\\Admin\\AdminRegistrationController@updateStatus"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/release-bulk-category"
+source = "App\\Http\\Controllers\\Admin\\AdminReleasesController@bulkCategory"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/release-delete/{id}"
+source = "App\\Http\\Controllers\\Admin\\AdminReleasesController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/release-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminReleasesController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/release-reports/bulk"
+source = "App\\Http\\Controllers\\Admin\\AdminReleaseReportController@bulkAction"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/release-reports/{id}/delete-release"
+source = "App\\Http\\Controllers\\Admin\\AdminReleaseReportController@deleteRelease"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/release-reports/{id}/dismiss"
+source = "App\\Http\\Controllers\\Admin\\AdminReleaseReportController@dismiss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/release-reports/{id}/response"
+source = "App\\Http\\Controllers\\Admin\\AdminReleaseReportController@updateResponse"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/release-reports/{id}/revert"
+source = "App\\Http\\Controllers\\Admin\\AdminReleaseReportController@revert"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/release-reports/{id}/status"
+source = "App\\Http\\Controllers\\Admin\\AdminReleaseReportController@updateStatus"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/release_naming_regexes-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminReleaseNamingRegexesController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/release_naming_regexes-test"
+source = "App\\Http\\Controllers\\Admin\\AdminReleaseNamingRegexesController@testRegex"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/resendverification"
+source = "App\\Http\\Controllers\\Admin\\AdminUserController@resendVerification"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/role-add"
+source = "App\\Http\\Controllers\\Admin\\AdminRoleController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/role-delete"
+source = "App\\Http\\Controllers\\Admin\\AdminRoleController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/role-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminRoleController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/show-add"
+source = "App\\Http\\Controllers\\Admin\\AdminShowsController@create"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/show-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminShowsController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/show-remove/{id}"
+source = "App\\Http\\Controllers\\Admin\\AdminShowsController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/status"
+source = "App\\Http\\Controllers\\Admin\\AdminStatusController@store"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/status/service/{service}/update"
+source = "App\\Http\\Controllers\\Admin\\AdminStatusController@updateService"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/status/{incident}/resolve"
+source = "App\\Http\\Controllers\\Admin\\AdminStatusController@resolve"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/user-delete"
+source = "App\\Http\\Controllers\\Admin\\AdminUserController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/user-edit"
+source = "App\\Http\\Controllers\\Admin\\AdminUserController@edit"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/user-list/bulk"
+source = "App\\Http\\Controllers\\Admin\\AdminUserController@bulkAction"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/user-passkeys/wipe"
+source = "App\\Http\\Controllers\\Admin\\AdminUserController@wipePasskeys"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /admin/verify"
+source = "App\\Http\\Controllers\\Admin\\AdminUserController@verify"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /btcpay/webhook"
+source = "App\\Http\\Controllers\\BtcPaymentController@btcPayCallback"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "PUT /admin/promotions/{id}"
+source = "App\\Http\\Controllers\\Admin\\AdminPromotionController@update"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "PUT /admin/registrations/periods/{period}"
+source = "App\\Http\\Controllers\\Admin\\AdminRegistrationController@updatePeriod"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "PUT /admin/settings/{domain}"
+source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@update"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "PUT /admin/status/{incident}"
+source = "App\\Http\\Controllers\\Admin\\AdminStatusController@update"
+status = "todo"

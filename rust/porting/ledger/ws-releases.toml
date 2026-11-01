@@ -1,0 +1,127 @@
+# Entry points owned by ws-releases. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "command"
+id = "multiprocessing:releases"
+source = "app/Console/Commands/ProcessReleasesMulti.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:delete-releases"
+source = "app/Console/Commands/DeleteReleases.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:import-nzbs"
+source = "app/Console/Commands/ImportNzbs.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:nzbclean"
+source = "app/Console/Commands/CleanNZB.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:update-releases-index"
+source = "app/Console/Commands/UpdateReleasesIndexSchema.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nzbs:import-database"
+source = "app/Console/Commands/ImportDatabaseNzbs.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:additional"
+source = "app/Console/Commands/ProcessAdditionalGuid.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:fetch-samples"
+source = "app/Console/Commands/FetchSamples.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:fingerprint-backfill"
+source = "app/Console/Commands/BackfillReleaseFingerprintMetadata.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:fingerprint-transfer"
+source = "app/Console/Commands/TransferFingerprintQueue.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:forward-verified-publications"
+source = "app/Console/Commands/ForwardVerifiedPublications.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:identity-suggestions"
+source = "app/Console/Commands/ReleaseIdentitySuggestions.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:prepare-candidates"
+source = "app/Console/Commands/PrepareReleaseCandidates.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:process"
+source = "app/Console/Commands/ProcessReleasesCommand.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:remove-crap"
+source = "app/Console/Commands/RemoveCrapReleases.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:retry-archive-inspection"
+source = "app/Console/Commands/RetryArchiveInspection.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:verification-barrier"
+source = "app/Console/Commands/ReleaseVerificationBarrier.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:verify-candidates"
+source = "app/Console/Commands/VerifyReleaseCandidates.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:verify-repairable"
+source = "app/Console/Commands/VerifyExistingReleases.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "verification:import-manifests"
+source = "app/Console/Commands/ImportVerificationManifests.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "CollectReleaseFingerprintMetadata"
+source = "app/Jobs/CollectReleaseFingerprintMetadata.php"
+status = "todo"

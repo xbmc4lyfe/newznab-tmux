@@ -1,0 +1,32 @@
+[package]
+name = "nntmux-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "nntmux-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nntmux-core.workspace = true
+nntmux-fingerprint.workspace = true
+nntmux-ingest.workspace = true
+nntmux-mail.workspace = true
+nntmux-namefix.workspace = true
+nntmux-postprocess.workspace = true
+nntmux-predb.workspace = true
+nntmux-releases.workspace = true
+nntmux-runtime.workspace = true
+nntmux-search.workspace = true
+nntmux-supervisor.workspace = true
+nntmux-telemetry.workspace = true
+nntmux-verify.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

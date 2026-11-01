@@ -1,0 +1,31 @@
+# Entry points owned by ws-postprocess. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "command"
+id = "multiprocessing:postprocess"
+source = "app/Console/Commands/ProcessPostProcess.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:additional-diagnose"
+source = "app/Console/Commands/AdditionalProcessingDiagnose.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:import-nfos"
+source = "app/Console/Commands/ImportNfos.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "postprocess:guid"
+source = "app/Console/Commands/PostProcessGuid.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "postprocess:tv-pipeline"
+source = "app/Console/Commands/PostProcessTvPipeline.php"
+status = "todo"

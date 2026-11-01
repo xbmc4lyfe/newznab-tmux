@@ -1,0 +1,73 @@
+# Entry points owned by ws-metadata. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "command"
+id = "anime:migrate-covers"
+source = "app/Console/Commands/MigrateAnimeCovers.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "anime:refresh"
+source = "app/Console/Commands/RefreshAnimeData.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "books:requeue-failed"
+source = "app/Console/Commands/RequeueFailedBooks.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "cbp:optimize-storage"
+source = "app/Console/Commands/OptimizeCbpStorage.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "movie:reverify-matches"
+source = "app/Console/Commands/MovieReverifyMatches.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:populate-anidb"
+source = "app/Console/Commands/NntmuxPopulateAniDB.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "steam:lookup"
+source = "app/Console/Commands/SteamLookupGame.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "steam:search"
+source = "app/Console/Commands/SteamSearchGames.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "tv:repair-links"
+source = "app/Console/Commands/RepairTvReleaseLinks.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "tv:reprocess"
+source = "app/Console/Commands/ReprocessTvRelease.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "tv:reprocess-missing-episodes"
+source = "app/Console/Commands/ReprocessMissingEpisodes.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "tv:reprocess-unmatched"
+source = "app/Console/Commands/ReprocessUnmatchedTvReleases.php"
+status = "todo"

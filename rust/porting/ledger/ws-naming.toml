@@ -1,0 +1,79 @@
+# Entry points owned by ws-naming. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "command"
+id = "benchmark:rename"
+source = "app/Console/Commands/BenchmarkRename.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "irc:scrape"
+source = "app/Console/Commands/IrcScraperCommand.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "match:prefiles"
+source = "app/Console/Commands/MatchPrefiles.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "multiprocessing:fixrelnames"
+source = "app/Console/Commands/ProcessFixRelNames.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:recategorize-releases"
+source = "app/Console/Commands/RecategorizeReleases.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:test-categorization"
+source = "app/Console/Commands/TestCategorization.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "predb:check"
+source = "app/Console/Commands/PredbCheck.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "predb:identity-rebuild"
+source = "app/Console/Commands/PredbIdentityRebuildCommand.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "predb:import-feed"
+source = "app/Console/Commands/PredbImportFeed.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:fix-names"
+source = "app/Console/Commands/FixReleaseNames.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:fix-names-group"
+source = "app/Console/Commands/ReleasesFixNamesGroup.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:fix-nzbsplit"
+source = "app/Console/Commands/FixNzbSplitNames.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:recategorize-onlyfans"
+source = "app/Console/Commands/RecategorizeOnlyFans.php"
+status = "todo"

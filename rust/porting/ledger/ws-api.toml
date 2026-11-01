@@ -1,0 +1,289 @@
+# Entry points owned by ws-api. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "job"
+id = "RecordApiUsage"
+source = "app/Jobs/RecordApiUsage.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "UpdateUserApiAccess"
+source = "app/Jobs/UpdateUserApiAccess.php"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /api/inform/release"
+source = "App\\Http\\Controllers\\Api\\ApiInformController@release"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /api/release/{guid}/filelist"
+source = "App\\Http\\Controllers\\Api\\FileListApiController@getFileList"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /api/release/{id}/mediainfo"
+source = "Closure"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /api/search/assist"
+source = "App\\Http\\Controllers\\SearchSuggestController@searchAssist"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /api/search/autocomplete"
+source = "App\\Http\\Controllers\\SearchSuggestController@autocomplete"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /api/search/suggest"
+source = "App\\Http\\Controllers\\SearchSuggestController@suggest"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /api/v2/capabilities"
+source = "App\\Http\\Controllers\\Api\\ApiV2Controller@capabilities"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /api/v2/getnzb"
+source = "App\\Http\\Controllers\\Api\\ApiV2Controller@getNzb"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /api/{fallbackPlaceholder}"
+source = "Closure"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /rss/cart"
+source = "App\\Http\\Controllers\\RssController@cartRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /rss/category"
+source = "App\\Http\\Controllers\\RssController@categoryFeedRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /rss/full-feed"
+source = "App\\Http\\Controllers\\RssController@fullFeedRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /rss/health"
+source = "App\\Http\\Controllers\\RssHealthController"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /rss/mymovies"
+source = "App\\Http\\Controllers\\RssController@myMoviesRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /rss/myshows"
+source = "App\\Http\\Controllers\\RssController@myShowsRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /rss/trending-movies"
+source = "App\\Http\\Controllers\\RssController@trendingMoviesRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /rss/trending-shows"
+source = "App\\Http\\Controllers\\RssController@trendingShowsRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|POST|HEAD /apihelp"
+source = "App\\Http\\Controllers\\ApiHelpController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|POST|HEAD /apiv2help"
+source = "App\\Http\\Controllers\\ApiHelpController@apiv2"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|POST|HEAD /getnzb"
+source = "App\\Http\\Controllers\\GetNzbController@getNzb"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|POST|HEAD /getnzb/{guid}"
+source = "App\\Http\\Controllers\\GetNzbController@getNzb"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|POST|HEAD /rsshelp"
+source = "App\\Http\\Controllers\\RssController@showRssDesc"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|QUERY|HEAD /api/v2/anime"
+source = "App\\Http\\Controllers\\Api\\ApiV2Controller@anime"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|QUERY|HEAD /api/v2/audio"
+source = "App\\Http\\Controllers\\Api\\ApiV2Controller@audio"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|QUERY|HEAD /api/v2/books"
+source = "App\\Http\\Controllers\\Api\\ApiV2Controller@books"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|QUERY|HEAD /api/v2/details"
+source = "App\\Http\\Controllers\\Api\\ApiV2Controller@details"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|QUERY|HEAD /api/v2/movies"
+source = "App\\Http\\Controllers\\Api\\ApiV2Controller@movie"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|QUERY|HEAD /api/v2/search"
+source = "App\\Http\\Controllers\\Api\\ApiV2Controller@apiSearch"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|QUERY|HEAD /api/v2/tv"
+source = "App\\Http\\Controllers\\Api\\ApiV2Controller@tv"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "OPTIONS /api/v1/api"
+source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "OPTIONS /api/v2/anime"
+source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "OPTIONS /api/v2/audio"
+source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "OPTIONS /api/v2/books"
+source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "OPTIONS /api/v2/details"
+source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "OPTIONS /api/v2/movies"
+source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "OPTIONS /api/v2/search"
+source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "OPTIONS /api/v2/tv"
+source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /api/v2/nzbadd"
+source = "App\\Http\\Controllers\\Api\\ApiV2Controller@nzbAdd"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /rss/cart"
+source = "App\\Http\\Controllers\\RssController@cartRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /rss/category"
+source = "App\\Http\\Controllers\\RssController@categoryFeedRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /rss/full-feed"
+source = "App\\Http\\Controllers\\RssController@fullFeedRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /rss/mymovies"
+source = "App\\Http\\Controllers\\RssController@myMoviesRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /rss/myshows"
+source = "App\\Http\\Controllers\\RssController@myShowsRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /rss/trending-movies"
+source = "App\\Http\\Controllers\\RssController@trendingMoviesRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /rss/trending-shows"
+source = "App\\Http\\Controllers\\RssController@trendingShowsRss"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST|GET|QUERY|HEAD /api/v1/api"
+source = "App\\Http\\Controllers\\Api\\ApiController@api"
+status = "todo"

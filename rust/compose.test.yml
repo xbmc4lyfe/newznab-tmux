@@ -1,0 +1,19 @@
+# Services for integration tests: docker compose -f rust/compose.test.yml up -d
+# export TEST_DATABASE_URL=mysql://root:root@127.0.0.1:33306
+# export TEST_REDIS_URL=redis://127.0.0.1:36379/
+# export TEST_MANTICORE_SQL=127.0.0.1:39306 TEST_MANTICORE_HTTP=127.0.0.1:39308
+name: nntmux-rust-test
+services:
+  mariadb:
+    image: mariadb:11.4.8
+    command: ["--max-allowed-packet=256M", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+    ports: ["127.0.0.1:33306:3306"]
+    tmpfs: ["/var/lib/mysql"]
+  redis:
+    image: redis:7.4.2-alpine
+    ports: ["127.0.0.1:36379:6379"]
+  manticore:
+    image: manticoresearch/manticore:28.4.4
+    ports: ["127.0.0.1:39306:9306", "127.0.0.1:39308:9308"]
