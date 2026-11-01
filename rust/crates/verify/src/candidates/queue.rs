@@ -90,21 +90,13 @@ enum TryClaim {
     Gone,
 }
 
+/// Locks the row, then takes the stable candidate lock, as an eligible row is the only one worth
+/// locking. A lock this attempt newly took is given back unless the lease is written: one the worker
+/// already held belongs to a claim still in flight.
 async fn try_claim(verify: &Verify, locks: &mut WorkerLocks, id: i64) -> Result<TryClaim> {
-    if !locks.try_candidate(id).await? {
-        return Ok(TryClaim::Busy);
-    }
-    let result = lease(verify, id).await;
-    match &result {
-        Ok(TryClaim::Claimed(_)) => {}
-        _ => locks.release_candidate(Some(id)).await,
-    }
-    result
-}
-
-async fn lease(verify: &Verify, id: i64) -> Result<TryClaim> {
     let lease_seconds = verify.config.lease_seconds;
-    in_tx!(verify.db, 5, |tx| {
+    let mut newly_taken = false;
+    let outcome = in_tx!(verify.db, 5, |tx| {
         let moment = now();
         let row: Option<Candidate> = sqlx::query_as(
             "SELECT * FROM release_verification_candidates FORCE INDEX (PRIMARY) WHERE id = ? \
@@ -119,6 +111,11 @@ async fn lease(verify: &Verify, id: i64) -> Result<TryClaim> {
         let Some(candidate) = row else {
             return Ok::<TryClaim, anyhow::Error>(TryClaim::Gone);
         };
+        let held = locks.holds_candidate(id);
+        if !locks.try_candidate(id).await? {
+            return Ok(TryClaim::Busy);
+        }
+        newly_taken = newly_taken || !held;
         let token = new_token();
         sqlx::query(
             "UPDATE release_verification_candidates SET status = 'verifying', lease_token = ?, lease_until = ? WHERE id = ?",
@@ -129,7 +126,11 @@ async fn lease(verify: &Verify, id: i64) -> Result<TryClaim> {
         .execute(&mut *tx)
         .await?;
         Ok(TryClaim::Claimed(Box::new(Claim { candidate, token })))
-    })
+    });
+    if newly_taken && !matches!(outcome, Ok(TryClaim::Claimed(_))) {
+        locks.release_candidate(Some(id)).await;
+    }
+    outcome
 }
 
 fn new_token() -> String {

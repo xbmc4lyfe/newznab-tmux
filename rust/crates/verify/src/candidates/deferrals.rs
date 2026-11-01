@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{NaiveDateTime, TimeDelta};
-use sqlx::{MySql, QueryBuilder};
+use sqlx::{MySql, MySqlConnection, QueryBuilder};
 use tracing::warn;
 
 use super::archive::{MetadataBudgetExceeded, archive};
@@ -59,13 +59,19 @@ async fn current_hashes(verify: &Verify, ids: &[i64]) -> Result<HashMap<i64, Vec
         .collect())
 }
 
-/// Whether a deferred collection is now eligible for archival because the budget was raised.
-pub(super) async fn unlocked_by_raised_budget(verify: &Verify, id: i64, hash: &[u8]) -> bool {
+/// Whether a deferred collection is now eligible for archival because the budget was raised. Reads
+/// on the caller's connection, so a full pool can't turn this into a false answer.
+pub(super) async fn unlocked_by_raised_budget(
+    verify: &Verify,
+    conn: &mut MySqlConnection,
+    id: i64,
+    hash: &[u8],
+) -> bool {
     let row: Result<Option<(Vec<u8>, u64)>> = sqlx::query_as(
         "SELECT collectionhash, budget_bytes FROM release_verification_oversized_collections WHERE collection_id = ?",
     )
     .bind(id)
-    .fetch_optional(&verify.db)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(Into::into);
     logged(row, None).is_some_and(|(stored, budget)| {

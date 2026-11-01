@@ -1655,6 +1655,7 @@ dependencies = [
  "deunicode",
  "fancy-regex",
  "flate2",
+ "futures-util",
  "hex",
  "nntmux-core",
  "nntmux-runtime",

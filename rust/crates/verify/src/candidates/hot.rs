@@ -49,7 +49,7 @@ pub async fn invalidate_hot_collections(
         if candidates.iter().all(|row| row.manifest_path.is_empty()) {
             continue;
         }
-        let snapshot = match snapshot_headers(verify, tx, &collection, true).await {
+        let snapshot = match snapshot_headers(verify, tx, &collection, false).await {
             Ok(mut snapshot) => {
                 snapshot.legacy_release_id = legacy_release_id(tx, &collection).await?;
                 snapshot

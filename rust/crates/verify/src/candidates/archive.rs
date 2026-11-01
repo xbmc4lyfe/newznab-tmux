@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 
 use anyhow::{Result, bail};
 use chrono::{NaiveDateTime, TimeDelta};
+use futures_util::TryStreamExt;
 use regex::Regex;
 use sqlx::{Connection, MySql, MySqlConnection, QueryBuilder};
 
@@ -77,7 +78,7 @@ async fn archive_admitted(
     let Some(hash) = hash else {
         return Ok(Vec::new());
     };
-    let unlocked = unlocked_by_raised_budget(verify, collection_id, &hash).await;
+    let unlocked = unlocked_by_raised_budget(verify, &mut *conn, collection_id, &hash).await;
     in_tx!(conn, 5, |tx| {
         archive_locked(verify, tx, collection_id, &hash, unlocked).await
     })
@@ -416,23 +417,27 @@ pub(super) async fn snapshot_headers(
         }
         query.push(") ORDER BY binaries_id, partnumber");
         query.push(share);
-        let parts: Vec<(u64, u32, String, u32)> =
-            query.build_query_as().fetch_all(&mut *conn).await?;
         let mut by_binary: std::collections::HashMap<u64, Vec<Segment>> =
             std::collections::HashMap::new();
-        for (binary, number, messageid, size) in parts {
-            metadata_bytes += 128 + messageid.len() as i64;
-            if metadata_bytes > budget {
-                return Err(MetadataBudgetExceeded(
-                    "Candidate exceeds metadata budget; headers retained.",
-                )
-                .into());
+        {
+            // Streamed, so an upload far over the budget stops at the budget.
+            let mut parts = query
+                .build_query_as::<(u64, u32, String, u32)>()
+                .fetch(&mut *conn);
+            while let Some((binary, number, messageid, size)) = parts.try_next().await? {
+                metadata_bytes += 128 + messageid.len() as i64;
+                if metadata_bytes > budget {
+                    return Err(MetadataBudgetExceeded(
+                        "Candidate exceeds metadata budget; headers retained.",
+                    )
+                    .into());
+                }
+                by_binary.entry(binary).or_default().push(Segment {
+                    number: i64::from(number),
+                    messageid,
+                    bytes: i64::from(size),
+                });
             }
-            by_binary.entry(binary).or_default().push(Segment {
-                number: i64::from(number),
-                messageid,
-                bytes: i64::from(size),
-            });
         }
         for (id, hash, name, totalparts) in batch {
             files.push(ManifestFile {

@@ -24,7 +24,7 @@ pub fn declared_file_count(subject: &str) -> i64 {
     let mut expected = 0;
     for capture in COUNTER.captures_iter(&outside).flatten() {
         let index: i64 = capture[1].parse().unwrap_or(i64::MAX);
-        let total: i64 = capture[2].parse().unwrap_or(0);
+        let total: i64 = capture[2].parse().unwrap_or(i64::MAX);
         if total > 0 && index <= total {
             expected = expected.max(total);
         }

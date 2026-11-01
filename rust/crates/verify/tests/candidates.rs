@@ -478,3 +478,273 @@ fn the_work_futures_are_send() {
     }
     let _ = check;
 }
+
+#[tokio::test]
+async fn a_second_claim_attempt_keeps_the_lock_of_a_claim_in_flight() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let id = harness.collection("d0", 1, &[("f1", 1, &[1])], 3).await?;
+    candidates::archive(&harness.verify, id).await?;
+    let mut locks = WorkerLocks::new(&harness.db(), &harness.verify.config).await?;
+    assert!(locks.start(0).await?);
+    let claim = candidates::claim(&harness.verify, &mut locks, true)
+        .await?
+        .expect("claim");
+    // The lease is live, so another claim finds nothing, and the stable lock stays.
+    assert!(
+        candidates::claim(&harness.verify, &mut locks, true)
+            .await?
+            .is_none()
+    );
+    assert!(locks.protects(claim.id()).await);
+    locks.close().await;
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn headers_that_conflict_with_a_partial_are_kept_apart_as_their_own_generation() -> Result<()>
+{
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let first = harness.collection("d1", 1, &[("f1", 2, &[1])], 3).await?;
+    candidates::archive(&harness.verify, first).await?;
+    let (candidate, path): (u64, String) =
+        sqlx::query_as("SELECT id, manifest_path FROM release_verification_candidates")
+            .fetch_one(&harness.db())
+            .await?;
+    let release = harness.published_partial(candidate, &path).await?;
+
+    // Another post under the hash: the same part with another message ID.
+    let other = harness
+        .collection_with_ids("d1", 1, "other", &[("f1", 2, &[1])], 3)
+        .await?;
+    candidates::archive(&harness.verify, other).await?;
+    let rows: Vec<CandidateSummary> = sqlx::query_as(
+        "SELECT id, status, release_id, upgrades_release_id, manifest_path FROM release_verification_candidates ORDER BY id",
+    )
+    .fetch_all(&harness.db())
+    .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].4, path, "the partial keeps its inventory");
+    assert_eq!(rows[1].2, None);
+    assert_eq!(rows[1].3, None, "it doesn't upgrade the partial");
+    let pointer: Option<u64> =
+        sqlx::query_scalar("SELECT late_article_candidate_id FROM releases WHERE id = ?")
+            .bind(release)
+            .fetch_one(&harness.db())
+            .await?;
+    assert_eq!(pointer, Some(candidate));
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn a_replay_of_a_partials_headers_only_records_new_groups() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let first = harness.collection("d2", 1, &[("f1", 2, &[1])], 3).await?;
+    candidates::archive(&harness.verify, first).await?;
+    let (candidate, path): (u64, String) =
+        sqlx::query_as("SELECT id, manifest_path FROM release_verification_candidates")
+            .fetch_one(&harness.db())
+            .await?;
+    let release = harness.published_partial(candidate, &path).await?;
+    let replay = harness.collection("d2", 1, &[("f1", 2, &[1])], 3).await?;
+    sqlx::query("INSERT INTO collection_groups (collections_id, group_name) VALUES (?, 'alt.binaries.test'), (?, 'a.b.crosspost')")
+        .bind(replay)
+        .bind(replay)
+        .execute(&harness.db())
+        .await?;
+    candidates::archive(&harness.verify, replay).await?;
+    assert_eq!(harness.count("release_verification_candidates").await?, 1);
+    assert_eq!(harness.count("collections").await?, 0);
+    let groups: Vec<String> = sqlx::query_scalar(
+        "SELECT g.name FROM releases_groups AS rg INNER JOIN usenet_groups AS g ON g.id = rg.groups_id WHERE rg.releases_id = ?",
+    )
+    .bind(release)
+    .fetch_all(&harness.db())
+    .await?;
+    assert_eq!(groups, ["alt.binaries.crosspost"]);
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn a_generation_whose_partial_was_deleted_is_retired_not_merged() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let first = harness.collection("d3", 1, &[("f1", 2, &[1])], 3).await?;
+    candidates::archive(&harness.verify, first).await?;
+    sqlx::query("UPDATE release_verification_candidates SET upgrades_release_id = 999")
+        .execute(&harness.db())
+        .await?;
+    let later = harness.collection("d3", 1, &[("f1", 2, &[2])], 3).await?;
+    candidates::archive(&harness.verify, later).await?;
+    let rows: Vec<CandidateSummary> = sqlx::query_as(
+        "SELECT id, status, release_id, upgrades_release_id, manifest_path FROM release_verification_candidates ORDER BY id",
+    )
+    .fetch_all(&harness.db())
+    .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].1.as_str(), rows[0].4.as_str()), ("expired", ""));
+    assert_eq!(rows[1].3, None);
+    let fresh = manifest::read(&harness.db(), &harness.verify.config, &rows[1].4).await?;
+    assert_eq!(
+        fresh.files[0].segments.len(),
+        1,
+        "the retired articles don't come back"
+    );
+    let size = manifest::PreparedManifest::new(&fresh)?.compressed.len() as u64;
+    assert_eq!(harness.pending_bytes().await?, size);
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn headers_older_than_the_expiry_are_recorded_expired_without_inventory() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let id = harness.collection("d4", 1, &[("f1", 1, &[1])], 3).await?;
+    sqlx::query(
+        "UPDATE collections SET last_seen_at = UTC_TIMESTAMP() - INTERVAL 49 HOUR WHERE id = ?",
+    )
+    .bind(id)
+    .execute(&harness.db())
+    .await?;
+    candidates::archive(&harness.verify, id).await?;
+    let (status, path): (String, String) =
+        sqlx::query_as("SELECT status, manifest_path FROM release_verification_candidates")
+            .fetch_one(&harness.db())
+            .await?;
+    assert_eq!((status.as_str(), path.as_str()), ("expired", ""));
+    assert_eq!(harness.count("collections").await?, 0);
+    assert_eq!(harness.count("release_verification_manifests").await?, 0);
+    assert_eq!(harness.pending_bytes().await?, 0);
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn a_retained_inventory_is_released_after_the_window_and_its_fence_clears() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let first = harness.collection("d5", 1, &[("f1", 2, &[1])], 3).await?;
+    candidates::archive(&harness.verify, first).await?;
+    let (candidate, path): (u64, String) =
+        sqlx::query_as("SELECT id, manifest_path FROM release_verification_candidates")
+            .fetch_one(&harness.db())
+            .await?;
+    let release = harness.published_partial(candidate, &path).await?;
+    sqlx::query(
+        "UPDATE release_verification_candidates SET last_unique_at = UTC_TIMESTAMP() - INTERVAL 49 HOUR, \
+         retained_last_unique_at = UTC_TIMESTAMP() - INTERVAL 49 HOUR",
+    )
+    .execute(&harness.db())
+    .await?;
+    candidates::expire(&harness.verify, None).await?;
+    let (path, retained): (String, Option<u64>) = sqlx::query_as(
+        "SELECT manifest_path, retained_for_release_id FROM release_verification_candidates",
+    )
+    .fetch_one(&harness.db())
+    .await?;
+    assert_eq!((path.as_str(), retained), ("", None));
+    let pointer: Option<u64> =
+        sqlx::query_scalar("SELECT late_article_candidate_id FROM releases WHERE id = ?")
+            .bind(release)
+            .fetch_one(&harness.db())
+            .await?;
+    assert_eq!(pointer, None);
+    assert_eq!(harness.pending_bytes().await?, 0);
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn a_late_article_pointer_at_a_finished_candidate_is_settled() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let release = sqlx::query(
+        "INSERT INTO releases (name, searchname, groups_id, guid, leftguid, size, late_article_candidate_id) \
+         VALUES ('n', 's', 1, 'e0e0e0e0-0000-0000-0000-000000000001', 'e', 1, 123456)",
+    )
+    .execute(&harness.db())
+    .await?
+    .last_insert_id();
+    candidates::expire(&harness.verify, None).await?;
+    let pointer: Option<u64> =
+        sqlx::query_scalar("SELECT late_article_candidate_id FROM releases WHERE id = ?")
+            .bind(release)
+            .fetch_one(&harness.db())
+            .await?;
+    assert_eq!(pointer, None);
+    harness.finish().await
+}
+
+fn cleanup() -> nntmux_verify::collections::Cleanup {
+    nntmux_verify::collections::Cleanup {
+        sql_chunk_size: 500,
+        orphan_scan_window: 250_000,
+        verification_sweep_seconds: 5,
+        part_retention_hours: 72,
+    }
+}
+
+#[tokio::test]
+async fn retention_sweeps_archive_what_is_owed_and_delete_the_rest() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    // Old and owed verification: archived, not lost.
+    let owed = harness.collection("e1", 1, &[("f1", 1, &[1])], 3).await?;
+    // Old, last seen past the expiry and unknown to any candidate: deleted outright.
+    let expired = harness.collection("e2", 1, &[("f1", 1, &[1])], 3).await?;
+    // An orphan with no binaries.
+    let orphan = harness.collection("e3", 1, &[], 3).await?;
+    // Fresh: left alone.
+    let fresh = harness.collection("e4", 1, &[("f1", 2, &[1])], 0).await?;
+    sqlx::query(
+        "UPDATE collections SET dateadded = UTC_TIMESTAMP() - INTERVAL 80 HOUR WHERE id IN (?, ?)",
+    )
+    .bind(owed)
+    .bind(expired)
+    .execute(&harness.db())
+    .await?;
+    sqlx::query(
+        "UPDATE collections SET last_seen_at = UTC_TIMESTAMP() - INTERVAL 60 HOUR WHERE id = ?",
+    )
+    .bind(expired)
+    .execute(&harness.db())
+    .await?;
+    nntmux_verify::collections::delete_finished_and_orphans(&harness.verify, &cleanup()).await?;
+    let left: Vec<u32> = sqlx::query_scalar("SELECT id FROM collections ORDER BY id")
+        .fetch_all(&harness.db())
+        .await?;
+    assert_eq!(left, [fresh as u32], "orphan {orphan} went too");
+    let sources: Vec<String> =
+        sqlx::query_scalar("SELECT source_identity FROM release_verification_candidates")
+            .fetch_all(&harness.db())
+            .await?;
+    assert_eq!(sources, [harness.source("e1")]);
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn a_collection_with_a_usable_part_owed_verification_is_never_plain_deleted() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let owed = harness.collection("e5", 1, &[("f1", 1, &[1])], 3).await?;
+    let done = harness.collection("e6", 1, &[], 3).await?;
+    let deleted = nntmux_verify::collections::delete_collections_and_descendants(
+        &harness.db(),
+        &cleanup(),
+        &[owed, done],
+        "test",
+    )
+    .await?;
+    assert_eq!(deleted, 1);
+    assert_eq!(harness.count("parts").await?, 1);
+    harness.finish().await
+}
