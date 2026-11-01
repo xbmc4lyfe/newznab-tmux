@@ -410,6 +410,21 @@ fn size_note(evidence: &Evidence, row: &PredbRow) -> Option<String> {
 
 /// Runs the ladder on one release. `flags` comes back filled in whatever the outcome.
 pub fn identify(evidence: &Evidence, context: &Context<'_>) -> (Outcome, Flags) {
+    let (mut outcome, flags) = climb(evidence, context);
+    // The tags can't tell One.Piece.S15.1080p.WEB-DL from a live-action show, but PreDB can. Only
+    // for series: a film can share its title with an anime and still be something else.
+    if let Outcome::Identified(found) = &mut outcome
+        && found.parsed.kind == name::Kind::Tv
+        && (context.predb.is_anime_title(&found.parsed.title)
+            || name::is_known_anime_title(&found.parsed.title))
+    {
+        found.parsed.kind = name::Kind::Anime;
+        found.scope = Scope::Anime;
+    }
+    (outcome, flags)
+}
+
+fn climb(evidence: &Evidence, context: &Context<'_>) -> (Outcome, Flags) {
     let mut flags = Flags::default();
     let plain = candidates(evidence, &mut flags);
     let decoded = decode_targets(evidence);
@@ -470,7 +485,15 @@ pub fn identify(evidence: &Evidence, context: &Context<'_>) -> (Outcome, Flags) 
                 return finish_with_flags(outcome, flags, evidence, context);
             }
             Some(Agreement::Pack(name)) => {
-                let hit = &hits[0];
+                let season = name::parse(&name);
+                let hit = hits
+                    .iter()
+                    .find(|hit| {
+                        let parsed = name::parse(&hit.0.title);
+                        name::folded(&parsed.title) == name::folded(&season.title)
+                            && parsed.season == season.season
+                    })
+                    .unwrap_or(&hits[0]);
                 let outcome = finish(
                     evidence,
                     Named {
@@ -893,6 +916,44 @@ mod tests {
         )]));
         let found = identified(run(&evidence, &DonorIndex::default()));
         assert_eq!((found.method, found.predb_id), ("predb_exact", Some(10)));
+    }
+
+    #[test]
+    fn anime_with_no_tag_is_out_of_scope() {
+        let mut predb = predb();
+        predb.insert(PredbRow {
+            id: 90,
+            title: "Dan.Da.Dan.S02E12.German.2025.ANiME.DL.1080p.WEB.h264-GRP".to_owned(),
+            category: "TV-1080P-DE".to_owned(),
+            size_mib: 0,
+            files: 0,
+            pre_at: None,
+        });
+        predb.finish();
+        let donors = DonorIndex::default();
+        let context = Context {
+            predb: &predb,
+            donors: &donors,
+            hooks: Hooks::default(),
+        };
+        for name in [
+            "One.Piece.S15.Grim.Prospects.A.Trap.that.Waits.in.the.New.World.1080p.CR.WEB-DL.DUAL.DDP2.0.H.264-Kitsune",
+            "Hunter.x.Hunter.S03E56.1080p.NF.WEB-DL.DDP2.0.x264.DUAL-sh4down",
+            "Dan.da.Dan.S02E03.1080p.BluRay.FLAC.2.0.x265.DUAL-FRNcR",
+        ] {
+            let mut evidence = release(r#"[01/99] "GPInOt3kYN.part001.rar" yEnc"#);
+            evidence.par2_names = vec![format!("{name}.mkv")];
+            let found = identified(identify(&evidence, &context).0);
+            assert_eq!(found.scope, Scope::Anime, "{name}");
+        }
+        // A live-action show with no such history stays in.
+        let mut evidence = release(r#"[01/99] "GPInOt3kYN.part001.rar" yEnc"#);
+        evidence.par2_names =
+            vec!["Wednesday.S02E01.1080p.NF.WEB-DL.AAC2.0.AV1.DUAL-Lup1n.mkv".to_owned()];
+        assert_eq!(
+            identified(identify(&evidence, &context).0).scope,
+            Scope::InScope
+        );
     }
 
     #[test]

@@ -284,11 +284,45 @@ fn is_anime(name: &str, tv: bool, year: Option<u16>, title_end: usize) -> bool {
             .expect("static pattern")
     });
     // Only after the title, because The.Bad.Batch and Anime.Supremacy are titles.
-    token!(r"anime|batch")
+    // CR is Crunchyroll, which carries almost nothing else.
+    token!(r"anime|batch|cr|hidive")
         .find(name)
         .is_some_and(|found| found.start() >= title_end)
         || FANSUB.is_match(name)
         || (!tv && year.is_none() && name.starts_with('[') && token!(r"\d{2,4}").is_match(name))
+}
+
+/// Long-running anime that scene names rarely tag, for when PreDB has no row to say so. Keep it
+/// to titles no live-action series shares.
+const KNOWN_ANIME_TITLES: [&str; 24] = [
+    "attackontitan",
+    "bleach",
+    "blackclover",
+    "boruto",
+    "demonslayer",
+    "detectiveconan",
+    "dragonball",
+    "dragonballsuper",
+    "dragonballz",
+    "fairytail",
+    "fullmetalalchemist",
+    "gintama",
+    "hunterxhunter",
+    "jujutsukaisen",
+    "jojosbizarreadventure",
+    "myheroacademia",
+    "naruto",
+    "narutoshippuden",
+    "onepiece",
+    "onepunchman",
+    "sailormoon",
+    "spyxfamily",
+    "tokyoghoul",
+    "vinlandsaga",
+];
+
+pub fn is_known_anime_title(title: &str) -> bool {
+    KNOWN_ANIME_TITLES.contains(&folded(title).as_str())
 }
 
 /// Whether a release is in scope, and why not if it isn't.
@@ -414,7 +448,11 @@ pub fn name_from_subject(subject: &str) -> Option<String> {
     // Counters first, because the usual subject ends in `yEnc (1/500)`.
     let without = COUNTER.replace_all(subject, " ");
     let trimmed = without.trim();
-    let trimmed = trimmed.strip_suffix("yEnc").unwrap_or(trimmed);
+    let trimmed = if trimmed.to_ascii_lowercase().ends_with("yenc") {
+        &trimmed[..trimmed.len() - 4]
+    } else {
+        trimmed
+    };
     let clean = trimmed.trim().trim_matches(['-', ' ']).to_owned();
     (!clean.is_empty()).then_some(clean)
 }
@@ -432,15 +470,22 @@ pub fn subject_prefix(subject: &str) -> Option<String> {
     }
     let prefix = &subject[..COUNTER.find(subject)?.start()];
     let prefix = prefix.trim().trim_matches(['-', ' ']);
-    (!prefix.contains('"') && !prefix.ends_with("yEnc") && usable(prefix))
-        .then(|| prefix.to_owned())
+    if prefix.contains('"') || prefix.to_ascii_lowercase().ends_with("yenc") {
+        return None;
+    }
+    let prefix = stem(prefix);
+    usable(&prefix).then_some(prefix)
 }
 
 /// Whether a name can identify anything at all. Hashes, part numbers and samples can't.
 pub fn usable(name: &str) -> bool {
-    // The plausibility check reads underscores as part of one long random-looking token. One
-    // underscore is more likely noise, as in 2F4lf3rZZOa7GRSFEAkZiLRF_re.
-    let dotted = if name.matches('_').count() >= 2 {
+    // The plausibility check reads one long token as random, and underscores and dashes as part
+    // of it. A name with a real tag is safe to split. Otherwise one underscore is more likely
+    // noise, as in 2F4lf3rZZOa7GRSFEAkZiLRF_re.
+    let tagged = resolution(name).is_some() || token!(r"s\d{1,3}[._ -]?e\d{1,4}").is_match(name);
+    let dotted = if tagged {
+        name.replace(['_', '-'], ".")
+    } else if name.matches('_').count() >= 2 {
         name.replace('_', ".")
     } else {
         name.to_owned()
@@ -449,8 +494,9 @@ pub fn usable(name: &str) -> bool {
         return false;
     }
     // Sample and proof only mean that at the end, not in Death.Proof.2007.
-    static EXTRA: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?i)(?:^|[._ -])(?:sample|proof)$").expect("static pattern"));
+    static EXTRA: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(?:^sample-|(?:^|[._ -])(?:sample|proof)$)").expect("static pattern")
+    });
     !EXTRA.is_match(name) && !token!(r"vts|video[._ ]ts").is_match(name)
 }
 
@@ -464,7 +510,8 @@ pub fn looks_obfuscated(name: &str) -> bool {
 ///
 /// `quality_required` is for sources that could be coincidence, such as a decoded name.
 pub fn acceptable(parsed: &ParsedName, name: &str, quality_required: bool) -> bool {
-    if !matches!(parsed.kind, Kind::Tv | Kind::Movie) {
+    // Anime stands too, so it gets reported as out of scope rather than as nothing.
+    if !matches!(parsed.kind, Kind::Tv | Kind::Movie | Kind::Anime) {
         return false;
     }
     let letters = parsed.title.chars().filter(|c| c.is_alphanumeric()).count();
@@ -713,6 +760,8 @@ mod tests {
             "Film.Name.1080p.BluRay.2021.x264-GRP",
             "10x10.2018.1080p.BluRay.x264-GRP",
             "Anime.Supremacy.2020.1080p.WEB-DL.H264-GRP",
+            "Some-Show-S01E02-1080p-WEB-DL-H264-GRP",
+            "Film_Name-S01E01-1080p-WEB-DL-x264-GRP",
         ] {
             assert!(in_scope(name), "{name}");
         }
@@ -732,6 +781,31 @@ mod tests {
         assert_eq!(scope(&film, None, None), Scope::Anime);
         let scene = parse("XXX.Some.Scene.2021.1080p.WEB.x264-GRP");
         assert_eq!(scope(&scene, None, None), Scope::NotTvOrMovie);
+    }
+
+    #[test]
+    fn a_leading_sample_tag_is_still_a_sample() {
+        assert!(!usable("Sample-Zmora.S01E05.1080p.WEB.H264-RAWR"));
+        assert!(usable("Sample.Size.2021.1080p.WEB-DL.H264-GRP"));
+    }
+
+    #[test]
+    fn subjects_are_read_whatever_the_case_of_yenc() {
+        assert_eq!(
+            name_from_subject("Film.2021.1080p.WEB-DL.H264-GRP.mkv yenc (1/500)").as_deref(),
+            Some("Film.2021.1080p.WEB-DL.H264-GRP.mkv")
+        );
+        assert_eq!(
+            subject_prefix(r#"Film.2021.1080p.WEB-DL.H264-GRP.part01.rar [01/78] - "x" yEnc"#)
+                .as_deref(),
+            Some("Film.2021.1080p.WEB-DL.H264-GRP")
+        );
+    }
+
+    #[test]
+    fn a_crunchyroll_tag_means_anime() {
+        let parsed = parse("Some.Show.S01E02.1080p.CR.WEB-DL.AAC2.0.H.264-GRP");
+        assert_eq!(scope(&parsed, None, None), Scope::Anime);
     }
 
     #[test]

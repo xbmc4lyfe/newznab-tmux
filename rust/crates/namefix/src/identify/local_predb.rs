@@ -1,8 +1,8 @@
 //! The PreDB table held in memory: by name, and by size for the in-scope rows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::name::folded;
+use super::name::{folded, parse};
 use crate::identity_key;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +30,8 @@ pub struct LocalPredb {
     normalized: HashMap<String, u32>,
     /// (size, row) of the rows a high-quality TV or movie post could be, by size.
     sized: Vec<(u32, u32)>,
+    /// Folded titles PreDB files as anime, by category or by an `ANiME` tag.
+    anime_titles: HashSet<String>,
 }
 
 /// A post's encoded payload over a PreDB size runs from nothing to a few percent of overhead.
@@ -39,6 +41,14 @@ pub(super) const POSTED_AFTER_PRE_SECONDS: i64 = 7 * 86_400;
 
 impl LocalPredb {
     pub fn insert(&mut self, row: PredbRow) {
+        if row.category.to_ascii_uppercase().starts_with("ANIME")
+            || row.title.to_ascii_lowercase().contains(".anime.")
+        {
+            let title = folded(&parse(&row.title).title);
+            if title.len() >= 3 {
+                self.anime_titles.insert(title);
+            }
+        }
         let index = u32::try_from(self.rows.len()).expect("under 4 billion PreDB rows");
         // Sources repeat a title. The first row with a size is the one worth keeping.
         let rows = &self.rows;
@@ -61,6 +71,11 @@ impl LocalPredb {
             self.sized.push((row.size_mib, index));
         }
         self.rows.push(row);
+    }
+
+    /// Whether PreDB has this title as anime. Scene names of an anime often carry no tag.
+    pub fn is_anime_title(&self, title: &str) -> bool {
+        self.anime_titles.contains(&folded(title))
     }
 
     /// Call once after the last [`Self::insert`].

@@ -9,6 +9,7 @@ use super::local_predb::{
     LocalPredb, POSTED_AFTER_PRE_SECONDS, POSTED_BEFORE_PRE_SECONDS, PredbRow, parse_size_mib,
     size_range_mib,
 };
+use super::name::parse;
 
 type Row = (
     i64,
@@ -18,6 +19,8 @@ type Row = (
     Option<String>,
     Option<i64>,
 );
+
+const MAX_ANIME_TITLES: usize = 8;
 
 const COLUMNS: &str = "SELECT CAST(id AS SIGNED), title, category, size, files, CAST(UNIX_TIMESTAMP(predate) AS SIGNED) FROM predb";
 
@@ -79,6 +82,25 @@ async fn load_rows(pool: &MySqlPool, evidence: &Evidence) -> Result<LocalPredb> 
         query.push(" AND ");
         query.push_bind(high);
         rows.extend(query.build_query_as::<Row>().fetch_all(pool).await?);
+    }
+    // One row per title settles whether PreDB has it as anime.
+    let mut seen: Vec<String> = Vec::new();
+    for name in candidate_names(evidence) {
+        let title = parse(&name).title;
+        if title.is_empty() || seen.contains(&title) || seen.len() == MAX_ANIME_TITLES {
+            continue;
+        }
+        let like = title
+            .replace('\\', r"\\")
+            .replace('%', r"\%")
+            .replace('_', r"\_")
+            .replace(' ', ".");
+        let mut query = QueryBuilder::new(COLUMNS);
+        query.push(" WHERE title LIKE ");
+        query.push_bind(format!("{like}.%"));
+        query.push(" AND (category LIKE 'ANIME%' OR title LIKE '%.ANiME.%') LIMIT 1");
+        rows.extend(query.build_query_as::<Row>().fetch_all(pool).await?);
+        seen.push(title);
     }
     rows.sort_by_key(|row| row.0);
     rows.dedup_by_key(|row| row.0);

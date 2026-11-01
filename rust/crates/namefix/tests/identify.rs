@@ -83,6 +83,27 @@ async fn identifies_by_name_and_by_size_from_mariadb() {
     assert_eq!((found.method, found.predb_id), ("predb_exact", Some(1)));
     assert_eq!(found.scope, Scope::InScope);
 
+    // PreDB knows this show as anime, though this name has no tag saying so.
+    predb(
+        &db.pool,
+        4,
+        "Dan.Da.Dan.S02E11.German.2025.ANiME.DL.1080p.WEB.h264-GRP",
+        "",
+        -3600,
+    )
+    .await;
+    let anime = evidence(
+        r#""Dan.da.Dan.S02E03.1080p.BluRay.FLAC.2.0.x265.DUAL-FRNcR.mkv" yEnc"#,
+        3_000_000_000,
+    );
+    let (outcome, _) = identify_release(&db.pool, &anime, &donors, Hooks::default())
+        .await
+        .expect("identify");
+    assert!(
+        matches!(&outcome, Outcome::Identified(found) if found.scope == Scope::Anime),
+        "{outcome:?}"
+    );
+
     // Spaces where PreDB has dots still find the row.
     let spaced = evidence(
         r#""Zmora S01E05 1080p AMZN WEB-DL DDP5.1 H.264-RAWR.mkv" yEnc (1/90)"#,
