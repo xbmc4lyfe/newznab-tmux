@@ -1,5 +1,6 @@
 <?php
 
+use App\Models\User;
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 
@@ -16,7 +17,7 @@ class CreateForumTableThreads extends Migration
             Schema::create('forum_threads', function (Blueprint $table) {
                 $table->increments('id');
                 $table->integer('parent_category')->unsigned();
-                $table->foreignIdFor(config('forum.integration.user_model'), 'author_id');
+                $table->foreignIdFor(User::class, 'author_id');
                 $table->string('title');
                 $table->boolean('pinned');
                 $table->boolean('locked');
