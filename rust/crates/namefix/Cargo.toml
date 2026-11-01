@@ -20,6 +20,7 @@ serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 nntmux-testkit.workspace = true

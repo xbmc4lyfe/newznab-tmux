@@ -475,7 +475,7 @@ async fn fix_nzbsplit(ctx: &Ctx, dry_run: bool, include_renamed: bool, backends:
 /// numbered source passes the tmux monitor ran.
 pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
     let backends = Arc::new(backends(&ctx)?);
-    run_slots(ctx, args, stop, move |ctx, slot| {
+    run_slots(ctx, "fixnames", args, stop, move |ctx, slot| {
         let backends = backends.clone();
         async move {
             if ctx.paused().await? {

@@ -16,7 +16,7 @@ use crate::donor;
 use crate::extractors;
 use crate::file_prioritizer as files;
 use crate::guard::{FilenameGuard, FilenamePass, collect_pass};
-use crate::queries::{self, Donor, FileRow, FixNamesConfig, MediaRow, PredbTitle, Source};
+use crate::queries::{self, Donor as DonorRow, FileRow, FixNamesConfig, MediaRow, PredbTitle, Source};
 use crate::release::{Release, parse_generation};
 use crate::update::{ReleaseUpdater, lock_snapshot, predb_regex};
 
@@ -287,7 +287,7 @@ impl NameFixer {
         &mut self,
         release: &Release,
         rows: &[FileRow],
-        donors: &HashMap<String, Vec<Donor>>,
+        donors: &HashMap<String, Vec<DonorRow>>,
         write: bool,
         status: bool,
     ) -> Result<()> {
@@ -390,7 +390,7 @@ impl NameFixer {
         &mut self,
         release: &Release,
         legacy: &[String],
-        legacy_donors: &HashMap<String, Vec<Donor>>,
+        legacy_donors: &HashMap<String, Vec<DonorRow>>,
         write: bool,
         status: bool,
     ) -> Result<bool> {
@@ -419,7 +419,8 @@ impl NameFixer {
             if !par2_snapshot_matches(&mut tx, &release).await? {
                 return Ok(false);
             }
-            let chosen = if strong.usable && !strong.overflow { donor::select_canonical(&strong.donors) } else { None };
+            let candidates: Vec<donor::Donor> = strong.donors.iter().map(selectable).collect();
+            let chosen = if strong.usable && !strong.overflow { donor::select_canonical(&candidates) } else { None };
             if queries::hash_evidence_generation(&mut tx, release.id).await? != strong.generation {
                 return Ok(false);
             }
@@ -430,12 +431,12 @@ impl NameFixer {
                 self.updater
                     .update_release(
                         &release,
-                        &chosen.canonical_title,
+                        chosen.canonical_title.as_deref().unwrap_or(""),
                         "hashCheck: PAR2 full MD5 and exact file size",
                         write,
                         "PAR2 hash, ",
                         status,
-                        chosen.predb_id as i64,
+                        chosen.predb_id.unwrap_or(0),
                         None,
                         None,
                     )
@@ -489,25 +490,28 @@ impl NameFixer {
     async fn apply_donor_match(
         &mut self,
         release: &Release,
-        donors: &[Donor],
+        donors: &[DonorRow],
         tolerance: i64,
         method: &str,
         kind: &str,
         write: bool,
         status: bool,
     ) -> Result<bool> {
-        let Some(chosen) = donor::select(donors, release.relsize, tolerance) else {
+        let candidates: Vec<donor::Donor> = donors.iter().map(selectable).collect();
+        let Some(chosen) = donor::select(&candidates, release.relsize, tolerance) else {
             return Ok(false);
         };
+        let searchname = chosen.searchname.clone().unwrap_or_default();
+        let predb_id = chosen.predb_id.unwrap_or(0);
         let current = release.searchname.as_deref().unwrap_or("");
-        if exact_value(&chosen.searchname) == exact_value(current) {
+        if exact_value(&searchname) == exact_value(current) {
             if write {
-                self.updater.attach_predb_snapshot(release, chosen.predb_id as i64, None, None, None).await?;
+                self.updater.attach_predb_snapshot(release, predb_id, None, None, None).await?;
             }
             return Ok(self.updater.matched);
         }
         self.updater
-            .update_release(release, &chosen.searchname, method, write, kind, status, chosen.predb_id as i64, None, None)
+            .update_release(release, &searchname, method, write, kind, status, predb_id, None, None)
             .await?;
         Ok(self.updater.matched)
     }
@@ -1151,7 +1155,7 @@ impl NameFixer {
                     .await?
             }
         };
-        let pass = collect_pass(&self.db(), &files::prioritize_for_predb(files_list), 8).await;
+        let pass = collect_pass(&self.db(), &files::prioritize_for_pre_db(files_list), 8).await;
         let mut guard = FilenameGuard::new(release.id, &pass, 8, inventory);
         for (filename, hit) in pass.unique_matches() {
             let same = exact_value(&hit.title) == exact_value(release.searchname.as_deref().unwrap_or(""));
@@ -1242,6 +1246,17 @@ impl NameFixer {
                 );
             }
         }
+    }
+}
+
+fn selectable(row: &DonorRow) -> donor::Donor {
+    donor::Donor {
+        releases_id: Some(row.releases_id as i64),
+        relsize: Some(row.relsize),
+        searchname: Some(row.searchname.clone()),
+        predb_id: Some(row.predb_id as i64),
+        canonical_title: Some(row.canonical_title.clone()),
+        ..donor::Donor::default()
     }
 }
 

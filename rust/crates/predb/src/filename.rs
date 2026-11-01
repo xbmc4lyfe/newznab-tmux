@@ -190,9 +190,7 @@ pub fn matches_predb_filename_evidence(file_name: &str, query: &str) -> bool {
 
 pub fn extract_filename_from_path(path: &str) -> &str {
     match path.rfind(['\\', '/']) {
-        Some(index) if index + 1 < path.len() && !path[index + 1..].contains('\n') => {
-            &path[index + 1..]
-        }
+        Some(index) if index + 1 < path.len() => &path[index + 1..],
         _ => path,
     }
 }

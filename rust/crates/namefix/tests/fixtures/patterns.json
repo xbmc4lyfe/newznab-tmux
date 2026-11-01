@@ -1,0 +1,682 @@
+[
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((s\\d{1,2}[._ -]?e\\d{1,3}(-?e\\d{1,3})?)|(?<!\\d)[S|]\\d{1,2}[E|x]\\d{1,}(?!\\d)|ep[._ -]?\\d{2,3})[._ -](2160p|4K|UHD)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[._ -](HDR10?\\+?|DV|Dolby[._ -]?Vision)?[._ -]?(HEVC|x265|H\\.?265)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((s\\d{1,2}[._ -]?e\\d{1,3}(-?e\\d{1,3})?)|(?<!\\d)[S|]\\d{1,2}[E|x]\\d{1,}(?!\\d)|ep[._ -]?\\d{2,3})[._ -](1080p|720p)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((s\\d{1,2}[._ -]?[bde]\\d{1,2}(-?e\\d{1,3})?)|(?<!\\d)[S|]\\d{1,2}[E|x]\\d{1,}(?!\\d)|ep[._ -]?\\d{2})[\\-\\w.',;.()]+(BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -][\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((s\\d{1,2}[._ -]?[bde]\\d{1,2}(-?e\\d{1,3})?)|(?<!\\d)\\d{1,2}x\\d{2}(?!\\d)|ep[._ -]?\\d{2})[\\-\\w.',;& ]+((19|20)\\d\\d)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((s\\d{1,2}[._ -]?[bde]\\d{1,2}(-?e\\d{1,3})?)|(?<!\\d)\\d{1,2}x\\d{2}(?!\\d)|ep[._ -]?\\d{2,3})[\\-\\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((s\\d{1,2}[._ -]?[bde]\\d{1,2}(-?e\\d{1,3})?)|(?<!\\d)\\d{1,2}x\\d{2}(?!\\d)|ep[._ -]?\\d{2})[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((s\\d{1,2}[._ -]?[bde]\\d{1,2}(-?e\\d{1,3})?)|(?<!\\d)\\d{1,2}x\\d{2}(?!\\d)|ep[._ -]?\\d{2})[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](480|720|1080|2160)[ip]?[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((19|20)\\d\\d)[._ -]((s\\d{1,2}[._ -]?[bde]\\d{1,2}(-?e\\d{1,3})?)|(?<!\\d)\\d{1,2}x\\d{2}(?!\\d)|ep[._ -]?\\d{2})[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(19|20)\\d\\d[._ -]\\d{2}[._ -]\\d{2}[._ -](720p|1080p|2160p|HDTV|WEB-?DL|WEB-?RIP)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w(19|20)\\d\\d[._ -]\\d{2}[._ -]\\d{2}[._ -](IndyCar|F1|Formula[._ -]?1|MotoGP|NBA|NCW([TY])S|NNS|NSCS?|NFL|NHL|MLB|UFC|WWE|Boxing)([._ -](19|20)\\d\\d)?[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+[._ -]S\\d{1,2}[._ -](COMPLETE|FULL)[._ -](720p|1080p|2160p|HDTV|WEB-?DL|WEB-?RIP|BluRay)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/TvPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+[._ -](\\d{2,4})[._ -](480p|720p|1080p|2160p)[._ -](HEVC|x265|x264|H\\.?264)[._ -](10bit)?[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/MoviePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((19|20)\\d\\d)[._ -](2160p|4K|UHD)[._ -](HDR10\\+?|DV|Dolby[._ -]?Vision|HLG)?[._ -]?(REMUX|BluRay|WEB-?DL|WEB-?RIP|UHD[._ -]?BluRay)[._ -](HEVC|x265|H\\.?265|AV1)[._ -]?(Atmos|DTS[._ -]?(HD)?|TrueHD)?[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/MoviePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((19|20)\\d\\d)[._ -](2160p|4K)[._ -](REMUX|Complete[._ -]?UHD)[._ -](HEVC|x265|H\\.?265)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/MoviePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((19|20)\\d\\d)[._ -](2160p|4K)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[._ -](HDR10\\+?|DV)?[._ -]?(HEVC|x265|H\\.?265)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/MoviePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((19|20)\\d\\d)[._ -](1080p|720p)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[._ -](x264|x265|H\\.?264|H\\.?265|HEVC)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/MoviePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((19|20)\\d\\d)[\\-\\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/MoviePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((19|20)\\d\\d)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[._ -](480|720|1080|2160)[ip]?[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/MoviePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((19|20)\\d\\d)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/MoviePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/MoviePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[\\-\\w.',;& ]+(BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -]((19|20)\\d\\d)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/MoviePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(Brazilian|Chinese|Croatian|Danish|Deutsch|Dutch|Estonian|English|Finnish|Flemish|Francais|French|German|Greek|Hebrew|Icelandic|Italian|Japenese|Japan|Japanese|Korean|Latin|Nordic|Norwegian|Polish|Portuguese|Russian|Serbian|Slovenian|Swedish|Spanisch|Spanish|Thai|Turkish|MULTi)[._ -]((19|20)\\d\\d)[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/MoviePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+((19|20)\\d\\d)[\\-\\w.',;& ]+(480|720|1080|2160)[ip]?[\\-\\w.',;& ]+(BluRay|BDRip|DVDRip|HDTV|WEB-?DL|WEB-?RIP)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/GamePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(NSW|PS[345P]|PSV|XBSX|XSX|XBOX[._ -]?SERIES[._ -]?[XS]|XBOX[._ -]?ONE|XBOX360?|WiiU?|Switch)[._ -](INTERNAL|PROPER|READNFO|READ[._ -]?NFO|MULTI\\d{1,2})?[._ -]?[\\-\\w.',;& ]+\\-[A-Za-z0-9]+$",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/GamePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(ASIA|DLC|EUR|GOTY|JPN|KOR|MULTI\\d{1}|NTSCU?|PAL|RF|Region[._ -]?Free|USA|XBLA)[._ -](DLC[._ -]Complete|FRENCH|GERMAN|MULTI\\d{1}|PROPER|PSN|READ[._ -]?NFO|UMD)?[._ -]?(GC|NDS|NGC|PS[345P]|PSP|PSV|Switch|NSW|Wii(U)?|XBOX(360|ONE|SERIES)?|XBSX)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/GamePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(GC|NDS|NGC|PS[345P]|Switch|NSW|Wii(U)?|XBOX(360|ONE|SERIES)?|XBSX)[._ -](CODEX|DUPLEX|PLAZA|SKIDROW|RELOADED|CPY|EMPRESS|RAZOR1911|HOODLUM|DARKSiDERS|FLT|TiNYiSO|ANOMALY|iNSOMNi|OneUp|STRANGE|SWAG|SKY|SUXXORS)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/GamePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(PC|WIN(32|64)?|MAC(OSX?)?|LINUX)[._ -]?(CODEX|SKIDROW|RELOADED|CPY|EMPRESS|RAZOR1911|HOODLUM|DARKSiDERS|FLT|GOG|PROPHET|TiNYiSO|PLAZA|P2P|SiMPLEX|rG)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/GamePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(DLC|Update|Patch|Hotfix)[._ -](v?\\d+[\\.\\d]*)?[._ -]?(CODEX|SKIDROW|RELOADED|PLAZA|EMPRESS|FLT|GOG|P2P|TiNYiSO)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/GamePatterns.php",
+        "body": "\\w[\\w.',;-].+-OUTLAWS",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/GamePatterns.php",
+        "body": "\\w[\\w.',;-].+\\-ALiAS",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/GamePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+[._ -]GOG[._ -]?(Classic|Galaxy)?[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/GamePatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+[._ -](REPACK|RIP)[._ -](FitGirl|DODI|xatab|R\\.G\\.|Mechanics)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/AppPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(\\d{1,10}|v\\d+[\\.\\d]*|Linux|UNIX|MacOS)[._ -](RPM|DEB)?[._ -]?(X64|X86|ARM64)?[._ -]?(Incl|With)?[._ -]?(Keygen|Patch|Crack|Serial|License)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/AppPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+\\d{1,8}[._ -](winall|win32|win64|x64|x86)[._ -]?(freeware|portable|repack)?[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/AppPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(MacOS|Mac[._ -]?OS[._ -]?X|OSX)[._ -][\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/AppPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+(Linux|Ubuntu|Debian|CentOS|RHEL|Fedora)[._ -](x64|x86|arm64)?[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/AppPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]*(Adobe|Photoshop|Illustrator|Premiere|After[._ -]?Effects|InDesign|Lightroom)[._ -][\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/AppPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]*(Microsoft|Office|Windows|Visual[._ -]?Studio)[._ -]\\d{2,4}[._ -][\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Patterns/AppPatterns.php",
+        "body": "\\w[\\-\\w.',;& ]+[._ -]v?\\d+[\\.\\d]+[._ -](Multilingual|MULTi|Portable|Repack|Cracked)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "([\\w.'()\\[\\]-]+(?:[\\s._-]+[\\w.'()\\[\\]-]+)+[-.][\\w]+)",
+        "flags": "ui"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\.(?:mkv|avi|mp4|m4v|wmv|mpg|mpeg|mov|ts|m2ts|vob|divx|flv|webm|ogv|3gp|asf|rm|rmvb|f4v|mp3|flac|m4a|aac|ogg|wav|wma|ape|opus|mka|ac3|dts|eac3|truehd|mpc|shn|tak|tta|wv|rar|r\\d{2,4}|zip|z\\d{2}|7z|par2?|tar|gz|bz2|xz|lz|lzma|zst|tgz|lz4|rev|enc|\\d{3})$",
+        "flags": "iD"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(.+?(x264|x265|HEVC|XviD|H\\.?264|H\\.?265)\\-[A-Za-z0-9]+)\\\\",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(.+?(x264|XviD)\\-TVP)\\\\",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(\\\\|\\/)?(.+(\\\\|\\/))*(.+?S\\d{1,3}[.-_ ]?E\\d{1,3}(?:[.-_ ]?E\\d{1,3})?[.-_ ].+?(?:720p|1080p|2160p|4K|HDTV|WEB-?DL|WEB-?RIP|BluRay|AMZN|HMAX|NF|DSNP).+?)\\.(.+)$",
+        "flags": "iu"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(\\\\|\\/)?(.+(\\\\|\\/))*(.+?S\\d{1,3}[.-_ ]?[ED]\\d{1,3}.+)\\.(.+)$",
+        "flags": "iu"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(\\\\|\\/)?(.+(\\\\|\\/))*(.+?[\\.\\-_ ](19|20)\\d\\d[\\.\\-_ ].+?(2160p|4K|UHD).+?(HDR10?\\+?|DV|Dolby[\\.\\-_ ]?Vision)?.+?(HEVC|x265|H\\.?265).+?)\\.(.+)$",
+        "flags": "iu"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(\\\\|\\/)?(.+(\\\\|\\/))*(.+?[\\.\\-_ ](19|20)\\d\\d[\\.\\-_ ].+?(720p|1080p).+?(BluRay|WEB-?DL|WEB-?RIP|BDRip|REMUX).+?(x264|x265|HEVC|H\\.?264|H\\.?265|AVC).+?)\\.(.+)$",
+        "flags": "iu"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(\\\\|\\/)?(.+(\\\\|\\/))*(.+?([\\.\\-_ ]\\d{4}[\\.\\-_ ].+?(BDRip|bluray|DVDRip|XVID|WEB-?DL|HDTV)).+)\\.(.+)$",
+        "flags": "iu"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^([a-z0-9\\.\\-_]+(19|20)\\d\\d[a-z0-9\\.\\-_]+[\\.\\-_ ](720p|1080p|2160p|4K|BDRip|bluray|DVDRip|x264|x265|XviD|HEVC)[a-z0-9\\.\\-_]+)\\.[a-z]{2,}$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^([A-Za-z0-9\\.\\-_]+[\\.\\-_ ](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|TVNZ|VUDU)[\\.\\-_ ].+?(WEB-?DL|WEB-?RIP).+?)\\.(.+)$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "(.+?([\\.\\-_ ](CD|FM)|[\\.\\-_ ]\\dCD|CDR|FLAC|SAT|WEB).+?(19|20)\\d\\d.+?)\\\\.+",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(.+?(19|20)\\d\\d\\-([a-z0-9]{3}|[a-z]{2,}|C4))\\\\",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(.+?[\\.\\-_ ](FLAC|MP3|AAC|OGG)[\\.\\-_ ].+?[\\.\\-_ ]\\d{4}[\\.\\-_ ].+?\\-[A-Za-z0-9]+)[\\\\\\/.]",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": ".+\\\\(.+\\((19|20)\\d\\d\\)\\.avi)$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": ".+\\\\(.+\\((19|20)\\d\\d\\)\\.iso)$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": ".+\\\\(.+\\((19|20)\\d\\d\\)\\.(mkv|mp4|m4v))$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\.(mkv|mp4|m4v)$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^([A-Za-z0-9][\\w.\\-]+(?:[\\.\\-_ ][\\w.\\-]+)+)[\\\\\\/](?:CD\\d|Disc\\d|DVD\\d|Subs?)?[\\\\\\/]?.+\\.(rar|r\\d{2,4}|zip|7z)$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^([A-Za-z0-9][\\w.\\-]+\\-[A-Za-z0-9]+)[\\\\\\/].+\\.(rar|r\\d{2,4})$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(.+?IMAGESET.+?)\\\\.+",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^VIDEOOT-[A-Z0-9]+\\\\([\\w!.,& ()\\[\\]'\\`-]{8,}?\\b.?)([\\-_](proof|sample|thumbs?))*(\\.part\\d*(\\.rar)?|\\.rar|\\.7z)?(\\d{1,3}\\.rev|\\.vol.+?|\\.mp4)",
+        "flags": ""
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^.+?SDPORN",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\w[\\-\\w.',;& ]+1080i[._ -]DD5[._ -]1[._ -]MPEG2-R&C(?=\\.ts)$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\w[\\-\\w.',;& ]+((s\\d{1,2}[._ -]?[bde]\\d{1,2})|\\d{1,2}x\\d{2}|ep[._ -]?\\d{2})[._ -](480|720|1080)[ip][._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-DL)[._ -]nSD[._ -](DivX|[HX][._ -]?264|MPEG2|XviD(HD)?|WMV)[._ -]NhaNC3[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\wtvp-[\\w.',;]+((s\\d{1,2}[._ -]?[bde]\\d{1,2})|\\d{1,2}x\\d{2}|ep[._ -]?\\d{2})[._ -](720p|1080p|xvid)(?=\\.(avi|mkv))$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\w[\\-\\w.',;& ]+\\d{3,4}\\.hdtv-lol\\.(avi|mp4|mkv|ts|nfo|nzb)",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\w[\\-\\w.',;& ]+-S\\d{1,2}[EX]\\d{1,2}-XVID-DL\\.avi",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\S.*[\\w.\\-',;]+\\s\\-\\ss\\d{2}[ex]\\d{2}\\s\\-\\s[\\w.\\-',;].+\\.",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\w.+?\\)\\.nds$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "3DS_\\d{4}.+\\d{4} - (.+?)\\.3ds",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(.+?)\\[[\\w]+\\]\\.(?:nsp|xci|nsz)$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(.+?[\\.\\-_ ](PS[345P]|PSV|XBOX360|XBOXONE|NSW)[\\.\\-_ ].+?\\-[A-Za-z0-9]+)[\\\\\\/.]",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\w.+?\\.(epub|mobi|azw3?|opf|fb2|prc|djvu|cb[rz])",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(.+?[\\.\\-_ ]Audiobook[\\.\\-_ ].+?)[\\\\\\/.]",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^([A-Za-z0-9][\\w.\\-]+\\-[A-Za-z0-9]{2,15})$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\.(?:mkv|avi|mp4|m4v|ts|m2ts|rar|r\\d{2,4}|7z|par2|nfo|sfv|md5|sha1)$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^[A-Za-z0-9 ._()\\[\\]@+,!'&-]+$",
+        "flags": ""
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(.+?)[ ._(\\[](?:19|20)\\d{2}(?=$|[ ._)\\]-])",
+        "flags": "u"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "[A-Za-z]{3}",
+        "flags": ""
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "^(?:\\[[^\\]]+\\]\\s*)+",
+        "flags": ""
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "(?<![a-z0-9])(?:720p|1080p|2160p)(?![a-z0-9])",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "(?<![a-z0-9])(?:HDTV(?:Light)?|BluRay|BDRip|WEB[- .]?DL|WEBRip|BD)(?![a-z0-9])",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "(?<![a-z0-9])(?:x264|x265|HEVC|H[ .]?264|H[ .]?265|XviD)(?![a-z0-9])",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\.(?:mkv|avi|mp4|m4v)$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/FileNameExtractor.php",
+        "body": "\\w+[\\-\\w.',;& ]+$",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "\\r\\n|\\r|\\n",
+        "flags": ""
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "^[ \\t]*Source[ \\t]*:",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "^[ \\t]+\\S",
+        "flags": ""
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "^[ \\t]*[A-Za-z][A-Za-z0-9 _-]*[ \\t]*:",
+        "flags": ""
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "^[ \\t]*[A-Za-z]:[\\\\/]",
+        "flags": ""
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "\\p{C}",
+        "flags": "u"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "^[ \\t]*(?:Filename|File[ \\t]+Name|Complete[ \\t]+Name|Release(?:[ \\t]+Name)?)[ \\t]*[:=][ \\t]*([^\\r\\n]+)$",
+        "flags": "im"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": ":\\s*.*[\\\\\\/]([A-Z0-9].+?S\\d+[.-_ ]?[ED]\\d+.+?)\\.\\w{2,}\\s+",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "(?:(\\:\\s{1,}))(.+?S\\d{1,3}[.-_ ]?[ED]\\d{1,3}.+?)(\\s{2,}|\\r|\\n)",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "(?:((?!Source\\s)\\:\\s{1,}))(.+?(19|20)\\d\\d.+?(BDRip|bluray|DVD(R|Rip)?|XVID).+?)(\\s{2,}|\\r|\\n)",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "(?:(\\s{2,}))((?!Source).+?[\\.\\-_ ](19|20)\\d\\d.+?(BDRip|bluray|DVD(R|Rip)?|XVID).+?)(\\s{2,}|\\r|\\n)",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "(?:(\\s{2,}))(.+?[\\.\\-_ ](NTSC|MULTi).+?(MULTi|DVDR)[\\.\\-_ ].+?)(\\s{2,}|\\r|\\n)",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "(?:\\s{2,})(.+?-FM-\\d{2}-\\d{2})",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "\\.pdf|Audio ?Book",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "(\\w[\\-\\w`~!@#$%^&*()_+={}|\"<>?\\[\\]\\;',.\\/ ]+\\s?\\((19|20)\\d\\d\\))",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "ALiAS|BAT-TEAM|FAiRLiGHT|Game Type|Glamoury|HI2U|iTWINS|JAGUAR|(LARGE|MEDIUM)ISO|MAZE|nERv|PROPHET|PROFiT|PROCYON|RELOADED|REVOLVER|ROGUE|ViTALiTY",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "\\w[\\w.+&*\\/\\()',;: -]+\\(c\\)[\\-\\w.',;& ]+\\w",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "\\w[\\w.+&*\\/()',;: -]+\\*ISO\\*",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "Supplier.+?IGUANA",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "\\w[\\-\\w`~!@#$%^&*()+={}|:\"<>?\\[\\]\\;',.\\/ ]+\\s\\((19|20)\\d\\d\\)",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "\\s\\[\\*\\] (English|Dutch|French|German|Spanish)\\b",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "\\s\\[\\*\\] (DT?S [2567][._ -][0-2]( MONO)?)\\b",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "Format.+(DVD([59R])?|[HX][._ -]?264)\\b",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "\\[(640x.+|1280x.+|1920x.+)\\] Resolution\\b",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "(idiomas|lang|language|langue|sprache).*?\\b(?P<lang>Brazilian|Chinese|Croatian|Danish|DE|Deutsch|Dutch|Estonian|ES|English|Englisch|Finnish|Flemish|Francais|French|FR|German|Greek|Hebrew|Icelandic|Italian|Japenese|Japan|Japanese|Korean|Latin|Nordic|Norwegian|Polish|Portuguese|Russian|Serbian|Slovenian|Swedish|Spanisch|Spanish|Thai|Turkish)\\b",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "(frame size|(video )?res(olution)?|video).*?(?P<res>(272|336|480|494|528|608|\\(?640|688|704|720x480|810|816|820|1 ?080|1280( \\@)?|1 ?920(x1080)?))",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "(largeur|width).*?(?P<res>(\\(?640|688|704|720|1280( \\@)?|1 ?920))",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "source.*?\\b(?P<source>BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-DL)\\b",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "(codec( (name|code))?|(original )?format|res(olution)|video( (codec|format|res))?|tv system|type|writing library).*?\\b(?P<video>AVC|AVI|DBrip|DIVX|\\(Divx|DVD|[HX][._ -]?264|MPEG-4 Visual|NTSC|PAL|WMV|XVID)\\b",
+        "flags": "i"
+    },
+    {
+        "file": "Extractors/NfoNameExtractor.php",
+        "body": "(audio( format)?|codec( name)?|format).*?\\b(?P<audio>0x0055 MPEG-1 Layer 3|AAC( LC)?|AC-?3|\\(AC3|DD5(.1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby(\\s?TrueHD)?|TrueHD|FLAC|MP3)\\b",
+        "flags": "i"
+    },
+    {
+        "file": "FilePrioritizer.php",
+        "body": "^(?:audio|video)[._-]?ts$",
+        "flags": "i"
+    },
+    {
+        "file": "FilePrioritizer.php",
+        "body": "^vts[._-]?\\d{1,2}[._-]?\\d{1,2}$",
+        "flags": "i"
+    },
+    {
+        "file": "FilePrioritizer.php",
+        "body": "^\\d{1,3}$",
+        "flags": ""
+    },
+    {
+        "file": "FilePrioritizer.php",
+        "body": "\\.(rar|r\\d{2,3})$",
+        "flags": "i"
+    },
+    {
+        "file": "FilePrioritizer.php",
+        "body": "[\\.\\-_](sample|proof|subs?|thumbs?)[\\.\\-_]",
+        "flags": "i"
+    },
+    {
+        "file": "FilePrioritizer.php",
+        "body": "\\.rar$",
+        "flags": "i"
+    },
+    {
+        "file": "FilePrioritizer.php",
+        "body": "\\.part\\d+\\.rar$",
+        "flags": "i"
+    },
+    {
+        "file": "FilePrioritizer.php",
+        "body": "\\.part0*1\\.rar$",
+        "flags": "i"
+    },
+    {
+        "file": "FilePrioritizer.php",
+        "body": "\\.url$",
+        "flags": "i"
+    },
+    {
+        "file": "FilePrioritizer.php",
+        "body": "[\\\\\\/]([^\\\\\\/]+)$",
+        "flags": ""
+    },
+    {
+        "file": "ConstrainedPredbMatcher.php",
+        "body": "\\.(?:mkv|mp4|avi|rar|nfo|par2)$",
+        "flags": ""
+    },
+    {
+        "file": "ConstrainedPredbMatcher.php",
+        "body": "-([a-z0-9]{2,20})$",
+        "flags": ""
+    },
+    {
+        "file": "ConstrainedPredbMatcher.php",
+        "body": "[^\\pL\\pN]+",
+        "flags": "u"
+    },
+    {
+        "file": "ConstrainedPredbMatcher.php",
+        "body": "\\s+",
+        "flags": ""
+    },
+    {
+        "file": "ConstrainedPredbMatcher.php",
+        "body": "^(?:19|20)\\d{2}$",
+        "flags": ""
+    },
+    {
+        "file": "ConstrainedPredbMatcher.php",
+        "body": "^s\\d{1,2}(?:e\\d{1,3})+$",
+        "flags": ""
+    },
+    {
+        "file": "ConstrainedPredbMatcher.php",
+        "body": "\\d+",
+        "flags": ""
+    },
+    {
+        "file": "ConstrainedPredbMatcher.php",
+        "body": "^s\\d{1,2}$",
+        "flags": ""
+    },
+    {
+        "file": "ConstrainedPredbMatcher.php",
+        "body": "^(?:480|576|720|1080|2160)[pi]$",
+        "flags": ""
+    },
+    {
+        "file": "PredbIdentityKey.php",
+        "body": "[._\\s]+",
+        "flags": "u"
+    },
+    {
+        "file": "DonorMatchSelector.php",
+        "body": "\\p{C}",
+        "flags": "u"
+    }
+]
