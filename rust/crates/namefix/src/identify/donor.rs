@@ -231,6 +231,7 @@ mod tests {
         } = index.find(
             &[fact(DonorKey::Crc32, "same"), fact(DonorKey::MkvUid, "uid")],
             100,
+            SIZE,
         )
         else {
             panic!("expected a donor");
