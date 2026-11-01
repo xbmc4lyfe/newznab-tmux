@@ -15,7 +15,7 @@ use App\Traits\DetectsHashedNames;
  */
 class FileNameCleaner
 {
-    public const PREDB_IDENTITY_POLICY = '65afde111b1c96db73695c3268de2caa001a9a46b6bf0dfb0bc04580b8ea9235';
+    public const PREDB_IDENTITY_POLICY = '6c53f5c588a38da6b02de28ce972fc69903a6969e860cabc71c1b3a8b55ff0ca';
 
     use DetectsHashedNames;
 
