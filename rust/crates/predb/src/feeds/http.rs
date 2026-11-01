@@ -69,7 +69,8 @@ impl FeedHttp {
     pub async fn get_json(&self, url: &str, query: &[(&str, String)]) -> FeedResult<Value> {
         let mut url = reqwest::Url::parse(url).context("parsing the feed URL")?;
         if !query.is_empty() {
-            url.query_pairs_mut().extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
+            url.query_pairs_mut()
+                .extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
         }
         let response = self.send(|client| client.get(url.clone())).await?;
         read_json(response).await

@@ -8,7 +8,6 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-fancy-regex.workspace = true
 nntmux-runtime.workspace = true
 regex.workspace = true
 sqlx.workspace = true

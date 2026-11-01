@@ -1,5 +1,6 @@
 //! Public PreDB feeds and catalogues, normalized to `predb` table semantics.
 
+pub mod command;
 pub mod http;
 pub mod importer;
 pub mod index;

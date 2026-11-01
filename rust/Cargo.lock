@@ -690,6 +690,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "deunicode"
+version = "1.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abd57806937c9cc163efc8ea3910e00a62e2aeb0b8119f1793a978088f8f6b04"
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1783,9 +1789,29 @@ dependencies = [
 name = "nntmux-api"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "hex",
+ "md-5 0.10.6",
+ "nntmux-core",
  "nntmux-runtime",
+ "nntmux-testkit",
  "nntmux-webkit",
+ "rand 0.9.5",
+ "redis",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1794,7 +1820,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "fancy-regex",
  "nntmux-runtime",
  "regex",
  "serde_json",
@@ -1806,6 +1831,10 @@ name = "nntmux-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fancy-regex",
+ "hex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1931,7 +1960,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
- "fancy-regex",
  "flate2",
  "futures-util",
  "hex",
@@ -1967,6 +1995,7 @@ name = "nntmux-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "futures-util",
  "metrics",
@@ -2037,8 +2066,24 @@ name = "nntmux-verify"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "crc32fast",
+ "deunicode",
+ "flate2",
+ "hex",
+ "nntmux-core",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "rand 0.9.5",
+ "redis",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2093,7 +2138,13 @@ dependencies = [
 name = "nntmux-yenc"
 version = "0.1.0"
 dependencies = [
- "anyhow",
+ "crc32fast",
+ "hex",
+ "md-5 0.10.6",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
 ]
 
 [[package]]
@@ -2891,6 +2942,17 @@ dependencies = [
 
 [[package]]
 name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
@@ -3130,7 +3192,7 @@ dependencies = [
  "log",
  "percent-encoding",
  "serde",
- "sha1",
+ "sha1 0.11.0",
  "sha2 0.11.1",
  "sqlx-core",
  "thiserror",

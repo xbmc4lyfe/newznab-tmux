@@ -39,58 +39,6 @@ fn translate_dollar(pattern: &str) -> String {
     out
 }
 
-/// Compiles a PCRE pattern that needs lookaround. `fancy_regex` works on `str` with Unicode on,
-/// so `\\d`, `\\w` and `$` are spelled out to keep their ASCII and end-of-string meaning.
-pub fn compile_fancy(pattern: &str, case_insensitive: bool) -> fancy_regex::Regex {
-    let mut out = String::with_capacity(pattern.len() + 16);
-    if case_insensitive {
-        out.push_str("(?i)");
-    }
-    let mut chars = pattern.chars();
-    let mut in_class = false;
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.next() {
-                Some('d') if in_class => out.push_str("0-9"),
-                Some('d') => out.push_str("[0-9]"),
-                Some('w') if in_class => out.push_str("0-9A-Za-z_"),
-                Some('w') => out.push_str("[0-9A-Za-z_]"),
-                Some(next) => {
-                    out.push('\\');
-                    out.push(next);
-                }
-                None => out.push('\\'),
-            },
-            '[' if !in_class => {
-                in_class = true;
-                out.push(c);
-            }
-            ']' if in_class => {
-                in_class = false;
-                out.push(c);
-            }
-            '$' if !in_class => out.push_str(r"(?=\n?\z)"),
-            _ => out.push(c),
-        }
-    }
-    fancy_regex::Regex::new(&out).unwrap_or_else(|error| panic!("bad pattern {pattern}: {error}"))
-}
-
-/// A lazily compiled pattern with lookaround: `frx!("...")` or `frx!(i "...")`.
-#[macro_export]
-macro_rules! frx {
-    (i $pattern:expr) => {{
-        static RE: std::sync::LazyLock<fancy_regex::Regex> =
-            std::sync::LazyLock::new(|| $crate::pcre::compile_fancy($pattern, true));
-        &*RE
-    }};
-    ($pattern:expr) => {{
-        static RE: std::sync::LazyLock<fancy_regex::Regex> =
-            std::sync::LazyLock::new(|| $crate::pcre::compile_fancy($pattern, false));
-        &*RE
-    }};
-}
-
 /// A lazily compiled pattern: `rx!("...")` is case-sensitive, `rx!(i "...")` isn't.
 #[macro_export]
 macro_rules! rx {

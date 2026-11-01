@@ -150,7 +150,7 @@ fn read_items(xml: &[u8]) -> anyhow::Result<Option<Vec<Item>>> {
     config.trim_text(false);
     config.check_end_names = true;
     let mut buffer = Vec::new();
-    let mut path: Vec<Vec<u8>> = Vec::new();
+    let mut path: Vec<String> = Vec::new();
     let mut items = Vec::new();
     let mut current: Option<Item> = None;
     let mut seen_channel = false;
@@ -162,20 +162,19 @@ fn read_items(xml: &[u8]) -> anyhow::Result<Option<Vec<Item>>> {
             Event::Start(start) => {
                 let name = start.name().as_ref().to_ascii_lowercase();
                 if path.is_empty() {
-                    if name != b"rss" {
+                    if name != "rss" {
                         return Ok(None);
                     }
                     seen_root = true;
                 }
-                if path.len() == 1 && name == b"channel" {
+                if path.len() == 1 && name == "channel" {
                     seen_channel = true;
                 }
-                if path.len() == 2 && name == b"item" && path[1] == b"channel" {
+                if path.len() == 2 && name == "item" && path[1] == "channel" {
                     current = Some(Item::default());
                 }
                 if path.len() == 3 && current.is_some() {
-                    first_child_text =
-                        Some((String::from_utf8_lossy(&name).into_owned(), String::new()));
+                    first_child_text = Some((name.clone(), String::new()));
                 }
                 path.push(name);
             }
@@ -184,10 +183,10 @@ fn read_items(xml: &[u8]) -> anyhow::Result<Option<Vec<Item>>> {
                 if path.is_empty() {
                     return Ok(None);
                 }
-                if path.len() == 1 && name == b"channel" {
+                if path.len() == 1 && name == "channel" {
                     seen_channel = true;
                 }
-                if path.len() == 2 && name == b"item" && path[1] == b"channel" {
+                if path.len() == 2 && name == "item" && path[1] == "channel" {
                     items.push(Item::default());
                 }
             }
@@ -195,21 +194,21 @@ fn read_items(xml: &[u8]) -> anyhow::Result<Option<Vec<Item>>> {
                 if let Some((_, value)) = &mut first_child_text
                     && path.len() == 4
                 {
-                    value.push_str(&text.xml10_content()?);
+                    value.push_str(&text.xml10_content());
                 }
             }
             Event::GeneralRef(reference) => {
                 if let Some((_, value)) = &mut first_child_text
                     && path.len() == 4
                 {
-                    value.push_str(&resolve_reference(&reference.decode()?));
+                    value.push_str(&resolve_reference(&reference.xml10_content()));
                 }
             }
             Event::CData(data) => {
                 if let Some((_, value)) = &mut first_child_text
                     && path.len() == 4
                 {
-                    value.push_str(&String::from_utf8_lossy(&data.into_inner()));
+                    value.push_str(&data.into_inner());
                 }
             }
             Event::End(_) => {

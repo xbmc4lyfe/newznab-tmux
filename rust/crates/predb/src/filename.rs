@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 
 use nntmux_categorize::names::{is_hashed_or_gibberish, unwrap_nzbsplit};
 use nntmux_categorize::pcre::{PHP_WS, contains_ci, replace_all, trim_chars};
-use nntmux_categorize::{frx, mi, ms, rx};
+use nntmux_categorize::{mi, ms, rx};
 use regex::Regex;
 use regex::bytes::Regex as BytesRegex;
 
@@ -175,9 +175,9 @@ pub fn clean_for_matching(file_name: &str, preserve_leading_number: bool) -> Opt
 
 /// `^\d{1,3}[\.\-_\s]+(?=[A-Za-z])` removed.
 fn strip_leading_track_number(name: &str) -> String {
-    match frx!(r"^\d{1,3}[\.\-_\s]+(?=[A-Za-z])").find(name) {
-        Ok(Some(found)) => name[found.end()..].to_owned(),
-        _ => name.to_owned(),
+    match rx!(r"^\d{1,3}[\.\-_\s]+[A-Za-z]").find(name.as_bytes()) {
+        Some(found) => name[found.end() - 1..].to_owned(),
+        None => name.to_owned(),
     }
 }
 

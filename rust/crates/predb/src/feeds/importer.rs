@@ -24,8 +24,6 @@ pub struct Totals {
 struct PredbRow {
     id: Option<u64>,
     title: String,
-    filename: String,
-    source: String,
     category: Option<String>,
     size: Option<String>,
     files: Option<String>,
@@ -122,7 +120,7 @@ impl Importer {
 
     async fn find(&self, title: &str) -> Result<Option<PredbRow>> {
         let row = sqlx::query(
-            "SELECT id, title, filename, source, category, size, files, predate, nuked, nukereason \
+            "SELECT id, title, category, size, files, predate, nuked, nukereason \
              FROM predb WHERE title = ? LIMIT 1",
         )
         .bind(title)
@@ -132,8 +130,6 @@ impl Importer {
             Ok(PredbRow {
                 id: Some(row.try_get("id")?),
                 title: row.try_get("title")?,
-                filename: row.try_get("filename")?,
-                source: row.try_get("source")?,
                 category: row.try_get("category")?,
                 size: row.try_get("size")?,
                 files: row.try_get("files")?,
@@ -196,8 +192,6 @@ impl Importer {
                         PredbRow {
                             id: None,
                             title: title.to_owned(),
-                            filename: String::new(),
-                            source: entry.source.clone(),
                             category: entry.category.clone(),
                             size: entry.size.clone(),
                             files: entry.files.clone(),
