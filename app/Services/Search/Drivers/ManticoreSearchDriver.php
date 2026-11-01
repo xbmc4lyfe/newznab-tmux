@@ -6,14 +6,8 @@ namespace App\Services\Search\Drivers;
 
 use App\Enums\SecondarySearchIndex;
 use App\Jobs\ReindexReleaseJob;
-use App\Models\BookInfo;
-use App\Models\ConsoleInfo;
-use App\Models\GamesInfo;
 use App\Models\MovieInfo;
-use App\Models\MusicInfo;
 use App\Models\Release;
-use App\Models\SteamApp;
-use App\Models\Video;
 use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
 use App\Services\Search\Contracts\PredbFilenameCandidateLookup;
 use App\Services\Search\Contracts\ReleaseCandidatePager;
@@ -27,7 +21,6 @@ use App\Services\Search\Support\ReleaseIndexProjection;
 use App\Services\Search\Support\SearchFailureTracker;
 use App\Support\PredbSearchDocument;
 use App\Support\ReleaseSearchIndexDocument;
-use App\Support\SecondaryIndexDocuments;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -624,29 +617,6 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
     }
 
     /**
-     * Delete a predb record from the index.
-     *
-     * @param  int  $id  Predb ID
-     */
-    public function deletePreDb(int $id): void
-    {
-        if (empty($id)) {
-            Log::warning('ManticoreSearch: Cannot delete predb without ID');
-
-            return;
-        }
-
-        try {
-            $this->manticoreSearch->table($this->config['indexes']['predb'])
-                ->deleteDocument($id);
-        } catch (ResponseException $e) {
-            Log::error('ManticoreSearch deletePreDb error: '.$e->getMessage(), [
-                'id' => $id,
-            ]);
-        }
-    }
-
-    /**
      * Bulk insert multiple releases into the index.
      *
      * @param  array<string, mixed>  $releases  Array of release data arrays
@@ -753,41 +723,6 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
             }
 
             return ['success' => 0, 'errors' => count($documents)];
-        }
-    }
-
-    /**
-     * Delete release from Manticore RT tables by GUID.
-     *
-     * @param  array<string, mixed>  $identifiers  ['g' => Release GUID(mandatory), 'id' => ReleaseID(optional, pass false)]
-     */
-    public function deleteReleaseByGuid(array $identifiers): void
-    {
-        if (empty($identifiers['g'])) {
-            Log::warning('ManticoreSearch: Cannot delete release without GUID');
-
-            return;
-        }
-
-        try {
-            if ($identifiers['i'] === false || empty($identifiers['i'])) {
-                $release = Release::query()->where('guid', $identifiers['g'])->first(['id']);
-                $identifiers['i'] = $release?->id;
-            }
-
-            if (! empty($identifiers['i'])) {
-                $this->manticoreSearch->table($this->config['indexes']['releases'])
-                    ->deleteDocument($identifiers['i']);
-            } else {
-                Log::warning('ManticoreSearch: Could not find release ID for deletion', [
-                    'guid' => $identifiers['g'],
-                ]);
-            }
-        } catch (ResponseException $e) {
-            Log::error('ManticoreSearch deleteRelease error: '.$e->getMessage(), [
-                'guid' => $identifiers['g'],
-                'id' => $identifiers['i'] ?? null,
-            ]);
         }
     }
 
@@ -2546,22 +2481,6 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
     }
 
     /**
-     * Search movies by external ID (IMDB, TMDB, Trakt).
-     *
-     * @param  string  $field  Field name (imdbid, tmdbid, traktid)
-     * @param  int|string  $value  The external ID value
-     * @return array<string, mixed>|null Movie data or null if not found
-     */
-    public function searchMovieByExternalId(string $field, int|string $value): ?array
-    {
-        if (empty($value)) {
-            return null;
-        }
-
-        return $this->searchMovieByExternalIds([$field => $value]);
-    }
-
-    /**
      * @param  array<string, mixed>  $externalIds
      * @return array<string, mixed>|null
      */
@@ -2657,34 +2576,6 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
     }
 
     /**
-     * Update a TV show in the search index.
-     *
-     * @param  int  $videoId  Video/TV show ID
-     */
-    public function updateTvShow(int $videoId): void
-    {
-        if (empty($videoId)) {
-            Log::warning('ManticoreSearch: Cannot update TV show without ID');
-
-            return;
-        }
-
-        try {
-            $video = Video::find($videoId);
-
-            if ($video !== null) {
-                $this->insertTvShow($video->toArray());
-            } else {
-                Log::warning('ManticoreSearch: TV show not found for update', ['id' => $videoId]);
-            }
-        } catch (\Throwable $e) {
-            Log::error('ManticoreSearch updateTvShow error: '.$e->getMessage(), [
-                'tvshow_id' => $videoId,
-            ]);
-        }
-    }
-
-    /**
      * Delete a TV show from the search index.
      *
      * @param  int  $id  TV show ID
@@ -2770,77 +2661,6 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
         $searchString = is_array($searchTerm) ? implode(' ', $searchTerm) : $searchTerm;
 
         return $this->searchIndexes($this->getTvShowsIndex(), $searchString, ['title'], []); // @phpstan-ignore argument.type
-    }
-
-    /**
-     * Search TV shows by external ID (TVDB, Trakt, TVMaze, TVRage, IMDB, TMDB).
-     *
-     * @param  string  $field  Field name (tvdb, trakt, tvmaze, tvrage, imdb, tmdb)
-     * @param  int|string  $value  The external ID value
-     * @return array<string, mixed>|null TV show data or null if not found
-     */
-    public function searchTvShowByExternalId(string $field, int|string $value): ?array
-    {
-        if (empty($value)) {
-            return null;
-        }
-
-        return $this->searchTvShowByExternalIds([$field => $value]);
-    }
-
-    /**
-     * @param  array<string, mixed>  $externalIds
-     * @return array<string, mixed>|null
-     */
-    public function searchTvShowByExternalIds(array $externalIds): ?array
-    {
-        $allowedFields = ['tvdb', 'trakt', 'tvmaze', 'tvrage', 'imdb', 'tmdb'];
-        $normalized = [];
-
-        foreach ($allowedFields as $field) {
-            $value = $externalIds[$field] ?? null;
-            if (empty($value)) {
-                continue;
-            }
-
-            $normalized[$field] = $field === 'imdb' ? (string) $value : (int) $value;
-        }
-
-        if ($normalized === []) {
-            return null;
-        }
-
-        $cacheKey = 'manticore:tvshow:any:'.md5(serialize($normalized));
-        $cached = Cache::get($cacheKey);
-        if ($cached !== null) {
-            return $cached;
-        }
-
-        try {
-            foreach ($normalized as $field => $value) {
-                $query = (new Search($this->manticoreSearch))
-                    ->setTable($this->getTvShowsIndex())
-                    ->filter($field, '=', $value)
-                    ->limit(1);
-
-                $results = $query->get();
-
-                foreach ($results as $doc) {
-                    $data = $doc->getData();
-                    $data['id'] = $doc->getId();
-                    Cache::put($cacheKey, $data, now()->addMinutes($this->config['cache_minutes'] ?? 5));
-
-                    return $data;
-                }
-            }
-        } catch (\Throwable $e) {
-            $this->recordSearchFailure();
-            Log::error('ManticoreSearch searchTvShowByExternalIds error: '.$e->getMessage(), [
-                'externalIds' => $externalIds,
-            ]);
-        }
-
-        return null;
     }
 
     /**
@@ -2931,138 +2751,6 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
         }
 
         return $resultIds;
-    }
-
-    /**
-     * Search releases by category ID using the search index.
-     * This provides a fast way to get release IDs for a specific category without hitting the database.
-     *
-     * @param  array<string, mixed>  $categoryIds  Array of category IDs to filter by
-     * @param  int  $limit  Maximum number of results
-     * @return array<string, mixed>
-     */
-    public function searchReleasesByCategory(array $categoryIds, int $limit = 1000): array
-    {
-        if (empty($categoryIds)) {
-            return [];
-        }
-
-        // Filter out invalid category IDs (-1 means "all categories")
-        $validCategoryIds = array_filter($categoryIds, fn ($id) => $id > 0);
-        if (empty($validCategoryIds)) {
-            return [];
-        }
-
-        $cacheKey = 'manticore:releases:cat:'.md5(serialize($validCategoryIds).':'.$limit);
-        $cached = Cache::get($cacheKey);
-        if ($cached !== null) {
-            return $cached;
-        }
-
-        try {
-            $query = (new Search($this->manticoreSearch))
-                ->setTable($this->getReleasesIndex())
-                ->limit(min($limit, 10000));
-
-            // Use IN filter for multiple category IDs
-            if (count($validCategoryIds) === 1) {
-                $query->filter('categories_id', '=', (int) $validCategoryIds[0]); // @phpstan-ignore offsetAccess.notFound
-            } else {
-                $query->filter('categories_id', 'in', array_map('intval', $validCategoryIds));
-            }
-
-            $results = $query->get();
-
-            $resultIds = [];
-            foreach ($results as $doc) {
-                $resultIds[] = $doc->getId();
-            }
-
-            if (! empty($resultIds)) {
-                Cache::put($cacheKey, $resultIds, now()->addMinutes($this->config['cache_minutes'] ?? 5));
-            }
-
-            return $resultIds; // @phpstan-ignore return.type
-        } catch (\Throwable $e) {
-            $this->recordSearchFailure();
-            Log::error('ManticoreSearch searchReleasesByCategory error: '.$e->getMessage(), [
-                'categoryIds' => $categoryIds,
-            ]);
-        }
-
-        return [];
-    }
-
-    /**
-     * Combined search: text search with category filtering.
-     * First searches by text, then filters by category IDs using the search index.
-     *
-     * @param  string  $searchTerm  Search text
-     * @param  array<string, mixed>  $categoryIds  Array of category IDs to filter by (empty for all categories)
-     * @param  int  $limit  Maximum number of results
-     * @return array<string, mixed>
-     */
-    public function searchReleasesWithCategoryFilter(string $searchTerm, array $categoryIds = [], int $limit = 1000): array
-    {
-        if (empty($searchTerm)) {
-            // If no search term, just filter by category
-            return $this->searchReleasesByCategory($categoryIds, $limit);
-        }
-
-        // Filter out invalid category IDs
-        $validCategoryIds = array_filter($categoryIds, fn ($id) => $id > 0);
-
-        $cacheKey = 'manticore:releases:search_cat:'.md5($searchTerm.':'.serialize($validCategoryIds).':'.$limit);
-        $cached = Cache::get($cacheKey);
-        if ($cached !== null) {
-            return $cached;
-        }
-
-        try {
-            $preparedSearch = self::prepareUserSearchQuery($searchTerm);
-            if (empty($preparedSearch)) {
-                return $this->searchReleasesByCategory($categoryIds, $limit);
-            }
-
-            $searchExpr = '@@relaxed '.self::scopeReleaseSearchQuery($searchTerm, $preparedSearch, '@searchname');
-
-            $query = (new Search($this->manticoreSearch))
-                ->setTable($this->getReleasesIndex())
-                ->search($searchExpr)
-                ->option('ranker', 'sph04')
-                ->stripBadUtf8(true)
-                ->limit(min($limit, 10000));
-
-            // Add category filter if provided
-            if (! empty($validCategoryIds)) {
-                if (count($validCategoryIds) === 1) {
-                    $query->filter('categories_id', '=', (int) $validCategoryIds[0]); // @phpstan-ignore offsetAccess.notFound
-                } else {
-                    $query->filter('categories_id', 'in', array_map('intval', $validCategoryIds));
-                }
-            }
-
-            $results = $query->get();
-
-            $resultIds = [];
-            foreach ($results as $doc) {
-                $resultIds[] = $doc->getId();
-            }
-
-            if (! empty($resultIds)) {
-                Cache::put($cacheKey, $resultIds, now()->addMinutes($this->config['cache_minutes'] ?? 5));
-            }
-
-            return $resultIds; // @phpstan-ignore return.type
-        } catch (\Throwable $e) {
-            $this->recordSearchFailure();
-            Log::error('ManticoreSearch searchReleasesWithCategoryFilter error: '.$e->getMessage(), [
-                'searchTerm' => $searchTerm,
-                'categoryIds' => $categoryIds,
-            ]);
-        }
-
-        return [];
     }
 
     /**
@@ -3421,29 +3109,6 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
             ]);
         } catch (\Throwable $e) {
             Log::error('ManticoreSearch insertSecondary error: '.$e->getMessage(), [
-                'secondary' => $index->value,
-                'id' => $id,
-            ]);
-        }
-    }
-
-    public function updateSecondary(SecondarySearchIndex $index, int $id): void
-    {
-        if ($id <= 0) {
-            return;
-        }
-
-        try {
-            match ($index) {
-                SecondarySearchIndex::Music => $this->insertSecondary($index, $id, SecondaryIndexDocuments::music(MusicInfo::query()->findOrFail($id))),
-                SecondarySearchIndex::Books => $this->insertSecondary($index, $id, SecondaryIndexDocuments::book(BookInfo::query()->findOrFail($id))),
-                SecondarySearchIndex::Games => $this->insertSecondary($index, $id, SecondaryIndexDocuments::games(GamesInfo::query()->findOrFail($id))),
-                SecondarySearchIndex::Console => $this->insertSecondary($index, $id, SecondaryIndexDocuments::console(ConsoleInfo::query()->findOrFail($id))),
-                SecondarySearchIndex::Steam => $this->insertSecondary($index, $id, SecondaryIndexDocuments::steam(SteamApp::query()->findOrFail($id))),
-                SecondarySearchIndex::Anime => null,
-            };
-        } catch (\Throwable $e) {
-            Log::warning('ManticoreSearch updateSecondary skipped: '.$e->getMessage(), [
                 'secondary' => $index->value,
                 'id' => $id,
             ]);

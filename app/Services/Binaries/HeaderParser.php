@@ -260,22 +260,6 @@ final class HeaderParser
     }
 
     /**
-     * Get count of non-yEnc headers filtered.
-     */
-    public function getNotYEncCount(): int
-    {
-        return $this->notYEnc;
-    }
-
-    /**
-     * Get count of blacklisted headers.
-     */
-    public function getBlacklistedCount(): int
-    {
-        return $this->blacklisted;
-    }
-
-    /**
      * Extract highest and lowest article info from headers.
      *
      * Only numbers inside the requested range count: a malformed overview line can

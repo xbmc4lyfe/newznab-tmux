@@ -127,18 +127,6 @@ parameters:
 			path: app/Facades/Search.php
 
 		-
-			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesByCategory\(\) parameter \#1 \$categoryIds with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Facades/Search.php
-
-		-
-			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesByCategory\(\) return type with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Facades/Search.php
-
-		-
 			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesByExternalId\(\) parameter \#1 \$externalIds with no value type specified in iterable type array\.$#'
 			identifier: missingType.iterableValue
 			count: 1
@@ -158,18 +146,6 @@ parameters:
 
 		-
 			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesFiltered\(\) return type with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Facades/Search.php
-
-		-
-			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesWithCategoryFilter\(\) parameter \#2 \$categoryIds with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Facades/Search.php
-
-		-
-			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesWithCategoryFilter\(\) return type with no value type specified in iterable type array\.$#'
 			identifier: missingType.iterableValue
 			count: 1
 			path: app/Facades/Search.php
@@ -674,44 +650,8 @@ parameters:
 			path: app/Services/MusicService.php
 
 		-
-			message: '#^Method App\\Services\\NfoService\:\:extractAllMediaIds\(\) should return array\<string, mixed\> but returns list\<array\<string, string\>\>\.$#'
-			identifier: return.type
-			count: 1
-			path: app/Services/NfoService.php
-
-		-
-			message: '#^Method App\\Services\\NfoService\:\:extractGenre\(\) should return array\<string, mixed\> but returns list\<string\>\.$#'
-			identifier: return.type
-			count: 1
-			path: app/Services/NfoService.php
-
-		-
 			message: '#^Method App\\Services\\NfoService\:\:extractLanguage\(\) should return array\<string, mixed\> but returns list\<string\>\.$#'
 			identifier: return.type
-			count: 1
-			path: app/Services/NfoService.php
-
-		-
-			message: '#^Method App\\Services\\NfoService\:\:extractUrls\(\) should return array\<string, mixed\> but returns array\<int\<0, max\>, string\>\.$#'
-			identifier: return.type
-			count: 1
-			path: app/Services/NfoService.php
-
-		-
-			message: '#^Method App\\Services\\NfoService\:\:parseNfoMetadata\(\) should return list\<array\<string, string\>\> but returns array\{urls\: array\<string, mixed\>, group\: string\|null, release_date\: string\|null, codec_info\: array\{video\?\: string, audio\?\: string, resolution\?\: string\}, file_size\: int\|null, media_ids\: array\<string, mixed\>, show_id\: array\{showid\: string, site\: string\}\|false, language\: array\<string, mixed\>, \.\.\.\}\.$#'
-			identifier: return.type
-			count: 1
-			path: app/Services/NfoService.php
-
-		-
-			message: '#^PHPDoc tag @return with type array\<int\<0, max\>, string\> is incompatible with native type string\|null\.$#'
-			identifier: return.phpDocType
-			count: 1
-			path: app/Services/NfoService.php
-
-		-
-			message: '#^PHPDoc tag @return with type list\<string\> is incompatible with native type int\|null\.$#'
-			identifier: return.phpDocType
 			count: 1
 			path: app/Services/NfoService.php
 

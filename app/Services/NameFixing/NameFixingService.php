@@ -359,52 +359,6 @@ class NameFixingService
     }
 
     /**
-     * Check with pattern matchers (TV, Movie, Game, App).
-     */
-    protected function checkWithPatternMatchers(object $release, bool $echo, string $type, bool $nameStatus, bool $show, bool $preId): void
-    {
-        if ($type === 'NFO, ') {
-            $release = clone $release;
-            $release->textstring = $this->nfoExtractor->identityText($release->textstring);
-        }
-
-        // Check for PreDB match first
-        $preDbMatch = $this->updateService->checkPreDbMatch($release, $release->textstring);
-        if ($preDbMatch !== null) {
-            $this->updateService->updateRelease(
-                $release,
-                $preDbMatch['title'],
-                'preDB: Match',
-                $echo,
-                $type,
-                $nameStatus,
-                $show,
-                $preDbMatch['id']
-            );
-
-            return;
-        }
-
-        if ($preId) {
-            return;
-        }
-
-        // Try pattern checkers
-        $result = $this->checkerService->check($release, $release->textstring);
-        if ($result !== null) {
-            $this->updateService->updateRelease(
-                $release,
-                $result->newName,
-                $result->getFormattedMethod(),
-                $echo,
-                $type,
-                $nameStatus,
-                $show
-            );
-        }
-    }
-
-    /**
      * Check SRR file for release name.
      */
     protected function srrNameCheck(object $release, bool $echo, string $type, bool $nameStatus, bool $show): bool
@@ -1573,14 +1527,6 @@ class NameFixingService
     public function getUpdateService(): ReleaseUpdateService
     {
         return $this->updateService;
-    }
-
-    /**
-     * Get the checker service.
-     */
-    public function getCheckerService(): NameCheckerService
-    {
-        return $this->checkerService;
     }
 
     /**

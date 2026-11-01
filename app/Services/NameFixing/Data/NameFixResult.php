@@ -48,33 +48,6 @@ final class NameFixResult extends Data
     }
 
     /**
-     * Create a result from PreDB match.
-     */
-    public static function fromPreDb(
-        string $newName,
-        int $preDbId,
-        string $source,
-        string $checkerName = 'PreDB'
-    ): self {
-        return new self(
-            newName: $newName,
-            method: "PreDB: {$source}",
-            checkerName: $checkerName,
-            preDbId: $preDbId,
-            confidence: 1.0,
-            metadata: ['source' => $source],
-        );
-    }
-
-    /**
-     * Check if this result has a PreDB ID.
-     */
-    public function hasPreDbId(): bool
-    {
-        return $this->preDbId > 0;
-    }
-
-    /**
      * Get a formatted method string for logging.
      */
     public function getFormattedMethod(): string
