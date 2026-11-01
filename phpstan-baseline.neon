@@ -397,24 +397,6 @@ parameters:
 			path: app/Models/Video.php
 
 		-
-			message: '#^Access to an undefined property TeamTeaTime\\Forum\\Models\\Post\:\:\$author_id\.$#'
-			identifier: property.notFound
-			count: 1
-			path: app/Policies/PostPolicy.php
-
-		-
-			message: '#^Access to an undefined property TeamTeaTime\\Forum\\Models\\Thread\:\:\$author_id\.$#'
-			identifier: property.notFound
-			count: 1
-			path: app/Policies/ThreadPolicy.php
-
-		-
-			message: '#^Parameter \#1 \$categories of method App\\Support\\Forum\\CategoryTreeBuilder\:\:build\(\) expects Illuminate\\Database\\Eloquent\\Collection\<int, TeamTeaTime\\Forum\\Models\\Category\>, Illuminate\\Database\\Eloquent\\Collection\<int, Illuminate\\Database\\Eloquent\\Model\> given\.$#'
-			identifier: argument.type
-			count: 1
-			path: app/Providers/ForumServiceProvider.php
-
-		-
 			message: '#^Parameter \#3 \$fail \(Closure\(string\)\: void\) of method App\\Rules\\RecaptchaRule\:\:validate\(\) should be compatible with parameter \$fail \(Closure\(string, string\|null\=\)\: Illuminate\\Translation\\PotentiallyTranslatedString\) of method Illuminate\\Contracts\\Validation\\ValidationRule\:\:validate\(\)$#'
 			identifier: method.childParameterType
 			count: 1
@@ -858,18 +840,6 @@ parameters:
 			identifier: nullsafe.neverNull
 			count: 1
 			path: app/Support/ApproximateRowCount.php
-
-		-
-			message: '#^Call to an undefined method Illuminate\\Database\\Eloquent\\Collection\<int, TeamTeaTime\\Forum\\Models\\Category\>\:\:linkNodes\(\)\.$#'
-			identifier: method.notFound
-			count: 1
-			path: app/Support/Forum/CategoryTreeBuilder.php
-
-		-
-			message: '#^Parameter \#1 \$categories of method App\\Support\\Forum\\CategoryTreeBuilder\:\:build\(\) expects Illuminate\\Database\\Eloquent\\Collection\<int, TeamTeaTime\\Forum\\Models\\Category\>, Aimeos\\Nestedset\\Collection given\.$#'
-			identifier: argument.type
-			count: 2
-			path: app/Support/Forum/CategoryTreeBuilder.php
 
 		-
 			message: '#^Method App\\Support\\SecondaryIndexDocuments\:\:book\(\) return type has no value type specified in iterable type array\.$#'

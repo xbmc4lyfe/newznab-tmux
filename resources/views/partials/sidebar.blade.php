@@ -80,10 +80,6 @@
             <i class="fas fa-chevron-down text-xs transition-transform"></i>
         </button>
         <div id="submenu2" class="sidebar-submenu ml-4 mt-1 space-y-1 hidden">
-            <a href="{{ url('forum') }}" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition">
-                <i class="fab fa-forumbee fa-fw mr-2"></i>
-                <span>Forum</span>
-            </a>
             <a href="{{ route('search') }}" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition">
                 <i class="fab fa-searchengin fa-fw mr-2"></i>
                 <span>Search</span>

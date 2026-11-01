@@ -107,7 +107,7 @@ class ViteDockerConfigurationTest extends TestCase
         $this->assertStringNotContainsString('--mount=type=cache,target=/src/docker/app/nzb-yenc-ffi/target', $dockerfile);
         $this->assertStringContainsString('--mount=type=cache,target=/usr/local/cargo/registry', $dockerfile);
         $this->assertStringContainsString('COPY app/Support/AdminReleaseNames.php /app/app/Support/AdminReleaseNames.php', $dockerfile);
-        $this->assertStringContainsString('COPY resources/forum /app/resources/forum', $dockerfile);
+        $this->assertStringNotContainsString('resources/forum', $dockerfile);
         $this->assertMatchesRegularExpression('/^FROM base-os AS vendor$/m', $dockerfile);
         $this->assertMatchesRegularExpression('/^FROM node AS frontend$/m', $dockerfile);
         $this->assertMatchesRegularExpression('/^FROM selfhost-runtime AS app-core$/m', $dockerfile);

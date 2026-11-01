@@ -3,7 +3,6 @@
 use App\Providers\AdditionalProcessingServiceProvider;
 use App\Providers\AppServiceProvider;
 use App\Providers\CategorizationServiceProvider;
-use App\Providers\ForumServiceProvider;
 use App\Providers\HorizonServiceProvider;
 use App\Providers\ProcessingServiceProvider;
 use App\Providers\SearchServiceProvider;
@@ -14,7 +13,6 @@ return [
     AdditionalProcessingServiceProvider::class,
     AppServiceProvider::class,
     CategorizationServiceProvider::class,
-    ForumServiceProvider::class,
     HorizonServiceProvider::class,
     ProcessingServiceProvider::class,
     SearchServiceProvider::class,
