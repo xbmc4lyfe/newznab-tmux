@@ -29,6 +29,8 @@ fn task(
 
 /// Stops a slow export before its next runs pile up behind it.
 const EXPORT_LIMIT: Duration = Duration::from_secs(240);
+/// A wedged service can't hold the every-minute health checks for long.
+const HEALTH_LIMIT: Duration = Duration::from_secs(300);
 
 pub fn tasks() -> Vec<Task<Ctx>> {
     use nntmux_ops::{
@@ -58,7 +60,12 @@ pub fn tasks() -> Vec<Task<Ctx>> {
         },
         task("nntmux:check-service-health", EveryMinutes(1), |ctx| {
             Box::pin(async move {
-                site_status::check_all(&ctx, site_status::UPTIME_DAYS).await?;
+                tokio::time::timeout(
+                    HEALTH_LIMIT,
+                    site_status::check_all(&ctx, site_status::UPTIME_DAYS),
+                )
+                .await
+                .context("the health checks ran over their limit")??;
                 Ok(())
             })
         }),

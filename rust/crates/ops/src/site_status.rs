@@ -122,7 +122,8 @@ async fn probe_search(ctx: &Ctx) -> Health {
         }
     };
     let start = Instant::now();
-    if client.is_available().await {
+    let available = tokio::time::timeout(REQUEST_TIMEOUT, client.is_available()).await;
+    if available.unwrap_or(false) {
         Health::fine(since_ms(start), "Search driver \"manticore\" available")
     } else {
         Health {

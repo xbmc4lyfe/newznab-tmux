@@ -74,6 +74,10 @@ async fn an_outage_opens_one_incident_and_recovery_resolves_it() -> Result<()> {
     // Still failing: no second incident.
     site_status::check_all(&ctx, 30).await?;
     assert_eq!(incidents(&ctx).await?.len(), 1);
+    // Give the outage a measurable length, so it counts against uptime below.
+    sqlx::query("UPDATE service_incidents SET started_at = NOW() - INTERVAL 1 HOUR")
+        .execute(&ctx.db)
+        .await?;
 
     // Recovery: the probe now works, so the incident resolves and the status clears.
     sqlx::query("UPDATE service_statuses SET probe_identifier = 'database' WHERE slug = 'bad'")
