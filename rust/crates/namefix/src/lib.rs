@@ -31,6 +31,7 @@ pub mod queries;
 pub mod release;
 pub mod result;
 pub mod service;
+pub mod size_mismatch;
 pub mod update;
 
 pub use commands::{Command, ctl, predbft_scheduled, run};
