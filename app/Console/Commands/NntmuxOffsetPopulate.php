@@ -4,14 +4,10 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
-use App\Facades\Elasticsearch;
 use App\Facades\Search;
 use App\Models\Predb;
 use App\Models\Release;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
-use App\Services\Search\Support\ElasticsearchResponseHelper;
-use App\Support\PredbSearchDocument;
-use Elastic\Elasticsearch\Client as ElasticsearchClient;
 use Exception;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Process;
@@ -25,7 +21,6 @@ class NntmuxOffsetPopulate extends Command
      */
     protected $signature = 'nntmux:offset-populate
                                        {--manticore : Use ManticoreSearch}
-                                       {--elastic : Use ElasticSearch}
                                        {--releases : Populates the releases index}
                                        {--predb : Populates the predb index}
                                        {--parallel=8 : Number of parallel processes}
@@ -40,7 +35,7 @@ class NntmuxOffsetPopulate extends Command
      */
     protected $description = 'Populate search indexes using offset-based parallel processing for maximum performance';
 
-    private const SUPPORTED_ENGINES = ['manticore', 'elastic'];
+    private const SUPPORTED_ENGINES = ['manticore'];
 
     private const SUPPORTED_INDEXES = ['releases', 'predb'];
 
@@ -53,7 +48,7 @@ class NntmuxOffsetPopulate extends Command
         $index = $this->getSelectedIndex();
 
         if (! $engine || ! $index) {
-            $this->error('You must specify both an engine (--manticore or --elastic) and an index (--releases or --predb).');
+            $this->error('You must specify both an engine (--manticore) and an index (--releases or --predb).');
 
             return Command::FAILURE;
         }
@@ -260,51 +255,23 @@ class NntmuxOffsetPopulate extends Command
     {
         $this->info('Verifying index population...');
 
-        if ($engine === 'elastic') {
-            try {
-                $index = (string) config('search.drivers.elasticsearch.indexes.'.$index, $index);
-                // Wait a moment for ElasticSearch to refresh
-                sleep(2);
-
-                $stats = Elasticsearch::indices()->stats(['index' => $index]);
-                $actualCount = $stats['indices'][$index]['total']['docs']['count'] ?? 0;
-
-                $this->info('Expected: '.number_format($expectedTotal).' records');
-                $this->info('Actual: '.number_format($actualCount).' records');
-
-                if ($actualCount >= $expectedTotal * 0.95) { // Allow for 5% tolerance
-                    $this->info('✓ Index population successful!');
-                } else {
-                    $this->warn('⚠ Index population may be incomplete');
-
-                    return false;
-                }
-            } catch (Exception $e) {
-                $this->warn("Could not verify index population: {$e->getMessage()}");
+        $indexName = (string) config("search.drivers.manticore.indexes.{$index}", $index.'_rt');
+        try {
+            $actualCount = app(ManticoreSearchDriver::class)->countIndexDocuments($indexName);
+            $this->info('Expected: '.number_format($expectedTotal));
+            $this->info('Actual: '.number_format($actualCount));
+            if ($actualCount < $expectedTotal) {
+                $this->warn('Manticore index population is incomplete.');
 
                 return false;
             }
+        } catch (Exception $e) {
+            $this->warn("Could not verify Manticore population: {$e->getMessage()}");
 
-            return true;
-        } else {
-            $indexName = (string) config("search.drivers.manticore.indexes.{$index}", $index.'_rt');
-            try {
-                $actualCount = app(ManticoreSearchDriver::class)->countIndexDocuments($indexName);
-                $this->info('Expected: '.number_format($expectedTotal));
-                $this->info('Actual: '.number_format($actualCount));
-                if ($actualCount < $expectedTotal) {
-                    $this->warn('Manticore index population is incomplete.');
-
-                    return false;
-                }
-            } catch (Exception $e) {
-                $this->warn("Could not verify Manticore population: {$e->getMessage()}");
-
-                return false;
-            }
-
-            return true;
+            return false;
         }
+
+        return true;
     }
 
     /**
@@ -312,130 +279,9 @@ class NntmuxOffsetPopulate extends Command
      */
     private function clearIndex(string $engine, string $index): void
     {
-        if ($engine === 'manticore') {
-            $indexName = (string) config("search.drivers.manticore.indexes.{$index}", $index.'_rt');
-            Search::truncateIndex([$indexName]);
-            $this->info("Truncated ManticoreSearch index: {$indexName}");
-        } else {
-            $logicalIndex = $index;
-            $index = (string) config('search.drivers.elasticsearch.indexes.'.$logicalIndex, $logicalIndex);
-            // For ElasticSearch, just clear the data instead of recreating the index
-            try {
-                /** @var ElasticsearchClient $client */
-                $client = app('elasticsearch');
-                $exists = ElasticsearchResponseHelper::boolResponse($client, fn (ElasticsearchClient $elasticClient) => $elasticClient->indices()->exists(['index' => $index]));
-
-                if ($exists) {
-                    // Get current document count
-                    $stats = Elasticsearch::indices()->stats(['index' => $index]);
-                    $currentCount = $stats['indices'][$index]['total']['docs']['count'] ?? 0;
-
-                    if ($currentCount > 0) {
-                        $this->info("ElasticSearch index '{$index}' exists with {$currentCount} documents. Clearing data...");
-
-                        // Delete all documents but keep the index structure
-                        Elasticsearch::deleteByQuery([
-                            'index' => $index,
-                            'body' => [
-                                'query' => ['match_all' => (object) []],
-                            ],
-                        ]);
-
-                        // Force refresh to ensure deletions are visible
-                        Elasticsearch::indices()->refresh(['index' => $index]);
-                        $this->info("Cleared all documents from ElasticSearch index: {$index}");
-                    } else {
-                        $this->info("ElasticSearch index '{$index}' exists but is already empty");
-                    }
-                } else {
-                    $this->info("ElasticSearch index '{$index}' does not exist. Creating optimized index...");
-                    $this->createOptimizedElasticIndex($index, $logicalIndex);
-                }
-            } catch (Exception $e) {
-                $this->warn("Could not clear ElasticSearch index: {$e->getMessage()}");
-                $this->info('Attempting to recreate index...');
-
-                // Fallback: delete and recreate
-                try {
-                    Elasticsearch::indices()->delete(['index' => $index]);
-                } catch (Exception $e) {
-                    // Index might not exist, that's okay
-                }
-                $this->createOptimizedElasticIndex($index, $logicalIndex);
-            }
-        }
-    }
-
-    /**
-     * Create optimized ElasticSearch index
-     */
-    private function createOptimizedElasticIndex(string $indexName, string $logicalIndex): void
-    {
-        $settings = [
-            'index' => $indexName,
-            'body' => [
-                'settings' => [
-                    'number_of_shards' => 1,
-                    'number_of_replicas' => 0,
-                    'refresh_interval' => '30s',
-                    'translog' => [
-                        'durability' => 'async',
-                        'sync_interval' => '30s',
-                        'flush_threshold_size' => '1gb',
-                    ],
-                ],
-                'mappings' => $this->getIndexMappings($logicalIndex),
-            ],
-        ];
-
-        Elasticsearch::indices()->create($settings);
-        $this->info("Created optimized ElasticSearch index: {$indexName}");
-    }
-
-    /**
-     * Get index mappings
-     *
-     * @return array<string, mixed>
-     */
-    private function getIndexMappings(string $indexName): array
-    {
-        if ($indexName === 'releases') {
-            return [
-                'properties' => [
-                    'id' => ['type' => 'long'],
-                    'name' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'searchname' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'plainsearchname' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'fromname' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'categories_id' => ['type' => 'integer'],
-                    'filename' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'postdate' => ['type' => 'date'],
-                    'media_movie_name' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'media_file_name' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'media_unique_id' => ['type' => 'keyword'],
-                    'media_container_format' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'media_video_format' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'media_video_codec' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'media_video_width' => ['type' => 'integer'],
-                    'media_video_height' => ['type' => 'integer'],
-                    'media_audio_format' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'media_audio_channels' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'media_audio_language' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'media_subtitle_language' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'has_media_info' => ['type' => 'integer'],
-                ],
-            ];
-        } else {
-            return [
-                'properties' => [
-                    'id' => ['type' => 'long'],
-                    'title' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'filename' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'source' => ['type' => 'keyword'],
-                    ...PredbSearchDocument::elasticsearchExactMappings(),
-                ],
-            ];
-        }
+        $indexName = (string) config("search.drivers.manticore.indexes.{$index}", $index.'_rt');
+        Search::truncateIndex([$indexName]);
+        $this->info("Truncated ManticoreSearch index: {$indexName}");
     }
 
     /**

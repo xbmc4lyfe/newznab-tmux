@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Enums\SecondarySearchIndex;
-use App\Facades\Elasticsearch;
 use App\Facades\Search;
 use App\Models\BookInfo;
 use App\Models\ConsoleInfo;
@@ -18,12 +17,10 @@ use App\Models\SteamApp;
 use App\Models\Video;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use App\Services\Search\Support\ReleaseIndexProjection;
-use App\Support\PredbSearchDocument;
 use App\Support\ReleaseSearchIndexDocument;
 use App\Support\SecondaryIndexDocuments;
 use Exception;
 use Illuminate\Console\Command;
-use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\DB;
 
 class NntmuxPopulateSearchIndexes extends Command
@@ -35,7 +32,6 @@ class NntmuxPopulateSearchIndexes extends Command
      */
     protected $signature = 'nntmux:populate
                                        {--manticore : Use ManticoreSearch}
-                                       {--elastic : Use ElasticSearch}
                                        {--releases : Populates the releases index}
                                        {--predb : Populates the predb index}
                                        {--movies : Populates the movies index}
@@ -58,9 +54,9 @@ class NntmuxPopulateSearchIndexes extends Command
      *
      * @var string
      */
-    protected $description = 'Populate Manticore/Elasticsearch indexes (releases, predb, movies, tvshows, music, books, games, console, steam, anime)';
+    protected $description = 'Populate Manticore indexes (releases, predb, movies, tvshows, music, books, games, console, steam, anime)';
 
-    private const SUPPORTED_ENGINES = ['manticore', 'elastic'];
+    private const SUPPORTED_ENGINES = ['manticore'];
 
     private const SUPPORTED_INDEXES = [
         'releases', 'predb', 'movies', 'tvshows',
@@ -90,7 +86,7 @@ class NntmuxPopulateSearchIndexes extends Command
             $indexes = $this->getSelectedIndexes();
 
             if (! $engine || $indexes === []) {
-                $this->error('You must specify an engine (--manticore or --elastic) and at least one index (or --all).');
+                $this->error('You must specify an engine (--manticore) and at least one index (or --all).');
                 $this->info('Use --help to see all available options.');
 
                 return Command::FAILURE;
@@ -750,352 +746,6 @@ class NntmuxPopulateSearchIndexes extends Command
     }
 
     /**
-     * Populate ElasticSearch releases index
-     */
-    private function elasticReleases(): int
-    {
-        $total = Release::count();
-        if (! $total) {
-            $this->warn('Releases table is empty. Nothing to do.');
-
-            return Command::SUCCESS;
-        }
-
-        $query = ReleaseIndexProjection::query()->orderBy('r.id');
-
-        return $this->processElasticData(
-            'releases',
-            $total,
-            $query,
-            fn ($item): array => ReleaseSearchIndexDocument::normalize((array) $item)
-        );
-    }
-
-    /**
-     * Populate ElasticSearch predb index
-     */
-    private function elasticPredb(): int
-    {
-        $indexName = (string) config('search.drivers.elasticsearch.indexes.predb', 'predb');
-        Elasticsearch::indices()->putMapping([
-            'index' => $indexName,
-            'body' => ['properties' => PredbSearchDocument::elasticsearchExactMappings()],
-        ]);
-
-        $total = Predb::count();
-        if (! $total) {
-            $this->warn('PreDB table is empty. Nothing to do.');
-
-            return Command::SUCCESS;
-        }
-
-        $query = Predb::query()
-            ->select(['id', 'title', 'filename', 'source'])
-            ->orderBy('id');
-
-        return $this->processElasticData(
-            $indexName,
-            $total,
-            $query,
-            function ($item) {
-                return PredbSearchDocument::forElasticsearch($item->getAttributes());
-            }
-        );
-    }
-
-    private function elasticMusic(): int
-    {
-        $ix = (string) config('search.drivers.elasticsearch.indexes.music', 'music');
-        Search::truncateIndex([$ix]);
-        $total = MusicInfo::count();
-        if (! $total) {
-            $this->warn('MusicInfo table is empty. Nothing to do.');
-
-            return Command::SUCCESS;
-        }
-        $query = MusicInfo::query()->orderBy('id');
-
-        return $this->processSecondaryElasticChunks(
-            SecondarySearchIndex::Music,
-            $total,
-            $query,
-            fn (MusicInfo $m): array => array_merge(['id' => $m->id], SecondaryIndexDocuments::music($m))
-        );
-    }
-
-    private function elasticBooks(): int
-    {
-        $ix = (string) config('search.drivers.elasticsearch.indexes.books', 'books');
-        Search::truncateIndex([$ix]);
-        $total = BookInfo::count();
-        if (! $total) {
-            $this->warn('BookInfo table is empty. Nothing to do.');
-
-            return Command::SUCCESS;
-        }
-        $query = BookInfo::query()->orderBy('id');
-
-        return $this->processSecondaryElasticChunks(
-            SecondarySearchIndex::Books,
-            $total,
-            $query,
-            fn (BookInfo $b): array => array_merge(['id' => $b->id], SecondaryIndexDocuments::book($b))
-        );
-    }
-
-    private function elasticGames(): int
-    {
-        $ix = (string) config('search.drivers.elasticsearch.indexes.games', 'games');
-        Search::truncateIndex([$ix]);
-        $total = GamesInfo::count();
-        if (! $total) {
-            $this->warn('GamesInfo table is empty. Nothing to do.');
-
-            return Command::SUCCESS;
-        }
-        $query = GamesInfo::query()->orderBy('id');
-
-        return $this->processSecondaryElasticChunks(
-            SecondarySearchIndex::Games,
-            $total,
-            $query,
-            fn (GamesInfo $g): array => array_merge(['id' => $g->id], SecondaryIndexDocuments::games($g))
-        );
-    }
-
-    private function elasticConsole(): int
-    {
-        $ix = (string) config('search.drivers.elasticsearch.indexes.console', 'console');
-        Search::truncateIndex([$ix]);
-        $total = ConsoleInfo::count();
-        if (! $total) {
-            $this->warn('ConsoleInfo table is empty. Nothing to do.');
-
-            return Command::SUCCESS;
-        }
-        $query = ConsoleInfo::query()->orderBy('id');
-
-        return $this->processSecondaryElasticChunks(
-            SecondarySearchIndex::Console,
-            $total,
-            $query,
-            fn (ConsoleInfo $c): array => array_merge(['id' => $c->id], SecondaryIndexDocuments::console($c))
-        );
-    }
-
-    private function elasticSteam(): int
-    {
-        $ix = (string) config('search.drivers.elasticsearch.indexes.steam', 'steam');
-        Search::truncateIndex([$ix]);
-        $total = SteamApp::count();
-        if (! $total) {
-            $this->warn('Steam apps table is empty. Nothing to do.');
-
-            return Command::SUCCESS;
-        }
-        $query = SteamApp::query()->orderBy('id');
-
-        return $this->processSecondaryElasticChunks(
-            SecondarySearchIndex::Steam,
-            $total,
-            $query,
-            fn (SteamApp $s): array => array_merge(['id' => (int) $s->id], SecondaryIndexDocuments::steam($s))
-        );
-    }
-
-    private function elasticAnime(): int
-    {
-        $ix = (string) config('search.drivers.elasticsearch.indexes.anime', 'anime');
-        Search::truncateIndex([$ix]);
-        $total = (int) DB::table('anidb_titles')->count();
-        if (! $total) {
-            $this->warn('anidb_titles table is empty. Nothing to do.');
-
-            return Command::SUCCESS;
-        }
-        $query = DB::table('anidb_titles as t')
-            ->leftJoin('anidb_info as i', 't.anidbid', '=', 'i.anidbid')
-            ->orderBy('t.anidbid')
-            ->select([
-                't.anidbid', 't.type', 't.lang', 't.title',
-                'i.anilist_id', 'i.mal_id', 'i.media_type', 'i.status',
-            ]);
-
-        return $this->processSecondaryElasticChunks(
-            SecondarySearchIndex::Anime,
-            $total,
-            $query,
-            function ($row) {
-                $docId = SecondarySearchIndex::animeTitleDocumentId(
-                    (int) $row->anidbid,
-                    (string) $row->type,
-                    (string) $row->lang,
-                    (string) $row->title
-                );
-
-                return array_merge(['id' => $docId], [
-                    'title' => (string) $row->title,
-                    'anidbid' => (int) $row->anidbid,
-                    'anilist_id' => (int) ($row->anilist_id ?? 0),
-                    'mal_id' => (int) ($row->mal_id ?? 0),
-                    'lang' => (string) $row->lang,
-                    'title_type' => (string) $row->type,
-                    'media_type' => (string) ($row->media_type ?? ''),
-                    'status' => (string) ($row->status ?? ''),
-                ]);
-            }
-        );
-    }
-
-    /**
-     * @param  Builder|\Illuminate\Database\Query\Builder  $query
-     */
-    private function processSecondaryElasticChunks(SecondarySearchIndex $enum, int $total, mixed $query, callable $transformer): int
-    {
-        $chunkSize = $this->getChunkSize();
-        $batchSize = $this->getBatchSize();
-
-        $this->optimizeDatabase();
-        $this->setGroupConcatMaxLen();
-
-        $this->info(sprintf(
-            'Populating Elasticsearch secondary index %s with %s rows.',
-            $enum->value,
-            number_format($total)
-        ));
-
-        $bar = $this->output->createProgressBar($total);
-        $bar->setFormat('verbose');
-        $bar->start();
-
-        $processedCount = 0;
-        $errorCount = 0;
-        $batchData = [];
-
-        try {
-            $query->chunk($chunkSize, function ($items) use ($enum, $transformer, $bar, &$processedCount, &$errorCount, $batchSize, &$batchData) {
-                foreach ($items as $item) {
-                    try {
-                        $batchData[] = $transformer($item);
-                        $processedCount++;
-
-                        if (count($batchData) >= $batchSize) {
-                            Search::bulkInsertSecondary($enum, $batchData);
-                            $batchData = [];
-                        }
-                    } catch (Exception $e) {
-                        $errorCount++;
-                        if ($this->output->isVerbose()) {
-                            $this->error('Error processing secondary index row: '.$e->getMessage());
-                        }
-                    }
-                    $bar->advance();
-                }
-            });
-
-            if ($batchData !== []) {
-                Search::bulkInsertSecondary($enum, $batchData);
-            }
-
-            $bar->finish();
-            $this->newLine();
-
-            return $errorCount > 0 ? Command::FAILURE : Command::SUCCESS;
-        } catch (Exception $e) {
-            $bar->finish();
-            $this->newLine();
-            $this->error('Failed to populate secondary Elasticsearch index: '.$e->getMessage());
-
-            return Command::FAILURE;
-        } finally {
-            $this->restoreDatabase();
-        }
-    }
-
-    /**
-     * Process data for ElasticSearch with optimizations
-     */
-    private function processElasticData(string $indexName, int $total, mixed $query, callable $transformer): int
-    {
-        $chunkSize = $this->getChunkSize();
-        $batchSize = $this->getBatchSize();
-
-        $this->optimizeDatabase();
-        $this->setGroupConcatMaxLen();
-
-        $this->info(sprintf(
-            "Populating ElasticSearch index '%s' with %s rows using chunks of %s and batch size of %s.",
-            $indexName,
-            number_format($total),
-            number_format($chunkSize),
-            number_format($batchSize)
-        ));
-
-        $bar = $this->output->createProgressBar($total);
-        $bar->setFormat('verbose');
-        $bar->start();
-
-        $processedCount = 0;
-        $errorCount = 0;
-
-        try {
-            $query->chunk($chunkSize, function ($items) use ($indexName, $transformer, $bar, &$processedCount, &$errorCount, $batchSize) {
-                // Process in optimized batches for ElasticSearch
-                foreach ($items->chunk($batchSize) as $batch) {
-                    $data = ['body' => []];
-
-                    foreach ($batch as $item) {
-                        try {
-                            $transformedData = $transformer($item);
-
-                            $data['body'][] = [
-                                'index' => [
-                                    '_index' => $indexName,
-                                    '_id' => $item->id,
-                                ],
-                            ];
-                            $data['body'][] = $transformedData;
-
-                            $processedCount++;
-                        } catch (Exception $e) {
-                            $errorCount++;
-                            if ($this->output->isVerbose()) {
-                                $this->error("Error processing item {$item->id}: {$e->getMessage()}");
-                            }
-                        }
-
-                        $bar->advance();
-                    }
-
-                    if (! empty($data['body'])) {
-                        $this->processElasticBatch($data, $errorCount);
-                    }
-                }
-            });
-
-            $bar->finish();
-            $this->newLine();
-
-            if ($errorCount > 0) {
-                $this->warn("Completed with {$errorCount} errors out of {$processedCount} processed items.");
-            } else {
-                $this->info('ElasticSearch population completed successfully!');
-            }
-
-            return Command::SUCCESS;
-
-        } catch (Exception $e) {
-            $bar->finish();
-            $this->newLine();
-            $this->error("Failed to populate ElasticSearch: {$e->getMessage()}");
-
-            return Command::FAILURE;
-        } finally {
-            $this->restoreDatabase();
-        }
-    }
-
-    /**
      * Process search index batch with retry logic
      *
      * @param  array<string, mixed>  $data
@@ -1179,42 +829,6 @@ class NntmuxPopulateSearchIndexes extends Command
         while ($attempt < $retries) {
             try {
                 Search::bulkInsertTvShows($data);
-                break;
-            } catch (Exception $e) {
-                $attempt++;
-                if ($attempt >= $retries) {
-                    throw $e;
-                }
-                usleep(100000); // 100ms delay before retry
-            }
-        }
-    }
-
-    /**
-     * Process ElasticSearch batch with retry logic
-     *
-     * @param  array<string, mixed>  $data
-     */
-    private function processElasticBatch(array $data, int &$errorCount): void
-    {
-        $retries = 3;
-        $attempt = 0;
-
-        while ($attempt < $retries) {
-            try {
-                $response = Elasticsearch::bulk($data);
-
-                // Check for errors in bulk response
-                if (isset($response['errors']) && $response['errors']) {
-                    foreach ($response['items'] as $item) {
-                        if (isset($item['index']['error'])) {
-                            $errorCount++;
-                            if ($this->output->isVerbose()) {
-                                $this->error('ElasticSearch error: '.json_encode($item['index']['error']));
-                            }
-                        }
-                    }
-                }
                 break;
             } catch (Exception $e) {
                 $attempt++;

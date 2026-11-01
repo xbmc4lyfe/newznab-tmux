@@ -361,13 +361,4 @@ class ManticoreSearchQueryTest extends TestCase
             $driverSource
         );
     }
-
-    #[Test]
-    public function search_releases_filtered_uses_stable_id_tiebreak_sort_for_elasticsearch(): void
-    {
-        $driverSource = file_get_contents(__DIR__.'/../../app/Services/Search/Drivers/ElasticSearchDriver.php');
-
-        $this->assertIsString($driverSource);
-        $this->assertStringContainsString("['id' => ['order' => \$order]],", $driverSource);
-    }
 }

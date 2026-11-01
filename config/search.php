@@ -8,7 +8,7 @@ return [
     |--------------------------------------------------------------------------
     |
     | This option controls the default search driver that will be used to
-    | perform full-text search operations. Supported: "manticore", "elasticsearch"
+    | perform full-text search operations. Supported: "manticore"
     |
     */
     'default' => env('SEARCH_DRIVER', 'manticore'),
@@ -67,50 +67,6 @@ return [
                 'enabled' => env('MANTICORESEARCH_FUZZY_ENABLED', true),
                 'max_distance' => env('MANTICORESEARCH_FUZZY_MAX_DISTANCE', 2),
                 'layouts' => env('MANTICORESEARCH_FUZZY_LAYOUTS', 'us'),
-            ],
-        ],
-
-        'elasticsearch' => [
-            'driver' => 'elasticsearch',
-            'hosts' => [
-                [
-                    'host' => env('ELASTICSEARCH_HOST', 'localhost'),
-                    'port' => env('ELASTICSEARCH_PORT', 9200),
-                    'scheme' => env('ELASTICSEARCH_SCHEME', null),
-                    'user' => env('ELASTICSEARCH_USER', null),
-                    'pass' => env('ELASTICSEARCH_PASS', null),
-                ],
-            ],
-            'timeout' => env('ELASTICSEARCH_TIMEOUT', 10),
-            'connect_timeout' => env('ELASTICSEARCH_CONNECT_TIMEOUT', 5),
-            'retries' => env('ELASTICSEARCH_RETRIES', 2),
-            'indexes' => [
-                'releases' => 'releases',
-                'predb' => 'predb',
-                'movies' => 'movies',
-                'tvshows' => 'tvshows',
-                'music' => 'music',
-                'books' => 'books',
-                'games' => 'games',
-                'console' => 'console',
-                'steam' => 'steam',
-                'anime' => 'anime',
-            ],
-            'cache_minutes' => env('ELASTICSEARCH_CACHE_MINUTES', 5),
-            'autocomplete' => [
-                'enabled' => env('ELASTICSEARCH_AUTOCOMPLETE_ENABLED', true),
-                'min_length' => env('ELASTICSEARCH_AUTOCOMPLETE_MIN_LENGTH', 2),
-                'max_results' => env('ELASTICSEARCH_AUTOCOMPLETE_MAX_RESULTS', 10),
-                'cache_minutes' => env('ELASTICSEARCH_AUTOCOMPLETE_CACHE_MINUTES', 10),
-            ],
-            'suggest' => [
-                'enabled' => env('ELASTICSEARCH_SUGGEST_ENABLED', true),
-            ],
-            'fuzzy' => [
-                'enabled' => env('ELASTICSEARCH_FUZZY_ENABLED', true),
-                'fuzziness' => env('ELASTICSEARCH_FUZZY_FUZZINESS', 'AUTO'),
-                'prefix_length' => env('ELASTICSEARCH_FUZZY_PREFIX_LENGTH', 2),
-                'max_expansions' => env('ELASTICSEARCH_FUZZY_MAX_EXPANSIONS', 50),
             ],
         ],
 

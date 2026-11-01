@@ -4,11 +4,9 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
-use App\Console\Commands\NntmuxOffsetPopulate;
 use App\Enums\CollectionFileCheckStatus;
 use App\Enums\NzbImportStatus;
 use App\Events\ReleaseNameFixed;
-use App\Facades\Elasticsearch;
 use App\Facades\Search;
 use App\Models\Predb;
 use App\Services\CollectionCleanupService;
@@ -21,28 +19,17 @@ use App\Services\Predb\PredbIdentityRebuild;
 use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
 use App\Services\Releases\ReleaseDuplicateFinder;
-use App\Support\PredbSearchDocument;
-use Elastic\Elasticsearch\ClientBuilder;
-use GuzzleHttp\Psr7\Response as HttpResponse;
-use Illuminate\Console\OutputStyle;
 use Illuminate\Contracts\Console\Kernel;
-use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
-use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
-use Mockery;
 use PDO;
 use PHPUnit\Framework\Attributes\DataProvider;
-use Psr\Http\Client\ClientInterface;
-use Psr\Http\Message\RequestInterface;
 use ReflectionMethod;
 use ReflectionProperty;
 use RuntimeException;
-use Symfony\Component\Console\Input\ArrayInput;
-use Symfony\Component\Console\Output\BufferedOutput;
 use Tests\TestCase;
 
 final class PredbMatchingTest extends TestCase
@@ -312,104 +299,6 @@ final class PredbMatchingTest extends TestCase
         };
         $scraper->updatePre();
         self::assertSame(2, DB::table('predb')->value('nuked'));
-    }
-
-    public function test_elasticsearch_population_adds_mappings_and_writes_exact_fields_to_configured_index(): void
-    {
-        config(['search.drivers.elasticsearch.indexes.predb' => 'custom_pre']);
-        Elasticsearch::swap(Mockery::mock());
-        Elasticsearch::shouldReceive('indices->putMapping')->once()->with(['index' => 'custom_pre', 'body' => ['properties' => PredbSearchDocument::elasticsearchExactMappings()]])->andReturn([]);
-        Elasticsearch::shouldReceive('bulk')->once()->with(['body' => [['index' => ['_index' => 'custom_pre', '_id' => 7]], PredbSearchDocument::forElasticsearch($this->hit())]])->andReturn(['errors' => false]);
-        DB::partialMock()->shouldReceive('statement')->once()->with('SET SESSION group_concat_max_len = ?', [16384])->andReturnTrue();
-
-        $this->artisan('nntmux:populate', ['--elastic' => true, '--predb' => true, '--count' => 1, '--batch-size' => 1])->assertSuccessful();
-    }
-
-    public function test_elasticsearch_offset_worker_adds_mappings_and_writes_exact_fields_to_configured_index(): void
-    {
-        config(['search.drivers.elasticsearch.indexes.predb' => 'custom_pre']);
-        Elasticsearch::swap(Mockery::mock());
-        Elasticsearch::shouldReceive('indices->putMapping')->once()->with(['index' => 'custom_pre', 'body' => ['properties' => PredbSearchDocument::elasticsearchExactMappings()]])->andReturn([]);
-        Elasticsearch::shouldReceive('bulk')->once()->with(['body' => [['index' => ['_index' => 'custom_pre', '_id' => 7]], PredbSearchDocument::forElasticsearch($this->hit())]])->andReturn(['errors' => false]);
-        DB::partialMock()->shouldReceive('statement')->once()->with('SET SESSION group_concat_max_len = ?', [65535])->andReturnTrue();
-
-        $this->artisan('nntmux:offset-worker', ['--elastic' => true, '--predb' => true, '--limit' => 1, '--batch-size' => 1])->assertSuccessful();
-    }
-
-    public function test_fresh_elasticsearch_indexes_have_exact_keyword_mappings(): void
-    {
-        $created = [];
-        $this->mockElasticIndexCreation($created);
-
-        $this->artisan('nntmux:create-es-indexes', ['--create-missing' => true])->assertSuccessful();
-
-        $properties = $created['custom_pre']['mappings']['properties'];
-        self::assertSame(['type' => 'keyword'], $properties['title_exact']);
-        self::assertSame(['type' => 'keyword'], $properties['filename_exact']);
-    }
-
-    public function test_offset_population_creates_configured_predb_index_with_exact_mappings(): void
-    {
-        $created = [];
-        $this->mockElasticIndexCreation($created);
-        $command = new NntmuxOffsetPopulate;
-        $command->setLaravel($this->app);
-        $command->setOutput(new OutputStyle(new ArrayInput([]), new BufferedOutput));
-
-        (new ReflectionMethod($command, 'clearIndex'))->invoke($command, 'elastic', 'predb');
-
-        self::assertSame(['custom_pre'], array_keys($created));
-        self::assertSame(['type' => 'keyword'], $created['custom_pre']['mappings']['properties']['title_exact']);
-        self::assertSame(['type' => 'keyword'], $created['custom_pre']['mappings']['properties']['filename_exact']);
-    }
-
-    public function test_database_reset_recreates_configured_predb_index_with_exact_mappings(): void
-    {
-        foreach (['first_record', 'first_record_postdate', 'last_record', 'last_record_postdate', 'last_updated'] as $column) {
-            DB::statement('ALTER TABLE usenet_groups ADD '.$column.' TEXT');
-        }
-        $created = [];
-        $this->mockElasticIndexCreation($created);
-        $this->app->detectEnvironment(static fn (): string => 'local');
-        config(['search.default' => 'elasticsearch', 'nntmux_settings.path_to_nzbs' => '/unused']);
-        $verificationRoot = storage_path('framework/testing/reset-es-'.bin2hex(random_bytes(6)));
-        config(['release_verification.storage_path' => $verificationRoot]);
-        DB::swap($manager = Mockery::mock(DB::getFacadeRoot()));
-        $manager->shouldReceive('statement')->andReturnTrue();
-        File::partialMock()->shouldReceive('allFiles')->twice()->andReturn([]);
-        File::shouldReceive('delete')->once()->with([])->andReturnTrue();
-        File::shouldReceive('exists')->andReturnFalse();
-
-        try {
-            $this->artisan('nntmux:resetdb')
-                ->expectsConfirmation('This command removes all releases, nzb files, samples, previews , nfos, truncates all article tables and resets all groups. Are you sure you want reset the DB?', 'yes')
-                ->assertSuccessful();
-        } finally {
-            (new Filesystem)->deleteDirectory($verificationRoot);
-        }
-
-        self::assertArrayNotHasKey('predb', $created);
-        self::assertSame(['type' => 'keyword'], $created['custom_pre']['mappings']['properties']['title_exact']);
-        self::assertSame(['type' => 'keyword'], $created['custom_pre']['mappings']['properties']['filename_exact']);
-    }
-
-    /** @param array<string, array<string, mixed>> $created */
-    private function mockElasticIndexCreation(array &$created): void
-    {
-        config(['search.drivers.elasticsearch.indexes.predb' => 'custom_pre']);
-        $http = $this->createStub(ClientInterface::class);
-        $http->method('sendRequest')->willReturnCallback(static function (RequestInterface $request) use (&$created): HttpResponse {
-            if ($request->getMethod() === 'HEAD') {
-                return new HttpResponse(404, ['X-Elastic-Product' => 'Elasticsearch']);
-            }
-            self::assertSame('PUT', $request->getMethod());
-            $created[ltrim($request->getUri()->getPath(), '/')] = json_decode((string) $request->getBody(), true, flags: JSON_THROW_ON_ERROR);
-
-            return new HttpResponse(200, ['X-Elastic-Product' => 'Elasticsearch', 'Content-Type' => 'application/json'], '{"acknowledged":true}');
-        });
-        $client = ClientBuilder::create()->setHosts(['http://localhost:9200'])->setHttpClient($http)->build();
-        $this->app->instance('elasticsearch', $client);
-        Elasticsearch::swap($client);
     }
 
     /** @return array{id: int, title: string, filename: string, source: string} */
