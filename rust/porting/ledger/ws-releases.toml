@@ -4,7 +4,7 @@
 kind = "command"
 id = "multiprocessing:releases"
 source = "app/Console/Commands/ProcessReleasesMulti.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -76,13 +76,13 @@ status = "todo"
 kind = "command"
 id = "releases:prepare-candidates"
 source = "app/Console/Commands/PrepareReleaseCandidates.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "releases:process"
 source = "app/Console/Commands/ProcessReleasesCommand.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"

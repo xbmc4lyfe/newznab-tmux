@@ -1,0 +1,68 @@
+{% extends "layout.html" %}
+{% import "components.html" as c %}
+
+{% block content %}
+<div class="surface-panel rounded-xl shadow-sm">
+    {% call c::page_header(header_title, header_eyebrow, header_description, "fas fa-file-lines") %}{% endcall %}
+
+    {% if front %}
+        <!-- Front Page Content -->
+        <div class="px-6 py-8">
+            {% if !content.is_empty() %}
+                <div class="space-y-6">
+                    {% for item in content %}
+                        <article class="surface-panel rounded-lg shadow-sm p-6 border transition-shadow duration-200 hover:shadow-md">
+                            <div class="surface-prose">
+                                {% if !item.title.is_empty() %}
+                                    <h2 class="mb-4 text-3xl font-bold">{{ item.title }}</h2>
+                                {% endif %}
+
+                                {% if !item.body.is_empty() %}
+                                    <div class="leading-relaxed">
+                                        {{ item.body|safe }}
+                                    </div>
+                                {% endif %}
+
+                                {% if !item.metadescription.is_empty() %}
+                                    <p class="mt-4 text-gray-600 dark:text-gray-400 italic">{{ item.metadescription }}</p>
+                                {% endif %}
+                            </div>
+                        </article>
+                    {% endfor %}
+                </div>
+            {% else %}
+                {% call c::empty_state("fas fa-file-alt", "No Content Available", "There is no content to display at this time.") %}{% endcall %}
+            {% endif %}
+        </div>
+    {% else %}
+        <!-- Content List Page -->
+        <div class="px-6 pb-6">
+            {% if !content.is_empty() %}
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {% for item in content %}
+                        {% if true %}
+                            <div class="surface-panel-alt rounded-lg border p-6 transition hover:shadow-md">
+                                <h3 class="text-xl font-semibold text-gray-900 dark:text-gray-100 mb-3">
+                                    <a href="/content?page=content&amp;id={{ item.id }}" class="hover:text-primary-600 dark:hover:text-primary-400 transition">
+                                        {{ item.title_or_untitled() }}
+                                    </a>
+                                </h3>
+
+                                {% if !item.metadescription.is_empty() %}
+                                    <p class="text-gray-600 dark:text-gray-400 mb-4">{{ item.short_description() }}</p>
+                                {% endif %}
+
+                                <a href="/content?page=content&amp;id={{ item.id }}" class="inline-flex items-center text-primary-600 dark:text-primary-400 hover:text-primary-800 dark:hover:text-primary-300 font-medium">
+                                    Read More <i class="fas fa-arrow-right ml-2"></i>
+                                </a>
+                            </div>
+                        {% endif %}
+                    {% endfor %}
+                </div>
+            {% else %}
+                {% call c::empty_state("fas fa-file-alt", "No Content Available", "There is no content to display at this time.") %}{% endcall %}
+            {% endif %}
+        </div>
+    {% endif %}
+</div>
+{% endblock %}

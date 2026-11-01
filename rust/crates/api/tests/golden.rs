@@ -8,6 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::{Body, to_bytes};
+use axum::extract::State;
 use axum::http::Request;
 use base64::Engine;
 use nntmux_api::{Settings, router_with};
@@ -20,8 +21,13 @@ use serde_json::Value;
 use sqlx::{AssertSqlSafe, MySqlPool};
 use tower::ServiceExt;
 
-/// PHP streams JSON without a length; the two stacks may differ only here.
-const IGNORED_HEADERS: [&str; 1] = ["content-length"];
+/// The two stacks may differ here: PHP streams JSON without a length, the rest vary per request.
+const IGNORED_HEADERS: [&str; 4] = [
+    "content-length",
+    "expires",
+    "content-security-policy",
+    "set-cookie",
+];
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -60,7 +66,7 @@ async fn run_sql(pool: &MySqlPool, sql: &str) -> Result<()> {
 
 fn settings() -> Settings {
     let prefix: u64 = rand::rng().random();
-    Settings::new(
+    let mut settings = Settings::new(
         "NNTmux".to_owned(),
         "admin@example.test".to_owned(),
         500,
@@ -68,16 +74,28 @@ fn settings() -> Settings {
         8192,
         60,
         format!("t{prefix:016x}:"),
-    )
+    );
+    settings.abuse.asn_lookup = false;
+    settings.upload_folder =
+        Some(std::env::temp_dir().join(format!("nntmux-api-uploads-{prefix:016x}")));
+    settings
+}
+
+fn settings_with_cap() -> Settings {
+    let mut capped = settings();
+    capped.max_limit = 1;
+    capped
 }
 
 fn app(ctx: &Ctx) -> Router {
-    router_with(settings()).with_state(ctx.clone())
+    router_with(settings())
+        .layer(axum::Extension(ctx.clone()))
+        .with_state(ctx.clone())
 }
 
 /// Volatile response parts become placeholders on both sides before comparing.
 fn mask(value: &str) -> String {
-    let date = regex::Regex::new(r#"("api(?:Oldest|oldest)Time":|apioldesttime=)"[^"]*""#)
+    let date = regex::Regex::new(r#"("(?:apiOldestTime|grabOldestTime|apioldesttime|graboldesttime)":|(?:apioldesttime|graboldesttime)=)"[^"]+""#)
         .expect("static regex");
     date.replace_all(value, "$1\"<now>\"").into_owned()
 }
@@ -127,8 +145,10 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
         let mut builder = Request::builder()
             .method(case["method"].as_str().unwrap_or("GET"))
             .uri(case["path"].as_str().context("path")?)
-            .header("accept", "*/*")
-            .header("user-agent", "golden");
+            .header("accept", "*/*");
+        if case["headers"]["User-Agent"].is_null() {
+            builder = builder.header("user-agent", "golden");
+        }
         if case["headers"]["Host"].is_null() {
             builder = builder.header("host", "127.0.0.1:8765");
         }
@@ -183,7 +203,11 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
         if i64::from(status) != expect["status"].as_i64().unwrap_or_default() {
             problems.push(format!("status {status} != {}", expect["status"]));
         }
-        if case["ignore_body"] != Value::Bool(true) && mask(&got_body) != mask(&want_body) {
+        let status_only = case["status_only"] == Value::Bool(true);
+        if !status_only
+            && case["ignore_body"] != Value::Bool(true)
+            && mask(&got_body) != mask(&want_body)
+        {
             problems.push(first_difference(&mask(&want_body), &mask(&got_body)));
         }
         let got_cmp: Vec<_> = got_headers
@@ -194,7 +218,7 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
             .iter()
             .filter(|(name, _)| case["ignore_body"] != Value::Bool(true) || name != "content-type")
             .collect();
-        if got_cmp != want_cmp {
+        if !status_only && got_cmp != want_cmp {
             problems.push(format!("headers\n  want {want_cmp:?}\n  got  {got_cmp:?}"));
         }
         let audit: Vec<String> = sqlx::query_scalar(
@@ -210,6 +234,14 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
             .collect();
         if audit != want_audit {
             problems.push(format!("audit\n  want {want_audit:?}\n  got  {audit:?}"));
+        }
+        if let Some(statement) = case["after"].as_str() {
+            let rows: Vec<String> = sqlx::query_scalar(AssertSqlSafe(statement.to_owned()))
+                .fetch_all(&db.pool)
+                .await?;
+            if Value::from(rows.clone()) != expect["after"] {
+                problems.push(format!("after: want {} got {rows:?}", expect["after"]));
+            }
         }
         if !problems.is_empty() {
             failures.push(format!("{name}: {}", problems.join("; ")));
@@ -372,4 +404,282 @@ async fn access_update_runs_once_per_interval() -> Result<()> {
 #[tokio::test]
 async fn foundation_matches_php() -> Result<()> {
     replay("golden_foundation.json", &[]).await
+}
+
+#[tokio::test]
+async fn releases_match_php() -> Result<()> {
+    replay("golden_releases.json", &[]).await
+}
+
+#[tokio::test]
+async fn getnzb_matches_php() -> Result<()> {
+    // DELETE meets the web stack's CSRF check first here (419), before routing would say 405.
+    replay("golden_getnzb.json", &["getnzb_method"]).await
+}
+
+/// The archive holds each stored NZB under its release name, unmodified, skipping unknown GUIDs.
+#[tokio::test]
+async fn zip_download_contains_each_nzb() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    let cases: Vec<Value> =
+        serde_json::from_str(&fs::read_to_string(fixtures().join("golden_getnzb.json"))?)?;
+    let case = cases
+        .iter()
+        .find(|case| case["name"] == "getnzb_zip_ok")
+        .context("case")?;
+    for statement in case["setup"].as_array().into_iter().flatten() {
+        run_sql(&db.pool, statement.as_str().context("setup")?).await?;
+    }
+    let request = Request::builder()
+        .uri(case["path"].as_str().context("path")?)
+        .header("host", "x.test")
+        .body(Body::empty())?;
+    let response = app(&ctx).oneshot(request).await?;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "application/x-zip");
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec()))?;
+    assert_eq!(archive.len(), 1);
+    let mut file = archive.by_name("A.Movie.2024.1080p.BluRay-GRP.nzb")?;
+    let mut contents = String::new();
+    std::io::Read::read_to_string(&mut file, &mut contents)?;
+    assert!(contents.contains("file poster=\"a@b\""));
+    db.drop_database().await
+}
+
+/// `limit` is left out: PHP passes the raw string to an `int` parameter under strict types, so any
+/// numeric `limit` answers 500 there. Rust honors it, which `rss_limit_is_honored` covers.
+#[tokio::test]
+async fn rss_matches_php() -> Result<()> {
+    replay("golden_rss.json", &["rss_limit_param"]).await
+}
+
+/// PHP crashes on a numeric `limit`; the feed should simply honor it.
+#[tokio::test]
+async fn rss_limit_is_honored() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    // -1 reads as the minimum page, and a huge value stops at the cap.
+    for (uri, app, items) in [
+        ("/rss/full-feed?limit=2&api_token=tokenalice", app(&ctx), 2),
+        ("/rss/full-feed?limit=-1&api_token=tokenalice", app(&ctx), 1),
+        (
+            "/rss/full-feed?limit=1e30&api_token=tokenalice",
+            router_with(settings_with_cap())
+                .layer(axum::Extension(ctx.clone()))
+                .with_state(ctx.clone()),
+            1,
+        ),
+    ] {
+        let request = Request::builder()
+            .uri(uri)
+            .header("host", "x.test")
+            .body(Body::empty())?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), 200);
+        let body = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
+        assert_eq!(body.matches("<item>").count(), items, "{uri}");
+    }
+    db.drop_database().await
+}
+
+/// Same score PHP's detector gives: the UA pair (25) and IP correlation (20) alone stay under the
+/// default threshold of 50, and the indexer Referer (30) tips it over.
+#[tokio::test]
+async fn proxy_detection_scores_like_php() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    let mut settings = settings();
+    settings.abuse.detection_enabled = true;
+    let app = router_with(settings)
+        .layer(axum::Extension(ctx.clone()))
+        .with_state(ctx.clone());
+    let call = |uri: &str, referer: Option<&str>| {
+        let mut builder = Request::builder()
+            .uri(uri)
+            .header("host", "x.test")
+            .header("user-agent", "Prowlarr/1.0")
+            .header("x-forwarded-for", "203.0.113.9");
+        if let Some(referer) = referer {
+            builder = builder.header("referer", referer);
+        }
+        app.clone()
+            .oneshot(builder.body(Body::empty()).expect("static request"))
+    };
+    let response = call("/api/v1/api?t=caps&apikey=tokenalice", None).await?;
+    assert_eq!(response.status(), 200);
+    let download = "/api/v1/api?t=g&apikey=tokenalice&id=nope";
+    assert_eq!(call(download, None).await?.status(), 404);
+    let refused = call(download, Some("http://hydra.local:5076/")).await?;
+    assert_eq!(refused.status(), 403);
+    let body = to_bytes(refused.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(body.to_vec())?.contains("Proxying NZB downloads"));
+    db.drop_database().await
+}
+
+#[tokio::test]
+async fn uploads_match_php() -> Result<()> {
+    replay("golden_upload.json", &[]).await
+}
+
+/// Signs in through the site's session, then replays what Laravel answered a signed-in user.
+#[tokio::test]
+async fn signed_in_routes_match_php() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    let seed = fs::read_to_string(fixtures().join("seed.sql"))?;
+    let cases: Vec<Value> =
+        serde_json::from_str(&fs::read_to_string(fixtures().join("golden_web.json"))?)?;
+    for case in &cases {
+        run_sql(&db.pool, &seed).await?;
+        for statement in case["setup"].as_array().into_iter().flatten() {
+            run_sql(&db.pool, statement.as_str().context("setup")?).await?;
+        }
+        let mut cookie = String::new();
+        if let Some(user) = case["session_user"].as_i64() {
+            let login = axum::routing::get(
+                move |session: nntmux_webkit::Session, State(state): State<Ctx>| async move {
+                    let found = nntmux_webkit::User::find(&state.db, user)
+                        .await
+                        .expect("query")
+                        .expect("user");
+                    nntmux_webkit::auth::login(&session, &found);
+                    "in"
+                },
+            );
+            let signer = nntmux_webkit::stack(Router::<Ctx>::new().route("/in", login))
+                .layer(axum::Extension(ctx.clone()))
+                .with_state(ctx.clone());
+            let response = signer
+                .oneshot(Request::get("/in").body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), 200);
+            cookie = response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok()?.split(';').next().map(str::to_owned))
+                .collect::<Vec<_>>()
+                .join("; ");
+        }
+        let mut builder = Request::builder()
+            .uri(case["path"].as_str().context("path")?)
+            .header("host", "127.0.0.1:8765");
+        if !cookie.is_empty() {
+            builder = builder.header("cookie", cookie);
+        }
+        if let Some(accept) = case["headers"]["Accept"].as_str() {
+            builder = builder.header("accept", accept);
+        }
+        let response = app(&ctx).oneshot(builder.body(Body::empty())?).await?;
+        let name = case["name"].as_str().unwrap_or_default();
+        assert_eq!(
+            i64::from(response.status().as_u16()),
+            case["expect"]["status"].as_i64().unwrap_or_default(),
+            "{name}"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            case["expect"]["body"].as_str().unwrap_or_default(),
+            "{name}"
+        );
+    }
+    db.drop_database().await
+}
+
+/// The help pages render inside the layout, with this user's token in the examples.
+#[tokio::test]
+async fn help_pages_render_for_a_signed_in_user() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    let login = axum::routing::get(
+        |session: nntmux_webkit::Session, State(state): State<Ctx>| async move {
+            let found = nntmux_webkit::User::find(&state.db, 1)
+                .await
+                .expect("query")
+                .expect("user");
+            nntmux_webkit::auth::login(&session, &found);
+            "in"
+        },
+    );
+    let signer = nntmux_webkit::stack(Router::<Ctx>::new().route("/in", login))
+        .layer(axum::Extension(ctx.clone()))
+        .with_state(ctx.clone());
+    let response = signer
+        .oneshot(Request::get("/in").body(Body::empty())?)
+        .await?;
+    let cookie = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok()?.split(';').next().map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("; ");
+    for (path, marker, wanted) in [
+        ("/apihelp", "Api Help", "apikey=tokenalice"),
+        ("/apiv2help", "Api V2 Help", "tokenalice"),
+        ("/rsshelp", "Rss Info", "/rss/category?id=2040"),
+    ] {
+        let request = Request::get(path)
+            .header("host", "x.test")
+            .header("cookie", &cookie)
+            .body(Body::empty())?;
+        let response = app(&ctx).oneshot(request).await?;
+        assert_eq!(response.status(), 200, "{path}");
+        let html = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
+        assert!(html.contains(marker), "{path}");
+        assert!(html.contains(wanted), "{path}");
+        assert!(html.contains("http://x.test/"), "{path}");
+    }
+    let guest = app(&ctx)
+        .oneshot(Request::get("/apihelp").body(Body::empty())?)
+        .await?;
+    assert_eq!(guest.status(), 303);
+    db.drop_database().await
 }
