@@ -151,39 +151,12 @@ services:
             - '${FORWARD_MAILPIT_DASHBOARD_PORT:-8025}:8025'
         networks:
             - nntmux
-    elasticsearch:
-        image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
-        profiles:
-            - elasticsearch
-        environment:
-            - TZ=${APP_TIMEZONE}
-            - discovery.type=single-node
-            - xpack.security.enabled=false
-            - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-        ports:
-            - 9200:9200
-            - 9300:9300
-        volumes:
-            - elasticsearch:/usr/share/elasticsearch/data
-        networks:
-            - nntmux
-        healthcheck:
-            test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
-            interval: 15s
-            timeout: 5s
-            retries: 3
-            start_period: 30s
-        deploy:
-            resources:
-                limits:
-                    memory: 1g
 networks:
     nntmux:
         driver: bridge
 volumes:
     mariadb:
     redis:
-    elasticsearch:
     manticore:
     storage:
     resources:
