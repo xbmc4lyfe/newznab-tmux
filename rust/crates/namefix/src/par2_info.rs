@@ -68,7 +68,9 @@ pub struct Par2Info {
 }
 
 fn le32(bytes: &[u8]) -> u64 {
-    u64::from(u32::from_le_bytes(bytes[..4].try_into().expect("four bytes")))
+    u64::from(u32::from_le_bytes(
+        bytes[..4].try_into().expect("four bytes"),
+    ))
 }
 
 /// `setData` over bytes that start at (or contain) a packet marker.
@@ -315,7 +317,10 @@ fn summary_name(name: &[u8]) -> Vec<u8> {
 /// PHP `trim` with its default characters.
 pub fn php_trim(value: &[u8]) -> &[u8] {
     let is_space = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
-    let start = value.iter().position(|b| !is_space(b)).unwrap_or(value.len());
+    let start = value
+        .iter()
+        .position(|b| !is_space(b))
+        .unwrap_or(value.len());
     let end = value
         .iter()
         .rposition(|b| !is_space(b))

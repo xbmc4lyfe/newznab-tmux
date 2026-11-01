@@ -74,7 +74,10 @@ fn invalid(message: &'static str) -> anyhow::Error {
 }
 
 fn is_signature(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn validate_arguments(
@@ -272,10 +275,7 @@ fn read_identity(document: &Value) -> Result<ArticleIdentity> {
         other => Some(other.as_i64().context("part")?),
     };
     Ok(ArticleIdentity {
-        name_base64: object["name_base64"]
-            .as_str()
-            .context("name")?
-            .to_owned(),
+        name_base64: object["name_base64"].as_str().context("name")?.to_owned(),
         size: object["size"].as_i64().context("size")?,
         part,
     })
@@ -289,7 +289,9 @@ async fn assert_writable(
     guard: &dyn Guard,
 ) -> Result<()> {
     if !guard.holds().await || !matches_snapshot(conn, snapshot).await? {
-        return Err(aborted("PAR2 checkpoint ownership or release identity changed."));
+        return Err(aborted(
+            "PAR2 checkpoint ownership or release identity changed.",
+        ));
     }
     Ok(())
 }

@@ -146,12 +146,12 @@ pattern!(
     r#"(?i)\.(?:rar|r[0-9]{2,4}|[0-9]{3}|7z|zip|mkv|mp4|avi|m2ts|ts|iso|nfo|sfv|srr|srs|jpg|png|mp3|flac)(?:["\s]|\z)"#
 );
 pattern!(LEGACY, r#"(?i)\.(par["\s]|[0-9]{2,3}").+\(1/1\)"#);
-pattern!(
-    PARTS_PRIMARY,
-    r"[(\[]?([0-9]+)[/)\]]([0-9]+)[)\]]?\n?\z"
-);
+pattern!(PARTS_PRIMARY, r"[(\[]?([0-9]+)[/)\]]([0-9]+)[)\]]?\n?\z");
 pattern!(PARTS_FALLBACK, r"([0-9]+)\)\n?\z");
-pattern!(FAMILY_PREFIX, r"^[ \t\n\r\x0B\x0C]*\[[0-9]+/[0-9]+\][ \t\n\r\x0B\x0C]*");
+pattern!(
+    FAMILY_PREFIX,
+    r"^[ \t\n\r\x0B\x0C]*\[[0-9]+/[0-9]+\][ \t\n\r\x0B\x0C]*"
+);
 pattern!(FAMILY_QUOTED, r#"(?i)"([^"]+\.par2)""#);
 pattern!(
     FAMILY_BARE,
@@ -210,8 +210,7 @@ pub fn parse_nzb(xml: &[u8]) -> Option<Vec<NzbFile>> {
                 if depth == 2 && name == "file" {
                     current = Some((
                         NzbFile {
-                            subject: attribute(&element, "subject")
-                                .unwrap_or_default(),
+                            subject: attribute(&element, "subject").unwrap_or_default(),
                             segments: Vec::new(),
                             has_segments: false,
                         },
@@ -224,11 +223,9 @@ pub fn parse_nzb(xml: &[u8]) -> Option<Vec<NzbFile>> {
                         *level = 3;
                     } else if depth == 4 && *level == 3 && name == "segment" {
                         segment_text = Some(RawSegment {
-                            number: attribute(&element, "number")
-                                .unwrap_or_default(),
+                            number: attribute(&element, "number").unwrap_or_default(),
                             id: String::new(),
-                            bytes: attribute(&element, "bytes")
-                                .unwrap_or_default(),
+                            bytes: attribute(&element, "bytes").unwrap_or_default(),
                         });
                     }
                 }
@@ -238,8 +235,7 @@ pub fn parse_nzb(xml: &[u8]) -> Option<Vec<NzbFile>> {
                 let name = local(&element);
                 if depth == 1 && name == "file" {
                     files.push(NzbFile {
-                        subject: attribute(&element, "subject")
-                            .unwrap_or_default(),
+                        subject: attribute(&element, "subject").unwrap_or_default(),
                         segments: Vec::new(),
                         has_segments: false,
                     });
@@ -248,11 +244,9 @@ pub fn parse_nzb(xml: &[u8]) -> Option<Vec<NzbFile>> {
                         *seen = true;
                     } else if depth == 3 && *level == 3 && name == "segment" {
                         file.segments.push(RawSegment {
-                            number: attribute(&element, "number")
-                                .unwrap_or_default(),
+                            number: attribute(&element, "number").unwrap_or_default(),
                             id: String::new(),
-                            bytes: attribute(&element, "bytes")
-                                .unwrap_or_default(),
+                            bytes: attribute(&element, "bytes").unwrap_or_default(),
                         });
                     }
                 }
@@ -274,11 +268,7 @@ pub fn parse_nzb(xml: &[u8]) -> Option<Vec<NzbFile>> {
                     let name: &str = reference.as_ref();
                     if let Some(resolved) = resolve_predefined_entity(name) {
                         segment.id.push_str(resolved);
-                    } else if let Some(c) = reference
-                        .resolve_char_ref()
-                        .ok()
-                        .flatten()
-                    {
+                    } else if let Some(c) = reference.resolve_char_ref().ok().flatten() {
                         segment.id.push(c);
                     }
                 }

@@ -14,12 +14,40 @@ pub trait Guard: Send + Sync {
     async fn holds(&self) -> bool;
 }
 
+/// A guard that also covers article reads, which can't await: the NNTP client asks a plain
+/// function whether to keep reading, so a background heartbeat keeps the flag it answers from.
+#[async_trait]
+pub trait Claim: Guard {
+    /// Cheap and synchronous: false once the claim was lost while an article was being read.
+    fn read_ok(&self) -> bool;
+    /// Refreshes the claim periodically while an article is read. Returns only if the claim
+    /// is lost; the caller races it against the read.
+    async fn keep_alive(&self);
+    /// Asked once an article arrived: whether the claim still holds.
+    async fn received(&self) -> bool;
+}
+
 /// A claim that is never lost, for callers with nothing to lose.
 pub struct Unguarded;
 
 #[async_trait]
 impl Guard for Unguarded {
     async fn holds(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait]
+impl Claim for Unguarded {
+    fn read_ok(&self) -> bool {
+        true
+    }
+
+    async fn keep_alive(&self) {
+        std::future::pending::<()>().await;
+    }
+
+    async fn received(&self) -> bool {
         true
     }
 }
@@ -40,6 +68,21 @@ impl Switch {
 #[async_trait]
 impl Guard for Switch {
     async fn holds(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Claim for Switch {
+    fn read_ok(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    async fn keep_alive(&self) {
+        std::future::pending::<()>().await;
+    }
+
+    async fn received(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
 }

@@ -30,8 +30,16 @@ fn candidates_match_php() {
             let label = format!("{name}: {}", got.subject);
             assert_eq!(got.subject, want["subject"].as_str().unwrap(), "{label}");
             assert_eq!(got.explicit, want["explicit"].as_bool().unwrap(), "{label}");
-            assert_eq!(got.class.name(), want["classification"].as_str().unwrap(), "{label}");
-            assert_eq!(got.signature(), want["signature"].as_str().unwrap(), "{label} signature");
+            assert_eq!(
+                got.class.name(),
+                want["classification"].as_str().unwrap(),
+                "{label}"
+            );
+            assert_eq!(
+                got.signature(),
+                want["signature"].as_str().unwrap(),
+                "{label} signature"
+            );
             assert_eq!(
                 family_key(&got.subject).as_deref(),
                 want["family"].as_str(),
@@ -45,7 +53,11 @@ fn candidates_match_php() {
                 assert_eq!(segment.bytes, want["bytes"].as_i64().unwrap(), "{label}");
             }
         }
-        assert_eq!(planned.manifest.encode(), case["manifest"].as_str().unwrap(), "{name} manifest");
+        assert_eq!(
+            planned.manifest.encode(),
+            case["manifest"].as_str().unwrap(),
+            "{name} manifest"
+        );
         assert_eq!(
             planned.non_explicit_bytes,
             case["non_explicit_bytes"].as_i64().unwrap(),
@@ -68,7 +80,15 @@ fn candidates_match_php() {
 fn subjects_match_php() {
     for case in fixture()["subjects"].as_array().unwrap() {
         let subject = case["subject"].as_str().unwrap();
-        assert_eq!(extract_parts_total(subject), case["parts"].as_i64().unwrap(), "{subject:?}");
-        assert_eq!(family_key(subject).as_deref(), case["family"].as_str(), "{subject:?}");
+        assert_eq!(
+            extract_parts_total(subject),
+            case["parts"].as_i64().unwrap(),
+            "{subject:?}"
+        );
+        assert_eq!(
+            family_key(subject).as_deref(),
+            case["family"].as_str(),
+            "{subject:?}"
+        );
     }
 }

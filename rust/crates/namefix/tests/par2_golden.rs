@@ -120,15 +120,17 @@ fn files_match(name: &str, acc: &PacketAccumulator, scenario: &Value) {
         assert_eq!(files.len(), wanted.len(), "{name} file count");
         for (file, want) in files.iter().zip(wanted) {
             let text = |key: &str| want[key].as_str().map(str::to_owned);
-            let bytes = want["name"]
-                .as_str()
-                .map(|n| STANDARD.decode(n).unwrap());
+            let bytes = want["name"].as_str().map(|n| STANDARD.decode(n).unwrap());
             assert_eq!(file.name, bytes, "{name} name");
             assert_eq!(file.size_decimal, text("size_decimal"), "{name} decimal");
             assert_eq!(file.hash, text("hash"), "{name} hash");
             assert_eq!(file.hash_16k, text("hash_16K"), "{name} hash16k");
             if !want["size_float"].as_bool().unwrap() {
-                assert_eq!(file.size.map(|s| s.to_string()), text("size"), "{name} size");
+                assert_eq!(
+                    file.size.map(|s| s.to_string()),
+                    text("size"),
+                    "{name} size"
+                );
             }
             assert_eq!(
                 file.blocks as u64,
@@ -194,7 +196,9 @@ fn size_helpers_match_php() {
         assert_eq!(actual.as_deref(), case["result"].as_str(), "{input}");
     }
     for case in fixture["little_endian"].as_array().unwrap() {
-        let bytes = STANDARD.decode(case["bytes_b64"].as_str().unwrap()).unwrap();
+        let bytes = STANDARD
+            .decode(case["bytes_b64"].as_str().unwrap())
+            .unwrap();
         assert_eq!(
             nntmux_namefix::par2_accumulator::little_endian_size(&bytes).to_string(),
             case["result"].as_str().unwrap()

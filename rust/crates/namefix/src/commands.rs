@@ -7,15 +7,18 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use nntmux_categorize::Categorizer;
 use nntmux_categorize::names::unwrap_nzbsplit;
+use nntmux_nntp::{NntpConfig, NntpPool};
 use nntmux_runtime::{Ctx, RoleArgs, Shutdown, run_slots};
 use nntmux_search::SearchClient;
 use redis::AsyncCommands;
 
+use crate::fixnames_chain;
+use crate::par2_check::{Par2Checker, Par2Settings};
+use crate::par2_nntp::NntpArticles;
+use crate::par2_probe::{BatchProbe, fix_names_with_par2};
 use crate::queries::{self, FixNamesConfig, PredbTitle};
 use crate::release::Release;
-use crate::service::{
-    CandidatePage, CandidateSearch, IncompleteMatch, NameFixer, Par2Outcome, Par2Probe,
-};
+use crate::service::{CandidatePage, CandidateSearch, IncompleteMatch, NameFixer};
 use crate::update::{FixerCleaner, ReleaseSearch, ReleaseUpdater};
 
 const LEFT_GUIDS: [&str; 16] = [
@@ -83,6 +86,10 @@ struct Backends {
     search: Arc<dyn ReleaseSearch>,
     candidates: Arc<dyn CandidateSearch>,
     cleaner: FixerCleaner,
+    /// Sessions for PAR2 reads, shared by every pass so they are reused. Nothing connects
+    /// until a release needs a PAR2 file.
+    nntp: NntpPool,
+    use_alternate: bool,
 }
 
 fn backends(ctx: &Ctx) -> Result<Backends> {
@@ -90,10 +97,14 @@ fn backends(ctx: &Ctx) -> Result<Backends> {
         client: SearchClient::from_ctx(ctx)?,
         db: ctx.db.clone(),
     });
+    let nntp = NntpConfig::from_env();
+    let use_alternate = nntp.use_alternate;
     Ok(Backends {
         search: client.clone(),
         candidates: client,
         cleaner: nntmux_predb::filename::fixer_cleaner,
+        nntp: NntpPool::new(nntp),
+        use_alternate,
     })
 }
 
@@ -129,16 +140,6 @@ impl CandidateSearch for SearchBackend {
     }
 }
 
-/// Leaves `proc_par2` pending, for the PAR2 sweep to reach.
-struct DeferPar2;
-
-#[async_trait::async_trait]
-impl Par2Probe for DeferPar2 {
-    async fn probe(&mut self, _release: &Release) -> Result<Par2Outcome> {
-        Ok(Par2Outcome::Deferred)
-    }
-}
-
 async fn fixer(ctx: &Ctx, config: FixNamesConfig, backends: &Backends) -> Result<NameFixer> {
     let categorizer = Categorizer::load(&ctx.db).await?;
     let updater = ReleaseUpdater::new(
@@ -148,6 +149,56 @@ async fn fixer(ctx: &Ctx, config: FixNamesConfig, backends: &Backends) -> Result
         backends.cleaner,
     );
     Ok(NameFixer::new(updater, config))
+}
+
+/// A PAR2 checker over the shared NNTP pool: its own name fixer, for the renames it applies.
+async fn par2_checker(
+    ctx: &Ctx,
+    config: FixNamesConfig,
+    backends: &Backends,
+) -> Result<Par2Checker> {
+    Ok(Par2Checker {
+        fixer: fixer(ctx, config.clone(), backends).await?,
+        search: backends.search.clone(),
+        redis: ctx.redis.clone(),
+        articles: Box::new(NntpArticles::with_pool(
+            backends.nntp.clone(),
+            backends.use_alternate,
+        )),
+        config,
+        settings: Par2Settings::from_env(),
+    })
+}
+
+/// One numbered level: `releases:fix-names <method>`.
+#[allow(clippy::too_many_arguments)]
+async fn run_level(
+    ctx: &Ctx,
+    backends: &Backends,
+    method: u32,
+    update: bool,
+    categories: i32,
+    set_status: bool,
+    limit: Option<usize>,
+    show: bool,
+) -> Result<()> {
+    let mut config = FixNamesConfig::from_env();
+    if let Some(limit) = limit {
+        config.batch_limit = Some(limit.max(1));
+    }
+    if matches!(method, 7 | 8) {
+        // The session is opened up front, so an unreachable provider fails the command.
+        let mut checker = par2_checker(ctx, config, backends).await?;
+        checker
+            .articles
+            .connect()
+            .await
+            .map_err(|error| anyhow::anyhow!("Unable to connect to usenet. Error: {error}"))?;
+        let time = if method % 2 == 1 { 1 } else { 2 };
+        return fix_names_with_par2(&mut checker, time, update, categories, set_status).await;
+    }
+    let mut fixer = fixer(ctx, config, backends).await?;
+    run_method(&mut fixer, method, update, categories, set_status, show).await
 }
 
 pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
@@ -161,15 +212,22 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
             limit,
             show,
         } => {
-            let mut config = FixNamesConfig::from_env();
-            config.batch_limit = Some(limit.max(1));
             let categories = match category.as_str() {
                 "all" => 2,
                 "predb_id" => 3,
                 _ => 1,
             };
-            let mut fixer = fixer(&ctx, config, &backends).await?;
-            run_method(&mut fixer, method, update, categories, set_status, show).await
+            run_level(
+                &ctx,
+                &backends,
+                method,
+                update,
+                categories,
+                set_status,
+                Some(limit),
+                show,
+            )
+            .await
         }
         Command::FixNamesGroup {
             kind,
@@ -182,14 +240,8 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 let Some(guid) = guid_char else {
                     bail!("--guid-char is required for standard type");
                 };
-                let (checked, fixed) = standard_pass(
-                    &ctx,
-                    &guid,
-                    limit.max(1) as usize,
-                    &backends,
-                    &mut DeferPar2,
-                )
-                .await?;
+                let (checked, fixed) =
+                    standard_pass(&ctx, &guid, limit.max(1) as usize, &backends).await?;
                 if checked == 0 {
                     println!("No releases to process");
                 } else {
@@ -251,7 +303,7 @@ async fn run_method(
                 .fix_names_with_files(time, write, categories, status, show)
                 .await
         }
-        7 | 8 => bail!("PAR2 renaming isn't ported yet"),
+        7 | 8 => bail!("PAR2 renaming needs a PAR2 checker, which `run_level` builds"),
         9 | 10 => {
             fixer
                 .fix_names_with_media(time, write, categories, status, show)
@@ -348,12 +400,14 @@ async fn standard_pass(
     left_guid: &str,
     limit: usize,
     backends: &Backends,
-    par2: &mut dyn Par2Probe,
 ) -> Result<(usize, u64)> {
     let config = FixNamesConfig::from_env();
     let releases = reserve_standard_batch(ctx, &config, left_guid, limit).await?;
-    let mut fixer = fixer(ctx, config, backends).await?;
-    fixer.process_standard_batch(releases, false, par2).await
+    let mut fixer = fixer(ctx, config.clone(), backends).await?;
+    let mut par2 = BatchProbe::new(par2_checker(ctx, config, backends).await?);
+    fixer
+        .process_standard_batch(releases, false, &mut par2)
+        .await
 }
 
 /// A bounded id window. Unfinished titles stay eligible and come back when the window wraps,
@@ -499,7 +553,7 @@ async fn fixrelnames(ctx: &Ctx, kind: &str, backends: Backends) -> Result<()> {
             let worker = (chunk_index * threads + index + 1) as i64;
             tasks.spawn(async move {
                 if kind == "standard" {
-                    standard_pass(&ctx, &guid, per_run as usize, &backends, &mut DeferPar2).await.map(|_| ())
+                    standard_pass(&ctx, &guid, per_run as usize, &backends).await.map(|_| ())
                 } else {
                     let (_, incomplete) = predbft_pass(&ctx, worker, workers, per_run, &backends).await?;
                     if incomplete > 0 {
@@ -638,9 +692,55 @@ fn slot_partitions(total: usize, slot: usize, slots: usize) -> impl Iterator<Ite
     (0..total).filter(move |partition| partition % slots.max(1) == slot)
 }
 
-/// The `fixnames` role: standard and PreDB fulltext passes across every GUID partition and PreDB
-/// shard. A cycle only counts as work if it moved something, because releases with PAR2 pending
-/// stay candidates and would otherwise be read again at once.
+/// One cycle of what the tmux monitor's fix-names pane ran: the numbered levels, when the
+/// pane would run them. Returns whether it ran.
+async fn run_chain(ctx: &Ctx, backends: &Backends) -> Result<bool> {
+    let config = FixNamesConfig::from_env();
+    let Some(claimed) =
+        fixnames_chain::claim(ctx, &config, &Par2Settings::from_env().key_prefix).await?
+    else {
+        return Ok(false);
+    };
+    let categories = match config.category.as_str() {
+        "all" => 2,
+        "predb_id" => 3,
+        _ => 1,
+    };
+    for level in claimed.levels.clone() {
+        // The pane checked for a drain between commands.
+        if ctx.paused().await? {
+            break;
+        }
+        if let Err(error) = run_level(
+            ctx,
+            backends,
+            level,
+            true,
+            categories,
+            true,
+            config.batch_limit,
+            true,
+        )
+        .await
+        {
+            tracing::warn!(
+                level,
+                error = format!("{error:#}"),
+                "fix-names level failed"
+            );
+        }
+    }
+    claimed.finish().await;
+    Ok(true)
+}
+
+/// The `fixnames` role: what the tmux monitor ran, plus the PreDB fulltext passes. The first
+/// slot runs the numbered fix-names levels (`fixNamesCommands`) whenever the pane would, which
+/// the `fix_names_enabled` setting and a `fix_timer` rest between cycles pace; the others
+/// share the PreDB shards. A cycle only counts as work if it moved something, so an idle role
+/// polls at its idle interval rather than spinning. The standard GUID-partition pass has no
+/// PHP schedule, so it stays a command (`releases:fix-names-group standard`) and is not run
+/// here.
 pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
     let backends = Arc::new(backends(&ctx)?);
     let slots = args.concurrency;
@@ -650,22 +750,19 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
             if ctx.paused().await? {
                 return Ok(false);
             }
-            let (per_run, threads) = post_processing_settings(&ctx).await?;
-            if per_run <= 0 {
-                return Ok(false);
-            }
             let mut moved = false;
-            for partition in slot_partitions(LEFT_GUIDS.len(), slot, slots) {
-                let guid = LEFT_GUIDS[partition];
-                let (_, fixed) =
-                    standard_pass(&ctx, guid, per_run as usize, &backends, &mut DeferPar2).await?;
-                moved |= fixed > 0;
+            if slot == 0 {
+                moved |= run_chain(&ctx, &backends).await?;
             }
-            let workers = threads.clamp(1, 16);
-            for shard in slot_partitions(workers as usize, slot, slots) {
-                let (processed, incomplete) =
-                    predbft_pass(&ctx, shard as i64 + 1, workers, per_run, &backends).await?;
-                moved |= processed > incomplete;
+            let predbft = crate::par2_check::env_bool("TMUX_FIX_NAMES_PREDBFT").unwrap_or(true);
+            let (per_run, threads) = post_processing_settings(&ctx).await?;
+            if predbft && per_run > 0 {
+                let workers = threads.clamp(1, 16);
+                for shard in slot_partitions(workers as usize, slot, slots) {
+                    let (processed, incomplete) =
+                        predbft_pass(&ctx, shard as i64 + 1, workers, per_run, &backends).await?;
+                    moved |= processed > incomplete;
+                }
             }
             Ok(moved)
         }

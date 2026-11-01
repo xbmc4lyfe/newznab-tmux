@@ -58,7 +58,9 @@ impl EvidenceSnapshot {
             && current.searchname == self.searchname
             && current.predb_id == self.predb_id
             && current.isrenamed == self.isrenamed
-            && self.proc_hash16k.is_none_or(|value| current.proc_hash16k == value)
+            && self
+                .proc_hash16k
+                .is_none_or(|value| current.proc_hash16k == value)
     }
 }
 
@@ -398,7 +400,9 @@ async fn remember_descriptors_locked(
             match rows.iter_mut().find(|(known, _)| *known == checksum) {
                 Some((_, kept)) => {
                     if descriptor_row(kept) != descriptor_row(descriptor) {
-                        anyhow::bail!("PAR2 descriptor checksum identity contains different evidence.");
+                        anyhow::bail!(
+                            "PAR2 descriptor checksum identity contains different evidence."
+                        );
                     }
                     *kept = descriptor;
                 }
@@ -493,7 +497,10 @@ pub async fn remember_hash_in_tx(
     guard: Option<&dyn Guard>,
 ) -> Result<bool> {
     let mut tx = db.begin().await?;
-    let done = remember_hash(&mut tx, release_id, full_md5, hash16k, size, expected, guard).await?;
+    let done = remember_hash(
+        &mut tx, release_id, full_md5, hash16k, size, expected, guard,
+    )
+    .await?;
     if done {
         tx.commit().await?;
     }

@@ -102,7 +102,7 @@ fn packet_length(header: &[u8]) -> Result<u64> {
         ));
     }
     let length = high * 0x1_0000_0000 + low;
-    if length < 64 || length % 4 != 0 {
+    if length < 64 || !length.is_multiple_of(4) {
         return Err(AccumulatorError::Invalid("Invalid PAR2 packet length"));
     }
     Ok(length)
@@ -181,7 +181,10 @@ impl PacketAccumulator {
         let mut result = Self::new(max_state_bytes)?;
         let strings: Vec<&str> = packets
             .iter()
-            .map(|p| p.as_str().ok_or(AccumulatorError::Invalid("Invalid PAR2 packet inventory")))
+            .map(|p| {
+                p.as_str()
+                    .ok_or(AccumulatorError::Invalid("Invalid PAR2 packet inventory"))
+            })
             .collect::<Result<_>>()?;
         let canonical = State {
             packets: strings.iter().map(|s| (*s).to_owned()).collect(),
@@ -199,7 +202,9 @@ impl PacketAccumulator {
         result.append(&decode(tail)?)?;
         result.skip_remaining = skip as u64;
         if result.export_state() != canonical {
-            return Err(AccumulatorError::Invalid("Noncanonical PAR2 accumulator state"));
+            return Err(AccumulatorError::Invalid(
+                "Noncanonical PAR2 accumulator state",
+            ));
         }
         result.assert_state_limit()?;
         Ok(result)
@@ -401,11 +406,13 @@ impl PacketAccumulator {
     fn retain(&mut self, packet: Vec<u8>) -> Result<()> {
         let kind: [u8; 16] = packet[48..64].try_into().expect("sixteen");
         let body = packet.len() - 64;
-        let malformed = (kind == *info::MAIN && (body < 12 || (body - 12) % 16 != 0))
+        let malformed = (kind == *info::MAIN && (body < 12 || !(body - 12).is_multiple_of(16)))
             || (kind == *info::FILEDESC && body < 56)
-            || (kind == *info::IFSC && (body < 16 || (body - 16) % 20 != 0));
+            || (kind == *info::IFSC && (body < 16 || !(body - 16).is_multiple_of(20)));
         if malformed {
-            return Err(AccumulatorError::Invalid("Malformed PAR2 metadata packet body"));
+            return Err(AccumulatorError::Invalid(
+                "Malformed PAR2 metadata packet body",
+            ));
         }
         if kind == *info::MAIN {
             let count = u64::from(u32::from_le_bytes(packet[72..76].try_into().expect("four")));
