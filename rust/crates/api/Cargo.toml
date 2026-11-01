@@ -36,6 +36,7 @@ unicode-normalization = "0.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 base64.workspace = true
 tempfile.workspace = true
 nntmux-testkit.workspace = true

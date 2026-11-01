@@ -43,4 +43,11 @@ The goal is zero PHP, with every entry point in Rust: all routes, commands, jobs
 
 Order: `ws-formats` first if threads must be staggered, since `ws-ingest`, `ws-releases` and `ws-postprocess` call it. They can start in parallel against the agreed API, which `ws-formats` should publish early as a first small PR. `ws-site` publishes `webkit` early for `ws-admin`. Everything else is independent, because it meets at the database.
 
+## Cutover requirements
+
+Merging `rust-native` into `master` is the last step, and `ws-deploy` owns getting it ready:
+
+- Keep GitHub Pages deploying. This branch deleted `.github/workflows/benchmark-pages.yml`, which also publishes the rewrite's progress figure. Restore it and its scripts from `master`, including `scripts/rewrite-metrics/`, and remove any PHP steps it no longer needs.
+- The progress metric reads the ledger, so keep two conventions stable: entries whose `source` is a `.rs` file don't count toward the headline, and `rust/porting/ledger/dropped.toml` holds vendor routes and is excluded. Record other dropped entries in the owning workstream's file, not there.
+
 `rust/indexer` is a separate SQLite and Tantivy experiment. Leave it alone unless the owner says otherwise.
