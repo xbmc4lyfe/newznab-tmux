@@ -159,7 +159,7 @@ where
                         continue;
                     }
                 }
-                let outcome = AssertUnwindSafe(work(ctx.clone(), slot))
+                let outcome = AssertUnwindSafe(async { work(ctx.clone(), slot).await })
                     .catch_unwind()
                     .await
                     .unwrap_or_else(|panic| Err(anyhow!(panic_message(panic.as_ref()))));
