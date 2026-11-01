@@ -2,13 +2,19 @@
 //!
 //! Owner: ws-releases. See `rust/WORKSTREAMS.md`.
 
+pub mod archive_retry;
+pub mod crap;
+pub mod delete;
+pub mod import_database;
 pub mod maintenance;
+pub mod nzb_clean;
 pub mod process;
 pub mod reconcile;
 pub mod remove;
 pub mod runner;
 pub mod settings;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -80,6 +86,68 @@ pub enum Command {
     Round,
     /// Categorize uncategorized Other > Misc releases.
     Categorize,
+    /// Delete releases matching the given criteria.
+    Delete(Box<delete::DeleteArgs>),
+    /// Remove crap releases based on various criteria.
+    RemoveCrap {
+        /// Type of crap to remove. All but passwordurl and wmv_all when absent.
+        #[arg(long = "type", default_value = "")]
+        kind: String,
+        /// Time limit in hours, or full.
+        #[arg(long, default_value = "full")]
+        time: String,
+        /// Specific blacklist ID.
+        #[arg(long)]
+        blacklist_id: Option<String>,
+        /// Actually delete releases.
+        #[arg(long)]
+        delete: bool,
+    },
+    /// Queue releases whose archives could not be read for one more post-processing pass.
+    RetryArchiveInspection {
+        /// Max releases to queue (0 = no limit).
+        #[arg(long, default_value_t = 0)]
+        limit: u64,
+        /// Count the affected releases by archive type without queueing them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Copy retained NZBs into the database, preserving originals.
+    ImportDatabase {
+        /// Legacy NZB roots, searched in this order.
+        #[arg(long = "root")]
+        roots: Vec<PathBuf>,
+        /// Maximum releases per invocation.
+        #[arg(long, default_value_t = 1000)]
+        limit: u32,
+        /// Override the stored resume cursor.
+        #[arg(long)]
+        after_id: Option<i64>,
+        /// Database checkpoint name.
+        #[arg(long, default_value = "published-nzbs")]
+        name: String,
+        /// Inspect without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Report legacy NZB files with no release, and clean stale temporary ones.
+    NzbClean {
+        /// Report NZBs that don't exist in the database.
+        #[arg(long = "notindb")]
+        not_in_db: bool,
+        /// Refused: a missing file can't qualify a release for deletion.
+        #[arg(long = "notondisk")]
+        not_on_disk: bool,
+        /// Delete stale temporary NZB files left by interrupted creation.
+        #[arg(long)]
+        temps: bool,
+        /// Minimum temporary NZB age in hours before deletion.
+        #[arg(long, default_value_t = 24)]
+        temp_age_hours: u64,
+        /// Actually delete the files. Otherwise it's a dry run.
+        #[arg(long)]
+        delete: bool,
+    },
 }
 
 pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
@@ -114,6 +182,57 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
             let count = maintenance::categorize_releases(&releases, None).await?;
             println!("categorized {count} releases");
             Ok(())
+        }
+        Command::Delete(args) => delete::run(&ctx.db, &args).await,
+        Command::RemoveCrap {
+            kind,
+            time,
+            blacklist_id,
+            delete,
+        } => {
+            let options = crap::Options {
+                delete,
+                time,
+                kind,
+                blacklist_id,
+            };
+            crap::run(&ctx.db, &options).await
+        }
+        Command::RetryArchiveInspection { limit, dry_run } => {
+            archive_retry::run(&ctx.db, limit, dry_run).await
+        }
+        Command::ImportDatabase {
+            roots,
+            limit,
+            after_id,
+            name,
+            dry_run,
+        } => {
+            let options = import_database::Options {
+                roots,
+                limit,
+                after_id,
+                name,
+                dry_run,
+            };
+            import_database::run(&ctx.db, &options).await
+        }
+        Command::NzbClean {
+            not_in_db,
+            not_on_disk,
+            temps,
+            temp_age_hours,
+            delete,
+        } => {
+            let options = nzb_clean::Options {
+                root: PathBuf::from(nntmux_core::var_or("PATH_TO_NZBS", "storage/nzb")),
+                not_in_db,
+                not_on_disk,
+                temps,
+                temp_age_hours,
+                delete,
+            };
+            nzb_clean::run(&ctx.db, &options).await
         }
     }
 }

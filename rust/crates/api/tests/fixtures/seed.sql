@@ -54,6 +54,8 @@ INSERT INTO consoleinfo (id, title, url, publisher, genres_id, releasedate, revi
   (91, 'A Game', 'https://games.example.test/a', 'A Studio', NULL, '2022-02-03 00:00:00', 'Fun.', 0);
 INSERT INTO bookinfo (id, title, author, publisher, genre, cover) VALUES (92, 'A Book', 'An Author', 'A Press', '', 0);
 INSERT INTO anidb_info (anidbid, anilist_id, updated) VALUES (93, 94, '2026-01-01 00:00:00');
+DELETE FROM anidb_titles;
+INSERT INTO anidb_titles (anidbid, type, lang, title) VALUES (93, 'main', 'en', 'An Anime');
 INSERT INTO releases (id, name, searchname, totalpart, groups_id, size, postdate, adddate, guid, leftguid, fromname, completion, categories_id, videos_id, tv_episodes_id, imdbid, musicinfo_id, consoleinfo_id, gamesinfo_id, bookinfo_id, anidbid, movieinfo_id, predb_id, grabs, comments, passwordstatus, nfostatus, nzbstatus, articles_found, articles_expected, files_found, files_expected) VALUES
   (1, 'movie.raw', 'A.Movie.2024.1080p.BluRay-GRP', 40, 9002, 5368709120, '2026-05-01 10:00:00', '2026-05-01 12:00:00', 'aaaa000000000000000000000000000000000001', 'a', 'poster@example.test (Poster)', 100, 2040, 0, 0, '1234567', NULL, NULL, 0, NULL, NULL, 80, 5, 3, 2, 0, 1, 1, NULL, NULL, NULL, NULL),
   (2, 'show.raw', 'Some.Show.S02E03.720p.WEB-GRP & <more>', 12, 9001, 734003200, '2026-05-02 10:00:00', '2026-05-02 12:00:00', 'bbbb000000000000000000000000000000000002', 'b', 'tv@example.test', 100, 5040, 70, 700, NULL, NULL, NULL, 0, NULL, NULL, NULL, 0, 0, 0, 0, 0, 1, NULL, NULL, NULL, NULL),
