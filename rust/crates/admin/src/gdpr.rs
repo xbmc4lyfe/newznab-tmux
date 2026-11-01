@@ -3,7 +3,7 @@
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use chrono::NaiveDateTime;
 use nntmux_core::var_or;
 use sqlx::{FromRow, MySqlPool};
@@ -47,7 +47,8 @@ struct Expired {
 
 /// `GdprRetentionService::purgeExpiredExports`: deletes each export file past its expiry and
 /// clears its path, keeping the request as the audit record. A file already gone still clears.
-/// One whose disk or path can't be resolved is left for an operator and logged.
+/// One whose disk or path can't be resolved, or whose file can't be deleted, keeps its path and
+/// is logged.
 pub async fn purge_expired_exports(
     db: &MySqlPool,
     storage: &Path,
@@ -77,7 +78,9 @@ pub async fn purge_expired_exports(
             Ok(()) => {}
             Err(failure) if failure.kind() == ErrorKind::NotFound => {}
             Err(failure) => {
-                return Err(failure).with_context(|| format!("deleting {}", file.display()));
+                // Keep the path so the next run tries again; one bad file shouldn't stop the rest.
+                warn!(request = request.id, file = %file.display(), error = %failure, "couldn't delete a GDPR export");
+                continue;
             }
         }
         sqlx::query(

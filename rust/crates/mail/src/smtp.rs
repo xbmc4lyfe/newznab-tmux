@@ -148,10 +148,9 @@ fn percent_decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `mail.from`: the sender on every message.
+/// `mail.from`: the sender on every message, with Laravel's defaults.
 pub fn sender() -> Result<Mailbox> {
-    let address = optional("MAIL_FROM_ADDRESS")
-        .context("MAIL_FROM_ADDRESS is unset, so there's no sender to mail from")?;
+    let address = optional("MAIL_FROM_ADDRESS").unwrap_or_else(|| "hello@example.com".to_owned());
     let name = optional("MAIL_FROM_NAME").unwrap_or_else(|| var_or("APP_NAME", "Laravel"));
     let address = address
         .parse()

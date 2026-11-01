@@ -2468,6 +2468,7 @@ dependencies = [
  "nntmux-site",
  "nntmux-webkit",
  "redis",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

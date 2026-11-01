@@ -16,7 +16,7 @@ use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
 use nntmux_webkit::mail::{OutgoingMail, outbox_key};
 use tracing::{error, info, warn};
 
-use crate::outbox::{BACKOFF, Outbox};
+use crate::outbox::{BACKOFF, Envelope, Outbox};
 use crate::smtp::{Failure, MailEnv, Transport, sender};
 
 /// How often an empty outbox is checked. Mail is rare and a reset link shouldn't wait long.
@@ -47,7 +47,8 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
 }
 
 /// Sends until shutdown, or until the outbox is empty with `once`. A message the server turns
-/// away for now is retried after each wait in `backoff`, then parked with the failed ones.
+/// away for now waits aside for each step of `backoff` in turn while later mail goes out, then is
+/// parked with the failed ones.
 pub async fn deliver<F, Fut>(
     outbox: &Outbox,
     send: F,
@@ -79,45 +80,39 @@ where
                 continue;
             }
         };
-        let mail: OutgoingMail = match serde_json::from_str(&raw) {
-            Ok(mail) => mail,
-            Err(failure) => {
-                error!(error = %failure, "unreadable mail in the outbox, parked with failed mail");
-                outbox.fail(&raw).await?;
-                metrics::counter!("nntmux_mail_total", "outcome" => "failed").increment(1);
-                continue;
-            }
+        let Some(Envelope { attempt, mail }) = Envelope::parse(&raw) else {
+            error!("unreadable mail in the outbox, parked with failed mail");
+            outbox.fail(&raw, &raw).await?;
+            metrics::counter!("nntmux_mail_total", "outcome" => "failed").increment(1);
+            continue;
         };
-        let mut retries = backoff.iter();
-        loop {
-            match send(mail.clone()).await {
-                Ok(()) => {
-                    outbox.done(&raw).await?;
-                    metrics::counter!("nntmux_mail_total", "outcome" => "sent").increment(1);
-                    info!(to = %mail.to, subject = %mail.subject, "mail sent");
-                    break;
-                }
-                Err(Failure::Transient(reason)) => {
-                    let Some(wait) = retries.next() else {
-                        error!(to = %mail.to, subject = %mail.subject, %reason, "mail kept failing, parked with failed mail");
-                        outbox.fail(&raw).await?;
-                        metrics::counter!("nntmux_mail_total", "outcome" => "failed").increment(1);
-                        break;
+        match send(mail.clone()).await {
+            Ok(()) => {
+                outbox.done(&raw).await?;
+                metrics::counter!("nntmux_mail_total", "outcome" => "sent").increment(1);
+                info!(to = %mail.to, subject = %mail.subject, "mail sent");
+            }
+            Err(Failure::Transient(reason)) => match backoff.get(attempt) {
+                Some(wait) => {
+                    // Waits aside, so one slow recipient doesn't hold up the mail behind it.
+                    let retry = Envelope {
+                        attempt: attempt + 1,
+                        mail,
                     };
-                    warn!(to = %mail.to, %reason, retry_in = wait.as_secs(), "mail send failed");
+                    warn!(to = %retry.mail.to, %reason, retry_in = wait.as_secs(), "mail send failed");
+                    outbox.defer(&raw, &retry.to_json()?, *wait).await?;
                     metrics::counter!("nntmux_mail_total", "outcome" => "retried").increment(1);
-                    stop.sleep(*wait).await;
-                    if stop.requested() {
-                        // Still in processing: the next start sends it.
-                        return Ok(());
-                    }
                 }
-                Err(Failure::Permanent(reason)) => {
-                    error!(to = %mail.to, subject = %mail.subject, %reason, "mail rejected, parked with failed mail");
-                    outbox.fail(&raw).await?;
+                None => {
+                    error!(to = %mail.to, subject = %mail.subject, %reason, "mail kept failing, parked with failed mail");
+                    outbox.fail(&raw, &serde_json::to_string(&mail)?).await?;
                     metrics::counter!("nntmux_mail_total", "outcome" => "failed").increment(1);
-                    break;
                 }
+            },
+            Err(Failure::Permanent(reason)) => {
+                error!(to = %mail.to, subject = %mail.subject, %reason, "mail rejected, parked with failed mail");
+                outbox.fail(&raw, &serde_json::to_string(&mail)?).await?;
+                metrics::counter!("nntmux_mail_total", "outcome" => "failed").increment(1);
             }
         }
     }
@@ -142,8 +137,11 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
     let outbox = Outbox::new(ctx.redis.clone(), outbox_key());
     match command {
         Command::Status => {
-            let (queued, processing, failed) = outbox.counts().await?;
-            println!("queued {queued}, sending {processing}, failed {failed}");
+            let counts = outbox.counts().await?;
+            println!(
+                "queued {}, sending {}, waiting to retry {}, failed {}",
+                counts.queued, counts.processing, counts.delayed, counts.failed
+            );
         }
         Command::RetryFailed => {
             let moved = outbox.retry_failed().await?;

@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use nntmux_mail::deliver;
-use nntmux_mail::outbox::Outbox;
+use nntmux_mail::outbox::{Counts, Outbox};
 use nntmux_mail::smtp::{Failure, Mailer, SmtpSettings, Transport};
 use nntmux_runtime::Shutdown;
 use nntmux_webkit::mail::OutgoingMail;
@@ -141,7 +141,7 @@ async fn queued_mail_goes_out_over_smtp_oldest_first() -> Result<()> {
     assert!(received[1].contains("Subject: second"));
     assert!(received[0].contains("From: NNTmux <site@example.com>"));
     // The rejected recipient is a permanent failure, parked without retries.
-    assert_eq!(outbox.counts().await?, (0, 0, 1));
+    assert_eq!(outbox.counts().await?, counts(0, 0, 0, 1));
     Ok(())
 }
 
@@ -194,9 +194,47 @@ async fn transient_failures_retry_then_park() -> Result<()> {
         ["flaky", "flaky", "flaky", "down", "down", "down", "down"]
     );
     // "down" ran out of retries and the unreadable entry can never be sent.
-    assert_eq!(outbox.counts().await?, (0, 0, 2));
+    assert_eq!(outbox.counts().await?, counts(0, 0, 0, 2));
     assert_eq!(outbox.retry_failed().await?, 2);
-    assert_eq!(outbox.counts().await?, (2, 0, 0));
+    assert_eq!(outbox.counts().await?, counts(2, 0, 0, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failing_message_waits_aside_while_later_mail_goes_out() -> Result<()> {
+    let Some(outbox) = outbox().await? else {
+        return Ok(());
+    };
+    let mut redis = redis().await?;
+    for subject in ["greylisted", "reset link"] {
+        enqueue(
+            &outbox,
+            &mut redis,
+            &serde_json::to_string(&mail("a@example.com", subject))?,
+        )
+        .await?;
+    }
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let log = sent.clone();
+    deliver(
+        &outbox,
+        move |mail| {
+            let log = log.clone();
+            async move {
+                if mail.subject == "greylisted" {
+                    return Err(Failure::Transient("451 try later".to_owned()));
+                }
+                log.lock().expect("lock").push(mail.subject);
+                Ok(())
+            }
+        },
+        &Shutdown::default(),
+        true,
+        &[Duration::from_secs(600)],
+    )
+    .await?;
+    assert_eq!(*sent.lock().expect("lock"), ["reset link"]);
+    assert_eq!(outbox.counts().await?, counts(0, 0, 1, 0));
     Ok(())
 }
 
@@ -206,35 +244,20 @@ async fn a_restart_requeues_mail_a_stopped_sender_held() -> Result<()> {
         return Ok(());
     };
     let mut redis = redis().await?;
-    enqueue(
-        &outbox,
-        &mut redis,
-        &serde_json::to_string(&mail("a@example.com", "held"))?,
-    )
-    .await?;
-    enqueue(
-        &outbox,
-        &mut redis,
-        &serde_json::to_string(&mail("b@example.com", "next"))?,
-    )
-    .await?;
-    // A shutdown during the retry wait leaves the message in processing.
-    let stop = Shutdown::default();
-    let stopper = stop.clone();
-    deliver(
-        &outbox,
-        move |_| {
-            stopper.request();
-            async { Err(Failure::Transient("timeout".to_owned())) }
-        },
-        &stop,
-        false,
-        &[Duration::from_secs(60)],
-    )
-    .await?;
-    assert_eq!(outbox.counts().await?, (1, 1, 0));
+    for subject in ["first", "second", "third"] {
+        enqueue(
+            &outbox,
+            &mut redis,
+            &serde_json::to_string(&mail("a@example.com", subject))?,
+        )
+        .await?;
+    }
+    // A sender stopped after claiming two messages and before finishing either.
+    outbox.claim().await?;
+    outbox.claim().await?;
+    assert_eq!(outbox.counts().await?, counts(1, 2, 0, 0));
 
-    assert_eq!(outbox.recover().await?, 1);
+    assert_eq!(outbox.recover().await?, 2);
     let order = Arc::new(Mutex::new(Vec::new()));
     let log = order.clone();
     deliver(
@@ -248,7 +271,16 @@ async fn a_restart_requeues_mail_a_stopped_sender_held() -> Result<()> {
         &[],
     )
     .await?;
-    assert_eq!(*order.lock().expect("lock"), ["held", "next"]);
-    assert_eq!(outbox.counts().await?, (0, 0, 0));
+    assert_eq!(*order.lock().expect("lock"), ["first", "second", "third"]);
+    assert_eq!(outbox.counts().await?, counts(0, 0, 0, 0));
     Ok(())
+}
+
+fn counts(queued: usize, processing: usize, delayed: usize, failed: usize) -> Counts {
+    Counts {
+        queued,
+        processing,
+        delayed,
+        failed,
+    }
 }
