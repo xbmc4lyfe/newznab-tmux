@@ -1,8 +1,8 @@
 //! `NzbParserService::parseNzbFileList` in its default form: one entry per NZB file.
 
 use fancy_regex::Regex;
-use quick_xml::{Reader, XmlVersion};
 use quick_xml::events::{BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 use std::sync::LazyLock;
 
 use crate::json::J;
@@ -82,7 +82,8 @@ fn read_files(xml: &[u8]) -> Option<Vec<File>> {
                         });
                     }
                     "segment" if current.is_some() => {
-                        let number = attribute(&element, "number").map(|value| crate::input::php_int(&value));
+                        let number = attribute(&element, "number")
+                            .map(|value| crate::input::php_int(&value));
                         if let Some(file) = &mut current {
                             file.size += attribute(&element, "bytes")
                                 .map_or(0, |value| crate::input::php_int(&value));
