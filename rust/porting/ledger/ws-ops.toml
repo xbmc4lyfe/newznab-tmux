@@ -4,7 +4,7 @@
 kind = "command"
 id = "metrics:collect"
 source = "app/Console/Commands/CollectSystemMetrics.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -40,7 +40,7 @@ status = "todo"
 kind = "command"
 id = "nntmux:collect-stats"
 source = "app/Console/Commands/CollectStats.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -58,13 +58,13 @@ status = "todo"
 kind = "command"
 id = "nntmux:disable-expired-promotions"
 source = "app/Console/Commands/DisableExpiredPromotions.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:disable-expired-registration-periods"
 source = "app/Console/Commands/DisableExpiredRegistrationPeriods.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -214,19 +214,19 @@ status = "todo"
 kind = "schedule"
 id = "call: function () {"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
 id = "call: function () {"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
 id = "call: function () {"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -250,7 +250,8 @@ status = "todo"
 kind = "schedule"
 id = "command: 'cache:prune-stale-tags')->hourly();"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "Laravel's cache-tag index. No Rust code uses Laravel cache tags."
 
 [[entry]]
 kind = "schedule"
@@ -268,7 +269,8 @@ status = "todo"
 kind = "schedule"
 id = "command: 'disposable:update')->weekly();"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "Refreshed a vendor package's list. The site crate checks a fixed list, and nothing reads the vendor file."
 
 [[entry]]
 kind = "schedule"
@@ -280,19 +282,20 @@ status = "todo"
 kind = "schedule"
 id = "command: 'horizon:snapshot')->everyFiveMinutes()->withoutOverlapping(5)->when(static fn (): bool =>"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "Rust has no Horizon: its work comes from database rows."
 
 [[entry]]
 kind = "schedule"
 id = "command: 'metrics:collect --cleanup')->dailyAt('03:00');"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
 id = "command: 'metrics:collect')->everyFiveMinutes()->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -316,7 +319,7 @@ status = "todo"
 kind = "schedule"
 id = "command: 'nntmux:collect-stats')->everyFifteenMinutes()->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -328,13 +331,13 @@ status = "todo"
 kind = "schedule"
 id = "command: 'nntmux:disable-expired-promotions')->daily();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
 id = "command: 'nntmux:disable-expired-registration-periods')->everyFiveMinutes()->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -358,7 +361,8 @@ status = "todo"
 kind = "schedule"
 id = "command: 'nntmux:search-repair --limit=100')->everyMinute()->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "The search-sync role retries failed index updates continuously."
 
 [[entry]]
 kind = "schedule"
@@ -370,7 +374,7 @@ status = "todo"
 kind = "schedule"
 id = "command: 'predb:check 3 --quiet')->everyTenMinutes()->withoutOverlapping()->runInBackground();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -388,7 +392,8 @@ status = "todo"
 kind = "schedule"
 id = "command: 'tmux:health-check --auto-restart')->everyThirtyMinutes()->withoutOverlapping()->when(stat"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "Compose restarts the supervisor; nothing runs in tmux."
 
 [[entry]]
 kind = "schedule"

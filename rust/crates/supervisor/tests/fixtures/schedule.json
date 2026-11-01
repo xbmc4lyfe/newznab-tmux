@@ -1,0 +1,142 @@
+[
+    {
+        "command": "disposable:update",
+        "cron": "0 0 * * 0"
+    },
+    {
+        "command": "clean:directories",
+        "cron": "0 * * * *"
+    },
+    {
+        "command": "nntmux:delete-unverified-users",
+        "cron": "0 1,13 * * *"
+    },
+    {
+        "command": "nntmux:update-expired-roles",
+        "cron": "0 0 * * *"
+    },
+    {
+        "command": "nntmux:disable-expired-promotions",
+        "cron": "0 0 * * *"
+    },
+    {
+        "command": "nntmux:disable-expired-registration-periods",
+        "cron": "*/5 * * * *"
+    },
+    {
+        "command": "nntmux:remove-bad",
+        "cron": "0 * * * *"
+    },
+    {
+        "command": "cloudflare:reload",
+        "cron": "0 0 * * *"
+    },
+    {
+        "command": "cache:prune-stale-tags",
+        "cron": "0 * * * *"
+    },
+    {
+        "command": "gdpr:purge-expired-exports",
+        "cron": "30 3 * * *"
+    },
+    {
+        "command": "nntmux:collect-stats",
+        "cron": "*/15 * * * *"
+    },
+    {
+        "command": "nntmux:populate-steam-apps",
+        "cron": "0 0 1 * *"
+    },
+    {
+        "command": "metrics:collect",
+        "cron": "*/5 * * * *"
+    },
+    {
+        "command": "metrics:collect --cleanup",
+        "cron": "0 3 * * *"
+    },
+    {
+        "command": "monitoring:export-metrics --scheduled",
+        "cron": "* * * * *"
+    },
+    {
+        "command": "horizon:snapshot",
+        "cron": "*/5 * * * *"
+    },
+    {
+        "command": "closure",
+        "cron": "0 4 * * 1"
+    },
+    {
+        "command": "closure",
+        "cron": "30 4 * * *"
+    },
+    {
+        "command": "cleanup-api-request-logs",
+        "cron": "0 * * * *"
+    },
+    {
+        "command": "tmux:health-check --auto-restart",
+        "cron": "*/30 * * * *"
+    },
+    {
+        "command": "nntmux:check-service-health",
+        "cron": "* * * * *"
+    },
+    {
+        "command": "nntmux:search-repair --limit=100",
+        "cron": "* * * * *"
+    },
+    {
+        "command": "releases:fingerprint-backfill --stale --limit=200",
+        "cron": "*/15 * * * *"
+    },
+    {
+        "command": "tv:reprocess-missing-episodes --scheduled --limit=500",
+        "cron": "*/30 * * * *"
+    },
+    {
+        "command": "tv:repair-links --legacy --stuck --orphans --limit=50000",
+        "cron": "15 5 * * *"
+    },
+    {
+        "command": "nntmux:index-logs",
+        "cron": "* * * * *"
+    },
+    {
+        "command": "admin:warm-dashboard",
+        "cron": "*/15 * * * *"
+    },
+    {
+        "command": "predb:import-feed --quiet",
+        "cron": "*/5 * * * *"
+    },
+    {
+        "command": "predb:check 3 --quiet",
+        "cron": "*/10 * * * *"
+    },
+    {
+        "command": "multiprocessing:fixrelnames predbft",
+        "cron": "*/5 * * * *"
+    },
+    {
+        "command": "releases:fix-names 7 --update --category=other --set-status --limit=1000",
+        "cron": "*/5 * * * *"
+    },
+    {
+        "command": "releases:fix-names 8 --update --category=other --set-status --limit=1000",
+        "cron": "* * * * *"
+    },
+    {
+        "command": "releases:prepare-candidates --limit=5000 --max-seconds=30 --diagnostics",
+        "cron": "* * * * *"
+    },
+    {
+        "command": "releases:verify-candidates --limit=1000 --max-seconds=300 --slot=1 --no-summary --diagnostics",
+        "cron": "* * * * *"
+    },
+    {
+        "command": "releases:verify-candidates --limit=1000 --max-seconds=300 --slot=2 --no-summary --diagnostics",
+        "cron": "* * * * *"
+    }
+]
