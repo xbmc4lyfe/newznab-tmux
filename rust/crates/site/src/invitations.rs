@@ -439,13 +439,16 @@ async fn store(
 
 /// `(email, token, expires, used, active)` for an invitation this user sent.
 type Owned = (String, String, DateTime<Utc>, bool, bool);
-type OwnedRow = (i64, String, String, DateTime<Utc>, Option<DateTime<Utc>>, i8);
+type OwnedRow = (
+    i64,
+    String,
+    String,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+    i8,
+);
 
-async fn owned(
-    ctx: &Ctx,
-    id: i64,
-    user_id: i64,
-) -> Result<Owned, WebError> {
+async fn owned(ctx: &Ctx, id: i64, user_id: i64) -> Result<Owned, WebError> {
     let row: Option<OwnedRow> = sqlx::query_as(
         "SELECT CAST(invited_by AS SIGNED), email, token, expires_at, used_at, is_active FROM invitations WHERE id = ?",
     )
@@ -536,14 +539,13 @@ struct ShowPage {
 type PreviewRow = (String, DateTime<Utc>, Option<DateTime<Utc>>, Option<String>);
 
 async fn show(State(ctx): State<Ctx>, layout: Layout, Path(token): Path<String>) -> WebResult {
-    let row: Option<PreviewRow> =
-        sqlx::query_as(
-            "SELECT i.email, i.expires_at, i.used_at, u.username
+    let row: Option<PreviewRow> = sqlx::query_as(
+        "SELECT i.email, i.expires_at, i.used_at, u.username
          FROM invitations i LEFT JOIN users u ON u.id = i.invited_by WHERE i.token = ? LIMIT 1",
-        )
-        .bind(&token)
-        .fetch_optional(&ctx.db)
-        .await?;
+    )
+    .bind(&token)
+    .fetch_optional(&ctx.db)
+    .await?;
     let preview = row.map(|(email, expires, used, inviter)| Preview {
         inviter: inviter.unwrap_or_else(|| "Unknown".to_owned()),
         email,

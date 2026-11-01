@@ -17,7 +17,9 @@ use nntmux_runtime::Ctx;
 use nntmux_webkit::auth::{Auth, verify_password};
 use nntmux_webkit::session::random_string;
 use nntmux_webkit::user::{Access, USER_MODEL};
-use nntmux_webkit::{CurrentUser, Input, Layout, MaybeUser, Session, User, WebResult, auth, config, guard};
+use nntmux_webkit::{
+    CurrentUser, Input, Layout, MaybeUser, Session, User, WebResult, auth, config, guard,
+};
 use rand::Rng;
 use serde_json::json;
 
@@ -30,7 +32,16 @@ const SCHEMES: [&str; 11] = [
 ];
 const THEMES: [&str; 3] = ["light", "dark", "system"];
 const TIMEZONE_REGIONS: [&str; 10] = [
-    "Africa", "America", "Antarctica", "Arctic", "Asia", "Atlantic", "Australia", "Europe", "Indian", "Pacific",
+    "Africa",
+    "America",
+    "Antarctica",
+    "Arctic",
+    "Asia",
+    "Atlantic",
+    "Australia",
+    "Europe",
+    "Indian",
+    "Pacific",
 ];
 /// `syncUserPermissions`: each checkbox and the view permission it grants directly.
 const VIEW_PERMISSIONS: [(&str, &str); 8] = [
@@ -62,7 +73,10 @@ pub fn router() -> Router<Ctx> {
         .route("/profileedit/disable2fa", post(delete_two_factor))
         .route("/profile-disable2fa", post(switch_off_two_factor))
         .route("/profileedit/cancel2fa", post(cancel_two_factor))
-        .route("/profile-security/disable-2fa", post(security_disable_two_factor))
+        .route(
+            "/profile-security/disable-2fa",
+            post(security_disable_two_factor),
+        )
         .route_layer(from_fn(guard::verified))
         .route_layer(from_fn(guard::authenticated));
     pages.merge(two_factor)
@@ -100,7 +114,6 @@ struct ProfilePage {
     timezone_display: String,
     current_time: String,
     grabs_today: i64,
-    download_limit: i64,
     download_remaining: i64,
     download_percentage: i64,
     download_color: &'static str,
@@ -139,7 +152,11 @@ fn gravatar_url(email: &str) -> String {
 
 /// A usage bar: the percentage and its color, with `warm` at 70% and red at 90%.
 fn usage_bar(used: i64, limit: i64, calm: &'static str) -> (i64, &'static str) {
-    let percentage = if limit > 0 { (used * 100 / limit).min(100) } else { 0 };
+    let percentage = if limit > 0 {
+        (used * 100 / limit).min(100)
+    } else {
+        0
+    };
     let color = match percentage {
         90.. => "bg-red-600",
         70.. => "bg-yellow-500",
@@ -150,21 +167,39 @@ fn usage_bar(used: i64, limit: i64, calm: &'static str) -> (i64, &'static str) {
 
 fn local_time(zone: &str, now: DateTime<Utc>) -> String {
     let zone: chrono_tz::Tz = zone.parse().unwrap_or(chrono_tz::UTC);
-    now.with_timezone(&zone).format("%b %d, %Y %H:%M").to_string()
+    now.with_timezone(&zone)
+        .format("%b %d, %Y %H:%M")
+        .to_string()
 }
 
 async fn count_last_day(ctx: &Ctx, table: &'static str, user_id: i64) -> Result<i64> {
-    let sql = format!("SELECT COUNT(*) FROM {table} WHERE users_id = ? AND timestamp > DATE_SUB(NOW(), INTERVAL 1 DAY)");
-    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).bind(user_id).fetch_one(&ctx.db).await?)
+    let sql = format!(
+        "SELECT COUNT(*) FROM {table} WHERE users_id = ? AND timestamp > DATE_SUB(NOW(), INTERVAL 1 DAY)"
+    );
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(user_id)
+        .fetch_one(&ctx.db)
+        .await?)
 }
 
-async fn show(State(ctx): State<Ctx>, layout: Layout, input: Input, CurrentUser(signed_in): CurrentUser) -> WebResult {
+async fn show(
+    State(ctx): State<Ctx>,
+    layout: Layout,
+    input: Input,
+    CurrentUser(signed_in): CurrentUser,
+) -> WebResult {
     let privileged = signed_in.access.has_any_role(&["Admin", "Moderator"]);
-    let private_profiles = !matches!(var_or("PRIVATE_PROFILES", "true").as_str(), "0" | "false" | "off" | "no");
+    let private_profiles = !matches!(
+        var_or("PRIVATE_PROFILES", "true").as_str(),
+        "0" | "false" | "off" | "no"
+    );
     let mut user = (*signed_in.user).clone();
     let mut public_view = false;
     if privileged || !private_profiles {
-        let id = input.get("id").filter(|id| id.bytes().all(|byte| byte.is_ascii_digit())).and_then(|id| id.parse().ok());
+        let id = input
+            .get("id")
+            .filter(|id| id.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|id| id.parse().ok());
         if let Some(id) = id {
             if let Some(found) = User::find(&ctx.db, id).await? {
                 user = found;
@@ -176,7 +211,11 @@ async fn show(State(ctx): State<Ctx>, layout: Layout, input: Input, CurrentUser(
             user = found;
         }
     }
-    let access = if user.id == signed_in.user.id { (*signed_in.access).clone() } else { Access::load(&ctx.db, user.id).await? };
+    let access = if user.id == signed_in.user.id {
+        (*signed_in.access).clone()
+    } else {
+        Access::load(&ctx.db, user.id).await?
+    };
     let role: Option<(String, i32, i32)> = sqlx::query_as(
         "SELECT r.name, CAST(r.downloadrequests AS SIGNED) + 0, CAST(r.apirequests AS SIGNED) + 0 FROM roles r
          JOIN model_has_roles m ON m.role_id = r.id WHERE m.model_type = ? AND m.model_id = ? ORDER BY r.id LIMIT 1",
@@ -185,10 +224,14 @@ async fn show(State(ctx): State<Ctx>, layout: Layout, input: Input, CurrentUser(
     .bind(user.id)
     .fetch_optional(&ctx.db)
     .await?;
-    let (role_name, download_limit, api_limit) = role.map_or(("User".to_owned(), 0, 0), |(name, downloads, api)| (name, i64::from(downloads), i64::from(api)));
+    let (role_name, download_limit, api_limit) = role
+        .map_or(("User".to_owned(), 0, 0), |(name, downloads, api)| {
+            (name, i64::from(downloads), i64::from(api))
+        });
     let grabs_today = count_last_day(&ctx, "user_downloads", user.id).await?;
     let api_requests = count_last_day(&ctx, "user_requests", user.id).await?;
-    let (download_percentage, download_color) = usage_bar(grabs_today, download_limit, "bg-green-600");
+    let (download_percentage, download_color) =
+        usage_bar(grabs_today, download_limit, "bg-green-600");
     let (api_percentage, api_color) = usage_bar(api_requests, api_limit, "bg-purple-600");
     let now = Utc::now();
     let as_utc = |at: NaiveDateTime| at.and_utc();
@@ -198,9 +241,15 @@ async fn show(State(ctx): State<Ctx>, layout: Layout, input: Input, CurrentUser(
         expired: at < now,
         days: (at - now).num_days(),
     });
-    let pending_role = match (user.pending_roles_id, user.pending_role_start_date.map(as_utc)) {
+    let pending_role = match (
+        user.pending_roles_id,
+        user.pending_role_start_date.map(as_utc),
+    ) {
         (Some(id), Some(start)) if start > now => {
-            let name: Option<String> = sqlx::query_scalar("SELECT name FROM roles WHERE id = ?").bind(id).fetch_optional(&ctx.db).await?;
+            let name: Option<String> = sqlx::query_scalar("SELECT name FROM roles WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&ctx.db)
+                .await?;
             Some(PendingRole {
                 name: name.unwrap_or_else(|| "Unknown".to_owned()),
                 date: start.format("%b %d, %Y %-I:%M %p").to_string(),
@@ -210,19 +259,42 @@ async fn show(State(ctx): State<Ctx>, layout: Layout, input: Input, CurrentUser(
         _ => None,
     };
     let invited_by = match user.invitedby {
-        Some(id) => User::find(&ctx.db, i64::from(id)).await?.map(|inviter| (inviter.id, inviter.username)),
+        Some(id) => User::find(&ctx.db, i64::from(id))
+            .await?
+            .map(|inviter| (inviter.id, inviter.username)),
         None => None,
     };
-    let zone = user.timezone.clone().filter(|zone| !zone.is_empty()).unwrap_or_else(|| "UTC".to_owned());
+    let zone = user
+        .timezone
+        .clone()
+        .filter(|zone| !zone.is_empty())
+        .unwrap_or_else(|| "UTC".to_owned());
     let page = ProfilePage {
-        layout: layout.titled("View User Profile", "view,profile,user,details", format!("View User Profile for {}", user.username)),
-        header_title: if public_view { user.username.clone() } else { "Your profile".to_owned() },
+        layout: layout.titled(
+            "View User Profile",
+            "view,profile,user,details",
+            format!("View User Profile for {}", user.username),
+        ),
+        header_title: if public_view {
+            user.username.clone()
+        } else {
+            "Your profile".to_owned()
+        },
         is_admin: access.has_role("Admin"),
         public_view,
         gravatar: gravatar_url(&user.email),
-        joined_date: user.created_at.map(|at| at.format("%b %d, %Y").to_string()).unwrap_or_default(),
-        joined_ago: user.created_at.map(|at| relative(at, now)).unwrap_or_default(),
-        last_login: user.lastlogin.map(|at| relative(as_utc(at), now)).unwrap_or_else(|| relative(now, now)),
+        joined_date: user
+            .created_at
+            .map(|at| at.format("%b %d, %Y").to_string())
+            .unwrap_or_default(),
+        joined_ago: user
+            .created_at
+            .map(|at| relative(at, now))
+            .unwrap_or_default(),
+        last_login: user
+            .lastlogin
+            .map(|at| relative(as_utc(at), now))
+            .unwrap_or_else(|| relative(now, now)),
         role_name,
         role_expiry,
         pending_role,
@@ -230,7 +302,6 @@ async fn show(State(ctx): State<Ctx>, layout: Layout, input: Input, CurrentUser(
         timezone_display: zone.replace('_', " "),
         current_time: local_time(&zone, now),
         grabs_today,
-        download_limit,
         download_remaining: download_limit - grabs_today,
         download_percentage,
         download_color,
@@ -289,7 +360,11 @@ fn timezone_groups() -> Vec<TimezoneGroup> {
             let prefix = format!("{region}/");
             TimezoneGroup {
                 region,
-                zones: chrono_tz::TZ_VARIANTS.iter().map(|zone| zone.name()).filter(|name| name.starts_with(&prefix)).collect(),
+                zones: chrono_tz::TZ_VARIANTS
+                    .iter()
+                    .map(|zone| zone.name())
+                    .filter(|name| name.starts_with(&prefix))
+                    .collect(),
             }
         })
         .collect()
@@ -297,7 +372,10 @@ fn timezone_groups() -> Vec<TimezoneGroup> {
 
 fn valid_timezone(zone: &str) -> bool {
     zone == "UTC"
-        || (TIMEZONE_REGIONS.iter().any(|region| zone.starts_with(&format!("{region}/"))) && zone.parse::<chrono_tz::Tz>().is_ok())
+        || (TIMEZONE_REGIONS
+            .iter()
+            .any(|region| zone.starts_with(&format!("{region}/")))
+            && zone.parse::<chrono_tz::Tz>().is_ok())
 }
 
 /// `^(?=.*?[A-Z])(?=.*?[a-z])(?=.*?[0-9])(?=.*?[#?!@$%^&*-]).{8,}$`
@@ -318,11 +396,12 @@ async fn profile_errors(ctx: &Ctx, input: &Input, user: &User) -> Result<String>
         } else if email.chars().count() > 255 {
             errors.push_str("The email field must not be greater than 255 characters.");
         } else {
-            let taken: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = ? AND id <> ?")
-                .bind(&email)
-                .bind(user.id)
-                .fetch_one(&ctx.db)
-                .await?;
+            let taken: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = ? AND id <> ?")
+                    .bind(&email)
+                    .bind(user.id)
+                    .fetch_one(&ctx.db)
+                    .await?;
             if taken > 0 {
                 errors.push_str("The email has already been taken.");
             } else if let Some(message) = validate::disposable_error(&email) {
@@ -360,8 +439,12 @@ async fn save_profile(ctx: &Ctx, input: &Input, auth: &Auth) -> Result<()> {
     let user = &auth.user;
     let on = |name: &str| i32::from(input.has(name));
     let email = input.get("email");
-    let theme = input.get("theme_preference").filter(|value| THEMES.contains(&value.as_str()));
-    let scheme = input.get("color_scheme").filter(|value| SCHEMES.contains(&value.as_str()));
+    let theme = input
+        .get("theme_preference")
+        .filter(|value| THEMES.contains(&value.as_str()));
+    let scheme = input
+        .get("color_scheme")
+        .filter(|value| SCHEMES.contains(&value.as_str()));
     let timezone = input.get("timezone").filter(|value| valid_timezone(value));
     let mut tx = ctx.db.begin().await?;
     sqlx::query(
@@ -382,7 +465,10 @@ async fn save_profile(ctx: &Ctx, input: &Input, auth: &Auth) -> Result<()> {
     .bind(user.id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("DELETE FROM user_excluded_categories WHERE users_id = ?").bind(user.id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM user_excluded_categories WHERE users_id = ?")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
     for category in input.list("excluded_categories") {
         if let Ok(category) = category.parse::<i64>() {
             sqlx::query("INSERT INTO user_excluded_categories (users_id, categories_id, created_at, updated_at) VALUES (?, ?, NOW(), NOW())")
@@ -445,14 +531,20 @@ fn qr_svg(email: &str, secret: &str) -> String {
         config::encode_component(&app),
     );
     qrcode::QrCode::new(uri.as_bytes())
-        .map(|code| code.render::<qrcode::render::svg::Color<'_>>().min_dimensions(200, 200).build())
+        .map(|code| {
+            code.render::<qrcode::render::svg::Color<'_>>()
+                .min_dimensions(200, 200)
+                .build()
+        })
         .unwrap_or_default()
 }
 
 async fn load_categories(ctx: &Ctx) -> Result<Vec<CategoryChoice>> {
-    let roots: Vec<(i64, String)> = sqlx::query_as("SELECT CAST(id AS SIGNED), title FROM root_categories WHERE status = 1 ORDER BY title")
-        .fetch_all(&ctx.db)
-        .await?;
+    let roots: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT CAST(id AS SIGNED), title FROM root_categories WHERE status = 1 ORDER BY title",
+    )
+    .fetch_all(&ctx.db)
+    .await?;
     let subs: Vec<(i64, i64, String)> = sqlx::query_as(
         "SELECT CAST(id AS SIGNED), CAST(root_categories_id AS SIGNED), title FROM categories
          WHERE status = 1 AND root_categories_id IS NOT NULL ORDER BY title",
@@ -463,7 +555,14 @@ async fn load_categories(ctx: &Ctx) -> Result<Vec<CategoryChoice>> {
         .into_iter()
         .map(|(id, title)| CategoryChoice {
             title,
-            subs: subs.iter().filter(|(_, root, _)| *root == id).map(|(id, _, title)| SubcategoryChoice { id: *id, title: title.clone() }).collect(),
+            subs: subs
+                .iter()
+                .filter(|(_, root, _)| *root == id)
+                .map(|(id, _, title)| SubcategoryChoice {
+                    id: *id,
+                    title: title.clone(),
+                })
+                .collect(),
         })
         .collect())
 }
@@ -499,7 +598,11 @@ async fn edit(
     CurrentUser(signed_in): CurrentUser,
 ) -> WebResult {
     let user = &signed_in.user;
-    let action = if method == axum::http::Method::POST { input.get("action").unwrap_or_else(|| "view".to_owned()) } else { "view".to_owned() };
+    let action = if method == axum::http::Method::POST {
+        input.get("action").unwrap_or_else(|| "view".to_owned())
+    } else {
+        "view".to_owned()
+    };
     let mut error = String::new();
     match action.as_str() {
         "newapikey" => {
@@ -525,7 +628,10 @@ async fn edit(
                         .await?;
                     send_verification(&ctx, user.id, &email, &user.username).await?;
                     auth::logout(&session);
-                    session.flash("info", "You will be able to login after you verify your new email address");
+                    session.flash(
+                        "info",
+                        "You will be able to login after you verify your new email address",
+                    );
                     return Ok(Redirect::to("/login").into_response());
                 }
                 session.flash("success", "Profile changes saved");
@@ -541,32 +647,53 @@ async fn edit(
         Some((false, secret)) => (false, true, secret),
         None => (false, false, String::new()),
     };
-    let excluded: Vec<i64> = sqlx::query_scalar("SELECT CAST(categories_id AS SIGNED) FROM user_excluded_categories WHERE users_id = ?")
-        .bind(user.id)
-        .fetch_all(&ctx.db)
-        .await?;
+    let excluded: Vec<i64> = sqlx::query_scalar(
+        "SELECT CAST(categories_id AS SIGNED) FROM user_excluded_categories WHERE users_id = ?",
+    )
+    .bind(user.id)
+    .fetch_all(&ctx.db)
+    .await?;
     if let Some(message) = session.flashed_str("error_2fa") {
         error = message;
     }
     let old_email = session.old("email");
-    let timezone = user.timezone.clone().filter(|zone| !zone.is_empty()).unwrap_or_else(|| "UTC".to_owned());
+    let timezone = user
+        .timezone
+        .clone()
+        .filter(|zone| !zone.is_empty())
+        .unwrap_or_else(|| "UTC".to_owned());
     let zone: chrono_tz::Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
     let page = EditPage {
-        layout: layout.titled("Edit User Profile", "edit,profile,user,details", format!("Edit User Profile for {}", user.username)),
+        layout: layout.titled(
+            "Edit User Profile",
+            "edit,profile,user,details",
+            format!("Edit User Profile for {}", user.username),
+        ),
         access: (*signed_in.access).clone(),
         error,
         success_2fa: session.flashed_str("success_2fa"),
-        email_value: if old_email.is_empty() { input.get("email").unwrap_or_else(|| user.email.clone()) } else { old_email },
+        email_value: if old_email.is_empty() {
+            input.get("email").unwrap_or_else(|| user.email.clone())
+        } else {
+            old_email
+        },
         theme_value: user.theme_preference.clone(),
         scheme_value: user.color_scheme.clone(),
-        current_time: Utc::now().with_timezone(&zone).format("%Y-%m-%d %H:%M:%S %Z").to_string(),
+        current_time: Utc::now()
+            .with_timezone(&zone)
+            .format("%Y-%m-%d %H:%M:%S %Z")
+            .to_string(),
         timezone,
         timezones: timezone_groups(),
         categories: load_categories(&ctx).await?,
         excluded: excluded.into_iter().collect(),
         two_factor_enabled,
         two_factor_pending,
-        qr_svg: if two_factor_pending { qr_svg(&user.email, &secret) } else { String::new() },
+        qr_svg: if two_factor_pending {
+            qr_svg(&user.email, &secret)
+        } else {
+            String::new()
+        },
         secret,
         passkeys_json: passkeys_json(&ctx, user.id).await?,
         user: (**user).clone(),
@@ -574,17 +701,37 @@ async fn edit(
     Ok(Html(page.render()?).into_response())
 }
 
-async fn update_theme(State(ctx): State<Ctx>, input: Input, MaybeUser(signed_in): MaybeUser) -> WebResult {
+async fn update_theme(
+    State(ctx): State<Ctx>,
+    input: Input,
+    MaybeUser(signed_in): MaybeUser,
+) -> WebResult {
     let Some(signed_in) = signed_in else {
-        return Ok((StatusCode::UNAUTHORIZED, Json(json!({"success": false, "message": "User not authenticated"}))).into_response());
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"success": false, "message": "User not authenticated"})),
+        )
+            .into_response());
     };
     let theme = input.get("theme_preference");
-    if theme.as_ref().is_some_and(|value| !THEMES.contains(&value.as_str())) {
-        return Ok(invalid("theme_preference", "The selected theme preference is invalid."));
+    if theme
+        .as_ref()
+        .is_some_and(|value| !THEMES.contains(&value.as_str()))
+    {
+        return Ok(invalid(
+            "theme_preference",
+            "The selected theme preference is invalid.",
+        ));
     }
     let scheme = input.get("color_scheme");
-    if scheme.as_ref().is_some_and(|value| !SCHEMES.contains(&value.as_str())) {
-        return Ok(invalid("color_scheme", "The selected color scheme is invalid."));
+    if scheme
+        .as_ref()
+        .is_some_and(|value| !SCHEMES.contains(&value.as_str()))
+    {
+        return Ok(invalid(
+            "color_scheme",
+            "The selected color scheme is invalid.",
+        ));
     }
     sqlx::query("UPDATE users SET theme_preference = COALESCE(?, theme_preference), color_scheme = COALESCE(?, color_scheme), updated_at = NOW() WHERE id = ?")
         .bind(&theme)
@@ -617,13 +764,20 @@ struct TwoFactorPage {
     qr_svg: String,
 }
 
-async fn two_factor_form(State(ctx): State<Ctx>, layout: GuestLayout, CurrentUser(signed_in): CurrentUser) -> WebResult {
+async fn two_factor_form(
+    State(ctx): State<Ctx>,
+    layout: GuestLayout,
+    CurrentUser(signed_in): CurrentUser,
+) -> WebResult {
     let row = two_factor_row(&ctx, signed_in.user.id).await?;
     let page = TwoFactorPage {
         layout,
         has_row: row.is_some(),
         enabled: row.as_ref().is_some_and(|(enabled, _)| *enabled),
-        qr_svg: row.as_ref().map(|(_, secret)| qr_svg(&signed_in.user.email, secret)).unwrap_or_default(),
+        qr_svg: row
+            .as_ref()
+            .map(|(_, secret)| qr_svg(&signed_in.user.email, secret))
+            .unwrap_or_default(),
     };
     Ok(Html(page.render()?).into_response())
 }
@@ -633,7 +787,9 @@ const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 /// Google2FA's default: 16 base32 characters.
 fn new_secret() -> String {
     let mut rng = rand::rng();
-    (0..16).map(|_| BASE32[rng.random_range(0..32)] as char).collect()
+    (0..16)
+        .map(|_| BASE32[rng.random_range(0..32)] as char)
+        .collect()
 }
 
 const TO_SECURITY: &str = "/profileedit#security";
@@ -643,7 +799,13 @@ fn security_flash(session: &Session, key: &str, message: &str) -> Response {
     Redirect::to(TO_SECURITY).into_response()
 }
 
-async fn generate_secret(State(ctx): State<Ctx>, session: Session, input: Input, headers: HeaderMap, CurrentUser(signed_in): CurrentUser) -> WebResult {
+async fn generate_secret(
+    State(ctx): State<Ctx>,
+    session: Session,
+    input: Input,
+    headers: HeaderMap,
+    CurrentUser(signed_in): CurrentUser,
+) -> WebResult {
     // A second click must not replace the secret an authenticator already scanned, or
     // create the duplicate row Laravel could.
     if two_factor_row(&ctx, signed_in.user.id).await?.is_none() {
@@ -654,91 +816,188 @@ async fn generate_secret(State(ctx): State<Ctx>, session: Session, input: Input,
             .await?;
     }
     let from_profile = input.has("from_profile")
-        || headers.get(header::REFERER).and_then(|value| value.to_str().ok()).is_some_and(|referer| referer.contains("profileedit"));
+        || headers
+            .get(header::REFERER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|referer| referer.contains("profileedit"));
     if from_profile {
-        return Ok(security_flash(&session, "success_2fa", "Secret Key is generated, Please scan the QR code and verify to Enable 2FA"));
+        return Ok(security_flash(
+            &session,
+            "success_2fa",
+            "Secret Key is generated, Please scan the QR code and verify to Enable 2FA",
+        ));
     }
-    session.flash("success", "Secret Key is generated, Please verify Code to Enable 2FA");
+    session.flash(
+        "success",
+        "Secret Key is generated, Please verify Code to Enable 2FA",
+    );
     Ok(Redirect::to("/2fa").into_response())
 }
 
-async fn enable_two_factor(State(ctx): State<Ctx>, session: Session, input: Input, CurrentUser(signed_in): CurrentUser) -> WebResult {
+async fn enable_two_factor(
+    State(ctx): State<Ctx>,
+    session: Session,
+    input: Input,
+    CurrentUser(signed_in): CurrentUser,
+) -> WebResult {
     let Some((_, secret)) = two_factor_row(&ctx, signed_in.user.id).await? else {
-        return Ok(security_flash(&session, "error_2fa", "Invalid Verification Code, Please try again."));
+        return Ok(security_flash(
+            &session,
+            "error_2fa",
+            "Invalid Verification Code, Please try again.",
+        ));
     };
     let now = u64::try_from(Utc::now().timestamp()).unwrap_or(0);
     if !verify_code(&secret, &input.str("verify-code"), now) {
-        return Ok(security_flash(&session, "error_2fa", "Invalid Verification Code, Please try again."));
+        return Ok(security_flash(
+            &session,
+            "error_2fa",
+            "Invalid Verification Code, Please try again.",
+        ));
     }
-    sqlx::query("UPDATE password_securities SET google2fa_enable = 1, updated_at = NOW() WHERE user_id = ?")
-        .bind(signed_in.user.id)
-        .execute(&ctx.db)
-        .await?;
+    sqlx::query(
+        "UPDATE password_securities SET google2fa_enable = 1, updated_at = NOW() WHERE user_id = ?",
+    )
+    .bind(signed_in.user.id)
+    .execute(&ctx.db)
+    .await?;
     // Turning it on from this browser proves the code here, so it shouldn't challenge at once.
     auth::mark_two_factor_passed(&session);
-    Ok(security_flash(&session, "success_2fa", "2FA is Enabled Successfully."))
+    Ok(security_flash(
+        &session,
+        "success_2fa",
+        "2FA is Enabled Successfully.",
+    ))
 }
 
-async fn cancel_two_factor(State(ctx): State<Ctx>, session: Session, CurrentUser(signed_in): CurrentUser) -> WebResult {
-    if matches!(two_factor_row(&ctx, signed_in.user.id).await?, Some((false, _))) {
-        sqlx::query("DELETE FROM password_securities WHERE user_id = ?").bind(signed_in.user.id).execute(&ctx.db).await?;
-        return Ok(security_flash(&session, "success_2fa", "2FA setup has been cancelled."));
+async fn cancel_two_factor(
+    State(ctx): State<Ctx>,
+    session: Session,
+    CurrentUser(signed_in): CurrentUser,
+) -> WebResult {
+    if matches!(
+        two_factor_row(&ctx, signed_in.user.id).await?,
+        Some((false, _))
+    ) {
+        sqlx::query("DELETE FROM password_securities WHERE user_id = ?")
+            .bind(signed_in.user.id)
+            .execute(&ctx.db)
+            .await?;
+        return Ok(security_flash(
+            &session,
+            "success_2fa",
+            "2FA setup has been cancelled.",
+        ));
     }
-    Ok(security_flash(&session, "error_2fa", "Unable to cancel 2FA setup."))
+    Ok(security_flash(
+        &session,
+        "error_2fa",
+        "Unable to cancel 2FA setup.",
+    ))
 }
 
-const WRONG_PASSWORD: &str = "Your password does not match with your account password. Please try again.";
+const WRONG_PASSWORD: &str =
+    "Your password does not match with your account password. Please try again.";
 
 /// `/disable2fa`: removes the setup entirely.
-async fn delete_two_factor(State(ctx): State<Ctx>, session: Session, input: Input, headers: HeaderMap, CurrentUser(signed_in): CurrentUser) -> WebResult {
+async fn delete_two_factor(
+    State(ctx): State<Ctx>,
+    session: Session,
+    input: Input,
+    headers: HeaderMap,
+    CurrentUser(signed_in): CurrentUser,
+) -> WebResult {
     let password = input.str("current-password");
     if password.is_empty() {
-        session.flash_errors(&[("current-password", "The current-password field is required.".to_owned())]);
+        session.flash_errors(&[(
+            "current-password",
+            "The current-password field is required.".to_owned(),
+        )]);
         return Ok(crate::auth::back(&headers, TO_SECURITY));
     }
     if !verify_password(&password, &signed_in.user.password) {
         return Ok(security_flash(&session, "error_2fa", WRONG_PASSWORD));
     }
-    sqlx::query("DELETE FROM password_securities WHERE user_id = ?").bind(signed_in.user.id).execute(&ctx.db).await?;
-    Ok(security_flash(&session, "success_2fa", "2FA is now Disabled."))
+    sqlx::query("DELETE FROM password_securities WHERE user_id = ?")
+        .bind(signed_in.user.id)
+        .execute(&ctx.db)
+        .await?;
+    Ok(security_flash(
+        &session,
+        "success_2fa",
+        "2FA is now Disabled.",
+    ))
 }
 
 /// `/profile-disable2fa`: keeps the secret, switched off.
-async fn switch_off_two_factor(State(ctx): State<Ctx>, session: Session, input: Input, headers: HeaderMap, CurrentUser(signed_in): CurrentUser) -> WebResult {
+async fn switch_off_two_factor(
+    State(ctx): State<Ctx>,
+    session: Session,
+    input: Input,
+    headers: HeaderMap,
+    CurrentUser(signed_in): CurrentUser,
+) -> WebResult {
     let password = input.str("current-password");
     if password.is_empty() {
-        session.flash_errors(&[("current-password", "The current-password field is required.".to_owned())]);
+        session.flash_errors(&[(
+            "current-password",
+            "The current-password field is required.".to_owned(),
+        )]);
         return Ok(crate::auth::back(&headers, TO_SECURITY));
     }
     if !verify_password(&password, &signed_in.user.password) {
         return Ok(security_flash(&session, "error_2fa", WRONG_PASSWORD));
     }
-    sqlx::query("UPDATE password_securities SET google2fa_enable = 0, updated_at = NOW() WHERE user_id = ?")
-        .bind(signed_in.user.id)
-        .execute(&ctx.db)
-        .await?;
-    Ok(security_flash(&session, "success_2fa", "2FA is now Disabled."))
+    sqlx::query(
+        "UPDATE password_securities SET google2fa_enable = 0, updated_at = NOW() WHERE user_id = ?",
+    )
+    .bind(signed_in.user.id)
+    .execute(&ctx.db)
+    .await?;
+    Ok(security_flash(
+        &session,
+        "success_2fa",
+        "2FA is now Disabled.",
+    ))
 }
 
-async fn security_disable_two_factor(State(ctx): State<Ctx>, session: Session, input: Input, headers: HeaderMap, CurrentUser(signed_in): CurrentUser) -> WebResult {
+async fn security_disable_two_factor(
+    State(ctx): State<Ctx>,
+    session: Session,
+    input: Input,
+    headers: HeaderMap,
+    CurrentUser(signed_in): CurrentUser,
+) -> WebResult {
     let json_wanted = guard::expects_json(&headers) || headers.contains_key("x-requested-with");
     let answer = |success: bool, message: &str| -> Response {
         if json_wanted {
             return Json(json!({"success": success, "message": message})).into_response();
         }
-        security_flash(&session, if success { "success_2fa" } else { "error_2fa" }, message)
+        security_flash(
+            &session,
+            if success { "success_2fa" } else { "error_2fa" },
+            message,
+        )
     };
     let password = input.str("current_password");
     if password.is_empty() {
-        return Ok(invalid("current_password", "The current password field is required."));
+        return Ok(invalid(
+            "current_password",
+            "The current password field is required.",
+        ));
     }
     if !verify_password(&password, &signed_in.user.password) {
-        return Ok(answer(false, "Your password does not match. Please try again."));
+        return Ok(answer(
+            false,
+            "Your password does not match. Please try again.",
+        ));
     }
-    let done = sqlx::query("UPDATE password_securities SET google2fa_enable = 0, updated_at = NOW() WHERE user_id = ?")
-        .bind(signed_in.user.id)
-        .execute(&ctx.db)
-        .await?;
+    let done = sqlx::query(
+        "UPDATE password_securities SET google2fa_enable = 0, updated_at = NOW() WHERE user_id = ?",
+    )
+    .bind(signed_in.user.id)
+    .execute(&ctx.db)
+    .await?;
     if done.rows_affected() == 0 && two_factor_row(&ctx, signed_in.user.id).await?.is_none() {
         return Ok(answer(false, "No 2FA configuration found for this user."));
     }
@@ -766,7 +1025,10 @@ mod tests {
         assert!(valid_timezone("UTC"));
         assert!(valid_timezone("Europe/Berlin"));
         assert!(!valid_timezone("Europe/Nowhere"));
-        assert!(!valid_timezone("Etc/GMT"), "PHP's region lists leave this out");
+        assert!(
+            !valid_timezone("Etc/GMT"),
+            "PHP's region lists leave this out"
+        );
     }
 
     #[test]

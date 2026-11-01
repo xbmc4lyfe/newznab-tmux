@@ -33,6 +33,7 @@ tower-http.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 nntmux-testkit.workspace = true
 redis.workspace = true
 tower.workspace = true
