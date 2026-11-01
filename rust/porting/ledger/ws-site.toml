@@ -281,19 +281,19 @@ status = "ported"
 kind = "route"
 id = "GET|POST|HEAD /mymovies"
 source = "App\\Http\\Controllers\\MyMoviesController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /myshows"
 source = "App\\Http\\Controllers\\MyShowsController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /myshows/browse"
 source = "App\\Http\\Controllers\\MyShowsController@browse"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -317,13 +317,13 @@ status = "ported"
 kind = "route"
 id = "GET|POST|HEAD /search"
 source = "App\\Http\\Controllers\\SearchController@search"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /series/{id?}"
 source = "App\\Http\\Controllers\\SeriesController@index"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -341,7 +341,7 @@ status = "ported"
 kind = "route"
 id = "GET|POST|HEAD /trending-tv"
 source = "App\\Http\\Controllers\\SeriesController@showTrending"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
