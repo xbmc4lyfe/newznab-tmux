@@ -21,6 +21,9 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 13. **Keep one access decision.** `LogFileRepository`'s listing is its access whitelist, yet the Wave 67.6 plan computed its own `accepted` flag that nothing read. A second answer to "may this be read?" can only drift from the real one.
 14. **Keep the design worth keeping.** `LogSearchCoordinator` is real code that stays: it sends a search to the index only when the index is reachable and caught up, falls back to a scan otherwise, and says which engine produced each result. The Wave 67.5 plans added nothing to that. The indexer's search should use the same shape.
 15. **A check that stays red stops being a check.** The #1083 pull request noted that CI failed before PHPUnit on a stale hash pin already failing on master, then merged. Fix a broken check or remove it, because a known failure hides new ones.
+16. **Never send a constant across a language boundary.** `XxxPipe::pipeName()` has PHP and native twins behind a toggle, just to return a fixed name. That code is older than Wave 67.1 and stays for a later slice. If a value needs no computation, return it.
+17. **Measure cleanup by what it clears.** Wave 67.1 reported 12.16x on planning for `CollectionCleanupService`, whose real work is database cleanup. A cleanup job should be measured by rows cleared per second and time spent holding locks.
+18. **Keep timing gates out of unit tests.** Four benchmark test files failed during a run on a machine with a load average above 24, then passed when rerun with load near 14. A speed gate in a unit suite fails on whatever else the machine is doing. Run benchmarks in their own job on a quiet machine, and compare trends.
 
 ## Slices
 
@@ -31,3 +34,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 2 | Wave 67.4 metadata plans: `Company`, `Game`, `Platform`, `InvitationService`, `IsbnDbService`, their Rust module and parity test | `2fac89eed` | 9 to 11 |
 | 3 | Wave 67.6 plans: `LogFileRepository`, `LogReader`, `LogSearcher`, `SearchQuery`, `Mcp/ProcessRunner`, their Rust module and parity test | `382db8a64` | 12, 13 |
 | 4 | Wave 67.5 plans: `LogIndex`, `LogSearchCoordinator`, `ManticoreLogSearcher`, `LogEntry`, `LogEntryParser`, their Rust module and parity test | `2a092659e` | 14, 15 |
+| 5 | Wave 67.1 plans: `XxxPipe`, `CollectionCleanupService`, `CollectionsCleaningService`, `ConfigurationProvider`, `DomainConfigurationRepository`, their Rust module and parity test | `a94d3fa42` | 16 to 18 |
