@@ -93,6 +93,9 @@ pub struct Options {
     pub limit: Option<usize>,
     /// Writes `release_identifications`, which also migrates the catalog.
     pub apply: bool,
+    /// Works through the releases in a fixed random order, so that a run stopped early, or one
+    /// with an srrDB budget, is a fair sample instead of the oldest posts.
+    pub shuffle: bool,
 }
 
 #[derive(Debug, Default)]
@@ -486,7 +489,10 @@ pub fn run(options: &Options, hooks: Hooks<'_>) -> Result<Report> {
         donors: &loaded.donors,
         hooks,
     };
-    let targets = loaded.targets;
+    let mut targets = loaded.targets;
+    if options.shuffle {
+        targets.sort_by_key(|target| sample_order(target.id));
+    }
     let target_count = targets.len();
     let answers = for_each_target(&nzbs_path, options.threads, targets, |target| {
         let (outcome, flags) = identify(target, &context);
@@ -959,6 +965,7 @@ mod tests {
             threads: 2,
             limit: None,
             apply,
+            shuffle: false,
         }
     }
 
