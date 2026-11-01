@@ -1,6 +1,8 @@
 //! What every worker role shares: the connections, a clean stop on SIGTERM, and the
 //! claim-work-commit loop.
 
+pub mod downtime;
+
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
