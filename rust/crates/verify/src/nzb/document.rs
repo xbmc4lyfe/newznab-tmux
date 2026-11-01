@@ -43,8 +43,8 @@ fn text(value: &str) -> String {
     out
 }
 
-/// The Unix time a stored post date names; the app runs in UTC. An unparsable date writes an empty
-/// attribute, as `(string) strtotime()` did.
+/// The Unix time a stored post date names; the app runs in UTC. Stored dates are `DATETIME` values;
+/// the other forms come from imported NZBs, and one that can't be read writes an empty attribute.
 fn post_time(value: &str) -> String {
     let parsed = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
         .map(|naive| naive.and_utc().timestamp())
@@ -114,10 +114,11 @@ pub fn document(manifest: &Manifest, verified_file_count: i64) -> Result<String>
     }
     let poster = attribute(&manifest.fromname);
     // A collection with no post date can't publish; it retries until it expires.
-    let Some(date) = manifest.date.as_deref() else {
-        bail!("Verified NZB has no post date.");
+    let date = match manifest.date.as_deref() {
+        Some(date) => post_time(date),
+        None if has_files => bail!("Verified NZB has no post date."),
+        None => String::new(),
     };
-    let date = post_time(date);
     let mut groups = String::new();
     for group in &manifest.groups {
         write!(groups, "<group>{}</group>", text(group))?;
