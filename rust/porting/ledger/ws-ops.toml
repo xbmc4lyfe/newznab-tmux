@@ -56,7 +56,7 @@ kind = "command"
 id = "nntmux:db"
 source = "app/Console/Commands/UpdateNNTmuxDB.php"
 status = "dropped"
-note = "Self-update for a checkout-based install. Deploys now ship images, and `nntmux-ctl migrate` covers the database."
+note = "Self-update for a checkout-based install. `nntmux-ctl migrate` applies migrations on deploy; rollback and seed options have no Rust equivalent, because the schema baseline replaces them."
 
 [[entry]]
 kind = "command"
@@ -317,7 +317,8 @@ status = "todo"
 kind = "schedule"
 id = "command: 'multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBac"
 source = "routes/console.php"
-status = "ported"
+status = "todo"
+note = "Waiting on the fixnames role reading TMUX_FIX_NAMES_PREDBFT and TMUX_FIX_NAMES_PREDBFT_SCHEDULED, so the pass keeps one launcher."
 
 [[entry]]
 kind = "schedule"

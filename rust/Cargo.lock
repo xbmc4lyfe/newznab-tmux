@@ -2554,7 +2554,6 @@ dependencies = [
  "futures-util",
  "metrics",
  "nntmux-core",
- "nntmux-namefix",
  "nntmux-ops",
  "nntmux-runtime",
  "nntmux-testkit",
