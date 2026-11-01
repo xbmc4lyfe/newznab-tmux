@@ -1,6 +1,9 @@
 //! The schedule from `routes/console.php`. Entries that have no place in the Rust stack, or that
 //! a role now runs continuously, are in `rust/porting/ledger/ws-ops.toml` with the reason.
 
+use std::time::Duration;
+
+use anyhow::Context;
 use chrono::Weekday;
 use nntmux_runtime::Ctx;
 
@@ -24,9 +27,35 @@ fn task(
     }
 }
 
+/// Stops a slow export before its next runs pile up behind it.
+const EXPORT_LIMIT: Duration = Duration::from_secs(240);
+
 pub fn tasks() -> Vec<Task<Ctx>> {
-    use nntmux_ops::{accounts, activity, disposable, resets, stats, system_metrics};
+    use nntmux_ops::{
+        accounts, activity, disposable, metrics_export, processing_stats, resets, stats,
+        system_metrics,
+    };
     vec![
+        Task {
+            enabled: metrics_export::enabled,
+            ..task(
+                "monitoring:export-metrics --scheduled",
+                EveryMinutes(1),
+                |ctx| {
+                    Box::pin(async move {
+                        tokio::time::timeout(EXPORT_LIMIT, metrics_export::push(&ctx))
+                            .await
+                            .context("the metrics export ran over its limit")?
+                    })
+                },
+            )
+        },
+        Task {
+            enabled: metrics_export::enabled,
+            ..task("processing-stats", EveryMinutes(1), |ctx| {
+                Box::pin(async move { processing_stats::publish(&ctx).await })
+            })
+        },
         task("nntmux:collect-stats", EveryMinutes(15), |ctx| {
             Box::pin(async move { stats::collect(&ctx.db).await })
         }),

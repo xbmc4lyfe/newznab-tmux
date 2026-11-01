@@ -10,7 +10,7 @@ status = "ported"
 kind = "command"
 id = "monitoring:export-metrics"
 source = "app/Console/Commands/ExportMonitoringMetrics.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -311,7 +311,7 @@ status = "ported"
 kind = "schedule"
 id = "command: 'monitoring:export-metrics --scheduled')->everyMinute()->withoutOverlapping(5)->when(stati"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"

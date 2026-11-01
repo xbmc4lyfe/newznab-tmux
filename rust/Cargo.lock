@@ -2372,6 +2372,7 @@ dependencies = [
  "futures-util",
  "nntmux-categorize",
  "nntmux-core",
+ "nntmux-postprocess",
  "nntmux-runtime",
  "nntmux-search",
  "nntmux-testkit",

@@ -5,7 +5,10 @@
 pub mod accounts;
 pub mod activity;
 pub mod disposable;
+pub mod metrics_export;
 pub mod populate;
+pub mod processing_stats;
+pub mod prometheus;
 pub mod resets;
 pub mod runtime_state;
 pub mod stats;
@@ -30,6 +33,14 @@ pub enum Command {
     DisableExpiredPromotions,
     /// Complete registration periods past their end (`nntmux:disable-expired-registration-periods`).
     DisableExpiredRegistrationPeriods,
+    /// Push application metrics to the Pushgateway (`monitoring:export-metrics`).
+    ExportMetrics {
+        /// Print the metrics instead of pushing them.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Recompute the processing statistics the metrics export reads.
+    ProcessingStats,
     /// Rebuild Manticore indexes from the database (`nntmux:populate`).
     Populate {
         /// Index to rebuild: releases, predb, movies, tvshows, music, books, games, console, steam
@@ -135,6 +146,19 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 println!("Marked registration period as done: {name}");
             }
             println!("Completed {} expired registration period(s).", names.len());
+        }
+        Command::ExportMetrics { print } => {
+            if print {
+                print!("{}", metrics_export::render(&ctx).await);
+            } else if metrics_export::enabled() {
+                metrics_export::push(&ctx).await?;
+            } else {
+                println!("Monitoring is disabled (MONITORING_ENABLED=false); nothing to export.");
+            }
+        }
+        Command::ProcessingStats => {
+            processing_stats::publish(&ctx).await?;
+            println!("Processing statistics published.");
         }
         Command::Populate {
             indexes,
