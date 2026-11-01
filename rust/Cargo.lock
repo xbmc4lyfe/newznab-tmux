@@ -2110,9 +2110,12 @@ dependencies = [
  "anyhow",
  "clap",
  "nntmux-runtime",
+ "nntmux-search",
+ "nntmux-testkit",
  "regex",
  "serde_json",
  "sqlx",
+ "tokio",
 ]
 
 [[package]]
@@ -2248,13 +2251,21 @@ name = "nntmux-namefix"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "chrono",
  "clap",
  "nntmux-categorize",
  "nntmux-core",
  "nntmux-predb",
  "nntmux-runtime",
+ "nntmux-search",
+ "nntmux-testkit",
+ "redis",
  "regex",
  "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
  "unicode-normalization",
 ]
 
