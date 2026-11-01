@@ -108,7 +108,11 @@ async fn unverified_and_disabled_accounts_cant_sign_in() {
         .await;
     assert!(!browser_is_signed_in(&mut browser).await);
     let mail = take_mail(&ctx, &format!("{unverified}@example.com")).await;
-    assert_eq!(mail.len(), 1, "the right password gets a fresh verification link");
+    assert_eq!(
+        mail.len(),
+        1,
+        "the right password gets a fresh verification link"
+    );
     let mut browser = Browser::new(&ctx);
     browser
         .post("/login", &[("username", &disabled), ("password", PASSWORD)])
