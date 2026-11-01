@@ -61,7 +61,7 @@ final class RemoteReleasePublisher
                 ->withOptions($this->progressOptions($progress))
                 ->withRequestMiddleware($this->cancellationGate($progress))
                 ->retry(3, 1000, fn (\Throwable $error): bool => $error instanceof ConnectionException && ! $this->cancelledNow(), throw: false)
-                ->post((string) config('release_verification.publish_url'), $payload);
+                ->post(trim((string) config('release_verification.publish_url')), $payload);
         } catch (\Throwable $error) {
             $timing?->reportRoundTrip('threw', null);
 
@@ -91,7 +91,7 @@ final class RemoteReleasePublisher
     public function batchAvailable(): bool
     {
         $url = config('release_verification.publish_batch_url');
-        if (! is_string($url) || $url === '') {
+        if (! is_string($url) || trim($url) === '') {
             return false;
         }
         try {
@@ -291,7 +291,7 @@ final class RemoteReleasePublisher
                 ->withOptions($this->progressOptions())
                 ->withRequestMiddleware($this->cancellationGate())
                 ->retry(3, 1000, fn (\Throwable $error): bool => $error instanceof ConnectionException && ! $this->cancelledNow(), throw: false)
-                ->post((string) config('release_verification.publish_batch_url'),
+                ->post(trim((string) config('release_verification.publish_batch_url')),
                     ['protocol' => RemotePublicationService::BATCH_PROTOCOL, 'items' => array_values($payloads)]);
         } catch (\Throwable $error) {
             $timing?->reportRoundTrip('threw', null, count($payloads));

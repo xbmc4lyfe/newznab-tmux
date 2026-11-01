@@ -63,10 +63,10 @@ Generate the Compose and application configuration using that host for both prim
 chmod 600 docker/config/usenet_servers.json
 export NNTP_PRIMARY_HOST=news.example.com
 export NNTP_ALT_HOST="$NNTP_PRIMARY_HOST"
-just --justfile docker/Justfile --working-directory docker env
+just docker env
 ```
 
-For a separate fallback provider, add a second server entry and set `NNTP_ALT_HOST` to its host before running `just --justfile docker/Justfile --working-directory docker env`.
+For a separate fallback provider, add a second server entry and set `NNTP_ALT_HOST` to its host before running `just docker env`.
 
 This creates `docker/.env` and `docker/config/app.env`, including a generated application key, database passwords, and administrator password. Keep these files private. Edit `docker/.env` for ports and memory limits, and `docker/config/app.env` for application settings and metadata API keys.
 
@@ -77,8 +77,8 @@ This creates `docker/.env` and `docker/config/app.env`, including a generated ap
 Run this for a fresh installation:
 
 ```bash
-just --justfile docker/Justfile --working-directory docker init DEPLOY_BY=local-setup
-just --justfile docker/Justfile --working-directory docker ps
+just docker init DEPLOY_BY=local-setup
+just docker ps
 ```
 
 Initialization builds the images, installs the database and search tables, configures monitoring, seeds groups and processing settings, attempts a PreDB import, and starts the stack. A failed public PreDB import is retried by the scheduler.
@@ -96,18 +96,20 @@ If `rg` is unavailable, open `docker/config/app.env` in your editor. Grafana is 
 Run these from the repository root:
 
 ```bash
-just --justfile docker/Justfile --working-directory docker ps                         # Service status
-just --justfile docker/Justfile --working-directory docker logs s=indexer             # Follow indexing logs
-just --justfile docker/Justfile --working-directory docker tmux                       # Attach to tmux; detach with Ctrl-a, then d
-just --justfile docker/Justfile --working-directory docker down                       # Stop containers; retain bind-mounted data
-just --justfile docker/Justfile --working-directory docker up DEPLOY_BY=local-start   # Start an initialized stack
-just --justfile docker/Justfile --working-directory docker backup                     # Database dump in docker/backups/
-just --justfile docker/Justfile --working-directory docker help                       # All available commands
+just docker ps                                 # Service status
+just docker logs s=indexer                     # Follow indexing logs
+just docker tmux                               # Attach to tmux; detach with Ctrl-a, then d
+just docker down                               # Stop containers; retain bind-mounted data
+just docker up DEPLOY_BY=local-start           # Start an initialized stack
+just deploy                                    # Sync origin/master & deploy dirty services
+just deploy web                                # Redeploy one component (or just deploy-web)
+just docker backup                             # Database dump in docker/backups/
+just docker help                               # All available commands
 ```
 
-After updating the checkout, back up the database and use `just --justfile docker/Justfile --working-directory docker deploy DEPLOY_BY=local-update` to rebuild, pause affected application writers, run migrations when needed, and recreate only the affected services. Use `deploy` for updates; `init` reapplies the starter groups and tuning.
+When you run `just deploy-plan`, `just build-stack`, or `just deploy` (or `just deploy <component>` / `just deploy-<component>` for a single component), the deployment guard automatically verifies that the checkout is on the default branch (`master`), fetches `origin/master` from GitHub, and fast-forwards the checkout before planning, building, pausing affected application writers, running migrations when needed, and recreating the targeted or affected services. Use `deploy` for updates; `init` reapplies the starter groups and tuning.
 
-Persistent data lives in `docker/data/`, logs in `docker/logs/`, and database dumps in `docker/backups/`. The backup command covers MariaDB; preserve application configuration and NZB/storage files separately. If initialization fails, inspect `just --justfile docker/Justfile --working-directory docker logs` before retrying; a partially initialized database needs recovery rather than a reset.
+Persistent data lives in `docker/data/`, logs in `docker/logs/`, and database dumps in `docker/backups/`. The backup command covers MariaDB; preserve application configuration and NZB/storage files separately. If initialization fails, inspect `just docker logs` before retrying; a partially initialized database needs recovery rather than a reset.
 
 ## Cloud deployments
 

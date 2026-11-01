@@ -84,7 +84,7 @@ final class IrcNetworks
         $configured = config('irc_settings.scrape_irc_channels');
 
         try {
-            $channels = $configured ? unserialize((string) $configured, ['allowed_classes' => false]) : null;
+            $channels = $configured ? @unserialize((string) $configured, ['allowed_classes' => false]) : null;
         } catch (\ValueError) {
             $channels = null;
         }

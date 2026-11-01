@@ -95,6 +95,27 @@ class ReleaseVerificationRemoteBatchPublisherTest extends ReleaseVerificationCan
         $this->assertArrayNotHasKey('files', $sent['items'][0]['evidence']);
     }
 
+    public function test_publish_urls_are_trimmed_and_a_blank_batch_url_counts_as_unset(): void
+    {
+        $this->batchSchema(releases: 2);
+        config(['release_verification.publish_url' => ' '.self::SINGLE."\n", 'release_verification.publish_batch_url' => ' '.self::BATCH."\n"]);
+        $this->requested = [];
+        $this->servePrimary();
+        $publisher = app(RemoteReleasePublisher::class);
+        $batched = $this->claimedCandidate('batched@article');
+
+        $publisher->publishMany([new RemotePublishItem($batched, $this->sampled($batched))]);
+        $this->assertSame([self::BATCH], $this->requested);
+
+        config(['release_verification.publish_batch_url' => "  \n"]);
+        $this->assertFalse($publisher->batchAvailable());
+
+        $this->requested = [];
+        $single = $this->claimedCandidate('single@article');
+        $publisher->publish($single, $this->sampled($single));
+        $this->assertSame([self::SINGLE], $this->requested);
+    }
+
     public function test_resending_a_batch_returns_the_same_outcomes_and_publishes_nothing_twice(): void
     {
         $this->batchSchema(releases: 1);

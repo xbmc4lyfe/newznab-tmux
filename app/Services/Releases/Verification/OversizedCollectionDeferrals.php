@@ -37,7 +37,46 @@ final class OversizedCollectionDeferrals
     /** The most header metadata one candidate may hold, counted as in CandidateRepository's snapshot. */
     public static function budget(): int
     {
-        return max(1, (int) config('release_verification.metadata_bytes', 50331648));
+        return max(1, (int) config('release_verification.metadata_bytes', 268435456));
+    }
+
+    /** Whether a deferred collection is now eligible for archival because the configured budget was raised. */
+    public function unlockedByRaisedBudget(int $collectionId, string $collectionHash): bool
+    {
+        return $this->guarded(function () use ($collectionId, $collectionHash): bool {
+            if (! $this->available()) {
+                return false;
+            }
+            $row = DB::table(self::TABLE)->where('collection_id', $collectionId)->first(['collectionhash', 'budget_bytes']);
+
+            return $row !== null && $row->collectionhash === $collectionHash && (int) $row->budget_bytes < self::budget();
+        }, false);
+    }
+
+    /**
+     * @param  list<int>  $ids
+     * @return array<int, true>
+     */
+    public function unlockedIds(array $ids): array
+    {
+        return $this->guarded(function () use ($ids): array {
+            if ($ids === [] || ! $this->available()) {
+                return [];
+            }
+            $budget = self::budget();
+            $unlocked = [];
+            foreach (array_chunk($ids, 500) as $chunk) {
+                $current = DB::table('collections')->whereIn('id', $chunk)->pluck('collectionhash', 'id')->all();
+                foreach (DB::table(self::TABLE)->whereIn('collection_id', $chunk)->get(['collection_id', 'collectionhash', 'budget_bytes']) as $row) {
+                    $id = (int) $row->collection_id;
+                    if (($current[$id] ?? null) === $row->collectionhash && (int) $row->budget_bytes < $budget) {
+                        $unlocked[$id] = true;
+                    }
+                }
+            }
+
+            return $unlocked;
+        }, []);
     }
 
     /**

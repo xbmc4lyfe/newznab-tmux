@@ -935,6 +935,61 @@ PHP);
         $this->assertSame(1, $builds());
     }
 
+    #[Test]
+    public function remote_default_branch_is_fetched_and_fast_forwarded_and_non_default_or_unpushed_commits_fail_closed(): void
+    {
+        $origin = $this->dir.'/origin.git';
+        $upstream = $this->dir.'/upstream';
+        $this->git('branch', '-M', 'master');
+        (new Process(['git', 'init', '-q', '--bare', $origin]))->mustRun();
+        $this->git('remote', 'add', 'origin', $origin);
+        $this->git('push', '-q', '-u', 'origin', 'master');
+
+        $deploy = ['run', 'build', '--', 'sh', '-c', 'cat '.$this->repo.'/app.txt >> '.$this->dir.'/deployed'];
+        $flags = ['SKIP_IF_UNCHANGED' => '1', 'STAMP_ON_SUCCESS' => '1'];
+
+        // Initial deploy at commit 1.
+        $this->assertSame(0, $this->guard($deploy, $flags)->getExitCode());
+        $this->assertSame(["one\n"], file($this->dir.'/deployed'));
+
+        // Advance origin/master in a separate clone without pulling locally.
+        (new Process(['git', 'clone', '-q', '--branch', 'master', $origin, $upstream]))->mustRun();
+        (new Process(['git', 'config', 'user.email', 'test@example.com'], $upstream))->mustRun();
+        (new Process(['git', 'config', 'user.name', 'Test'], $upstream))->mustRun();
+        file_put_contents($upstream.'/app.txt', "two-from-origin\n");
+        (new Process(['git', 'commit', '-q', '-am', 'remote runtime update'], $upstream))->mustRun();
+        (new Process(['git', 'push', '-q', 'origin', 'master'], $upstream))->mustRun();
+        $remoteHead = trim((new Process(['git', 'rev-parse', '--short', 'HEAD'], $upstream))->mustRun()->getOutput());
+
+        // deploy-guard automatically fetches origin/master, fast-forwards, and deploys the new commit.
+        $synced = $this->guard($deploy, $flags);
+        $this->assertSame(0, $synced->getExitCode(), $synced->getErrorOutput());
+        $this->assertStringContainsString('fast-forwarded master', $synced->getOutput());
+        $this->assertSame(["one\n", "two-from-origin\n"], file($this->dir.'/deployed'));
+        $this->assertStringContainsString('result=synced', (string) file_get_contents($this->dir.'/deploy.log'));
+        $this->assertStringContainsString('head='.$remoteHead.' result=started', (string) file_get_contents($this->dir.'/deploy.log'));
+
+        // Unpushed local commit on master fails closed instead of deploying unmerged local code.
+        file_put_contents($this->repo.'/app.txt', "unpushed-local\n");
+        $this->git('commit', '-q', '-am', 'local unpushed commit');
+        $unpushed = $this->guard($deploy, $flags);
+        $this->assertSame(1, $unpushed->getExitCode());
+        $this->assertStringContainsString('cannot be fast-forwarded', $unpushed->getErrorOutput());
+        $this->assertCount(2, file($this->dir.'/deployed'));
+
+        // Reset back to origin/master, then switch to a feature branch: fails closed.
+        $this->git('reset', '--hard', 'origin/master');
+        $this->git('checkout', '-q', '-b', 'codex/feature');
+        $nonDefault = $this->guard($deploy, $flags);
+        $this->assertSame(1, $nonDefault->getExitCode());
+        $this->assertStringContainsString('not default branch master', $nonDefault->getErrorOutput());
+        $this->assertCount(2, file($this->dir.'/deployed'));
+
+        // DEPLOY_SYNC_REMOTE=0 explicitly allows offline/local-branch execution when requested.
+        $override = $this->guard($deploy, $flags + ['DEPLOY_SYNC_REMOTE' => '0']);
+        $this->assertSame(0, $override->getExitCode());
+    }
+
     /**
      * @param  list<string>  $arguments
      * @param  array<string, string>  $env

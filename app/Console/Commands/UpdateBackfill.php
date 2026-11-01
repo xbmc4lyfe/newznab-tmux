@@ -38,13 +38,17 @@ class UpdateBackfill extends Command
             $nntp = $this->getNntp();
             $backfill = new BackfillService(nntp: $nntp);
 
+            $isGroupName = is_string($mode)
+                && ! \in_array($mode, ['all', 'alph', 'date', 'safe'], true)
+                && preg_match('/^[a-z0-9+_.-]+\.[a-z0-9+_.-]+$/i', $mode) === 1;
+
             match (true) {
                 $mode === 'all' && ! isset($quantity) => $backfill->backfillAllGroups(),
                 $mode === 'alph' && is_numeric($quantity) => $backfill->backfillAllGroups('', (int) $quantity, 'normal'),
                 $mode === 'date' && is_numeric($quantity) => $backfill->backfillAllGroups('', (int) $quantity, 'date'),
                 $mode === 'safe' && is_numeric($quantity) => $backfill->safeBackfill((int) $quantity),
-                preg_match('/^alt\.binaries\..+$/i', $mode) && ! isset($quantity) => $backfill->backfillAllGroups($mode),
-                preg_match('/^alt\.binaries\..+$/i', $mode) && is_numeric($quantity) => $backfill->backfillAllGroups($mode, (int) $quantity),
+                $isGroupName && ! isset($quantity) => $backfill->backfillAllGroups($mode),
+                $isGroupName && is_numeric($quantity) => $backfill->backfillAllGroups($mode, (int) $quantity),
                 default => throw new \Exception($this->getHelpText()),
             };
 
@@ -74,7 +78,7 @@ class UpdateBackfill extends Command
     /**
      * Get NNTP connection.
      */
-    private function getNntp(): NNTPService
+    protected function getNntp(): NNTPService
     {
         $nntp = new NNTPService;
 

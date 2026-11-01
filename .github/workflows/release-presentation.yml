@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   native-presentation:
-    # Avoid self-hosted workers that also advertise ubuntu-latest but have no Docker daemon.
+    # Needs the Docker daemon that GitHub-hosted images provide.
     runs-on: ubuntu-24.04
     env:
       RUST_TOOLCHAIN: '1.98.0'

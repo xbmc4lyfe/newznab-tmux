@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace Tests\Feature;
 
+use App\Http\Controllers\Admin\AdminAnidbController;
 use App\Services\AnidbService;
 use App\View\Composers\GlobalDataComposer;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use ReflectionClass;
@@ -126,6 +129,28 @@ final class AdminAnidbControllerTest extends TestCase
             Schema::dropIfExists('anidb_info');
             Schema::dropIfExists('anidb_titles');
         }
+    }
+
+    public function test_edit_submit_casts_request_values_for_the_strict_update_signature(): void
+    {
+        $request = Request::create('/admin/anidb-edit/123', 'POST', [
+            'action' => 'submit',
+            'anidbid' => '123',
+            'title' => 'Regression Test Anime',
+            'rating' => 825,
+        ]);
+
+        $queries = DB::pretend(function () use ($request): void {
+            $response = app(AdminAnidbController::class)->edit($request, 123);
+
+            self::assertInstanceOf(RedirectResponse::class, $response);
+        });
+
+        $updates = array_values(array_filter($queries, static fn (array $query): bool => str_contains($query['query'], 'UPDATE anidb_titles')));
+
+        self::assertCount(1, $updates);
+        self::assertStringContainsString('Regression Test Anime', $updates[0]['query']);
+        self::assertStringContainsString('WHERE anidbid = 123', $updates[0]['query']);
     }
 
     /**

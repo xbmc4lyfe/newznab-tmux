@@ -98,7 +98,8 @@ class FixNzbSplitNames extends Command
                         'musicinfo_id' => null,
                         'consoleinfo_id' => null,
                         'gamesinfo_id' => 0,
-                        'bookinfo_id' => 0,
+                        'bookinfo_id' => null,
+                        'movieinfo_id' => null,
                         'anidbid' => null,
                     ]);
 

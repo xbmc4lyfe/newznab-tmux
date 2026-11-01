@@ -25,6 +25,14 @@ class IrcNetworksTest extends TestCase
     }
 
     #[Test]
+    public function a_corrupt_channel_setting_falls_back_to_the_default_channel(): void
+    {
+        config(['irc_settings.scrape_irc_channels' => 'not-a-serialized-value']);
+
+        $this->assertSame(['#PreNNTmux' => null], IrcNetworks::resolve('synirc')['channels']);
+    }
+
+    #[Test]
     public function the_synirc_network_keeps_using_the_top_level_settings(): void
     {
         config([

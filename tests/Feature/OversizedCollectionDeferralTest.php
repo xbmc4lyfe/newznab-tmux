@@ -78,6 +78,38 @@ class OversizedCollectionDeferralTest extends ReleaseVerificationCandidatesTest
         $this->assertSame(600, count(app(ManifestStore::class)->read($candidate->manifest_path)['files'][0]['segments']), 'Every article is archived.');
     }
 
+    public function test_raising_the_budget_after_expiry_hours_admits_the_deferred_upload_as_ready(): void
+    {
+        $oversized = $this->upload('oversized', 600);
+        $this->createReleases();
+        $this->assertSame(1, DB::table('release_verification_oversized_collections')->count());
+
+        Carbon::setTestNow('2026-10-22 12:00:01');
+        config(['release_verification.metadata_bytes' => self::BUDGET * 4]);
+        $this->createReleases();
+
+        $this->assertFalse(DB::table('collections')->where('id', $oversized)->exists());
+        $this->assertSame(0, DB::table('release_verification_oversized_collections')->count());
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame('ready', $candidate->status);
+        $this->assertSame(600, count(app(ManifestStore::class)->read($candidate->manifest_path)['files'][0]['segments']));
+    }
+
+    public function test_the_stale_sweep_archives_a_deferred_upload_once_the_budget_is_raised(): void
+    {
+        $oversized = $this->upload('oversized', 600);
+        $this->createReleases();
+        DB::table('collections')->where('id', $oversized)->update(['dateadded' => '2026-10-01 00:00:00']);
+        config(['release_verification.metadata_bytes' => self::BUDGET * 4]);
+
+        $this->sweep();
+
+        $this->assertFalse(DB::table('collections')->where('id', $oversized)->exists());
+        $this->assertSame(0, DB::table('release_verification_oversized_collections')->count());
+        $candidate = DB::table('release_verification_candidates')->sole();
+        $this->assertSame('ready', $candidate->status);
+    }
+
     public function test_a_deferral_left_by_a_replaced_collection_does_not_hold_back_another_upload(): void
     {
         $id = $this->upload('fresh', 1);

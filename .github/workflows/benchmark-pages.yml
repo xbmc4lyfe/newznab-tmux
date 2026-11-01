@@ -45,7 +45,7 @@ concurrency:
 
 jobs:
   test:
-    # Avoid self-hosted workers that also advertise ubuntu-latest without Node.js installed.
+    # Needs the Node.js that GitHub-hosted images provide.
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.source.outputs.sha }}

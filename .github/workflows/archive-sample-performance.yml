@@ -1,37 +1,38 @@
 name: Archive and sample planning performance
 
 on:
-  push:
-    branches: [master]
-  pull_request:
-    branches: [master]
-    paths:
-      - '.github/workflows/archive-sample-performance.yml'
-      - 'scripts/*benchmark*'
-      - 'scripts/composer-install-ci.sh'
-      - 'app/Services/Releases/Fingerprint/**'
-      - 'app/Services/Releases/Verification/*SpotCheckPlanner.php'
-      - 'app/Services/Releases/Verification/*HeaderFilenameIdentity.php'
-      - 'app/Services/Binaries/BinariesService.php'
-      - 'app/Services/Binaries/HeaderParser.php'
-      - 'app/Services/Binaries/NativePerArticleObfuscation.php'
-      - 'app/Services/Binaries/PerArticleObfuscationGate.php'
-      - 'app/Services/Binaries/PerArticleObfuscationRouter.php'
-      - 'tests/Support/PerArticleObfuscationCorpus.php'
-      - 'tests/Unit/PerArticleObfuscation*'
-      - 'docker/app/nzb-yenc-ffi/**'
-      - 'scripts/generate-header-filename-*'
-      - 'tests/Support/HeaderFilenameIdentityCorpus.php'
-      - 'tests/Unit/*FilenameIdentity*'
-      - 'tests/Fixtures/*BenchmarkFixtures.php'
-      - 'tests/Fixtures/par2/**'
-      - 'tests/Unit/*BenchmarkTest.php'
-      - 'tests/Unit/test_benchmark*'
-      - 'tests/Unit/test_composer_install_retry.py'
-      - 'tests/Unit/test_date_cpp_reference.py'
-      - 'tests/Unit/CppDateWorkerTest.php'
-      - 'composer.json'
-      - 'composer.lock'
+  # TODO: turn back on
+  # push:
+  #   branches: [master]
+  # pull_request:
+  #   branches: [master]
+  #   paths:
+  #     - '.github/workflows/archive-sample-performance.yml'
+  #     - 'scripts/*benchmark*'
+  #     - 'scripts/composer-install-ci.sh'
+  #     - 'app/Services/Releases/Fingerprint/**'
+  #     - 'app/Services/Releases/Verification/*SpotCheckPlanner.php'
+  #     - 'app/Services/Releases/Verification/*HeaderFilenameIdentity.php'
+  #     - 'app/Services/Binaries/BinariesService.php'
+  #     - 'app/Services/Binaries/HeaderParser.php'
+  #     - 'app/Services/Binaries/NativePerArticleObfuscation.php'
+  #     - 'app/Services/Binaries/PerArticleObfuscationGate.php'
+  #     - 'app/Services/Binaries/PerArticleObfuscationRouter.php'
+  #     - 'tests/Support/PerArticleObfuscationCorpus.php'
+  #     - 'tests/Unit/PerArticleObfuscation*'
+  #     - 'docker/app/nzb-yenc-ffi/**'
+  #     - 'scripts/generate-header-filename-*'
+  #     - 'tests/Support/HeaderFilenameIdentityCorpus.php'
+  #     - 'tests/Unit/*FilenameIdentity*'
+  #     - 'tests/Fixtures/*BenchmarkFixtures.php'
+  #     - 'tests/Fixtures/par2/**'
+  #     - 'tests/Unit/*BenchmarkTest.php'
+  #     - 'tests/Unit/test_benchmark*'
+  #     - 'tests/Unit/test_composer_install_retry.py'
+  #     - 'tests/Unit/test_date_cpp_reference.py'
+  #     - 'tests/Unit/CppDateWorkerTest.php'
+  #     - 'composer.json'
+  #     - 'composer.lock'
   workflow_dispatch:
     inputs:
       comparison:

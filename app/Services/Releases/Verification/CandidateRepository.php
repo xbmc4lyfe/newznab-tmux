@@ -31,6 +31,19 @@ final class CandidateRepository
 
     private const array CLAIMABLE_STATUSES = ['ready', 'pending', 'unknown', 'verifying'];
 
+    private const array EXPIRABLE_STATUSES = [
+        'ready',
+        'waiting_upload',
+        'pending',
+        'unknown',
+        'header_rejected',
+        'unrepairable',
+        'verifying',
+        'dirty',
+        'metadata_deferred',
+        'metadata_review',
+    ];
+
     /** Window reads per claim while concurrent claimers keep winning the rows this worker tried. */
     private const int CLAIM_WINDOW_PASSES = 10;
 
@@ -261,6 +274,10 @@ final class CandidateRepository
                 $path = $prepared === null ? $this->store->write($manifest) : $this->store->writePrepared($prepared);
                 $size = $this->store->size($path);
                 $arrivalAt = Carbon::parse($collection->last_seen_at ?? $collection->dateadded ?? $collection->added ?? now())->format('Y-m-d H:i:s');
+                if (is_string($collection->collectionhash)
+                    && app(OversizedCollectionDeferrals::class)->unlockedByRaisedBudget($collectionId, $collection->collectionhash)) {
+                    $arrivalAt = max($arrivalAt, now()->format('Y-m-d H:i:s'));
+                }
                 $lastUniqueAt = $existing === null ? (! $merges ? $arrivalAt : max($arrivalAt, $previous->last_unique_at))
                     : ($newArticles ? max($arrivalAt, $existing->last_unique_at) : $existing->last_unique_at);
                 $expired = $lastUniqueAt < now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
@@ -1023,6 +1040,7 @@ final class CandidateRepository
         $hours = (int) config('release_verification.partial_after_hours', 4);
 
         return $hours > 0 && ($candidate->release_id ?? null) === null && is_string($candidate->last_unique_at ?? null)
+            && $candidate->last_unique_at >= self::owedPartialCutoff()
             && $candidate->last_unique_at < now()->subHours($hours)->format('Y-m-d H:i:s');
     }
 
@@ -1045,6 +1063,7 @@ final class CandidateRepository
         }
         $now = now();
         $cutoff = $now->copy()->subHours($hours)->format('Y-m-d H:i:s');
+        $owedCutoff = self::owedPartialCutoff();
 
         // The verification_due index serves the status / next_attempt_at order.
         if (DB::transactionLevel() === 0 && in_array(DB::getDriverName(), ['mysql', 'mariadb'], true)) {
@@ -1053,18 +1072,19 @@ final class CandidateRepository
             DB::statement('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
         }
 
-        return DB::transaction(function () use ($limit, $cutoff, $now, $hours): int {
+        return DB::transaction(function () use ($limit, $cutoff, $owedCutoff, $now, $hours): int {
             // Skip rows ingestion holds rather than wait on them, and take the next due ones instead, so a busy
             // prefix never hides later stalled uploads. Each row's predicates hold under its lock.
             $query = DB::table('release_verification_candidates')->where('status', 'waiting_upload')
-                ->where('next_attempt_at', '<=', $now)->whereNull('release_id')->whereNull('lease_token')
+                ->where('next_attempt_at', '>=', $owedCutoff)->where('next_attempt_at', '<=', $now)
+                ->where('last_unique_at', '>=', $owedCutoff)->whereNull('release_id')->whereNull('lease_token')
                 ->orderBy('next_attempt_at')->orderBy('id')->limit(max(1, $limit));
             $rows = (in_array(DB::getDriverName(), ['mysql', 'mariadb'], true) ? $query->lock('for update skip locked') : $query->lockForUpdate())
                 ->get(['id', 'last_unique_at', 'reason']);
             $eligible = [];
             foreach ($rows as $row) {
-                if (str_starts_with((string) ($row->reason ?? ''), self::PARTIAL_DEFERRED)) {
-                    // Already tried and refused by policy: only new headers change that.
+                if (str_starts_with((string) ($row->reason ?? ''), self::PARTIAL_DEFERRED) || $row->last_unique_at < $owedCutoff) {
+                    // Already tried and refused by policy, or past the partial-attempt window: only new headers change that.
                     DB::table('release_verification_candidates')->where('id', $row->id)
                         ->update(['next_attempt_at' => $now->copy()->addHours(max(1, (int) config('release_verification.expiry_hours')))->format('Y-m-d H:i:s')]);
                 } elseif ($row->last_unique_at < $cutoff) {
@@ -1271,9 +1291,93 @@ final class CandidateRepository
         if ($mayStart !== null && ! $mayStart()) {
             return;
         }
+        $this->expireCandidates($mayStart);
+        $this->expireRetainedPartials($mayStart);
+        $this->settleLateArticleHolders($mayStart);
+    }
+
+    /**
+     * Page through candidates by primary key, resuming where the last pass stopped so an expired or
+     * owed prefix never makes maintenance a full-table scan.
+     *
+     * @param  (callable(): bool)|null  $mayStart
+     */
+    private function expireCandidates(?callable $mayStart): void
+    {
+        $cursorKey = 'release_verification:expiry_cursor';
+        try {
+            $after = max(0, (int) Cache::get($cursorKey, 0));
+        } catch (Throwable) {
+            $after = 0;
+        }
+        $startAfter = $after;
+        $wrapped = $after === 0;
         $partials = (int) config('release_verification.partial_after_hours', 4) > 0;
-        $ids = DB::table('release_verification_candidates')->whereNull('release_id')
-            ->whereIn('status', ['ready', 'waiting_upload', 'pending', 'unknown', 'header_rejected', 'unrepairable', 'verifying', 'dirty', 'metadata_deferred', 'metadata_review'])
+        $expired = 0;
+        try {
+            for ($page = 0; $page < 10 && $expired < 100; $page++) {
+                if ($page > 0 && $mayStart !== null && ! $mayStart()) {
+                    return;
+                }
+                $through = $wrapped && $startAfter > 0 ? $startAfter : null;
+                $bounds = $this->expiryPageBounds($after, $through);
+                $pageEnd = isset($bounds[0]) ? (int) $bounds[0] : $through;
+                $hasMore = isset($bounds[1]);
+                foreach ($this->expirableCandidateIds($after, $pageEnd, 100 - $expired, $partials) as $id) {
+                    if ($mayStart !== null && ! $mayStart()) {
+                        return;
+                    }
+                    if ($this->expireCandidate((int) $id, $partials) === 'expired') {
+                        $expired++;
+                    }
+                    $after = (int) $id;
+                    if ($expired >= 100) {
+                        return;
+                    }
+                }
+                if ($hasMore && $pageEnd !== null) {
+                    $after = $pageEnd;
+
+                    continue;
+                }
+                $after = 0;
+                if ($wrapped) {
+                    return;
+                }
+                $wrapped = true;
+            }
+        } finally {
+            try {
+                Cache::put($cursorKey, $after, now()->addDay());
+            } catch (Throwable) {
+                // The next pass starts over.
+            }
+        }
+    }
+
+    /** @return list<int|string> */
+    private function expiryPageBounds(int $after, ?int $through = null): array
+    {
+        return DB::table('release_verification_candidates')
+            ->when(in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
+            ->where('id', '>', $after)
+            ->when($through !== null, fn ($query) => $query->where('id', '<=', $through))
+            ->orderBy('id')
+            ->offset(999)
+            ->limit(2)
+            ->pluck('id')
+            ->all();
+    }
+
+    /** @return Collection<int, int|string> */
+    private function expirableCandidateIds(int $after, ?int $through, int $limit, bool $partials): Collection
+    {
+        return DB::table('release_verification_candidates')
+            ->when(in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
+            ->where('id', '>', $after)
+            ->when($through !== null, fn ($query) => $query->where('id', '<=', $through))
+            ->whereNull('release_id')
+            ->whereIn('status', self::EXPIRABLE_STATUSES)
             ->where('last_unique_at', '<', now()->subHours((int) config('release_verification.expiry_hours')))
             ->where(fn ($q) => $q->whereNull('lease_until')->orWhere('lease_until', '<', now()))
             // A stalled upload still owed its partial attempt is published, not expired (it would otherwise lose
@@ -1282,37 +1386,40 @@ final class CandidateRepository
                 ->orWhereNotIn('status', ['waiting_upload', 'ready'])
                 ->orWhere(fn ($waiting) => $waiting->where('status', 'waiting_upload')->where('reason', 'like', self::PARTIAL_DEFERRED.'%'))
                 ->orWhere(fn ($ready) => $ready->where('status', 'ready')->where(fn ($r) => $r->whereNull('reason')->orWhere('reason', '!=', self::PARTIAL_QUEUED)))))
-            ->orderBy('id')->limit(100)->pluck('id');
-        foreach ($ids as $id) {
-            if ($mayStart !== null && ! $mayStart()) {
-                break;
+            ->orderBy('id')
+            ->limit(max(1, $limit))
+            ->pluck('id');
+    }
+
+    /** @return 'expired'|'retained'|'terminal' */
+    private function expireCandidate(int $id, bool $partials): string
+    {
+        return DB::transaction(function () use ($id, $partials): string {
+            $this->ledger->enter();
+            $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
+            if ($row === null || $row->release_id !== null || ! in_array($row->status, self::EXPIRABLE_STATUSES, true)) {
+                return 'terminal';
             }
-            DB::transaction(function () use ($id, $partials): void {
-                $this->ledger->enter();
-                $row = DB::table('release_verification_candidates')->where('id', $id)->lockForUpdate()->first();
-                if ($row === null || $row->release_id !== null
-                    || ! in_array($row->status, ['ready', 'waiting_upload', 'pending', 'unknown', 'header_rejected', 'unrepairable', 'verifying', 'dirty', 'metadata_deferred', 'metadata_review'], true)
-                    || $row->last_unique_at >= now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s')
-                    || ($row->lease_until !== null && $row->lease_until >= now()->format('Y-m-d H:i:s'))
-                    || ($partials && self::owedPartialAttempt($row))) {
-                    return;
-                }
-                DB::table('release_verification_candidates')->where('id', $id)->update(['status' => in_array($row->status, ['metadata_deferred', 'metadata_review'], true) ? 'metadata_expired' : 'expired',
-                    'version' => (int) $row->version + 1,
-                    'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]
-                    + (self::tracksUpgrades() ? ['upgrades_release_id' => null] : []));
-                if (($row->upgrades_release_id ?? null) !== null && Release::hasLateArticleFlag()) {
-                    // An expired generation can no longer upgrade its partial; workers may now process it.
-                    $this->releaseLateArticleFence([(int) $row->upgrades_release_id], (int) $id);
-                }
-                $this->ledger->adjust(-(int) $row->manifest_bytes);
-                DB::afterCommit(function () use ($row): void {
-                    $this->store->deleteIfUnreferenced($row->manifest_path);
-                });
-            }, 5);
-        }
-        $this->expireRetainedPartials($mayStart);
-        $this->settleLateArticleHolders($mayStart);
+            if ($row->last_unique_at >= now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s')
+                || ($row->lease_until !== null && $row->lease_until >= now()->format('Y-m-d H:i:s'))
+                || ($partials && self::owedPartialAttempt($row))) {
+                return 'retained';
+            }
+            DB::table('release_verification_candidates')->where('id', $id)->update(['status' => in_array($row->status, ['metadata_deferred', 'metadata_review'], true) ? 'metadata_expired' : 'expired',
+                'version' => (int) $row->version + 1,
+                'manifest_path' => '', 'manifest_bytes' => 0, 'lease_token' => null, 'lease_until' => null]
+                + (self::tracksUpgrades() ? ['upgrades_release_id' => null] : []));
+            if (($row->upgrades_release_id ?? null) !== null && Release::hasLateArticleFlag()) {
+                // An expired generation can no longer upgrade its partial; workers may now process it.
+                $this->releaseLateArticleFence([(int) $row->upgrades_release_id], $id);
+            }
+            $this->ledger->adjust(-(int) $row->manifest_bytes);
+            DB::afterCommit(function () use ($row): void {
+                $this->store->deleteIfUnreferenced($row->manifest_path);
+            });
+
+            return 'expired';
+        }, 5);
     }
 
     /**

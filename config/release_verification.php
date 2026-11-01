@@ -77,13 +77,12 @@ return [
     'free_bytes' => (int) env('RELEASE_VERIFICATION_FREE_BYTES', 10737418240),
     'article_bytes' => (int) env('RELEASE_VERIFICATION_ARTICLE_BYTES', 16777216),
     // Most header metadata one candidate may hold, merged or not, counted as 128 bytes plus the message-ID
-    // per article. 48 MiB is about 250,000 articles with typical message-IDs, whose NZB stays under the
-    // 32 MiB audit reader limit. Larger uploads keep their headers and are retried after a backoff, or at
+    // per article. 256 MiB is about 1,450,000 articles with typical message-IDs, whose NZB stays under the
+    // 256 MiB audit reader limit. Larger uploads keep their headers and are retried after a backoff, or at
     // once when this is raised.
-    'metadata_bytes' => (int) env('RELEASE_VERIFICATION_METADATA_BYTES', 50331648),
-    // PHP memory limit for verification workers and the candidate preparer. A candidate at the metadata
-    // budget's limit peaks near 250 MiB above PHP's baseline (more with short message-IDs).
-    'worker_memory' => (string) env('RELEASE_VERIFICATION_WORKER_MEMORY', '512M'),
+    'metadata_bytes' => (int) env('RELEASE_VERIFICATION_METADATA_BYTES', 268435456),
+    // PHP memory limit for verification workers and the candidate preparer.
+    'worker_memory' => (string) env('RELEASE_VERIFICATION_WORKER_MEMORY', '1536M'),
     // Batch samples across leased candidates, retaining one full manifest at a time.
     'sample_batch_size' => (int) env('RELEASE_VERIFICATION_SAMPLE_BATCH_SIZE', 1),
     // Experimental Rust framing transport; empty keeps the native PHP pipeline.
