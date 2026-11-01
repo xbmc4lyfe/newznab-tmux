@@ -45,9 +45,10 @@ impl YencPart {
         self.begin.map_or(0, |begin| begin - 1)
     }
 
-    /// Bytes this article carries, or `None` when its header doesn't say.
+    /// Bytes this article carries, or `None` when its header doesn't say or the
+    /// lenient path let through a range too large to measure.
     pub fn length(&self) -> Option<i64> {
-        Some(self.end? - self.begin? + 1)
+        self.end?.checked_sub(self.begin?)?.checked_add(1)
     }
 }
 

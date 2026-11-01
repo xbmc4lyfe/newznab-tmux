@@ -182,3 +182,11 @@ fn in_place_and_buffer_decoding_agree_with_the_allocating_path() {
     let written = decoder::decode_in_place(&mut in_place);
     assert_eq!(in_place[..written], expected);
 }
+
+#[test]
+fn an_unmeasurable_lenient_range_has_no_length() {
+    let article =
+        b"=ybegin part=1 line=1 size=1 name=x\n=ypart begin=0 end=9223372036854775807\nk\n=yend size=1";
+    let (_, part) = decode_with_frame(article);
+    assert_eq!(part.unwrap().length(), None);
+}

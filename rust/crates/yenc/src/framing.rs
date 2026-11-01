@@ -2,6 +2,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+pub const MAX_INPUT_BYTES: usize = 67_108_864;
 const MAX_CONTROL_LINES: usize = 256;
 const MAX_FIELDS_PER_LINE: usize = 64;
 const MAX_FIELD_NAME_BYTES: usize = 128;
@@ -93,6 +94,11 @@ pub struct FieldOccurrence {
     pub value_utf8: Option<String>,
     pub decimal_u64: Option<u64>,
     pub decimal_status: &'static str,
+}
+
+/// [`parse`] for untrusted input, refusing anything over the parser's byte budget.
+pub fn parse_bounded(data: &[u8]) -> Option<YencFramingMetadata> {
+    (data.len() <= MAX_INPUT_BYTES).then(|| parse(data))
 }
 
 pub fn parse(data: &[u8]) -> YencFramingMetadata {
