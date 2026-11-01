@@ -127,18 +127,6 @@ parameters:
 			path: app/Facades/Search.php
 
 		-
-			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesByCategory\(\) parameter \#1 \$categoryIds with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Facades/Search.php
-
-		-
-			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesByCategory\(\) return type with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Facades/Search.php
-
-		-
 			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesByExternalId\(\) parameter \#1 \$externalIds with no value type specified in iterable type array\.$#'
 			identifier: missingType.iterableValue
 			count: 1
@@ -158,18 +146,6 @@ parameters:
 
 		-
 			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesFiltered\(\) return type with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Facades/Search.php
-
-		-
-			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesWithCategoryFilter\(\) parameter \#2 \$categoryIds with no value type specified in iterable type array\.$#'
-			identifier: missingType.iterableValue
-			count: 1
-			path: app/Facades/Search.php
-
-		-
-			message: '#^Class App\\Facades\\Search has PHPDoc tag @method for method searchReleasesWithCategoryFilter\(\) return type with no value type specified in iterable type array\.$#'
 			identifier: missingType.iterableValue
 			count: 1
 			path: app/Facades/Search.php

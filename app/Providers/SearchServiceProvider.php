@@ -7,7 +7,6 @@ namespace App\Providers;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\Contracts\SearchServiceInterface;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
-use App\Services\Search\MediaSearchService;
 use App\Services\Search\SearchService;
 use App\Services\Search\Support\SearchFailureTracker;
 use Illuminate\Contracts\Foundation\Application;
@@ -44,11 +43,6 @@ class SearchServiceProvider extends ServiceProvider
         // Per-request record of failed search queries (see ApiReleaseRowCache)
         $this->app->scoped(SearchFailureTracker::class);
 
-        // Register the MediaSearchService for optimized movie/TV searches
-        $this->app->singleton(MediaSearchService::class, function (Application $app) {
-            return new MediaSearchService;
-        });
-
         // Register individual drivers as singletons for direct access
         $this->app->singleton(ManticoreSearchDriver::class, function (Application $app) {
             $config = config('search.drivers.manticore', []);
@@ -59,7 +53,6 @@ class SearchServiceProvider extends ServiceProvider
         // Register aliases (using prefixed names to avoid conflicts with other packages)
         $this->app->alias(SearchService::class, 'search');
         $this->app->alias(ManticoreSearchDriver::class, 'search.manticore');
-        $this->app->alias(MediaSearchService::class, 'search.media');
     }
 
     /**
