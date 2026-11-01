@@ -377,7 +377,7 @@ async fn zip_download(
     Ok(Reply::new(200, "application/x-zip", bytes)
         .header(
             "content-disposition",
-            format!("attachment; filename*=UTF-8''{name}; filename=\"{name}\""),
+            format!("attachment; filename*=UTF-8''{name}"),
         )
         .header("pragma", "public")
         .header("cache-control", "public, must-revalidate")

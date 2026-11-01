@@ -65,7 +65,7 @@ status = "ported"
 kind = "route"
 id = "GET|HEAD /api/v2/getnzb"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@getNzb"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -173,7 +173,7 @@ status = "todo"
 kind = "route"
 id = "GET|QUERY|HEAD /api/v2/details"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@details"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
