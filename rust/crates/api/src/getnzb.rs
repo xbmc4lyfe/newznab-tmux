@@ -184,7 +184,7 @@ async fn release_info(ctx: &Ctx, guid: &str) -> Result<Option<ReleaseInfo>> {
 }
 
 /// Laravel's `e()`.
-fn html_escape(text: &str) -> String {
+pub fn html_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
