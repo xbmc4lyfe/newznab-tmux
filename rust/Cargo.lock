@@ -1528,6 +1528,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "html-escape"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9356095b4b41197bba32173600e1582792cda618f65d12f68e2e77d273413c5"
+
+[[package]]
 name = "html5ever"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2499,6 +2505,7 @@ dependencies = [
  "deunicode",
  "futures-util",
  "hex",
+ "html-escape",
  "image",
  "md-5 0.10.6",
  "nntmux-core",
@@ -2510,12 +2517,14 @@ dependencies = [
  "redis",
  "regex",
  "reqwest",
+ "scraper",
  "serde",
  "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "webp",
  "wiremock",
 ]

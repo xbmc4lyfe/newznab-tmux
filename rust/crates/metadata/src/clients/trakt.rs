@@ -274,6 +274,18 @@ impl Trakt {
         .await
     }
 
+    pub async fn movie_summary(&self, movie: &str) -> Result<Option<Value>> {
+        let Some(id) = format_media_id(movie) else {
+            return Ok(None);
+        };
+        self.cached(
+            &format!("trakt_movie_{}_full", md5_hex(&id)),
+            &format!("movies/{id}"),
+            &[("extended", "full".to_owned())],
+        )
+        .await
+    }
+
     pub async fn show_seasons(&self, show: &str, extended: &str) -> Result<Option<Value>> {
         let Some(id) = format_media_id(show) else {
             return Ok(None);

@@ -2,96 +2,22 @@
 
 use std::sync::Arc;
 
-use nntmux_metadata::cache::Cache;
+mod common;
+
+use common::{Keys, harness, insert_release};
 use nntmux_metadata::candidates::tv_status;
-use nntmux_metadata::clients::fanart::Fanart;
-use nntmux_metadata::clients::tmdb::Tmdb;
 use nntmux_metadata::clients::trakt::{EpisodeIds, Trakt};
-use nntmux_metadata::clients::tvdb::Tvdb;
-use nntmux_metadata::clients::tvmaze::TvMaze;
-use nntmux_metadata::images::Images;
 use nntmux_metadata::services::Services;
 use nntmux_metadata::tv::commands::{TvRepairLinksOptions, repair_links};
 use nntmux_metadata::tv::providers::{TvMazeProvider, TvProvider, TvdbProvider};
 use nntmux_metadata::tv::store::{Show, add_show};
 use nntmux_metadata::tv::{Candidate, Outcome, Pipeline, RunState};
 use nntmux_metadata::{LookupMode, MetadataSettings, Renamed};
-use nntmux_testkit::TestDb;
 use reqwest::Client;
 use serde_json::json;
 use sqlx::{MySqlPool, Row};
-use tempfile::TempDir;
 use wiremock::matchers::{header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-
-struct Harness {
-    db: TestDb,
-    services: Arc<Services>,
-    mock: MockServer,
-    covers: TempDir,
-}
-
-async fn harness(tvdb_key: &str) -> Option<Harness> {
-    let db = TestDb::create().await.unwrap()?;
-    let Ok(redis_url) = std::env::var("TEST_REDIS_URL") else {
-        return None;
-    };
-    let client = redis::Client::open(redis_url).unwrap();
-    let redis = redis::aio::ConnectionManager::new(client).await.unwrap();
-    let cache = Cache::with_prefix(redis, &format!("{}:", db.name));
-    let mock = MockServer::start().await;
-    let http = Client::new();
-    let covers = TempDir::new().unwrap();
-    let mut images = Images::from_env().unwrap();
-    images.covers = covers.path().to_owned();
-    images.allow_private_hosts = true;
-    let mut tmdb = Tmdb::new(http.clone(), String::new(), 5, 1, 1);
-    tmdb.base_url = mock.uri();
-    let mut tvdb = Tvdb::new(http.clone(), tvdb_key.to_owned(), None, 5);
-    tvdb.base_url = mock.uri();
-    let mut tvmaze = TvMaze::new(http.clone(), 5, 1);
-    tvmaze.base_url = mock.uri();
-    tvmaze.min_interval = std::time::Duration::ZERO;
-    let mut trakt = Trakt::new(http.clone(), cache.clone(), String::new(), 5, 1, 1);
-    trakt.base_url = mock.uri();
-    trakt.throttled = false;
-    let mut fanart = Fanart::new(http.clone(), cache.clone(), String::new(), 5, 1, 1);
-    fanart.base_url = mock.uri();
-    let services = Arc::new(Services {
-        db: db.pool.clone(),
-        cache,
-        search: None,
-        images,
-        http,
-        tmdb,
-        tvdb,
-        tvmaze,
-        trakt,
-        fanart,
-    });
-    Some(Harness {
-        db,
-        services,
-        mock,
-        covers,
-    })
-}
-
-async fn insert_release(db: &MySqlPool, name: &str, guid: &str) -> i64 {
-    let done = sqlx::query(
-        "INSERT INTO releases (name, searchname, guid, leftguid, fromname, size, postdate, adddate, \
-         categories_id, groups_id, totalpart) \
-         VALUES (?, ?, ?, ?, 'poster', 5000000, NOW(), NOW(), 5030, 1, 1)",
-    )
-    .bind(name)
-    .bind(name)
-    .bind(guid)
-    .bind(&guid[..1])
-    .execute(db)
-    .await
-    .unwrap();
-    done.last_insert_id() as i64
-}
+use wiremock::{Mock, ResponseTemplate};
 
 async fn release_state(db: &MySqlPool, id: i64) -> (i64, i64, i64, bool) {
     let row = sqlx::query(
@@ -137,7 +63,9 @@ fn maze_only(services: &Arc<Services>) -> Vec<Box<dyn TvProvider>> {
 
 #[tokio::test]
 async fn a_new_show_is_stored_and_its_episode_matched() {
-    let Some(h) = harness("").await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     let name = "Game.of.Thrones.S01E02.720p.HDTV";
     let id = insert_release(&h.db.pool, name, "a0000000000000000000000000000001").await;
     Mock::given(path("/singlesearch/shows"))
@@ -231,7 +159,9 @@ async fn a_new_show_is_stored_and_its_episode_matched() {
 
 #[tokio::test]
 async fn rate_limits_defer_and_trip_the_circuit_breaker() {
-    let Some(h) = harness("").await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "7200"))
         .expect(3)
@@ -269,7 +199,9 @@ async fn rate_limits_defer_and_trip_the_circuit_breaker() {
 
 #[tokio::test]
 async fn a_rename_during_processing_is_not_overwritten() {
-    let Some(h) = harness("").await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     let name = "Show.Gone.S01E02.WEB";
     let id = insert_release(&h.db.pool, name, "c0000000000000000000000000000001").await;
     sqlx::query("UPDATE releases SET searchname = 'Renamed' WHERE id = ?")
@@ -293,7 +225,9 @@ async fn a_rename_during_processing_is_not_overwritten() {
 
 #[tokio::test]
 async fn parse_failures_and_misses_get_their_statuses() {
-    let Some(h) = harness("").await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(404))
         .mount(&h.mock)
@@ -325,7 +259,9 @@ async fn parse_failures_and_misses_get_their_statuses() {
 
 #[tokio::test]
 async fn a_season_pack_links_the_show_and_a_missing_episode_is_scheduled() {
-    let Some(h) = harness("").await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     let video: u64 = sqlx::query(
         "INSERT INTO videos (type, title, started, tvmaze) VALUES (0, 'Known Show', '2011-01-01', 9)",
     )
@@ -371,7 +307,12 @@ async fn a_season_pack_links_the_show_and_a_missing_episode_is_scheduled() {
 
 #[tokio::test]
 async fn tvdb_logs_in_retries_a_401_and_reads_the_extended_record() {
-    let Some(h) = harness("key").await else {
+    let Some(h) = harness(Keys {
+        tvdb: "key",
+        ..Keys::default()
+    })
+    .await
+    else {
         return;
     };
     Mock::given(method("POST"))
@@ -426,7 +367,9 @@ async fn tvdb_logs_in_retries_a_401_and_reads_the_extended_record() {
 
 #[tokio::test]
 async fn posters_are_saved_and_marked() {
-    let Some(h) = harness("").await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     let mut png = Vec::new();
     image::DynamicImage::new_rgb8(40, 30)
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
@@ -470,7 +413,9 @@ async fn posters_are_saved_and_marked() {
 
 #[tokio::test]
 async fn process_takes_only_due_releases_in_the_bucket() {
-    let Some(h) = harness("").await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(404))
         .mount(&h.mock)
@@ -538,7 +483,9 @@ async fn process_takes_only_due_releases_in_the_bucket() {
 
 #[tokio::test]
 async fn repair_links_normalizes_and_is_idempotent() {
-    let Some(h) = harness("").await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     let db = &h.db.pool;
     let legacy = insert_release(db, "Legacy.S01E01.WEB", "a0000000000000000000000000000021").await;
     let exhausted = insert_release(db, "Gone.S01E01.WEB", "a0000000000000000000000000000022").await;
@@ -653,7 +600,9 @@ async fn repair_links_normalizes_and_is_idempotent() {
 
 #[tokio::test]
 async fn external_id_matches_stay_on_tv_rows() {
-    let Some(h) = harness("").await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     let film = sqlx::query(
         "INSERT INTO videos (type, title, started, tmdb) VALUES (1, 'A Film', '2011-01-01', 55)",
     )
@@ -677,7 +626,9 @@ async fn external_id_matches_stay_on_tv_rows() {
 
 #[tokio::test]
 async fn trakt_resolves_external_ids_before_asking_for_an_episode() {
-    let Some(h) = harness("").await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     let cache = h.services.cache.clone();
     let mut trakt = Trakt::new(Client::new(), cache, "key".to_owned(), 5, 1, 1);
     trakt.base_url = h.mock.uri();

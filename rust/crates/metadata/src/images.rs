@@ -86,6 +86,16 @@ impl Images {
         if self.webp { "webp" } else { "jpg" }
     }
 
+    /// `imageExists`: this image in the configured format or an older one.
+    pub fn exists(&self, kind: &str, basename: &str) -> bool {
+        let directory = self.covers.join(kind);
+        [self.extension(), "webp", "jpg", "jpeg"]
+            .iter()
+            .any(|extension| {
+                fs::File::open(directory.join(format!("{basename}.{extension}"))).is_ok()
+            })
+    }
+
     /// `saveRemoteImage`. False when the image can't be fetched or used, which only means no cover.
     pub async fn save_remote(&self, name: &str, url: &str, kind: &str, profile: Profile) -> bool {
         let directory = self.covers.join(kind);

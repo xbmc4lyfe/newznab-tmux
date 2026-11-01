@@ -20,6 +20,11 @@ pub struct Cache {
     prefix: String,
 }
 
+#[derive(Serialize, serde::Deserialize)]
+struct Entry<T> {
+    value: Option<T>,
+}
+
 /// A held lock. If its holder dies it expires by itself.
 pub struct Lock {
     key: String,
@@ -64,6 +69,29 @@ impl Cache {
         if let Err(failure) = stored {
             warn!(error = %failure, "redis write failed");
         }
+    }
+
+    /// A remembered answer, which may be a remembered miss. The outer `None` means not cached.
+    pub async fn get_entry<T: DeserializeOwned>(&self, key: &str) -> Option<Option<T>> {
+        self.get::<Entry<T>>(key).await.map(|entry| entry.value)
+    }
+
+    pub async fn put_entry<T: Serialize>(&self, key: &str, value: Option<&T>, ttl: Duration) {
+        self.put(key, &Entry { value }, ttl).await;
+    }
+
+    /// `Cache::add`: true when this call created the key, or when Redis is down.
+    pub async fn add(&self, key: &str, ttl: Duration) -> bool {
+        let mut redis = self.redis.clone();
+        let set: redis::RedisResult<Option<String>> = redis::cmd("SET")
+            .arg(self.key(key))
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl.as_secs().max(1))
+            .query_async(&mut redis)
+            .await;
+        set.map_or(true, |set| set.is_some())
     }
 
     pub async fn forget(&self, key: &str) {

@@ -2,6 +2,7 @@
 //! then the provider APIs (TVDB, TVMaze, TMDB, Trakt) until one resolves it, and the outcome is
 //! written once at the end. Port of `TvProcessingPipeline` and its pipes.
 
+pub mod adder;
 pub mod commands;
 pub mod parse;
 pub mod providers;
