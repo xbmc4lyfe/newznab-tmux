@@ -1,6 +1,7 @@
 //! `BlockAbusiveServices` and `IndexerProxyDetector`: refuses streaming services, some cloud networks
 //! and, when configured, indexer apps that proxy NZB downloads.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use md5::{Digest, Md5};
@@ -290,6 +291,15 @@ async fn fetch_asn(ip: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// `FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE`: nothing to look up for these.
+fn is_public(address: &str) -> bool {
+    match address.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_multicast() || ip.octets()[0] >= 240),
+        Ok(IpAddr::V6(ip)) => !(ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || ip.is_unique_local() || ip.is_unicast_link_local()),
+        Err(_) => false,
+    }
+}
+
 /// The middleware: `Some` is the refusal.
 pub async fn check(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Option<Reply> {
     let user_agent = request.header("user-agent").unwrap_or_default();
@@ -346,7 +356,7 @@ pub async fn check(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Opti
     }
 
     if config.asn_lookup
-        && let Some(address) = &ip
+        && let Some(address) = ip.as_ref().filter(|address| is_public(address))
         && let Some(asn) = asn_of(ctx, settings, address).await
         && let Some((_, name)) = BLOCKED_ASNS
             .iter()

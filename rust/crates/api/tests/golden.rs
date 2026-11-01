@@ -73,6 +73,12 @@ fn settings() -> Settings {
     settings
 }
 
+fn settings_with_cap() -> Settings {
+    let mut capped = settings();
+    capped.max_limit = 1;
+    capped
+}
+
 fn app(ctx: &Ctx) -> Router {
     router_with(settings()).with_state(ctx.clone())
 }
@@ -461,14 +467,18 @@ async fn rss_limit_is_honored() -> Result<()> {
         redis,
     };
     run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
-    let request = Request::builder()
-        .uri("/rss/full-feed?limit=2&api_token=tokenalice")
-        .header("host", "x.test")
-        .body(Body::empty())?;
-    let response = app(&ctx).oneshot(request).await?;
-    assert_eq!(response.status(), 200);
-    let body = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
-    assert_eq!(body.matches("<item>").count(), 2);
+    // -1 reads as the minimum page, and a huge value stops at the cap.
+    for (uri, app, items) in [
+        ("/rss/full-feed?limit=2&api_token=tokenalice", app(&ctx), 2),
+        ("/rss/full-feed?limit=-1&api_token=tokenalice", app(&ctx), 1),
+        ("/rss/full-feed?limit=1e30&api_token=tokenalice", router_with(settings_with_cap()).with_state(ctx.clone()), 1),
+    ] {
+        let request = Request::builder().uri(uri).header("host", "x.test").body(Body::empty())?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), 200);
+        let body = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
+        assert_eq!(body.matches("<item>").count(), items, "{uri}");
+    }
     db.drop_database().await
 }
 

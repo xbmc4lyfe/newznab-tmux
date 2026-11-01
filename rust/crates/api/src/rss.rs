@@ -211,7 +211,7 @@ struct FeedQuery {
 }
 
 /// `parseCommonRssParams`, for the feeds taking show, anidb and paging filters.
-fn common_filters(input: &Input, categories: Vec<String>) -> FeedQuery {
+fn common_filters(input: &Input, settings: &Settings, categories: Vec<String>) -> FeedQuery {
     let positive = |key: &str| {
         let value = php_int(input.str(key).unwrap_or_default());
         if value == 0 { -1 } else { value }
@@ -227,8 +227,10 @@ fn common_filters(input: &Input, categories: Vec<String>) -> FeedQuery {
         show,
         anidb,
         air_date: abs_numeric(input, "airdate", -1),
+        // PHP answered 500 to any numeric limit, so nothing depends on larger pages; the cap stops
+        // one request loading the whole table.
         limit: match input.str("limit") {
-            Some(value) if is_numeric(value) => php_int(value),
+            Some(value) if is_numeric(value) => php_int(value).clamp(1, settings.limit_max()),
             _ => 100,
         },
         offset: abs_numeric(input, "num", 0),
@@ -277,11 +279,7 @@ async fn general_rows(
     } else {
         String::new()
     };
-    let limit = if query.limit == -1 {
-        String::new()
-    } else {
-        format!(" LIMIT {} OFFSET {}", query.limit.max(0), query.offset)
-    };
+    let limit = format!(" LIMIT {} OFFSET {}", query.limit, query.offset);
     let sql = format!(
         "SELECT {FEED_COLUMNS}
          FROM releases r
@@ -625,7 +623,7 @@ pub async fn feed(
                 ctx,
                 settings,
                 user.id,
-                &common_filters(input, vec!["0".to_owned()]),
+                &common_filters(input, settings, vec!["0".to_owned()]),
             )
             .await?
         }
@@ -634,7 +632,7 @@ pub async fn feed(
                 ctx,
                 settings,
                 user.id,
-                &common_filters(input, vec!["-2".to_owned()]),
+                &common_filters(input, settings, vec!["-2".to_owned()]),
             )
             .await?
         }
@@ -654,7 +652,7 @@ pub async fn feed(
                     Style::Plain,
                 ));
             }
-            general_rows(ctx, settings, user.id, &common_filters(input, ids)).await?
+            general_rows(ctx, settings, user.id, &common_filters(input, settings, ids)).await?
         }
         Feed::TrendingMovies => trending_movies(ctx, settings).await?,
         Feed::TrendingShows => trending_shows(ctx, settings).await?,

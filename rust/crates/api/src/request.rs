@@ -15,6 +15,7 @@ pub struct ApiRequest {
     pub method: String,
     pub path: String,
     query_string: Option<String>,
+    client_ip: String,
     pub input: Input,
     pub headers: HeaderMap,
     pub raw_body: bytes::Bytes,
@@ -23,6 +24,7 @@ pub struct ApiRequest {
 impl ApiRequest {
     pub async fn read(request: Request) -> anyhow::Result<Self> {
         let (parts, body) = request.into_parts();
+        let client_ip = nntmux_webkit::client_ip::from_parts(&parts).to_string();
         let raw_body = to_bytes(body, MAX_BODY_BYTES).await?;
         let method = parts.method.as_str().to_owned();
         let query = parse_urlencoded(parts.uri.query().unwrap_or_default());
@@ -30,6 +32,7 @@ impl ApiRequest {
             method,
             path: parts.uri.path().to_owned(),
             query_string: parts.uri.query().map(str::to_owned),
+            client_ip,
             input: Input {
                 query,
                 body: Bag::new(),
@@ -84,22 +87,9 @@ impl ApiRequest {
         format!("{scheme}://{host}")
     }
 
-    /// The client address for accounting and per-IP limits: the nearest forwarded address that
-    /// isn't a private proxy hop.
+    /// The client address for accounting and per-IP limits, with proxies we trust skipped.
     pub fn client_ip(&self) -> Option<String> {
-        let forwarded = self.header("x-forwarded-for").unwrap_or_default();
-        let hops: Vec<&str> = forwarded
-            .split(',')
-            .map(str::trim)
-            .filter(|hop| !hop.is_empty())
-            .collect();
-        let parsed = |hop: &&str| hop.parse::<std::net::IpAddr>().ok();
-        hops.iter()
-            .rev()
-            .filter_map(parsed)
-            .find(|ip| !is_private(ip))
-            .or_else(|| hops.first().and_then(parsed))
-            .map(|ip| ip.to_string())
+        Some(self.client_ip.clone())
     }
 
     /// `$request->getRequestUri()`: the path and raw query.
@@ -206,15 +196,6 @@ impl ApiRequest {
         self.input.body = canonicalize(&parsed);
         self.input.query = canonicalize(&self.input.query);
         Ok(())
-    }
-}
-
-fn is_private(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
-        }
     }
 }
 
