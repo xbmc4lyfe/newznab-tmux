@@ -306,9 +306,14 @@ async fn audit_locked(
                 &release.searchname,
                 release.predb_id,
             );
-            enter_publication(tx, &keys)
-                .await
-                .map_err(|_| anyhow!(STATE_UNAVAILABLE))?;
+            enter_publication(tx, &keys).await.map_err(|failure| {
+                // A deadlock or lock wait retries; anything else means the state is missing.
+                if crate::txn::is_lock_error(&failure) {
+                    failure
+                } else {
+                    anyhow!(STATE_UNAVAILABLE)
+                }
+            })?;
             if verdict == "unknown" {
                 sqlx::query(
                     "INSERT INTO release_verification_audit_retries (release_id, next_attempt_at, reason) \
