@@ -199,7 +199,7 @@ pub async fn delete_releases(releases: &Releases, settings: &Settings) -> Result
         .await?;
     }
     let disabled: Vec<i64> =
-        sqlx::query_scalar::<_, i32>("SELECT id FROM categories WHERE status = 2")
+        sqlx::query_scalar::<_, u32>("SELECT id FROM categories WHERE status = 2")
             .fetch_all(db)
             .await?
             .into_iter()
@@ -222,7 +222,7 @@ pub async fn delete_releases(releases: &Releases, settings: &Settings) -> Result
         .await?;
     for genre in genres {
         sweep(releases, "disabled genre", |query| {
-            query.push("musicinfo_id IN (SELECT id FROM musicinfo WHERE genre_id = ");
+            query.push("musicinfo_id IN (SELECT id FROM musicinfo WHERE genres_id = ");
             query.push_bind(genre).push(")");
         })
         .await?;
@@ -250,7 +250,7 @@ pub async fn delete_releases(releases: &Releases, settings: &Settings) -> Result
 /// releases per category per pass.
 async fn delete_category_min_size(releases: &Releases) -> Result<()> {
     let db = &releases.verify.db;
-    let categories: Vec<(i32, i64)> = sqlx::query_as(
+    let categories: Vec<(u32, i64)> = sqlx::query_as(
         "SELECT id, CAST(minsizetoformrelease AS SIGNED) FROM categories WHERE minsizetoformrelease > 0",
     )
     .fetch_all(db)

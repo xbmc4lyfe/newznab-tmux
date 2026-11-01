@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use nntmux_core::parsed_or;
 use nntmux_runtime::Shutdown;
 use tokio::task::JoinSet;
@@ -34,7 +34,8 @@ pub async fn run_round(releases: &Releases, stop: &Shutdown) -> Result<()> {
     let limits = Limits::from_env()?;
     let groups = groups_with_collections(releases).await?;
     if groups.is_empty() {
-        return Ok(());
+        // Retention and categorization don't depend on new collections arriving.
+        return maintenance::run(releases, &settings).await;
     }
     let threads = settings.release_threads.max(1) as usize;
     let rolling: u64 = parsed_or::<i64>("CBP_RELEASE_ROLLING_INTERVAL", 60)?.max(0) as u64;
@@ -94,8 +95,16 @@ async fn run_full_passes(
     let mut follow_ups: Vec<(i64, Instant)> = Vec::new();
     let mut running = JoinSet::new();
     let mut first_runs_active = 0usize;
+    let pass_limit = Duration::from_secs(
+        parsed_or::<u64>(
+            "NN_CONCURRENCY_TIMEOUT",
+            parsed_or::<u64>("NN_MULTIPROCESSING_MAX_CHILD_TIME", 1800)?,
+        )?
+        .max(1),
+    );
     loop {
-        let stopping = stop.requested() || stop_requested(db).await?;
+        // A brief database error on this poll must not cancel the passes in flight.
+        let stopping = stop.requested() || stop_requested(db).await.unwrap_or(false);
         if !stopping {
             while running.len() < threads {
                 let (group, first) = if let Some(group) = first_runs.pop() {
@@ -112,8 +121,15 @@ async fn run_full_passes(
                 let (releases, settings, limits) = (releases.clone(), settings.clone(), *limits);
                 let started = Instant::now();
                 running.spawn(async move {
-                    let outcome =
-                        process::run_group_pass(&releases, &settings, &limits, group).await;
+                    let pass = process::run_group_pass(&releases, &settings, &limits, group);
+                    // A pass stuck behind a lost lock or a hung query gives up, as a worker was killed.
+                    let outcome = match tokio::time::timeout(pass_limit, pass).await {
+                        Ok(outcome) => outcome,
+                        Err(_) => Err(anyhow!(
+                            "the release pass exceeded {} seconds",
+                            pass_limit.as_secs()
+                        )),
+                    };
                     (group, first, started, outcome)
                 });
             }
@@ -130,14 +146,25 @@ async fn run_full_passes(
             }
             bail!("the release round stopped with groups left");
         };
-        let (group, first, started, outcome) = joined?;
+        let (group, first, started, outcome) = match joined {
+            Ok(finished) => finished,
+            Err(failure) => {
+                // Which group panicked is in the panic's own log; a first run's count can't be told
+                // apart here, so the round stops offering follow-ups rather than outlive its tail.
+                error!(error = %failure, "a release pass panicked");
+                first_runs_active = first_runs_active.saturating_sub(1);
+                continue;
+            }
+        };
         first_runs_active -= usize::from(first);
         match outcome {
-            Ok(()) => info!(group, "finished release processing"),
+            Ok(()) => {
+                info!(group, "finished release processing");
+                if rolling > 0 && (first_runs_active > 0 || !first_runs.is_empty()) {
+                    follow_ups.push((group, started + Duration::from_secs(rolling)));
+                }
+            }
             Err(failure) => error!(group, error = format!("{failure:#}"), "release pass failed"),
-        }
-        if rolling > 0 && (first_runs_active > 0 || !first_runs.is_empty()) {
-            follow_ups.push((group, started + Duration::from_secs(rolling)));
         }
     }
 }

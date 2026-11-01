@@ -328,3 +328,77 @@ async fn a_round_runs_ready_windows_full_passes_and_maintenance() -> Result<()> 
     );
     h.db.drop_database().await
 }
+
+#[tokio::test]
+async fn disabled_categories_and_genres_and_category_minimums_are_enforced() -> Result<()> {
+    let Some(h) = Harness::start().await? else {
+        return Ok(());
+    };
+    let settings = Settings {
+        completion: 0,
+        min_files: 0,
+        ..Settings::default()
+    };
+    let disabled: u32 =
+        sqlx::query_scalar("SELECT id FROM categories WHERE id <> 2030 ORDER BY id LIMIT 1")
+            .fetch_one(h.pool())
+            .await?;
+    sqlx::query("UPDATE categories SET status = 2 WHERE id = ?")
+        .bind(disabled)
+        .execute(h.pool())
+        .await?;
+    add_release(&h, 2, "grabs=0").await?;
+    sqlx::query("UPDATE releases SET categories_id = ? WHERE guid LIKE '00000002%'")
+        .bind(disabled)
+        .execute(h.pool())
+        .await?;
+    // A disabled genre's music release goes.
+    let genre = sqlx::query("INSERT INTO genres (title, type, disabled) VALUES ('Off', 3000, 1)")
+        .execute(h.pool())
+        .await?
+        .last_insert_id();
+    let music = sqlx::query(
+        "INSERT INTO musicinfo (title, asin, url, salesrank, artist, publisher, releasedate, review, year, genres_id, tracks, cover) \
+         VALUES ('t', 'a', 'u', 0, 'x', 'p', NOW(), '', '2020', ?, '', 0)",
+    )
+    .bind(genre)
+    .execute(h.pool())
+    .await?
+    .last_insert_id();
+    add_release(&h, 3, "grabs=0").await?;
+    sqlx::query("UPDATE releases SET musicinfo_id = ? WHERE guid LIKE '00000003%'")
+        .bind(music)
+        .execute(h.pool())
+        .await?;
+    // Too small for its category, unless it's a partial.
+    sqlx::query("UPDATE categories SET minsizetoformrelease = 1000000 WHERE id = 2030")
+        .execute(h.pool())
+        .await?;
+    add_release(&h, 4, "grabs=0").await?;
+    add_release(&h, 5, "articles_expected=10").await?;
+
+    maintenance::run(&h.releases, &settings).await?;
+    let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM releases ORDER BY guid")
+        .fetch_all(h.pool())
+        .await?;
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].starts_with("00000005"));
+    h.db.drop_database().await
+}
+
+#[tokio::test]
+async fn an_idle_round_still_runs_maintenance() -> Result<()> {
+    let Some(h) = Harness::start().await? else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO ingestion_configurations (id, release_threads, delete_passworded_releases, safe_backfill_date) \
+         VALUES (1, 1, 1, '2012-06-24') ON DUPLICATE KEY UPDATE delete_passworded_releases = 1",
+    )
+    .execute(h.pool())
+    .await?;
+    add_release(&h, 1, "passwordstatus=1").await?;
+    nntmux_releases::runner::run_round(&h.releases, &nntmux_runtime::Shutdown::default()).await?;
+    assert_eq!(h.scalar("SELECT COUNT(*) FROM releases").await?, 0);
+    h.db.drop_database().await
+}
