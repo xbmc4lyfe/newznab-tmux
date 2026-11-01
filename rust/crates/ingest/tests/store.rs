@@ -311,3 +311,117 @@ async fn missed_parts_queue_counts_attempts() {
     assert_eq!(count(pool, "missed_parts").await, 194);
     db.drop_database().await.unwrap();
 }
+
+#[tokio::test]
+async fn maintenance_commands_reclassify_and_collect_stats() {
+    use nntmux_ingest::maintenance::{
+        backfill_daily_stats, backfill_hourly_stats, reclassify_header_rejections,
+    };
+    let Some(db) = TestDb::create().await.unwrap() else {
+        return;
+    };
+    let pool = &db.pool;
+
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'release_verification_candidates'
+         AND IS_NULLABLE = 'NO' AND COLUMN_DEFAULT IS NULL AND EXTRA NOT LIKE '%auto_increment%'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let cases = [
+        (
+            "unknown",
+            "Candidate has no file inventory to spot check.",
+            0,
+        ),
+        ("unknown", "Provider timed out.", 0),
+        (
+            "unknown",
+            "Candidate has no file inventory to spot check.",
+            1,
+        ),
+        (
+            "passed",
+            "Candidate has no file inventory to spot check.",
+            0,
+        ),
+    ];
+    for (index, (status, reason, pending)) in cases.into_iter().enumerate() {
+        let assignments: Vec<String> = columns
+            .iter()
+            .filter(|column| !["status", "reason"].contains(&column.as_str()))
+            .cloned()
+            .collect();
+        let values = vec!["?"; assignments.len()].join(", ");
+        let sql = format!(
+            "INSERT INTO release_verification_candidates (status, reason, header_check_pending, {}) \
+             VALUES (?, ?, ?, {values})",
+            assignments.join(", ")
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(status)
+            .bind(reason)
+            .bind(pending);
+        for _ in &assignments {
+            query = query.bind(format!("{index}"));
+        }
+        query.execute(pool).await.unwrap();
+    }
+    let done = reclassify_header_rejections(pool, 2, 0, 0).await.unwrap();
+    assert_eq!((done.changed, done.resume_after), (1, None));
+    let statuses: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM release_verification_candidates ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        statuses,
+        ["header_rejected", "unknown", "unknown", "passed"]
+    );
+
+    // Hourly rows sum into the day. An existing day is skipped unless forced.
+    let today = chrono::Utc::now().date_naive();
+    sqlx::query(
+        "INSERT INTO user_activity_stats_hourly (stat_hour, downloads_count, api_hits_count)
+         VALUES (?, 2, 3), (?, 5, 7)",
+    )
+    .bind(today.and_hms_opt(0, 0, 0).unwrap())
+    .bind(today.and_hms_opt(1, 0, 0).unwrap())
+    .execute(pool)
+    .await
+    .unwrap();
+    let totals = backfill_daily_stats(pool, 2, false).await.unwrap();
+    assert_eq!((totals.collected, totals.skipped), (2, 0));
+    let row = || async {
+        sqlx::query_as::<_, (i32, i32)>(
+            "SELECT downloads_count, api_hits_count FROM user_activity_stats WHERE stat_date = ?",
+        )
+        .bind(today)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(row().await, (7, 10));
+    sqlx::query(
+        "UPDATE user_activity_stats_hourly SET downloads_count = 9 WHERE downloads_count = 2",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        backfill_daily_stats(pool, 1, false).await.unwrap().skipped,
+        1
+    );
+    assert_eq!(row().await, (7, 10));
+    assert_eq!(
+        backfill_daily_stats(pool, 1, true).await.unwrap().collected,
+        1
+    );
+    assert_eq!(row().await, (14, 10));
+
+    let totals = backfill_hourly_stats(pool, 3, false).await.unwrap();
+    assert_eq!(totals.collected + totals.skipped, 3);
+    db.drop_database().await.unwrap();
+}

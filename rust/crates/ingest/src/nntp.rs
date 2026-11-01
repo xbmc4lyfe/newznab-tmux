@@ -37,7 +37,7 @@ pub struct SelectedGroup {
 }
 
 #[async_trait]
-pub trait Nntp: Send {
+pub trait Nntp: Send + Sync {
     async fn select_group(&mut self, group: &str) -> Result<SelectedGroup, NntpFailure>;
     /// The overview of articles `first..=last` in the selected group.
     async fn xover(&mut self, first: u64, last: u64) -> Result<Vec<Overview>, NntpFailure>;

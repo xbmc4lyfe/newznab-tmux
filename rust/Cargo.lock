@@ -1490,11 +1490,13 @@ dependencies = [
  "nntmux-runtime",
  "nntmux-testkit",
  "rand 0.9.5",
+ "redis",
  "regex",
  "serde",
  "serde_json",
  "sha1 0.10.7",
  "sqlx",
+ "thiserror",
  "tokio",
  "tracing",
 ]

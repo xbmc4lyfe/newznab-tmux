@@ -15,6 +15,7 @@ md-5.workspace = true
 nntmux-core.workspace = true
 nntmux-runtime.workspace = true
 rand.workspace = true
+redis.workspace = true
 regex.workspace = true
 sha1.workspace = true
 sqlx.workspace = true

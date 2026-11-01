@@ -58,10 +58,22 @@ status = "todo"
 kind = "command"
 id = "nntmux:backfill-user-activity-stats"
 source = "app/Console/Commands/BackfillUserActivityStats.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "releases:reclassify-header-rejections"
 source = "app/Console/Commands/ReclassifyHeaderRejections.php"
+status = "ported"
+
+[[entry]]
+kind = "command"
+id = "update:backfill"
+source = "app/Console/Commands/UpdateBackfill.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "update:binaries"
+source = "app/Console/Commands/UpdateBinaries.php"
 status = "todo"
