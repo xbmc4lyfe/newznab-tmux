@@ -56,6 +56,10 @@ async fn home_needs_a_login_and_shows_index_content() {
     let (response, html) = browser.get("/content?page=content").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(html.contains("Open notes"));
+    assert!(
+        !html.contains("Staff notes"),
+        "the list hides staff pages too"
+    );
 
     db.drop_database().await.unwrap();
 }
@@ -97,7 +101,7 @@ async fn contact_validates_and_queues_mail_with_a_reply_address() {
         .await;
     assert_eq!(location(&response), "/contact-us");
     let (_, html) = browser.get("/contact-us").await;
-    assert!(html.contains("must be a valid email address"));
+    assert!(html.contains("Please enter a valid email address."));
     assert!(html.contains(r#"value="me""#), "what was typed comes back");
 
     let (response, html) = browser
@@ -200,5 +204,29 @@ async fn release_reports_are_once_per_user() {
         .post_authed("/release-report", &[("reason", "spam")])
         .await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let release = sqlx::query("INSERT INTO releases (guid, leftguid) VALUES (UUID(), 'a')")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let id = release.last_insert_id().to_string();
+    let (response, _) = browser
+        .post_authed(
+            "/release-report",
+            &[("release_id", &id), ("reason", "spam")],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (response, _) = browser
+        .post_authed(
+            "/release-report",
+            &[("release_id", &id), ("reason", "spam")],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let (_, body) = browser
+        .get(&format!("/release-report/check?release_id={id}"))
+        .await;
+    assert!(body.contains("true"));
     db.drop_database().await.unwrap();
 }

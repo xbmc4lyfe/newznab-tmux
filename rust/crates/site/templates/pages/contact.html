@@ -112,6 +112,3 @@
 </div>
 {% endblock %}
 
-{% block scripts %}
-    {% if let Some(captcha) = captcha %}<div class="mb-6"><div class="{{ captcha.class() }}" data-sitekey="{{ captcha.sitekey }}"></div></div>{% if let Some(message) = error_captcha %}<p class="mt-2 text-sm text-red-600 dark:text-red-400">{{ message }}</p>{% endif %}{% endif %}
-{% endblock %}

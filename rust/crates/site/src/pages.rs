@@ -134,24 +134,27 @@ async fn content(
     };
     let id = input.int("id", 0);
     let page = input.str("page");
+    let staff = matches!(role, ROLE_ADMIN | ROLE_MODERATOR);
+    let visible = if staff {
+        "1 = 1"
+    } else {
+        "(role = ? OR role = ?)"
+    };
     let (rows, front): (Vec<ContentRow>, bool) = if id == 0 && page == "content" {
-        let sql = format!("SELECT {CONTENT_COLUMNS} FROM content WHERE id <> 1 {ORDERED}");
-        (
-            sqlx::query_as(sqlx::AssertSqlSafe(sql))
-                .fetch_all(&ctx.db)
-                .await?,
-            false,
-        )
+        // Laravel listed every page here, staff-only and disabled ones included.
+        let sql = format!(
+            "SELECT {CONTENT_COLUMNS} FROM content WHERE id <> 1 AND status = 1 AND {visible} {ORDERED}"
+        );
+        let mut query = sqlx::query_as(sqlx::AssertSqlSafe(sql));
+        if !staff {
+            query = query.bind(ROLE_EVERYONE).bind(role);
+        }
+        (query.fetch_all(&ctx.db).await?, false)
     } else if id != 0 && !page.is_empty() {
-        let visible = if matches!(role, ROLE_ADMIN | ROLE_MODERATOR) {
-            "1 = 1"
-        } else {
-            "(role = ? OR role = ?)"
-        };
         let sql =
             format!("SELECT {CONTENT_COLUMNS} FROM content WHERE id = ? AND {visible} LIMIT 1");
         let mut query = sqlx::query_as(sqlx::AssertSqlSafe(sql)).bind(id);
-        if !matches!(role, ROLE_ADMIN | ROLE_MODERATOR) {
+        if !staff {
             query = query.bind(ROLE_EVERYONE).bind(role);
         }
         (query.fetch_all(&ctx.db).await?, false)
@@ -310,7 +313,7 @@ async fn contact_form(layout: Layout, session: Session) -> WebResult {
 fn contact_errors(username: &str, email: &str, comment: &str) -> Vec<(&'static str, String)> {
     let mut errors = Vec::new();
     if username.is_empty() {
-        errors.push(("username", "The username field is required.".to_owned()));
+        errors.push(("username", "Please enter your name.".to_owned()));
     } else if username.chars().count() > 255 {
         errors.push((
             "username",
@@ -318,11 +321,11 @@ fn contact_errors(username: &str, email: &str, comment: &str) -> Vec<(&'static s
         ));
     }
     if email.is_empty() {
-        errors.push(("useremail", "The useremail field is required.".to_owned()));
+        errors.push(("useremail", "Please enter your email address.".to_owned()));
     } else if !validate::valid_email(email) {
         errors.push((
             "useremail",
-            "The useremail field must be a valid email address.".to_owned(),
+            "Please enter a valid email address.".to_owned(),
         ));
     } else if email.chars().count() > 255 {
         errors.push((
@@ -331,11 +334,11 @@ fn contact_errors(username: &str, email: &str, comment: &str) -> Vec<(&'static s
         ));
     }
     if comment.is_empty() {
-        errors.push(("comment", "The comment field is required.".to_owned()));
+        errors.push(("comment", "Please enter your message.".to_owned()));
     } else if comment.chars().count() < 10 {
         errors.push((
             "comment",
-            "The comment field must be at least 10 characters.".to_owned(),
+            "Your message must be at least 10 characters long.".to_owned(),
         ));
     }
     errors
@@ -567,7 +570,7 @@ async fn load_incidents(ctx: &Ctx, condition: &str, order: &str) -> Result<Vec<I
     // Only incidents touching a public (HTTP) service: internal probe outages stay private.
     let sql = format!(
         "SELECT i.title, i.description, i.status, i.impact, i.started_at, i.resolved_at,
-                GROUP_CONCAT(s.name ORDER BY s.sort_order, s.id SEPARATOR ', ') AS services
+                GROUP_CONCAT(IF(s.check_type = 'http', s.name, NULL) ORDER BY s.sort_order, s.id SEPARATOR ', ') AS services
          FROM service_incidents i
          JOIN service_incident_service_status p ON p.service_incident_id = i.id
          JOIN service_statuses s ON s.id = p.service_status_id
@@ -1001,7 +1004,7 @@ mod tests {
         assert_eq!(errors.len(), 3);
         assert_eq!(
             errors[2].1,
-            "The comment field must be at least 10 characters."
+            "Your message must be at least 10 characters long."
         );
     }
 }
