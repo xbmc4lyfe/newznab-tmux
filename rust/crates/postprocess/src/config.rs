@@ -314,10 +314,11 @@ fn env_true(key: &str) -> bool {
         .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "(true)"))
 }
 
-/// A tool path with PHP's `?: false`: empty means the tool is off.
+/// A tool path with PHP's `?: false`: an unset key takes the default, and a value PHP reads as
+/// falsy turns the tool off.
 fn env_path(key: &str, default: &str) -> Option<String> {
-    let value = var_or(key, default);
-    (!value.is_empty()).then_some(value)
+    let value = env::var(key).unwrap_or_else(|_| default.to_owned());
+    laravel_truthy(&value).then_some(value)
 }
 
 /// The configured ffprobe, or the one installed next to ffmpeg.
