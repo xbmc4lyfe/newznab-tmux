@@ -30,5 +30,11 @@ status = "todo"
 kind = "command"
 id = "postprocess:tv-pipeline"
 source = "app/Console/Commands/PostProcessTvPipeline.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "update:postprocess"
+source = "app/Console/Commands/UpdatePostProcess.php"
 status = "ported"
 note = "nntmux-ctl postprocess tv-pipeline <guid> [renamed], over the metadata crate's TV provider pipeline."

@@ -14,6 +14,7 @@ bcrypt.workspace = true
 chrono.workspace = true
 form_urlencoded.workspace = true
 hex.workspace = true
+md-5.workspace = true
 hmac.workspace = true
 ipnet.workspace = true
 nntmux-core.workspace = true
