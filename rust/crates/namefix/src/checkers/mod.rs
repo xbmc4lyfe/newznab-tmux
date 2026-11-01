@@ -68,7 +68,12 @@ impl Rule {
     fn apply(&self, checker: &str, textstring: &str) -> Option<NameFixResult> {
         let found = match self.re {
             Re::Bytes(re) => caps(re, textstring)?,
-            Re::Look(re) => pcre_caps(re, textstring)?,
+            // The engine's backtrack limit can stop it partway through NFO-sized text, where
+            // PHP's JIT finds the match. None of these patterns can take a newline, so the first
+            // line with a match holds the leftmost match of the whole text.
+            Re::Look(re) => textstring
+                .split('\n')
+                .find_map(|line| pcre_caps(re, line))?,
         };
         let mut name = found.whole();
         if let Some(after) = self.after {

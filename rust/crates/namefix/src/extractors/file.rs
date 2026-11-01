@@ -86,9 +86,6 @@ pub fn extract_from_file(filename: &str) -> Option<NameFixResult> {
         "Scene release with group"
     );
 
-    // These end in `(.+)$`, and no part of them can take a newline, so a final one is the
-    // only thing `$` can see past. The Pcre engine's `$` doesn't allow it.
-    let subject = filename.strip_suffix('\n').unwrap_or(filename);
     for (pattern, method) in [
         (
             pcre!(
@@ -119,7 +116,7 @@ pub fn extract_from_file(filename: &str) -> Option<NameFixResult> {
             "Generic movie 1",
         ),
     ] {
-        if let Some(c) = pcre_caps(pattern, subject) {
+        if let Some(c) = pcre_caps(pattern, filename) {
             return found(c.text_or_empty(4), method);
         }
     }
