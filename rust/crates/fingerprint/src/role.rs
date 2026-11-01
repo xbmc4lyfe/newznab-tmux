@@ -1,6 +1,7 @@
 //! The `fingerprint` role: database-backed collection workers and the stale sweep.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -34,6 +35,11 @@ impl Settings {
     pub fn from_env(nntp: &NntpConfig) -> Result<Self> {
         if nntp.primary.host.trim().is_empty() {
             bail!("NNTP_SERVER is required");
+        }
+        // Without this every connect fails, and each release would save as a partial result that
+        // nothing retries.
+        if nntp.primary.port == 0 {
+            bail!("NNTP_PORT is required");
         }
         let mut providers = vec![provider("primary", &nntp.primary)];
         if let Some(alternate) = nntp
@@ -148,11 +154,17 @@ pub async fn work_once(pool: &MySqlPool, settings: &Settings) -> Result<bool> {
     Ok(true)
 }
 
+async fn ctx_paused(ctx: &Ctx) -> bool {
+    ctx.paused().await.unwrap_or(true)
+}
+
 pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
     let settings = Arc::new(Settings::from_env(&NntpConfig::from_env())?);
+    let failed = Arc::new(AtomicBool::new(false));
     let mut tasks = JoinSet::new();
     for _ in 0..settings.concurrency {
-        let (ctx, stop, settings) = (ctx.clone(), stop.clone(), settings.clone());
+        let (ctx, stop, settings, failed) =
+            (ctx.clone(), stop.clone(), settings.clone(), failed.clone());
         let once = args.once;
         tasks.spawn(async move {
             while !stop.requested() {
@@ -189,6 +201,7 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
                     }
                     Err(failure) => {
                         error!(error = format!("{failure:#}"), "fingerprint worker failed");
+                        failed.store(true, Ordering::Relaxed);
                         if once {
                             return;
                         }
@@ -199,7 +212,7 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
         });
     }
     if !args.once {
-        let (db, stop) = (ctx.db.clone(), stop.clone());
+        let (db, stop, sweep_ctx) = (ctx.db.clone(), stop.clone(), ctx.clone());
         tasks.spawn(async move {
             // Records an upgrade marked stale, and runs whose worker died.
             while !stop.requested() {
@@ -210,6 +223,10 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
                     dry_run: false,
                     stale: true,
                 };
+                if ctx_paused(&sweep_ctx).await {
+                    stop.sleep(STALE_SWEEP_EVERY).await;
+                    continue;
+                }
                 match backfill::backfill(&db, &options).await {
                     Ok(ids) if !ids.is_empty() => {
                         info!(count = ids.len(), "stale fingerprints requeued")
@@ -224,6 +241,14 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
             }
         });
     }
-    while tasks.join_next().await.is_some() {}
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(failure) = joined {
+            error!(error = %failure, "a fingerprint worker stopped");
+            failed.store(true, Ordering::Relaxed);
+        }
+    }
+    if args.once && failed.load(Ordering::Relaxed) {
+        bail!("A fingerprint worker failed.");
+    }
     Ok(())
 }
