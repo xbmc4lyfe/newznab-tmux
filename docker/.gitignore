@@ -1,10 +1,12 @@
-# Written by bin/deploy-guard
-.deploy.lock
+# Written by bin/deploy
+.deploy.lock/
+.deploy.log
+.deploy.config
+# Left behind by the PHP-era deploy guard on existing installs
 .deploy.lock.claim/
 .deploy.lock.recovery-hold
-.deploy.log
 .deploy.stamp
 .deploy.stamp.*
-.build.stamp.*
 .build.stamp
+.build.stamp.*
 .deploy.time

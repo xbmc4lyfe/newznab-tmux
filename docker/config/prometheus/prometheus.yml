@@ -44,7 +44,7 @@ scrape_configs:
     relabel_configs:
       - source_labels: [__address__]
         regex: '([^:]+):\d+'
-        target_label: role
+        target_label: service
 
   # Database-derived NNTmux metrics pushed every minute by the supervisor's metrics export.
   - job_name: pushgateway

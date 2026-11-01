@@ -49,16 +49,15 @@ Dockerfile		-binary text
 # Deployment configuration is source code and must remain reviewable as text.
 /infra/terraform/** -binary text eol=lf
 /deploy/** -binary text eol=lf
-.env.dist -binary text eol=lf
 .env.example -binary text eol=lf
 /tests/Fixtures/rapidyenc-abi.c -binary text eol=lf
 
 # Reviewable, mergeable text despite the repository-wide `* binary` default
 Justfile		-binary text eol=lf
-docker/bin/deploy-guard	-binary text eol=lf
+docker/bin/deploy	-binary text eol=lf
+docker/bin/deploy-inspect	-binary text eol=lf
 docker/Justfile		-binary text eol=lf
 /scripts/nzb_fingerprint.py	-binary text eol=lf
-/scripts/dotenv-get -binary text eol=lf
 /tests/Unit/test_nzb_fingerprint.py	-binary text eol=lf
 /scripts/benchmark-yenc-abi.py -binary text eol=lf
 /tests/Unit/test_yenc_abi_benchmark.py -binary text eol=lf
@@ -75,20 +74,15 @@ docker/Justfile		-binary text eol=lf
 /tests/Fixtures/NativeSpotCheckPlannerInvalidLibrary.c -binary text eol=lf
 
 # Native release presentation and its runtime fixtures must be reviewable.
-/docker/app/Caddyfile -binary text eol=lf
-/docker/app/php/release-presentation.h -binary text eol=lf
 /tests/Fixtures/ReleasePresentation.Dockerfile -binary text eol=lf
 /scripts/test-release-presentation-web.py -binary text eol=lf
 /tests/Fixtures/ReleasePresentation.Dockerfile.dockerignore -binary text eol=lf
 
-# Guarded application rollout helpers are source, not binary artifacts.
-/docker/bin/build-images -binary text eol=lf
+# Guarded application rollout helpers and stack config are source, not binary artifacts.
 /docker/bin/compose -binary text eol=lf
 /docker/bin/compose_dotenv.py -binary text eol=lf
-/docker/bin/deploy-app -binary text eol=lf
-/docker/bin/deploy-current -binary text eol=lf
-/docker/bin/deploy-plan -binary text eol=lf
-/docker/bin/up-app -binary text eol=lf
+/docker/bin/generate-env -binary text eol=lf
+/docker/config/** -binary text eol=lf
 
 /scripts/benchmark-pages.py -binary text eol=lf
 /scripts/export-benchmark-summary.py -binary text eol=lf

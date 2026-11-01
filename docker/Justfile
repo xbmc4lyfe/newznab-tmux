@@ -8,7 +8,7 @@ export JUST := just_executable()
 CURDIR := canonicalize(module_directory())
 COMPOSE := CURDIR + "/bin/compose"
 ENV_FILE := CURDIR + "/.env"
-ENV_KEYS := "COMPOSE_FILE COMPOSE_OVERLAY_FILE DC APP_IMAGE DEPLOY_BY DEPLOY_SYNC_REMOTE DEPLOY_GIT_REMOTE DEPLOY_GIT_BRANCH DEPLOY_HEALTH_TIMEOUT DEPLOY_LOCK_DIR DEPLOY_LOG APP_PORT DB_DATABASE DB_ROOTPASSWORD DRY_RUN s cmd"
+ENV_KEYS := "COMPOSE_FILE COMPOSE_OVERLAY_FILE DC APP_IMAGE DEPLOY_BY DEPLOY_SYNC_REMOTE DEPLOY_GIT_REMOTE DEPLOY_GIT_BRANCH DEPLOY_HEALTH_TIMEOUT DEPLOY_LOCK_DIR DEPLOY_LOG DEPLOY_CONFIG_STAMP DEPLOY_DATA_SERVICES DEPLOY_RECREATE_DATA APP_ENV_FILE APP_PORT DB_DATABASE DB_ROOTPASSWORD DRY_RUN s cmd"
 
 # Recipe prelude. Precedence: trailing KEY=VAL arguments, then the environment, then docker/.env.
 # docker/.env is read with the parser docker/bin/compose shares (Compose's quoting rules), never
@@ -62,14 +62,14 @@ deploy *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    exec "{{CURDIR}}/bin/deploy" "${ARGS[@]}"
+    exec "{{CURDIR}}/bin/deploy" ${ARGS[@]+"${ARGS[@]}"}
 
 # What deploy would do, without building or changing anything
 deploy-plan *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    DRY_RUN=1 exec "{{CURDIR}}/bin/deploy" "${ARGS[@]}"
+    DRY_RUN=1 exec "{{CURDIR}}/bin/deploy" ${ARGS[@]+"${ARGS[@]}"}
 
 # First-time install on an empty database: env, build, nntmux-ctl init, seed, start
 init *args:
@@ -97,7 +97,7 @@ up *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    "{{COMPOSE}}" up -d --wait "${ARGS[@]}"
+    "{{COMPOSE}}" up -d --wait ${ARGS[@]+"${ARGS[@]}"}
 
 # Stop the stack. Workers drain in-flight work within their stop grace.
 down *args:

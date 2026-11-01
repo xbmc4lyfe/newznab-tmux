@@ -4,20 +4,34 @@
 #   1. One deploy at a time (a lock directory; a crashed run leaves it for the owner to inspect).
 #   2. The checkout must be on DEPLOY_GIT_BRANCH and match DEPLOY_GIT_REMOTE (fast-forwarded when
 #      only behind). Local or diverged commits stop the deploy.
-#   3. Build the image while the old stack keeps running.
-#   4. `docker compose up -d --wait`: `migrate` runs first, then each changed service is
-#      recreated. Workers get SIGTERM and finish their in-flight units within their
-#      stop_grace_period before the new container starts. Unchanged services are left alone.
-#   5. Every started line in DEPLOY_LOG gets a matching finished line with the exit code.
+#   3. Preflight, before anything changes: no running container of a service the Compose file no
+#      longer defines (the PHP horizon/scheduler/indexer after cutover), no `$` interpolation in
+#      config/app.env, and no changed mounted config on a data service (mariadb, redis,
+#      manticore) unless DEPLOY_RECREATE_DATA=1.
+#   4. Build the image while the old stack keeps running.
+#   5. `migrate` runs on its own. If it fails, nothing has been recreated and the old stack keeps
+#      serving.
+#   6. `docker compose up -d --wait`: each changed service is recreated. Workers get SIGTERM and
+#      finish their in-flight units within their stop_grace_period before the new container
+#      starts. Compose doesn't notice a changed mounted file (Caddyfile, prometheus.yml, Grafana
+#      provisioning), so services whose mounted config hash differs from the last healthy deploy
+#      (DEPLOY_CONFIG_STAMP) are force-recreated as well.
+#   7. Every running app container must run the image just built; then the config stamp is saved.
+#   8. Every started line in DEPLOY_LOG gets a matching finished line with the exit code.
 #
 # Settings come from the environment (the Justfile loads docker/.env): DEPLOY_BY (required),
 # DEPLOY_SYNC_REMOTE, DEPLOY_GIT_REMOTE, DEPLOY_GIT_BRANCH, DEPLOY_HEALTH_TIMEOUT, DEPLOY_LOCK_DIR,
-# DEPLOY_LOG, APP_IMAGE, DRY_RUN=1 (print the plan and stop).
+# DEPLOY_LOG, DEPLOY_CONFIG_STAMP, DEPLOY_DATA_SERVICES, DEPLOY_RECREATE_DATA, APP_ENV_FILE,
+# APP_IMAGE, DRY_RUN=1 (print the plan and stop).
+#
+# Written for bash 3.2 (macOS): no associative arrays, and every array expansion is guarded so an
+# empty one doesn't trip `set -u`.
 set -euo pipefail
 
 stack=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 repo=$(dirname "$stack")
 compose="$stack/bin/compose"
+inspect="$stack/bin/deploy-inspect"
 
 : "${DEPLOY_BY:?set DEPLOY_BY in docker/.env or on the command line}"
 remote=${DEPLOY_GIT_REMOTE:-origin}
@@ -26,10 +40,15 @@ sync=${DEPLOY_SYNC_REMOTE:-1}
 timeout=${DEPLOY_HEALTH_TIMEOUT:-600}
 lock=${DEPLOY_LOCK_DIR:-$stack/.deploy.lock}
 log=${DEPLOY_LOG:-$stack/.deploy.log}
+config_stamp=${DEPLOY_CONFIG_STAMP:-$stack/.deploy.config}
+data_services=" ${DEPLOY_DATA_SERVICES:-mariadb redis manticore} "
+app_env=${APP_ENV_FILE:-$stack/config/app.env}
 image=${APP_IMAGE:-nntmux/rust:local}
+dry_run=${DRY_RUN:-0}
 services=("$@")
 
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+has() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
 
 if ! mkdir "$lock" 2>/dev/null; then
     echo "Another deploy holds $lock ($(cat "$lock/owner" 2>/dev/null || echo unknown))." >&2
@@ -38,12 +57,13 @@ if ! mkdir "$lock" 2>/dev/null; then
 fi
 printf '%s pid=%s at=%s\n' "$DEPLOY_BY" "$$" "$(stamp)" > "$lock/owner"
 started=0
+work=$(mktemp -d)
 finish() {
     rc=$?
     if [ "$started" = 1 ]; then
         printf '%s deploy result=finished rc=%s by=%s\n' "$(stamp)" "$rc" "$DEPLOY_BY" >> "$log"
     fi
-    rm -rf "$lock"
+    rm -rf "$lock" "$work"
     exit "$rc"
 }
 trap finish EXIT
@@ -60,7 +80,7 @@ if [ "$sync" != 0 ]; then
         echo "The checkout has commits that aren't on $remote/$branch; push or drop them first." >&2
         exit 1
     fi
-    if [ "${DRY_RUN:-0}" = 1 ]; then
+    if [ "$dry_run" = 1 ]; then
         echo "Would fast-forward $(git rev-parse --short=12 HEAD) to $(git rev-parse --short=12 FETCH_HEAD)."
     else
         git merge --quiet --ff-only FETCH_HEAD
@@ -68,9 +88,90 @@ if [ "$sync" != 0 ]; then
 fi
 commit=$(git rev-parse --short=12 HEAD)
 
-if [ "${DRY_RUN:-0}" = 1 ]; then
+# ── Preflight. Nothing has changed yet, so every refusal here leaves the stack as it was.
+"$compose" config --format json > "$work/model.json"
+"$compose" --profile '*' config --format json > "$work/all.json"
+project=$("$inspect" name < "$work/model.json")
+known=" $("$inspect" services < "$work/all.json" | tr '\n' ' ') "
+app_users=" $("$inspect" image-users "$image" < "$work/model.json" | tr '\n' ' ') "
+if [ "$app_users" = "  " ]; then
+    echo "No service in the Compose model runs $image; check APP_IMAGE and COMPOSE_FILE." >&2
+    exit 1
+fi
+
+orphans=""
+while read -r name svc; do
+    [ -n "$name" ] || continue
+    has "$known" "$svc" || orphans="$orphans $name"
+done <<EOF_PS
+$(docker ps --filter "label=com.docker.compose.project=$project" \
+    --format '{{.Names}} {{.Label "com.docker.compose.service"}}')
+EOF_PS
+if [ -n "$orphans" ]; then
+    echo "Containers of services the Compose file no longer defines are running:$orphans." >&2
+    echo "They would keep writing beside the new stack. Drain them with their own tooling, then" >&2
+    echo "stop and remove them (Compose can't, since it no longer knows them):" >&2
+    echo "  docker stop --time 1920$orphans && docker rm$orphans" >&2
+    exit 1
+fi
+
+if [ -f "$app_env" ]; then
+    bad=$("$inspect" interpolated "$app_env" | tr '\n' ' ')
+    if [ -n "${bad// /}" ]; then
+        echo "$app_env: Compose would interpolate \$ in: $bad" >&2
+        echo "Single-quote those values (KEY='value'), or write \$\$ for a literal \$." >&2
+        exit 1
+    fi
+fi
+
+# Targets: the services named on the command line, else every service in the active profiles.
+if [ ${#services[@]} -gt 0 ]; then
+    targets=" ${services[*]} "
+else
+    targets=" $("$inspect" services < "$work/model.json" | tr '\n' ' ') "
+fi
+need_migrate=0
+for svc in $targets; do
+    has "$known" "$svc" || { echo "Unknown service: $svc" >&2; exit 1; }
+    has "$app_users" "$svc" && need_migrate=1
+done
+
+# Mounted config: compare with the last healthy deploy's stamp. Without a stamp (first deploy)
+# every stateless service with mounted config is recreated, since its running container may hold
+# another revision's files; a data service's hash is only recorded.
+"$inspect" configs "$stack" < "$work/model.json" > "$work/configs"
+recreate=()
+blocked=""
+while read -r svc hash; do
+    has "$targets" "$svc" || continue
+    if [ -f "$config_stamp" ]; then
+        old=$(awk -v s="$svc" '$1 == s { print $2 }' "$config_stamp")
+        [ "$old" = "$hash" ] && continue
+        [ -z "$old" ] && has "$data_services" "$svc" && continue
+    elif has "$data_services" "$svc"; then
+        continue
+    fi
+    if has "$data_services" "$svc"; then
+        if [ "${DEPLOY_RECREATE_DATA:-0}" = 1 ]; then
+            recreate+=("$svc")
+        else
+            blocked="$blocked $svc"
+        fi
+    else
+        recreate+=("$svc")
+    fi
+done < "$work/configs"
+if [ -n "$blocked" ]; then
+    echo "Mounted config changed for data service(s):$blocked." >&2
+    echo "Recreating one interrupts every writer. Plan a window, then rerun with DEPLOY_RECREATE_DATA=1." >&2
+    exit 1
+fi
+
+if [ "$dry_run" = 1 ]; then
     echo "Would build $image from $commit and roll out: ${services[*]:-every default service}."
-    "$compose" up --dry-run --no-build -d "${services[@]}"
+    [ "$need_migrate" = 1 ] && echo "Would run migrate before recreating anything."
+    echo "Would force-recreate for changed mounted config: ${recreate[*]:-none}."
+    "$compose" up --dry-run --no-build -d ${services[@]+"${services[@]}"}
     exit 0
 fi
 
@@ -78,7 +179,52 @@ started=1
 printf '%s deploy result=started by=%s commit=%s services=%s\n' \
     "$(stamp)" "$DEPLOY_BY" "$commit" "${services[*]:-all}" >> "$log"
 
+# ── Rollout.
 docker build --label "org.opencontainers.image.revision=$commit" -t "$image" "$repo"
-"$compose" up -d --wait --wait-timeout "$timeout" "${services[@]}"
+built=$(docker image inspect --format '{{.Id}}' "$image")
+
+if [ "$need_migrate" = 1 ]; then
+    echo "Running migrations before recreating any service."
+    "$compose" run --rm migrate
+fi
+"$compose" up -d --wait --wait-timeout "$timeout" ${services[@]+"${services[@]}"}
+if [ ${#recreate[@]} -gt 0 ]; then
+    echo "Recreating for changed mounted config: ${recreate[*]}."
+    "$compose" up -d --wait --wait-timeout "$timeout" --no-deps --force-recreate "${recreate[@]}"
+fi
+
+# Every running app container must run the image just built, whatever Compose decided.
+stale=""
+for svc in $app_users; do
+    has "$targets" "$svc" || continue
+    for id in $("$compose" ps -q "$svc"); do
+        [ "$(docker inspect --format '{{.Image}}' "$id")" = "$built" ] || stale="$stale $svc"
+    done
+done
+if [ -n "$stale" ]; then
+    echo "Still running another image than $built:$stale." >&2
+    exit 1
+fi
+
+# Grafana applies GF_SECURITY_ADMIN_PASSWORD only to a new database, so set it on every rollout.
+if has "$targets" grafana && [ -n "$("$compose" ps -q grafana)" ]; then
+    # shellcheck disable=SC2016 # expanded inside the container
+    "$compose" exec -T grafana sh -c \
+        'printf %s "$GF_SECURITY_ADMIN_PASSWORD" | grafana cli admin reset-admin-password --password-from-stdin' \
+        > /dev/null || echo "Warning: couldn't set Grafana's admin password; set it in Grafana." >&2
+fi
+
+# Save the stamp: services rolled out now get their new hash; the others keep their old one.
+{
+    while read -r svc hash; do
+        if has "$targets" "$svc" || [ ! -f "$config_stamp" ]; then
+            echo "$svc $hash"
+        else
+            awk -v s="$svc" '$1 == s' "$config_stamp"
+        fi
+    done < "$work/configs"
+} > "$work/stamp"
+mv "$work/stamp" "$config_stamp"
+
 "$compose" ps
 echo "Deployed $commit."
