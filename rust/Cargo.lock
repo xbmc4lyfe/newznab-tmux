@@ -2270,8 +2270,14 @@ name = "nntmux-ops"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2438,7 +2444,19 @@ name = "nntmux-supervisor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "futures-util",
+ "metrics",
+ "nntmux-core",
+ "nntmux-ops",
+ "nntmux-predb",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "redis",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
