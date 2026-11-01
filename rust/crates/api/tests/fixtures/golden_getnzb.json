@@ -1,0 +1,1375 @@
+[
+ {
+  "name": "getnzb_no_r",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001",
+  "expect": {
+   "status": 400,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "91"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [200] Missing parameter"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"200\" description=\"Missing parameter\"/>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_bad_r",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=nope",
+  "expect": {
+   "status": 401,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "100"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [100] Incorrect user credentials"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"100\" description=\"Incorrect user credentials\"/>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_unverified",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenunverified",
+  "expect": {
+   "status": 401,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "100"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [100] Incorrect user credentials"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"100\" description=\"Incorrect user credentials\"/>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_disabled",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokendisabled",
+  "expect": {
+   "status": 403,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "91"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [101] Account suspended"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"101\" description=\"Account suspended\"/>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_no_id",
+  "path": "/getnzb?r=tokenalice",
+  "expect": {
+   "status": 400,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "98"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [200] Parameter id is required"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"200\" description=\"Parameter id is required\"/>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_missing_nzb",
+  "path": "/getnzb?id=bbbb000000000000000000000000000000000002&r=tokenalice",
+  "expect": {
+   "status": 404,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "93"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [300] NZB file not found!"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"300\" description=\"NZB file not found!\"/>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_nonsense",
+  "path": "/getnzb?id=nope&r=tokenalice",
+  "expect": {
+   "status": 404,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "93"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [300] NZB file not found!"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"300\" description=\"NZB file not found!\"/>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_limit",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "INSERT INTO user_downloads (users_id, releases_id, timestamp) SELECT 1, 1, NOW() FROM seq_1_to_10;"
+  ],
+  "expect": {
+   "status": 429,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "96"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [501] Download limit reached"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"501\" description=\"Download limit reached\"/>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_ok",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001.NZB&r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ],
+  "after": "SELECT CAST(grabs AS CHAR) FROM releases WHERE id=1 UNION ALL SELECT CAST(grabs AS CHAR) FROM users WHERE id=1 UNION ALL SELECT CAST(COUNT(*) AS CHAR) FROM user_downloads WHERE users_id=1 AND releases_id=1",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "private, must-revalidate"
+    ],
+    [
+     "content-disposition",
+     "attachment; filename=A.Movie.2024.1080p.BluRay-GRP.nzb"
+    ],
+    [
+     "content-type",
+     "application/x-nzb"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-dnzb-category",
+     "Movies &gt; HD"
+    ],
+    [
+     "x-dnzb-details",
+     "http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-failure",
+     "http://127.0.0.1:8765/failed?guid=aaaa000000000000000000000000000000000001&userid=1&api_token=tokenalice"
+    ],
+    [
+     "x-dnzb-moreinfo",
+     "http://www.imdb.com/title/tt1234567"
+    ],
+    [
+     "x-dnzb-nfo",
+     "http://127.0.0.1:8765/nfo/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-rcode",
+     "200"
+    ],
+    [
+     "x-dnzb-rtext",
+     "OK, NZB content follows."
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb><file poster=\"1-a@b\" date=\"1\" subject=\"s\"><groups><group>g</group></groups><segments><segment bytes=\"1\" number=\"1\">m@x</segment></segments></file><file poster=\"1-c@d\"></file></nzb>\n",
+   "audit": [],
+   "after": [
+    "4",
+    "4",
+    "1"
+   ]
+  }
+ },
+ {
+  "name": "getnzb_guid_path",
+  "path": "/getnzb/bbbb000000000000000000000000000000000002?r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('bbbb000000000000000000000000000000000002', 2, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "private, must-revalidate"
+    ],
+    [
+     "content-disposition",
+     "attachment; filename=Some.Show.S02E03.720p.WEB-GRP_more.nzb; filename*=utf-8''Some.Show.S02E03.720p.WEB-GRP_%26_more.nzb"
+    ],
+    [
+     "content-type",
+     "application/x-nzb"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-dnzb-category",
+     "TV &gt; HD"
+    ],
+    [
+     "x-dnzb-details",
+     "http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002"
+    ],
+    [
+     "x-dnzb-failure",
+     "http://127.0.0.1:8765/failed?guid=bbbb000000000000000000000000000000000002&userid=1&api_token=tokenalice"
+    ],
+    [
+     "x-dnzb-moreinfo",
+     "http://www.thetvdb.com/?tab=series&id=73"
+    ],
+    [
+     "x-dnzb-rcode",
+     "200"
+    ],
+    [
+     "x-dnzb-rtext",
+     "OK, NZB content follows."
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb><file poster=\"1-a@b\" date=\"1\" subject=\"s\"><groups><group>g</group></groups><segments><segment bytes=\"1\" number=\"1\">m@x</segment></segments></file><file poster=\"1-c@d\"></file></nzb>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_post",
+  "method": "POST",
+  "path": "/getnzb",
+  "headers": {
+   "Content-Type": "application/x-www-form-urlencoded"
+  },
+  "body": "id=bbbb000000000000000000000000000000000002&r=tokenposter",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('bbbb000000000000000000000000000000000002', 2, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ],
+  "ignore_body": true,
+  "expect": {
+   "status": 419,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "text/html; charset=utf-8"
+    ]
+   ],
+   "body": "<!DOCTYPE html>\n<html lang=\"en\">\n    <head>\n        <meta charset=\"utf-8\">\n        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\n        <title>Page Expired</title>\n\n        <style>\n            /*! normalize.css v8.0.1 | MIT License | github.com/necolas/normalize.css */html{line-height:1.15;-webkit-text-size-adjust:100%}body{margin:0}a{background-color:transparent}code{font-family:monospace,monospace;font-size:1em}[hidden]{display:none}html{font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,Noto Sans,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;line-height:1.5}*,:after,:before{box-sizing:border-box;border:0 solid #e2e8f0}a{color:inherit;text-decoration:inherit}code{font-family:Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace}svg,video{display:block;vertical-align:middle}video{max-width:100%;height:auto}.bg-white{--bg-opacity:1;background-color:#fff;background-color:rgba(255,255,255,var(--bg-opacity))}.bg-gray-100{--bg-opacity:1;background-color:#f7fafc;background-color:rgba(247,250,252,var(--bg-opacity))}.border-gray-200{--border-opacity:1;border-color:#edf2f7;border-color:rgba(237,242,247,var(--border-opacity))}.border-gray-400{--border-opacity:1;border-color:#cbd5e0;border-color:rgba(203,213,224,var(--border-opacity))}.border-t{border-top-width:1px}.border-r{border-right-width:1px}.flex{display:flex}.grid{display:grid}.hidden{display:none}.items-center{align-items:center}.justify-center{justify-content:center}.font-semibold{font-weight:600}.h-5{height:1.25rem}.h-8{height:2rem}.h-16{height:4rem}.text-sm{font-size:.875rem}.text-lg{font-size:1.125rem}.leading-7{line-height:1.75rem}.mx-auto{margin-left:auto;margin-right:auto}.ml-1{margin-left:.25rem}.mt-2{margin-top:.5rem}.mr-2{margin-right:.5rem}.ml-2{margin-left:.5rem}.mt-4{margin-top:1rem}.ml-4{margin-left:1rem}.mt-8{margin-top:2rem}.ml-12{margin-left:3rem}.-mt-px{margin-top:-1px}.max-w-xl{max-width:36rem}.max-w-6xl{max-width:72rem}.min-h-screen{min-height:100vh}.overflow-hidden{overflow:hidden}.p-6{padding:1.5rem}.py-4{padding-top:1rem;padding-bottom:1rem}.px-4{padding-left:1rem;padding-right:1rem}.px-6{padding-left:1.5rem;padding-right:1.5rem}.pt-8{padding-top:2rem}.fixed{position:fixed}.relative{position:relative}.top-0{top:0}.right-0{right:0}.shadow{box-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px 0 rgba(0,0,0,.06)}.text-center{text-align:center}.text-gray-200{--text-opacity:1;color:#edf2f7;color:rgba(237,242,247,var(--text-opacity))}.text-gray-300{--text-opacity:1;color:#e2e8f0;color:rgba(226,232,240,var(--text-opacity))}.text-gray-400{--text-opacity:1;color:#cbd5e0;color:rgba(203,213,224,var(--text-opacity))}.text-gray-500{--text-opacity:1;color:#a0aec0;color:rgba(160,174,192,var(--text-opacity))}.text-gray-600{--text-opacity:1;color:#718096;color:rgba(113,128,150,var(--text-opacity))}.text-gray-700{--text-opacity:1;color:#4a5568;color:rgba(74,85,104,var(--text-opacity))}.text-gray-900{--text-opacity:1;color:#1a202c;color:rgba(26,32,44,var(--text-opacity))}.uppercase{text-transform:uppercase}.underline{text-decoration:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.tracking-wider{letter-spacing:.05em}.w-5{width:1.25rem}.w-8{width:2rem}.w-auto{width:auto}.grid-cols-1{grid-template-columns:repeat(1,minmax(0,1fr))}@-webkit-keyframes spin{0%{transform:rotate(0deg)}to{transform:rotate(1turn)}}@keyframes spin{0%{transform:rotate(0deg)}to{transform:rotate(1turn)}}@-webkit-keyframes ping{0%{transform:scale(1);opacity:1}75%,to{transform:scale(2);opacity:0}}@keyframes ping{0%{transform:scale(1);opacity:1}75%,to{transform:scale(2);opacity:0}}@-webkit-keyframes pulse{0%,to{opacity:1}50%{opacity:.5}}@keyframes pulse{0%,to{opacity:1}50%{opacity:.5}}@-webkit-keyframes bounce{0%,to{transform:translateY(-25%);-webkit-animation-timing-function:cubic-bezier(.8,0,1,1);animation-timing-function:cubic-bezier(.8,0,1,1)}50%{transform:translateY(0);-webkit-animation-timing-function:cubic-bezier(0,0,.2,1);animation-timing-function:cubic-bezier(0,0,.2,1)}}@keyframes bounce{0%,to{transform:translateY(-25%);-webkit-animation-timing-function:cubic-bezier(.8,0,1,1);animation-timing-function:cubic-bezier(.8,0,1,1)}50%{transform:translateY(0);-webkit-animation-timing-function:cubic-bezier(0,0,.2,1);animation-timing-function:cubic-bezier(0,0,.2,1)}}@media (min-width:640px){.sm\\:rounded-lg{border-radius:.5rem}.sm\\:block{display:block}.sm\\:items-center{align-items:center}.sm\\:justify-start{justify-content:flex-start}.sm\\:justify-between{justify-content:space-between}.sm\\:h-20{height:5rem}.sm\\:ml-0{margin-left:0}.sm\\:px-6{padding-left:1.5rem;padding-right:1.5rem}.sm\\:pt-0{padding-top:0}.sm\\:text-left{text-align:left}.sm\\:text-right{text-align:right}}@media (min-width:768px){.md\\:border-t-0{border-top-width:0}.md\\:border-l{border-left-width:1px}.md\\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}}@media (min-width:1024px){.lg\\:px-8{padding-left:2rem;padding-right:2rem}}@media (prefers-color-scheme:dark){.dark\\:bg-gray-800{--bg-opacity:1;background-color:#2d3748;background-color:rgba(45,55,72,var(--bg-opacity))}.dark\\:bg-gray-900{--bg-opacity:1;background-color:#1a202c;background-color:rgba(26,32,44,var(--bg-opacity))}.dark\\:border-gray-700{--border-opacity:1;border-color:#4a5568;border-color:rgba(74,85,104,var(--border-opacity))}.dark\\:text-white{--text-opacity:1;color:#fff;color:rgba(255,255,255,var(--text-opacity))}.dark\\:text-gray-400{--text-opacity:1;color:#cbd5e0;color:rgba(203,213,224,var(--text-opacity))}}\n        </style>\n\n        <style>\n            body {\n                font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, \"Noto Sans\", sans-serif, \"Apple Color Emoji\", \"Segoe UI Emoji\", \"Segoe UI Symbol\", \"Noto Color Emoji\";\n            }\n        </style>\n    </head>\n    <body class=\"antialiased\">\n        <div class=\"relative flex items-top justify-center min-h-screen bg-gray-100 dark:bg-gray-800 sm:items-center sm:pt-0\">\n            <div class=\"max-w-xl mx-auto sm:px-6 lg:px-8\">\n                <div class=\"flex items-center pt-8 sm:justify-start sm:pt-0\">\n                    <div class=\"px-4 text-lg text-gray-500 border-r border-gray-400 tracking-wider\">\n                        419                    </div>\n\n                    <div class=\"ml-4 text-lg text-gray-500 uppercase tracking-wider\">\n                        Page Expired                    </div>\n                </div>\n            </div>\n        </div>\n    </body>\n</html>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_del",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenalice&del=1",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "INSERT INTO users_releases (users_id, releases_id) VALUES (1,1),(1,2);"
+  ],
+  "after": "SELECT CAST(COUNT(*) AS CHAR) FROM users_releases",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "private, must-revalidate"
+    ],
+    [
+     "content-disposition",
+     "attachment; filename=A.Movie.2024.1080p.BluRay-GRP.nzb"
+    ],
+    [
+     "content-type",
+     "application/x-nzb"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-dnzb-category",
+     "Movies &gt; HD"
+    ],
+    [
+     "x-dnzb-details",
+     "http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-failure",
+     "http://127.0.0.1:8765/failed?guid=aaaa000000000000000000000000000000000001&userid=1&api_token=tokenalice"
+    ],
+    [
+     "x-dnzb-moreinfo",
+     "http://www.imdb.com/title/tt1234567"
+    ],
+    [
+     "x-dnzb-nfo",
+     "http://127.0.0.1:8765/nfo/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-rcode",
+     "200"
+    ],
+    [
+     "x-dnzb-rtext",
+     "OK, NZB content follows."
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb><file poster=\"1-a@b\" date=\"1\" subject=\"s\"><groups><group>g</group></groups><segments><segment bytes=\"1\" number=\"1\">m@x</segment></segments></file><file poster=\"1-c@d\"></file></nzb>\n",
+   "audit": [],
+   "after": [
+    "1"
+   ]
+  }
+ },
+ {
+  "name": "getnzb_corrupt_digest",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0000000000000000000000000000000000000000000000000000000000000000', REPEAT('a',32), 221, NOW(), NOW());"
+  ],
+  "status_only": true,
+  "expect": {
+   "status": 500,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "text/html; charset=utf-8"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ]
+   ],
+   "body": "<!DOCTYPE html>\n<html lang=\"en\">\n    <head>\n        <meta charset=\"utf-8\">\n        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\n        <title>Server Error</title>\n\n        <style>\n            /*! normalize.css v8.0.1 | MIT License | github.com/necolas/normalize.css */html{line-height:1.15;-webkit-text-size-adjust:100%}body{margin:0}a{background-color:transparent}code{font-family:monospace,monospace;font-size:1em}[hidden]{display:none}html{font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,Noto Sans,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;line-height:1.5}*,:after,:before{box-sizing:border-box;border:0 solid #e2e8f0}a{color:inherit;text-decoration:inherit}code{font-family:Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace}svg,video{display:block;vertical-align:middle}video{max-width:100%;height:auto}.bg-white{--bg-opacity:1;background-color:#fff;background-color:rgba(255,255,255,var(--bg-opacity))}.bg-gray-100{--bg-opacity:1;background-color:#f7fafc;background-color:rgba(247,250,252,var(--bg-opacity))}.border-gray-200{--border-opacity:1;border-color:#edf2f7;border-color:rgba(237,242,247,var(--border-opacity))}.border-gray-400{--border-opacity:1;border-color:#cbd5e0;border-color:rgba(203,213,224,var(--border-opacity))}.border-t{border-top-width:1px}.border-r{border-right-width:1px}.flex{display:flex}.grid{display:grid}.hidden{display:none}.items-center{align-items:center}.justify-center{justify-content:center}.font-semibold{font-weight:600}.h-5{height:1.25rem}.h-8{height:2rem}.h-16{height:4rem}.text-sm{font-size:.875rem}.text-lg{font-size:1.125rem}.leading-7{line-height:1.75rem}.mx-auto{margin-left:auto;margin-right:auto}.ml-1{margin-left:.25rem}.mt-2{margin-top:.5rem}.mr-2{margin-right:.5rem}.ml-2{margin-left:.5rem}.mt-4{margin-top:1rem}.ml-4{margin-left:1rem}.mt-8{margin-top:2rem}.ml-12{margin-left:3rem}.-mt-px{margin-top:-1px}.max-w-xl{max-width:36rem}.max-w-6xl{max-width:72rem}.min-h-screen{min-height:100vh}.overflow-hidden{overflow:hidden}.p-6{padding:1.5rem}.py-4{padding-top:1rem;padding-bottom:1rem}.px-4{padding-left:1rem;padding-right:1rem}.px-6{padding-left:1.5rem;padding-right:1.5rem}.pt-8{padding-top:2rem}.fixed{position:fixed}.relative{position:relative}.top-0{top:0}.right-0{right:0}.shadow{box-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px 0 rgba(0,0,0,.06)}.text-center{text-align:center}.text-gray-200{--text-opacity:1;color:#edf2f7;color:rgba(237,242,247,var(--text-opacity))}.text-gray-300{--text-opacity:1;color:#e2e8f0;color:rgba(226,232,240,var(--text-opacity))}.text-gray-400{--text-opacity:1;color:#cbd5e0;color:rgba(203,213,224,var(--text-opacity))}.text-gray-500{--text-opacity:1;color:#a0aec0;color:rgba(160,174,192,var(--text-opacity))}.text-gray-600{--text-opacity:1;color:#718096;color:rgba(113,128,150,var(--text-opacity))}.text-gray-700{--text-opacity:1;color:#4a5568;color:rgba(74,85,104,var(--text-opacity))}.text-gray-900{--text-opacity:1;color:#1a202c;color:rgba(26,32,44,var(--text-opacity))}.uppercase{text-transform:uppercase}.underline{text-decoration:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.tracking-wider{letter-spacing:.05em}.w-5{width:1.25rem}.w-8{width:2rem}.w-auto{width:auto}.grid-cols-1{grid-template-columns:repeat(1,minmax(0,1fr))}@-webkit-keyframes spin{0%{transform:rotate(0deg)}to{transform:rotate(1turn)}}@keyframes spin{0%{transform:rotate(0deg)}to{transform:rotate(1turn)}}@-webkit-keyframes ping{0%{transform:scale(1);opacity:1}75%,to{transform:scale(2);opacity:0}}@keyframes ping{0%{transform:scale(1);opacity:1}75%,to{transform:scale(2);opacity:0}}@-webkit-keyframes pulse{0%,to{opacity:1}50%{opacity:.5}}@keyframes pulse{0%,to{opacity:1}50%{opacity:.5}}@-webkit-keyframes bounce{0%,to{transform:translateY(-25%);-webkit-animation-timing-function:cubic-bezier(.8,0,1,1);animation-timing-function:cubic-bezier(.8,0,1,1)}50%{transform:translateY(0);-webkit-animation-timing-function:cubic-bezier(0,0,.2,1);animation-timing-function:cubic-bezier(0,0,.2,1)}}@keyframes bounce{0%,to{transform:translateY(-25%);-webkit-animation-timing-function:cubic-bezier(.8,0,1,1);animation-timing-function:cubic-bezier(.8,0,1,1)}50%{transform:translateY(0);-webkit-animation-timing-function:cubic-bezier(0,0,.2,1);animation-timing-function:cubic-bezier(0,0,.2,1)}}@media (min-width:640px){.sm\\:rounded-lg{border-radius:.5rem}.sm\\:block{display:block}.sm\\:items-center{align-items:center}.sm\\:justify-start{justify-content:flex-start}.sm\\:justify-between{justify-content:space-between}.sm\\:h-20{height:5rem}.sm\\:ml-0{margin-left:0}.sm\\:px-6{padding-left:1.5rem;padding-right:1.5rem}.sm\\:pt-0{padding-top:0}.sm\\:text-left{text-align:left}.sm\\:text-right{text-align:right}}@media (min-width:768px){.md\\:border-t-0{border-top-width:0}.md\\:border-l{border-left-width:1px}.md\\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}}@media (min-width:1024px){.lg\\:px-8{padding-left:2rem;padding-right:2rem}}@media (prefers-color-scheme:dark){.dark\\:bg-gray-800{--bg-opacity:1;background-color:#2d3748;background-color:rgba(45,55,72,var(--bg-opacity))}.dark\\:bg-gray-900{--bg-opacity:1;background-color:#1a202c;background-color:rgba(26,32,44,var(--bg-opacity))}.dark\\:border-gray-700{--border-opacity:1;border-color:#4a5568;border-color:rgba(74,85,104,var(--border-opacity))}.dark\\:text-white{--text-opacity:1;color:#fff;color:rgba(255,255,255,var(--text-opacity))}.dark\\:text-gray-400{--text-opacity:1;color:#cbd5e0;color:rgba(203,213,224,var(--text-opacity))}}\n        </style>\n\n        <style>\n            body {\n                font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, \"Noto Sans\", sans-serif, \"Apple Color Emoji\", \"Segoe UI Emoji\", \"Segoe UI Symbol\", \"Noto Color Emoji\";\n            }\n        </style>\n    </head>\n    <body class=\"antialiased\">\n        <div class=\"relative flex items-top justify-center min-h-screen bg-gray-100 dark:bg-gray-800 sm:items-center sm:pt-0\">\n            <div class=\"max-w-xl mx-auto sm:px-6 lg:px-8\">\n                <div class=\"flex items-center pt-8 sm:justify-start sm:pt-0\">\n                    <div class=\"px-4 text-lg text-gray-500 border-r border-gray-400 tracking-wider\">\n                        500                    </div>\n\n                    <div class=\"ml-4 text-lg text-gray-500 uppercase tracking-wider\">\n                        Server Error                    </div>\n                </div>\n            </div>\n        </div>\n    </body>\n</html>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_grab_off",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "UPDATE ingestion_configurations SET grab_status=0;"
+  ],
+  "after": "SELECT CAST(grabs AS CHAR) FROM releases WHERE id=1",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "private, must-revalidate"
+    ],
+    [
+     "content-disposition",
+     "attachment; filename=A.Movie.2024.1080p.BluRay-GRP.nzb"
+    ],
+    [
+     "content-type",
+     "application/x-nzb"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-dnzb-category",
+     "Movies &gt; HD"
+    ],
+    [
+     "x-dnzb-details",
+     "http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-failure",
+     "http://127.0.0.1:8765/failed?guid=aaaa000000000000000000000000000000000001&userid=1&api_token=tokenalice"
+    ],
+    [
+     "x-dnzb-moreinfo",
+     "http://www.imdb.com/title/tt1234567"
+    ],
+    [
+     "x-dnzb-nfo",
+     "http://127.0.0.1:8765/nfo/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-rcode",
+     "200"
+    ],
+    [
+     "x-dnzb-rtext",
+     "OK, NZB content follows."
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb><file poster=\"1-a@b\" date=\"1\" subject=\"s\"><groups><group>g</group></groups><segments><segment bytes=\"1\" number=\"1\">m@x</segment></segments></file><file poster=\"1-c@d\"></file></nzb>\n",
+   "audit": [],
+   "after": [
+    "3"
+   ]
+  }
+ },
+ {
+  "name": "getnzb_unicode_name",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "UPDATE releases SET searchname='Déjà Vu: 日本語/x, y' WHERE id=1;"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "private, must-revalidate"
+    ],
+    [
+     "content-disposition",
+     "attachment; filename=Deja_Vu_x_y.nzb; filename*=utf-8''D%C3%A9j%C3%A0_Vu_%E6%97%A5%E6%9C%AC%E8%AA%9E_x_y.nzb"
+    ],
+    [
+     "content-type",
+     "application/x-nzb"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-dnzb-category",
+     "Movies &gt; HD"
+    ],
+    [
+     "x-dnzb-details",
+     "http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-failure",
+     "http://127.0.0.1:8765/failed?guid=aaaa000000000000000000000000000000000001&userid=1&api_token=tokenalice"
+    ],
+    [
+     "x-dnzb-moreinfo",
+     "http://www.imdb.com/title/tt1234567"
+    ],
+    [
+     "x-dnzb-nfo",
+     "http://127.0.0.1:8765/nfo/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-rcode",
+     "200"
+    ],
+    [
+     "x-dnzb-rtext",
+     "OK, NZB content follows."
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb><file poster=\"1-a@b\" date=\"1\" subject=\"s\"><groups><group>g</group></groups><segments><segment bytes=\"1\" number=\"1\">m@x</segment></segments></file><file poster=\"1-c@d\"></file></nzb>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_method",
+  "method": "DELETE",
+  "path": "/getnzb",
+  "ignore_body": true,
+  "expect": {
+   "status": 405,
+   "headers": [
+    [
+     "allow",
+     "GET, HEAD, POST"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "text/html; charset=utf-8"
+    ]
+   ],
+   "body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\" />\n    <meta name=\"robots\" content=\"noindex,nofollow,noarchive\" />\n    <title>An Error Occurred: Method Not Allowed</title>\n    <link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 128 128%22><text y=%221.2em%22 font-size=%2296%22>❌</text></svg>\" />\n    <style>body { background-color: #fff; color: #222; font: 16px/1.5 -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif; margin: 0; }\n.container { margin: 30px; max-width: 600px; }\nh1 { color: #dc3545; font-size: 24px; }\nh2 { font-size: 18px; }</style>\n</head>\n<body>\n<div class=\"container\">\n    <h1>Oops! An Error Occurred</h1>\n    <h2>The server returned a \"405 Method Not Allowed\".</h2>\n\n    <p>\n        Something is broken. Please let us know what you were doing when this error occurred.\n        We will fix it as soon as possible. Sorry for any inconvenience caused.\n    </p>\n</div>\n</body>\n</html>",
+   "audit": []
+  }
+ },
+ {
+  "name": "v1_get_no_id",
+  "path": "/api/v1/api?t=get&apikey=tokenalice",
+  "expect": {
+   "status": 404,
+   "headers": [
+    [
+     "accept-query",
+     "application/json"
+    ],
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "141"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [300] No such item (the guid you provided has no release in our database)"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"300\" description=\"No such item (the guid you provided has no release in our database)\"/>\n",
+   "audit": [
+    "/api/v1/api?t=get"
+   ]
+  }
+ },
+ {
+  "name": "v1_get_missing_release",
+  "path": "/api/v1/api?t=g&apikey=tokenalice&id=nope",
+  "expect": {
+   "status": 404,
+   "headers": [
+    [
+     "accept-query",
+     "application/json"
+    ],
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "141"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [300] No such item (the guid you provided has no release in our database)"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"300\" description=\"No such item (the guid you provided has no release in our database)\"/>\n",
+   "audit": [
+    "/api/v1/api?id=nope&t=g"
+   ]
+  }
+ },
+ {
+  "name": "v1_get_suffix_refused",
+  "path": "/api/v1/api?t=g&apikey=tokenalice&id=aaaa000000000000000000000000000000000001.nzb",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ],
+  "expect": {
+   "status": 404,
+   "headers": [
+    [
+     "accept-query",
+     "application/json"
+    ],
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "141"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [300] No such item (the guid you provided has no release in our database)"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"300\" description=\"No such item (the guid you provided has no release in our database)\"/>\n",
+   "audit": [
+    "/api/v1/api?id=aaaa000000000000000000000000000000000001.nzb&t=g"
+   ]
+  }
+ },
+ {
+  "name": "v1_get_ok",
+  "path": "/api/v1/api?t=g&apikey=tokenalice&id=aaaa000000000000000000000000000000000001",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "accept-query",
+     "application/json"
+    ],
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "private, must-revalidate"
+    ],
+    [
+     "content-disposition",
+     "attachment; filename=A.Movie.2024.1080p.BluRay-GRP.nzb"
+    ],
+    [
+     "content-type",
+     "application/x-nzb"
+    ],
+    [
+     "x-dnzb-category",
+     "Movies &gt; HD"
+    ],
+    [
+     "x-dnzb-details",
+     "http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-failure",
+     "http://127.0.0.1:8765/failed?guid=aaaa000000000000000000000000000000000001&userid=1&api_token=tokenalice"
+    ],
+    [
+     "x-dnzb-moreinfo",
+     "http://www.imdb.com/title/tt1234567"
+    ],
+    [
+     "x-dnzb-nfo",
+     "http://127.0.0.1:8765/nfo/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-rcode",
+     "200"
+    ],
+    [
+     "x-dnzb-rtext",
+     "OK, NZB content follows."
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb><file poster=\"1-a@b\" date=\"1\" subject=\"s\"><groups><group>g</group></groups><segments><segment bytes=\"1\" number=\"1\">m@x</segment></segments></file><file poster=\"1-c@d\"></file></nzb>\n",
+   "audit": [
+    "/api/v1/api?id=aaaa000000000000000000000000000000000001&t=g"
+   ]
+  }
+ },
+ {
+  "name": "v1_get_no_nzb",
+  "path": "/api/v1/api?t=g&apikey=tokenalice&id=bbbb000000000000000000000000000000000002",
+  "expect": {
+   "status": 404,
+   "headers": [
+    [
+     "accept-query",
+     "application/json"
+    ],
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "93"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [300] NZB file not found!"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"300\" description=\"NZB file not found!\"/>\n",
+   "audit": [
+    "/api/v1/api?id=bbbb000000000000000000000000000000000002&t=g"
+   ]
+  }
+ },
+ {
+  "name": "v2_get_missing_release",
+  "path": "/api/v2/getnzb?api_token=tokenalice&id=nope",
+  "expect": {
+   "status": 404,
+   "headers": [
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"error\":\"No such item (the guid you provided has no release in our database)\"}",
+   "audit": [
+    "/api/v2/getnzb?id=nope"
+   ]
+  }
+ },
+ {
+  "name": "v2_get_ok_suffix",
+  "path": "/api/v2/getnzb?api_token=tokenalice&id=aaaa000000000000000000000000000000000001.nzb",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "private, must-revalidate"
+    ],
+    [
+     "content-disposition",
+     "attachment; filename=A.Movie.2024.1080p.BluRay-GRP.nzb"
+    ],
+    [
+     "content-type",
+     "application/x-nzb"
+    ],
+    [
+     "x-dnzb-category",
+     "Movies &gt; HD"
+    ],
+    [
+     "x-dnzb-details",
+     "http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-failure",
+     "http://127.0.0.1:8765/failed?guid=aaaa000000000000000000000000000000000001&userid=1&api_token=tokenalice"
+    ],
+    [
+     "x-dnzb-moreinfo",
+     "http://www.imdb.com/title/tt1234567"
+    ],
+    [
+     "x-dnzb-nfo",
+     "http://127.0.0.1:8765/nfo/aaaa000000000000000000000000000000000001"
+    ],
+    [
+     "x-dnzb-rcode",
+     "200"
+    ],
+    [
+     "x-dnzb-rtext",
+     "OK, NZB content follows."
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb><file poster=\"1-a@b\" date=\"1\" subject=\"s\"><groups><group>g</group></groups><segments><segment bytes=\"1\" number=\"1\">m@x</segment></segments></file><file poster=\"1-c@d\"></file></nzb>\n",
+   "audit": [
+    "/api/v2/getnzb?id=aaaa000000000000000000000000000000000001.nzb"
+   ]
+  }
+ },
+ {
+  "name": "v2_get_no_nzb",
+  "path": "/api/v2/getnzb?api_token=tokenalice&id=bbbb000000000000000000000000000000000002",
+  "expect": {
+   "status": 404,
+   "headers": [
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [300] NZB file not found!"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"error\":\"NZB file not found!\"}",
+   "audit": [
+    "/api/v2/getnzb?id=bbbb000000000000000000000000000000000002"
+   ]
+  }
+ },
+ {
+  "name": "v2_get_limit",
+  "path": "/api/v2/getnzb?api_token=tokenalice&id=aaaa000000000000000000000000000000000001",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "INSERT INTO user_downloads (users_id, releases_id, timestamp) SELECT 1, 1, NOW() FROM seq_1_to_10;"
+  ],
+  "expect": {
+   "status": 429,
+   "headers": [
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [501] Download limit reached"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"error\":\"Download limit reached\"}",
+   "audit": [
+    "/api/v2/getnzb?id=aaaa000000000000000000000000000000000001"
+   ]
+  }
+ },
+ {
+  "name": "v1_nfo_unicode_file",
+  "path": "/api/v1/api?t=gn&apikey=tokenalice&id=aaaa000000000000000000000000000000000001&o=file",
+  "setup": [
+   "UPDATE releases SET searchname='Déjà Vu: 日本語/x, y' WHERE id=1;",
+   "INSERT INTO release_nfos (releases_id, nfo) VALUES (1, COMPRESS('x'));"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "accept-query",
+     "application/json"
+    ],
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-disposition",
+     "attachment; filename=Deja_Vu_x_y.nfo; filename*=utf-8''D%C3%A9j%C3%A0_Vu_%E6%97%A5%E6%9C%AC%E8%AA%9E_x_y.nfo"
+    ],
+    [
+     "content-type",
+     "application/octet-stream"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "x",
+   "audit": [
+    "/api/v1/api?id=aaaa000000000000000000000000000000000001&o=file&t=gn"
+   ]
+  }
+ },
+ {
+  "name": "getnzb_zip_limit",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001,bbbb000000000000000000000000000000000002&r=tokenalice&zip=1",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "INSERT INTO user_downloads (users_id, releases_id, timestamp) SELECT 1, 1, NOW() FROM seq_1_to_9;"
+  ],
+  "expect": {
+   "status": 429,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "96"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [501] Download limit reached"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"501\" description=\"Download limit reached\"/>\n",
+   "audit": []
+  }
+ },
+ {
+  "name": "getnzb_zip_ok",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001,bbbb000000000000000000000000000000000002,nope&r=tokenalice&zip=1&del=1",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "INSERT INTO users_releases (users_id, releases_id) VALUES (1,1),(1,2);"
+  ],
+  "status_only": true,
+  "after": "SELECT CAST(grabs AS CHAR) FROM releases WHERE id IN (1,2) UNION ALL SELECT CAST(grabs AS CHAR) FROM users WHERE id=1 UNION ALL SELECT CAST(COUNT(*) AS CHAR) FROM user_downloads WHERE users_id=1 UNION ALL SELECT CAST(COUNT(*) AS CHAR) FROM users_releases",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "public, must-revalidate"
+    ],
+    [
+     "content-disposition",
+     "attachment; filename*=UTF-8''20261101010913.zip"
+    ],
+    [
+     "content-length",
+     "433"
+    ],
+    [
+     "content-transfer-encoding",
+     "binary"
+    ],
+    [
+     "content-type",
+     "application/x-zip"
+    ],
+    [
+     "pragma",
+     "public"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-accel-buffering",
+     "no"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ]
+   ],
+   "body_b64": "UEsDBC0ACAgAACZpYV0AAAAA//////////8hABgAQS5Nb3ZpZS4yMDI0LjEwODBwLkJsdVJheS1HUlAubnpiAQAQAAAAAAAAAAAAAAAAAAAAAABTVgAAPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPG56Yj48ZmlsZSBwb3N0ZXI9ImFAYiIgZGF0ZT0iMSIgc3ViamVjdD0icyI+PGdyb3Vwcz48Z3JvdXA+ZzwvZ3JvdXA+PC9ncm91cHM+PHNlZ21lbnRzPjxzZWdtZW50IGJ5dGVzPSIxIiBudW1iZXI9IjEiPm1AeDwvc2VnbWVudD48L3NlZ21lbnRzPjwvZmlsZT48ZmlsZSBwb3N0ZXI9ImNAZCI+PC9maWxlPjwvbnpiPgpQSwcIhlej2N0AAAAAAAAA3QAAAAAAAABQSwECAwYtAAgIAAAmaWFdhlej2N0AAADdAAAAIQAAAAAAAAAAACAAAAAAAAAAQS5Nb3ZpZS4yMDI0LjEwODBwLkJsdVJheS1HUlAubnpiUEsFBgAAAAABAAEATwAAAEwBAAAAAA==",
+   "audit": [],
+   "after": [
+    "4",
+    "1",
+    "6",
+    "2",
+    "0"
+   ]
+  }
+ }
+]

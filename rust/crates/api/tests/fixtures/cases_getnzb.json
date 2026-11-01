@@ -1,0 +1,181 @@
+[
+ {
+  "name": "getnzb_no_r",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001"
+ },
+ {
+  "name": "getnzb_bad_r",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=nope"
+ },
+ {
+  "name": "getnzb_unverified",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenunverified"
+ },
+ {
+  "name": "getnzb_disabled",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokendisabled"
+ },
+ {
+  "name": "getnzb_no_id",
+  "path": "/getnzb?r=tokenalice"
+ },
+ {
+  "name": "getnzb_missing_nzb",
+  "path": "/getnzb?id=bbbb000000000000000000000000000000000002&r=tokenalice"
+ },
+ {
+  "name": "getnzb_nonsense",
+  "path": "/getnzb?id=nope&r=tokenalice"
+ },
+ {
+  "name": "getnzb_limit",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "INSERT INTO user_downloads (users_id, releases_id, timestamp) SELECT 1, 1, NOW() FROM seq_1_to_10;"
+  ]
+ },
+ {
+  "name": "getnzb_ok",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001.NZB&r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ],
+  "after": "SELECT CAST(grabs AS CHAR) FROM releases WHERE id=1 UNION ALL SELECT CAST(grabs AS CHAR) FROM users WHERE id=1 UNION ALL SELECT CAST(COUNT(*) AS CHAR) FROM user_downloads WHERE users_id=1 AND releases_id=1"
+ },
+ {
+  "name": "getnzb_guid_path",
+  "path": "/getnzb/bbbb000000000000000000000000000000000002?r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('bbbb000000000000000000000000000000000002', 2, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ]
+ },
+ {
+  "name": "getnzb_post",
+  "method": "POST",
+  "path": "/getnzb",
+  "headers": {
+   "Content-Type": "application/x-www-form-urlencoded"
+  },
+  "body": "id=bbbb000000000000000000000000000000000002&r=tokenposter",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('bbbb000000000000000000000000000000000002', 2, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ],
+  "ignore_body": true
+ },
+ {
+  "name": "getnzb_del",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenalice&del=1",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "INSERT INTO users_releases (users_id, releases_id) VALUES (1,1),(1,2);"
+  ],
+  "after": "SELECT CAST(COUNT(*) AS CHAR) FROM users_releases"
+ },
+ {
+  "name": "getnzb_corrupt_digest",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0000000000000000000000000000000000000000000000000000000000000000', REPEAT('a',32), 221, NOW(), NOW());"
+  ],
+  "status_only": true
+ },
+ {
+  "name": "getnzb_grab_off",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "UPDATE ingestion_configurations SET grab_status=0;"
+  ],
+  "after": "SELECT CAST(grabs AS CHAR) FROM releases WHERE id=1"
+ },
+ {
+  "name": "getnzb_unicode_name",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001&r=tokenalice",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "UPDATE releases SET searchname='Déjà Vu: 日本語/x, y' WHERE id=1;"
+  ]
+ },
+ {
+  "name": "getnzb_method",
+  "method": "DELETE",
+  "path": "/getnzb",
+  "ignore_body": true
+ },
+ {
+  "name": "v1_get_no_id",
+  "path": "/api/v1/api?t=get&apikey=tokenalice"
+ },
+ {
+  "name": "v1_get_missing_release",
+  "path": "/api/v1/api?t=g&apikey=tokenalice&id=nope"
+ },
+ {
+  "name": "v1_get_suffix_refused",
+  "path": "/api/v1/api?t=g&apikey=tokenalice&id=aaaa000000000000000000000000000000000001.nzb",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ]
+ },
+ {
+  "name": "v1_get_ok",
+  "path": "/api/v1/api?t=g&apikey=tokenalice&id=aaaa000000000000000000000000000000000001",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ]
+ },
+ {
+  "name": "v1_get_no_nzb",
+  "path": "/api/v1/api?t=g&apikey=tokenalice&id=bbbb000000000000000000000000000000000002"
+ },
+ {
+  "name": "v2_get_missing_release",
+  "path": "/api/v2/getnzb?api_token=tokenalice&id=nope"
+ },
+ {
+  "name": "v2_get_ok_suffix",
+  "path": "/api/v2/getnzb?api_token=tokenalice&id=aaaa000000000000000000000000000000000001.nzb",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
+  ]
+ },
+ {
+  "name": "v2_get_no_nzb",
+  "path": "/api/v2/getnzb?api_token=tokenalice&id=bbbb000000000000000000000000000000000002"
+ },
+ {
+  "name": "v2_get_limit",
+  "path": "/api/v2/getnzb?api_token=tokenalice&id=aaaa000000000000000000000000000000000001",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "INSERT INTO user_downloads (users_id, releases_id, timestamp) SELECT 1, 1, NOW() FROM seq_1_to_10;"
+  ]
+ },
+ {
+  "name": "v1_nfo_unicode_file",
+  "path": "/api/v1/api?t=gn&apikey=tokenalice&id=aaaa000000000000000000000000000000000001&o=file",
+  "setup": [
+   "UPDATE releases SET searchname='Déjà Vu: 日本語/x, y' WHERE id=1;",
+   "INSERT INTO release_nfos (releases_id, nfo) VALUES (1, COMPRESS('x'));"
+  ]
+ },
+ {
+  "name": "getnzb_zip_limit",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001,bbbb000000000000000000000000000000000002&r=tokenalice&zip=1",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "INSERT INTO user_downloads (users_id, releases_id, timestamp) SELECT 1, 1, NOW() FROM seq_1_to_9;"
+  ]
+ },
+ {
+  "name": "getnzb_zip_ok",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001,bbbb000000000000000000000000000000000002,nope&r=tokenalice&zip=1&del=1",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "INSERT INTO users_releases (users_id, releases_id) VALUES (1,1),(1,2);"
+  ],
+  "status_only": true,
+  "after": "SELECT CAST(grabs AS CHAR) FROM releases WHERE id IN (1,2) UNION ALL SELECT CAST(grabs AS CHAR) FROM users WHERE id=1 UNION ALL SELECT CAST(COUNT(*) AS CHAR) FROM user_downloads WHERE users_id=1 UNION ALL SELECT CAST(COUNT(*) AS CHAR) FROM users_releases"
+ }
+]

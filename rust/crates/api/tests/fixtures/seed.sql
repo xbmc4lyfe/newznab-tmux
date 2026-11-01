@@ -25,6 +25,9 @@ INSERT INTO usenet_groups (id, name, description, active, last_updated) VALUES
 TRUNCATE user_requests;
 TRUNCATE user_downloads;
 DELETE FROM release_informs;
+DELETE FROM release_nfos;
+DELETE FROM release_nzb_contents;
+UPDATE ingestion_configurations SET grab_status = 1, categorize_web_dl = 0, show_passworded_releases = 0;
 DELETE FROM users_releases;
 DELETE FROM releases;
 DELETE FROM tv_episodes;

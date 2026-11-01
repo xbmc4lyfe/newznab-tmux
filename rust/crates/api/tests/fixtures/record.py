@@ -4,8 +4,8 @@
 Start it first, on a scratch copy of the php-ref-setup.sh database:
   docker exec nntmux-rust-test-mariadb-1 sh -c "mariadb -uroot -proot -e 'CREATE DATABASE nntmux_api_ref'; \
     mariadb-dump -uroot -proot --no-tablespaces nntmux | mariadb -uroot -proot nntmux_api_ref"
-  cd newznab-tmux-php-ref/public && DB_DATABASE=nntmux_api_ref APP_DEBUG=false APP_ENV=production \
-    MAIL_FROM_ADDRESS=admin@example.test php -S 127.0.0.1:8765 ../vendor/laravel/framework/src/Illuminate/Foundation/resources/server.php
+  export every QUERY_ENV value below, then php artisan manticore:create-indexes
+  cd newznab-tmux-php-ref/public && php -S 127.0.0.1:8765 ../vendor/laravel/framework/src/Illuminate/Foundation/resources/server.php
 
 Every case runs from a fresh seed.sql plus its own `setup` statements, so the array cache and
 the request counters can't leak between cases. Usage: record.py [case file stems...]"""
@@ -21,9 +21,16 @@ import sys
 HERE = pathlib.Path(__file__).parent
 HOST = "127.0.0.1"
 PORT = 8765
-DROPPED = {"date", "host", "connection", "x-powered-by", "set-cookie", "server-timing", "http/1.1"}
+DROPPED = {"date", "expires", "host", "connection", "x-powered-by", "set-cookie", "server-timing", "http/1.1", "content-security-policy"}
 REF = pathlib.Path.home() / "git.xbmc4lyfe/newznab-tmux-php-ref"
-QUERY_ENV = {"DB_DATABASE": "nntmux_api_ref", "APP_DEBUG": "false", "APP_ENV": "production", "MAIL_FROM_ADDRESS": "admin@example.test"}
+QUERY_ENV = {
+    "DB_DATABASE": "nntmux_api_ref",
+    "APP_DEBUG": "false",
+    "APP_ENV": "production",
+    "MAIL_FROM_ADDRESS": "admin@example.test",
+    "MANTICORESEARCH_PORT": "39308",
+} | {f"MANTICORESEARCH_INDEX_{name.upper()}": f"apiref_{name}_rt" for name in (
+    "releases", "predb", "movies", "tvshows", "music", "books", "games", "console", "steam", "anime")}
 
 
 def sql(statements):
@@ -32,6 +39,15 @@ def sql(statements):
         input=statements.encode(),
         check=True,
     )
+
+
+def after(statement):
+    done = subprocess.run(
+        ["docker", "exec", "nntmux-rust-test-mariadb-1", "mariadb", "-uroot", "-proot", "-N", "nntmux_api_ref", "-e", statement],
+        capture_output=True,
+        check=True,
+    )
+    return done.stdout.decode().splitlines()
 
 
 def audit():
@@ -89,6 +105,8 @@ def main():
             for _ in range(case.get("repeat", 1)):
                 expect = fetch(case)
             expect["audit"] = audit()
+            if case.get("after"):
+                expect["after"] = after(case["after"])
             out.append(case | {"expect": expect})
             print(case["name"], out[-1]["expect"]["status"])
         name = stem.replace("cases", "golden", 1)

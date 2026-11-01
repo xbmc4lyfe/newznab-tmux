@@ -9,13 +9,19 @@ mod auth;
 mod cache;
 mod caps;
 mod db;
+mod filename;
+mod getnzb;
 mod input;
 mod json;
 mod misc;
+mod nzb;
 mod params;
 mod pipeline;
+mod present_v1;
+mod present_v2;
 mod reply;
 mod request;
+mod rows;
 mod settings;
 pub mod usage;
 mod v1;
@@ -56,5 +62,7 @@ pub fn router_with(settings: Settings) -> Router<Ctx> {
         .route("/api/release/{id}/mediainfo", route(Endpoint::MediaInfo))
         .route("/api/{*rest}", route(Endpoint::Fallback))
         .route("/rss/health", route(Endpoint::RssHealth))
+        .route("/getnzb", route(Endpoint::GetNzb))
+        .route("/getnzb/{guid}", route(Endpoint::GetNzb))
         .layer(Extension(Arc::new(settings)))
 }
