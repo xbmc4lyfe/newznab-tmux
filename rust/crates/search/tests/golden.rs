@@ -484,19 +484,126 @@ async fn an_unreachable_server_is_an_error_and_is_remembered() {
 }
 
 #[tokio::test]
-async fn unported_calls_say_so() {
-    let client = SearchClient::new(SearchConfig::new("http://127.0.0.1:9"), None).unwrap();
+async fn lookup_requests_match_php() {
+    let golden = golden();
+    let lookups = &golden["lookups"];
+    let server = recording_server().await;
+    let client = SearchClient::new(SearchConfig::new(server.uri()), None).unwrap();
+    client
+        .search_release_candidates_page("Dead.Circus (2019)!", 21, 5)
+        .await
+        .unwrap();
+    assert_eq!(json!(search_bodies(&server).await), lookups["candidates"]);
+
+    let server = recording_server().await;
+    let client = SearchClient::new(SearchConfig::new(server.uri()), None).unwrap();
+    assert_eq!(
+        client
+            .match_predb_exact("Some.Release-GRP [x]")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(json!(search_bodies(&server).await), lookups["exact"]);
+
+    let server = recording_server().await;
+    let client = SearchClient::new(SearchConfig::new(server.uri()), None).unwrap();
+    client
+        .search_predb_filename_candidates("some.release.nfo")
+        .await
+        .unwrap();
+    assert_eq!(json!(search_bodies(&server).await), lookups["filename"]);
+}
+
+fn hit_response(hits: &Value, total: u64, relation: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "timed_out": false,
+        "hits": {"total": total, "total_relation": relation, "hits": hits}
+    }))
+}
+
+#[tokio::test]
+async fn filename_candidates_fail_closed() {
+    let good = json!({"_id": 1, "_source": {"title": "A", "filename": "a", "source": "s"}});
+    let accepted = server_answering_search_with(hit_response(&json!([good]), 1, "eq")).await;
+    assert_eq!(
+        accepted
+            .search_predb_filename_candidates("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let refused = [
+        hit_response(&json!([good]), 1, "gte"),
+        hit_response(&json!([good]), 2, "eq"),
+        hit_response(&json!([{"_id": 0, "_source": {"title": "A"}}]), 1, "eq"),
+        hit_response(&json!([{"_id": "x", "_source": {"title": "A"}}]), 1, "eq"),
+        hit_response(&json!([{"_id": 1, "_source": {"title": ""}}]), 1, "eq"),
+        hit_response(&json!([{"_id": 1, "_source": {"title": "a/b"}}]), 1, "eq"),
+        hit_response(
+            &json!([{"_id": 1, "_source": {"title": "a\u{7}"}}]),
+            1,
+            "eq",
+        ),
+        hit_response(
+            &json!([{"_id": 1, "_source": {"title": "a\u{FFFD}"}}]),
+            1,
+            "eq",
+        ),
+        hit_response(
+            &json!([{"_id": 1, "_source": {"title": "a", "filename": 5}}]),
+            1,
+            "eq",
+        ),
+        hit_response(
+            &json!([{"_id": 1, "_source": {"title": "a".repeat(256)}}]),
+            1,
+            "eq",
+        ),
+        hit_response(
+            &json!([{"_id": 1, "_source": {"title": "a", "source": "b".repeat(51)}}]),
+            1,
+            "eq",
+        ),
+    ];
+    for response in refused {
+        let client = server_answering_search_with(response).await;
+        assert_eq!(
+            client.search_predb_filename_candidates("a").await.unwrap(),
+            None
+        );
+    }
+}
+
+#[tokio::test]
+async fn candidate_pages_refuse_bad_arguments_and_disordered_ids() {
+    let client = server_answering_search_with(hit_response(&json!([]), 0, "eq")).await;
+    for (limit, after) in [(0, 0), (1001, 0), (10, -1)] {
+        assert!(matches!(
+            client
+                .search_release_candidates_page("x", limit, after)
+                .await,
+            Err(SearchError::InvalidArgument(_))
+        ));
+    }
     assert!(matches!(
-        client.match_predb_exact("x").await,
-        Err(SearchError::NotPorted(_))
+        client.search_release_candidates_page("...", 10, 0).await,
+        Err(SearchError::RejectedQuery(_))
     ));
+
+    let disordered = json!([{"_id": 5, "_source": {}}, {"_id": 4, "_source": {}}]);
+    let client = server_answering_search_with(hit_response(&disordered, 2, "eq")).await;
     assert!(matches!(
-        client.search_predb_filename_candidates("x").await,
-        Err(SearchError::NotPorted(_))
+        client.search_release_candidates_page("x", 10, 0).await,
+        Err(SearchError::Malformed(_))
     ));
+    let client = server_answering_search_with(hit_response(&disordered, 2, "eq")).await;
     assert!(matches!(
-        client.search_release_candidates_page("x", 1, 0).await,
-        Err(SearchError::NotPorted(_))
+        client.search_release_candidates_page("x", 10, 5).await,
+        Err(SearchError::Malformed(_))
     ));
 }
 
@@ -704,6 +811,37 @@ async fn live_results_match_php() {
         };
         let actual = client.search_movie_by_external_ids(&ids).await.unwrap();
         assert_eq!(json!(actual), case[1], "movie external {}", case[0]);
+    }
+
+    for case in results["candidates"].as_array().unwrap() {
+        let outcome = client
+            .search_release_candidates_page(
+                s(&case[0]),
+                case[1].as_u64().unwrap(),
+                case[2].as_i64().unwrap(),
+            )
+            .await;
+        if case[3]["available"] == json!(false) {
+            assert!(
+                matches!(outcome, Err(SearchError::RejectedQuery(_))),
+                "{case}"
+            );
+            continue;
+        }
+        let page = outcome.unwrap();
+        assert_eq!(json!(page.ids), case[3]["ids"], "{case}");
+        assert_eq!(json!(page.has_more), case[3]["has_more"], "{case}");
+    }
+    for case in results["predb_exact"].as_array().unwrap() {
+        let actual = client.match_predb_exact(s(&case[0])).await.unwrap();
+        assert_eq!(json!(actual), case[1], "exact {}", case[0]);
+    }
+    for case in results["predb_filename"].as_array().unwrap() {
+        let actual = client
+            .search_predb_filename_candidates(s(&case[0]))
+            .await
+            .unwrap();
+        assert_eq!(json!(actual), case[1], "filename {}", case[0]);
     }
 
     tables.drop().await;
