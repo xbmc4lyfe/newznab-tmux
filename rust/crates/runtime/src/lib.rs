@@ -159,10 +159,13 @@ where
                         continue;
                     }
                 }
-                let outcome = AssertUnwindSafe(async { work(ctx.clone(), slot).await })
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|panic| Err(anyhow!(panic_message(panic.as_ref()))));
+                let outcome = AssertUnwindSafe({
+                    let (work, ctx) = (work.clone(), ctx.clone());
+                    async move { work(ctx, slot).await }
+                })
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic| Err(anyhow!(panic_message(panic.as_ref()))));
                 match outcome {
                     Ok(true) => {
                         metrics::counter!("nntmux_work_units_total", "role" => role).increment(1);
