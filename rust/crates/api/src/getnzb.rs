@@ -158,6 +158,7 @@ async fn grab_status(ctx: &Ctx) -> Result<bool> {
     Ok(status.unwrap_or(true))
 }
 
+#[derive(sqlx::FromRow)]
 struct ReleaseInfo {
     id: u32,
     searchname: String,
@@ -168,9 +169,9 @@ struct ReleaseInfo {
 }
 
 async fn release_info(ctx: &Ctx, guid: &str) -> Result<Option<ReleaseInfo>> {
-    let row: Option<(u32, String, Option<String>, bool, Option<u32>, String)> = sqlx::query_as(
+    Ok(sqlx::query_as(
         "SELECT r.id, r.searchname, r.imdbid, r.nfostatus, v.tvdb,
-                CONCAT(COALESCE(cp.title, ''), ' > ', COALESCE(c.title, ''))
+                CONCAT(COALESCE(cp.title, ''), ' > ', COALESCE(c.title, '')) AS category
          FROM releases r
          LEFT JOIN videos v ON v.id = r.videos_id
          LEFT JOIN categories c ON c.id = r.categories_id
@@ -179,17 +180,7 @@ async fn release_info(ctx: &Ctx, guid: &str) -> Result<Option<ReleaseInfo>> {
     )
     .bind(guid)
     .fetch_optional(&ctx.db)
-    .await?;
-    Ok(row.map(
-        |(id, searchname, imdbid, nfostatus, tvdb, category)| ReleaseInfo {
-            id,
-            searchname,
-            imdbid,
-            nfostatus,
-            tvdb,
-            category,
-        },
-    ))
+    .await?)
 }
 
 /// Laravel's `e()`.
