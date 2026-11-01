@@ -347,7 +347,7 @@ async fn handle(
         Endpoint::V2Tv => v2::tv(ctx, settings, api, resolved).await,
         Endpoint::V2Details => v2::details(ctx, settings, api, resolved).await,
         Endpoint::V2GetNzb => v2::get_nzb(ctx, settings, api, resolved).await,
-        Endpoint::Inform => misc::inform(ctx, api).await,
+        Endpoint::Inform => misc::inform(ctx, settings, api).await,
         Endpoint::MediaInfo => misc::media_info(ctx, route_id.as_deref().unwrap_or_default()).await,
         Endpoint::Fallback => Ok(misc::fallback()),
         Endpoint::RssHealth => Ok(misc::rss_health()),
