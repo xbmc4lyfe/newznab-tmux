@@ -49,3 +49,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 12 | Wave 66.3 plans: `NativePerArticleObfuscation`, `PartHandler`, `PerArticleObfuscationGate`, `BookProcessingCandidateQuery`, `BookService`, their Rust module and parity test | `4eb535a46` | None new |
 | 13 | Wave 66.5 plans: `BookPipe`, `CategorizationPassable`, `ConsolePipe`, `GroupNamePipe`, `MiscPipe`, their Rust module and parity test. This finishes Wave 66 | `1ead7cd3f` | None new |
 | 14 | Wave 65.6 plans: `CategoryData`, `DetailsData`, `ReleaseData`, `ReleaseRows`, `XmlResponseContext`, their Rust module and parity test | `2b3558d2c` | None new |
+| 15 | Wave 65.4 plans: `UsenetDownloadService`, `AdminDashboardSnapshotService`, `AnidbService`, `ArchiveProcessingService`, `BlacklistService`, their Rust module and parity test | `0ff724f0b` | None new |
