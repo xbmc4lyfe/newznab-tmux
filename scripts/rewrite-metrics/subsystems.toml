@@ -1,0 +1,206 @@
+# Subsystem map and cutover ledger for the Rust rewrite.
+#
+# Each PHP file under app/ belongs to the first subsystem whose `paths` regex
+# (matched against the repo-relative path) fits. Files that match nothing land in
+# "platform". Keep this file in the repo next to the Rust workspace and update
+# `status` only with production evidence.
+#
+# status values, in order:
+#   php        PHP serves production; no Rust replacement yet
+#   shadow     Rust runs in production beside PHP and its output is compared
+#   rust       Rust serves production; PHP still in the tree as fallback
+#   deleted    Rust serves production AND the subsystem's PHP is gone (done)
+#
+# evidence: link to the PR that flipped the status plus the deploy log line or
+# Grafana panel that proves production runs it.
+
+# progress.py adds the headline. baseline_live is this subsystem's live PHP at the
+# baseline commit. workstreams and crates map it to the ledgers and Rust crates on
+# rust-native; a new workstream or crate that isn't listed counts toward platform.
+#
+# Baseline = the last tree before any pipeline-ffi work (#301, 2026-10-23).
+# progress_pct = share of these live PHP lines that are gone.
+[baseline]
+commit = "eb5e2de"
+date = "2026-10-23"
+live_lines = 188303
+total_lines = 196448
+
+[ledger]
+# Vendor routes (forum, Horizon, Pulse): dropped, but they have no lines in app/.
+excluded = ["dropped"]
+# Shared code with no entry points of its own. It's retired as everything else is.
+follows_rest = ["platform"]
+
+[[subsystem]]
+key = "ingest"
+baseline_live = 12279
+workstreams = ["ws-ingest", "ws-formats"]
+crates = ["ingest", "nntp", "yenc"]
+title = "Headers, binaries, backfill, NNTP, yEnc"
+phase = 2
+status = "php"
+evidence = ""
+paths = [
+  '^app/Services/(Binaries|Backfill|NNTP|Yenc)/',
+  '^app/Services/(YencService|XrefService|BlacklistService|RegexService|CollectionCleanupService|CollectionsCleaningService)\.php$',
+  '^app/Console/Commands/(UpdateBinaries|ProcessBinaries|ProcessBackfill|UpdateBackfill|BackfillGroup|UpdatePerGroup|ProcessUpdatePerGroup|GetArticleRange|PartRepair|UpdateGroupHeaders|GroupsUpdate|YencDoctorCommand|ReclassifyHeaderRejections|NntmuxOffset\w*)\.php$',
+  '^app/Facades/Yenc\.php$',
+]
+
+[[subsystem]]
+key = "namefix_predb"
+baseline_live = 18905
+workstreams = ["ws-naming"]
+crates = ["namefix", "predb"]
+title = "Name fixing, PreDB, IRC"
+phase = 2
+status = "php"
+evidence = ""
+paths = [
+  '^app/Services/(NameFixing|Predb)/',
+  '^app/Services/(IRCClient|IRCScraper)\.php$',
+  '^app/Console/Commands/(FixReleaseNames|ProcessFixRelNames|ReleasesFixNamesGroup|ReleasesCleanSubjectNames|MatchPrefiles|Predb\w*|IrcScraperCommand|BenchmarkRename|ReleaseIdentitySuggestions)\.php$',
+]
+
+[[subsystem]]
+key = "releases"
+baseline_live = 37702
+workstreams = ["ws-releases"]
+crates = ["releases", "fingerprint", "verify"]
+title = "Release creation, NZB, fingerprint and verification"
+phase = 2
+status = "php"
+evidence = ""
+paths = [
+  '^app/Services/(Releases|Nzb)/',
+  '^app/Services/Release(Creation|Cleaning|Processing|Remover|Extra)Service\.php$',
+  '^app/Console/Commands/(ProcessReleases\w*|Releases\w*|Verify\w*|PrepareReleaseCandidates|ReleaseVerificationBarrier|ForwardVerifiedPublications|ImportVerificationManifests|TransferFingerprintQueue|BackfillReleaseFingerprintMetadata|DeleteReleases|RemoveCrapReleases|NntmuxRemoveBadReleases|FindSizeMismatchedReleases|CleanNZB|FixNzbSplitNames|ImportNzbs|ImportDatabaseNzbs|OptimizeCbpStorage)\.php$',
+  '^app/Jobs/CollectReleaseFingerprintMetadata\.php$',
+  '^app/Http/Controllers/ReleaseVerification\w*\.php$',
+]
+
+[[subsystem]]
+key = "categorization"
+baseline_live = 3786
+workstreams = ["ws-naming"]
+crates = ["categorize"]
+title = "Categorization"
+phase = 2
+status = "php"
+evidence = ""
+paths = [
+  '^app/Services/Categorization/',
+  '^app/Console/Commands/(RecategorizeReleases|TestCategorization|RecategorizeOnlyFans)\.php$',
+]
+
+[[subsystem]]
+key = "postprocess"
+baseline_live = 36978
+workstreams = ["ws-postprocess", "ws-metadata"]
+crates = ["postprocess", "metadata", "formats"]
+title = "Post-processing: additional, NFO, PAR2, TV, movies, music, games, books, anime"
+phase = 2
+status = "php"
+evidence = ""
+paths = [
+  '^app/Services/(AdditionalProcessing|TvProcessing|IGDB)/',
+  '^app/Services/(Anidb\w*|Anime\w*|Archive\w*|Book\w*|Books\w*|Console\w*|Episode\w*|FanartTv\w*|Games\w*|Genre\w*|GoogleBooks\w*|IGDB\w*|Imdb\w*|IsbnDb\w*|Itunes\w*|Movie\w*|Movies\w*|Music\w*|Nfo\w*|OpenLibrary\w*|Par2\w*|PopulateAniList\w*|PostProcess\w*|ReleaseImage\w*|SeriesRelease\w*|Steam\w*|TmdbClient|Trakt\w*|TvMaze\w*|TempWorkspace\w*)\.php$',
+  '^app/Console/Commands/(PostProcess\w*|ProcessPostProcess|UpdatePostProcess|ProcessAdditionalGuid|AdditionalProcessingDiagnose|Reprocess\w*|RepairTvReleaseLinks|Steam\w*|FetchMovieByImdb|MovieReverifyMatches|MigrateAnimeCovers|RefreshAnimeData|NntmuxPopulateAniDB|NntmuxPopulateSteamApps|RequeueFailedBooks|RetryArchiveInspection|FetchSamples|ImportNfos|NntmuxResetTvShowPostProcessing|NntmuxResetPostProcessing)\.php$',
+]
+
+[[subsystem]]
+key = "search"
+baseline_live = 12897
+workstreams = ["ws-search"]
+crates = ["search"]
+title = "Search indexing (Manticore / Elasticsearch)"
+phase = 2
+status = "php"
+evidence = ""
+paths = [
+  '^app/Services/Search/',
+  '^app/Console/Commands/(NntmuxSearch\w*|InspectManticore|CreateManticoreIndexes|NntmuxCreateESIndexes|NntmuxESReindex|UpdateReleasesIndexSchema\w*|CreateMediaIndexes|NntmuxPopulateSearchIndexes|NntmuxCheckIndex)\.php$',
+  '^app/Jobs/ReindexReleaseJob\.php$',
+]
+
+[[subsystem]]
+key = "orchestration"
+baseline_live = 7881
+workstreams = ["ws-ops"]
+crates = ["supervisor"]
+title = "Queues, scheduler, tmux orchestration"
+phase = 3
+status = "php"
+evidence = ""
+paths = [
+  '^app/Services/(Tmux|Runners)/',
+  '^app/Services/(ForkingService|NntmuxUpdateLock)\.php$',
+  '^app/Console/Commands/(Tmux\w*|ProcessSafe)\.php$',
+  '^app/Console/Kernel\.php$',
+]
+
+[[subsystem]]
+key = "api"
+baseline_live = 5276
+workstreams = ["ws-api"]
+crates = ["api"]
+title = "Newznab API, RSS, NZB download"
+phase = 4
+status = "php"
+evidence = ""
+paths = [
+  '^app/Services/Api/',
+  '^app/Http/Controllers/Api/',
+  '^app/Http/Controllers/(RssController|RssHealthController|GetNzbController|ApiHelpController)\.php$',
+  '^app/Jobs/(RecordApiUsage|UpdateUserApiAccess)\.php$',
+]
+
+[[subsystem]]
+key = "ops"
+baseline_live = 8278
+workstreams = ["ws-ops"]
+crates = ["ops", "telemetry"]
+title = "Monitoring, status probes, log viewer, MCP"
+phase = 3
+status = "php"
+evidence = ""
+paths = [
+  '^app/Services/(Monitoring|StatusProbes|LogViewer|Mcp)/',
+  '^app/Mcp/',
+  '^app/Services/(SystemMetricsService|RedisMonitorService|SiteStatusService|AdminDashboardSnapshotService)\.php$',
+  '^app/Console/Commands/(CollectStats|CollectSystemMetrics|ExportMonitoringMetrics|InstallMonitoring|CheckService\w*|RedisMonitor|IndexLogs|WarmAdminDashboard)\.php$',
+]
+
+[[subsystem]]
+key = "web"
+baseline_live = 21142
+workstreams = ["ws-site", "ws-admin"]
+crates = ["web", "webkit", "site", "admin", "mail"]
+title = "Web UI, admin, auth, accounts, mail"
+phase = 5
+status = "php"
+evidence = ""
+paths = [
+  '^app/Http/',
+  '^app/View/',
+  '^app/Mail/',
+  '^app/Notifications/',
+  '^app/Policies/',
+  '^app/Rules/',
+  '^app/Services/(Gdpr|Security|Cloudflare)/',
+  '^app/Services/(Invitation\w*|PasswordBreach\w*|Recaptcha\w*|Turnstile\w*|Registration\w*|UserInactivity\w*|UserStats\w*|SiteLogo\w*|MovieBrowse\w*)\.php$',
+  '^app/Jobs/(Send\w+|RemoveInactiveAccounts|PurgeDeletedAccounts)\.php$',
+  '^app/Console/Commands/(Gdpr\w*|PurgeExpiredGdprExports|NntmuxDeleteUnVerifiedUsers|NntmuxUpdateExpiredRoles|NntmuxPurgeDeletedAccounts|DisableExpired\w*|ManageRoleStacking|MailPreview|BackfillUserActivityStats|CaptchaStatus|CloudflareReload)\.php$',
+]
+
+[[subsystem]]
+key = "platform"
+baseline_live = 23179
+workstreams = ["ws-deploy"]
+crates = ["core", "db", "runtime", "ctl", "testkit", "worker"]
+title = "Models, enums, config, install/update, shared support (catch-all)"
+phase = 6
+status = "php"
+evidence = ""
+paths = ['^app/']
