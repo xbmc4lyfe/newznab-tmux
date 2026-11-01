@@ -70,6 +70,8 @@ fn settings() -> Settings {
         format!("t{prefix:016x}:"),
     );
     settings.abuse.asn_lookup = false;
+    settings.upload_folder =
+        Some(std::env::temp_dir().join(format!("nntmux-api-uploads-{prefix:016x}")));
     settings
 }
 
@@ -528,4 +530,9 @@ async fn proxy_detection_scores_like_php() -> Result<()> {
     let body = to_bytes(refused.into_body(), usize::MAX).await?;
     assert!(String::from_utf8(body.to_vec())?.contains("Proxying NZB downloads"));
     db.drop_database().await
+}
+
+#[tokio::test]
+async fn uploads_match_php() -> Result<()> {
+    replay("golden_upload.json", &[]).await
 }

@@ -5,7 +5,8 @@ use axum::extract::Request;
 use axum::http::HeaderMap;
 use serde_json::Value as Json;
 
-use crate::input::{Bag, Input, Value, canonicalize, from_json, parse_urlencoded};
+use crate::input::{Bag, Input, Value, canonicalize, clean_value, from_json, parse_urlencoded};
+use crate::upload::UploadedFile;
 
 /// Largest body read: `post_max_size` in the image's PHP configuration.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -19,6 +20,8 @@ pub struct ApiRequest {
     pub input: Input,
     pub headers: HeaderMap,
     pub raw_body: bytes::Bytes,
+    pub files: Vec<UploadedFile>,
+    multipart_fields: Bag,
 }
 
 impl ApiRequest {
@@ -39,7 +42,12 @@ impl ApiRequest {
             },
             headers: parts.headers,
             raw_body,
+            files: Vec::new(),
+            multipart_fields: Bag::new(),
         };
+        if this.method != "GET" && this.method != "HEAD" {
+            this.read_multipart().await;
+        }
         // HTTP QUERY's body waits for `validate_query`, the only reader allowed to accept it.
         if this.method != "QUERY" && this.method != "GET" && this.method != "HEAD" {
             this.input.body = this.parse_body();
@@ -47,11 +55,55 @@ impl ApiRequest {
         Ok(this)
     }
 
+    /// A malformed body leaves what parsed so far, as PHP's own form parsing does.
+    async fn read_multipart(&mut self) {
+        let Some(boundary) = self
+            .header("content-type")
+            .and_then(|value| multer::parse_boundary(value).ok())
+        else {
+            return;
+        };
+        let body = self.raw_body.clone();
+        let stream =
+            futures_util::stream::once(async move { Ok::<_, std::convert::Infallible>(body) });
+        let mut multipart = multer::Multipart::new(stream, boundary);
+        while let Ok(Some(field)) = multipart.next_field().await {
+            let name = field.name().unwrap_or_default().to_owned();
+            let filename = field.file_name().map(str::to_owned);
+            let Ok(content) = field.bytes().await else {
+                return;
+            };
+            match filename {
+                Some(filename) => self.files.push(UploadedFile {
+                    field: name,
+                    filename,
+                    content: content.to_vec(),
+                }),
+                None => {
+                    let raw = String::from_utf8_lossy(&content);
+                    self.multipart_fields.push((name, clean_value(&raw)));
+                }
+            }
+        }
+    }
+
+    pub fn file(&self, field: &str) -> Option<&UploadedFile> {
+        self.files.iter().rev().find(|file| file.field == field)
+    }
+
+    /// `$request->has()` also sees uploaded files.
+    pub fn has_field(&self, field: &str) -> bool {
+        self.input.has(field) || self.file(field).is_some()
+    }
+
     fn parse_body(&self) -> Bag {
         let content_type = self
             .header("content-type")
             .unwrap_or_default()
             .to_ascii_lowercase();
+        if content_type.starts_with("multipart/") {
+            return self.multipart_fields.clone();
+        }
         if content_type.contains("json") {
             return match serde_json::from_slice::<Json>(&self.raw_body) {
                 Ok(json) => match from_json(&json) {

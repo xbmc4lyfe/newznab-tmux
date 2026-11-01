@@ -48,9 +48,9 @@ pub use read::{
     Suggestion,
 };
 pub use reconcile::{PredbReconcileReport, ReconcileOptions, ReconcileReport, parse_since};
+pub use registry::SecondaryIndex;
 #[doc(hidden)]
 pub use registry::create_table_sql;
-pub use registry::SecondaryIndex;
 pub use release_query::{
     Bounds, Phrases, Ranges, ReleaseSearchQuery, SearchPage, SortDirection, SortField,
 };
