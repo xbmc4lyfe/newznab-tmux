@@ -7,6 +7,25 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+nntmux-yenc.workspace = true
+rand.workspace = true
+rustls.workspace = true
+serde.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+nntmux-testkit.workspace = true
+rcgen.workspace = true
 
 [lints]
 workspace = true
