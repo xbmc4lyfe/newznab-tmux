@@ -205,13 +205,22 @@ pub async fn run(
             records: Vec::new(),
         });
     }
-    let outcome = audit_locked(verify, source, options, &scratch, &mut report_line).await;
+    let outcome = audit_locked(
+        verify,
+        &mut locks,
+        source,
+        options,
+        &scratch,
+        &mut report_line,
+    )
+    .await;
     locks.close().await;
     outcome
 }
 
 async fn audit_locked(
     verify: &Verify,
+    locks: &mut WorkerLocks,
     source: &dyn ArticleSource,
     options: AuditOptions,
     scratch: &Path,
@@ -290,10 +299,15 @@ async fn audit_locked(
             continue;
         };
         attempted += 1;
+        ensure_exclusive(locks).await?;
         let entry = register(db, &config.host, id).await?;
         ensure_directory(&scratch.join(format!("audit-{id}-{entry}")))?;
         let (verdict, reason) = examine(db, source, &spot_check, &release).await;
+        // The spot check can take a while; a barrier that took the gate meanwhile must see no
+        // further writes.
+        ensure_exclusive(locks).await?;
         record(db, entry, &verdict, &reason).await?;
+        ensure_exclusive(locks).await?;
         let delete = !options.dry_run && options.delete && verdict == "unrepairable";
         let retry_at = now() + Duration::seconds(config.retry_seconds.max(1));
         in_tx!(db, 5, |tx| {
@@ -371,6 +385,14 @@ async fn audit_locked(
         report.records.push(record);
     }
     Ok(report)
+}
+
+/// Fails closed once the exclusive worker gate is gone, before the next write.
+async fn ensure_exclusive(locks: &mut WorkerLocks) -> Result<()> {
+    if !locks.holds_exclusive().await {
+        bail!("Verification worker locks were lost.");
+    }
+    Ok(())
 }
 
 /// A release deleted since it was listed has nothing left to audit.

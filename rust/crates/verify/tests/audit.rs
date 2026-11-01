@@ -33,6 +33,34 @@ impl ArticleSource for FakeSource {
     }
 }
 
+/// Ends every other session of the test database the first time an article is fetched, the way
+/// a lost lock connection or an idle timeout does.
+struct SessionKiller {
+    pool: MySqlPool,
+}
+
+#[async_trait]
+impl ArticleSource for SessionKiller {
+    async fn fetch_bounded(&self, _: &str, _: i64) -> Result<Vec<u8>> {
+        let mut conn = self.pool.acquire().await?;
+        let others: Vec<i64> = sqlx::query_scalar(
+            "SELECT CAST(ID AS SIGNED) FROM information_schema.PROCESSLIST WHERE DB = DATABASE() AND ID <> CONNECTION_ID()",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        for id in others {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("KILL {id}")))
+                .execute(&mut *conn)
+                .await;
+        }
+        Err(anyhow!("article missing"))
+    }
+
+    async fn stat(&self, _: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// A single-part yEnc article holding `payload` for `name`.
 fn article(name: &str, payload: &[u8]) -> Vec<u8> {
     let encoded: Vec<u8> = payload
@@ -349,5 +377,42 @@ async fn audits_defer_to_due_candidates_and_running_workers() -> Result<()> {
     let due = audit::run(&harness.verify, &source, options(), |_| {}).await?;
     assert_eq!(due.deferred, Some(Deferred::CandidatesDue));
     assert!(due.records.is_empty());
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn an_audit_stops_writing_once_its_lock_session_is_lost() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let pool = harness.db();
+    let id = release(
+        &pool,
+        "e0000000-0000-0000-0000-000000000005",
+        Some(&nzb_document(&[("Lost.mkv", "lost@x")])),
+        None,
+    )
+    .await?;
+    let source = SessionKiller { pool: pool.clone() };
+    let failure = audit::run(&harness.verify, &source, options(), |_| {})
+        .await
+        .expect_err("the gate was lost");
+    assert_eq!(failure.to_string(), "Verification worker locks were lost.");
+    // The audit was registered before the check, but no verdict, retry or cursor was written.
+    let verdicts = count(
+        &pool,
+        "SELECT COUNT(*) FROM release_verification_scratch WHERE audit_release_id = ? \
+         AND audit_verdict IS NOT NULL",
+        id,
+    )
+    .await?;
+    assert_eq!(verdicts, 0);
+    let retries = count(
+        &pool,
+        "SELECT COUNT(*) FROM release_verification_audit_retries WHERE release_id = ?",
+        id,
+    )
+    .await?;
+    assert_eq!(retries, 0);
     harness.finish().await
 }
