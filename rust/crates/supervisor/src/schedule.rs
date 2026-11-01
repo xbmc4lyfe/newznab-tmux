@@ -25,7 +25,7 @@ fn task(
 }
 
 pub fn tasks() -> Vec<Task<Ctx>> {
-    use nntmux_ops::{accounts, activity, disposable, stats, system_metrics};
+    use nntmux_ops::{accounts, activity, disposable, resets, stats, system_metrics};
     vec![
         task("nntmux:collect-stats", EveryMinutes(15), |ctx| {
             Box::pin(async move { stats::collect(&ctx.db).await })
@@ -93,6 +93,12 @@ pub fn tasks() -> Vec<Task<Ctx>> {
         task("cleanup-api-request-logs", Cadence::Hourly, |ctx| {
             Box::pin(async move {
                 activity::cleanup_request_logs(&ctx.db).await?;
+                Ok(())
+            })
+        }),
+        task("nntmux:remove-bad", Cadence::Hourly, |ctx| {
+            Box::pin(async move {
+                resets::remove_bad(&ctx.db).await?;
                 Ok(())
             })
         }),
