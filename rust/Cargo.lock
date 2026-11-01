@@ -1623,7 +1623,9 @@ dependencies = [
 name = "nntmux-formats"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "hex",
+ "md-5 0.10.6",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1789,18 +1791,22 @@ dependencies = [
  "clap",
  "crc32fast",
  "deunicode",
+ "fancy-regex",
  "flate2",
+ "futures-util",
  "hex",
  "nntmux-core",
  "nntmux-runtime",
  "nntmux-testkit",
  "rand 0.9.5",
  "redis",
+ "regex",
  "serde",
  "serde_json",
  "sha1 0.10.7",
  "sha2 0.10.9",
  "sqlx",
+ "thiserror",
  "tokio",
  "tracing",
 ]
