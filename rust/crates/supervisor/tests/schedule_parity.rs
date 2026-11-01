@@ -17,6 +17,10 @@ fn tasks_match_the_php_schedule() {
     let php: Vec<Value> =
         serde_json::from_str(include_str!("fixtures/schedule.json")).expect("valid fixture");
     for task in tasks() {
+        // Replaces what the tmux monitor computed on its own clock, so PHP had no schedule entry.
+        if task.name == "processing-stats" {
+            continue;
+        }
         let cron = task.cadence.cron();
         let found = php
             .iter()

@@ -121,6 +121,39 @@ impl SearchClient {
     }
 
     /// Writes a document built by the caller. On false a failure row records the retry.
+    /// Every release with an id in this range, for a full populate. Lists are capped at the length
+    /// the populate command always used, so one release with thousands of files can't make a
+    /// document too large to send.
+    pub async fn release_documents_between(
+        &self,
+        db: &MySqlPool,
+        low: i64,
+        high: i64,
+    ) -> Result<Vec<ReleaseDocument>, SearchError> {
+        let database = |error: sqlx::Error| SearchError::Database(error.to_string());
+        let mut conn = db.acquire().await.map_err(database)?;
+        sqlx::query("SET SESSION group_concat_max_len = 16384")
+            .execute(&mut *conn)
+            .await
+            .map_err(database)?;
+        let statement = format!("{PROJECTION} WHERE r.id BETWEEN ? AND ? ORDER BY r.id");
+        let rows = sqlx::query_as::<_, ReleaseRow>(sqlx::AssertSqlSafe(statement))
+            .bind(low)
+            .bind(high)
+            .fetch_all(&mut *conn)
+            .await;
+        // The connection goes back to the pool, so it must not keep the shorter limit.
+        sqlx::query("SET SESSION group_concat_max_len = @@GLOBAL.group_concat_max_len")
+            .execute(&mut *conn)
+            .await
+            .map_err(database)?;
+        Ok(rows
+            .map_err(database)?
+            .into_iter()
+            .map(ReleaseDocument::from)
+            .collect())
+    }
+
     pub async fn insert_release(&self, db: &MySqlPool, document: &ReleaseDocument) -> bool {
         if document.id <= 0 {
             warn!("can't insert a release without an id");
