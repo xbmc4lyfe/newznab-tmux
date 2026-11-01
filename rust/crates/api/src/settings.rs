@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use nntmux_core::{parsed_or, var_or};
+use nntmux_core::{optional, parsed_or, var_or};
 
 use crate::abuse::AbuseConfig;
 use crate::json::J;
@@ -23,6 +23,7 @@ pub struct Settings {
     /// Where cover images live, checked in order.
     pub cover_roots: Vec<PathBuf>,
     pub abuse: AbuseConfig,
+    pub upload_folder: Option<PathBuf>,
     /// Small read-mostly values such as the v1 server menu, which every XML response needs.
     local: Mutex<HashMap<String, (Instant, J)>>,
 }
@@ -65,6 +66,7 @@ impl Settings {
                 PathBuf::from("/app/public/covers"),
             ],
             abuse: AbuseConfig::default(),
+            upload_folder: optional("NZB_UPLOAD_FOLDER").map(PathBuf::from),
             local: Mutex::new(HashMap::new()),
         }
     }
