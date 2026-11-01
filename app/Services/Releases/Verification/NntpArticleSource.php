@@ -160,12 +160,6 @@ final class NntpArticleSource implements ArticleSource
     }
 
     /** @param callable(VerifiedArticle): void $validate */
-    public function fetchValidated(string $messageId, callable $validate): string
-    {
-        return $this->fetchVerified($messageId, $validate)->raw;
-    }
-
-    /** @param callable(VerifiedArticle): void $validate */
     public function fetchVerified(string $messageId, callable $validate): FetchedArticle
     {
         $fetched = $this->fetchFromProviders($messageId, $validate);

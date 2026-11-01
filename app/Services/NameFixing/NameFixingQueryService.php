@@ -273,21 +273,6 @@ final class NameFixingQueryService
         );
     }
 
-    /**
-     * @param  list<int>  $releaseIds
-     * @return list<object>
-     */
-    public function hashRows(array $releaseIds): array
-    {
-        return $this->selectForReleaseIds(
-            'SELECT ph.releases_id, ph.hash
-             FROM par_hashes ph
-             WHERE ph.releases_id IN (%s)
-             ORDER BY ph.releases_id, ph.hash',
-            $releaseIds
-        );
-    }
-
     /** @param list<int> $releaseIds
      * @return list<object>
      */
@@ -297,12 +282,6 @@ final class NameFixingQueryService
             WHERE ph.releases_id IN (%s) AND NOT EXISTS
                 (SELECT 1 FROM par_file_hashes strong WHERE strong.releases_id = ph.releases_id)
             ORDER BY ph.releases_id, ph.hash', $releaseIds);
-    }
-
-    public function hashRetryDue(int $releaseId, string $guid): bool
-    {
-        return ! $this->database->table('par2_hash_retry')->where('releases_id', $releaseId)
-            ->whereRaw('HEX(release_guid) = ?', [strtoupper(bin2hex($guid))])->where('retry_at', '>', CarbonImmutable::now()->toDateTimeString())->exists();
     }
 
     /**
