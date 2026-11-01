@@ -1,0 +1,116 @@
+<nav class="layout-primary-nav relative" aria-label="Content categories">
+    <div class="container mx-auto max-w-[1600px] px-3 sm:px-5 lg:px-8">
+        <div class="flex items-center justify-between h-16">
+            <button type="button" class="touch-target rounded-xl p-2 text-gray-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 2xl:hidden" id="mobile-menu-toggle" aria-label="Toggle category navigation" aria-expanded="false" aria-controls="mobile-nav-panel">
+                <i class="fas fa-bars text-xl" id="mobile-menu-icon-open" aria-hidden="true"></i>
+                <i class="fas fa-times text-xl hidden" id="mobile-menu-icon-close" aria-hidden="true"></i>
+            </button>
+            <div class="layout-primary-nav__categories hidden min-w-0 flex-1 2xl:flex 2xl:items-center 2xl:gap-1" id="desktop-nav">
+                {% for cat in layout.nav %}
+                <div class="relative dropdown-container shrink-0">
+                    <button class="dropdown-toggle flex items-center px-3 py-2 text-gray-300 dark:text-gray-400 hover:text-white dark:hover:text-white hover:bg-white/10 dark:hover:bg-white/5 rounded-lg transition text-sm whitespace-nowrap">
+                        <i class="fa {{ cat.icon }} mr-1.5"></i><span>{{ cat.title }}</span><i class="fas fa-chevron-down ml-1 text-xs"></i>
+                    </button>
+                    <div class="dropdown-menu absolute left-0 top-full w-48 bg-gray-900 dark:bg-gray-950 rounded-xl shadow-lg z-50">
+                        {% for link in cat.links %}<a href="{{ link.href }}" class="block px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white">{{ link.label }}</a><div class="border-t border-white/10 dark:border-white/5"></div>{% endfor %}
+                        {% for sub in cat.subs %}
+                        {% if sub.foreign.is_empty() %}
+                        <a href="{{ sub.href }}" class="block px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white">{{ sub.title }}</a>
+                        {% else %}
+                        <div class="relative submenu-container">
+                            <button type="button" class="submenu-toggle w-full text-left flex items-center justify-between px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white"><span>{{ sub.title }}</span><i class="fas fa-chevron-right text-xs"></i></button>
+                            <div class="submenu absolute left-full top-0 w-40 bg-gray-900 dark:bg-gray-950 rounded-xl shadow-lg z-50 ml-0.5 hidden">
+                                <a href="{{ sub.href }}" class="block px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white">All Foreign</a><div class="border-t border-white/10 dark:border-white/5"></div>
+                                {% for language in sub.foreign %}<a href="{{ language.href }}" class="block px-4 py-2 text-sm text-gray-300 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white dark:hover:text-white">{{ language.label }}</a>{% endfor %}
+                            </div>
+                        </div>
+                        {% endif %}
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+            <div class="flex items-center space-x-2 lg:space-x-4 ml-auto">
+                <button type="button" class="touch-target rounded-xl p-2 text-gray-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 2xl:hidden" id="mobile-search-toggle" aria-label="Toggle release search" aria-expanded="false" aria-controls="mobile-search-form"><i class="fa fa-search text-lg" aria-hidden="true"></i></button>
+                <form method="GET" action="/search" class="layout-primary-nav__search relative hidden items-center gap-2 2xl:flex" id="header-search-form" role="search">
+                    <label for="header-search-category" class="sr-only">Search category</label>
+                    <select id="header-search-category" name="t" class="rounded-lg border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary-500">
+                        <option value="-1">All</option>
+                        {% include "nav_options.html" %}
+                    </select>
+                    <div class="relative">
+                        <label for="header-search-input" class="sr-only">Search releases</label>
+                        <input type="search" name="search" id="header-search-input" value="{{ layout.header_search }}" placeholder="Search releases" autocomplete="off" class="w-40 rounded-lg border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary-500 xl:w-48">
+                        <div id="header-autocomplete-dropdown" class="hidden absolute z-50 w-64 mt-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg max-h-60 overflow-y-auto right-0"></div>
+                    </div>
+                    <button type="submit" class="rounded-lg bg-primary-600 px-4 py-2 text-white transition hover:bg-primary-700 dark:bg-primary-700 dark:hover:bg-primary-800" aria-label="Search releases"><i class="fa fa-search" aria-hidden="true"></i></button>
+                </form>
+                <div class="relative dropdown-container">
+                    <button class="dropdown-toggle flex items-center space-x-2 text-gray-300 hover:text-white px-2 lg:px-3 py-2 rounded-lg hover:bg-white/10 transition">
+                        <span class="w-8 h-8 bg-primary-600 dark:bg-primary-700 rounded-full flex items-center justify-center text-white font-bold text-sm">{{ layout.initial }}</span>
+                        <span class="hidden lg:block text-sm">{{ layout.username }}</span>
+                        <i class="fas fa-chevron-down text-xs hidden lg:inline"></i>
+                    </button>
+                    <div class="dropdown-menu absolute right-0 top-full w-56 bg-gray-900 rounded-xl shadow-lg z-50">
+                        <a href="/cart/index" class="block px-4 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"><i class="fa fa-shopping-basket fa-fw mr-2"></i>My Download Basket</a>
+                        <a href="/mymovies" class="block px-4 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"><i class="fa fa-film fa-fw mr-2"></i>My Movies</a>
+                        <a href="/myshows" class="block px-4 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"><i class="fa fa-television fa-fw mr-2"></i>My Shows</a>
+                        <a href="/invitations" class="block px-4 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"><i class="fa fa-envelope fa-fw mr-2"></i>My Invitations</a>
+                        <div class="border-t border-white/10"></div>
+                        <a href="/profileedit" class="block px-4 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"><i class="fa fa-cog fa-fw mr-2"></i>Account Settings</a>
+                        {% if layout.is_admin %}<a href="/admin/index" class="block px-4 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"><i class="fa fa-cogs fa-fw mr-2"></i>Admin</a>{% endif %}
+                        <div class="border-t border-white/10"></div>
+                        <div class="px-4 py-2"><span class="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">Theme</span><div class="flex items-center gap-1" id="dropdown-theme-switcher"><button type="button" data-theme="light" class="dropdown-theme-btn flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs rounded-lg transition {% if layout.theme == "light" %}bg-primary-600 text-white{% else %}text-gray-300 hover:bg-white/10 hover:text-white{% endif %}" title="Light Mode"><i class="fas fa-sun"></i><span>Light</span></button><button type="button" data-theme="dark" class="dropdown-theme-btn flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs rounded-lg transition {% if layout.theme == "dark" %}bg-primary-600 text-white{% else %}text-gray-300 hover:bg-white/10 hover:text-white{% endif %}" title="Dark Mode"><i class="fas fa-moon"></i><span>Dark</span></button><button type="button" data-theme="system" class="dropdown-theme-btn flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs rounded-lg transition {% if layout.theme == "system" %}bg-primary-600 text-white{% else %}text-gray-300 hover:bg-white/10 hover:text-white{% endif %}" title="System (Auto)"><i class="fas fa-desktop"></i><span>Auto</span></button></div></div>
+                        <div class="px-4 py-2"><span class="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">Color Scheme</span><div class="grid grid-cols-4 place-items-center gap-2" id="dropdown-scheme-switcher">{% for swatch in layout.swatches %}<button type="button" data-scheme="{{ swatch.value }}" title="{{ swatch.label }}" aria-pressed="{% if layout.scheme == swatch.value %}true{% else %}false{% endif %}" class="dropdown-scheme-btn w-8 h-8 rounded-full {{ swatch.class }} transition ring-offset-2 ring-offset-gray-900 {% if layout.scheme == swatch.value %}ring-2 ring-white{% else %}hover:ring-2 hover:ring-white/50{% endif %}"><span class="sr-only">{{ swatch.label }}</span></button>{% endfor %}</div></div>
+                        <div class="border-t border-white/10"></div>
+                        <a href="/profile" class="block px-4 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"><i class="fa fa-user fa-fw mr-2"></i>Profile</a>
+                        <a href="/logout" data-logout class="block px-4 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"><i class="fas fa-sign-out-alt fa-fw mr-2"></i>Sign Out</a>
+                        <form id="logout-form" action="/logout" method="POST" class="hidden"><input type="hidden" name="_token" value="{{ layout.csrf }}"></form>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div id="mobile-search-form" class="2xl:hidden hidden bg-gray-800 dark:bg-gray-950 border-t border-white/10 dark:border-white/5 shadow-lg z-50">
+        <div class="container mx-auto px-4 py-3">
+            <form method="GET" action="/search" class="space-y-3" id="mobile-search-form-el">
+                <label for="mobile-search-category" class="sr-only">Search category</label>
+                <select id="mobile-search-category" name="t" class="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-3 focus:outline-none focus:ring-2 focus:ring-primary-500 touch-target">
+                    <option value="-1">All Categories</option>
+                    {% include "nav_options.html" %}
+                </select>
+                <div class="relative">
+                    <label for="mobile-search-input" class="sr-only">Search releases</label>
+                    <input type="search" name="search" id="mobile-search-input" value="{{ layout.header_search }}" placeholder="Search releases..." autocomplete="off" class="w-full bg-gray-700 text-white text-sm px-3 py-3 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 touch-target">
+                    <div id="mobile-autocomplete-dropdown" class="hidden absolute z-50 w-full mt-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg max-h-60 overflow-y-auto"></div>
+                </div>
+                <button type="submit" class="w-full bg-primary-600 dark:bg-primary-700 hover:bg-primary-700 dark:hover:bg-primary-800 text-white px-4 py-3 rounded-lg transition touch-target font-semibold"><i class="fa fa-search mr-2"></i>Search</button>
+            </form>
+        </div>
+    </div>
+    <div id="mobile-nav-panel" class="2xl:hidden hidden bg-gray-800 dark:bg-gray-950 border-t border-white/10 dark:border-white/5 shadow-lg z-50 max-h-[70vh] overflow-y-auto overscroll-contain">
+        <div class="container mx-auto px-4 py-3">
+            <div class="space-y-1">
+                {% for cat in layout.nav %}
+                <div class="mobile-nav-section">
+                    <button type="button" class="mobile-nav-toggle w-full flex items-center justify-between px-4 py-3 text-gray-200 hover:bg-white/10 dark:hover:bg-white/5 rounded-lg transition touch-target">
+                        <div class="flex items-center"><i class="fa {{ cat.icon }} fa-fw mr-3 text-gray-400"></i><span class="font-medium">{{ cat.title }}</span></div>
+                        <i class="fas fa-chevron-down text-xs text-gray-400 transition-transform duration-200 mobile-nav-chevron"></i>
+                    </button>
+                    <div class="mobile-nav-submenu hidden ml-4 mt-1 space-y-0.5 pb-1">
+                        {% for link in cat.links %}<a href="{{ link.href }}" class="block px-4 py-2.5 text-sm text-gray-300 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white rounded-lg transition touch-target">{{ link.label }}</a>{% endfor %}
+                        {% for sub in cat.subs %}<a href="{{ sub.href }}" class="block px-4 py-2.5 text-sm text-gray-400 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white rounded-lg transition touch-target">{{ sub.title }}</a>{% endfor %}
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+            <div class="border-t border-white/10 dark:border-white/5 mt-3 pt-3 space-y-0.5">
+                <a href="/cart/index" class="flex items-center px-4 py-2.5 text-sm text-gray-300 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white rounded-lg transition touch-target"><i class="fa fa-shopping-basket fa-fw mr-3 text-gray-400"></i>My Download Basket</a>
+                <a href="/profileedit" class="flex items-center px-4 py-2.5 text-sm text-gray-300 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white rounded-lg transition touch-target"><i class="fa fa-cog fa-fw mr-3 text-gray-400"></i>Account Settings</a>
+                {% if layout.is_admin %}<a href="/admin/index" class="flex items-center px-4 py-2.5 text-sm text-gray-300 hover:bg-white/10 dark:hover:bg-white/5 hover:text-white rounded-lg transition touch-target"><i class="fa fa-cogs fa-fw mr-3 text-gray-400"></i>Admin</a>{% endif %}
+                <div class="px-4 py-2.5"><span class="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Theme</span><div class="flex items-center gap-1.5" id="mobile-theme-switcher"><button type="button" data-theme="light" class="mobile-theme-btn flex-1 flex items-center justify-center gap-1.5 px-3 py-2 touch-target text-xs rounded-lg transition {% if layout.theme == "light" %}bg-primary-600 text-white{% else %}text-gray-300 hover:bg-white/10 hover:text-white{% endif %}" title="Light Mode"><i class="fas fa-sun"></i><span>Light</span></button><button type="button" data-theme="dark" class="mobile-theme-btn flex-1 flex items-center justify-center gap-1.5 px-3 py-2 touch-target text-xs rounded-lg transition {% if layout.theme == "dark" %}bg-primary-600 text-white{% else %}text-gray-300 hover:bg-white/10 hover:text-white{% endif %}" title="Dark Mode"><i class="fas fa-moon"></i><span>Dark</span></button><button type="button" data-theme="system" class="mobile-theme-btn flex-1 flex items-center justify-center gap-1.5 px-3 py-2 touch-target text-xs rounded-lg transition {% if layout.theme == "system" %}bg-primary-600 text-white{% else %}text-gray-300 hover:bg-white/10 hover:text-white{% endif %}" title="System (Auto)"><i class="fas fa-desktop"></i><span>Auto</span></button></div></div>
+                <div class="px-4 py-2.5"><span class="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Color Scheme</span><div class="grid grid-cols-4 place-items-center gap-3" id="mobile-scheme-switcher">{% for swatch in layout.swatches %}<button type="button" data-scheme="{{ swatch.value }}" title="{{ swatch.label }}" aria-pressed="{% if layout.scheme == swatch.value %}true{% else %}false{% endif %}" class="mobile-scheme-btn w-9 h-9 touch-target rounded-full {{ swatch.class }} transition ring-offset-2 ring-offset-gray-900 {% if layout.scheme == swatch.value %}ring-2 ring-white{% else %}hover:ring-2 hover:ring-white/50{% endif %}"><span class="sr-only">{{ swatch.label }}</span></button>{% endfor %}</div></div>
+            </div>
+        </div>
+    </div>
+</nav>
