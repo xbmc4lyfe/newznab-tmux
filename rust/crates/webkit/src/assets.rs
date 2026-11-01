@@ -31,14 +31,18 @@ fn parse(manifest: &str) -> Option<Assets> {
     let entries: HashMap<String, Entry> = serde_json::from_str(manifest).ok()?;
     let mut assets = Assets::default();
     for name in ENTRIES {
-        let Some(entry) = entries.get(name) else { continue };
+        let Some(entry) = entries.get(name) else {
+            continue;
+        };
         let path = format!("/build/{}", entry.file);
         if entry.file.ends_with(".css") {
             assets.styles.push(path);
         } else {
             assets.scripts.push(path);
         }
-        assets.styles.extend(entry.css.iter().map(|css| format!("/build/{css}")));
+        assets
+            .styles
+            .extend(entry.css.iter().map(|css| format!("/build/{css}")));
     }
     Some(assets)
 }
@@ -64,7 +68,10 @@ mod tests {
             r#"{"css/app.css":{"file":"assets/app-1.css"},"js/app.js":{"file":"assets/app-2.js","css":["assets/extra-3.css"]},"other.js":{"file":"x.js"}}"#,
         )
         .unwrap();
-        assert_eq!(assets.styles, ["/build/assets/app-1.css", "/build/assets/extra-3.css"]);
+        assert_eq!(
+            assets.styles,
+            ["/build/assets/app-1.css", "/build/assets/extra-3.css"]
+        );
         assert_eq!(assets.scripts, ["/build/assets/app-2.js"]);
     }
 }

@@ -17,7 +17,10 @@ pub enum WebError {
     PageExpired,
     TooManyRequests,
     /// 403 for a category this account can't see. The name is shown on the page.
-    CategoryDisabled { category: String, subcategory: bool },
+    CategoryDisabled {
+        category: String,
+        subcategory: bool,
+    },
     Internal(anyhow::Error),
 }
 
@@ -42,7 +45,9 @@ struct CategoryDisabledPage<'a> {
 }
 
 fn page(status: StatusCode, title: &str, message: &str) -> Response {
-    let body = ErrorPage { title, message }.render().unwrap_or_else(|_| title.to_owned());
+    let body = ErrorPage { title, message }
+        .render()
+        .unwrap_or_else(|_| title.to_owned());
     (status, Html(body)).into_response()
 }
 
@@ -90,9 +95,17 @@ impl IntoResponse for WebError {
         self.log();
         let status = self.status();
         match &self {
-            Self::CategoryDisabled { category, subcategory } => {
-                let template = CategoryDisabledPage { category, subcategory: *subcategory };
-                let body = template.render().unwrap_or_else(|_| "Category Disabled".to_owned());
+            Self::CategoryDisabled {
+                category,
+                subcategory,
+            } => {
+                let template = CategoryDisabledPage {
+                    category,
+                    subcategory: *subcategory,
+                };
+                let body = template
+                    .render()
+                    .unwrap_or_else(|_| "Category Disabled".to_owned());
                 (status, Html(body)).into_response()
             }
             _ => page(status, self.message(), self.message()),

@@ -47,8 +47,8 @@ async fn main() -> Result<()> {
         listener,
         ServiceExt::<Request>::into_make_service_with_connect_info::<SocketAddr>(app),
     )
-        .with_graceful_shutdown(stop.token().cancelled_owned())
-        .await
-        .context("serving")?;
+    .with_graceful_shutdown(stop.token().cancelled_owned())
+    .await
+    .context("serving")?;
     health.await?
 }

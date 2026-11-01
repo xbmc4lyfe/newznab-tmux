@@ -195,7 +195,11 @@ struct Views {
 fn category_nav(root: i64, title: &str, subs: Vec<(i64, String)>, views: Views) -> NavCategory {
     let link = |label: String, href: String| NavLink { label, href };
     let covers = (root == MOVIE_ROOT && views.movie) || (root == GAME_ROOT && views.console);
-    let top = if covers { format!("/{title}") } else { format!("/browse/{title}") };
+    let top = if covers {
+        format!("/{title}")
+    } else {
+        format!("/browse/{title}")
+    };
     let links = match root {
         TV_ROOT => vec![
             link("All TV".to_owned(), format!("/browse/{title}")),
@@ -213,23 +217,43 @@ fn category_nav(root: i64, title: &str, subs: Vec<(i64, String)>, views: Views) 
             let (href, foreign) = match (root, id) {
                 (TV_ROOT, TV_FOREIGN) => (format!("/browse/TV/{sub}"), foreign_links(id)),
                 (TV_ROOT, _) => (format!("/browse/TV/{sub}"), Vec::new()),
-                (MOVIE_ROOT, MOVIE_FOREIGN) if views.movie => (format!("/{title}/{sub}"), foreign_links(id)),
-                (MOVIE_ROOT, MOVIE_FOREIGN) => (format!("/browse/{title}/{sub}"), foreign_links(id)),
+                (MOVIE_ROOT, MOVIE_FOREIGN) if views.movie => {
+                    (format!("/{title}/{sub}"), foreign_links(id))
+                }
+                (MOVIE_ROOT, MOVIE_FOREIGN) => {
+                    (format!("/browse/{title}/{sub}"), foreign_links(id))
+                }
                 (PC_ROOT, PC_GAMES) if views.game => (format!("/{sub}"), Vec::new()),
                 _ if covers => (format!("/{title}/{sub}"), Vec::new()),
                 _ => (format!("/browse/{title}/{sub}"), Vec::new()),
             };
-            NavSub { id, title: sub, href, foreign }
+            NavSub {
+                id,
+                title: sub,
+                href,
+                foreign,
+            }
         })
         .collect();
-    NavCategory { id: root, title: title.to_owned(), icon: icon(root), links, subs }
+    NavCategory {
+        id: root,
+        title: title.to_owned(),
+        icon: icon(root),
+        links,
+        subs,
+    }
 }
 
 /// `Category::getForMenu`: roots that still have a visible child, with those children.
-async fn load_nav(db: &MySqlPool, excluded: &[i64], views: Views) -> anyhow::Result<Vec<NavCategory>> {
-    let roots: Vec<(i64, String)> = sqlx::query_as("SELECT CAST(id AS SIGNED), title FROM root_categories ORDER BY id")
-        .fetch_all(db)
-        .await?;
+async fn load_nav(
+    db: &MySqlPool,
+    excluded: &[i64],
+    views: Views,
+) -> anyhow::Result<Vec<NavCategory>> {
+    let roots: Vec<(i64, String)> =
+        sqlx::query_as("SELECT CAST(id AS SIGNED), title FROM root_categories ORDER BY id")
+            .fetch_all(db)
+            .await?;
     let children: Vec<(i64, i64, String)> = sqlx::query_as(
         "SELECT CAST(id AS SIGNED), CAST(root_categories_id AS SIGNED), title FROM categories
          WHERE root_categories_id IS NOT NULL ORDER BY id",
@@ -270,7 +294,9 @@ fn looks_like_domain(url: &str) -> bool {
         return false;
     };
     let mut label_chars = label.chars();
-    label_chars.next().is_some_and(|first| first.is_ascii_alphanumeric())
+    label_chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
         && label_chars.all(|c| c.is_ascii_alphanumeric() || c == '-')
         && rest.chars().take_while(char::is_ascii_alphabetic).count() >= 2
 }
@@ -298,7 +324,12 @@ async fn load_useful_links(db: &MySqlPool) -> anyhow::Result<Vec<UsefulLink>> {
         .map(|(title, url, body)| {
             let (url, external) = resolve_content_url(url.as_deref().unwrap_or_default());
             let body = useful_link_body(body.as_deref().unwrap_or_default());
-            UsefulLink { title, url, external, body }
+            UsefulLink {
+                title,
+                url,
+                external,
+                body,
+            }
         })
         .collect())
 }
@@ -342,7 +373,12 @@ pub struct Layout {
 
 impl Layout {
     /// Sets the page title, the description and the keywords.
-    pub fn titled(mut self, title: impl Into<String>, keywords: impl Into<String>, description: impl Into<String>) -> Self {
+    pub fn titled(
+        mut self,
+        title: impl Into<String>,
+        keywords: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
         self.meta_title = title.into();
         self.meta_keywords = keywords.into();
         self.meta_description = description.into();
@@ -386,7 +422,11 @@ fn flash_messages(session: &Session) -> (Option<String>, Vec<String>, String) {
     let error = session.flashed("error");
     let errors = match &error {
         Some(Value::String(message)) => vec![message.clone()],
-        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
         _ => Vec::new(),
     };
     let success = session.flashed_str("success");
@@ -403,11 +443,10 @@ impl FromRequestParts<Ctx> for Layout {
     type Rejection = WebError;
 
     async fn from_request_parts(parts: &mut Parts, ctx: &Ctx) -> Result<Self, Self::Rejection> {
-        let session = parts
-            .extensions
-            .get::<Session>()
-            .cloned()
-            .ok_or_else(|| WebError::Internal(anyhow::anyhow!("the web stack isn't installed")))?;
+        let session =
+            parts.extensions.get::<Session>().cloned().ok_or_else(|| {
+                WebError::Internal(anyhow::anyhow!("the web stack isn't installed"))
+            })?;
         let nonce = parts
             .extensions
             .get::<CspNonce>()
@@ -415,7 +454,9 @@ impl FromRequestParts<Ctx> for Layout {
             .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
             .map_err(|_| WebError::Internal(anyhow::anyhow!("no CSP nonce")))?;
         let auth = parts.extensions.get::<Auth>().cloned();
-        let input = Input::from_request_parts(parts, ctx).await.unwrap_or_default();
+        let input = Input::from_request_parts(parts, ctx)
+            .await
+            .unwrap_or_default();
 
         let site = SiteConfig::load(&ctx.db).await?;
         let useful_links = load_useful_links(&ctx.db).await?;
@@ -471,7 +512,10 @@ impl FromRequestParts<Ctx> for Layout {
                 .is_none_or(|at| at < (Utc::now() - Duration::hours(3)).naive_utc());
             if stale {
                 let ip = client_ip::from_parts(parts).to_string();
-                auth::log_if_failed(auth::record_login(ctx, user.id, &ip).await, "updating lastlogin");
+                auth::log_if_failed(
+                    auth::record_login(ctx, user.id, &ip).await,
+                    "updating lastlogin",
+                );
             }
             let excluded = user::category_exclusions(&ctx.db, user.id, &auth.access).await?;
             let views = Views {
@@ -483,7 +527,12 @@ impl FromRequestParts<Ctx> for Layout {
             layout.signed_in = true;
             layout.is_admin = auth.access.has_role("Admin");
             layout.username = user.username.clone();
-            layout.initial = user.username.chars().take(1).flat_map(char::to_uppercase).collect();
+            layout.initial = user
+                .username
+                .chars()
+                .take(1)
+                .flat_map(char::to_uppercase)
+                .collect();
             layout.theme = user.theme_preference.clone();
             layout.scheme = user.color_scheme.clone();
             let access = &auth.access;
@@ -528,10 +577,22 @@ mod tests {
     #[test]
     fn content_urls_resolve_like_laravel() {
         assert_eq!(resolve_content_url(""), (None, false));
-        assert_eq!(resolve_content_url("https://a.b/c"), (Some("https://a.b/c".to_owned()), true));
-        assert_eq!(resolve_content_url("chatgpt.ai"), (Some("https://chatgpt.ai".to_owned()), true));
-        assert_eq!(resolve_content_url("/local"), (Some("/local".to_owned()), false));
-        assert_eq!(resolve_content_url("local/page"), (Some("/local/page".to_owned()), false));
+        assert_eq!(
+            resolve_content_url("https://a.b/c"),
+            (Some("https://a.b/c".to_owned()), true)
+        );
+        assert_eq!(
+            resolve_content_url("chatgpt.ai"),
+            (Some("https://chatgpt.ai".to_owned()), true)
+        );
+        assert_eq!(
+            resolve_content_url("/local"),
+            (Some("/local".to_owned()), false)
+        );
+        assert_eq!(
+            resolve_content_url("local/page"),
+            (Some("/local/page".to_owned()), false)
+        );
     }
 
     #[test]
@@ -541,10 +602,26 @@ mod tests {
         assert_eq!(plain.links[0].href, "/browse/Movies");
         assert_eq!(plain.subs[1].href, "/browse/Movies/HD");
         assert_eq!(plain.subs[0].foreign.len(), 10);
-        let covers = category_nav(MOVIE_ROOT, "Movies", subs, Views { movie: true, ..Views::default() });
+        let covers = category_nav(
+            MOVIE_ROOT,
+            "Movies",
+            subs,
+            Views {
+                movie: true,
+                ..Views::default()
+            },
+        );
         assert_eq!(covers.links[0].href, "/Movies");
         assert_eq!(covers.subs[1].href, "/Movies/HD");
-        let pc = category_nav(PC_ROOT, "PC", vec![(4050, "Games".to_owned())], Views { game: true, ..Views::default() });
+        let pc = category_nav(
+            PC_ROOT,
+            "PC",
+            vec![(4050, "Games".to_owned())],
+            Views {
+                game: true,
+                ..Views::default()
+            },
+        );
         assert_eq!(pc.subs[0].href, "/Games");
     }
 

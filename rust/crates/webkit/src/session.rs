@@ -141,7 +141,11 @@ impl Session {
 
     /// The first flashed error for a field.
     pub fn error(&self, field: &str) -> Option<String> {
-        self.flashed("errors")?.get(field)?.get(0)?.as_str().map(str::to_owned)
+        self.flashed("errors")?
+            .get(field)?
+            .get(0)?
+            .as_str()
+            .map(str::to_owned)
     }
 
     /// Every flashed error, in field order.

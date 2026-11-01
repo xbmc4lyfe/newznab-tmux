@@ -1727,7 +1727,9 @@ dependencies = [
  "nntmux-runtime",
  "nntmux-site",
  "nntmux-telemetry",
+ "nntmux-webkit",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
 ]

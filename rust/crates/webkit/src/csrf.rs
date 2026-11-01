@@ -65,7 +65,12 @@ pub async fn override_method(request: Request) -> Result<Request, StatusCode> {
     } else {
         multipart_field(&bytes, "_method")
     };
-    match method.unwrap_or_default().trim().to_ascii_uppercase().as_str() {
+    match method
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
         "PUT" => parts.method = Method::PUT,
         "PATCH" => parts.method = Method::PATCH,
         "DELETE" => parts.method = Method::DELETE,
@@ -114,15 +119,16 @@ pub async fn layer(request: Request, next: Next) -> Response {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned)
         });
-        let valid = !expected.is_empty()
-            && sent.is_some_and(|sent| constant_time_eq(&sent, &expected));
+        let valid =
+            !expected.is_empty() && sent.is_some_and(|sent| constant_time_eq(&sent, &expected));
         if !valid {
             return WebError::PageExpired.into_response();
         }
     }
 
     parts.extensions.insert(input);
-    next.run(Request::from_parts(parts, Body::from(bytes))).await
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
 }
 
 #[cfg(test)]

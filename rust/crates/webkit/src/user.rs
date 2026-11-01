@@ -73,7 +73,11 @@ impl User {
     }
 
     /// Finds by a column, skipping soft-deleted accounts. `column` must be a literal.
-    pub async fn find_by(db: &MySqlPool, column: &'static str, value: &str) -> Result<Option<Self>> {
+    pub async fn find_by(
+        db: &MySqlPool,
+        column: &'static str,
+        value: &str,
+    ) -> Result<Option<Self>> {
         let sql = format!("SELECT {COLUMNS} FROM users WHERE {column} = ? AND deleted_at IS NULL");
         Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(value)
@@ -101,7 +105,11 @@ impl User {
             self.lastname.as_deref().unwrap_or_default()
         );
         let name = name.trim();
-        if name.is_empty() { self.username.clone() } else { name.to_owned() }
+        if name.is_empty() {
+            self.username.clone()
+        } else {
+            name.to_owned()
+        }
     }
 }
 
@@ -143,7 +151,11 @@ impl Access {
         .bind(user_id)
         .fetch_all(db)
         .await?;
-        Ok(Self { roles, direct, via_roles })
+        Ok(Self {
+            roles,
+            direct,
+            via_roles,
+        })
     }
 
     pub fn has_role(&self, role: &str) -> bool {
@@ -178,7 +190,11 @@ impl Access {
 /// Every category hidden from a user: all children of roots their permissions exclude, plus
 /// what they excluded themselves. Roots and their children both count, so callers can filter
 /// `categories_id` directly.
-pub async fn category_exclusions(db: &MySqlPool, user_id: i64, access: &Access) -> Result<Vec<i64>> {
+pub async fn category_exclusions(
+    db: &MySqlPool,
+    user_id: i64,
+    access: &Access,
+) -> Result<Vec<i64>> {
     let roots = access.excluded_roots();
     let mut hidden: Vec<i64> = sqlx::query_scalar(
         "SELECT CAST(c.id AS SIGNED) FROM categories c
@@ -190,7 +206,9 @@ pub async fn category_exclusions(db: &MySqlPool, user_id: i64, access: &Access) 
     .await?;
     if !roots.is_empty() {
         let marks = vec!["?"; roots.len()].join(",");
-        let sql = format!("SELECT CAST(id AS SIGNED) FROM categories WHERE root_categories_id IN ({marks})");
+        let sql = format!(
+            "SELECT CAST(id AS SIGNED) FROM categories WHERE root_categories_id IN ({marks})"
+        );
         let mut query = sqlx::query_scalar(sqlx::AssertSqlSafe(sql));
         for root in &roots {
             query = query.bind(*root);
@@ -215,7 +233,10 @@ mod tests {
         };
         let roots = access.excluded_roots();
         assert!(!roots.contains(&5000));
-        assert!(roots.contains(&2000), "a role's permission doesn't lift the exclusion");
+        assert!(
+            roots.contains(&2000),
+            "a role's permission doesn't lift the exclusion"
+        );
         assert!(access.can("view movies"));
         assert!(!access.has_direct_permission("view movies"));
     }

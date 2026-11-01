@@ -2,38 +2,49 @@
 //! one-session rule and the shared layout. Skips itself when the test services aren't set.
 
 use askama::Template;
+use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Extension, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::{from_fn, map_request};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::Router;
 use nntmux_runtime::Ctx;
 use nntmux_testkit::TestDb;
 use nntmux_webkit::{CurrentUser, Input, Layout, Session, WebResult, auth, csrf, guard, throttle};
 use tower::{Layer, ServiceExt};
 
 #[derive(Template)]
-#[template(source = r#"{% extends "layout.html" %}{% block content %}<p id="page">{{ who }}</p>{% endblock %}"#, ext = "html")]
+#[template(
+    source = r#"{% extends "layout.html" %}{% block content %}<p id="page">{{ who }}</p>{% endblock %}"#,
+    ext = "html"
+)]
 struct TestPage {
     layout: Layout,
     who: String,
 }
 
 async fn whoami(layout: Layout, CurrentUser(auth): CurrentUser) -> WebResult {
-    let page = TestPage { layout: layout.titled("Who", "", ""), who: auth.user.username.clone() };
+    let page = TestPage {
+        layout: layout.titled("Who", "", ""),
+        who: auth.user.username.clone(),
+    };
     Ok(Html(page.render()?).into_response())
 }
 
 async fn guest_page(layout: Layout) -> WebResult {
-    let page = TestPage { layout, who: "guest".to_owned() };
+    let page = TestPage {
+        layout,
+        who: "guest".to_owned(),
+    };
     Ok(Html(page.render()?).into_response())
 }
 
 /// Signs in the user named by the `id` field, the way the login form will.
 async fn sign_in(State(ctx): State<Ctx>, session: Session, input: Input) -> WebResult {
-    let user = nntmux_webkit::User::find(&ctx.db, input.int("id", 0)).await?.ok_or(nntmux_webkit::WebError::NotFound)?;
+    let user = nntmux_webkit::User::find(&ctx.db, input.int("id", 0))
+        .await?
+        .ok_or(nntmux_webkit::WebError::NotFound)?;
     auth::login(&session, &user);
     session.regenerate();
     auth::rotate_session_token(&ctx, &session, user.id).await?;
@@ -56,14 +67,18 @@ fn app(ctx: Ctx) -> Router {
         .route_layer(from_fn(guard::authenticated));
     let limited = Router::new()
         .route("/limited", get(|| async { "ok" }))
-        .route_layer(from_fn(|request, next| throttle::limit(request, next, 2, 60)));
+        .route_layer(from_fn(|request, next| {
+            throttle::limit(request, next, 2, 60)
+        }));
     let router = private
         .merge(limited)
         .route("/", get(guest_page))
         .route("/sign-in", post(sign_in))
         .route("/flash", post(flash))
         .route("/thing", delete(remove));
-    let inner = nntmux_webkit::stack(router).layer(Extension(ctx.clone())).with_state(ctx);
+    let inner = nntmux_webkit::stack(router)
+        .layer(Extension(ctx.clone()))
+        .with_state(ctx);
     Router::new().fallback_service(map_request(csrf::override_method).layer(inner))
 }
 
@@ -81,7 +96,11 @@ impl Browser {
             .join("; ")
     }
 
-    async fn send(&mut self, request: axum::http::request::Builder, body: &str) -> (Response, String) {
+    async fn send(
+        &mut self,
+        request: axum::http::request::Builder,
+        body: &str,
+    ) -> (Response, String) {
         let request = request
             .header(header::COOKIE, self.cookie_header())
             .body(Body::from(body.to_owned()))
@@ -104,7 +123,8 @@ impl Browser {
     }
 
     async fn post(&mut self, path: &str, body: &str) -> (Response, String) {
-        let request = Request::post(path).header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        let request =
+            Request::post(path).header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
         self.send(request, body).await
     }
 
@@ -151,10 +171,15 @@ async fn add_user(db: &sqlx::MySqlPool, name: &str, verified: bool) -> i64 {
 
 #[tokio::test]
 async fn sessions_csrf_and_guards_work_end_to_end() {
-    let Some((db, ctx)) = fixture().await else { return };
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
     let id = add_user(&db.pool, "alice", true).await;
     let unverified = add_user(&db.pool, "bobby", false).await;
-    let mut browser = Browser { app: app(ctx.clone()), cookies: Vec::new() };
+    let mut browser = Browser {
+        app: app(ctx.clone()),
+        cookies: Vec::new(),
+    };
 
     // Guests are sent to the login page, and it remembers where they were going.
     let (response, _) = browser.get("/whoami?x=1").await;
@@ -166,7 +191,9 @@ async fn sessions_csrf_and_guards_work_end_to_end() {
     assert_eq!(response.status().as_u16(), 419);
 
     let token = browser.token().await;
-    let (response, _) = browser.post("/sign-in", &format!("id={id}&_token={token}")).await;
+    let (response, _) = browser
+        .post("/sign-in", &format!("id={id}&_token={token}"))
+        .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     // The session survives across requests, and the layout shows the account.
@@ -175,31 +202,62 @@ async fn sessions_csrf_and_guards_work_end_to_end() {
     assert!(html.contains(r#"<p id="page">alice</p>"#));
     assert!(html.contains("<title>Who - "));
     assert!(html.contains("My Download Basket"));
-    assert!(response.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("no-store"));
-    assert!(response.headers().contains_key(header::CONTENT_SECURITY_POLICY));
-    let csp = response.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().to_owned();
-    assert!(html.contains(&format!("nonce=\"{}", csp.split("nonce-").nth(1).unwrap().split('\'').next().unwrap())));
+    assert!(
+        response.headers()[header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .contains("no-store")
+    );
+    assert!(
+        response
+            .headers()
+            .contains_key(header::CONTENT_SECURITY_POLICY)
+    );
+    let csp = response.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(html.contains(
+        &format!("nonce=\"{}", csp.split("nonce-").nth(1).unwrap().split('\'').next().unwrap())
+    ));
 
     // A newer sign-in elsewhere ends this session.
-    let mut other = Browser { app: app(ctx.clone()), cookies: Vec::new() };
+    let mut other = Browser {
+        app: app(ctx.clone()),
+        cookies: Vec::new(),
+    };
     let other_token = other.token().await;
-    other.post("/sign-in", &format!("id={id}&_token={other_token}")).await;
+    other
+        .post("/sign-in", &format!("id={id}&_token={other_token}"))
+        .await;
     let (response, _) = browser.get("/whoami").await;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     let (_, html) = browser.get("/").await;
-    assert!(html.contains("signed in on another device"), "the reason is flashed");
+    assert!(
+        html.contains("signed in on another device"),
+        "the reason is flashed"
+    );
 
     // A changed password ends a session too.
     let (response, _) = other.get("/whoami").await;
     assert_eq!(response.status(), StatusCode::OK);
-    sqlx::query("UPDATE users SET password = 'changed' WHERE id = ?").bind(id).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE users SET password = 'changed' WHERE id = ?")
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     let (response, _) = other.get("/whoami").await;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
     // Unverified accounts go to the notice.
-    let mut third = Browser { app: app(ctx.clone()), cookies: Vec::new() };
+    let mut third = Browser {
+        app: app(ctx.clone()),
+        cookies: Vec::new(),
+    };
     let token = third.token().await;
-    third.post("/sign-in", &format!("id={unverified}&_token={token}")).await;
+    third
+        .post("/sign-in", &format!("id={unverified}&_token={token}"))
+        .await;
     let (response, _) = third.get("/whoami").await;
     assert_eq!(response.headers()[header::LOCATION], "/email/verify");
 
@@ -208,8 +266,13 @@ async fn sessions_csrf_and_guards_work_end_to_end() {
 
 #[tokio::test]
 async fn flashes_show_once_and_method_overrides_route() {
-    let Some((db, ctx)) = fixture().await else { return };
-    let mut browser = Browser { app: app(ctx), cookies: Vec::new() };
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let mut browser = Browser {
+        app: app(ctx),
+        cookies: Vec::new(),
+    };
     let token = browser.token().await;
 
     browser.post("/flash", &format!("_token={token}")).await;
@@ -218,7 +281,9 @@ async fn flashes_show_once_and_method_overrides_route() {
     let (_, html) = browser.get("/").await;
     assert!(!html.contains("Saved it"));
 
-    let (response, body) = browser.post("/thing", &format!("_method=DELETE&_token={token}")).await;
+    let (response, body) = browser
+        .post("/thing", &format!("_method=DELETE&_token={token}"))
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body, "deleted");
 
@@ -227,13 +292,24 @@ async fn flashes_show_once_and_method_overrides_route() {
 
 #[tokio::test]
 async fn throttling_counts_and_answers_429() {
-    let Some((db, ctx)) = fixture().await else { return };
-    let mut browser = Browser { app: app(ctx.clone()), cookies: Vec::new() };
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let mut browser = Browser {
+        app: app(ctx.clone()),
+        cookies: Vec::new(),
+    };
     // Each run gets its own prefix through its own client address.
     let ip = format!("203.0.113.{}", rand_octet());
     let request = |ip: &str| Request::get("/limited").header("x-forwarded-for", ip.to_owned());
-    assert_eq!(browser.send(request(&ip), "").await.0.status(), StatusCode::OK);
-    assert_eq!(browser.send(request(&ip), "").await.0.status(), StatusCode::OK);
+    assert_eq!(
+        browser.send(request(&ip), "").await.0.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        browser.send(request(&ip), "").await.0.status(),
+        StatusCode::OK
+    );
     let (response, _) = browser.send(request(&ip), "").await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(response.headers().contains_key(header::RETRY_AFTER));

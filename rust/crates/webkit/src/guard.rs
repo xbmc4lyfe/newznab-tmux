@@ -47,7 +47,11 @@ pub async fn authenticated(request: Request, next: Next) -> Response {
         return next.run(request).await;
     }
     if expects_json(request.headers()) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"message": "Unauthenticated."}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"message": "Unauthenticated."})),
+        )
+            .into_response();
     }
     if request.method() == Method::GET
         && let Some(session) = request.extensions().get::<Session>()
@@ -131,13 +135,15 @@ pub async fn role_or_permission(
     allowed: &'static [&'static str],
     permission: &'static str,
 ) -> Response {
-    let permitted = request.extensions().get::<Auth>().is_some_and(|auth| {
-        auth.access.has_any_role(allowed) || auth.access.can(permission)
-    });
+    let permitted = request
+        .extensions()
+        .get::<Auth>()
+        .is_some_and(|auth| auth.access.has_any_role(allowed) || auth.access.can(permission));
     if permitted {
         next.run(request).await
     } else {
-        WebError::Forbidden(Some("User does not have the right permissions.".to_owned())).into_response()
+        WebError::Forbidden(Some("User does not have the right permissions.".to_owned()))
+            .into_response()
     }
 }
 

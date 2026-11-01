@@ -99,20 +99,32 @@ pub async fn layer(mut request: Request, next: Next) -> Response {
     }
     set(&mut response, "x-frame-options", "SAMEORIGIN");
     set(&mut response, "x-content-type-options", "nosniff");
-    set(&mut response, "referrer-policy", "strict-origin-when-cross-origin");
+    set(
+        &mut response,
+        "referrer-policy",
+        "strict-origin-when-cross-origin",
+    );
 
     let signed_in = response.extensions().get::<Auth>().is_some();
     if signed_in || auth_path {
         response.headers_mut().insert(
             CACHE_CONTROL,
-            HeaderValue::from_static("no-cache, no-store, must-revalidate, private, max-age=0, s-maxage=0"),
+            HeaderValue::from_static(
+                "no-cache, no-store, must-revalidate, private, max-age=0, s-maxage=0",
+            ),
         );
         set(&mut response, "pragma", "no-cache");
         set(&mut response, "expires", "Thu, 01 Jan 1970 00:00:00 GMT");
         set(&mut response, "cdn-cache-control", "no-store");
         set(&mut response, "cloudflare-cdn-cache-control", "no-store");
-        let vary = if bearer { "Cookie, Authorization" } else { "Cookie" };
-        response.headers_mut().append(VARY, HeaderValue::from_static(vary));
+        let vary = if bearer {
+            "Cookie, Authorization"
+        } else {
+            "Cookie"
+        };
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static(vary));
     }
     response
 }

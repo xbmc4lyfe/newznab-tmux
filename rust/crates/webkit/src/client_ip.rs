@@ -43,7 +43,9 @@ fn is_private(ip: IpAddr) -> bool {
             v6.is_loopback()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
-                || v6.to_ipv4_mapped().is_some_and(|v4| is_private(IpAddr::V4(v4)))
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_private(IpAddr::V4(v4)))
         }
     }
 }
@@ -54,7 +56,10 @@ fn trusted_proxies() -> Vec<IpNet> {
         .split(',')
         .filter_map(|entry| parse_net(entry.trim()))
         .collect();
-    if !matches!(var_or("TRUST_CLOUDFLARE", "true").as_str(), "0" | "false" | "off" | "no") {
+    if !matches!(
+        var_or("TRUST_CLOUDFLARE", "true").as_str(),
+        "0" | "false" | "off" | "no"
+    ) {
         nets.extend(CLOUDFLARE.iter().filter_map(|entry| parse_net(entry)));
     }
     nets
@@ -134,7 +139,10 @@ mod tests {
     fn the_rightmost_untrusted_hop_wins() {
         let cloudflare = vec![parse_net("162.158.0.0/15").unwrap()];
         let forwarded = Some("6.6.6.6, 8.8.8.8, 162.158.1.1");
-        assert_eq!(resolve(ip("172.18.0.2"), forwarded, &cloudflare), ip("8.8.8.8"));
+        assert_eq!(
+            resolve(ip("172.18.0.2"), forwarded, &cloudflare),
+            ip("8.8.8.8")
+        );
     }
 
     #[test]
@@ -144,6 +152,9 @@ mod tests {
 
     #[test]
     fn junk_stops_the_walk() {
-        assert_eq!(resolve(ip("10.0.0.1"), Some("oops, 10.0.0.2"), &[]), ip("10.0.0.2"));
+        assert_eq!(
+            resolve(ip("10.0.0.1"), Some("oops, 10.0.0.2"), &[]),
+            ip("10.0.0.2")
+        );
     }
 }

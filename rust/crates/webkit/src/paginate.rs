@@ -5,7 +5,11 @@ use crate::config::encode_component;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageLink {
-    Page { number: u64, url: String, current: bool },
+    Page {
+        number: u64,
+        url: String,
+        current: bool,
+    },
     Gap,
 }
 
@@ -36,7 +40,13 @@ fn page_url(path: &str, query: &[(String, String)], page: u64) -> String {
 
 impl Pager {
     /// `query` is the current query string without `page`, see [`crate::Input::query_pairs`].
-    pub fn new(path: &str, query: &[(String, String)], total: u64, per_page: u64, current: u64) -> Self {
+    pub fn new(
+        path: &str,
+        query: &[(String, String)],
+        total: u64,
+        per_page: u64,
+        current: u64,
+    ) -> Self {
         let per_page = per_page.max(1);
         let last = total.div_ceil(per_page).max(1);
         let url = |page: u64| page_url(path, query, page);
@@ -71,8 +81,16 @@ impl Pager {
             per_page,
             current,
             last,
-            first_item: if shown { (current - 1) * per_page + 1 } else { 0 },
-            last_item: if shown { (current * per_page).min(total) } else { 0 },
+            first_item: if shown {
+                (current - 1) * per_page + 1
+            } else {
+                0
+            },
+            last_item: if shown {
+                (current * per_page).min(total)
+            } else {
+                0
+            },
             previous_url: (current > 1).then(|| url(current - 1)),
             next_url: (current < last).then(|| url(current + 1)),
             links,
@@ -123,9 +141,15 @@ mod tests {
 
     #[test]
     fn the_query_string_survives() {
-        let query = vec![("t".to_owned(), "5000".to_owned()), ("q".to_owned(), "a b".to_owned())];
+        let query = vec![
+            ("t".to_owned(), "5000".to_owned()),
+            ("q".to_owned(), "a b".to_owned()),
+        ];
         let pager = Pager::new("/browse", &query, 100, 10, 1);
-        assert_eq!(pager.next_url.as_deref(), Some("/browse?t=5000&q=a+b&page=2"));
+        assert_eq!(
+            pager.next_url.as_deref(),
+            Some("/browse?t=5000&q=a+b&page=2")
+        );
     }
 
     #[test]

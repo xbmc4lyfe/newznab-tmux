@@ -24,13 +24,22 @@ pub async fn hit(ctx: &Ctx, key: &str, window_seconds: u64) -> redis::RedisResul
          return {count, redis.call('TTL', KEYS[1])}",
     );
     let mut redis = ctx.redis.clone();
-    script.key(key).arg(window_seconds).invoke_async(&mut redis).await
+    script
+        .key(key)
+        .arg(window_seconds)
+        .invoke_async(&mut redis)
+        .await
 }
 
 /// How many hits a key has in its current window. Redis trouble reads as none.
 pub async fn attempts(ctx: &Ctx, key: &str) -> u64 {
     let mut redis = ctx.redis.clone();
-    redis.get::<_, Option<u64>>(key).await.ok().flatten().unwrap_or(0)
+    redis
+        .get::<_, Option<u64>>(key)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0)
 }
 
 /// Starts a key over.
@@ -58,7 +67,14 @@ pub async fn limit(request: Request, next: Next, max: u64, window_seconds: u64) 
     check(&ctx, request, next, &who, max, window_seconds).await
 }
 
-async fn check(ctx: &Ctx, request: Request, next: Next, who: &str, max: u64, window_seconds: u64) -> Response {
+async fn check(
+    ctx: &Ctx,
+    request: Request,
+    next: Next,
+    who: &str,
+    max: u64,
+    window_seconds: u64,
+) -> Response {
     let key = format!(
         "{}throttle:{}:{max}:{window_seconds}:{who}",
         key_prefix(),

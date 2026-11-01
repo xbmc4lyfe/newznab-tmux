@@ -131,7 +131,10 @@ fn config_store_ip() -> bool {
 
 fn sign_remember(id: i64, token: &str, password: &str) -> String {
     let fingerprint = password_fingerprint(password);
-    let signature = hmac_hex(&config::app_key(), &format!("remember|{id}|{token}|{fingerprint}"));
+    let signature = hmac_hex(
+        &config::app_key(),
+        &format!("remember|{id}|{token}|{fingerprint}"),
+    );
     format!("{id}|{token}|{signature}")
 }
 
@@ -144,7 +147,11 @@ pub async fn issue_remember_cookie(ctx: &Ctx, user: &User) -> Result<String> {
         .execute(&ctx.db)
         .await?;
     let value = config::encode_component(&sign_remember(user.id, &token, &user.password));
-    Ok(config::cookie_header(REMEMBER_COOKIE, &value, REMEMBER_SECONDS))
+    Ok(config::cookie_header(
+        REMEMBER_COOKIE,
+        &value,
+        REMEMBER_SECONDS,
+    ))
 }
 
 /// Ends every remembered browser for the account, and returns a cookie that clears this one.
@@ -172,7 +179,11 @@ async fn user_from_remember(ctx: &Ctx, headers: &HeaderMap) -> Result<Option<Use
     let Some(user) = User::find(&ctx.db, id).await? else {
         return Ok(None);
     };
-    let Some(token) = user.remember_token.as_deref().filter(|token| !token.is_empty()) else {
+    let Some(token) = user
+        .remember_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+    else {
         return Ok(None);
     };
     let matches = constant_time_eq(&cookie, &sign_remember(id, token, &user.password));
@@ -227,7 +238,10 @@ pub async fn layer(mut request: Request, next: Next) -> Response {
         if !current.is_empty() {
             match session.get_str(TOKEN_KEY) {
                 Some(stored) if !constant_time_eq(&stored, current) => {
-                    return end_session(&session, request.headers().contains_key("x-requested-with"));
+                    return end_session(
+                        &session,
+                        request.headers().contains_key("x-requested-with"),
+                    );
                 }
                 Some(_) => {}
                 None => session.put(TOKEN_KEY, current),
@@ -279,7 +293,12 @@ fn end_session(session: &Session, ajax: bool) -> Response {
 
 /// True when the request passes two-factor: the account has none, the feature is off, or this
 /// session or a trusted device already proved it.
-pub async fn two_factor_satisfied(ctx: &Ctx, session: &Session, user: &User, headers: &HeaderMap) -> Result<bool> {
+pub async fn two_factor_satisfied(
+    ctx: &Ctx,
+    session: &Session,
+    user: &User,
+    headers: &HeaderMap,
+) -> Result<bool> {
     let enabled: Option<(i8, Option<String>)> = sqlx::query_as(
         "SELECT google2fa_enable, google2fa_secret FROM password_securities WHERE user_id = ? LIMIT 1",
     )
@@ -289,7 +308,9 @@ pub async fn two_factor_satisfied(ctx: &Ctx, session: &Session, user: &User, hea
     let required = matches!(&enabled, Some((1, Some(secret))) if !secret.is_empty());
 
     let trusted = match config::cookie_value(headers, TRUSTED_DEVICE_COOKIE) {
-        Some(cookie) => trusted_device_valid(ctx, &config::decode_component(&cookie), user.id).await?,
+        Some(cookie) => {
+            trusted_device_valid(ctx, &config::decode_component(&cookie), user.id).await?
+        }
         None => false,
     };
     if trusted {
@@ -350,7 +371,8 @@ pub async fn trusted_device_valid(ctx: &Ctx, cookie: &str, user_id: i64) -> Resu
     let Ok(data) = serde_json::from_str::<TrustedDeviceCookie>(cookie) else {
         return Ok(false);
     };
-    if data.user_id != user_id || Utc::now().timestamp() > data.expires_at || data.token.is_empty() {
+    if data.user_id != user_id || Utc::now().timestamp() > data.expires_at || data.token.is_empty()
+    {
         return Ok(false);
     }
     let updated = sqlx::query(
@@ -376,7 +398,12 @@ pub async fn trusted_device_valid(ctx: &Ctx, cookie: &str, user_id: i64) -> Resu
 }
 
 /// Trusts this browser for 30 days, and returns the cookie to send.
-pub async fn issue_trusted_device(ctx: &Ctx, user_id: i64, ip: Option<&str>, user_agent: Option<&str>) -> Result<String> {
+pub async fn issue_trusted_device(
+    ctx: &Ctx,
+    user_id: i64,
+    ip: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<String> {
     let token = random_string(64);
     let expires = Utc::now() + chrono::Duration::days(TRUSTED_DEVICE_DAYS);
     let agent = user_agent.map(|agent| agent.chars().take(500).collect::<String>());
@@ -416,6 +443,9 @@ pub fn log_failed_login(username: &str, ip: &str) {
 /// Writes a best-effort value, logging rather than failing the request.
 pub fn log_if_failed<T>(result: Result<T>, what: &str) {
     if let Err(failure) = result {
-        error!(error = format!("{failure:#}"), what, "best-effort step failed");
+        error!(
+            error = format!("{failure:#}"),
+            what, "best-effort step failed"
+        );
     }
 }
