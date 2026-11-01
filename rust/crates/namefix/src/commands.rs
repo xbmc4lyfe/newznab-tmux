@@ -72,9 +72,9 @@ pub enum Command {
         #[arg(long)]
         show: bool,
     },
-    /// Fixes NZBSPLIT-wrapped names and recategorizes them (`releases:fix-nzbsplit`).
     /// Finds releases much bigger or smaller than their files (`nntmux:find-size-mismatches`).
     FindSizeMismatches(crate::size_mismatch::Args),
+    /// Fixes NZBSPLIT-wrapped names and recategorizes them (`releases:fix-nzbsplit`).
     FixNzbsplit {
         #[arg(long)]
         dry_run: bool,
