@@ -8,7 +8,6 @@ use crate::xml::XmlWriter;
 
 /// `$params` in the controllers: the requester's limits and how to build their links.
 pub struct Params {
-    pub uid: i64,
     pub token: String,
     pub extended: bool,
     pub delete_from_cart: bool,
