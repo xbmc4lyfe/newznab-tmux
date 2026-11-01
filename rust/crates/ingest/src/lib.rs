@@ -2,6 +2,9 @@
 //!
 //! Owner: ws-ingest. See `rust/WORKSTREAMS.md`.
 
+pub mod clean;
+pub mod header;
+
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
