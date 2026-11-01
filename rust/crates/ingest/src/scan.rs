@@ -9,7 +9,7 @@ use nntmux_core::pcre::Pcre;
 use nntmux_runtime::Shutdown;
 use rand::Rng;
 use sqlx::MySqlPool;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::blacklist::{Blacklist, record_usage};
 use crate::clean::CollectionRegex;
@@ -209,6 +209,16 @@ impl<'a> Ingest<'a> {
         Ok(stop.unwrap_or(false))
     }
 
+    /// Tells the downtime compensator that ingestion is live. A failed note never fails ingestion.
+    async fn note_ingestion(&self) {
+        if let Err(failure) = nntmux_runtime::downtime::note_ingestion_on(self.pool).await {
+            debug!(
+                error = format!("{failure:#}"),
+                "unable to record ingestion activity"
+            );
+        }
+    }
+
     pub async fn mark_binary_run(&self) -> Result<()> {
         sqlx::query(
             "UPDATE processing_runtime_states SET last_binary_run_at = ?, updated_at = ? WHERE id = 1",
@@ -256,7 +266,7 @@ impl<'a> Ingest<'a> {
         if !capacity_available(self.pool, self.config).await? {
             return Ok(());
         }
-        note_ingestion();
+        self.note_ingestion().await;
         self.mark_binary_run().await?;
         let Some(server) = self.select_group(&group.name).await else {
             return Ok(());
@@ -488,7 +498,7 @@ impl<'a> Ingest<'a> {
             record_usage(self.pool, &matched_rules).await?;
             if !parsed.is_empty() {
                 let failed = store(self.pool, self.hooks, limits, group, &regexes, &parsed).await;
-                note_ingestion();
+                self.note_ingestion().await;
                 match failed {
                     Ok(failed) => not_inserted.extend(failed),
                     Err(failure) => {
@@ -886,11 +896,6 @@ pub async fn load_regexes(pool: &MySqlPool, group: &str) -> Result<Vec<Collectio
             }
         })
         .collect())
-}
-
-/// Tells the downtime compensator that ingestion is live. A failed note never fails ingestion.
-fn note_ingestion() {
-    // ws-releases: replace with nntmux_runtime::downtime::note_ingestion(&ctx) when it merges.
 }
 
 #[cfg(test)]
