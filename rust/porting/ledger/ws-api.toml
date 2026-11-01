@@ -245,7 +245,7 @@ status = "ported"
 kind = "route"
 id = "POST /api/v2/nzbadd"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@nzbAdd"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"

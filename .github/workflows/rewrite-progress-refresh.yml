@@ -1,0 +1,19 @@
+name: Rewrite progress refresh
+
+# Pages only deploys from master, so a push here asks master's Benchmark Pages run
+# to measure this branch again and republish the front page.
+on:
+  push:
+    branches: [rust-native]
+
+permissions:
+  actions: write
+
+jobs:
+  refresh:
+    if: github.repository == 'xbmc4lyfe/newznab-tmux'
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run benchmark-pages.yml --repo "$GITHUB_REPOSITORY" --ref master

@@ -8,7 +8,7 @@ use nntmux_runtime::Ctx;
 use crate::auth::{self, User};
 use crate::caps::{self, Server};
 use crate::filename;
-use crate::getnzb::{self, Errors};
+use crate::getnzb::{self, Errors, html_escape};
 use crate::input::{Input, php_int};
 use crate::misc::{cp437_to_utf8, nl2br};
 use crate::params;
@@ -17,6 +17,7 @@ use crate::reply::{Reply, xml_error};
 use crate::request::ApiRequest;
 use crate::rows;
 use crate::settings::Settings;
+use crate::upload;
 use crate::usage::{self, Statistics, rfc2822};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,13 +385,53 @@ async fn nfo(
 }
 
 async fn nzb_add(
-    _ctx: &Ctx,
-    _settings: &Settings,
-    _request: &ApiRequest,
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
     account: &Account,
 ) -> Result<Reply> {
     if !account.user.can_post {
         return Ok(xml_error(102, "Insufficient privileges/not authorized"));
     }
-    Ok(not_ported())
+    let legacy = request.has_field("file");
+    let modern = request.has_field("nzb") || request.has_field("nfo");
+    if legacy && modern {
+        return Ok(xml_error(
+            201,
+            "Use either file or nzb/nfo upload fields, not both",
+        ));
+    }
+    if !legacy && !modern {
+        return Ok(xml_error(200, "Missing parameter (nzb file is required)"));
+    }
+    audit(ctx, settings, request, account).await?;
+
+    let folder = settings.upload_folder.clone();
+    let name = if modern {
+        let Some(nzb) = request.file("nzb").cloned() else {
+            return Ok(xml_error(200, "Missing parameter (nzb file is required)"));
+        };
+        let nfo = request.file("nfo").cloned();
+        tokio::task::spawn_blocking(move || {
+            upload::stage(folder.as_deref(), &nzb, nfo.as_ref()).map(|staged| staged.name)
+        })
+        .await?
+    } else {
+        let Some(file) = request.file("file").cloned() else {
+            return Ok(xml_error(600, "Failed to load upload (no file)"));
+        };
+        tokio::task::spawn_blocking(move || upload::stage_legacy(folder.as_deref(), &file)).await?
+    };
+    match name {
+        Err(failure) => Ok(xml_error(600, &failure.message)),
+        Ok(name) => Ok(Reply::new(
+            200,
+            "text/xml; charset=utf-8",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<success id=\"0\" guid=\"\" categoryid=\"{}\" name=\"{}\" />\n",
+                request.input.string("cat"),
+                html_escape(&name),
+            ),
+        )),
+    }
 }
