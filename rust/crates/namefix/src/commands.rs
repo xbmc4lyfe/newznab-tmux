@@ -567,14 +567,7 @@ async fn fix_nzbsplit(
     let mut after = 0i64;
     let mut updated = 0;
     loop {
-        let rows: Vec<(
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            i64,
-            i32,
-        )> = sqlx::query_as(sqlx::AssertSqlSafe(select.clone()))
+        let rows: Vec<NzbsplitRow> = sqlx::query_as(sqlx::AssertSqlSafe(select.clone()))
             .bind(after)
             .fetch_all(&ctx.db)
             .await?;
@@ -629,6 +622,15 @@ async fn fix_nzbsplit(
     }
     Ok(())
 }
+
+type NzbsplitRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    i32,
+);
 
 /// The partitions in `0..total` that a slot serves, so that the slots together cover them all
 /// whatever the concurrency.

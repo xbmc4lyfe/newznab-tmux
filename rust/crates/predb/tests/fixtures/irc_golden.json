@@ -1,0 +1,622 @@
+{
+    "announce": [
+        {
+            "format": "corruptnet",
+            "message": "PRE: [FLAC] Name.Album-GRP",
+            "out": {
+                "title": "Name.Album-GRP",
+                "source": "src",
+                "category": "FLAC",
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 10:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "corruptnet",
+            "message": "PRE: [] Name-GRP",
+            "out": null
+        },
+        {
+            "format": "corruptnet",
+            "message": "INFO: Name-GRP [14F 67.5MB]",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": "67.5MB",
+                "files": "14",
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": true
+            }
+        },
+        {
+            "format": "corruptnet",
+            "message": "INFO: Name-GRP [0F 1MB]",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": "1MB",
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": true
+            }
+        },
+        {
+            "format": "corruptnet",
+            "message": "NUKE: Name-GRP [bad.rip]",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 2,
+                "reason": "bad.rip",
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "corruptnet",
+            "message": "UNNUKE: Name-GRP []",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 1,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "corruptnet",
+            "message": "MODNUKE: Name-GRP [x] [NUKENET]",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 3,
+                "reason": "x",
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "corruptnet",
+            "message": "RENUKE: Name-GRP [y]",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 4,
+                "reason": "y",
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "corruptnet",
+            "message": "OLDNUKE: Name-GRP [z]",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 5,
+                "reason": "z",
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "corruptnet",
+            "message": "pre: [X] Name-GRP",
+            "out": null
+        },
+        {
+            "format": "corruptnet",
+            "message": "PRE: [X] NoGroup",
+            "out": null
+        },
+        {
+            "format": "corruptnet",
+            "message": "PRE: [X] Sp ace-GRP",
+            "out": null
+        },
+        {
+            "format": "corruptnet",
+            "message": "PRE: [X] Name-GRP\n",
+            "out": null
+        },
+        {
+            "format": "corruptnet",
+            "message": "  PRE: [FLAC] Trimmed-GRP  ",
+            "out": {
+                "title": "Trimmed-GRP",
+                "source": "src",
+                "category": "FLAC",
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 10:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "corruptnet",
+            "message": "PRE: [X] Accénted.Name-GRP",
+            "out": {
+                "title": "Accénted.Name-GRP",
+                "source": "src",
+                "category": "X",
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 10:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "zenet",
+            "message": "(PRE) (MP3-WEB) (Name-GRP)",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": "MP3-WEB",
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 10:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "zenet",
+            "message": "(pre) (x) (Name-GRP)",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": "x",
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 10:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "zenet",
+            "message": "(INFO) (Name-GRP) (2 Files) (38 MB)",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": "38MB",
+                "files": "2",
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": true
+            }
+        },
+        {
+            "format": "zenet",
+            "message": "(INFO) (Name-GRP) (1 File) (0.5 MB)",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": "512KB",
+                "files": "1",
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": true
+            }
+        },
+        {
+            "format": "zenet",
+            "message": "(NUKE) (Name-GRP) (reason here)",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 2,
+                "reason": "reason here",
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "zenet",
+            "message": "(PRE) () (Name-GRP)",
+            "out": null
+        },
+        {
+            "format": "predatabase",
+            "message": "pre | MP3-WEB | Name-GRP",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": "MP3-WEB",
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 10:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "predatabase",
+            "message": "info | Name-GRP - 14 F & 67 MB",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": "67MB",
+                "files": "14",
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": true
+            }
+        },
+        {
+            "format": "predatabase",
+            "message": "p2p | #1 | BTN | Name-GRP, WIN!",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 10:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "predatabase",
+            "message": "p2p | #2 | BTN | Name-GRP, WIN!",
+            "out": null
+        },
+        {
+            "format": "predatabase",
+            "message": "pre |  | Name-GRP",
+            "out": null
+        },
+        {
+            "format": "ngp",
+            "message": ".::: PRE ::: TV-X264-HD ::: Name-GRP :::.",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": "TV-X264-HD",
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 10:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "ngp",
+            "message": "[INFO] FOR Name-GRP with 5F 158.3MB added.",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": "158.3MB",
+                "files": "5",
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": true
+            }
+        },
+        {
+            "format": "ngp",
+            "message": "[INFO] FOR Name-GRP with 5F 158.3MB added",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": "158.3MB",
+                "files": "5",
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": true
+            }
+        },
+        {
+            "format": "ngp",
+            "message": ".::: NUKE ::: X ::: Name-GRP :::.",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": "X",
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 2,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "ngp",
+            "message": ".::: BOGUS ::: X ::: Name-GRP :::.",
+            "out": null
+        },
+        {
+            "format": "rizon",
+            "message": "[PRE]  [TV-HD]  Name-GRP",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": "TV-HD",
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 10:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "rizon",
+            "message": "[NUKE] Name-GRP [dupe] [NUKENET]",
+            "out": {
+                "title": "Name-GRP",
+                "source": "src",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 2,
+                "reason": "dupe",
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "rizon",
+            "message": "[PRE] Name-GRP",
+            "out": null
+        },
+        {
+            "format": "opentrackers",
+            "message": "PRE: [FLAC] Name-GRP",
+            "out": {
+                "title": "Name-GRP",
+                "source": "opentrackers-relay",
+                "category": "FLAC",
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": "2026-08-01 10:00:00",
+                "enrich": false
+            }
+        },
+        {
+            "format": "opentrackers",
+            "message": "(PRE) (MP3) (Name-GRP)",
+            "out": {
+                "title": "Name-GRP",
+                "source": "opentrackers-relay",
+                "category": "MP3",
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": "2026-08-01 10:00:00",
+                "enrich": false
+            }
+        },
+        {
+            "format": "opentrackers",
+            "message": "pre | X | Name-GRP",
+            "out": {
+                "title": "Name-GRP",
+                "source": "opentrackers-relay",
+                "category": "X",
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": "2026-08-01 10:00:00",
+                "enrich": false
+            }
+        },
+        {
+            "format": "opentrackers",
+            "message": "[PRE] [X] Name-GRP",
+            "out": {
+                "title": "Name-GRP",
+                "source": "opentrackers-relay",
+                "category": "X",
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": "2026-08-01 10:00:00",
+                "enrich": false
+            }
+        },
+        {
+            "format": "opentrackers",
+            "message": "INFO: Name-GRP [14F 67MB]",
+            "out": {
+                "title": "Name-GRP",
+                "source": "opentrackers-relay",
+                "category": null,
+                "size": "67MB",
+                "files": "14",
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": true
+            }
+        },
+        {
+            "format": "opentrackers",
+            "message": "NUKE: Name-GRP [why]",
+            "out": {
+                "title": "Name-GRP",
+                "source": "opentrackers-relay",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 2,
+                "reason": "why",
+                "listed": null,
+                "enrich": false
+            }
+        },
+        {
+            "format": "opentrackers",
+            "message": "p2p | #1 | BTN | Name-GRP, WIN!",
+            "out": {
+                "title": "Name-GRP",
+                "source": "opentrackers-relay",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": "2026-08-01 10:00:00",
+                "enrich": false
+            }
+        },
+        {
+            "format": "opentrackers",
+            "message": "junk",
+            "out": null
+        }
+    ],
+    "streams": [
+        {
+            "format": "predb_club",
+            "message": "{\"action\":\"insert\",\"row\":{\"name\":\"A-GRP\",\"cat\":\"TV\",\"size\":10,\"files\":2,\"preAt\":1600000000,\"nuke\":null}}",
+            "out": [
+                {
+                    "title": "A-GRP",
+                    "source": "predb.club",
+                    "category": "TV",
+                    "size": "10MB",
+                    "files": "2",
+                    "predate": "2020-09-13 12:26:40",
+                    "nuked": 0,
+                    "reason": null,
+                    "listed": null,
+                    "enrich": false
+                }
+            ]
+        },
+        {
+            "format": "predb_club",
+            "message": "{\"action\":\"delete\",\"row\":{\"name\":\"A-GRP\"}}",
+            "out": []
+        },
+        {
+            "format": "predb_club",
+            "message": "{\"hb\":1}",
+            "out": []
+        },
+        {
+            "format": "predb_club",
+            "message": "not json",
+            "out": []
+        },
+        {
+            "format": "predb_net",
+            "message": "{\"message\":{\"pretime\":1600000000,\"release\":\"B-GRP\",\"section\":\"MP3\",\"group\":\"GRP\"}}",
+            "out": [
+                {
+                    "title": "B-GRP",
+                    "source": "predb.net",
+                    "category": "MP3",
+                    "size": null,
+                    "files": null,
+                    "predate": "2020-09-13 12:26:40",
+                    "nuked": 0,
+                    "reason": null,
+                    "listed": null,
+                    "enrich": false
+                }
+            ]
+        },
+        {
+            "format": "predb_net",
+            "message": "{\"message\":\"text\"}",
+            "out": []
+        }
+    ],
+    "delays": [
+        30,
+        60,
+        120,
+        240,
+        1920,
+        3600,
+        3600
+    ]
+}

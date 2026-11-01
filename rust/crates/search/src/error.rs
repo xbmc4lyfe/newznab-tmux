@@ -19,6 +19,11 @@ pub enum SearchError {
     BeyondWindow { offset: u64, max_matches: u64 },
     #[error("Manticore sent a malformed response: {0}")]
     Malformed(String),
+    #[error("the database failed: {0}")]
+    Database(String),
+    /// The caller passed an argument this call can't use.
+    #[error("invalid search argument: {0}")]
+    InvalidArgument(&'static str),
     #[error("the search cursor is invalid or expired")]
     InvalidCursor,
     #[error("the search cursor doesn't match this query or index generation")]
