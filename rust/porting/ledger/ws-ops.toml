@@ -431,3 +431,10 @@ kind = "schedule"
 id = "job: new RemoveInactiveAccounts)->daily();"
 source = "routes/console.php"
 status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:index-logs"
+source = "app/Console/Commands/IndexLogs.php"
+status = "todo"
+note = "Moved from ws-search: this tails log files for the admin log viewer, which ws-ops owns."

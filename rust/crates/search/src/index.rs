@@ -106,6 +106,20 @@ fn now() -> NaiveDateTime {
 }
 
 impl SearchClient {
+    /// One release as the indexing projection reads it.
+    pub(crate) async fn release_row(
+        &self,
+        db: &MySqlPool,
+        release_id: i64,
+    ) -> Result<Option<ReleaseRow>, SearchError> {
+        let statement = format!("{PROJECTION} WHERE r.id = ?");
+        sqlx::query_as::<_, ReleaseRow>(sqlx::AssertSqlSafe(statement))
+            .bind(release_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|error| SearchError::Database(error.to_string()))
+    }
+
     /// Writes a document built by the caller. On false a failure row records the retry.
     pub async fn insert_release(&self, db: &MySqlPool, document: &ReleaseDocument) -> bool {
         if document.id <= 0 {

@@ -104,16 +104,9 @@ impl SearchClient {
     }
 
     /// Runs one statement through `/sql` and returns its rows.
+    #[doc(hidden)]
     pub async fn sql(&self, statement: &str) -> Result<Vec<Map<String, Value>>, SearchError> {
-        let mut encoder = Url::parse("http://localhost/").expect("a valid constant URL");
-        encoder
-            .query_pairs_mut()
-            .append_pair("mode", "raw")
-            .append_pair("query", statement);
-        let body = encoder.query().unwrap_or_default().to_owned();
-        let response = self
-            .send("sql", "application/x-www-form-urlencoded", body)
-            .await?;
+        let response = self.sql_response(statement).await?;
         let mut rows = Vec::new();
         for result in response.as_array().into_iter().flatten() {
             let data = result.get("data").and_then(Value::as_array);
@@ -126,8 +119,31 @@ impl SearchClient {
         Ok(rows)
     }
 
+    async fn sql_response(&self, statement: &str) -> Result<Value, SearchError> {
+        let mut encoder = Url::parse("http://localhost/").expect("a valid constant URL");
+        encoder
+            .query_pairs_mut()
+            .append_pair("mode", "raw")
+            .append_pair("query", statement);
+        let body = encoder.query().unwrap_or_default().to_owned();
+        self.send("sql", "application/x-www-form-urlencoded", body)
+            .await
+    }
+
+    /// Runs one statement and returns its whole response, including `total` and `warning`.
+    pub(crate) async fn sql_envelope(&self, statement: &str) -> Result<Value, SearchError> {
+        let response = self.sql_response(statement).await?;
+        response
+            .as_array()
+            .and_then(|results| match results.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| SearchError::Malformed(format!("unexpected /sql response: {response}")))
+    }
+
     /// Replaces one document, creating it if it's new.
-    pub async fn replace_document(
+    pub(crate) async fn replace_document(
         &self,
         table: &str,
         id: i64,
@@ -140,6 +156,7 @@ impl SearchClient {
     }
 
     /// Replaces many documents in one request. `documents` holds each one's id and fields.
+    #[doc(hidden)]
     pub async fn replace_documents(
         &self,
         table: &str,
