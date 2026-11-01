@@ -573,5 +573,45 @@
  {
   "name": "v2_token_limit_headers",
   "path": "/api/v2/movies?api_token=tokenposter"
+ },
+ {
+  "name": "block_ua_api",
+  "path": "/api/v1/api?t=caps",
+  "headers": {
+   "User-Agent": "Stremio/1.0"
+  }
+ },
+ {
+  "name": "block_ua_rss",
+  "path": "/rss/health",
+  "headers": {
+   "User-Agent": "AIOStreams"
+  }
+ },
+ {
+  "name": "block_ua_getnzb",
+  "path": "/getnzb",
+  "headers": {
+   "User-Agent": "usenetstreamer"
+  },
+  "status_only": true
+ },
+ {
+  "name": "block_ua_before_method",
+  "method": "DELETE",
+  "path": "/api/v1/api",
+  "headers": {
+   "User-Agent": "stremio"
+  }
+ },
+ {
+  "name": "block_ua_not_preflight",
+  "method": "OPTIONS",
+  "path": "/api/v2/tv",
+  "headers": {
+   "User-Agent": "stremio",
+   "Origin": "https://x.test",
+   "Access-Control-Request-Method": "GET"
+  }
  }
 ]

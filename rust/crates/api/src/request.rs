@@ -5,7 +5,8 @@ use axum::extract::Request;
 use axum::http::HeaderMap;
 use serde_json::Value as Json;
 
-use crate::input::{Bag, Input, Value, canonicalize, from_json, parse_urlencoded};
+use crate::input::{Bag, Input, Value, canonicalize, clean_value, from_json, parse_urlencoded};
+use crate::upload::UploadedFile;
 
 /// Largest body read: `post_max_size` in the image's PHP configuration.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -14,27 +15,39 @@ const MAX_QUERY_PARAMETERS: usize = 64;
 pub struct ApiRequest {
     pub method: String,
     pub path: String,
+    query_string: Option<String>,
+    client_ip: String,
     pub input: Input,
     pub headers: HeaderMap,
     pub raw_body: bytes::Bytes,
+    pub files: Vec<UploadedFile>,
+    multipart_fields: Bag,
 }
 
 impl ApiRequest {
     pub async fn read(request: Request) -> anyhow::Result<Self> {
         let (parts, body) = request.into_parts();
+        let client_ip = nntmux_webkit::client_ip::from_parts(&parts).to_string();
         let raw_body = to_bytes(body, MAX_BODY_BYTES).await?;
         let method = parts.method.as_str().to_owned();
         let query = parse_urlencoded(parts.uri.query().unwrap_or_default());
         let mut this = Self {
             method,
             path: parts.uri.path().to_owned(),
+            query_string: parts.uri.query().map(str::to_owned),
+            client_ip,
             input: Input {
                 query,
                 body: Bag::new(),
             },
             headers: parts.headers,
             raw_body,
+            files: Vec::new(),
+            multipart_fields: Bag::new(),
         };
+        if this.method != "GET" && this.method != "HEAD" {
+            this.read_multipart().await;
+        }
         // HTTP QUERY's body waits for `validate_query`, the only reader allowed to accept it.
         if this.method != "QUERY" && this.method != "GET" && this.method != "HEAD" {
             this.input.body = this.parse_body();
@@ -42,11 +55,55 @@ impl ApiRequest {
         Ok(this)
     }
 
+    /// A malformed body leaves what parsed so far, as PHP's own form parsing does.
+    async fn read_multipart(&mut self) {
+        let Some(boundary) = self
+            .header("content-type")
+            .and_then(|value| multer::parse_boundary(value).ok())
+        else {
+            return;
+        };
+        let body = self.raw_body.clone();
+        let stream =
+            futures_util::stream::once(async move { Ok::<_, std::convert::Infallible>(body) });
+        let mut multipart = multer::Multipart::new(stream, boundary);
+        while let Ok(Some(field)) = multipart.next_field().await {
+            let name = field.name().unwrap_or_default().to_owned();
+            let filename = field.file_name().map(str::to_owned);
+            let Ok(content) = field.bytes().await else {
+                return;
+            };
+            match filename {
+                Some(filename) => self.files.push(UploadedFile {
+                    field: name,
+                    filename,
+                    content: content.to_vec(),
+                }),
+                None => {
+                    let raw = String::from_utf8_lossy(&content);
+                    self.multipart_fields.push((name, clean_value(&raw)));
+                }
+            }
+        }
+    }
+
+    pub fn file(&self, field: &str) -> Option<&UploadedFile> {
+        self.files.iter().rev().find(|file| file.field == field)
+    }
+
+    /// `$request->has()` also sees uploaded files.
+    pub fn has_field(&self, field: &str) -> bool {
+        self.input.has(field) || self.file(field).is_some()
+    }
+
     fn parse_body(&self) -> Bag {
         let content_type = self
             .header("content-type")
             .unwrap_or_default()
             .to_ascii_lowercase();
+        if content_type.starts_with("multipart/") {
+            return self.multipart_fields.clone();
+        }
         if content_type.contains("json") {
             return match serde_json::from_slice::<Json>(&self.raw_body) {
                 Ok(json) => match from_json(&json) {
@@ -66,38 +123,21 @@ impl ApiRequest {
         self.headers.get(name).and_then(|value| value.to_str().ok())
     }
 
-    /// `url('/')`: the request's scheme and host, with no trailing slash. Laravel trusts forwarded
-    /// headers only from known proxies; the Rust web role always sits behind one.
     pub fn base_url(&self) -> String {
-        let scheme = self
-            .header("x-forwarded-proto")
-            .and_then(|value| value.split(',').next())
-            .map_or("http", str::trim);
-        let host = self
-            .header("x-forwarded-host")
-            .and_then(|value| value.split(',').next())
-            .map(str::trim)
-            .or_else(|| self.header("host"))
-            .unwrap_or("localhost");
-        format!("{scheme}://{host}")
+        base_url(&self.headers)
     }
 
-    /// The client address for accounting and per-IP limits: the nearest forwarded address that
-    /// isn't a private proxy hop.
+    /// The client address for accounting and per-IP limits, with proxies we trust skipped.
     pub fn client_ip(&self) -> Option<String> {
-        let forwarded = self.header("x-forwarded-for").unwrap_or_default();
-        let hops: Vec<&str> = forwarded
-            .split(',')
-            .map(str::trim)
-            .filter(|hop| !hop.is_empty())
-            .collect();
-        let parsed = |hop: &&str| hop.parse::<std::net::IpAddr>().ok();
-        hops.iter()
-            .rev()
-            .filter_map(parsed)
-            .find(|ip| !is_private(ip))
-            .or_else(|| hops.first().and_then(parsed))
-            .map(|ip| ip.to_string())
+        Some(self.client_ip.clone())
+    }
+
+    /// `$request->getRequestUri()`: the path and raw query.
+    pub fn request_uri(&self) -> String {
+        match &self.query_string {
+            Some(query) => format!("{}?{query}", self.path),
+            None => self.path.clone(),
+        }
     }
 
     pub fn is_query_method(&self) -> bool {
@@ -199,13 +239,19 @@ impl ApiRequest {
     }
 }
 
-fn is_private(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
-        }
-    }
+/// `url('/')`: the request's scheme and host, with no trailing slash. Laravel trusts forwarded
+/// headers only from known proxies; the Rust web role always sits behind one.
+pub fn base_url(headers: &HeaderMap) -> String {
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let first = |value: &'_ str| value.split(',').next().map(str::trim).map(str::to_owned);
+    let scheme = header("x-forwarded-proto")
+        .and_then(first)
+        .unwrap_or_else(|| "http".to_owned());
+    let host = header("x-forwarded-host")
+        .and_then(first)
+        .or_else(|| header("host").map(str::to_owned))
+        .unwrap_or_else(|| "localhost".to_owned());
+    format!("{scheme}://{host}")
 }
 
 /// Container nesting. `json_decode($raw, false, 3)` accepts an object holding a list of scalars and

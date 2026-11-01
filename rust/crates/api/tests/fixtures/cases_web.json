@@ -1,0 +1,39 @@
+[
+ {
+  "name": "filelist",
+  "as_user": 1,
+  "path": "/api/release/aaaa000000000000000000000000000000000001/filelist",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/5WRTU7DMBCF9z2F5QWCBf5JhIQgSYNU2LErB7CTaQhKxsF2mrSnx6GFthQJsfLI82nmvTfJfGwbsgbraoMplUxQAliYssYqpS/Lp+tbOs9mCW41CSS6lL56391xPgwDQxi2ukZWmJYvlgseCRHzgNIsWdUNkM44DzalKteUlMpD2ECJ6/UbFD6lD+zZrGtgnbJeSGaVJRfvvfH3I7NC7kqyecSCXEoeXYWplTV95/ZvphrPwnpla3BMJXz3+1tTfzf51wgHVQvoDxXRGw/BnxQhA+xbPSmPaNZG+ZjwPXRGR8e0DLQ8oflhDZ8i+RFMkZdHeaDxwHBlPj2fua3+4eHmoCkOmuI/NE03y2YfmVqAOgwCAAA='), '1b8041bb59dc70da9e70e9c7657059664f32a38a1d45895d4e8423f109076c54', REPEAT('a',32), 524, NOW(), NOW());"
+  ],
+  "session_user": 1
+ },
+ {
+  "name": "filelist_no_release",
+  "as_user": 1,
+  "path": "/api/release/nope/filelist",
+  "session_user": 1
+ },
+ {
+  "name": "filelist_no_nzb",
+  "as_user": 1,
+  "path": "/api/release/bbbb000000000000000000000000000000000002/filelist",
+  "session_user": 1
+ },
+ {
+  "name": "filelist_guest_json",
+  "path": "/api/release/nope/filelist",
+  "headers": {
+   "Accept": "application/json"
+  }
+ },
+ {
+  "name": "getnzb_session",
+  "as_user": 4,
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001",
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/5WRTU7DMBCF9z2F5QWCBf5JhIQgSYNU2LErB7CTaQhKxsF2mrSnx6GFthQJsfLI82nmvTfJfGwbsgbraoMplUxQAliYssYqpS/Lp+tbOs9mCW41CSS6lL56391xPgwDQxi2ukZWmJYvlgseCRHzgNIsWdUNkM44DzalKteUlMpD2ECJ6/UbFD6lD+zZrGtgnbJeSGaVJRfvvfH3I7NC7kqyecSCXEoeXYWplTV95/ZvphrPwnpla3BMJXz3+1tTfzf51wgHVQvoDxXRGw/BnxQhA+xbPSmPaNZG+ZjwPXRGR8e0DLQ8oflhDZ8i+RFMkZdHeaDxwHBlPj2fua3+4eHmoCkOmuI/NE03y2YfmVqAOgwCAAA='), '1b8041bb59dc70da9e70e9c7657059664f32a38a1d45895d4e8423f109076c54', REPEAT('a',32), 524, NOW(), NOW());"
+  ],
+  "session_user": 4
+ }
+]

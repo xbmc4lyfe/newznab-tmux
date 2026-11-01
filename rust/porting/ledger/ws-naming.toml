@@ -52,7 +52,7 @@ status = "ported"
 kind = "command"
 id = "predb:import-feed"
 source = "app/Console/Commands/PredbImportFeed.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
