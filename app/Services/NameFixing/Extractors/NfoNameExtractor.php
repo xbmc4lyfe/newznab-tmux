@@ -8,8 +8,6 @@ use App\Services\NameFixing\Data\NameFixResult;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Support\PredbSearchDocument;
-use App\Support\RustPipelineLibrary;
-use FFI\CData;
 
 /**
  * Extracts release names from NFO content.
@@ -18,72 +16,6 @@ use FFI\CData;
  */
 class NfoNameExtractor
 {
-    public const FFI_CDEF = <<<'CDEF'
-        ssize_t nntmux_nfo_predb_candidates(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_extract_pattern_match(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_extract_pattern_mode(const char *text, size_t text_len, uint32_t mode, char *out_buf, size_t out_cap);
-        ssize_t nntmux_filename_extract_candidate(const char *filename, size_t filename_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_file_extract_candidate(const char *filename, size_t filename_len, char *out_buf, size_t out_cap);
-    CDEF;
-
-    public const TAGS_FFI_CDEF = <<<'CDEF'
-        ssize_t nntmux_nfo_append_title_year_tags(const char *, size_t, const char *, size_t, char *, size_t);
-        ssize_t nntmux_nfo_append_language(const char *, size_t, const char *, size_t, char *, size_t);
-        ssize_t nntmux_nfo_append_resolution(const char *, size_t, const char *, size_t, char *, size_t);
-        ssize_t nntmux_nfo_append_source(const char *, size_t, const char *, size_t, char *, size_t);
-        ssize_t nntmux_nfo_append_audio_codec(const char *, size_t, const char *, size_t, char *, size_t);
-    CDEF;
-
-    private static bool $tagsFfiResolved = false;
-
-    private static ?\FFI $tagsFfi = null;
-
-    private function appendTagRust(string $symbol, string $name, string $nfo): ?string
-    {
-        try {
-            if ($this->libraryPath !== null) {
-                $ffi = RustPipelineLibrary::resolveDomain('nfo_title_year_tags', self::TAGS_FFI_CDEF, $this->libraryPath);
-            } else {
-                if (! self::$tagsFfiResolved) {
-                    self::$tagsFfi = RustPipelineLibrary::resolveDomain('nfo_title_year_tags', self::TAGS_FFI_CDEF);
-                    self::$tagsFfiResolved = true;
-                }
-                $ffi = self::$tagsFfi;
-            }
-            if ($ffi === null) {
-                return null;
-            }
-            $cap = 0;
-            $buffer = RustPipelineLibrary::obtainScratch($ffi, strlen($name) + 512, $cap);
-            if ($buffer === null) {
-                return null;
-            }
-            $written = $ffi->$symbol($name, strlen($name), $nfo, strlen($nfo), $buffer, $cap);
-            if (is_int($written) && $written < -1) {
-                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($buffer === null) {
-                    return null;
-                }
-                $written = $ffi->$symbol($name, strlen($name), $nfo, strlen($nfo), $buffer, $cap);
-            }
-
-            return is_int($written) && $written >= 0 && $written <= $cap ? \FFI::string($buffer, $written) : null;
-        } catch (\Throwable) {
-            return null;
-        }
-    }
-
-    private ?string $libraryPath = null;
-
-    private ?string $lastRawNfo = null;
-
-    private ?string $lastIdentityText = null;
-
-    public function __construct(?string $libraryPath = null)
-    {
-        $this->libraryPath = $libraryPath;
-    }
-
     /**
      * Exclude upstream Source fields from release identity evidence.
      *
@@ -91,27 +23,6 @@ class NfoNameExtractor
      * blank line. The original NFO remains available for technical metadata.
      */
     public function identityText(string $nfoContent): string
-    {
-        if ($this->lastRawNfo === $nfoContent && $this->lastIdentityText !== null) {
-            return $this->lastIdentityText;
-        }
-
-        $native = RustPipelineLibrary::nfoIdentityText($nfoContent, $this->libraryPath);
-        if ($native !== null) {
-            $this->lastRawNfo = $nfoContent;
-            $this->lastIdentityText = $native;
-
-            return $native;
-        }
-
-        $php = $this->identityTextPhp($nfoContent);
-        $this->lastRawNfo = $nfoContent;
-        $this->lastIdentityText = $php;
-
-        return $php;
-    }
-
-    public function identityTextPhp(string $nfoContent): string
     {
         $lines = preg_split('/\r\n|\r|\n/', $nfoContent);
         if ($lines === false) {
@@ -147,99 +58,12 @@ class NfoNameExtractor
      */
     public function predbCandidates(string $nfoContent): array
     {
-        if ($nfoContent === '') {
-            return ['titles' => [], 'complete' => true];
-        }
-
-        if (get_class($this) === self::class) {
-            $native = $this->predbCandidatesRust($nfoContent);
-            if ($native !== null) {
-                return $native;
-            }
-        }
-
-        return $this->predbCandidatesPhp($nfoContent);
-    }
-
-    private static bool $ffiResolved = false;
-
-    private static ?\FFI $defaultFfi = null;
-
-    private static ?CData $defaultBuf = null;
-
-    private static int $defaultCap = 0;
-
-    private function resolveFfi(): ?\FFI
-    {
-        if ($this->libraryPath !== null) {
-            return RustPipelineLibrary::resolveDomain('nfo_extractors', self::FFI_CDEF, $this->libraryPath);
-        }
-        if (! self::$ffiResolved) {
-            self::$defaultFfi = RustPipelineLibrary::resolveDomain('nfo_extractors', self::FFI_CDEF);
-            if (self::$defaultFfi !== null) {
-                self::$defaultBuf = RustPipelineLibrary::obtainScratch(self::$defaultFfi, 8192, self::$defaultCap);
-            }
-            self::$ffiResolved = true;
-        }
-
-        return self::$defaultFfi;
-    }
-
-    /**
-     * @return array{titles: list<string>, complete: bool}|null
-     */
-    private function predbCandidatesRust(string $nfoContent): ?array
-    {
-        $ffi = $this->resolveFfi();
-        if ($ffi === null) {
-            return null;
-        }
-
-        try {
-            $len = strlen($nfoContent);
-            if ($this->libraryPath === null && self::$defaultBuf !== null && $len + 64 <= self::$defaultCap) {
-                $buf = self::$defaultBuf;
-                $cap = self::$defaultCap;
-            } else {
-                $cap = 0;
-                $buf = RustPipelineLibrary::obtainScratch($ffi, max(512, min(65536, $len + 64)), $cap);
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_nfo_predb_candidates($nfoContent, $len, $buf, $cap);
-            if ($written <= -16) {
-                $buf = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_nfo_predb_candidates($nfoContent, $len, $buf, $cap);
-            }
-            if ($written === 0) {
-                return ['titles' => [], 'complete' => true];
-            }
-            if ($written === -4) {
-                return ['titles' => [], 'complete' => false];
-            }
-            if ($written > 0) {
-                $raw = \FFI::string($buf, $written);
-
-                return ['titles' => explode("\0", $raw), 'complete' => true];
-            }
-        } catch (\Throwable) {
-            return null;
-        }
-
-        return null;
-    }
-
-    /**
-     * @return array{titles: list<string>, complete: bool}
-     */
-    public function predbCandidatesPhp(string $nfoContent): array
-    {
-        $identity = $this->identityTextPhp($nfoContent);
+        $identity = $this->identityText($nfoContent);
         $cleaner = new FileNameCleaner;
         $titles = [];
         $raw = [];
         foreach ($this->literalNameFields($identity) as $field) {
-            $title = $cleaner->computeForMatchingPhp($field, false);
+            $title = $cleaner->cleanForMatching($field);
             if ($title !== false) {
                 $raw[] = $title;
             }
@@ -274,80 +98,9 @@ class NfoNameExtractor
     }
 
     /**
-     * @return array{0: bool, 1: ?NameFixResult}
-     */
-    private function extractPatternModeRust(string $nfoContent, int $mode): array
-    {
-        if ($nfoContent === '') {
-            return [true, null];
-        }
-
-        $ffi = $this->resolveFfi();
-        if ($ffi === null) {
-            return [false, null];
-        }
-
-        try {
-            $len = strlen($nfoContent);
-            $cap = 0;
-            $buf = RustPipelineLibrary::obtainScratch($ffi, 512, $cap);
-            if ($mode === 0) {
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_nfo_extract_pattern_match($nfoContent, $len, $buf, $cap);
-            } else {
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_nfo_extract_pattern_mode($nfoContent, $len, $mode, $buf, $cap);
-            }
-            if ($written <= -16) {
-                $buf = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($mode === 0) {
-                    // @phpstan-ignore method.notFound
-                    $written = $ffi->nntmux_nfo_extract_pattern_match($nfoContent, $len, $buf, $cap);
-                } else {
-                    // @phpstan-ignore method.notFound
-                    $written = $ffi->nntmux_nfo_extract_pattern_mode($nfoContent, $len, $mode, $buf, $cap);
-                }
-            }
-            if ($written === 0) {
-                return [true, null];
-            }
-            if ($written > 0) {
-                $raw = \FFI::string($buf, $written);
-                $nul = strpos($raw, "\0");
-                if ($nul !== false) {
-                    return [
-                        true,
-                        NameFixResult::fromMatch(
-                            substr($raw, 0, $nul),
-                            substr($raw, $nul + 1),
-                            'NFO',
-                        ),
-                    ];
-                }
-            }
-        } catch (\Throwable) {
-            return [false, null];
-        }
-
-        return [false, null];
-    }
-
-    /**
      * Check NFO content for TV patterns.
      */
     public function checkForTv(string $nfoContent): ?NameFixResult
-    {
-        return $this->checkForTvPhp($nfoContent);
-    }
-
-    public function checkForTvRust(string $nfoContent): ?NameFixResult
-    {
-        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 1);
-
-        return $handled ? $result : $this->checkForTvPhp($nfoContent);
-    }
-
-    public function checkForTvPhp(string $nfoContent): ?NameFixResult
     {
         $nfoContent = $this->identityText($nfoContent);
         $result = [];
@@ -369,18 +122,6 @@ class NfoNameExtractor
      * Check NFO content for Movie patterns.
      */
     public function checkForMovie(string $nfoContent): ?NameFixResult
-    {
-        return $this->checkForMoviePhp($nfoContent);
-    }
-
-    public function checkForMovieRust(string $nfoContent): ?NameFixResult
-    {
-        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 2);
-
-        return $handled ? $result : $this->checkForMoviePhp($nfoContent);
-    }
-
-    public function checkForMoviePhp(string $nfoContent): ?NameFixResult
     {
         $nfoContent = $this->identityText($nfoContent);
         $result = [];
@@ -408,18 +149,6 @@ class NfoNameExtractor
      */
     public function checkForMusic(string $nfoContent): ?NameFixResult
     {
-        return $this->checkForMusicPhp($nfoContent);
-    }
-
-    public function checkForMusicRust(string $nfoContent): ?NameFixResult
-    {
-        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 3);
-
-        return $handled ? $result : $this->checkForMusicPhp($nfoContent);
-    }
-
-    public function checkForMusicPhp(string $nfoContent): ?NameFixResult
-    {
         $nfoContent = $this->identityText($nfoContent);
         $result = [];
 
@@ -440,33 +169,6 @@ class NfoNameExtractor
      */
     public function checkForTitleYear(string $nfoContent): ?NameFixResult
     {
-        return $this->checkForTitleYearPhp($nfoContent);
-    }
-
-    public function checkForTitleYearRust(string $nfoContent): ?NameFixResult
-    {
-        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 4);
-
-        return $handled ? $result : $this->checkForTitleYearPhp($nfoContent);
-    }
-
-    public function checkForTitleYearPhp(string $nfoContent): ?NameFixResult
-    {
-        return $this->checkForTitleYearNative($nfoContent);
-    }
-
-    public function checkForTitleYearNative(string $nfoContent): ?NameFixResult
-    {
-        return $this->checkForTitleYearWithTags($nfoContent, false);
-    }
-
-    public function checkForTitleYearTagsRust(string $nfoContent): ?NameFixResult
-    {
-        return $this->checkForTitleYearWithTags($nfoContent, true);
-    }
-
-    private function checkForTitleYearWithTags(string $nfoContent, bool $rust): ?NameFixResult
-    {
         $metadata = $nfoContent;
         $nfoContent = $this->identityText($nfoContent);
         $result = [];
@@ -483,9 +185,20 @@ class NfoNameExtractor
 
         $releaseName = $result[0];
 
-        $releaseName = $rust
-            ? $this->appendTitleYearTagsRust($releaseName, $metadata)
-            : $this->appendTitleYearTagsNative($releaseName, $metadata);
+        // Extract language
+        $releaseName = $this->appendLanguageFromNfo($releaseName, $metadata);
+
+        // Extract resolution
+        $releaseName = $this->appendResolutionFromNfo($releaseName, $metadata);
+
+        // Extract source
+        $releaseName = $this->appendSourceFromNfo($releaseName, $metadata);
+
+        // Extract video codec
+        $releaseName = $this->appendVideoCodecFromNfo($releaseName, $metadata);
+
+        // Extract audio codec
+        $releaseName = $this->appendAudioCodecFromNfo($releaseName, $metadata);
 
         $releaseName .= '-NoGroup';
 
@@ -496,18 +209,6 @@ class NfoNameExtractor
      * Check NFO content for Game patterns.
      */
     public function checkForGame(string $nfoContent): ?NameFixResult
-    {
-        return $this->checkForGamePhp($nfoContent);
-    }
-
-    public function checkForGameRust(string $nfoContent): ?NameFixResult
-    {
-        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 5);
-
-        return $handled ? $result : $this->checkForGamePhp($nfoContent);
-    }
-
-    public function checkForGamePhp(string $nfoContent): ?NameFixResult
     {
         $nfoContent = $this->identityText($nfoContent);
         $result = [];
@@ -538,18 +239,6 @@ class NfoNameExtractor
      * Check NFO content for IGUANA supplier patterns.
      */
     public function checkForIguana(string $nfoContent): ?NameFixResult
-    {
-        return $this->checkForIguanaPhp($nfoContent);
-    }
-
-    public function checkForIguanaRust(string $nfoContent): ?NameFixResult
-    {
-        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 6);
-
-        return $handled ? $result : $this->checkForIguanaPhp($nfoContent);
-    }
-
-    public function checkForIguanaPhp(string $nfoContent): ?NameFixResult
     {
         $nfoContent = $this->identityText($nfoContent);
         if (! preg_match('/Supplier.+?IGUANA/i', $nfoContent)) {
@@ -592,45 +281,10 @@ class NfoNameExtractor
         return null;
     }
 
-    public function appendTitleYearTagsRust(string $releaseName, string $nfoContent): string
-    {
-        if (get_class($this) !== self::class) {
-            return $this->appendTitleYearTagsNative($releaseName, $nfoContent);
-        }
-
-        return $this->appendTagRust('nntmux_nfo_append_title_year_tags', $releaseName, $nfoContent)
-            ?? $this->appendTitleYearTagsNative($releaseName, $nfoContent);
-    }
-
-    public function appendTitleYearTagsNative(string $releaseName, string $nfoContent): string
-    {
-        $releaseName = $this->appendLanguageFromNfo($releaseName, $nfoContent);
-        $releaseName = $this->appendResolutionFromNfo($releaseName, $nfoContent);
-        $releaseName = $this->appendSourceFromNfo($releaseName, $nfoContent);
-        $releaseName = $this->appendVideoCodecFromNfo($releaseName, $nfoContent);
-
-        return $this->appendAudioCodecFromNfo($releaseName, $nfoContent);
-    }
-
     /**
      * Append language from NFO content.
      */
     protected function appendLanguageFromNfo(string $releaseName, string $nfoContent): string
-    {
-        return $this->appendLanguageFromNfoNative($releaseName, $nfoContent);
-    }
-
-    public function appendLanguageFromNfoRust(string $releaseName, string $nfoContent): string
-    {
-        if (get_class($this) !== self::class) {
-            return $this->appendLanguageFromNfoNative($releaseName, $nfoContent);
-        }
-
-        return $this->appendTagRust('nntmux_nfo_append_language', $releaseName, $nfoContent)
-            ?? $this->appendLanguageFromNfoNative($releaseName, $nfoContent);
-    }
-
-    public function appendLanguageFromNfoNative(string $releaseName, string $nfoContent): string
     {
         $result = [];
         if (preg_match('/(idiomas|lang|language|langue|sprache).*?\b(?P<lang>Brazilian|Chinese|Croatian|Danish|DE|Deutsch|Dutch|Estonian|ES|English|Englisch|Finnish|Flemish|Francais|French|FR|German|Greek|Hebrew|Icelandic|Italian|Japenese|Japan|Japanese|Korean|Latin|Nordic|Norwegian|Polish|Portuguese|Russian|Serbian|Slovenian|Swedish|Spanisch|Spanish|Thai|Turkish)\b/i', $nfoContent, $result)) {
@@ -651,21 +305,6 @@ class NfoNameExtractor
      * Append resolution from NFO content.
      */
     protected function appendResolutionFromNfo(string $releaseName, string $nfoContent): string
-    {
-        return $this->appendResolutionFromNfoNative($releaseName, $nfoContent);
-    }
-
-    public function appendResolutionFromNfoRust(string $releaseName, string $nfoContent): string
-    {
-        if (get_class($this) !== self::class) {
-            return $this->appendResolutionFromNfoNative($releaseName, $nfoContent);
-        }
-
-        return $this->appendTagRust('nntmux_nfo_append_resolution', $releaseName, $nfoContent)
-            ?? $this->appendResolutionFromNfoNative($releaseName, $nfoContent);
-    }
-
-    public function appendResolutionFromNfoNative(string $releaseName, string $nfoContent): string
     {
         $result = [];
 
@@ -696,21 +335,6 @@ class NfoNameExtractor
      * Append source from NFO content.
      */
     protected function appendSourceFromNfo(string $releaseName, string $nfoContent): string
-    {
-        return $this->appendSourceFromNfoNative($releaseName, $nfoContent);
-    }
-
-    public function appendSourceFromNfoRust(string $releaseName, string $nfoContent): string
-    {
-        if (get_class($this) !== self::class) {
-            return $this->appendSourceFromNfoNative($releaseName, $nfoContent);
-        }
-
-        return $this->appendTagRust('nntmux_nfo_append_source', $releaseName, $nfoContent)
-            ?? $this->appendSourceFromNfoNative($releaseName, $nfoContent);
-    }
-
-    public function appendSourceFromNfoNative(string $releaseName, string $nfoContent): string
     {
         $result = [];
 
@@ -754,21 +378,6 @@ class NfoNameExtractor
      * Append audio codec from NFO content.
      */
     protected function appendAudioCodecFromNfo(string $releaseName, string $nfoContent): string
-    {
-        return $this->appendAudioCodecFromNfoNative($releaseName, $nfoContent);
-    }
-
-    public function appendAudioCodecFromNfoRust(string $releaseName, string $nfoContent): string
-    {
-        if (get_class($this) !== self::class) {
-            return $this->appendAudioCodecFromNfoNative($releaseName, $nfoContent);
-        }
-
-        return $this->appendTagRust('nntmux_nfo_append_audio_codec', $releaseName, $nfoContent)
-            ?? $this->appendAudioCodecFromNfoNative($releaseName, $nfoContent);
-    }
-
-    public function appendAudioCodecFromNfoNative(string $releaseName, string $nfoContent): string
     {
         $result = [];
 
@@ -831,287 +440,5 @@ class NfoNameExtractor
         }
 
         return null;
-    }
-
-    public function extractFromNfoRust(string $nfoContent): ?NameFixResult
-    {
-        [$handled, $result] = $this->extractPatternModeRust($nfoContent, 0);
-
-        return $handled ? $result : $this->extractFromNfoPhp($nfoContent);
-    }
-
-    public function extractFromNfoPhp(string $nfoContent): ?NameFixResult
-    {
-        $cleaner = new FileNameCleaner;
-        foreach ($this->literalNameFields($this->identityTextPhp($nfoContent)) as $field) {
-            $title = $cleaner->computeForMatchingPhp($field, false);
-            if ($title !== false && $cleaner->isLiteralTechnicalSceneTitle($title)) {
-                return NameFixResult::fromMatch($title, 'Complete literal NFO field', 'NFO');
-            }
-        }
-
-        $result = $this->checkForTvPhp($nfoContent);
-        if ($result !== null) {
-            return $result;
-        }
-
-        $result = $this->checkForMoviePhp($nfoContent);
-        if ($result !== null) {
-            return $result;
-        }
-
-        $result = $this->checkForMusicPhp($nfoContent);
-        if ($result !== null) {
-            return $result;
-        }
-
-        $result = $this->checkForTitleYearPhp($nfoContent);
-        if ($result !== null) {
-            return $result;
-        }
-
-        $result = $this->checkForGamePhp($nfoContent);
-        if ($result !== null) {
-            return $result;
-        }
-
-        $result = $this->checkForIguanaPhp($nfoContent);
-        if ($result !== null) {
-            return $result;
-        }
-
-        return null;
-    }
-
-    // ---- Wave 58.2 batch plan ----------------------------------------------------------------
-
-    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 3.69x/3.78x, uncommon 4.06x/4.00x); see RustConstrainedPredbFileNameNfoObfuscatedNameCheckerW58ParityTest. */
-    private const bool W58_RUST_FFI_DEFAULT = true;
-
-    private const string W58_FFI_CDEF = <<<'C'
-        intptr_t nntmux_w58_nfo_title_plan_batch(const char *nfos, size_t nfos_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * Wave 58 routing, binding and output buffer, kept in function-local statics. Operations:
-     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
-     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
-     * least $val words (null without the library).
-     */
-    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $capacity = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = \is_bool($val) ? $val : null;
-
-                return $previous;
-            case 'ffi':
-                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w58', self::W58_FFI_CDEF) ?? false;
-
-                return $ffi === false ? null : $ffi;
-            case 'out':
-                $words = \is_int($val) ? $val : 0;
-                if (! $out instanceof CData || $capacity < $words) {
-                    $resolved = self::w58RustFfiState('ffi');
-                    $buffer = $resolved instanceof \FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
-                    if (! $buffer instanceof CData) {
-                        return null;
-                    }
-                    [$out, $capacity] = [$buffer, max(1024, $words)];
-                }
-
-                return [$ffi, $out, $capacity];
-            default:
-                return $enabled;
-        }
-    }
-
-    public static function usesW58RustFfi(): bool
-    {
-        $enabled = self::w58RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W58_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with planNfoBatch() routed to Rust ($enabled) or PHP, then restores the
-     * previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w58RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w58RustFfiState('set', $previous);
-        }
-    }
-
-    /** @param  list<int>  $out */
-    private static function w58Digest(array $out): int
-    {
-        /** @var array{1: int} $digest */
-        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
-
-        return $digest[1];
-    }
-
-    /**
-     * The words the export wrote, or null when it declined (returning anything but $words).
-     *
-     * @return list<int>|null
-     */
-    private static function w58Words(mixed $written, CData $out, int $words): ?array
-    {
-        /** @var array<int, int>|false $values */
-        $values = $written === $words ? unpack('P*', \FFI::string($out, $words * 8)) : false;
-
-        return \is_array($values) ? array_values($values) : null;
-    }
-
-    /** High bytes (CP437/UTF-8 box drawing) and ASCII art punctuation. */
-    private const string W58_ART = '/[\x80-\xff|#*=~^<>\[\]{}`]/';
-
-    private const string W58_ART_BYTES = '|#*=~^<>[]{}`';
-
-    private const string W58_KEY_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .';
-
-    private const string W58_TITLE_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._()-';
-
-    private const string W58_ALNUM = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-
-    private const array W58_TITLE_KEYS = ['release' => true, 'title' => true, 'name' => true, 'rls' => true, 'release name' => true,
-        'releasename' => true, 'rls name' => true];
-
-    /**
-     * Batch plan over NFO texts. Lines split on `\n`; control bytes and art bytes become spaces
-     * and lines are trimmed of spaces (empty lines skipped). A `key: value` line with a 2-24 byte
-     * `[A-Za-z .]` key (right-trimmed of spaces) is key-value; the key, lowercased and
-     * right-trimmed of dots and spaces, is a title key when it names the release (release,
-     * title, name, rls, release name, releasename, rls name). The value (or the whole line) is
-     * a title candidate when it is 8-255 bytes of `[A-Za-z0-9._()-]` with a `.` or `_`, scored
-     * 8 for a title key, 4 for a `-GROUP` (2-15 alphanumerics after offset 0), min(separators,
-     * 3) and 2 for a `(19|20)YY` digit run; the first highest score wins. Per NFO `best score |
-     * 32 any key-value line | 64 any art byte | 128 any title key | min(len, 0xFFFFFF) << 8 |
-     * crc32(best) << 32`; then the non-empty lines, art bytes, key-value lines, NFOs with a
-     * candidate and the XXH64 digest of all earlier words.
-     *
-     * @param  list<string>  $nfos
-     * @return list<int>
-     */
-    public static function planNfoBatch(array $nfos): array
-    {
-        return self::usesW58RustFfi() ? self::planNfoBatchNative($nfos) : self::planNfoBatchPhp($nfos);
-    }
-
-    /**
-     * @param  list<string>  $nfos
-     * @return list<int>
-     */
-    public static function planNfoBatchPhp(array $nfos): array
-    {
-        $from = implode('', array_map(chr(...), [...range(0x00, 0x1F), ...range(0x80, 0xFF)])).self::W58_ART_BYTES;
-        $to = str_repeat(' ', \strlen($from));
-        $out = [];
-        $lines = $art = $kvLines = $found = 0;
-        foreach ($nfos as $nfo) {
-            $nfo = (string) $nfo;
-            $nfoArt = (int) preg_match_all(self::W58_ART, $nfo);
-            $art += $nfoArt;
-            $flags = $nfoArt > 0 ? 64 : 0;
-            $bestScore = 0;
-            $best = '';
-            foreach (explode("\n", $nfo) as $line) {
-                $clean = trim(strtr($line, $from, $to), ' ');
-                if ($clean === '') {
-                    continue;
-                }
-                $lines++;
-                $candidate = $clean;
-                $titleKey = false;
-                if (($p = strpos($clean, ':')) !== false) {
-                    $key = rtrim(substr($clean, 0, $p), ' ');
-                    $keyLength = \strlen($key);
-                    if ($keyLength >= 2 && $keyLength <= 24 && strspn($key, self::W58_KEY_CHARS) === $keyLength) {
-                        $kvLines++;
-                        $flags |= 32;
-                        $titleKey = isset(self::W58_TITLE_KEYS[rtrim(strtolower($key), '. ')]);
-                        if ($titleKey) {
-                            $flags |= 128;
-                        }
-                        $candidate = trim(substr($clean, $p + 1), ' ');
-                    }
-                }
-                $score = self::w58NfoScore($candidate, $titleKey);
-                if ($score > $bestScore) {
-                    $bestScore = $score;
-                    $best = $candidate;
-                }
-            }
-            if ($bestScore > 0) {
-                $found++;
-            }
-            $out[] = $flags | $bestScore | min(\strlen($best), 0xFFFFFF) << 8 | crc32($best) << 32;
-        }
-        array_push($out, $lines, $art, $kvLines, $found);
-        $out[] = self::w58Digest($out);
-
-        return $out;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing, an NFO holds a NUL byte or the
-     * column is not a list.
-     *
-     * @param  list<string>  $nfos
-     * @return list<int>
-     */
-    public static function planNfoBatchNative(array $nfos): array
-    {
-        $count = \count($nfos);
-        $words = $count + 5;
-        /** @var array{\FFI, CData, int}|null $state */
-        $state = $count === 0 ? null : self::w58RustFfiState('out', $words);
-        if ($state === null || ! array_is_list($nfos)) {
-            return self::planNfoBatchPhp($nfos);
-        }
-        $blob = implode("\0", $nfos);
-        [$ffi, $out, $cap] = $state;
-        try {
-            // @phpstan-ignore method.notFound (Declared by W58_FFI_CDEF.)
-            $written = $ffi->nntmux_w58_nfo_title_plan_batch($blob, \strlen($blob), $count, $out, $cap);
-        } catch (\Throwable) {
-            $written = -1;
-        }
-
-        return self::w58Words($written, $out, $words) ?? self::planNfoBatchPhp($nfos);
-    }
-
-    private static function w58NfoScore(string $candidate, bool $titleKey): int
-    {
-        $length = \strlen($candidate);
-        if ($length < 8 || $length > 255 || strspn($candidate, self::W58_TITLE_CHARS) !== $length) {
-            return 0;
-        }
-        $separators = substr_count($candidate, '.') + substr_count($candidate, '_');
-        if ($separators === 0) {
-            return 0;
-        }
-        $p = strrpos($candidate, '-');
-        $group = $p !== false && $p > 0 && ($g = $length - $p - 1) >= 2 && $g <= 15 && strspn($candidate, self::W58_ALNUM, $p + 1) === $g;
-
-        return ($titleKey ? 8 : 0) + ($group ? 4 : 0) + min($separators, 3)
-            + (preg_match('/(?<![0-9])(?:19|20)[0-9]{2}(?![0-9])/', $candidate) === 1 ? 2 : 0);
     }
 }

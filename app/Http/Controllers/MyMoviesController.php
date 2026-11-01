@@ -9,36 +9,10 @@ use App\Models\UserMovie;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\MovieBrowseService;
 use App\Services\MovieService;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Http\Request;
-use Throwable;
 
 class MyMoviesController extends BasePageController
 {
-    public const string FFI_CDEF = <<<'CDEF'
-    int32_t nntmux_watchlist_post_gate(const char *action, size_t action_len, uint8_t is_post);
-    int32_t nntmux_watchlist_selected_categories(
-        uint32_t mode,
-        const char *field,
-        size_t field_len,
-        size_t *out_lens,
-        size_t lens_cap
-    );
-    CDEF;
-
-    private const int SELECTED_NONE = 0;
-
-    private const int SELECTED_EDIT = 2;
-
-    /**
-     * Production default stays false until benchmark/parity sign-off; see
-     * tests/Unit/RustSearchContentWatchlistControllersParityTest.php.
-     */
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
     private MovieService $movieService;
 
     private MovieBrowseService $movieBrowseService;
@@ -55,7 +29,7 @@ class MyMoviesController extends BasePageController
     public function show(Request $request): mixed
     {
         $action = $this->scalarInput($request, 'id');
-        abort_if(self::postGateBlocked($action, $request->isMethod('post')), 405);
+        abort_if(in_array($action, ['delete', 'doadd', 'doedit'], true) && ! $request->isMethod('post'), 405);
 
         $imdbid = $this->scalarInput($request, 'imdb');
         $from = $this->localReturnUrl($request, '/mymovies');
@@ -90,7 +64,11 @@ class MyMoviesController extends BasePageController
                     return redirect()->to($from);
                 }
 
-                $this->viewData = array_merge($this->viewData, self::watchlistViewState('add', $this->movieCategories(true), ''));
+                $categories = $this->movieCategories(true);
+                $this->viewData['type'] = 'add';
+                $this->viewData['cat_ids'] = array_keys($categories);
+                $this->viewData['cat_names'] = $categories;
+                $this->viewData['cat_selected'] = [];
                 $this->viewData['imdbid'] = $imdbid;
                 $this->viewData['movie'] = $movie;
                 $this->viewData['userdata'] = $this->userdata;
@@ -113,7 +91,12 @@ class MyMoviesController extends BasePageController
                     return redirect()->to($from);
                 }
 
-                $this->viewData = array_merge($this->viewData, self::watchlistViewState('edit', $this->movieCategories(false), (string) ($movie['categories'] ?? '')));
+                $categories = $this->movieCategories(false);
+
+                $this->viewData['type'] = 'edit';
+                $this->viewData['cat_ids'] = array_keys($categories);
+                $this->viewData['cat_names'] = $categories;
+                $this->viewData['cat_selected'] = ! empty($movie['categories']) ? explode('|', $movie['categories']) : [];
                 $this->viewData['imdbid'] = $imdbid;
                 $this->viewData['movie'] = $movie;
                 $this->viewData['userdata'] = $this->userdata;
@@ -242,156 +225,5 @@ class MyMoviesController extends BasePageController
         }
 
         return array_values(array_unique($selected));
-    }
-
-    /**
-     * Overrides the base page toggle for this controller's helpers; `null` restores the PHP default.
-     */
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi ?? false;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $ffi): void
-    {
-        self::$ffi = $ffi;
-    }
-
-    /**
-     * True when a state-changing action (`delete`, `doadd`, `doedit`) arrives without POST.
-     */
-    public static function postGateBlocked(string $action, bool $isPost): bool
-    {
-        return self::$useRustFfi ? self::postGateBlockedNative($action, $isPost) : self::postGateBlockedPhp($action, $isPost);
-    }
-
-    public static function postGateBlockedPhp(string $action, bool $isPost): bool
-    {
-        return in_array($action, ['delete', 'doadd', 'doedit'], true) && ! $isPost;
-    }
-
-    public static function postGateBlockedNative(string $action, bool $isPost): bool
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::postGateBlockedPhp($action, $isPost);
-        }
-
-        try {
-            $result = self::callFfi($ffi, 'nntmux_watchlist_post_gate', $action, \strlen($action), $isPost ? 1 : 0);
-
-            return match ($result) {
-                1 => true,
-                0 => false,
-                default => self::postGateBlockedPhp($action, $isPost),
-            };
-        } catch (Throwable) {
-            return self::postGateBlockedPhp($action, $isPost);
-        }
-    }
-
-    /**
-     * Add/edit form state: category ids and names, plus the `|`-separated selected
-     * categories for `edit` unless the field is PHP-empty (`''` or `'0'`).
-     *
-     * @param  array<int, string>  $categories
-     * @return array{type: string, cat_ids: list<int>, cat_names: array<int, string>, cat_selected: list<string>}
-     */
-    public static function watchlistViewState(string $type, array $categories, string $selectedCategories): array
-    {
-        return self::$useRustFfi
-            ? self::watchlistViewStateNative($type, $categories, $selectedCategories)
-            : self::watchlistViewStatePhp($type, $categories, $selectedCategories);
-    }
-
-    /**
-     * @param  array<int, string>  $categories
-     * @return array{type: string, cat_ids: list<int>, cat_names: array<int, string>, cat_selected: list<string>}
-     */
-    public static function watchlistViewStatePhp(string $type, array $categories, string $selectedCategories): array
-    {
-        return [
-            'type' => $type,
-            'cat_ids' => array_keys($categories),
-            'cat_names' => $categories,
-            'cat_selected' => $type === 'edit' && ! empty($selectedCategories) ? explode('|', $selectedCategories) : [],
-        ];
-    }
-
-    /**
-     * @param  array<int, string>  $categories
-     * @return array{type: string, cat_ids: list<int>, cat_names: array<int, string>, cat_selected: list<string>}
-     */
-    public static function watchlistViewStateNative(string $type, array $categories, string $selectedCategories): array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::watchlistViewStatePhp($type, $categories, $selectedCategories);
-        }
-
-        try {
-            $length = \strlen($selectedCategories);
-            // One segment per separator plus one.
-            $segments = substr_count($selectedCategories, '|') + 1;
-            $lens = $ffi->new('size_t['.$segments.']');
-            $count = self::callFfi(
-                $ffi,
-                'nntmux_watchlist_selected_categories',
-                $type === 'edit' ? self::SELECTED_EDIT : self::SELECTED_NONE,
-                $selectedCategories,
-                $length,
-                $lens,
-                $segments,
-            );
-            if (! \is_int($count) || $count < 0 || $count > $segments) {
-                return self::watchlistViewStatePhp($type, $categories, $selectedCategories);
-            }
-
-            $selected = [];
-            $offset = 0;
-            for ($i = 0; $i < $count; $i++) {
-                $len = (int) $lens[$i];
-                $selected[] = (string) substr($selectedCategories, $offset, $len);
-                $offset += $len + 1;
-            }
-            if ($count > 0 && $offset !== $length + 1) {
-                return self::watchlistViewStatePhp($type, $categories, $selectedCategories);
-            }
-
-            return [
-                'type' => $type,
-                'cat_ids' => array_keys($categories),
-                'cat_names' => $categories,
-                'cat_selected' => $selected,
-            ];
-        } catch (Throwable) {
-            return self::watchlistViewStatePhp($type, $categories, $selectedCategories);
-        }
-    }
-
-    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
-    {
-        return $ffi->$symbol(...$args);
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === false) {
-            return null;
-        }
-
-        if (self::$ffi instanceof FFI) {
-            return self::$ffi;
-        }
-
-        $ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
     }
 }

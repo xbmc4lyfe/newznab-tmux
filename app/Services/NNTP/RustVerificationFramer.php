@@ -4,11 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\NNTP;
 
-use App\Services\RegexService;
-use App\Support\RustPipelineLibrary;
 use Closure;
-use FFI;
-use FFI\CData;
 use RuntimeException;
 use Throwable;
 
@@ -26,9 +22,6 @@ final class RustVerificationFramer
     private const int MAX_BUFFER_BYTES = 67108864;
 
     private const int IPC_TIMEOUT_SECONDS = 30;
-
-    /** A Unicode space, control or angle bracket; preg_match() fails on invalid UTF-8. */
-    private const string INVALID_ID_PATTERN = '~(*UCP)[\\s\\p{Cc}<>]~u';
 
     /** @var resource|null */
     private $process = null;
@@ -152,7 +145,7 @@ final class RustVerificationFramer
         }
         foreach ($connection['ids'] as $id) {
             if (! is_string($id) || $id === '' || strlen($id) > self::MAX_INIT_BYTES
-                || preg_match(self::INVALID_ID_PATTERN, $id) !== 0) {
+                || preg_match('~(*UCP)[\\s\\p{Cc}<>]~u', $id) !== 0) {
                 throw new RuntimeException('Invalid Rust verification framer article ID.');
             }
         }
@@ -279,258 +272,5 @@ final class RustVerificationFramer
     public function __destruct()
     {
         $this->close();
-    }
-
-    /**
-     * Disabled: five paired runs measured 2.13-2.20x common mean but only 1.46-1.95x common p99
-     * (2.47-2.56x and 2.31-2.80x uncommon mean and p99; see the W46 parity test), below the 1.5x rule
-     * in one run.
-     */
-    public const bool W461_RUST_FFI_DEFAULT = false;
-
-    public const string W461_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w461_framer_article_id_batch(const char *input, size_t len, char *out, size_t cap);
-        C;
-
-    private const array W461_SUMMARY_KEYS = ['total_ids', 'empty_id_count', 'valid_count', 'oversize_count', 'invalid_utf8_count', 'space_count', 'control_count', 'bracket_count'];
-
-    private static ?bool $w461UseRustFfi = null;
-
-    private static FFI|false|null $w461Ffi = null;
-
-    /** Null restores the benchmark default. */
-    public static function useW461RustFfi(?bool $enable = true): void
-    {
-        self::$w461UseRustFfi = $enable;
-    }
-
-    public static function usesW461RustFfi(): bool
-    {
-        return self::$w461UseRustFfi ?? self::W461_RUST_FFI_DEFAULT;
-    }
-
-    /** Restores the benchmark default and drops the cached library handle. */
-    public static function resetW461RustFfi(): void
-    {
-        self::$w461UseRustFfi = null;
-        self::$w461Ffi = null;
-    }
-
-    /**
-     * Summarizes article IDs the way validateConnection() checks each one: IDs it accepts, IDs over
-     * MAX_INIT_BYTES, invalid UTF-8, and IDs holding a Unicode space, a control character or an angle bracket.
-     * Entries come from strings, integers, or the first non-null id, message_id array field; other values
-     * (including objects) count as empty entries.
-     *
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>
-     */
-    public static function summarizeArticleIdBatch(array $rows): array
-    {
-        return self::usesW461RustFfi() ? self::summarizeArticleIdBatchNative($rows) : self::summarizeArticleIdBatchPhp($rows);
-    }
-
-    /**
-     * Rust summary; falls back to PHP when the library or input frame is unusable.
-     *
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>
-     */
-    public static function summarizeArticleIdBatchNative(array $rows): array
-    {
-        // Only the length of an ID over MAX_INIT_BYTES matters, so its bytes are never copied.
-        $values = RegexService::w461Invoke(self::$w461Ffi, self::W461_FFI_CDEF, 'nntmux_w461_framer_article_id_batch', $rows, ['id', 'message_id'], \count(self::W461_SUMMARY_KEYS), '', self::MAX_INIT_BYTES);
-
-        return $values === null ? self::summarizeArticleIdBatchPhp($rows) : array_combine(self::W461_SUMMARY_KEYS, $values);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>
-     */
-    public static function summarizeArticleIdBatchPhp(array $rows): array
-    {
-        $summary = array_fill_keys(self::W461_SUMMARY_KEYS, 0);
-        foreach (RegexService::w461Entries($rows, ['id', 'message_id']) as $id) {
-            $summary['total_ids']++;
-            if ($id === '') {
-                $summary['empty_id_count']++;
-
-                continue;
-            }
-            if (strlen($id) > self::MAX_INIT_BYTES) {
-                $summary['oversize_count']++;
-
-                continue;
-            }
-            $invalid = preg_match(self::INVALID_ID_PATTERN, $id);
-            if ($invalid === 0) {
-                $summary['valid_count']++;
-
-                continue;
-            }
-            if ($invalid === false) {
-                $summary['invalid_utf8_count']++;
-
-                continue;
-            }
-            $summary['space_count'] += (int) preg_match('~(*UCP)\\s~u', $id);
-            $summary['control_count'] += (int) preg_match('~\\p{Cc}~u', $id);
-            $summary['bracket_count'] += (int) (strpbrk($id, '<>') !== false);
-        }
-
-        return $summary;
-    }
-
-    /**
-     * Enabled: the paired benchmark in the W55 parity test measures 2.295x common mean, 1.639x common
-     * p99, 3.773x uncommon mean and 3.57x uncommon p99 (per-metric minimum of four runs), above
-     * the 1.5x rule.
-     */
-    private const bool W55_RUST_FFI_DEFAULT = true;
-
-    private const string W55_FFI_CDEF = 'ssize_t nntmux_w551_article_id_code_batch(const char *ids, size_t ids_len, size_t count, int64_t *out, size_t out_cap);';
-
-    public static function usesW55RustFfi(): bool
-    {
-        $enabled = self::w55RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
-    }
-
-    /** Runs $callback with the Wave 55 batch routed to Rust or PHP, then restores the routing. */
-    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w55RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w55RustFfiState('set', $previous);
-        }
-    }
-
-    public const int W55_ARTICLE_ID_VALID = 0;
-
-    public const int W55_ARTICLE_ID_EMPTY = 1;
-
-    public const int W55_ARTICLE_ID_OVERSIZE = 2;
-
-    public const int W55_ARTICLE_ID_INVALID_UTF8 = 3;
-
-    public const int W55_ARTICLE_ID_REJECTED = 4;
-
-    public const int W55_ARTICLE_ID_SPACE = 8;
-
-    public const int W55_ARTICLE_ID_CONTROL = 16;
-
-    public const int W55_ARTICLE_ID_BRACKET = 32;
-
-    /**
-     * One `W55_ARTICLE_ID_*` code per article ID, checked the way validateConnection() checks it:
-     * valid, empty, over MAX_INIT_BYTES, invalid UTF-8, or rejected with the Unicode space, control
-     * character and angle bracket bits it holds.
-     *
-     * @param  array<array-key, string>  $ids
-     * @return list<int>
-     */
-    public static function articleIdCodes(array $ids): array
-    {
-        return self::usesW55RustFfi() ? self::articleIdCodesNative($ids) : self::articleIdCodesPhp($ids);
-    }
-
-    /**
-     * @param  array<array-key, string>  $ids
-     * @return list<int>
-     */
-    public static function articleIdCodesPhp(array $ids): array
-    {
-        $codes = [];
-        foreach ($ids as $id) {
-            if ($id === '') {
-                $codes[] = self::W55_ARTICLE_ID_EMPTY;
-
-                continue;
-            }
-            if (\strlen($id) > self::MAX_INIT_BYTES) {
-                $codes[] = self::W55_ARTICLE_ID_OVERSIZE;
-
-                continue;
-            }
-            $codes[] = match (preg_match(self::INVALID_ID_PATTERN, $id)) {
-                0 => self::W55_ARTICLE_ID_VALID,
-                false => self::W55_ARTICLE_ID_INVALID_UTF8,
-                default => self::W55_ARTICLE_ID_REJECTED
-                    | (preg_match('~(*UCP)\s~u', $id) === 1 ? self::W55_ARTICLE_ID_SPACE : 0)
-                    | (preg_match('~\p{Cc}~u', $id) === 1 ? self::W55_ARTICLE_ID_CONTROL : 0)
-                    | (strpbrk($id, '<>') !== false ? self::W55_ARTICLE_ID_BRACKET : 0),
-            };
-        }
-
-        return $codes;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
-     * holding a NUL byte).
-     *
-     * @param  array<array-key, string>  $ids
-     * @return list<int>
-     */
-    public static function articleIdCodesNative(array $ids): array
-    {
-        $count = \count($ids);
-        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
-        $buffer = $count === 0 ? null : self::w55RustFfiState('out', $count);
-        if ($buffer === null) {
-            return self::articleIdCodesPhp($ids);
-        }
-        [$ffi, $out, $cap] = $buffer;
-        $joined = implode("\0", $ids);
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w551_article_id_code_batch($joined, \strlen($joined), $count, $out, $cap);
-        } catch (Throwable) {
-            $written = -1;
-        }
-        $codes = $written === $count ? unpack('P*', FFI::string($out, $count * 8)) : false;
-        if (! \is_array($codes)) {
-            return self::articleIdCodesPhp($ids);
-        }
-
-        /** @var list<int> */
-        return array_values($codes);
-    }
-
-    /**
-     * Wave 55 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
-     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
-     */
-    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'out':
-                $ffi ??= RustPipelineLibrary::resolveDomain('framer_w55', self::W55_FFI_CDEF) ?? false;
-                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
-                    return null;
-                }
-                if (! $out instanceof CData || $outCap < $val) {
-                    $outCap = max(512, $val * 2);
-                    $out = $ffi->new("int64_t[{$outCap}]");
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled;
-        }
     }
 }

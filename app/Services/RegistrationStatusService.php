@@ -11,56 +11,12 @@ use App\Models\RegistrationStatusHistory;
 use App\Models\User;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Configuration\DomainConfigurationRepository;
-use App\Support\RustPipelineLibrary;
 use Carbon\CarbonInterface;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
-use InvalidArgumentException;
-use Throwable;
 
 class RegistrationStatusService
 {
-    /** Scheduled period audit events for {@see periodDescription()}. */
-    public const PERIOD_CREATED = 0;
-
-    public const PERIOD_UPDATED = 1;
-
-    public const PERIOD_ENABLED = 2;
-
-    public const PERIOD_DISABLED = 3;
-
-    public const PERIOD_COMPLETED = 4;
-
-    public const PERIOD_DELETED = 5;
-
-    /**
-     * {@see decide()} reasons in Rust index order.
-     *
-     * @var list<string>
-     */
-    public const REASONS = ['scheduled_open_period', 'manual_open', 'manual_invite', 'manual_closed'];
-
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_regstatus_decide(int64_t manual_status, int32_t has_active_period, int64_t *out);
-        int64_t nntmux_regstatus_normalize_manual(int64_t status);
-        ssize_t nntmux_regstatus_text(int32_t kind, int64_t a, int64_t b, const char *first, size_t first_len, const char *second, size_t second_len, char *out, size_t cap);
-        C;
-
-    private const TEXT_LABEL = 0;
-
-    private const TEXT_MESSAGE = 1;
-
-    private const TEXT_MANUAL_CHANGE = 2;
-
-    private const TEXT_PERIOD = 3;
-
-    // PHP remains the production default until benchmarks qualify Rust.
-    private static ?bool $useRustFfi = null;
-
-    private static FFI|false|null $ffi = null;
-
     public function __construct(
         private readonly ConfigurationProvider $configuration,
         private readonly DomainConfigurationRepository $repository,
@@ -80,12 +36,18 @@ class RegistrationStatusService
 
     public function statusLabel(int $status): string
     {
-        return self::labelFor($status);
+        return $this->statusOptions()[$status] ?? 'Unknown';
     }
 
     public function getManualStatus(): int
     {
-        return self::normalizeManualStatus($this->configuration->registration()->status->value);
+        $manualStatus = $this->configuration->registration()->status->value;
+
+        if (! array_key_exists($manualStatus, $this->statusOptions())) {
+            return RegistrationStatus::Open->value;
+        }
+
+        return $manualStatus;
     }
 
     public function getActivePeriod(?CarbonInterface $at = null): ?RegistrationPeriod
@@ -131,9 +93,14 @@ class RegistrationStatusService
 
         $manualStatus = $this->getManualStatus();
         $activePeriod = $this->getActivePeriod($at);
-        $decision = self::decide($manualStatus, $activePeriod !== null);
-        $effectiveStatus = $decision['effective_status'];
-        $scheduledOverrideActive = $decision['scheduled_override_active'];
+        $scheduledOverrideActive = $activePeriod !== null && $manualStatus !== RegistrationStatus::Open->value;
+        $effectiveStatus = $activePeriod !== null ? RegistrationStatus::Open->value : $manualStatus;
+        $reason = match (true) {
+            $scheduledOverrideActive => 'scheduled_open_period',
+            $effectiveStatus === RegistrationStatus::Open->value => 'manual_open',
+            $effectiveStatus === RegistrationStatus::Invite->value => 'manual_invite',
+            default => 'manual_closed',
+        };
 
         return [
             'manual_status' => $manualStatus,
@@ -142,12 +109,12 @@ class RegistrationStatusService
             'effective_status_label' => $this->statusLabel($effectiveStatus),
             'active_period' => $activePeriod,
             'scheduled_override_active' => $scheduledOverrideActive,
-            'reason' => $decision['reason'],
+            'reason' => $reason,
             'message' => $this->buildMessage($effectiveStatus, $activePeriod, $scheduledOverrideActive),
-            'available' => $decision['available'],
-            'is_open' => $decision['is_open'],
-            'is_invite_only' => $decision['is_invite_only'],
-            'is_closed' => $decision['is_closed'],
+            'available' => $effectiveStatus !== RegistrationStatus::Closed->value,
+            'is_open' => $effectiveStatus === RegistrationStatus::Open->value,
+            'is_invite_only' => $effectiveStatus === RegistrationStatus::Invite->value,
+            'is_closed' => $effectiveStatus === RegistrationStatus::Closed->value,
         ];
     }
 
@@ -163,7 +130,13 @@ class RegistrationStatusService
             return;
         }
 
-        $description = self::manualStatusDescription($oldStatus, $newStatus);
+        $description = $oldStatus === $newStatus
+            ? sprintf('Manual registration status note added while status remained %s.', $this->statusLabel($newStatus))
+            : sprintf(
+                'Manual registration status changed from %s to %s.',
+                $this->statusLabel($oldStatus),
+                $this->statusLabel($newStatus)
+            );
 
         RegistrationStatusHistory::record(
             RegistrationStatusHistory::ACTION_MANUAL_STATUS_CHANGED,
@@ -195,7 +168,7 @@ class RegistrationStatusService
 
         RegistrationStatusHistory::record(
             RegistrationStatusHistory::ACTION_PERIOD_CREATED,
-            self::periodDescription(self::PERIOD_CREATED, (string) $period->name),
+            sprintf('Scheduled open period "%s" created.', $period->name),
             $changedBy?->id,
             null,
             null,
@@ -229,7 +202,7 @@ class RegistrationStatusService
 
         RegistrationStatusHistory::record(
             RegistrationStatusHistory::ACTION_PERIOD_UPDATED,
-            self::periodDescription(self::PERIOD_UPDATED, (string) $period->name),
+            sprintf('Scheduled open period "%s" updated.', $period->name),
             $changedBy?->id,
             null,
             null,
@@ -254,7 +227,11 @@ class RegistrationStatusService
 
         RegistrationStatusHistory::record(
             RegistrationStatusHistory::ACTION_PERIOD_TOGGLED,
-            self::periodDescription($period->is_enabled ? self::PERIOD_ENABLED : self::PERIOD_DISABLED, (string) $period->name),
+            sprintf(
+                'Scheduled open period "%s" %s.',
+                $period->name,
+                $period->is_enabled ? 'enabled' : 'disabled'
+            ),
             $changedBy?->id,
             null,
             null,
@@ -290,7 +267,7 @@ class RegistrationStatusService
 
             RegistrationStatusHistory::record(
                 RegistrationStatusHistory::ACTION_PERIOD_COMPLETED,
-                self::periodDescription(self::PERIOD_COMPLETED, (string) $period->name),
+                sprintf('Scheduled open period "%s" completed after reaching its end time.', $period->name),
                 null,
                 null,
                 null,
@@ -318,7 +295,7 @@ class RegistrationStatusService
 
         RegistrationStatusHistory::record(
             RegistrationStatusHistory::ACTION_PERIOD_DELETED,
-            self::periodDescription(self::PERIOD_DELETED, (string) $periodName),
+            sprintf('Scheduled open period "%s" deleted.', $periodName),
             $changedBy?->id,
             null,
             null,
@@ -338,10 +315,18 @@ class RegistrationStatusService
         bool $scheduledOverrideActive
     ): string {
         if ($scheduledOverrideActive && $activePeriod !== null) {
-            return self::statusMessage($effectiveStatus, true, $activePeriod->ends_at->format('Y-m-d H:i'), (string) $activePeriod->name);
+            return sprintf(
+                'Registrations are temporarily open until %s because of the scheduled period "%s".',
+                $activePeriod->ends_at->format('Y-m-d H:i'),
+                $activePeriod->name
+            );
         }
 
-        return self::statusMessage($effectiveStatus, false);
+        return match ($effectiveStatus) {
+            RegistrationStatus::Open->value => 'Registrations are currently open.',
+            RegistrationStatus::Invite->value => 'Registrations are currently invite only.',
+            default => 'Registrations are currently closed.',
+        };
     }
 
     /**
@@ -370,437 +355,5 @@ class RegistrationStatusService
     {
         Cache::forget(AdminDashboardSnapshotService::CACHE_KEY);
         Cache::forget('api_registration_status');
-    }
-
-    public static function enableRustFfi(): void
-    {
-        self::$useRustFfi = true;
-    }
-
-    public static function disableRustFfi(): void
-    {
-        self::$useRustFfi = false;
-    }
-
-    /**
-     * Restore the production default and re-resolve the library on next use.
-     */
-    public static function resetRustFfi(): void
-    {
-        self::$useRustFfi = null;
-        self::$ffi = null;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? false;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $override = null): void
-    {
-        self::$ffi = $override;
-    }
-
-    /**
-     * Effective registration status for a manual status and whether a scheduled open period
-     * is active: the period forces Open and is an override unless the manual status is Open.
-     *
-     * @return array{effective_status: int, scheduled_override_active: bool, reason: string, available: bool, is_open: bool, is_invite_only: bool, is_closed: bool}
-     */
-    public static function decide(int $manualStatus, bool $hasActivePeriod): array
-    {
-        return self::usesRustFfi()
-            ? self::decideNative($manualStatus, $hasActivePeriod)
-            : self::decidePhp($manualStatus, $hasActivePeriod);
-    }
-
-    /**
-     * @return array{effective_status: int, scheduled_override_active: bool, reason: string, available: bool, is_open: bool, is_invite_only: bool, is_closed: bool}
-     */
-    public static function decidePhp(int $manualStatus, bool $hasActivePeriod): array
-    {
-        $scheduledOverrideActive = $hasActivePeriod && $manualStatus !== RegistrationStatus::Open->value;
-        $effectiveStatus = $hasActivePeriod ? RegistrationStatus::Open->value : $manualStatus;
-        $reason = match (true) {
-            $scheduledOverrideActive => 'scheduled_open_period',
-            $effectiveStatus === RegistrationStatus::Open->value => 'manual_open',
-            $effectiveStatus === RegistrationStatus::Invite->value => 'manual_invite',
-            default => 'manual_closed',
-        };
-
-        return [
-            'effective_status' => $effectiveStatus,
-            'scheduled_override_active' => $scheduledOverrideActive,
-            'reason' => $reason,
-            'available' => $effectiveStatus !== RegistrationStatus::Closed->value,
-            'is_open' => $effectiveStatus === RegistrationStatus::Open->value,
-            'is_invite_only' => $effectiveStatus === RegistrationStatus::Invite->value,
-            'is_closed' => $effectiveStatus === RegistrationStatus::Closed->value,
-        ];
-    }
-
-    /**
-     * @return array{effective_status: int, scheduled_override_active: bool, reason: string, available: bool, is_open: bool, is_invite_only: bool, is_closed: bool}
-     */
-    public static function decideNative(int $manualStatus, bool $hasActivePeriod): array
-    {
-        if (($ffi = self::ffi()) === null) {
-            return self::decidePhp($manualStatus, $hasActivePeriod);
-        }
-        try {
-            $out = $ffi->new('int64_t[3]');
-            // @phpstan-ignore method.notFound
-            $code = $ffi->nntmux_regstatus_decide($manualStatus, $hasActivePeriod ? 1 : 0, $out);
-            [$effectiveStatus, $flags, $reason] = [$out[0], $out[1], $out[2]];
-        } catch (Throwable) {
-            return self::decidePhp($manualStatus, $hasActivePeriod);
-        }
-        if ($code !== 0 || ! \is_int($effectiveStatus) || ! \is_int($flags) || ! \is_int($reason) || ! isset(self::REASONS[$reason])) {
-            return self::decidePhp($manualStatus, $hasActivePeriod);
-        }
-
-        return [
-            'effective_status' => $effectiveStatus,
-            'scheduled_override_active' => ($flags & 1) !== 0,
-            'reason' => self::REASONS[$reason],
-            'available' => ($flags & 2) !== 0,
-            'is_open' => ($flags & 4) !== 0,
-            'is_invite_only' => ($flags & 8) !== 0,
-            'is_closed' => ($flags & 16) !== 0,
-        ];
-    }
-
-    /**
-     * A known manual status, otherwise Open.
-     */
-    public static function normalizeManualStatus(int $status): int
-    {
-        return self::usesRustFfi() ? self::normalizeManualStatusNative($status) : self::normalizeManualStatusPhp($status);
-    }
-
-    public static function normalizeManualStatusPhp(int $status): int
-    {
-        return RegistrationStatus::tryFrom($status) === null ? RegistrationStatus::Open->value : $status;
-    }
-
-    public static function normalizeManualStatusNative(int $status): int
-    {
-        if (($ffi = self::ffi()) === null) {
-            return self::normalizeManualStatusPhp($status);
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $normalized = $ffi->nntmux_regstatus_normalize_manual($status);
-        } catch (Throwable) {
-            return self::normalizeManualStatusPhp($status);
-        }
-
-        return \is_int($normalized) && RegistrationStatus::tryFrom($normalized) !== null
-            ? $normalized
-            : self::normalizeManualStatusPhp($status);
-    }
-
-    /**
-     * Status label, or `Unknown` for a value outside {@see RegistrationStatus}.
-     */
-    public static function labelFor(int $status): string
-    {
-        return self::usesRustFfi() ? self::labelForNative($status) : self::labelForPhp($status);
-    }
-
-    public static function labelForPhp(int $status): string
-    {
-        return RegistrationStatus::tryFrom($status)?->label() ?? 'Unknown';
-    }
-
-    public static function labelForNative(int $status): string
-    {
-        return self::textNative(self::TEXT_LABEL, $status, 0) ?? self::labelForPhp($status);
-    }
-
-    /**
-     * Public registration message; a scheduled override names the period and its end time.
-     */
-    public static function statusMessage(int $effectiveStatus, bool $scheduledOverrideActive, string $periodEndsAt = '', string $periodName = ''): string
-    {
-        return self::usesRustFfi()
-            ? self::statusMessageNative($effectiveStatus, $scheduledOverrideActive, $periodEndsAt, $periodName)
-            : self::statusMessagePhp($effectiveStatus, $scheduledOverrideActive, $periodEndsAt, $periodName);
-    }
-
-    public static function statusMessagePhp(int $effectiveStatus, bool $scheduledOverrideActive, string $periodEndsAt = '', string $periodName = ''): string
-    {
-        if ($scheduledOverrideActive) {
-            return sprintf(
-                'Registrations are temporarily open until %s because of the scheduled period "%s".',
-                $periodEndsAt,
-                $periodName
-            );
-        }
-
-        return match ($effectiveStatus) {
-            RegistrationStatus::Open->value => 'Registrations are currently open.',
-            RegistrationStatus::Invite->value => 'Registrations are currently invite only.',
-            default => 'Registrations are currently closed.',
-        };
-    }
-
-    public static function statusMessageNative(int $effectiveStatus, bool $scheduledOverrideActive, string $periodEndsAt = '', string $periodName = ''): string
-    {
-        return self::textNative(self::TEXT_MESSAGE, $effectiveStatus, $scheduledOverrideActive ? 1 : 0, $periodEndsAt, $periodName)
-            ?? self::statusMessagePhp($effectiveStatus, $scheduledOverrideActive, $periodEndsAt, $periodName);
-    }
-
-    /**
-     * Audit description for a manual status update (a note when the status is unchanged).
-     */
-    public static function manualStatusDescription(int $oldStatus, int $newStatus): string
-    {
-        return self::usesRustFfi()
-            ? self::manualStatusDescriptionNative($oldStatus, $newStatus)
-            : self::manualStatusDescriptionPhp($oldStatus, $newStatus);
-    }
-
-    public static function manualStatusDescriptionPhp(int $oldStatus, int $newStatus): string
-    {
-        return $oldStatus === $newStatus
-            ? sprintf('Manual registration status note added while status remained %s.', self::labelForPhp($newStatus))
-            : sprintf(
-                'Manual registration status changed from %s to %s.',
-                self::labelForPhp($oldStatus),
-                self::labelForPhp($newStatus)
-            );
-    }
-
-    public static function manualStatusDescriptionNative(int $oldStatus, int $newStatus): string
-    {
-        return self::textNative(self::TEXT_MANUAL_CHANGE, $oldStatus, $newStatus)
-            ?? self::manualStatusDescriptionPhp($oldStatus, $newStatus);
-    }
-
-    /**
-     * Audit description for a scheduled period event (one of the PERIOD_* constants).
-     */
-    public static function periodDescription(int $event, string $name): string
-    {
-        return self::usesRustFfi() ? self::periodDescriptionNative($event, $name) : self::periodDescriptionPhp($event, $name);
-    }
-
-    public static function periodDescriptionPhp(int $event, string $name): string
-    {
-        $suffix = match ($event) {
-            self::PERIOD_CREATED => 'created',
-            self::PERIOD_UPDATED => 'updated',
-            self::PERIOD_ENABLED => 'enabled',
-            self::PERIOD_DISABLED => 'disabled',
-            self::PERIOD_COMPLETED => 'completed after reaching its end time',
-            self::PERIOD_DELETED => 'deleted',
-            default => throw new InvalidArgumentException("Unknown scheduled period event [{$event}]."),
-        };
-
-        return sprintf('Scheduled open period "%s" %s.', $name, $suffix);
-    }
-
-    public static function periodDescriptionNative(int $event, string $name): string
-    {
-        return self::textNative(self::TEXT_PERIOD, $event, 0, $name) ?? self::periodDescriptionPhp($event, $name);
-    }
-
-    private static function textNative(int $kind, int $a, int $b, string $first = '', string $second = ''): ?string
-    {
-        if (($ffi = self::ffi()) === null) {
-            return null;
-        }
-        $capacity = 0;
-        $buffer = RustPipelineLibrary::obtainScratch($ffi, \strlen($first) + \strlen($second) + 128, $capacity);
-        if ($buffer === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_regstatus_text($kind, $a, $b, $first, \strlen($first), $second, \strlen($second), $buffer, $capacity);
-            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
-                return null;
-            }
-
-            return FFI::string($buffer, $written);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
-    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51 parity test). */
-    private const bool W51_RUST_FFI_DEFAULT = true;
-
-    private const string W51_FFI_CDEF = 'ssize_t nntmux_w511_registration_status_decide_batch(const char *statuses, size_t statuses_len, const char *active, size_t active_len, size_t count, int64_t *out, size_t out_cap);';
-
-    public static function usesW51RustFfi(): bool
-    {
-        $enabled = self::w51RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
-    }
-
-    /** Runs $callback with the Wave 51 batch routed to Rust or PHP, then restores the routing. */
-    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w51RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w51RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Batch of {@see resolve()} decisions: `decide(normalizeManualStatus($manual), $active)` per
-     * row as `effective_status | scheduled_override_active << 2 | available << 3 | is_open << 4
-     * | is_invite_only << 5 | is_closed << 6 | reason << 8` (reason = {@see REASONS} index).
-     *
-     * @param  list<int>  $manualStatuses
-     * @param  list<bool>  $hasActivePeriods
-     * @return list<int>
-     */
-    public static function decideBatch(array $manualStatuses, array $hasActivePeriods): array
-    {
-        return self::usesW51RustFfi()
-            ? self::decideBatchNative($manualStatuses, $hasActivePeriods)
-            : self::decideBatchPhp($manualStatuses, $hasActivePeriods);
-    }
-
-    /**
-     * @param  list<int>  $manualStatuses
-     * @param  list<bool>  $hasActivePeriods
-     * @return list<int>
-     */
-    public static function decideBatchPhp(array $manualStatuses, array $hasActivePeriods): array
-    {
-        self::w51Count($manualStatuses, $hasActivePeriods);
-        $reasons = array_flip(self::REASONS);
-        $words = [];
-        foreach ($manualStatuses as $i => $status) {
-            $decision = self::decidePhp(self::normalizeManualStatusPhp($status), $hasActivePeriods[$i]);
-            $words[] = $decision['effective_status']
-                | (int) $decision['scheduled_override_active'] << 2
-                | (int) $decision['available'] << 3
-                | (int) $decision['is_open'] << 4
-                | (int) $decision['is_invite_only'] << 5
-                | (int) $decision['is_closed'] << 6
-                | $reasons[$decision['reason']] << 8;
-        }
-
-        return $words;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing or declines the batch.
-     *
-     * @param  list<int>  $manualStatuses
-     * @param  list<bool>  $hasActivePeriods
-     * @return list<int>
-     */
-    public static function decideBatchNative(array $manualStatuses, array $hasActivePeriods): array
-    {
-        $count = self::w51Count($manualStatuses, $hasActivePeriods);
-        $maxWords = $count;
-        $buffer = $count === 0 ? null : self::w51Buffer($maxWords);
-        if ($buffer === null) {
-            return self::decideBatchPhp($manualStatuses, $hasActivePeriods);
-        }
-        [$ffi, $out, $cap] = $buffer;
-        $statuses = pack('P*', ...$manualStatuses);
-        $active = pack('C*', ...$hasActivePeriods);
-        try {
-            // @phpstan-ignore method.notFound
-            $words = self::w51Decode($out, $ffi->nntmux_w511_registration_status_decide_batch($statuses, \strlen($statuses), $active, \strlen($active), $count, $out, $cap), $maxWords);
-        } catch (Throwable) {
-            $words = null;
-        }
-
-        return $words !== null && \count($words) === $count ? $words : self::decideBatchPhp($manualStatuses, $hasActivePeriods);
-    }
-
-    /**
-     * @param  array<mixed>  ...$columns
-     */
-    private static function w51Count(array ...$columns): int
-    {
-        $count = \count($columns[0]);
-        foreach ($columns as $column) {
-            if (\count($column) !== $count) {
-                throw new InvalidArgumentException('Registration decision batch columns must have the same length.');
-            }
-        }
-
-        return $count;
-    }
-
-    /**
-     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
-     *
-     * @return array{0: FFI, 1: CData, 2: int}|null
-     */
-    private static function w51Buffer(int $words): ?array
-    {
-        $buffer = self::w51RustFfiState('out', $words);
-
-        return \is_array($buffer) ? $buffer : null;
-    }
-
-    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
-    private static function w51Decode(CData $out, mixed $written, int $maxWords): ?array
-    {
-        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
-            return null;
-        }
-        if ($written === 0) {
-            return [];
-        }
-        $decoded = unpack('P*', FFI::string($out, $written * 8));
-
-        /** @var list<int>|null */
-        return \is_array($decoded) ? array_values($decoded) : null;
-    }
-
-    /**
-     * Wave 51 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
-     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
-     */
-    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'out':
-                $ffi ??= RustPipelineLibrary::resolveDomain('admin_status_w51', self::W51_FFI_CDEF) ?? false;
-                if (! $ffi instanceof FFI || ! \is_int($val)) {
-                    return null;
-                }
-                if (! $out instanceof CData || $outCap < $val) {
-                    $outCap = max(512, $val * 2);
-                    $out = $ffi->new("int64_t[{$outCap}]");
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled;
-        }
     }
 }

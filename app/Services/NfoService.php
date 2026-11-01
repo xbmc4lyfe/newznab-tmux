@@ -13,10 +13,8 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbContentsService;
 use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
-use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
 use dariusiii\rarinfo\SfvInfo;
-use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -32,96 +30,34 @@ use Throwable;
  */
 class NfoService
 {
-    public const METADATA_FFI_CDEF = <<<'CDEF'
-        ssize_t nntmux_nfo_extract_urls(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_extract_group_name(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_extract_release_date(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_extract_codec_info(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_extract_file_size(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_parse_metadata(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_extract_language(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_extract_runtime(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_extract_genre(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_extract_software_info(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_extract_release_title(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        int32_t nntmux_nfo_calculate_quality(const char *text, size_t text_len);
-        int32_t nntmux_nfo_calculate_quality_fused(const char *text, size_t text_len);
-        int32_t nntmux_nfo_has_ascii_art(const char *text, size_t text_len);
-        int32_t nntmux_nfo_analyze_structure(const char *text, size_t text_len);
-        ssize_t nntmux_nfo_extract_all_media_ids(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nfo_parse_show_id(const char *text, size_t text_len, char *out_buf, size_t out_cap);
-    CDEF;
-
-    private static bool $metadataFfiResolved = false;
-
-    private static ?\FFI $metadataFfi = null;
-
-    private function resolveMetadataFfi(): ?\FFI
-    {
-        if ($this->libraryPath !== null) {
-            return RustPipelineLibrary::resolveDomain('nfo_metadata_quality', self::METADATA_FFI_CDEF, $this->libraryPath);
-        }
-        if (! self::$metadataFfiResolved) {
-            self::$metadataFfi = RustPipelineLibrary::resolveDomain('nfo_metadata_quality', self::METADATA_FFI_CDEF);
-            self::$metadataFfiResolved = true;
-        }
-
-        return self::$metadataFfi;
-    }
+    /**
+     * Regex to detect common non-NFO file headers/signatures.
+     * Matches XML, NZB, RIFF (media), PAR/RAR archives, and other binary formats.
+     */
+    protected string $_nonNfoHeaderRegex = '/\A(\s*<\?xml|=newz\[NZB\]=|RIFF|\s*[RP]AR|.{0,10}(JFIF|matroska|ftyp|ID3)|PK\x03\x04|\x1f\x8b\x08|MZ|%PDF|GIF8[79]a|\x89PNG)|;\s*Generated\s*by.*SF\w/i';
 
     /**
-     * Byte-preserving serialized values keep sparse URL keys and binary NFO text.
-     * A missing/older library, unavailable engine or failed allocation falls back.
+     * Regex to identify text encoding from the 'file' command output.
      */
-    private function metadataRust(string $symbol, string $text, bool &$handled, bool $scalar = false): mixed
-    {
-        $handled = false;
-        if (ini_get('pcre.backtrack_limit') !== '1000000' || ini_get('pcre.recursion_limit') !== '100000'
-            || ini_get('pcre.jit') !== '1' || ! in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true)) {
-            return null;
-        }
-        try {
-            $ffi = $this->resolveMetadataFfi();
-            if ($ffi === null) {
-                return null;
-            }
-            if ($scalar) {
-                $result = $ffi->$symbol($text, strlen($text));
-                $handled = is_int($result) && $result >= 0;
+    protected string $_textFileRegex = '/(ASCII|ISO-8859|UTF-(8|16|32).*?|Non-ISO extended-ASCII)\s*text/i';
 
-                return $result;
-            }
-            $capacity = 0;
-            $buffer = RustPipelineLibrary::obtainScratch($ffi, max(512, strlen($text) + 512), $capacity);
-            if ($buffer === null) {
-                return null;
-            }
-            $written = $ffi->$symbol($text, strlen($text), $buffer, $capacity);
-            if (is_int($written) && $written < -1) {
-                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($buffer === null) {
-                    return null;
-                }
-                $written = $ffi->$symbol($text, strlen($text), $buffer, $capacity);
-            }
-            if (! is_int($written) || $written <= 0 || $written > $capacity) {
-                return null;
-            }
-            $result = unserialize(\FFI::string($buffer, $written), ['allowed_classes' => false]);
-            $handled = true;
+    /**
+     * Regex to identify common binary file types from the 'file' command output.
+     */
+    protected string $_binaryFileRegex = '/^(JPE?G|Parity|PNG|RAR|XML|(7-)?[Zz]ip|PDF|GIF|executable|archive|compressed|data|binary)/i';
 
-            return $result;
-        } catch (Throwable) {
-            return null;
-        }
-    }
+    /**
+     * Regex to detect binary characters within the content.
+     * Excludes common control characters that may appear in NFOs (tab, newline, carriage return).
+     */
+    protected string $_binaryCharsRegex = '/[\x00-\x08\x0B\x0C\x0E-\x1F]/';
 
-    private const DEFAULT_NON_NFO_HEADER_REGEX = '/\A(\s*<\?xml|=newz\[NZB\]=|RIFF|\s*[RP]AR|.{0,10}(JFIF|matroska|ftyp|ID3)|PK\x03\x04|\x1f\x8b\x08|MZ|%PDF|GIF8[79]a|\x89PNG)|;\s*Generated\s*by.*SF\w/i';
-
-    private const DEFAULT_BINARY_CHARS_REGEX = '/[\x00-\x08\x0B\x0C\x0E-\x1F]/';
-
-    /** @var list<string> */
-    private const DEFAULT_NFO_KEYWORDS = [
+    /**
+     * Common NFO keywords that help identify legitimate NFO files.
+     *
+     * @var array<string, mixed>
+     */
+    protected array $_nfoKeywords = [ // @phpstan-ignore property.defaultValue
         // Release information
         'release', 'group', 'date', 'size', 'format', 'source', 'genre', 'codec',
         'bitrate', 'resolution', 'language', 'subtitle', 'ripped', 'cracked',
@@ -145,42 +81,11 @@ class NfoService
     ];
 
     /**
-     * Regex to detect common non-NFO file headers/signatures.
-     * Matches XML, NZB, RIFF (media), PAR/RAR archives, and other binary formats.
-     */
-    protected string $_nonNfoHeaderRegex = self::DEFAULT_NON_NFO_HEADER_REGEX;
-
-    /**
-     * Regex to identify text encoding from the 'file' command output.
-     */
-    protected string $_textFileRegex = '/(ASCII|ISO-8859|UTF-(8|16|32).*?|Non-ISO extended-ASCII)\s*text/i';
-
-    /**
-     * Regex to identify common binary file types from the 'file' command output.
-     */
-    protected string $_binaryFileRegex = '/^(JPE?G|Parity|PNG|RAR|XML|(7-)?[Zz]ip|PDF|GIF|executable|archive|compressed|data|binary)/i';
-
-    /**
-     * Regex to detect binary characters within the content.
-     * Excludes common control characters that may appear in NFOs (tab, newline, carriage return).
-     */
-    protected string $_binaryCharsRegex = '/[\x00-\x08\x0B\x0C\x0E-\x1F]/';
-
-    /**
-     * Common NFO keywords that help identify legitimate NFO files.
-     *
-     * @var array<string, mixed>
-     */
-    protected array $_nfoKeywords = self::DEFAULT_NFO_KEYWORDS; // @phpstan-ignore property.defaultValue
-
-    /**
      * Scene group patterns for improved detection.
      *
      * @var array<string, mixed>
      */
-    protected array $_sceneGroupPatterns = self::DEFAULT_SCENE_GROUP_PATTERNS; // @phpstan-ignore property.defaultValue
-
-    private const DEFAULT_SCENE_GROUP_PATTERNS = [
+    protected array $_sceneGroupPatterns = [ // @phpstan-ignore property.defaultValue
         '/(?:^|\n)\s*[-=*]{3,}.*?([A-Z0-9]{2,15})\s*[-=*]{3,}/i',
         '/(?:presents?|brought\s+(?:to\s+)?(?:you\s+)?by|from)\s*[:\-]?\s*([A-Z][A-Z0-9]{1,14})/i',
         '/(?:greets?\s+(?:go(?:es)?\s+)?(?:out\s+)?to|respect\s+to)\s*[:\-]?\s*([\w,\s&]+)/i',
@@ -239,8 +144,6 @@ class NfoService
 
     private ?int $timeoutSeconds = null;
 
-    private ?string $libraryPath = null;
-
     public const NFO_FAILED = -9; // We failed to get a NFO after admin set max retries.
 
     public const NFO_FAILED_ARCHIVE = -10; // Archive-based NFO extraction also failed; no more retries.
@@ -257,9 +160,8 @@ class NfoService
      * Heavy settings (batch limits, sizes, retries) load on first NFO processing use via getters,
      * so constructing this service does not hit the cache or database.
      */
-    public function __construct(?string $libraryPath = null)
+    public function __construct()
     {
-        $this->libraryPath = $libraryPath;
         $this->echo = (bool) config('nntmux.echocli');
 
         $this->tmpPath = rtrim((string) config('nntmux.tmp_unrar_path'), '/\\').'/';
@@ -349,24 +251,6 @@ class NfoService
      */
     public function parseShowId(string $str): array|false
     {
-        return $this->parseShowIdNative($str);
-    }
-
-    /** @return array<string, mixed>|false */
-    public function parseShowIdRust(string $str): array|false
-    {
-        if (get_class($this) !== self::class) {
-            return $this->parseShowIdNative($str);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_parse_show_id', $str, $handled);
-
-        return $handled && (is_array($value) || $value === false) ? $value : $this->parseShowIdNative($str);
-    }
-
-    /** @return array{showid: string, site: string}|false */
-    public function parseShowIdNative(string $str): array|false
-    {
         // TVMaze
         if (preg_match('/tvmaze\.com\/shows\/(\d{1,6})/i', $str, $hits)) {
             return ['showid' => trim($hits[1]), 'site' => 'tvmaze'];
@@ -438,25 +322,14 @@ class NfoService
             return false;
         }
 
-        $preconditionFlags = null;
-        if ($this->_nonNfoHeaderRegex === self::DEFAULT_NON_NFO_HEADER_REGEX) {
-            $preconditionFlags = RustPipelineLibrary::nfoCheckPreconditions($possibleNFO, $this->libraryPath);
+        // Quick check for known non-NFO file signatures
+        if (preg_match($this->_nonNfoHeaderRegex, $possibleNFO)) {
+            return false;
         }
 
-        if ($preconditionFlags !== null) {
-            if (($preconditionFlags & 3) !== 0) {
-                return false;
-            }
-        } else {
-            // Quick check for known non-NFO file signatures
-            if (preg_match($this->_nonNfoHeaderRegex, $possibleNFO)) {
-                return false;
-            }
-
-            // Additional binary format checks
-            if ($this->detectBinaryFormat($possibleNFO)) {
-                return false;
-            }
+        // Additional binary format checks
+        if ($this->detectBinaryFormat($possibleNFO)) {
+            return false;
         }
 
         $tmpPath = $this->tmpPath.$guid.'.nfo';
@@ -469,13 +342,9 @@ class NfoService
             // Use 'file' command via fileInfo if available
             $result = fileInfo($tmpPath);
             if (! empty($result)) {
-                $hasBinaryChars = ($preconditionFlags !== null && $this->_binaryCharsRegex === self::DEFAULT_BINARY_CHARS_REGEX)
-                    ? (($preconditionFlags & 4) !== 0)
-                    : (bool) preg_match($this->_binaryCharsRegex, $possibleNFO);
-
                 if (preg_match($this->_textFileRegex, $result)) {
                     $isNfo = true;
-                } elseif (preg_match($this->_binaryFileRegex, $result) || $hasBinaryChars) {
+                } elseif (preg_match($this->_binaryFileRegex, $result) || preg_match($this->_binaryCharsRegex, $possibleNFO)) {
                     $isNfo = false;
                 }
 
@@ -504,10 +373,7 @@ class NfoService
             }
 
             // Check for binary characters
-            $hasBinaryChars = ($preconditionFlags !== null && $this->_binaryCharsRegex === self::DEFAULT_BINARY_CHARS_REGEX)
-                ? (($preconditionFlags & 4) !== 0)
-                : (bool) preg_match($this->_binaryCharsRegex, $possibleNFO);
-            if ($hasBinaryChars) {
+            if (preg_match($this->_binaryCharsRegex, $possibleNFO)) {
                 return false;
             }
 
@@ -538,20 +404,6 @@ class NfoService
      * @return bool True if binary format detected.
      */
     protected function detectBinaryFormat(string $data): bool
-    {
-        if (\strlen($data) < 4) {
-            return false;
-        }
-
-        $flags = RustPipelineLibrary::nfoCheckPreconditions($data, $this->libraryPath);
-        if ($flags !== null) {
-            return ($flags & 2) !== 0;
-        }
-
-        return $this->detectBinaryFormatPhp($data);
-    }
-
-    protected function detectBinaryFormatPhp(string $data): bool
     {
         if (strlen($data) < 4) {
             return false;
@@ -606,22 +458,6 @@ class NfoService
      * @return bool True if content appears to be a valid NFO.
      */
     protected function validateNfoContent(string $content): bool
-    {
-        if (\strlen($content) < 50) {
-            return false;
-        }
-
-        if ($this->_nfoKeywords === self::DEFAULT_NFO_KEYWORDS) {
-            $native = RustPipelineLibrary::nfoValidateContent($content, $this->libraryPath);
-            if ($native !== null) {
-                return $native;
-            }
-        }
-
-        return $this->validateNfoContentPhp($content);
-    }
-
-    protected function validateNfoContentPhp(string $content): bool
     {
         $length = strlen($content);
 
@@ -1187,24 +1023,6 @@ class NfoService
      */
     public function extractUrls(string $nfoContent): array
     {
-        return $this->extractUrlsNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function extractUrlsRust(string $nfoContent): array
-    {
-        if (get_class($this) !== self::class) {
-            return $this->extractUrlsNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_extract_urls', $nfoContent, $handled);
-
-        return $handled && is_array($value) ? $value : $this->extractUrlsNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function extractUrlsNative(string $nfoContent): array
-    {
         $urls = [];
 
         // Match HTTP/HTTPS URLs
@@ -1235,22 +1053,6 @@ class NfoService
      * @return array<int<0, max>, string>
      */
     public function extractGroupName(string $nfoContent): ?string
-    {
-        return $this->extractGroupNameNative($nfoContent);
-    }
-
-    public function extractGroupNameRust(string $nfoContent): ?string
-    {
-        if (get_class($this) !== self::class || $this->_sceneGroupPatterns !== self::DEFAULT_SCENE_GROUP_PATTERNS) {
-            return $this->extractGroupNameNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_extract_group_name', $nfoContent, $handled);
-
-        return $handled && ($value === null || is_string($value)) ? $value : $this->extractGroupNameNative($nfoContent);
-    }
-
-    public function extractGroupNameNative(string $nfoContent): ?string
     {
         // False positives to filter out
         $falsePositives = [
@@ -1303,22 +1105,6 @@ class NfoService
      */
     public function extractReleaseDate(string $nfoContent): ?string
     {
-        return $this->extractReleaseDateNative($nfoContent);
-    }
-
-    public function extractReleaseDateRust(string $nfoContent): ?string
-    {
-        if (get_class($this) !== self::class) {
-            return $this->extractReleaseDateNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_extract_release_date', $nfoContent, $handled);
-
-        return $handled && ($value === null || is_string($value)) ? $value : $this->extractReleaseDateNative($nfoContent);
-    }
-
-    public function extractReleaseDateNative(string $nfoContent): ?string
-    {
         $patterns = [
             // DD/MM/YYYY or MM/DD/YYYY
             '/(?:date|released?|rls)\s*[:\-]?\s*(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/i',
@@ -1363,24 +1149,6 @@ class NfoService
      * @return array{video?: string, audio?: string, resolution?: string} Array with codec info.
      */
     public function extractCodecInfo(string $nfoContent): array
-    {
-        return $this->extractCodecInfoNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function extractCodecInfoRust(string $nfoContent): array
-    {
-        if (get_class($this) !== self::class) {
-            return $this->extractCodecInfoNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_extract_codec_info', $nfoContent, $handled);
-
-        return $handled && is_array($value) ? $value : $this->extractCodecInfoNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function extractCodecInfoNative(string $nfoContent): array
     {
         $result = [];
 
@@ -1436,22 +1204,6 @@ class NfoService
      */
     public function extractFileSize(string $nfoContent): ?int
     {
-        return $this->extractFileSizeNative($nfoContent);
-    }
-
-    public function extractFileSizeRust(string $nfoContent): ?int
-    {
-        if (get_class($this) !== self::class) {
-            return $this->extractFileSizeNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_extract_file_size', $nfoContent, $handled);
-
-        return $handled && ($value === null || is_int($value)) ? $value : $this->extractFileSizeNative($nfoContent);
-    }
-
-    public function extractFileSizeNative(string $nfoContent): ?int
-    {
         $patterns = [
             '/(?:size|file\s*size)\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*(bytes?|[KMGTP]B|[KMGTP]iB)/i',
             '/\b(\d+(?:[.,]\d+)?)\s*(GB|GiB|MB|MiB|TB|TiB)\b/i',
@@ -1487,24 +1239,6 @@ class NfoService
      * @return array<string, mixed> Array of media IDs with their sources.
      */
     public function extractAllMediaIds(string $nfoContent): array
-    {
-        return $this->extractAllMediaIdsNative($nfoContent);
-    }
-
-    /** @return list<array{id: string, source: string}> */
-    public function extractAllMediaIdsRust(string $nfoContent): array
-    {
-        if (get_class($this) !== self::class) {
-            return $this->extractAllMediaIdsNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_extract_all_media_ids', $nfoContent, $handled);
-
-        return $handled && is_array($value) ? $value : $this->extractAllMediaIdsNative($nfoContent);
-    }
-
-    /** @return list<array{id: string, source: string}> */
-    public function extractAllMediaIdsNative(string $nfoContent): array
     {
         $ids = [];
 
@@ -1568,24 +1302,6 @@ class NfoService
      */
     public function parseNfoMetadata(string $nfoContent): array
     {
-        return $this->parseNfoMetadataNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function parseNfoMetadataRust(string $nfoContent): array
-    {
-        if (get_class($this) !== self::class || $this->_sceneGroupPatterns !== self::DEFAULT_SCENE_GROUP_PATTERNS) {
-            return $this->parseNfoMetadataNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_parse_metadata', $nfoContent, $handled);
-
-        return $handled && is_array($value) ? $value : $this->parseNfoMetadataNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function parseNfoMetadataNative(string $nfoContent): array
-    {
         return [
             'urls' => $this->extractUrls($nfoContent),
             'group' => $this->extractGroupName($nfoContent),
@@ -1609,24 +1325,6 @@ class NfoService
      * @return array<string, mixed> Array of detected languages.
      */
     public function extractLanguage(string $nfoContent): array
-    {
-        return $this->extractLanguageNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function extractLanguageRust(string $nfoContent): array
-    {
-        if (get_class($this) !== self::class) {
-            return $this->extractLanguageNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_extract_language', $nfoContent, $handled);
-
-        return $handled && is_array($value) ? $value : $this->extractLanguageNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function extractLanguageNative(string $nfoContent): array
     {
         $languages = [];
 
@@ -1668,22 +1366,6 @@ class NfoService
      */
     public function extractRuntime(string $nfoContent): ?int
     {
-        return $this->extractRuntimeNative($nfoContent);
-    }
-
-    public function extractRuntimeRust(string $nfoContent): ?int
-    {
-        if (get_class($this) !== self::class) {
-            return $this->extractRuntimeNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_extract_runtime', $nfoContent, $handled);
-
-        return $handled && ($value === null || is_int($value)) ? $value : $this->extractRuntimeNative($nfoContent);
-    }
-
-    public function extractRuntimeNative(string $nfoContent): ?int
-    {
         $patterns = [
             // "Runtime: 1h 30m" or "Duration: 90min"
             '/(?:runtime|duration|length|playtime)\s*[:\-]?\s*(?:(\d{1,2})\s*h(?:ours?)?\s*)?(\d{1,3})\s*m(?:in(?:utes?)?)?/i',
@@ -1722,24 +1404,6 @@ class NfoService
      */
     public function extractGenre(string $nfoContent): array
     {
-        return $this->extractGenreNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function extractGenreRust(string $nfoContent): array
-    {
-        if (get_class($this) !== self::class) {
-            return $this->extractGenreNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_extract_genre', $nfoContent, $handled);
-
-        return $handled && is_array($value) ? $value : $this->extractGenreNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function extractGenreNative(string $nfoContent): array
-    {
         $genres = [];
 
         if (preg_match('/(?:genre|category|type)\s*[:\-]?\s*([^\n\r]+)/i', $nfoContent, $matches)) {
@@ -1775,24 +1439,6 @@ class NfoService
      * @return list<string>
      */
     public function extractSoftwareInfo(string $nfoContent): array
-    {
-        return $this->extractSoftwareInfoNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function extractSoftwareInfoRust(string $nfoContent): array
-    {
-        if (get_class($this) !== self::class) {
-            return $this->extractSoftwareInfoNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_extract_software_info', $nfoContent, $handled);
-
-        return $handled && is_array($value) ? $value : $this->extractSoftwareInfoNative($nfoContent);
-    }
-
-    /** @return array<array-key, mixed> */
-    public function extractSoftwareInfoNative(string $nfoContent): array
     {
         $info = [];
 
@@ -1842,22 +1488,6 @@ class NfoService
      */
     public function extractReleaseTitle(string $nfoContent): ?string
     {
-        return $this->extractReleaseTitleNative($nfoContent);
-    }
-
-    public function extractReleaseTitleRust(string $nfoContent): ?string
-    {
-        if (get_class($this) !== self::class) {
-            return $this->extractReleaseTitleNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_extract_release_title', $nfoContent, $handled);
-
-        return $handled && ($value === null || is_string($value)) ? $value : $this->extractReleaseTitleNative($nfoContent);
-    }
-
-    public function extractReleaseTitleNative(string $nfoContent): ?string
-    {
         $patterns = [
             // "Title: Movie Name" or "Release: Title.Goes.Here"
             '/(?:title|release|name)\s*[:\-]?\s*([^\n\r]{5,100})/i',
@@ -1887,22 +1517,8 @@ class NfoService
      */
     public function cleanNfoContent(string $nfoContent): string
     {
-        if ($nfoContent === '') {
-            return '';
-        }
-
-        $native = RustPipelineLibrary::nfoCleanContent($nfoContent, $this->libraryPath);
-        if ($native !== null) {
-            return $native;
-        }
-
-        return $this->cleanNfoContentPhp($nfoContent);
-    }
-
-    public function cleanNfoContentPhp(string $nfoContent): string
-    {
         // Convert to UTF-8 if needed (CP437 is common for NFOs)
-        $content = (string) iconv('CP437', 'UTF-8//IGNORE//TRANSLIT', $nfoContent);
+        $content = cp437toUTF($nfoContent);
 
         // Normalize line endings
         $content = str_replace(["\r\n", "\r"], "\n", $content);
@@ -1944,34 +1560,6 @@ class NfoService
      * @return int Quality score from 0-100.
      */
     public function calculateNfoQuality(string $nfoContent): int
-    {
-        return $this->calculateNfoQualityNative($nfoContent);
-    }
-
-    public function calculateNfoQualityRust(string $nfoContent): int
-    {
-        if (get_class($this) !== self::class || $this->_sceneGroupPatterns !== self::DEFAULT_SCENE_GROUP_PATTERNS || $this->_nfoKeywords !== self::DEFAULT_NFO_KEYWORDS) {
-            return $this->calculateNfoQualityNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_calculate_quality', $nfoContent, $handled, true);
-
-        return $handled && is_int($value) ? $value : $this->calculateNfoQualityNative($nfoContent);
-    }
-
-    /** Comparative candidate: fused extraction with independent ordered regex scans. */
-    public function calculateNfoQualityFusedRust(string $nfoContent): int
-    {
-        if (get_class($this) !== self::class || $this->_sceneGroupPatterns !== self::DEFAULT_SCENE_GROUP_PATTERNS || $this->_nfoKeywords !== self::DEFAULT_NFO_KEYWORDS) {
-            return $this->calculateNfoQualityNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_calculate_quality_fused', $nfoContent, $handled, true);
-
-        return $handled && is_int($value) ? $value : $this->calculateNfoQualityNative($nfoContent);
-    }
-
-    public function calculateNfoQualityNative(string $nfoContent): int
     {
         $score = 50; // Base score
 
@@ -2057,22 +1645,6 @@ class NfoService
      */
     protected function hasAsciiArt(string $nfoContent): bool
     {
-        return $this->hasAsciiArtNative($nfoContent);
-    }
-
-    public function hasAsciiArtRust(string $nfoContent): bool
-    {
-        if (get_class($this) !== self::class) {
-            return $this->hasAsciiArtNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_has_ascii_art', $nfoContent, $handled, true);
-
-        return $handled && is_int($value) ? (bool) $value : $this->hasAsciiArtNative($nfoContent);
-    }
-
-    public function hasAsciiArtNative(string $nfoContent): bool
-    {
         // Check for common ASCII art characters in repeated sequences
         $asciiArtPatterns = [
             // Decorative borders
@@ -2103,22 +1675,6 @@ class NfoService
      * @return int Score based on structural quality (0-15).
      */
     protected function analyzeStructure(string $nfoContent): int
-    {
-        return $this->analyzeStructureNative($nfoContent);
-    }
-
-    public function analyzeStructureRust(string $nfoContent): int
-    {
-        if (get_class($this) !== self::class) {
-            return $this->analyzeStructureNative($nfoContent);
-        }
-        $handled = false;
-        $value = $this->metadataRust('nntmux_nfo_analyze_structure', $nfoContent, $handled, true);
-
-        return $handled && is_int($value) ? $value : $this->analyzeStructureNative($nfoContent);
-    }
-
-    public function analyzeStructureNative(string $nfoContent): int
     {
         $score = 0;
 
@@ -2224,318 +1780,5 @@ class NfoService
         $this->maxRetries = null;
         $this->maxSize = null;
         $this->minSize = null;
-    }
-
-    /** Disabled: common p99 missed 1.5x in three of five paired runs (1.51x, 1.38x, 1.39x, 1.39x, 1.89x; see the W42 parity test). */
-    public const bool W424_RUST_FFI_DEFAULT = false;
-
-    public const string W424_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w424_nfo_content_batch(const char *input, size_t len, char *out, size_t cap);
-        C;
-
-    private const array W424_SUMMARY_KEYS = ['total_nfos', 'empty_nfo_count', 'imdb_link_count', 'tv_link_count', 'url_count', 'high_ascii_count', 'multi_line_count'];
-
-    private static ?bool $w424UseRustFfi = null;
-
-    private static \FFI|false|null $w424Ffi = null;
-
-    public static function useW424RustFfi(bool $enable = true): void
-    {
-        self::$w424UseRustFfi = $enable;
-    }
-
-    public static function usesW424RustFfi(): bool
-    {
-        return self::$w424UseRustFfi ?? self::W424_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW424RustFfi(): void
-    {
-        self::$w424UseRustFfi = null;
-        self::$w424Ffi = null;
-    }
-
-    /**
-     * Summarize NFO text: imdb.com/title/tt links with at least seven
-     * digits, TheTVDB/TVmaze hosts, http(s) URLs (all ASCII case-insensitive),
-     * bytes above 0x7F (CP437 art) and at least ten newlines after trimming.
-     * Entries come from strings, integers, or the nfo or content array
-     * field; other values (including objects) count as empty entries.
-     *
-     * @param  array<array-key, mixed>  $entries
-     * @return array<string, int>
-     */
-    public static function summarizeNfoContentBatch(array $entries): array
-    {
-        return self::usesW424RustFfi()
-            ? self::summarizeNfoContentBatchNative($entries)
-            : self::summarizeNfoContentBatchPhp($entries);
-    }
-
-    /**
-     * Rust summary; falls back to PHP when the library or input frame is unusable.
-     *
-     * @param  array<array-key, mixed>  $entries
-     * @return array<string, int>
-     */
-    public static function summarizeNfoContentBatchNative(array $entries): array
-    {
-        return self::w424Call(self::w424Entries($entries)) ?? self::summarizeNfoContentBatchPhp($entries);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $entries
-     * @return array<string, int>
-     */
-    public static function summarizeNfoContentBatchPhp(array $entries): array
-    {
-        $summary = array_fill_keys(self::W424_SUMMARY_KEYS, 0);
-        foreach (self::w424Entries($entries) as $entry) {
-            $summary['total_nfos']++;
-            $entry = trim($entry);
-            if ($entry === '') {
-                $summary['empty_nfo_count']++;
-
-                continue;
-            }
-            $summary['imdb_link_count'] += (int) (preg_match('~imdb\.com/title/tt\d{7}~i', $entry) === 1);
-            $summary['tv_link_count'] += (int) (stripos($entry, 'thetvdb.com') !== false || stripos($entry, 'tvmaze.com') !== false);
-            $summary['url_count'] += (int) (stripos($entry, 'http://') !== false || stripos($entry, 'https://') !== false);
-            $summary['high_ascii_count'] += (int) (preg_match('/[\x80-\xFF]/', $entry) === 1);
-            $summary['multi_line_count'] += (int) (substr_count($entry, "\n") >= 10);
-        }
-
-        return $summary;
-    }
-
-    /** Only integer and string entries participate; objects are never cast or serialized.
-     *
-     * @param  array<array-key, mixed>  $input
-     * @return list<string>
-     */
-    private static function w424Entries(array $input): array
-    {
-        $entries = [];
-        foreach ($input as $item) {
-            if (is_array($item)) {
-                $item = $item['nfo'] ?? $item['content'] ?? null;
-            }
-            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
-        }
-
-        return $entries;
-    }
-
-    /** @param list<string> $entries
-     * @return array<string, int>|null
-     */
-    private static function w424Call(array $entries): ?array
-    {
-        try {
-            $input = serialize([$entries]);
-            if (strlen($input) > 16777216) {
-                return null;
-            }
-            self::$w424Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w424', self::W424_FFI_CDEF) ?? false;
-            $ffi = self::$w424Ffi;
-            if ($ffi === false) {
-                return null;
-            }
-            $capacity = 0;
-            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
-            if ($out === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound (Declared by W424_FFI_CDEF.)
-            $written = $ffi->nntmux_w424_nfo_content_batch($input, strlen($input), $out, $capacity);
-            if (is_int($written) && $written < -1 && $written >= -16777216) {
-                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($out === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound (Declared by W424_FFI_CDEF.)
-                $written = $ffi->nntmux_w424_nfo_content_batch($input, strlen($input), $out, $capacity);
-            }
-            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
-                return null;
-            }
-            $result = @unserialize(\FFI::string($out, $written), ['allowed_classes' => false]);
-            if (! is_array($result) || array_keys($result) !== self::W424_SUMMARY_KEYS || $result['total_nfos'] !== count($entries)) {
-                return null;
-            }
-            $summary = [];
-            foreach (self::W424_SUMMARY_KEYS as $key) {
-                $value = $result[$key];
-                if (! is_int($value) || $value < 0 || $value > count($entries)) {
-                    return null;
-                }
-                $summary[$key] = $value;
-            }
-
-            return $summary;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** Wave 55.2 paired benchmarks decide this default; see RustNfoServiceDbNzbStoreNfoImportNzbContentsParserW55ParityTest. */
-    private const bool W55_RUST_FFI_DEFAULT = true;
-
-    private const string W55_FFI_CDEF = <<<'C'
-        intptr_t nntmux_w552_nfo_show_id_plan_batch(const char *texts, size_t texts_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * Wave 55 routing, binding and output buffer, kept in function-local statics. Operations:
-     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
-     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
-     * least $val words (null without the library).
-     */
-    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $capacity = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = \is_bool($val) ? $val : null;
-
-                return $previous;
-            case 'ffi':
-                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w55', self::W55_FFI_CDEF) ?? false;
-
-                return $ffi === false ? null : $ffi;
-            case 'out':
-                $words = \is_int($val) ? $val : 0;
-                if (! $out instanceof CData || $capacity < $words) {
-                    $resolved = self::w55RustFfiState('ffi');
-                    $buffer = $resolved instanceof \FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
-                    if (! $buffer instanceof CData) {
-                        return null;
-                    }
-                    [$out, $capacity] = [$buffer, max(1024, $words)];
-                }
-
-                return [$ffi, $out, $capacity];
-            default:
-                return $enabled;
-        }
-    }
-
-    public static function usesW55RustFfi(): bool
-    {
-        $enabled = self::w55RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with planShowIdBatch() routed to Rust ($enabled) or PHP, then restores the previous
-     * routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w55RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w55RustFfiState('set', $previous);
-        }
-    }
-
-    /** parseShowIdNative()'s patterns in priority order (TVDB has two). */
-    private const array W55_SHOW_ID_PATTERNS = [
-        '/tvmaze\.com\/shows\/(\d{1,6})/i',
-        '/imdb\.com\/title\/(tt\d{7,})/i',
-        '/thetvdb\.com\/\?tab=series&id=(\d{1,8})/i',
-        '/thetvdb\.com\/series\/(\d{1,8}|[\w-]+)/i',
-        '/themoviedb\.org\/movie\/(\d{1,8})/i',
-        '/themoviedb\.org\/tv\/(\d{1,8})/i',
-        '/anidb\.net\/(?:perl-bin\/animedb\.pl\?show=anime&aid=|anime\/)(\d{1,6})/i',
-        '/trakt\.tv\/(?:shows|movies)\/([\w-]+)/i',
-    ];
-
-    /**
-     * Batch show-id plan, as parseShowIdNative() reads each NFO. One word per text:
-     * `pattern | min(id length, 0xFFFFFF) << 8 | crc32(id) << 32`, where pattern is the first
-     * matching W55_SHOW_ID_PATTERNS entry (1-8, both TVDB forms are site `thetvdb`) and the word
-     * is 0 without a match. The matched texts, the per-pattern counts (1-8) and the XXH64 digest
-     * of all earlier words follow.
-     *
-     * @param  list<string>  $texts
-     * @return list<int>
-     */
-    public static function planShowIdBatch(array $texts): array
-    {
-        return self::usesW55RustFfi() ? self::planShowIdBatchNative($texts) : self::planShowIdBatchPhp($texts);
-    }
-
-    /**
-     * @param  list<string>  $texts
-     * @return list<int>
-     */
-    public static function planShowIdBatchPhp(array $texts): array
-    {
-        $out = [];
-        $counts = array_fill(0, 9, 0);
-        foreach ($texts as $text) {
-            $pattern = 0;
-            $id = '';
-            foreach (self::W55_SHOW_ID_PATTERNS as $i => $regex) {
-                if (preg_match($regex, $text, $hits)) {
-                    $pattern = $i + 1;
-                    $id = trim($hits[1]);
-                    break;
-                }
-            }
-            $counts[$pattern]++;
-            $out[] = $pattern === 0 ? 0 : $pattern | min(\strlen($id), 0xFFFFFF) << 8 | crc32($id) << 32;
-        }
-        $out[] = \count($texts) - $counts[0];
-        array_push($out, ...\array_slice($counts, 1));
-        /** @var array{1: int} $digest */
-        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
-        $out[] = $digest[1];
-
-        return $out;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing, PCRE's character tables are not the
-     * default (C) ones, or the texts are not a list.
-     *
-     * @param  list<string>  $texts
-     * @return list<int>
-     */
-    public static function planShowIdBatchNative(array $texts): array
-    {
-        $count = \count($texts);
-        $words = $count + 10;
-        /** @var array{\FFI, CData, int}|null $state */
-        $state = $count === 0 ? null : self::w55RustFfiState('out', $words);
-        if ($state === null || ! array_is_list($texts) || ! NzbParserService::pcreUsesDefaultTables()) {
-            return self::planShowIdBatchPhp($texts);
-        }
-        $blob = implode('', $texts);
-        $ints = pack('P*', ...array_map(strlen(...), $texts));
-        [$ffi, $out, $cap] = $state;
-        try {
-            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
-            $written = $ffi->nntmux_w552_nfo_show_id_plan_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, $out, $cap);
-        } catch (Throwable) {
-            $written = -1;
-        }
-        /** @var array<int, int>|false $values */
-        $values = $written === $words ? unpack('P*', \FFI::string($out, $words * 8)) : false;
-
-        return \is_array($values) ? array_values($values) : self::planShowIdBatchPhp($texts);
     }
 }

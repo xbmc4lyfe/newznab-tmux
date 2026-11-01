@@ -7,19 +7,14 @@ namespace App\Services\AdditionalProcessing;
 use App\Services\AdditionalProcessing\Config\ProcessingConfiguration;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\Releases\ReleaseBrowseService;
-use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\ArchiveInfo;
 use dariusiii\rarinfo\Par2Info;
 use dariusiii\rarinfo\RarInfo;
 use dariusiii\rarinfo\SzipInfo;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Process;
-use InvalidArgumentException;
 use Symfony\Component\Process\Process as SymfonyProcess;
-use Throwable;
 
 /**
  * Service for extracting and processing archive files (RAR, ZIP, 7z).
@@ -36,39 +31,6 @@ class ArchiveExtractionService
 
     public const SEVENZIP_LISTING_MAX_ENTRIES = 1000;
 
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_archive_7z_validate_end_header(const char *head, size_t head_len, const char *tail, size_t tail_len, char *out_buf, size_t out_cap);
-        int32_t nntmux_archive_is_nfo_file(const char *filename, size_t filename_len);
-        ssize_t nntmux_archive_rank_nfo_files_nul(const char *names, size_t names_len, size_t count, char *out_buf, size_t out_cap);
-        int32_t nntmux_archive_detect_standalone_video(const char *data, size_t data_len);
-        C;
-
-    public const string W406_FFI_CDEF = 'ssize_t nntmux_w406_archive_media_download_processor_planner(uint8_t operation, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
-
-    /** Wave 40.6 paired benchmarks decide this default; see RustArchiveExtractionMediaUsenetDownloadReleaseProcW40ParityTest. */
-    public const bool W406_RUST_FFI_DEFAULT = false;
-
-    private const int W406_RUST_MAX_INPUT = 16_777_216;
-
-    /** Extensions of directly executable programs and scripts, compared ASCII case-insensitively. */
-    private const array W406_EXECUTABLE_EXTENSIONS = ['bat' => true, 'cmd' => true, 'com' => true, 'cpl' => true, 'exe' => true, 'jar' => true,
-        'js' => true, 'msi' => true, 'ps1' => true, 'scr' => true, 'sh' => true, 'vbs' => true];
-
-    private static ?bool $w406UseRustFfi = null;
-
-    private static FFI|false|null $w406Ffi = null;
-
-    private const array STANDALONE_VIDEO_CODES = [
-        1 => 'avi',
-        2 => 'mkv',
-        3 => 'mpg',
-        4 => 'ts',
-        5 => 'mp4',
-        6 => 'wmv',
-        7 => 'flv',
-        8 => 'ogv',
-    ];
-
     private ArchiveInfo $archiveInfo;
 
     private Par2Info $par2Info;
@@ -76,8 +38,7 @@ class ArchiveExtractionService
     public function __construct(
         private readonly ProcessingConfiguration $config,
         ?ArchiveInfo $archiveInfo = null,
-        ?Par2Info $par2Info = null,
-        private readonly ?string $libraryPath = null,
+        ?Par2Info $par2Info = null
     ) {
         $this->archiveInfo = $archiveInfo ?? new ArchiveInfo;
         $this->par2Info = $par2Info ?? new Par2Info;
@@ -271,147 +232,12 @@ class ArchiveExtractionService
     }
 
     /**
-     * `isNfoFile()` backed by the Rust pipeline library; falls back to `isNfoFile()`
-     * (and leaves `$supported` false) when the library is unavailable.
-     */
-    public function isNfoFileNative(string $filename, bool &$supported = false): bool
-    {
-        $supported = false;
-        $ffi = RustPipelineLibrary::resolveDomain('archive_extraction', self::FFI_CDEF, $this->libraryPath);
-        if ($ffi === null) {
-            return $this->isNfoFile($filename);
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_archive_is_nfo_file($filename, strlen($filename));
-        } catch (Throwable) {
-            return $this->isNfoFile($filename);
-        }
-
-        if (! is_int($status) || $status < 0) {
-            return $this->isNfoFile($filename);
-        }
-
-        $supported = true;
-
-        return $status === 1;
-    }
-
-    /**
      * Sort files to prioritize NFO files for processing.
      *
      * @param  list<array<string, mixed>>  $files  Array of file info arrays.
      * @return list<array<string, mixed>> Sorted array with NFO files first.
      */
     public function sortFilesWithNfoPriority(array $files): array
-    {
-        if (static::class !== self::class) {
-            return $this->sortFilesWithNfoPriorityPhp($files);
-        }
-
-        return $this->sortFilesWithNfoPriorityNative($files);
-    }
-
-    /**
-     * Sort archive file records with NFO priority in a single Rust FFI crossing, falling back to PHP.
-     *
-     * @param  list<array<string, mixed>>  $files
-     * @return list<array<string, mixed>>
-     */
-    public function sortFilesWithNfoPriorityNative(array $files, bool &$supported = false): array
-    {
-        $supported = false;
-        $count = count($files);
-        $ffi = RustPipelineLibrary::resolveDomain('archive_extraction', self::FFI_CDEF, $this->libraryPath);
-        if ($ffi === null) {
-            return $this->sortFilesWithNfoPriorityPhp($files);
-        }
-        if ($count <= 1) {
-            $supported = true;
-
-            return array_values($files);
-        }
-
-        $values = array_values($files);
-        $names = [];
-        foreach ($values as $file) {
-            $names[] = is_string($file['name'] ?? null) ? $file['name'] : '';
-        }
-
-        $joined = implode("\0", $names);
-        if (substr_count($joined, "\0") !== $count - 1) {
-            return $this->sortFilesWithNfoPriorityPhp($files);
-        }
-
-        $needed = $count * 4 + 16;
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, $needed, $cap);
-        if ($scratch === null) {
-            return $this->sortFilesWithNfoPriorityPhp($files);
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_archive_rank_nfo_files_nul(
-                $joined,
-                strlen($joined),
-                $count,
-                $scratch,
-                $cap,
-            );
-            if (is_int($written) && $written < -1) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($scratch === null) {
-                    return $this->sortFilesWithNfoPriorityPhp($files);
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_archive_rank_nfo_files_nul(
-                    $joined,
-                    strlen($joined),
-                    $count,
-                    $scratch,
-                    $cap,
-                );
-            }
-        } catch (Throwable) {
-            return $this->sortFilesWithNfoPriorityPhp($files);
-        }
-
-        if (! is_int($written) || $written < 0) {
-            return $this->sortFilesWithNfoPriorityPhp($files);
-        }
-        if ($written === 0) {
-            $supported = true;
-
-            return $values;
-        }
-        if ($written !== $count * 4) {
-            return $this->sortFilesWithNfoPriorityPhp($files);
-        }
-
-        /** @var array<int, int>|false $order */
-        $order = unpack('V*', FFI::string($scratch, $written));
-        if ($order === false) {
-            return $this->sortFilesWithNfoPriorityPhp($files);
-        }
-
-        $supported = true;
-        $sorted = [];
-        foreach ($order as $idx) {
-            $sorted[] = $values[$idx];
-        }
-
-        return $sorted;
-    }
-
-    /**
-     * Pure PHP reference implementation of NFO-priority sorting.
-     *
-     * @param  list<array<string, mixed>>  $files
-     * @return list<array<string, mixed>>
-     */
-    public function sortFilesWithNfoPriorityPhp(array $files): array
     {
         usort($files, function ($a, $b) {
             $aIsNfo = $this->isNfoFile($a['name'] ?? '');
@@ -452,7 +278,7 @@ class ArchiveExtractionService
             if (! File::isDirectory($unzipDir)) {
                 File::makeDirectory($unzipDir, 0777, true, true);
             }
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             if ($this->config->debugMode) {
                 Log::warning('Failed ensuring extraction subdirectories: '.$e->getMessage());
             }
@@ -541,69 +367,6 @@ class ArchiveExtractionService
      * last, so it can be cut from the tail and checked. Packed data is left out.
      */
     public function withSevenZipEndHeader(string $head, string $tail): ?string
-    {
-        return $this->withSevenZipEndHeaderNative($head, $tail);
-    }
-
-    /**
-     * Rebuild a listable 7z via the Rust CRC32/header accelerator, falling back to PHP.
-     */
-    public function withSevenZipEndHeaderNative(string $head, string $tail, bool &$supported = false): ?string
-    {
-        $supported = false;
-        $ffi = RustPipelineLibrary::resolveDomain('archive_extraction', self::FFI_CDEF, $this->libraryPath);
-        if ($ffi === null) {
-            return $this->withSevenZipEndHeaderPhp($head, $tail);
-        }
-
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $cap);
-        if ($scratch === null) {
-            return $this->withSevenZipEndHeaderPhp($head, $tail);
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_archive_7z_validate_end_header(
-                $head,
-                strlen($head),
-                $tail,
-                strlen($tail),
-                $scratch,
-                $cap,
-            );
-            if (is_int($written) && $written < -1) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($scratch === null) {
-                    return $this->withSevenZipEndHeaderPhp($head, $tail);
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_archive_7z_validate_end_header(
-                    $head,
-                    strlen($head),
-                    $tail,
-                    strlen($tail),
-                    $scratch,
-                    $cap,
-                );
-            }
-        } catch (Throwable) {
-            return $this->withSevenZipEndHeaderPhp($head, $tail);
-        }
-
-        if (! is_int($written) || $written < 0) {
-            return $this->withSevenZipEndHeaderPhp($head, $tail);
-        }
-
-        $supported = true;
-
-        return $written === 0 ? null : FFI::string($scratch, $written);
-    }
-
-    /**
-     * Pure PHP reference implementation of 7z end-header validation and reconstruction.
-     */
-    public function withSevenZipEndHeaderPhp(string $head, string $tail): ?string
     {
         $start = $this->sevenZipStartHeader($head);
         if ($start === null || $start['next_size'] === 0 || $start['next_size'] > strlen($tail)) {
@@ -704,7 +467,7 @@ class ArchiveExtractionService
             $process = new SymfonyProcess([$client, 'l', '-slt', '-ba', '-sccUTF-8', '-pnntmux', '-t7z', '--', $file]);
             $process->setTimeout(60)->start();
             [$files, $complete] = $this->readSevenZipListing($process);
-        } catch (Throwable) {
+        } catch (\Throwable) {
             return null;
         } finally {
             if ($process?->isRunning()) {
@@ -827,9 +590,6 @@ class ArchiveExtractionService
 
     /**
      * Detect a plain media container (not an archive) from its leading bytes.
-     *
-     * Stays on native PHP in production because the 4-byte signature checks cost ~100 ns,
-     * so a single-buffer FFI crossing (~80 ns) measures below the 1.5x adoption threshold.
      */
     public function detectStandaloneVideo(string $data): ?string
     {
@@ -850,34 +610,6 @@ class ArchiveExtractionService
             $sig4 === 'OggS' => 'ogv',
             default => null,
         };
-    }
-
-    /**
-     * `detectStandaloneVideo()` backed by the Rust pipeline library; falls back to
-     * `detectStandaloneVideo()` (and leaves `$supported` false) when unavailable.
-     */
-    public function detectStandaloneVideoNative(string $data, bool &$supported = false): ?string
-    {
-        $supported = false;
-        $ffi = RustPipelineLibrary::resolveDomain('archive_extraction', self::FFI_CDEF, $this->libraryPath);
-        if ($ffi === null) {
-            return $this->detectStandaloneVideo($data);
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $code = $ffi->nntmux_archive_detect_standalone_video($data, strlen($data));
-        } catch (Throwable) {
-            return $this->detectStandaloneVideo($data);
-        }
-
-        if (! is_int($code) || $code < 0) {
-            return $this->detectStandaloneVideo($data);
-        }
-
-        $supported = true;
-
-        return self::STANDALONE_VIDEO_CODES[$code] ?? null;
     }
 
     /**
@@ -946,7 +678,7 @@ class ArchiveExtractionService
                         $extractedFiles[$filename] = $extracted;
                         $remaining = array_values(array_diff($remaining, [$filename]));
                     }
-                } catch (Throwable $e) {
+                } catch (\Throwable $e) {
                     if ($this->config->debugMode) {
                         Log::debug('ArchiveInfo getFileData failed: '.$e->getMessage());
                     }
@@ -972,42 +704,6 @@ class ArchiveExtractionService
      * @return array<string, int> name => size
      */
     public static function completeStoredEntries(array $files): array
-    {
-        $entries = [];
-        foreach ($files as $file) {
-            if (! is_array($file) || ! isset($file['name'], $file['size'], $file['range'])
-                || ($file['source'] ?? 'main') !== 'main'
-                || ! empty($file['pass'])
-                || ! empty($file['is_dir'])
-                || ($file['compressed'] ?? null) !== 0
-            ) {
-                continue;
-            }
-
-            $size = (int) $file['size'];
-            if ($size <= 0) {
-                continue;
-            }
-
-            $range = (string) $file['range'];
-            $dash = strpos($range, '-');
-            $start = $dash === 0 ? 0 : (int) $range;
-            $end = $dash === false ? -1 : (int) substr($range, $dash + 1);
-            if ($end - $start + 1 === $size) {
-                $entries[(string) $file['name']] = $size;
-            }
-        }
-
-        return $entries;
-    }
-
-    /**
-     * Original array_map/explode implementation of `completeStoredEntries()` retained for parity checks.
-     *
-     * @param  array<int|string, mixed>  $files
-     * @return array<string, int> name => size
-     */
-    public static function completeStoredEntriesLegacy(array $files): array
     {
         $entries = [];
         foreach ($files as $file) {
@@ -1119,7 +815,7 @@ class ArchiveExtractionService
                     return File::get($file->getPathname());
                 }
             }
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             if ($this->config->debugMode) {
                 Log::debug('External extraction failed: '.$e->getMessage());
             }
@@ -1155,364 +851,5 @@ class ArchiveExtractionService
         }
 
         Process::timeout(1800)->run($command);
-    }
-
-    public static function useW406RustFfi(?bool $enabled): void
-    {
-        self::$w406UseRustFfi = $enabled;
-    }
-
-    public static function usesW406RustFfi(): bool
-    {
-        return self::$w406UseRustFfi ?? self::W406_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW406RustFfi(): void
-    {
-        self::$w406UseRustFfi = null;
-        self::$w406Ffi = null;
-    }
-
-    /**
-     * Audit extracted archive member paths. A member is rejected when it is not a string, is empty, starts with
-     * '/' or '\\', contains a NUL byte, or has a '..' segment ('/' and '\\' both separate segments); the rest are
-     * safe relative paths. Every string member whose final extension is an executable or script type counts as
-     * executable, rejected or not. The listing exceeds the limit when it holds more than max(0, $maxEntries) members.
-     *
-     * @param  array<array-key, mixed>  $relativePaths
-     * @return array{total_entries: int, safe_relative: int, traversal_rejected: int, executable: int, exceeds_limit: bool}
-     */
-    public static function summarizeExtractedEntriesSafety(array $relativePaths, int $maxEntries = 500): array
-    {
-        return (self::usesW406RustFfi() ? self::summarizeExtractedEntriesSafetyNative($relativePaths, $maxEntries) : null)
-            ?? self::summarizeExtractedEntriesSafetyPhp($relativePaths, $maxEntries);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $relativePaths
-     * @return array{total_entries: int, safe_relative: int, traversal_rejected: int, executable: int, exceeds_limit: bool}
-     */
-    public static function summarizeExtractedEntriesSafetyPhp(array $relativePaths, int $maxEntries = 500): array
-    {
-        $rejected = 0;
-        $executable = 0;
-        foreach ($relativePaths as $path) {
-            if (! \is_string($path)) {
-                $rejected++;
-
-                continue;
-            }
-            $normalized = strtr($path, '\\', '/');
-            if ($path === '' || $normalized[0] === '/' || str_contains($path, "\0") || \in_array('..', explode('/', $normalized), true)) {
-                $rejected++;
-            }
-            $slash = strrpos($normalized, '/');
-            $name = $slash === false ? $normalized : substr($normalized, $slash + 1);
-            $dot = strrpos($name, '.');
-            if ($dot !== false && isset(self::W406_EXECUTABLE_EXTENSIONS[strtolower(substr($name, $dot + 1))])) {
-                $executable++;
-            }
-        }
-        $total = \count($relativePaths);
-
-        return [
-            'total_entries' => $total,
-            'safe_relative' => $total - $rejected,
-            'traversal_rejected' => $rejected,
-            'executable' => $executable,
-            'exceeds_limit' => $total > max(0, $maxEntries),
-        ];
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $relativePaths
-     * @return array{total_entries: int, safe_relative: int, traversal_rejected: int, executable: int, exceeds_limit: bool}|null
-     */
-    public static function summarizeExtractedEntriesSafetyNative(array $relativePaths, int $maxEntries = 500): ?array
-    {
-        $total = \count($relativePaths);
-        $frame = pack('qV', $maxEntries, $total);
-        foreach ($relativePaths as $path) {
-            $frame .= self::w406OptionalString($path);
-        }
-        $slots = self::w406Slots(1, $frame, 5);
-        if ($slots === null || $slots[0] !== $total || $slots[1] < 0 || $slots[2] < 0 || $total !== $slots[1] + $slots[2]
-            || $slots[3] < 0 || $slots[3] > $total || ($slots[4] & ~1) !== 0) {
-            return null;
-        }
-
-        return [
-            'total_entries' => $total,
-            'safe_relative' => $slots[1],
-            'traversal_rejected' => $slots[2],
-            'executable' => $slots[3],
-            'exceeds_limit' => $slots[4] === 1,
-        ];
-    }
-
-    /**
-     * Frames a value as a u32-LE length-prefixed string, or as the 0xFFFFFFFF marker when it is not a string.
-     *
-     * @internal
-     */
-    public static function w406OptionalString(mixed $value): string
-    {
-        return \is_string($value) ? pack('V', \strlen($value)).$value : pack('V', 0xFFFFFFFF);
-    }
-
-    /**
-     * Calls the Wave 40.6 export shared by the additional-processing helpers and decodes its fixed i64 slots.
-     * Every output fits the initial scratch buffer, so any negative or unexpected size falls back to PHP.
-     *
-     * @internal
-     *
-     * @return list<int>|null
-     */
-    public static function w406Slots(int $operation, string $input, int $slots): ?array
-    {
-        if (\strlen($input) > self::W406_RUST_MAX_INPUT) {
-            return null;
-        }
-        try {
-            self::$w406Ffi ??= RustPipelineLibrary::resolveDomain('additional_w406', self::W406_FFI_CDEF) ?? false;
-            if (self::$w406Ffi === false) {
-                return null;
-            }
-            $ffi = self::$w406Ffi;
-            $capacity = 0;
-            $buffer = RustPipelineLibrary::obtainScratch($ffi, $slots * 8, $capacity);
-            if ($buffer === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w406_archive_media_download_processor_planner($operation, $input, \strlen($input), $buffer, min($capacity, self::W406_RUST_MAX_INPUT));
-            if ($written !== $slots * 8) {
-                return null;
-            }
-            $values = unpack('q*', FFI::string($buffer, $written));
-
-            return $values === false ? null : array_values($values);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // Wave 52.4 batch helper
-    // ---------------------------------------------------------------------
-
-    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 3.48x, p99 2.58x; uncommon mean 4.22x, p99 2.91x); see RustWorkPlannerArchiveConfigConsoleMediaExtractW52ParityTest. */
-    private const bool W52_RUST_FFI_DEFAULT = true;
-
-    public const string W52_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w524_extracted_entry_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /** extractedEntryBatch() flags. */
-    public const int W52_ENTRY_EMPTY = 1;
-
-    public const int W52_ENTRY_ABSOLUTE = 2;
-
-    public const int W52_ENTRY_TRAVERSAL = 4;
-
-    public const int W52_ENTRY_NUL = 8;
-
-    public const int W52_ENTRY_EXECUTABLE = 16;
-
-    public const int W52_ENTRY_ARCHIVE = 32;
-
-    public const int W52_ENTRY_NFO = 64;
-
-    private const array W52_ARCHIVE_EXTENSIONS = ['rar' => true, 'zip' => true, '7z' => true];
-
-    private const array W52_NFO_EXTENSIONS = ['nfo' => true, 'diz' => true, 'inf' => true];
-
-    /**
-     * Audit extracted archive member paths, two ints each: [flags, base name offset << 32 |
-     * length, the text after the last '/' or '\\']. Flags: 1 empty, 2 absolute (leading '/' or
-     * '\\'), 4 '..' segment, 8 NUL byte, 16 executable or script extension, 32 nested archive
-     * (rar, zip, 7z, rNN or NNN), 64 nfo/diz/inf. Empty, absolute, traversal and NUL members
-     * are the ones summarizeExtractedEntriesSafety() rejects.
-     *
-     * @param  list<string>  $paths
-     * @return list<int>
-     */
-    public static function extractedEntryBatch(array $paths): array
-    {
-        return self::usesW52RustFfi()
-            ? self::extractedEntryBatchNative($paths)
-            : self::extractedEntryBatchPhp($paths);
-    }
-
-    /**
-     * @param  list<string>  $paths
-     * @return list<int>
-     */
-    public static function extractedEntryBatchNative(array $paths): array
-    {
-        self::w52AssertList($paths);
-        if ($paths === []) {
-            return [];
-        }
-
-        [$text, $twin] = self::w52Text($paths);
-
-        return self::w52Call($text, $twin, \count($paths))
-            ?? self::extractedEntryBatchPhp($paths);
-    }
-
-    /**
-     * @param  list<string>  $paths
-     * @return list<int>
-     */
-    public static function extractedEntryBatchPhp(array $paths): array
-    {
-        self::w52AssertList($paths);
-        $out = [];
-        foreach ($paths as $path) {
-            if ($path === '') {
-                $out[] = self::W52_ENTRY_EMPTY;
-                $out[] = 0;
-
-                continue;
-            }
-            $normalized = strtr($path, '\\', '/');
-            $flags = $normalized[0] === '/' ? self::W52_ENTRY_ABSOLUTE : 0;
-            if (\in_array('..', explode('/', $normalized), true)) {
-                $flags |= self::W52_ENTRY_TRAVERSAL;
-            }
-            if (str_contains($path, "\0")) {
-                $flags |= self::W52_ENTRY_NUL;
-            }
-            $slash = strrpos($normalized, '/');
-            $at = $slash === false ? 0 : $slash + 1;
-            $dot = strrpos($normalized, '.', $at);
-            $extension = $dot === false ? '' : strtolower(substr($normalized, $dot + 1));
-            if (isset(self::W406_EXECUTABLE_EXTENSIONS[$extension])) {
-                $flags |= self::W52_ENTRY_EXECUTABLE;
-            }
-            if (isset(self::W52_ARCHIVE_EXTENSIONS[$extension]) || preg_match('/^(?:r\d\d|\d{3})\z/', $extension) === 1) {
-                $flags |= self::W52_ENTRY_ARCHIVE;
-            }
-            if (isset(self::W52_NFO_EXTENSIONS[$extension])) {
-                $flags |= self::W52_ENTRY_NFO;
-            }
-            $out[] = $flags;
-            $out[] = ($at << 32) | (\strlen($path) - $at);
-        }
-
-        return $out;
-    }
-
-    public static function usesW52RustFfi(): bool
-    {
-        $enabled = self::w52RustFfiState('enabled');
-
-        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Run $callback with the W52 batch dispatch forced on or off, then restore the previous choice.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w52RustFfiState('enabled');
-        self::w52RustFfiState('enabled', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w52RustFfiState('enabled', $previous);
-        }
-    }
-
-    /**
-     * One FFI crossing for the batch: encoded text and packed int64 columns in, 2 int64
-     * words back per record. Null when the library is missing or declines.
-     *
-     * @return list<int>|null
-     */
-    private static function w52Call(string $text, string $ints, int $count): ?array
-    {
-        try {
-            $state = self::w52RustFfiState();
-            $ffi = $state['ffi'] ?? null;
-            if ($ffi === null) {
-                $ffi = RustPipelineLibrary::resolveDomain('metadata_w52', self::W52_FFI_CDEF) ?? false;
-                self::w52RustFfiState('ffi', $ffi);
-            }
-            if (! $ffi instanceof FFI) {
-                return null;
-            }
-            $need = $count * 2;
-            $out = $state['out'] ?? null;
-            $cap = $state['cap'] ?? 0;
-            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
-                $cap = max(1024, $need);
-                $out = $ffi->new('int64_t['.$cap.']');
-                self::w52RustFfiState('out', $out);
-                self::w52RustFfiState('cap', $cap);
-            }
-            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
-            $written = $ffi->nntmux_w524_extracted_entry_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
-            if ($written !== $need) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($out, $need * 8));
-
-            return $values === false ? null : array_values($values);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Text column encoding: NUL-joined values and, when a value holds a NUL byte, the same
-     * values joined with 0x01 so Rust finds the separators where the two buffers differ.
-     *
-     * @param  list<string>  $values
-     * @return array{0: string, 1: string}
-     */
-    private static function w52Text(array $values): array
-    {
-        $joined = implode("\0", $values);
-
-        return [$joined, substr_count($joined, "\0") === \count($values) - 1 ? '' : implode("\x01", $values)];
-    }
-
-    /** @param array<array-key, mixed> $values */
-    private static function w52AssertList(array $values): void
-    {
-        if (! array_is_list($values)) {
-            throw new InvalidArgumentException('W52 batch input must be a list.');
-        }
-    }
-
-    /**
-     * W52 routing override and cached binding. Readonly classes cannot declare static
-     * properties, so they live in a function static: no arguments returns the state, one
-     * argument reads a key ('reset' clears everything) and two arguments write a key.
-     */
-    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
-        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-        if ($op === null) {
-            return $state;
-        }
-        if ($op === 'reset') {
-            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-
-            return null;
-        }
-        if (\func_num_args() > 1) {
-            $state[$op] = $val;
-        }
-
-        return $state[$op] ?? null;
     }
 }

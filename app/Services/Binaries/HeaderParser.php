@@ -5,9 +5,6 @@ declare(strict_types=1);
 namespace App\Services\Binaries;
 
 use App\Services\BlacklistService;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 
 /**
  * Parses and filters raw NNTP headers.
@@ -23,13 +20,6 @@ final class HeaderParser
      * File counter inside a subject base name, such as `[03/62]` or `(3 of 62)`.
      */
     public const string FILE_COUNTER_PATTERN = '/[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])[\s$:]/i';
-
-    private const string FFI_CDEF = <<<'C'
-        int64_t nntmux_header_parse_subject(const char *input, size_t len);
-        int64_t nntmux_header_parse_batch(const char *input, size_t len, size_t count, char *out, size_t cap);
-        C;
-
-    private FFI|false|null $subjectFfi = null;
 
     private BlacklistService $blacklistService;
 
@@ -51,12 +41,8 @@ final class HeaderParser
     /** Rust port of markPerArticleObfuscated(); false keeps the PHP rule only, null builds it on first need. */
     private NativePerArticleObfuscation|false|null $native;
 
-    public function __construct(
-        ?BlacklistService $blacklistService = null,
-        NativePerArticleObfuscation|false|null $native = null,
-        private readonly ?string $libraryPath = null,
-        private readonly bool $useRust = true
-    ) {
+    public function __construct(?BlacklistService $blacklistService = null, NativePerArticleObfuscation|false|null $native = null)
+    {
         $this->blacklistService = $blacklistService ?? new BlacklistService;
         $this->native = $native;
     }
@@ -178,123 +164,6 @@ final class HeaderParser
     }
 
     /**
-     * Preserve the original PCRE captures, including raw digit strings and yEnc normalization.
-     *
-     * @return array<int, string>|null
-     */
-    public function parseSubject(string $subject): ?array
-    {
-        // Paired caller benchmarks keep short subjects and negative tail probes on PCRE.
-        $ffi = $this->useRust && self::worthNativeSubject($subject) ? $this->subjectLibrary() : null;
-        if ($ffi !== null) {
-            // @phpstan-ignore method.notFound
-            $packed = $ffi->nntmux_header_parse_subject($subject, \strlen($subject));
-            if (\is_int($packed) && $packed >= 0) {
-                return self::subjectCaptures($subject, $packed);
-            }
-        }
-        if (! preg_match(self::SUBJECT_PATTERN, $subject, $matches)) {
-            return null;
-        }
-        if (stripos($subject, 'yEnc') === false) {
-            $matches[1] .= ' yEnc';
-        }
-
-        return $matches;
-    }
-
-    private static function worthNativeSubject(string $subject): bool
-    {
-        return self::nativeSubjectShape($subject)
-            && (int) ini_get('pcre.backtrack_limit') >= 1000000
-            && (int) ini_get('pcre.recursion_limit') >= 100000
-            && \in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true);
-    }
-
-    private static function nativeSubjectShape(string $subject): bool
-    {
-        $length = \strlen($subject);
-
-        return $length >= 768 && $length <= 2048 && $subject[$length - 1] === ')'
-            && preg_match('/\\([0-9]+\\/[0-9]+\\)$/D', $subject) === 1;
-    }
-
-    private function subjectLibrary(): ?FFI
-    {
-        if (! $this->useRust) {
-            return null;
-        }
-        if ($this->subjectFfi === null) {
-            $this->subjectFfi = RustPipelineLibrary::resolveDomain('header_parser', self::FFI_CDEF, $this->libraryPath) ?? false;
-        }
-
-        return $this->subjectFfi === false ? null : $this->subjectFfi;
-    }
-
-    /** @return array<int, string>|null */
-    private static function subjectCaptures(string $subject, int $packed): ?array
-    {
-        if ($packed === 0) {
-            return null;
-        }
-        $start = $packed & 255;
-        $length = ($packed >> 8) & 65535;
-        $partLength = ($packed >> 32) & 255;
-        $totalLength = ($packed >> 40) & 255;
-        $partStart = $start + $length + (($packed >> 24) & 255) + 1;
-        $totalStart = $partStart + $partLength + 1;
-
-        return [
-            substr($subject, 0, $totalStart + $totalLength + 1),
-            substr($subject, $start, $length).(($packed >> 48) === 1 ? ' yEnc' : ''),
-            substr($subject, $partStart, $partLength),
-            substr($subject, $totalStart, $totalLength),
-        ];
-    }
-
-    /**
-     * Copy results before returning: blacklist calls may reuse the shared scratch buffer.
-     *
-     * @param  array<int, array<string, mixed>>  $headers
-     * @return array<int, int>|null
-     */
-    private function batchSubjects(array $headers): ?array
-    {
-        if (\count($headers) < 32) {
-            return null;
-        }
-        $first = reset($headers);
-        if (! isset($first['Subject']) || ! \is_string($first['Subject']) || ! self::worthNativeSubject($first['Subject'])) {
-            return null;
-        }
-        $ffi = $this->subjectLibrary();
-        if ($ffi === null) {
-            return null;
-        }
-        $framed = '';
-        foreach ($headers as $header) {
-            if (! isset($header['Subject']) || ! \is_string($header['Subject']) || ! self::nativeSubjectShape($header['Subject'])) {
-                return null;
-            }
-            $framed .= pack('V', \strlen($header['Subject'])).$header['Subject'];
-        }
-        $needed = \count($headers) * 8;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, $needed);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_header_parse_batch($framed, \strlen($framed), \count($headers), $scratch, $needed);
-        if ($written !== $needed) {
-            return null;
-        }
-        /** @var array<int, int> $packed */
-        $packed = unpack('q*', FFI::string($scratch, $needed));
-
-        return $packed;
-    }
-
-    /**
      * Parse and filter raw headers from NNTP.
      *
      * @param  array<int, array<string, mixed>>  $headers  Raw headers from NNTP
@@ -318,11 +187,7 @@ final class HeaderParser
                 ? array_fill_keys(array_map('intval', $missingParts), true)
                 : $missingParts);
 
-        $nativeSubjects = $this->useRust && ! $partRepair && $this->perArticleObfuscated === []
-            ? $this->batchSubjects($headers) : null;
-        $subjectIndex = 0;
         foreach ($headers as $header) {
-            $subjectIndex++;
             // Check if we got the article
             if (! isset($header['Number'])) {
                 continue;
@@ -345,22 +210,15 @@ final class HeaderParser
             }
 
             // Parse subject to get base name and part/total like "(12/45)"
-            if ($nativeSubjects !== null && $nativeSubjects[$subjectIndex] >= 0) {
-                $matches = self::subjectCaptures($header['Subject'], $nativeSubjects[$subjectIndex]);
-                if ($matches === null) {
-                    $this->notYEnc++;
+            if (! preg_match(self::SUBJECT_PATTERN, $header['Subject'], $matches)) {
+                $this->notYEnc++;
 
-                    continue;
-                }
-            } else {
-                if (! preg_match(self::SUBJECT_PATTERN, $header['Subject'], $matches)) {
-                    $this->notYEnc++;
+                continue;
+            }
 
-                    continue;
-                }
-                if (stripos($header['Subject'], 'yEnc') === false) {
-                    $matches[1] .= ' yEnc';
-                }
+            // Normalize to include yEnc if missing
+            if (stripos($header['Subject'], 'yEnc') === false) {
+                $matches[1] .= ' yEnc';
             }
 
             $header['matches'] = $matches;
@@ -456,273 +314,5 @@ final class HeaderParser
         }
 
         return $result;
-    }
-
-    /**
-     * PHP stays the default for summarizeHeaderBatch(): the paired benchmark in
-     * tests/Unit/RustBinariesConfigServiceHandlerHeaderW41ParityTest.php does not clear 1.5x.
-     */
-    public const bool W411_RUST_FFI_DEFAULT = false;
-
-    private const array W411_HEADER_KEYS = ['headers', 'invalid_rows', 'missing_subject', 'yenc', 'part_counter', 'bad_number', 'min_number', 'max_number'];
-
-    private static ?bool $w411UseRustFfi = null;
-
-    private static FFI|false|null $w411Ffi = null;
-
-    /**
-     * Summarizes overview headers (`Subject`, `Number`): a subject that is not a string or trim()s to '' is missing,
-     * string subjects containing `yenc` (ASCII case-insensitive) or a `(digits/digits)` part counter are counted, and
-     * article numbers that are not positive ints (or 1-18 digit strings) are bad; the smallest and largest good
-     * numbers are reported (0 when none). Non-array rows are invalid.
-     *
-     * @param  array<array-key, mixed>  $headers
-     * @return array<string, int>
-     */
-    public static function summarizeHeaderBatch(array $headers): array
-    {
-        return (self::usesW411RustFfi() ? self::summarizeHeaderBatchNative($headers) : null)
-            ?? self::summarizeHeaderBatchPhp($headers);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $headers
-     * @return array<string, int>
-     */
-    public static function summarizeHeaderBatchPhp(array $headers): array
-    {
-        $summary = array_fill_keys(self::W411_HEADER_KEYS, 0);
-        $summary['headers'] = \count($headers);
-        $min = null;
-        $max = 0;
-        foreach ($headers as $header) {
-            if (! \is_array($header)) {
-                $summary['invalid_rows']++;
-
-                continue;
-            }
-            $subject = $header['Subject'] ?? null;
-            if (\is_string($subject)) {
-                $summary['missing_subject'] += (int) (trim($subject) === '');
-                $summary['yenc'] += (int) (stripos($subject, 'yenc') !== false);
-                $summary['part_counter'] += (int) preg_match('/\(\d+\/\d+\)/', $subject);
-            } else {
-                $summary['missing_subject']++;
-            }
-            $number = BinariesService::w411Int($header['Number'] ?? null);
-            if ($number === null || $number <= 0) {
-                $summary['bad_number']++;
-            } else {
-                $min = $min === null ? $number : min($min, $number);
-                $max = max($max, $number);
-            }
-        }
-        $summary['min_number'] = $min ?? 0;
-        $summary['max_number'] = $max;
-
-        return $summary;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $headers
-     * @return array<string, int>|null
-     */
-    public static function summarizeHeaderBatchNative(array $headers): ?array
-    {
-        $words = [\count($headers)];
-        $blob = [];
-        foreach ($headers as $header) {
-            if (\is_array($header)) {
-                BinariesService::w411PackRow($words, $blob, [$header['Subject'] ?? null, $header['Number'] ?? null]);
-            } else {
-                $words[] = 0;
-            }
-        }
-        $values = BinariesService::w411Invoke(self::$w411Ffi, 4, $words, $blob);
-
-        return $values !== null && \count($values) === \count(self::W411_HEADER_KEYS) ? array_combine(self::W411_HEADER_KEYS, $values) : null;
-    }
-
-    public static function useW411RustFfi(bool $enable = true): void
-    {
-        self::$w411UseRustFfi = $enable;
-    }
-
-    public static function usesW411RustFfi(): bool
-    {
-        return self::$w411UseRustFfi ?? self::W411_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW411RustFfi(): void
-    {
-        self::$w411UseRustFfi = null;
-        self::$w411Ffi = null;
-    }
-
-    /** Wave 52.2 paired benchmarks decide this default; see RustBinariesCollectionHeaderMissedPartHandlerW52ParityTest. */
-    private const bool W52_RUST_FFI_DEFAULT = true;
-
-    public const string W52_FFI_CDEF = <<<'C'
-        intptr_t nntmux_w522_header_subject_plan_batch(const char *subjects, size_t subjects_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * Wave 52 routing, binding and output buffer, kept in function-local statics. Operations:
-     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
-     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
-     * least $val words (null without the library).
-     */
-    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $capacity = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = \is_bool($val) ? $val : null;
-
-                return $previous;
-            case 'ffi':
-                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w52', self::W52_FFI_CDEF) ?? false;
-
-                return $ffi === false ? null : $ffi;
-            case 'out':
-                $words = \is_int($val) ? $val : 0;
-                if (! $out instanceof CData || $capacity < $words) {
-                    $resolved = self::w52RustFfiState('ffi');
-                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
-                    if (! $buffer instanceof CData) {
-                        return null;
-                    }
-                    [$out, $capacity] = [$buffer, max(1024, $words)];
-                }
-
-                return [$ffi, $out, $capacity];
-            default:
-                return $enabled;
-        }
-    }
-
-    public static function usesW52RustFfi(): bool
-    {
-        $enabled = self::w52RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with planSubjects() routed to Rust ($enabled) or PHP, then restores the
-     * previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w52RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w52RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Batch SUBJECT_PATTERN plan, as parse() splits subjects. Three words per subject: `flags |
-     * min(strlen(base), 0xFFFFFF) << 8 | crc32(base) << 32`, then `(int)` of the part and of the
-     * total (all three zero when the pattern does not match). The base is capture 1, plus ` yEnc`
-     * when the subject lacks `yEnc` in any case. Flags: 1 matched, 2 yEnc appended, 4 part above
-     * total, 8 part zero, 16 total of at least 2. Matched, unmatched, yEnc-appended and multi-part
-     * counts, the largest matched total and the XXH64 digest of all earlier words follow.
-     *
-     * @param  list<string>  $subjects
-     * @return list<int>
-     */
-    public static function planSubjects(array $subjects): array
-    {
-        return self::usesW52RustFfi() ? self::planSubjectsNative($subjects) : self::planSubjectsPhp($subjects);
-    }
-
-    /**
-     * @param  list<string>  $subjects
-     * @return list<int>
-     */
-    public static function planSubjectsPhp(array $subjects): array
-    {
-        $out = [];
-        $matched = $appended = $multi = $maxTotal = 0;
-        foreach ($subjects as $subject) {
-            if (preg_match(self::SUBJECT_PATTERN, $subject, $matches) !== 1) {
-                $out[] = 0;
-                $out[] = 0;
-                $out[] = 0;
-
-                continue;
-            }
-            $matched++;
-            $base = $matches[1];
-            $flags = 1;
-            if (stripos($subject, 'yEnc') === false) {
-                $base .= ' yEnc';
-                $flags |= 2;
-                $appended++;
-            }
-            $part = (int) $matches[2];
-            $total = (int) $matches[3];
-            $flags |= ($part > $total ? 4 : 0) | ($part === 0 ? 8 : 0);
-            if ($total >= 2) {
-                $flags |= 16;
-                $multi++;
-            }
-            $maxTotal = max($maxTotal, $total);
-            $out[] = $flags | min(\strlen($base), 0xFFFFFF) << 8 | crc32($base) << 32;
-            $out[] = $part;
-            $out[] = $total;
-        }
-        $out[] = $matched;
-        $out[] = \count($subjects) - $matched;
-        $out[] = $appended;
-        $out[] = $multi;
-        $out[] = $maxTotal;
-        /** @var array{1: int} $digest */
-        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
-        $out[] = $digest[1];
-
-        return $out;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing, the input is not a list or a
-     * subject holds a NUL byte.
-     *
-     * @param  list<string>  $subjects
-     * @return list<int>
-     */
-    public static function planSubjectsNative(array $subjects): array
-    {
-        $count = \count($subjects);
-        $words = 3 * $count + 6;
-        /** @var array{FFI, CData, int}|null $state */
-        $state = $count === 0 ? null : self::w52RustFfiState('out', $words);
-        if ($state === null || ! array_is_list($subjects)) {
-            return self::planSubjectsPhp($subjects);
-        }
-        [$ffi, $out, $cap] = $state;
-        $joined = implode("\0", $subjects);
-        try {
-            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
-            $written = $ffi->nntmux_w522_header_subject_plan_batch($joined, \strlen($joined), $count, $out, $cap);
-        } catch (\Throwable) {
-            $written = -1;
-        }
-        /** @var array<int, int>|false $values */
-        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
-
-        return \is_array($values) ? array_values($values) : self::planSubjectsPhp($subjects);
     }
 }

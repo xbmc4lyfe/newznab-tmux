@@ -10,10 +10,7 @@ use App\Services\AdditionalProcessing\DTO\Par2FileEntry;
 use App\Services\AdditionalProcessing\Enums\DownloadKind;
 use App\Services\NNTP\NNTPService;
 use App\Services\Yenc\YencPart;
-use App\Support\RustPipelineLibrary;
 use Exception;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -22,24 +19,6 @@ use Illuminate\Support\Facades\Log;
  */
 class UsenetDownloadService
 {
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_rfm_is_group_unavailable(const char *ptr, size_t len);
-        int32_t nntmux_rfm_mapped_article_kind(const char *ptr, size_t len);
-        C;
-
-    private const string DEFAULT_VIDEO_FILE_REGEX = '\.(AVI|F4V|IFO|M1V|M2V|M4V|MKV|MOV|MP4|MPEG|MPG|MPGV|MPV|OGV|QT|RM|RMVB|TS|VOB|WMV)';
-
-    private static ?FFI $ffi = null;
-
-    private static bool $ffiResolved = false;
-
-    private static bool $useRustFfi = true;
-
-    /** Wave 40.6 paired benchmarks decide this default; see RustArchiveExtractionMediaUsenetDownloadReleaseProcW40ParityTest. */
-    public const bool W406_RUST_FFI_DEFAULT = false;
-
-    private static ?bool $w406UseRustFfi = null;
-
     private const int MAX_CACHE_ENTRIES = 4;
 
     private const int MAX_CACHE_ENTRY_BYTES = 8_388_608;
@@ -469,10 +448,11 @@ class UsenetDownloadService
                 && ($article['part']->name !== $file->name || $article['part']->size !== $file->size))) {
             return;
         }
-        $archive = self::isMappedArchiveName($file->name);
+        $archive = preg_match('/\.(?:rar|7z(?:\.\d+)?|zip|\d{3})$/i', $file->name) === 1;
         $video = $allowVideo && ! $archive && $this->config->processThumbnails && $this->config->mediaMainVideoFallback
             && $file->size >= $this->config->mediaMainVideoMinBytes
-            && self::isMappedVideoName($file->name, $this->config->videoFileRegex)
+            && stripos($file->name, 'sample') === false
+            && preg_match('/'.$this->config->videoFileRegex.'$/i', $file->name) === 1
             && $article['part']->size === $file->size && $article['part']->offset() === 0
             && ($article['part']->part === null || $article['part']->part === 1);
         $key = $article['key'];
@@ -522,130 +502,10 @@ class UsenetDownloadService
         return count($this->releaseCache) + count($this->mappedArchiveArticles) + count($this->mappedVideoArticles) + ($this->pendingMappingArticle === null ? 0 : 1);
     }
 
-    /**
-     * Retains the native PHP path in production (~0.44x-0.72x mean in paired benchmarks);
-     * see isMappedArchiveNameNative().
-     */
-    public static function isMappedArchiveName(string $name): bool
-    {
-        return self::isMappedArchiveNamePhp($name);
-    }
-
-    public static function isMappedArchiveNamePhp(string $name): bool
-    {
-        return preg_match('/\.(?:rar|7z(?:\.\d+)?|zip|\d{3})$/i', $name) === 1;
-    }
-
-    public static function isMappedArchiveNameNative(string $name, bool &$supported = false, ?string $libraryPath = null): bool
-    {
-        $kind = self::mappedArticleKind($name, $libraryPath);
-        $supported = $kind !== null;
-
-        return $kind === null ? self::isMappedArchiveNamePhp($name) : ($kind & 1) === 1;
-    }
-
-    /**
-     * A main-video name: not a sample and ending in a configured video extension.
-     *
-     * Retains the native PHP path in production (~0.76x common, ~1.14x-1.32x uncommon mean
-     * in paired benchmarks); see isMappedVideoNameNative().
-     */
-    public static function isMappedVideoName(string $name, string $videoFileRegex): bool
-    {
-        return self::isMappedVideoNamePhp($name, $videoFileRegex);
-    }
-
-    public static function isMappedVideoNamePhp(string $name, string $videoFileRegex): bool
-    {
-        return stripos($name, 'sample') === false
-            && preg_match('/'.$videoFileRegex.'$/i', $name) === 1;
-    }
-
-    public static function isMappedVideoNameNative(string $name, string $videoFileRegex, bool &$supported = false, ?string $libraryPath = null): bool
-    {
-        $kind = $videoFileRegex === self::DEFAULT_VIDEO_FILE_REGEX ? self::mappedArticleKind($name, $libraryPath) : null;
-        $supported = $kind !== null;
-
-        return $kind === null ? self::isMappedVideoNamePhp($name, $videoFileRegex) : ($kind & 2) === 2;
-    }
-
-    /**
-     * Retains the native PHP path in production (~0.37x-0.52x mean in paired benchmarks);
-     * see isGroupUnavailableMessageNative().
-     */
     private function isGroupUnavailableMessage(string $errorMessage): bool
-    {
-        return self::isGroupUnavailableMessagePhp($errorMessage);
-    }
-
-    public static function isGroupUnavailableMessagePhp(string $errorMessage): bool
     {
         return stripos($errorMessage, 'No such news group') !== false
             || stripos($errorMessage, 'Group not found') !== false;
-    }
-
-    public static function isGroupUnavailableMessageNative(string $errorMessage, bool &$supported = false, ?string $libraryPath = null): bool
-    {
-        $supported = false;
-        $ffi = self::rustFfi($libraryPath);
-        if ($ffi === null) {
-            return self::isGroupUnavailableMessagePhp($errorMessage);
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_rfm_is_group_unavailable($errorMessage, strlen($errorMessage));
-        } catch (\Throwable) {
-            return self::isGroupUnavailableMessagePhp($errorMessage);
-        }
-
-        if (! is_int($status) || $status < 0) {
-            return self::isGroupUnavailableMessagePhp($errorMessage);
-        }
-        $supported = true;
-
-        return $status === 1;
-    }
-
-    /**
-     * Toggle the Rust helpers; disabled, every *Native method falls back to PHP.
-     */
-    public static function useRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    private static function mappedArticleKind(string $name, ?string $libraryPath): ?int
-    {
-        $ffi = self::rustFfi($libraryPath);
-        if ($ffi === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $kind = $ffi->nntmux_rfm_mapped_article_kind($name, strlen($name));
-        } catch (\Throwable) {
-            return null;
-        }
-
-        return is_int($kind) && $kind >= 0 ? $kind : null;
-    }
-
-    private static function rustFfi(?string $libraryPath = null): ?FFI
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        if ($libraryPath !== null) {
-            return RustPipelineLibrary::resolveDomain('usenet_download', self::FFI_CDEF, $libraryPath);
-        }
-        if (! self::$ffiResolved) {
-            self::$ffiResolved = true;
-            self::$ffi = RustPipelineLibrary::resolveDomain('usenet_download', self::FFI_CDEF);
-        }
-
-        return self::$ffi;
     }
 
     /**
@@ -724,233 +584,5 @@ class UsenetDownloadService
     public function meetsMinimumSize(string $data, int $minimumBytes = 40): bool
     {
         return strlen($data) > $minimumBytes;
-    }
-
-    public static function useW406RustFfi(?bool $enabled): void
-    {
-        self::$w406UseRustFfi = $enabled;
-    }
-
-    public static function usesW406RustFfi(): bool
-    {
-        return self::$w406UseRustFfi ?? self::W406_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW406RustFfi(): void
-    {
-        self::$w406UseRustFfi = null;
-    }
-
-    /**
-     * Summarize NNTP segment outcomes. Each outcome is an array whose string 'status' is ok/downloaded,
-     * missing/not_found or timeout/error/retry (compared exactly); other values only count toward the total.
-     * Downloaded segments add max(0, an integer 'bytes'), saturating at PHP_INT_MAX. The window aborts once
-     * more than max(0, $maxMissingSegments) articles are missing.
-     *
-     * @param  array<array-key, mixed>  $segmentOutcomes
-     * @return array{total_segments: int, downloaded: int, missing_articles: int, transient_errors: int, downloaded_bytes: int, abort_threshold_exceeded: bool}
-     */
-    public static function summarizeSegmentDownloadWindow(array $segmentOutcomes, int $maxMissingSegments = 2): array
-    {
-        return (self::usesW406RustFfi() ? self::summarizeSegmentDownloadWindowNative($segmentOutcomes, $maxMissingSegments) : null)
-            ?? self::summarizeSegmentDownloadWindowPhp($segmentOutcomes, $maxMissingSegments);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $segmentOutcomes
-     * @return array{total_segments: int, downloaded: int, missing_articles: int, transient_errors: int, downloaded_bytes: int, abort_threshold_exceeded: bool}
-     */
-    public static function summarizeSegmentDownloadWindowPhp(array $segmentOutcomes, int $maxMissingSegments = 2): array
-    {
-        $downloaded = 0;
-        $missing = 0;
-        $transient = 0;
-        $bytes = 0;
-        foreach ($segmentOutcomes as $outcome) {
-            [$status, $size] = self::w406Segment($outcome);
-            switch ($status) {
-                case 'ok':
-                case 'downloaded':
-                    $downloaded++;
-                    if ($size > 0) {
-                        $bytes = $bytes > PHP_INT_MAX - $size ? PHP_INT_MAX : $bytes + $size;
-                    }
-                    break;
-                case 'missing':
-                case 'not_found':
-                    $missing++;
-                    break;
-                case 'timeout':
-                case 'error':
-                case 'retry':
-                    $transient++;
-                    break;
-            }
-        }
-
-        return [
-            'total_segments' => \count($segmentOutcomes),
-            'downloaded' => $downloaded,
-            'missing_articles' => $missing,
-            'transient_errors' => $transient,
-            'downloaded_bytes' => $bytes,
-            'abort_threshold_exceeded' => $missing > max(0, $maxMissingSegments),
-        ];
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $segmentOutcomes
-     * @return array{total_segments: int, downloaded: int, missing_articles: int, transient_errors: int, downloaded_bytes: int, abort_threshold_exceeded: bool}|null
-     */
-    public static function summarizeSegmentDownloadWindowNative(array $segmentOutcomes, int $maxMissingSegments = 2): ?array
-    {
-        $total = \count($segmentOutcomes);
-        $frame = pack('qV', $maxMissingSegments, $total);
-        foreach ($segmentOutcomes as $outcome) {
-            [$status, $size] = self::w406Segment($outcome);
-            $frame .= ArchiveExtractionService::w406OptionalString($status).pack('q', $size);
-        }
-        $slots = ArchiveExtractionService::w406Slots(3, $frame, 6);
-        if ($slots === null || $slots[0] !== $total || $slots[1] < 0 || $slots[2] < 0 || $slots[3] < 0
-            || $total < $slots[1] + $slots[2] + $slots[3] || $slots[4] < 0 || ($slots[5] & ~1) !== 0) {
-            return null;
-        }
-
-        return [
-            'total_segments' => $total,
-            'downloaded' => $slots[1],
-            'missing_articles' => $slots[2],
-            'transient_errors' => $slots[3],
-            'downloaded_bytes' => $slots[4],
-            'abort_threshold_exceeded' => $slots[5] === 1,
-        ];
-    }
-
-    /** @return array{0: string|null, 1: int} The outcome's string status and integer byte count, if any. */
-    private static function w406Segment(mixed $outcome): array
-    {
-        if (! \is_array($outcome)) {
-            return [null, 0];
-        }
-        $status = $outcome['status'] ?? null;
-        $size = $outcome['bytes'] ?? null;
-
-        return [\is_string($status) ? $status : null, \is_int($size) ? $size : 0];
-    }
-
-    /** Enabled: three paired runs cleared every 1.5x gate (common mean 4.22-4.42x, p99 3.69-3.95x; uncommon mean 3.78-3.92x, p99 3.08-3.87x); see RustReleaseFileArchiveProcessorSyncUsenetW52ParityTest. */
-    private const bool W52_RUST_FFI_DEFAULT = true;
-
-    public const string W52_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w523_mapped_article_kind_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    private static ?bool $useW52RustFfi = null;
-
-    private static FFI|false|null $w52Ffi = null;
-
-    private static ?CData $w52Out = null;
-
-    private static int $w52OutCap = 0;
-
-    public static function usesW52RustFfi(): bool
-    {
-        return self::$useW52RustFfi ?? self::W52_RUST_FFI_DEFAULT;
-    }
-
-    /** Runs $callback with the Wave 52 Rust path forced on or off, then restores the previous setting. */
-    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::$useW52RustFfi;
-        self::$useW52RustFfi = $enabled;
-        try {
-            return $callback();
-        } finally {
-            self::$useW52RustFfi = $previous;
-        }
-    }
-
-    /**
-     * Classifies PAR2-mapped article names: one word per name with 1 isMappedArchiveNamePhp() and
-     * 2 isMappedVideoNamePhp($name, $videoFileRegex), then the archive and video counts. Rust
-     * handles the default video regex; any other regex stays on PHP.
-     *
-     * @param  array<int, string>  $names
-     * @return list<int>
-     */
-    public static function w52MappedArticleKindBatch(array $names, string $videoFileRegex = self::DEFAULT_VIDEO_FILE_REGEX): array
-    {
-        return self::usesW52RustFfi() ? self::w52MappedArticleKindBatchNative($names, $videoFileRegex) : self::w52MappedArticleKindBatchPhp($names, $videoFileRegex);
-    }
-
-    /**
-     * @param  array<int, string>  $names
-     * @return list<int>
-     */
-    public static function w52MappedArticleKindBatchNative(array $names, string $videoFileRegex = self::DEFAULT_VIDEO_FILE_REGEX): array
-    {
-        if ($videoFileRegex !== self::DEFAULT_VIDEO_FILE_REGEX) {
-            return self::w52MappedArticleKindBatchPhp($names, $videoFileRegex);
-        }
-        $count = \count($names);
-
-        return self::w52Invoke(implode("\0", $names), '', $count, $count + 2)
-            ?? self::w52MappedArticleKindBatchPhp($names, $videoFileRegex);
-    }
-
-    /**
-     * @param  array<int, string>  $names
-     * @return list<int>
-     */
-    public static function w52MappedArticleKindBatchPhp(array $names, string $videoFileRegex = self::DEFAULT_VIDEO_FILE_REGEX): array
-    {
-        $out = [];
-        $archives = 0;
-        $videos = 0;
-        foreach ($names as $name) {
-            $name = (string) $name;
-            $archive = self::isMappedArchiveNamePhp($name);
-            $video = self::isMappedVideoNamePhp($name, $videoFileRegex);
-            $archives += (int) $archive;
-            $videos += (int) $video;
-            $out[] = (int) $archive | ($video ? 2 : 0);
-        }
-        $out[] = $archives;
-        $out[] = $videos;
-
-        return $out;
-    }
-
-    /**
-     * Calls the Wave 52 export with NUL-joined strings and packed `i64` integers. Null when the
-     * library is missing, the call declines (for example a string holding a NUL byte) or it writes
-     * more than $cap words, so the caller falls back to PHP.
-     *
-     * @return list<int>|null
-     */
-    private static function w52Invoke(string $blob, string $ints, int $count, int $cap): ?array
-    {
-        self::$w52Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w52', self::W52_FFI_CDEF) ?? false;
-        $ffi = self::$w52Ffi;
-        if ($ffi === false) {
-            return null;
-        }
-        try {
-            if (self::$w52Out === null || self::$w52OutCap < $cap) {
-                self::$w52OutCap = max(1024, $cap * 2);
-                self::$w52Out = $ffi->new('int64_t['.self::$w52OutCap.']');
-            }
-            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
-            $written = $ffi->nntmux_w523_mapped_article_kind_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w52Out, self::$w52OutCap);
-            if (! \is_int($written) || $written <= 0 || $written > $cap) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string(self::$w52Out, $written * 8));
-
-            /** @var list<int>|null */
-            return $values === false ? null : array_values($values);
-        } catch (\Throwable) {
-            return null;
-        }
     }
 }

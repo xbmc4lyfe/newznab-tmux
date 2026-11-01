@@ -4,23 +4,9 @@ declare(strict_types=1);
 
 namespace App\Support;
 
-use FFI;
-use Throwable;
-
 final class PredbSearchDocument
 {
-    public const PREDB_IDENTITY_POLICY = '602ab87b80da1ca545fbb0cb363d26577d781442f51059251f07ef548be53a3d';
-
-    private const string FFI_CDEF = <<<'C'
-        int64_t nntmux_predb_validate_filename_candidate(const char *id_str, size_t id_len, int64_t id_int, uint32_t has_id_int, const char *title, size_t title_len, const char *filename, size_t filename_len, const char *source, size_t source_len);
-        ssize_t nntmux_prometheus_format_text(const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_release_plain_search_name(const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        int64_t nntmux_datetime_to_unix_utc(const char *input, size_t input_len);
-        C;
-
-    private static FFI|false|null $ffi = null;
-
-    private static bool $useNative = true;
+    public const PREDB_IDENTITY_POLICY = '2ca16d6496f3ad5cec424f796b17fae0cf25e17cc84522ad874727c821e5f579';
 
     public static function exactValue(string $value): string
     {
@@ -29,67 +15,6 @@ final class PredbSearchDocument
 
     /** @return array{id: int, title: string, filename: string, source: string}|null */
     public static function filenameCandidate(mixed $row): ?array
-    {
-        if (! is_array($row) || ! is_array($row['_source'] ?? null)) {
-            return null;
-        }
-        $rawId = $row['_id'] ?? null;
-        if (! is_int($rawId) && ! is_string($rawId)) {
-            return null;
-        }
-        $source = $row['_source'];
-        $title = $source['title'] ?? null;
-        if (! is_string($title) || $title === '') {
-            return null;
-        }
-        $filename = $source['filename'] ?? '';
-        $src = $source['source'] ?? '';
-        if (! is_string($filename) || ! is_string($src)) {
-            return null;
-        }
-
-        if (self::$useNative) {
-            $ffi = self::$ffi ??= (RustPipelineLibrary::resolveDomain('search_doc_metrics', self::FFI_CDEF) ?? false);
-            if ($ffi !== false) {
-                try {
-                    $hasInt = is_int($rawId) ? 1 : 0;
-                    $idStr = $hasInt === 1 ? '' : $rawId;
-                    // @phpstan-ignore method.notFound
-                    $validId = $ffi->nntmux_predb_validate_filename_candidate(
-                        $idStr,
-                        strlen($idStr),
-                        $hasInt === 1 ? $rawId : 0,
-                        $hasInt,
-                        $title,
-                        strlen($title),
-                        $filename,
-                        strlen($filename),
-                        $src,
-                        strlen($src),
-                    );
-                    if (is_int($validId)) {
-                        if ($validId > 0) {
-                            return [
-                                'id' => $validId,
-                                'title' => $title,
-                                'filename' => $filename,
-                                'source' => $src,
-                            ];
-                        }
-                        if ($validId === 0) {
-                            return null;
-                        }
-                    }
-                } catch (Throwable) {
-                }
-            }
-        }
-
-        return self::filenameCandidatePhp($row);
-    }
-
-    /** @return array{id: int, title: string, filename: string, source: string}|null */
-    private static function filenameCandidatePhp(mixed $row): ?array
     {
         if (! is_array($row) || ! is_array($row['_source'] ?? null)) {
             return null;

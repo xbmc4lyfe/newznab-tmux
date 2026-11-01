@@ -14,13 +14,9 @@ use App\Services\Search\Drivers\ElasticSearchDriver;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Manager;
-use Throwable;
 
 /**
  * Search Service Manager - handles driver resolution for search functionality.
@@ -31,36 +27,6 @@ use Throwable;
  */
 class SearchService extends Manager implements SearchServiceInterface
 {
-    /**
-     * Rust candidates for the pure helpers below. They stay opt-in: none beat PHP by
-     * 1.5x in the paired benchmark (tests/Unit/RustSearchMediaApiCapabilitiesParityTest.php).
-     */
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_search_service_escape_string(int32_t kind, const char *input, size_t len, char *out, size_t cap);
-        int32_t nntmux_search_fuzzy_config_normalize(const int32_t *tags, const int64_t *ints, const char *input, size_t len, const int64_t *lens, int64_t *out);
-        ssize_t nntmux_search_release_ids_diff(const int64_t *ids, size_t count, const int64_t *failed, size_t failed_count, int64_t *out, size_t cap);
-        C;
-
-    public static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
-    public const string W405_FFI_CDEF = 'ptrdiff_t nntmux_w40_manticore_elastic_search_service_circuit(uint32_t mode, const char *input, size_t input_len, char *out, size_t cap);';
-
-    /**
-     * Rust stays opt-in for the Wave 40.5 summary: the FFI round trip misses the 1.5x gate; see
-     * tests/Unit/RustManticoreElasticSearchServiceCircuitW40ParityTest.php.
-     */
-    public const bool W405_RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useW405RustFfi = null;
-
-    private const int W405_NATIVE_MAX_PARTS = 1 << 20;
-
-    private const int W405_NATIVE_MAX_BYTES = 16 * 1024 * 1024;
-
-    private static FFI|false|null $w405Ffi = null;
-
     /**
      * search_index_failures.operation for a deferred update that has not been flushed.
      */
@@ -97,269 +63,6 @@ class SearchService extends Manager implements SearchServiceInterface
      * @var array<int, int>
      */
     private array $deferredReleaseIds = [];
-
-    public static function setUseRustFfi(bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi;
-    }
-
-    public static function searchFfi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
-    public static function useW405RustFfi(?bool $use = true): void
-    {
-        self::$useW405RustFfi = $use;
-    }
-
-    public static function usesW405RustFfi(): bool
-    {
-        return self::$useW405RustFfi ?? self::W405_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW405RustFfi(): void
-    {
-        self::$useW405RustFfi = null;
-    }
-
-    /**
-     * Summarizes search driver fallback attempts in call order. An attempt succeeds only when
-     * `ok` is `true`; `latency_ms` counts when it is an integer (negative values as 0) and the
-     * total saturates at PHP_INT_MAX. Non-array attempts are failed attempts with no latency. A
-     * fallback is used whenever more than one driver was attempted; the winner is the first
-     * successful attempt (-1 when none).
-     *
-     * @param  array<array-key, mixed>  $driverAttempts
-     * @return array{attempts: int, primary_hit: bool, fallback_used: bool, total_latency_ms: int, budget_exceeded: bool, winning_index: int}
-     */
-    public static function summarizeSearchFallbackTelemetry(array $driverAttempts, int $latencyBudgetMs = 1500): array
-    {
-        return self::usesW405RustFfi()
-            ? self::summarizeSearchFallbackTelemetryNative($driverAttempts, $latencyBudgetMs)
-            : self::summarizeSearchFallbackTelemetryPhp($driverAttempts, $latencyBudgetMs);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $driverAttempts
-     * @return array{attempts: int, primary_hit: bool, fallback_used: bool, total_latency_ms: int, budget_exceeded: bool, winning_index: int}
-     */
-    private static function summarizeSearchFallbackTelemetryNative(array $driverAttempts, int $latencyBudgetMs): array
-    {
-        $parts = [(string) $latencyBudgetMs];
-        foreach ($driverAttempts as $attempt) {
-            if (! \is_array($attempt)) {
-                array_push($parts, '0', '');
-
-                continue;
-            }
-            $latency = $attempt['latency_ms'] ?? null;
-            array_push($parts, ($attempt['ok'] ?? null) === true ? '1' : '0', \is_int($latency) ? (string) $latency : '');
-        }
-        $fields = self::evaluateW405Native(3, $parts);
-        if ($fields === null || \count($fields) !== 6) {
-            return self::summarizeSearchFallbackTelemetryPhp($driverAttempts, $latencyBudgetMs);
-        }
-
-        return [
-            'attempts' => (int) $fields[0],
-            'primary_hit' => $fields[1] === '1',
-            'fallback_used' => $fields[2] === '1',
-            'total_latency_ms' => (int) $fields[3],
-            'budget_exceeded' => $fields[4] === '1',
-            'winning_index' => (int) $fields[5],
-        ];
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $driverAttempts
-     * @return array{attempts: int, primary_hit: bool, fallback_used: bool, total_latency_ms: int, budget_exceeded: bool, winning_index: int}
-     */
-    private static function summarizeSearchFallbackTelemetryPhp(array $driverAttempts, int $latencyBudgetMs): array
-    {
-        $total = 0;
-        $winner = -1;
-        $index = 0;
-        foreach ($driverAttempts as $attempt) {
-            if (\is_array($attempt)) {
-                if ($winner < 0 && ($attempt['ok'] ?? null) === true) {
-                    $winner = $index;
-                }
-                $latency = \is_int($attempt['latency_ms'] ?? null) ? max(0, $attempt['latency_ms']) : 0;
-                $total = $latency > PHP_INT_MAX - $total ? PHP_INT_MAX : $total + $latency;
-            }
-            $index++;
-        }
-
-        return [
-            'attempts' => $index,
-            'primary_hit' => $winner === 0,
-            'fallback_used' => $index > 1,
-            'total_latency_ms' => $total,
-            'budget_exceeded' => $total > $latencyBudgetMs,
-            'winning_index' => $winner,
-        ];
-    }
-
-    /**
-     * Shared Wave 40.5 bridge to `nntmux_w40_manticore_elastic_search_service_circuit`. Returns the
-     * decoded result fields, or null when the library is missing, the input is too large or Rust
-     * declines (callers then use their PHP implementation).
-     *
-     * @param  list<string>  $parts
-     * @return list<string>|null
-     */
-    public static function evaluateW405Native(int $mode, array $parts): ?array
-    {
-        $ffi = self::w405Ffi();
-        if ($ffi === null || $mode < 0 || \count($parts) > self::W405_NATIVE_MAX_PARTS) {
-            return null;
-        }
-
-        try {
-            $input = pack('V', \count($parts));
-            foreach ($parts as $part) {
-                $input .= pack('V', \strlen($part)).$part;
-            }
-            if (\strlen($input) > self::W405_NATIVE_MAX_BYTES) {
-                return null;
-            }
-
-            $minBytes = \strlen($input) * 2 + 256;
-            for ($attempt = 0; $attempt < 2; $attempt++) {
-                $capacity = 0;
-                $out = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $capacity);
-                if ($out === null) {
-                    return null;
-                }
-                $capacity = min($capacity, self::W405_NATIVE_MAX_BYTES);
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_w40_manticore_elastic_search_service_circuit($mode, $input, \strlen($input), $out, $capacity);
-                if (! \is_int($written)) {
-                    return null;
-                }
-                if ($written >= 4 && $written <= $capacity) {
-                    return self::unpackW405(FFI::string($out, $written));
-                }
-                if ($written > -4 || -$written <= $capacity || -$written > self::W405_NATIVE_MAX_BYTES) {
-                    return null;
-                }
-                $minBytes = -$written;
-            }
-        } catch (Throwable) {
-            return null;
-        }
-
-        return null;
-    }
-
-    /** @return list<string>|null */
-    private static function unpackW405(string $packet): ?array
-    {
-        $length = \strlen($packet);
-        $header = unpack('V', $packet);
-        $count = \is_array($header) ? $header[1] : null;
-        if (! \is_int($count) || $count > intdiv($length - 4, 4)) {
-            return null;
-        }
-
-        $offset = 4;
-        $parts = [];
-        for ($i = 0; $i < $count; $i++) {
-            if ($offset + 4 > $length) {
-                return null;
-            }
-            $size = unpack('V', $packet, $offset);
-            $size = \is_array($size) ? $size[1] : null;
-            if (! \is_int($size) || $offset + 4 + $size > $length) {
-                return null;
-            }
-            $parts[] = substr($packet, $offset + 4, $size);
-            $offset += 4 + $size;
-        }
-
-        return $offset === $length ? $parts : null;
-    }
-
-    private static function w405Ffi(): ?FFI
-    {
-        if (self::$w405Ffi === null) {
-            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
-            self::$w405Ffi = RustPipelineLibrary::resolveDomain('search_w405', self::W405_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
-        }
-
-        return self::$w405Ffi instanceof FFI ? self::$w405Ffi : null;
-    }
-
-    /**
-     * Encode PHP values for the Rust helpers as (tag, int, bytes): 0 null, 1 bool,
-     * 2 int, 3 string, 5 array (int holds its count). Null for other types (floats,
-     * objects), which stay on the PHP path.
-     *
-     * @param  list<mixed>  $values
-     * @return array{tags: list<int>, ints: list<int>, bytes: string, lens: list<int>}|null
-     */
-    public static function encodeFfiValues(array $values): ?array
-    {
-        $encoded = ['tags' => [], 'ints' => [], 'bytes' => '', 'lens' => []];
-        foreach ($values as $value) {
-            [$tag, $int, $bytes] = match (true) {
-                $value === null => [0, 0, ''],
-                \is_bool($value) => [1, (int) $value, ''],
-                \is_int($value) => [2, $value, ''],
-                \is_string($value) => [3, 0, $value],
-                \is_array($value) => [5, \count($value), ''],
-                default => [null, 0, ''],
-            };
-            if ($tag === null) {
-                return null;
-            }
-            $encoded['tags'][] = $tag;
-            $encoded['ints'][] = $int;
-            $encoded['bytes'] .= $bytes;
-            $encoded['lens'][] = \strlen($bytes);
-        }
-
-        return $encoded;
-    }
-
-    /**
-     * @param  list<int>  $values
-     */
-    public static function ffiInt64Array(FFI $ffi, array $values): ?CData
-    {
-        $count = \count($values);
-        if ($count === 0) {
-            return null;
-        }
-        $array = $ffi->new("int64_t[{$count}]");
-        foreach ($values as $i => $value) {
-            $array[$i] = $value;
-        }
-
-        return $array;
-    }
-
-    /**
-     * @param  list<int>  $values
-     */
-    public static function ffiInt32Array(FFI $ffi, array $values): ?CData
-    {
-        $count = \count($values);
-        if ($count === 0) {
-            return null;
-        }
-        $array = $ffi->new("int32_t[{$count}]");
-        foreach ($values as $i => $value) {
-            $array[$i] = $value;
-        }
-
-        return $array;
-    }
 
     /**
      * Get the default driver name.
@@ -422,58 +125,9 @@ class SearchService extends Manager implements SearchServiceInterface
      */
     public function escapeString(string $string): string
     {
-        return self::escapeForDriverClass(get_class($this->driver()), $string);
-    }
+        $driverClass = get_class($this->driver());
 
-    /**
-     * @param  class-string<SearchDriverInterface>  $driverClass
-     */
-    public static function escapeForDriverClass(string $driverClass, string $string): string
-    {
-        return self::$useRustFfi
-            ? self::escapeForDriverClassNative($driverClass, $string)
-            : self::escapeForDriverClassPhp($driverClass, $string);
-    }
-
-    /**
-     * @param  class-string<SearchDriverInterface>  $driverClass
-     */
-    public static function escapeForDriverClassPhp(string $driverClass, string $string): string
-    {
         return $driverClass::escapeString($string);
-    }
-
-    /**
-     * @param  class-string<SearchDriverInterface>  $driverClass
-     */
-    public static function escapeForDriverClassNative(string $driverClass, string $string): string
-    {
-        $ffi = $driverClass === ManticoreSearchDriver::class ? self::searchFfi() : null;
-        if ($ffi === null) {
-            return self::escapeForDriverClassPhp($driverClass, $string);
-        }
-
-        $len = \strlen($string);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len * 3 + 16), $cap);
-        if ($scratch === null) {
-            return self::escapeForDriverClassPhp($driverClass, $string);
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_search_service_escape_string(0, $string, $len, $scratch, $cap);
-        if (\is_int($written) && $written < -2) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written - 3, $cap);
-            if ($scratch === null) {
-                return self::escapeForDriverClassPhp($driverClass, $string);
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_search_service_escape_string(0, $string, $len, $scratch, $cap);
-        }
-        if (! \is_int($written) || $written < 0) {
-            return self::escapeForDriverClassPhp($driverClass, $string);
-        }
-
-        return $written === 0 ? '' : FFI::string($scratch, $written);
     }
 
     // Implement SearchServiceInterface methods by delegating to the current driver
@@ -510,78 +164,6 @@ class SearchService extends Manager implements SearchServiceInterface
     public function getFuzzyConfig(): array
     {
         return $this->driver()->getFuzzyConfig();
-    }
-
-    /**
-     * Fuzzy settings with the defaults and casts the drivers apply when they read them.
-     *
-     * @return array{enabled: bool, max_distance: int, prefix_length: int, max_expansions: int}
-     */
-    public function getNormalizedFuzzyConfig(): array
-    {
-        return self::normalizeFuzzyConfig($this->getFuzzyConfig());
-    }
-
-    /**
-     * @param  array<string, mixed>  $config
-     * @return array{enabled: bool, max_distance: int, prefix_length: int, max_expansions: int}
-     */
-    public static function normalizeFuzzyConfig(array $config): array
-    {
-        return self::$useRustFfi ? self::normalizeFuzzyConfigNative($config) : self::normalizeFuzzyConfigPhp($config);
-    }
-
-    /**
-     * @param  array<string, mixed>  $config
-     * @return array{enabled: bool, max_distance: int, prefix_length: int, max_expansions: int}
-     */
-    public static function normalizeFuzzyConfigPhp(array $config): array
-    {
-        return [
-            'enabled' => (bool) ($config['enabled'] ?? true),
-            'max_distance' => (int) ($config['max_distance'] ?? 2),
-            'prefix_length' => (int) ($config['prefix_length'] ?? 2),
-            'max_expansions' => (int) ($config['max_expansions'] ?? 50),
-        ];
-    }
-
-    /**
-     * @param  array<string, mixed>  $config
-     * @return array{enabled: bool, max_distance: int, prefix_length: int, max_expansions: int}
-     */
-    public static function normalizeFuzzyConfigNative(array $config): array
-    {
-        $ffi = self::searchFfi();
-        $encoded = $ffi === null ? null : self::encodeFfiValues([
-            $config['enabled'] ?? null,
-            $config['max_distance'] ?? null,
-            $config['prefix_length'] ?? null,
-            $config['max_expansions'] ?? null,
-        ]);
-        if ($ffi === null || $encoded === null) {
-            return self::normalizeFuzzyConfigPhp($config);
-        }
-
-        $out = $ffi->new('int64_t[4]');
-        // @phpstan-ignore method.notFound
-        $rc = $ffi->nntmux_search_fuzzy_config_normalize(
-            self::ffiInt32Array($ffi, $encoded['tags']),
-            self::ffiInt64Array($ffi, $encoded['ints']),
-            $encoded['bytes'],
-            \strlen($encoded['bytes']),
-            self::ffiInt64Array($ffi, $encoded['lens']),
-            $out,
-        );
-        if ($rc !== 0) {
-            return self::normalizeFuzzyConfigPhp($config);
-        }
-
-        return [
-            'enabled' => $out[0] === 1,
-            'max_distance' => (int) $out[1],
-            'prefix_length' => (int) $out[2],
-            'max_expansions' => (int) $out[3],
-        ];
     }
 
     /**
@@ -690,93 +272,18 @@ class SearchService extends Manager implements SearchServiceInterface
                     throw new \LogicException('The search driver changed to one without bulk release updates.');
                 }
                 $failed = $driver->updateReleases($releaseIds);
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 Log::error('Search: deferred release index flush failed: '.$e->getMessage(), ['releases' => count($releaseIds)]);
                 $this->handDeferredReleasesToRepair($releaseIds);
 
                 continue;
             }
 
-            $this->clearDeferredReleaseMarkers(self::refreshedReleaseIds($releaseIds, $failed));
+            $this->clearDeferredReleaseMarkers(array_values(array_diff($releaseIds, $failed)));
             // Whatever is left: reported failures, and markers on which another worker
             // counted a failure after the refresh read its rows.
             $this->handDeferredReleasesToRepair($releaseIds);
         }
-    }
-
-    /**
-     * The deferred releases the driver refreshed: `$releaseIds` without the failures,
-     * in order.
-     *
-     * @param  list<int>  $releaseIds
-     * @param  array<int, int|string>  $failed
-     * @return list<int>
-     */
-    public static function refreshedReleaseIds(array $releaseIds, array $failed): array
-    {
-        return self::$useRustFfi
-            ? self::refreshedReleaseIdsNative($releaseIds, $failed)
-            : self::refreshedReleaseIdsPhp($releaseIds, $failed);
-    }
-
-    /**
-     * @param  list<int>  $releaseIds
-     * @param  array<int, int|string>  $failed
-     * @return list<int>
-     */
-    public static function refreshedReleaseIdsPhp(array $releaseIds, array $failed): array
-    {
-        return array_values(array_diff($releaseIds, $failed));
-    }
-
-    /**
-     * @param  list<int>  $releaseIds
-     * @param  array<int, int|string>  $failed
-     * @return list<int>
-     */
-    public static function refreshedReleaseIdsNative(array $releaseIds, array $failed): array
-    {
-        if ($releaseIds === [] || $failed === []) {
-            return self::refreshedReleaseIdsPhp($releaseIds, $failed);
-        }
-        foreach ($releaseIds as $id) {
-            if (! \is_int($id)) {
-                return self::refreshedReleaseIdsPhp($releaseIds, $failed);
-            }
-        }
-        $failedIds = [];
-        foreach ($failed as $id) {
-            if (! \is_int($id)) {
-                return self::refreshedReleaseIdsPhp($releaseIds, $failed);
-            }
-            $failedIds[] = $id;
-        }
-        $ffi = self::searchFfi();
-        if ($ffi === null) {
-            return self::refreshedReleaseIdsPhp($releaseIds, $failed);
-        }
-
-        $count = \count($releaseIds);
-        $out = $ffi->new("int64_t[{$count}]");
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_search_release_ids_diff(
-            self::ffiInt64Array($ffi, $releaseIds),
-            $count,
-            self::ffiInt64Array($ffi, $failedIds),
-            \count($failedIds),
-            $out,
-            $count,
-        );
-        if (! \is_int($written) || $written < 0) {
-            return self::refreshedReleaseIdsPhp($releaseIds, $failed);
-        }
-
-        $kept = [];
-        for ($i = 0; $i < $written; $i++) {
-            $kept[] = (int) $out[$i];
-        }
-
-        return $kept;
     }
 
     /**
@@ -810,7 +317,7 @@ class SearchService extends Manager implements SearchServiceInterface
                         ->orWhere('next_attempt_at', '<=', $now);
                 })
                 ->update($lease) > 0;
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::debug('Search: unable to record a deferred release index update', [
                 'release_id' => $releaseId,
                 'error' => $e->getMessage(),
@@ -841,7 +348,7 @@ class SearchService extends Manager implements SearchServiceInterface
                 ->where('last_error', $this->deferralToken)
                 ->where('attempts', 0)
                 ->delete();
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::debug('Search: unable to clear deferred release index markers', [
                 'releases' => count($releaseIds),
                 'error' => $e->getMessage(),
@@ -863,7 +370,7 @@ class SearchService extends Manager implements SearchServiceInterface
                 ->where('operation', self::DEFERRED_RELEASE_OPERATION)
                 ->where('last_error', $this->deferralToken)
                 ->update(['next_attempt_at' => now(), 'updated_at' => now()]);
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::debug('Search: unable to hand deferred releases to repair', [
                 'releases' => count($releaseIds),
                 'error' => $e->getMessage(),
@@ -1298,137 +805,5 @@ class SearchService extends Manager implements SearchServiceInterface
     public function searchAnimeTitle(string $query, int $limit = 100): array
     {
         return $this->driver()->searchAnimeTitle($query, $limit);
-    }
-
-    public const string W51_FFI_CDEF = 'int64_t nntmux_w515_search_escape_queries(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
-
-    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51.5 parity test's QUALIFICATION). */
-    private const bool W51_RUST_FFI_DEFAULT = true;
-
-    private static ?bool $w51RustFfi = null;
-
-    private static FFI|false|null $w51Ffi = null;
-
-    private static ?CData $w51Out = null;
-
-    private static int $w51OutCap = 0;
-
-    public static function usesW51RustFfi(): bool
-    {
-        return self::$w51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with escapeQueryBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::$w51RustFfi;
-        self::$w51RustFfi = $enabled;
-
-        try {
-            return $callback();
-        } finally {
-            self::$w51RustFfi = $previous;
-        }
-    }
-
-    /**
-     * Exactly $words output words from the Wave 51.5 Rust helper, or null to fall back to PHP. The helper
-     * leads with the number of rows PHP must compute, returned in $patches.
-     *
-     * @return list<int>|null
-     */
-    private static function w51Words(int $count, string $data, string $ints, int $words, ?int &$patches = null): ?array
-    {
-        if (self::$w51Ffi === null) {
-            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
-            self::$w51Ffi = RustPipelineLibrary::resolveDomain('search_w51', self::W51_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
-            self::$w51Out = null;
-            self::$w51OutCap = 0;
-        }
-        $ffi = self::$w51Ffi;
-        if (! $ffi instanceof FFI) {
-            return null;
-        }
-
-        try {
-            if (self::$w51Out === null || $words >= self::$w51OutCap) {
-                $cap = max(1024, $words + 1);
-                self::$w51Out = $ffi->new('int64_t['.$cap.']');
-                self::$w51OutCap = $cap;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w515_search_escape_queries($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w51Out, self::$w51OutCap);
-            if ($written !== $words + 1) {
-                return null;
-            }
-            $patches = self::$w51Out[0];
-            /** @var array<int, int>|false $values */
-            $values = unpack('P*', FFI::string(self::$w51Out, $written * 8), 8);
-
-            return \is_array($values) ? array_values($values) : null;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** PHP `hash('xxh64')` of $value read as a signed big-endian word, as the Rust helper reports it. */
-    private static function w51Digest(string $value): int
-    {
-        /** @var array{1: int} $unpacked */
-        $unpacked = unpack('J', hash('xxh64', $value, true));
-
-        return $unpacked[1];
-    }
-
-    /**
-     * Batch escape of user queries for both drivers: ManticoreSearchDriver::escapeStringPhp() and
-     * ElasticSearchDriver::escapeStringPhp(). Four words per query: `[Manticore length,
-     * xxh64(Manticore escape), Elasticsearch length, xxh64(Elasticsearch escape)]`.
-     *
-     * @param  list<string>  $queries
-     * @return list<int>
-     */
-    public static function escapeQueryBatch(array $queries): array
-    {
-        return self::usesW51RustFfi() ? self::escapeQueryBatchNative($queries) : self::escapeQueryBatchPhp($queries);
-    }
-
-    /**
-     * @param  list<string>  $queries
-     * @return list<int>
-     */
-    public static function escapeQueryBatchPhp(array $queries): array
-    {
-        $out = [];
-        foreach ($queries as $query) {
-            $manticore = ManticoreSearchDriver::escapeStringPhp($query);
-            $elastic = ElasticSearchDriver::escapeStringPhp($query);
-            array_push($out, \strlen($manticore), self::w51Digest($manticore), \strlen($elastic), self::w51Digest($elastic));
-        }
-
-        return $out;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing or a query holds a NUL byte.
-     *
-     * @param  list<string>  $queries
-     * @return list<int>
-     */
-    public static function escapeQueryBatchNative(array $queries): array
-    {
-        $count = \count($queries);
-        if ($count === 0 || ! array_is_list($queries)) {
-            return self::escapeQueryBatchPhp($queries);
-        }
-
-        return self::w51Words($count, implode("\0", $queries), '', 4 * $count) ?? self::escapeQueryBatchPhp($queries);
     }
 }

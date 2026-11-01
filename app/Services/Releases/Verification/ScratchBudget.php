@@ -4,24 +4,13 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use RuntimeException;
-use Throwable;
 
 /** Durable reservations count retained files and in-flight growth across each host's workers. */
 final class ScratchBudget
 {
-    // Single-call FFI remains opt-in until every paired mean/p99 gate reaches 1.5x.
-    private static bool $useRustFfi = false;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
     public function __construct(private readonly ?int $entryId = null) {}
 
     public function forEntry(int $entryId): self
@@ -92,12 +81,12 @@ final class ScratchBudget
         if ($free === false) {
             throw new RuntimeException('Verification is waiting for shared scratch capacity.');
         }
-        $limit = self::reservationCap((int) config('release_verification.scratch_bytes'), $free, (int) config('release_verification.free_bytes'));
+        $limit = min((int) config('release_verification.scratch_bytes'), (int) floor($free) - (int) config('release_verification.free_bytes'));
         DB::transaction(function () use ($entryId, $bytes, $limit): void {
             // Lock the entry, then change the shared budget with one conditional delta as the last
             // lock request, so concurrent workers hold the budget row only until commit.
             $entry = DB::table('release_verification_scratch')->where('id', $entryId)->lockForUpdate()->sole();
-            $delta = self::reservationDelta($bytes, (int) $entry->reserved_bytes);
+            $delta = $bytes - (int) $entry->reserved_bytes;
             $changed = DB::table('release_verification_scratch_budget')->where('host', $entry->host)->where('initialized', true)
                 ->whereRaw('reserved_bytes + ? <= ?', [$delta, $limit])
                 ->update(['reserved_bytes' => DB::raw('reserved_bytes + ('.$delta.')')]);
@@ -107,7 +96,7 @@ final class ScratchBudget
                     throw new RuntimeException('Shared scratch budget is not initialized.');
                 }
                 // An unchanged total within the limit changes no row.
-                if (self::rejectUnchanged($delta, (int) $state->reserved_bytes, $limit)) {
+                if ($delta !== 0 || (int) $state->reserved_bytes > $limit) {
                     throw new RuntimeException('Verification is waiting for shared scratch capacity.');
                 }
             }
@@ -125,7 +114,7 @@ final class ScratchBudget
         $bytes = $this->directoryBytes((string) config('release_verification.storage_path').'/scratch/'.app(ScratchInventory::class)->directoryName($entry), $heartbeat);
         DB::transaction(function () use ($entryId, $bytes): void {
             $entry = DB::table('release_verification_scratch')->where('id', $entryId)->lockForUpdate()->sole();
-            $this->adjust((string) $entry->host, self::reservationDelta($bytes, (int) $entry->reserved_bytes));
+            $this->adjust((string) $entry->host, $bytes - (int) $entry->reserved_bytes);
             DB::table('release_verification_scratch')->where('id', $entryId)->update(['reserved_bytes' => $bytes]);
         }, 5);
     }
@@ -223,248 +212,5 @@ final class ScratchBudget
         }
 
         return $bytes;
-    }
-
-    public static function reservationCap(int $scratchBytes, float $freeBytes, int $freeReserveBytes): int|float
-    {
-        return self::$useRustFfi ? (self::reservationCapNative($scratchBytes, $freeBytes, $freeReserveBytes) ?? self::reservationCapPhp($scratchBytes, $freeBytes, $freeReserveBytes)) : self::reservationCapPhp($scratchBytes, $freeBytes, $freeReserveBytes);
-    }
-
-    // @phpstan-ignore return.unusedType (PHP promotes integer overflow to float; exercised by parity tests.)
-    public static function reservationCapPhp(int $scratchBytes, float $freeBytes, int $freeReserveBytes): int|float
-    {
-        return min($scratchBytes, (int) floor($freeBytes) - $freeReserveBytes);
-    }
-
-    public static function reservationCapNative(int $scratchBytes, float $freeBytes, int $freeReserveBytes): int|float|null
-    {
-        $result = LeaseHeartbeat::computeNative(4, [$scratchBytes, $freeBytes, $freeReserveBytes])['value'] ?? null;
-
-        return is_int($result) || is_float($result) ? $result : null;
-    }
-
-    public static function reservationDelta(int $bytes, int $reservedBytes): int|float
-    {
-        return self::$useRustFfi ? (self::reservationDeltaNative($bytes, $reservedBytes) ?? self::reservationDeltaPhp($bytes, $reservedBytes)) : self::reservationDeltaPhp($bytes, $reservedBytes);
-    }
-
-    // @phpstan-ignore return.unusedType (PHP promotes integer overflow to float; exercised by parity tests.)
-    public static function reservationDeltaPhp(int $bytes, int $reservedBytes): int|float
-    {
-        return $bytes - $reservedBytes;
-    }
-
-    public static function reservationDeltaNative(int $bytes, int $reservedBytes): int|float|null
-    {
-        $result = LeaseHeartbeat::computeNative(5, [$bytes, $reservedBytes])['value'] ?? null;
-
-        return is_int($result) || is_float($result) ? $result : null;
-    }
-
-    public static function adjustedBudget(int $reservedBytes, int $delta): int|float
-    {
-        return self::$useRustFfi ? (self::adjustedBudgetNative($reservedBytes, $delta) ?? self::adjustedBudgetPhp($reservedBytes, $delta)) : self::adjustedBudgetPhp($reservedBytes, $delta);
-    }
-
-    // @phpstan-ignore return.unusedType (PHP promotes integer overflow to float; exercised by parity tests.)
-    public static function adjustedBudgetPhp(int $reservedBytes, int $delta): int|float
-    {
-        return max(0, $reservedBytes + $delta);
-    }
-
-    public static function adjustedBudgetNative(int $reservedBytes, int $delta): int|float|null
-    {
-        $result = LeaseHeartbeat::computeNative(6, [$reservedBytes, $delta])['value'] ?? null;
-
-        return is_int($result) || is_float($result) ? $result : null;
-    }
-
-    public static function rejectUnchanged(int|float $delta, int $reservedBytes, int|float $limit): bool
-    {
-        return self::$useRustFfi ? (self::rejectUnchangedNative($delta, $reservedBytes, $limit) ?? self::rejectUnchangedPhp($delta, $reservedBytes, $limit)) : self::rejectUnchangedPhp($delta, $reservedBytes, $limit);
-    }
-
-    public static function rejectUnchangedPhp(int|float $delta, int $reservedBytes, int|float $limit): bool
-    {
-        return $delta !== 0 || $reservedBytes > $limit;
-    }
-
-    public static function rejectUnchangedNative(int|float $delta, int $reservedBytes, int|float $limit): ?bool
-    {
-        $result = LeaseHeartbeat::computeNative(7, [$delta, $reservedBytes, $limit])['value'] ?? null;
-
-        return is_bool($result) ? $result : null;
-    }
-
-    public const string W58_FFI_CDEF = 'int64_t nntmux_w585_budget_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
-
-    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W58.5 parity test's QUALIFICATION). */
-    private const bool W58_RUST_FFI_DEFAULT = true;
-
-    /**
-     * Wave 58.5 routing and FFI cache, kept in function-local statics (readonly verification classes cannot declare
-     * static properties, so every W58 class follows the same shape). Without $op it reports the routing; 'set' swaps
-     * the override for $val and returns the previous one; 'reset' replaces the cached handle with $val (null
-     * re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]` with room for at least $val words,
-     * or null without the library.
-     */
-    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'reset':
-                $ffi = $val;
-                $out = null;
-                $outCap = 0;
-
-                return null;
-            case 'buffer':
-                if ($ffi === null) {
-                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
-                    $ffi = RustPipelineLibrary::resolveDomain('w58_5', self::W58_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
-                }
-                if (! $ffi instanceof FFI || ! \is_int($val)) {
-                    return null;
-                }
-                if ($out === null || $outCap < $val) {
-                    $outCap = max(1024, $val);
-                    $out = $ffi->new('int64_t['.$outCap.']');
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled ?? self::W58_RUST_FFI_DEFAULT;
-        }
-    }
-
-    public static function usesW58RustFfi(): bool
-    {
-        return self::w58RustFfiState() === true;
-    }
-
-    /**
-     * Runs $callback with budgetPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w58RustFfiState('set', $enabled);
-
-        try {
-            return $callback();
-        } finally {
-            self::w58RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Exactly $words output words from the Wave 58.5 Rust helper over $count NUL-joined records, or null
-     * to fall back to PHP.
-     *
-     * @return list<int>|null
-     */
-    private static function w58Words(int $count, string $data, int $words): ?array
-    {
-        try {
-            $handle = self::w58RustFfiState('buffer', $words);
-            if (! \is_array($handle)) {
-                return null;
-            }
-            [$ffi, $out, $cap] = $handle;
-            $written = $ffi->nntmux_w585_budget_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
-            if ($written !== $words) {
-                return null;
-            }
-            /** @var array<int, int>|false $values */
-            $values = unpack('q*', FFI::string($out, $written * 8));
-
-            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Batch admission plan over six comma-separated, trimmed fields (`scratch_bytes, free_bytes, free_reserve,
-     * reserved_total, entry_reserved, request_bytes`; empty reads 0). Five words per record: `[cap, delta, admitted,
-     * after, flags]`. Cap is the reservation cap, delta the reservation delta; admitted is 1 when the host total plus
-     * delta fits the cap, and after is the admitted total floored at zero or the unchanged total. Flags: 1 field that
-     * is not 1-18 digits (read as 0), 2 not exactly six fields, 4 negative cap (free space below its reserve), 8
-     * reclaiming delta.
-     *
-     * @param  list<string>  $records
-     * @return list<int>
-     */
-    public static function budgetPlanBatch(array $records): array
-    {
-        return self::usesW58RustFfi() ? self::budgetPlanBatchNative($records) : self::budgetPlanBatchPhp($records);
-    }
-
-    /**
-     * @param  list<string>  $records
-     * @return list<int>
-     */
-    public static function budgetPlanBatchPhp(array $records): array
-    {
-        $out = [];
-        foreach ($records as $record) {
-            $fields = explode(',', $record);
-            $flags = \count($fields) === 6 ? 0 : 2;
-            $values = [0, 0, 0, 0, 0, 0];
-            for ($i = 0; $i < 6; $i++) {
-                $field = trim($fields[$i] ?? '');
-                if ($field === '') {
-                    continue;
-                }
-                if (\strlen($field) <= 18 && ctype_digit($field)) {
-                    $values[$i] = (int) $field;
-                } else {
-                    $flags |= 1;
-                }
-            }
-            [$scratch, $free, $reserve, $reserved, $entry, $request] = $values;
-            $cap = min($scratch, $free - $reserve);
-            if ($cap < 0) {
-                $flags |= 4;
-            }
-            $delta = $request - $entry;
-            if ($delta < 0) {
-                $flags |= 8;
-            }
-            $admitted = $reserved + $delta <= $cap;
-            array_push($out, $cap, $delta, (int) $admitted, $admitted ? max(0, $reserved + $delta) : $reserved, $flags);
-        }
-
-        return $out;
-    }
-
-    /**
-     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
-     * a NUL.
-     *
-     * @param  list<string>  $records
-     * @return list<int>
-     */
-    public static function budgetPlanBatchNative(array $records): array
-    {
-        $count = \count($records);
-        if ($count === 0) {
-            return [];
-        }
-
-        return self::w58Words($count, implode("\0", $records), 5 * $count) ?? self::budgetPlanBatchPhp($records);
     }
 }

@@ -4,12 +4,9 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
-use App\Http\Controllers\Admin\AdminBlacklistController;
 use App\Models\Predb;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\ReleaseCleaningService;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Console\Attributes\Description;
 use Illuminate\Console\Attributes\Signature;
 use Illuminate\Console\Command;
@@ -33,34 +30,6 @@ use Illuminate\Support\Facades\DB;
 #[Description('Rename releases still named after a raw "[n/m] - \"file\"" posting subject')]
 class ReleasesCleanSubjectNames extends Command
 {
-    private static bool $useRustFfi = false;
-
-    public static function useRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function subjectCandidateNative(string $name): ?bool
-    {
-        if (ini_get('pcre.backtrack_limit') !== '1000000' || ini_get('pcre.recursion_limit') !== '100000') {
-            return null;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('cleaning', 'int32_t nntmux_subject_candidate(const char *input, size_t input_len);');
-        if ($ffi === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $result = $ffi->nntmux_subject_candidate($name, strlen($name));
-
-        return $result === 0 || $result === 1 ? $result === 1 : null;
-    }
-
-    private static function subjectCandidatePhp(string $name): bool
-    {
-        return $name !== '' && preg_match('/^\[\s*\d+\s*\/\s*\d+\s*\]/', $name) !== 1
-            && preg_match('/[^\x20-\x7E]/', $name) !== 1;
-    }
-
     /** Search names that may still be a raw counter-and-file subject (`[1/9] - "`, `[1/9] "`, `[1/9]-"`, `[1/9] - #34;`). */
     private const string RAW_SUBJECT_LIKE = '[%/%]%';
 
@@ -149,9 +118,14 @@ class ReleasesCleanSubjectNames extends Command
         $name = is_array($meta) ? trim((string) ($meta['cleansubject'] ?? '')) : '';
         $preId = is_array($meta) ? max(0, (int) ($meta['predb'] ?? 0)) : 0;
 
-        // Preserve empty/counter/non-ASCII rejection before looking up PreDB.
-        $accepted = self::$useRustFfi ? (self::subjectCandidateNative($name) ?? self::subjectCandidatePhp($name)) : self::subjectCandidatePhp($name);
-        if (! $accepted) {
+        // Still a counter-and-file subject: no cleaner recognised it (for example a hashed file name).
+        if ($name === '' || preg_match('/^\[\s*\d+\s*\/\s*\d+\s*\]/', $name) === 1) {
+            return [null, 0];
+        }
+
+        // The name-fixing update path drops non-ASCII characters, which would mangle an accented title.
+        // New releases keep it, so leave these rather than corrupt them.
+        if (preg_match('/[^\x20-\x7E]/', $name) === 1) {
             return [null, 0];
         }
 
@@ -162,122 +136,5 @@ class ReleasesCleanSubjectNames extends Command
         }
 
         return [$name, $preId];
-    }
-
-    /**
-     * PHP remains the default: the paired benchmark in
-     * tests/Unit/RustAdminRegexCategoryGroupReleaseW39ParityTest.php is below 1.5x.
-     */
-    public const bool W391_RUST_FFI_DEFAULT = false;
-
-    private const array W391_DRY_RUN_KEYS = ['candidates', 'invalid_rows', 'unchanged', 'changed', 'shortened_bytes', 'hash_like', 'sampled'];
-
-    private static ?bool $w391UseRustFfi = null;
-
-    private static FFI|false|null $w391Ffi = null;
-
-    /**
-     * Summarizes dry-run candidates (`id`, `searchname`, `name` = the cleaned name or null when rejected): rows without
-     * a string search name are invalid; a null name or one equal to the search name ignoring ASCII case is unchanged.
-     * For changed rows it sums the bytes saved, counts hex/hash-like new names and samples the first `$sampleLimit`
-     * ids (0 when absent).
-     *
-     * @param  array<array-key, mixed>  $candidates
-     * @return array<string, int|list<int>>
-     */
-    public static function planCleanSubjectDryRunSummary(array $candidates, int $sampleLimit = 25): array
-    {
-        return (self::usesW391RustFfi() ? self::planCleanSubjectDryRunSummaryNative($candidates, $sampleLimit) : null)
-            ?? self::planCleanSubjectDryRunSummaryPhp($candidates, $sampleLimit);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $candidates
-     * @return array<string, int|list<int>>
-     */
-    private static function planCleanSubjectDryRunSummaryPhp(array $candidates, int $sampleLimit): array
-    {
-        $limit = max(0, $sampleLimit);
-        $summary = array_fill_keys(self::W391_DRY_RUN_KEYS, 0);
-        $summary['candidates'] = count($candidates);
-        $ids = [];
-        foreach ($candidates as $row) {
-            $from = is_array($row) ? ($row['searchname'] ?? null) : null;
-            if (! is_string($from)) {
-                $summary['invalid_rows']++;
-
-                continue;
-            }
-            $to = $row['name'] ?? null;
-            if (! is_string($to) || strcasecmp($to, $from) === 0) {
-                $summary['unchanged']++;
-
-                continue;
-            }
-            $summary['changed']++;
-            $summary['shortened_bytes'] += max(0, strlen($from) - strlen($to));
-            if (self::w391HashLike($to)) {
-                $summary['hash_like']++;
-            }
-            if ($summary['sampled'] < $limit) {
-                $summary['sampled']++;
-                $ids[] = AdminBlacklistController::w391Int($row['id'] ?? null) ?? 0;
-            }
-        }
-        $summary['sample_ids'] = $ids;
-
-        return $summary;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $candidates
-     * @return array<string, int|list<int>>|null
-     */
-    private static function planCleanSubjectDryRunSummaryNative(array $candidates, int $sampleLimit): ?array
-    {
-        $words = [$sampleLimit, count($candidates)];
-        $blob = [];
-        foreach ($candidates as $row) {
-            if (is_array($row)) {
-                AdminBlacklistController::w391PackRow($words, $blob, [$row['id'] ?? null, $row['searchname'] ?? null, $row['name'] ?? null]);
-            } else {
-                $words[] = 0;
-            }
-        }
-        $values = AdminBlacklistController::w391Invoke(self::$w391Ffi, 5, $words, $blob);
-        $fixed = count(self::W391_DRY_RUN_KEYS);
-        if ($values === null || count($values) < $fixed + 1 || $values[$fixed] < 0 || count($values) !== $fixed + 1 + $values[$fixed]) {
-            return null;
-        }
-        $summary = array_combine(self::W391_DRY_RUN_KEYS, array_slice($values, 0, $fixed));
-        $summary['sample_ids'] = array_slice($values, $fixed + 1);
-
-        return $summary;
-    }
-
-    /** 16+ hex digits, or 24+ ASCII alphanumerics mixing digits and letters. */
-    private static function w391HashLike(string $name): bool
-    {
-        $length = strlen($name);
-        $letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-
-        return ($length >= 16 && strspn($name, '0123456789abcdefABCDEF') === $length)
-            || ($length >= 24 && strspn($name, '0123456789'.$letters) === $length && strpbrk($name, '0123456789') !== false && strpbrk($name, $letters) !== false);
-    }
-
-    public static function useW391RustFfi(?bool $enabled): void
-    {
-        self::$w391UseRustFfi = $enabled;
-    }
-
-    public static function usesW391RustFfi(): bool
-    {
-        return self::$w391UseRustFfi ?? self::W391_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW391RustFfi(): void
-    {
-        self::$w391UseRustFfi = null;
-        self::$w391Ffi = null;
     }
 }

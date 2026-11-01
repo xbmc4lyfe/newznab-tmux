@@ -3,12 +3,11 @@
 namespace App\Services\NameFixing;
 
 use App\Support\PredbSearchDocument;
-use App\Support\RustPipelineLibrary;
 
 /** Immutable basename evidence; nomination cleaning must never establish identity. */
 final readonly class OriginalFilenameEvidence
 {
-    public const PREDB_IDENTITY_POLICY = 'c1deea74e2c158ebf2bc466c29bfdfeb7a43cf02a31c460498ef72b0d9da8a00';
+    public const PREDB_IDENTITY_POLICY = 'fb5caa8fd67b7e9190dc8e471532b01c6c01364b06b6f317c0a0fe19eb71e91e';
 
     public string $basename;
 
@@ -59,20 +58,6 @@ final readonly class OriginalFilenameEvidence
      * @return list<string>|null
      */
     public function canonicalNominationKeys(): ?array
-    {
-        $supported = false;
-        $ffiRes = RustPipelineLibrary::originalFilenameNominationKeys($this->basename, null, $supported);
-        if ($supported) {
-            return $ffiRes;
-        }
-
-        return $this->canonicalNominationKeysPhp();
-    }
-
-    /**
-     * @return list<string>|null
-     */
-    public function canonicalNominationKeysPhp(): ?array
     {
         $raw = $this->basename;
         $length = strlen($raw);

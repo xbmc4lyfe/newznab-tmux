@@ -5,9 +5,7 @@ declare(strict_types=1);
 namespace App\Mcp\Tools;
 
 use App\Mcp\Tools\Concerns\HasVersionedStructuredOutput;
-use App\Services\Mcp\ProcessRunner;
 use App\Services\Mcp\RuntimeProbeRunner;
-use App\Support\RustPipelineLibrary;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
 use Laravel\Mcp\Request;
 use Laravel\Mcp\Response;
@@ -28,19 +26,6 @@ class ProbeRuntimeTool extends Tool
 {
     use HasVersionedStructuredOutput;
 
-    // Opt-in only until correctness and end-to-end performance gates pass.
-    private static bool $useRustFfi = false;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('mcp-tool-runner', ProcessRunner::FFI_CDEF) !== null;
-    }
-
     private const array PROBES = ['database', 'redis', 'search', 'queue', 'disk', 'nntp'];
 
     public function schema(JsonSchema $schema): array
@@ -58,47 +43,14 @@ class ProbeRuntimeTool extends Tool
         ]);
         $results = $runner->run(array_values($validated['probes']));
         $failed = count(array_filter($results, fn (array $result): bool => ! $result['ok']));
-        $summary = self::buildProbeToolSummary(count($results), $failed, (int) config('nntmux-mcp.schema_version', 1));
         $payload = [
-            'schema_version' => $summary['schema_version'],
-            'summary' => $summary['summary'],
+            'schema_version' => (int) config('nntmux-mcp.schema_version', 1),
+            'summary' => sprintf('Completed %d probe(s); %d reported unhealthy.', count($results), $failed),
             'results' => $results,
-            'warnings' => $summary['warnings'],
-            'truncated' => $summary['truncated'],
-        ];
-
-        return Response::make(Response::text($payload['summary']))->withStructuredContent($payload);
-    }
-
-    /**
-     * @return array{schema_version: int, summary: string, warnings: list<string>, truncated: bool}
-     */
-    public static function buildProbeToolSummary(int $total, int $failed, int $schemaVersion): array
-    {
-        return (self::$useRustFfi ? self::buildProbeToolSummaryNative($total, $failed, $schemaVersion) : null)
-            ?? self::buildProbeToolSummaryPhp($total, $failed, $schemaVersion);
-    }
-
-    /**
-     * @return array{schema_version: int, summary: string, warnings: list<string>, truncated: bool}
-     */
-    public static function buildProbeToolSummaryPhp(int $total, int $failed, int $schemaVersion): array
-    {
-        return [
-            'schema_version' => $schemaVersion,
-            'summary' => sprintf('Completed %d probe(s); %d reported unhealthy.', $total, $failed),
             'warnings' => $failed > 0 ? ['One or more selected runtime services reported unhealthy.'] : [],
             'truncated' => false,
         ];
-    }
 
-    /**
-     * @return array{schema_version: int, summary: string, warnings: list<string>, truncated: bool}|null
-     */
-    public static function buildProbeToolSummaryNative(int $total, int $failed, int $schemaVersion): ?array
-    {
-        $result = ProcessRunner::transformNative(7, [$total, $failed, $schemaVersion]);
-
-        return is_array($result) ? $result : null;
+        return Response::make(Response::text($payload['summary']))->withStructuredContent($payload);
     }
 }

@@ -4,10 +4,7 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers\Admin;
 
-use App\Enums\ServiceStatusEnum;
-use App\Facades\Search;
 use App\Http\Controllers\BasePageController;
-use App\Http\Controllers\GetNzbController;
 use App\Services\AdminDashboardSnapshotService;
 use App\Services\Monitoring\GrafanaEmbedService;
 use App\Services\RegistrationStatusService;
@@ -19,271 +16,6 @@ use Illuminate\Support\Carbon;
 
 class AdminPageController extends BasePageController
 {
-    // Keep PHP as the production default until the Rust performance gate passes.
-    private static bool $useRustFfi = false;
-
-    public const string FFI_CDEF = GetNzbController::FFI_CDEF;
-
-    /**
-     * Rust stays opt-in for the Wave 38.5 status summary: the FFI round trip is slower than PHP
-     * (< 1.5x); see tests/Unit/RustSearchFacadeControllerGuestLayoutParityTest.php.
-     */
-    public const bool ADMIN_PAGE_RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useAdminPageRustFfi = null;
-
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi ?? false;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    /** @param array<array-key, array<string, mixed>> $rows
-     * @return list<array<string, mixed>>
-     */
-    public static function serviceRows(array $rows): array
-    {
-        return self::$useRustFfi ? self::serviceRowsNative($rows) : self::serviceRowsPhp($rows);
-    }
-
-    /** @param array<array-key, array<string, mixed>> $rows
-     * @return list<array<string, mixed>>
-     */
-    public static function serviceRowsPhp(array $rows): array
-    {
-        return array_values(array_map(static fn (array $row): array => [
-            'name' => $row['name'],
-            'slug' => $row['slug'],
-            'check_type' => $row['check_type'],
-            'status' => $row['status'],
-            'status_label' => $row['status_label'],
-            'uptime_percentage' => $row['uptime_percentage'],
-        ], $rows));
-    }
-
-    /** @param array<array-key, array<string, mixed>> $rows
-     * @return list<array<string, mixed>>
-     */
-    public static function serviceRowsNative(array $rows): array
-    {
-        $result = GetNzbController::transformNative(11, [$rows]);
-
-        return is_array($result) ? $result : self::serviceRowsPhp($rows);
-    }
-
-    /** @param array<array-key, array<string, mixed>> $rows
-     * @return list<array<string, mixed>>
-     */
-    public static function incidentRows(array $rows): array
-    {
-        return self::$useRustFfi ? self::incidentRowsNative($rows) : self::incidentRowsPhp($rows);
-    }
-
-    /** @param array<array-key, array<string, mixed>> $rows
-     * @return list<array<string, mixed>>
-     */
-    public static function incidentRowsPhp(array $rows): array
-    {
-        return array_values(array_map(static fn (array $row): array => [
-            'id' => $row['id'],
-            'title' => $row['title'],
-            'impact' => $row['impact'],
-            'impact_label' => $row['impact_label'],
-            'started_at' => $row['started_at'],
-            'started_at_human' => $row['started_at_human'],
-            'is_auto' => $row['is_auto'],
-            'services' => $row['services'],
-        ], $rows));
-    }
-
-    /** @param array<array-key, array<string, mixed>> $rows
-     * @return list<array<string, mixed>>
-     */
-    public static function incidentRowsNative(array $rows): array
-    {
-        $result = GetNzbController::transformNative(12, [$rows]);
-
-        return is_array($result) ? $result : self::incidentRowsPhp($rows);
-    }
-
-    /** @param array<array-key, array<string, mixed>> $rows
-     * @return array<array-key, array<string, mixed>>
-     */
-    public static function activityRows(array $rows, bool $humanOnly = false): array
-    {
-        return self::$useRustFfi ? self::activityRowsNative($rows, $humanOnly) : self::activityRowsPhp($rows, $humanOnly);
-    }
-
-    /** @param array<array-key, array<string, mixed>> $rows
-     * @return array<array-key, array<string, mixed>>
-     */
-    public static function activityRowsPhp(array $rows, bool $humanOnly = false): array
-    {
-        return array_map(static function (array $row) use ($humanOnly): array {
-            $activity = [
-                'type' => $row['type'],
-                'message' => $row['message'],
-                'icon' => $row['icon'],
-                'icon_bg' => $row['icon_bg'],
-                'icon_color' => $row['icon_color'],
-                'created_at' => $humanOnly ? $row['created_at_human'] : $row['created_at'],
-            ];
-            if (! $humanOnly) {
-                $activity['created_at_human'] = $row['created_at_human'];
-            }
-
-            return [...$activity, 'username' => $row['username'], 'metadata' => $row['metadata']];
-        }, $rows);
-    }
-
-    /** @param array<array-key, array<string, mixed>> $rows
-     * @return array<array-key, array<string, mixed>>
-     */
-    public static function activityRowsNative(array $rows, bool $humanOnly = false): array
-    {
-        $result = GetNzbController::transformNative(13, [$rows, $humanOnly]);
-
-        return is_array($result) ? $result : self::activityRowsPhp($rows, $humanOnly);
-    }
-
-    /** @param array<string, mixed>|null $period
-     * @return array<string, mixed>|null
-     */
-    public static function registrationPeriod(?array $period): ?array
-    {
-        return self::$useRustFfi ? self::registrationPeriodNative($period) : self::registrationPeriodPhp($period);
-    }
-
-    /** @param array<string, mixed>|null $period
-     * @return array<string, mixed>|null
-     */
-    public static function registrationPeriodPhp(?array $period): ?array
-    {
-        return $period === null ? null : ['id' => $period['id'], 'name' => $period['name'], 'starts_at' => $period['starts_at'], 'ends_at' => $period['ends_at']];
-    }
-
-    /** @param array<string, mixed>|null $period
-     * @return array<string, mixed>|null
-     */
-    public static function registrationPeriodNative(?array $period): ?array
-    {
-        $result = GetNzbController::transformNative(14, [$period]);
-
-        return is_array($result) ? $result : self::registrationPeriodPhp($period);
-    }
-
-    /** @return array{daily: bool, count: int} */
-    public static function metricWindow(string $range): array
-    {
-        return self::$useRustFfi ? self::metricWindowNative($range) : self::metricWindowPhp($range);
-    }
-
-    /** @return array{daily: bool, count: int} */
-    public static function metricWindowPhp(string $range): array
-    {
-        return ['daily' => $range === '30d', 'count' => $range === '30d' ? 30 : 24];
-    }
-
-    /** @return array{daily: bool, count: int} */
-    public static function metricWindowNative(string $range): array
-    {
-        $result = GetNzbController::transformNative(15, [$range]);
-
-        return is_array($result) ? $result : self::metricWindowPhp($range);
-    }
-
-    public static function useAdminPageRustFfi(?bool $use = true): void
-    {
-        self::$useAdminPageRustFfi = $use;
-    }
-
-    public static function usesAdminPageRustFfi(): bool
-    {
-        return self::$useAdminPageRustFfi ?? self::ADMIN_PAGE_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetAdminPageRustFfi(): void
-    {
-        self::$useAdminPageRustFfi = null;
-    }
-
-    /**
-     * Summarizes service health values (trimmed, ASCII lowercased) per `ServiceStatusEnum` case in
-     * declaration order. Unrecognized values count as unknown; the overall status is the worst known
-     * severity (operational when none), and `all_operational` needs no unknown and no degradation.
-     *
-     * @param  list<string>  $statuses
-     * @return array{total: int, counts: array<string, int>, unknown: int, overall: string, severity: int, all_operational: bool}
-     */
-    public static function summarizeServiceStatuses(array $statuses): array
-    {
-        return self::usesAdminPageRustFfi() ? self::summarizeServiceStatusesNative($statuses) : self::summarizeServiceStatusesPhp($statuses);
-    }
-
-    /**
-     * @param  list<string>  $statuses
-     * @return array{total: int, counts: array<string, int>, unknown: int, overall: string, severity: int, all_operational: bool}
-     */
-    private static function summarizeServiceStatusesNative(array $statuses): array
-    {
-        $cases = ServiceStatusEnum::cases();
-        $fields = Search::evaluateNative(4, $statuses);
-        if ($fields === null || \count($fields) !== \count($cases) + 5) {
-            return self::summarizeServiceStatusesPhp($statuses);
-        }
-
-        $counts = [];
-        foreach ($cases as $slot => $case) {
-            $counts[$case->value] = (int) $fields[1 + $slot];
-        }
-        $tail = \count($cases) + 1;
-
-        return [
-            'total' => (int) $fields[0],
-            'counts' => $counts,
-            'unknown' => (int) $fields[$tail],
-            'overall' => $fields[$tail + 1],
-            'severity' => (int) $fields[$tail + 2],
-            'all_operational' => $fields[$tail + 3] === '1',
-        ];
-    }
-
-    /**
-     * @param  list<string>  $statuses
-     * @return array{total: int, counts: array<string, int>, unknown: int, overall: string, severity: int, all_operational: bool}
-     */
-    private static function summarizeServiceStatusesPhp(array $statuses): array
-    {
-        $counts = array_fill_keys(array_column(ServiceStatusEnum::cases(), 'value'), 0);
-        $unknown = 0;
-        $worst = ServiceStatusEnum::Operational;
-        foreach ($statuses as $status) {
-            $case = ServiceStatusEnum::tryFrom(strtolower(trim($status)));
-            if ($case === null) {
-                $unknown++;
-
-                continue;
-            }
-            $counts[$case->value]++;
-            if ($case->severityPhp() > $worst->severityPhp()) {
-                $worst = $case;
-            }
-        }
-
-        return [
-            'total' => \count($statuses),
-            'counts' => $counts,
-            'unknown' => $unknown,
-            'overall' => $worst->value,
-            'severity' => $worst->severityPhp(),
-            'all_operational' => $unknown === 0 && $worst->severityPhp() === 0,
-        ];
-    }
-
     protected UserStatsService $userStatsService;
 
     protected SystemMetricsService $systemMetricsService;
@@ -344,16 +76,16 @@ class AdminPageController extends BasePageController
     {
         $payload = $this->snapshot->get();
 
-        $serviceStatuses = self::serviceRows(collect($payload['serviceStatuses'])->map(static fn ($svc) => [
+        $serviceStatuses = collect($payload['serviceStatuses'])->map(static fn ($svc) => [
             'name' => $svc->name,
             'slug' => $svc->slug,
             'check_type' => $svc->check_type,
             'status' => $svc->status->value,
             'status_label' => $svc->status->label(),
             'uptime_percentage' => (float) $svc->uptime_percentage,
-        ])->values()->all());
+        ])->values();
 
-        $activeIncidents = self::incidentRows(collect($payload['activeIncidents'])->map(static fn ($incident) => [
+        $activeIncidents = collect($payload['activeIncidents'])->map(static fn ($incident) => [
             'id' => $incident->id,
             'title' => $incident->title,
             'impact' => $incident->impact->value,
@@ -362,9 +94,9 @@ class AdminPageController extends BasePageController
             'started_at_human' => $incident->started_at?->diffForHumans(),
             'is_auto' => (bool) $incident->is_auto,
             'services' => $incident->services->pluck('name')->all(),
-        ])->values()->all());
+        ])->values();
 
-        $recentActivity = self::activityRows(array_map(static fn ($activity): array => [
+        $recentActivity = array_map(static fn ($activity): array => [
             'type' => $activity->type,
             'message' => $activity->message,
             'icon' => $activity->icon,
@@ -374,15 +106,15 @@ class AdminPageController extends BasePageController
             'created_at_human' => $activity->created_at?->diffForHumans(),
             'username' => $activity->username,
             'metadata' => $activity->metadata,
-        ], $payload['recent_activity']));
+        ], $payload['recent_activity']);
 
         $registrationStatus = $payload['registrationStatus'];
-        $serializePeriod = static fn ($period): ?array => self::registrationPeriod($period === null ? null : [
+        $serializePeriod = static fn ($period): ?array => $period === null ? null : [
             'id' => $period->id,
             'name' => $period->name,
             'starts_at' => $period->starts_at?->format('Y-m-d H:i'),
             'ends_at' => $period->ends_at?->format('Y-m-d H:i'),
-        ]);
+        ];
 
         $registrationPayload = [
             'manual_status' => $registrationStatus['manual_status'],
@@ -417,17 +149,16 @@ class AdminPageController extends BasePageController
     {
         $payload = $this->snapshot->get();
 
-        $activities = self::activityRows(array_map(static fn ($activity): array => [
+        $activities = array_map(static fn ($activity): array => [
             'type' => $activity->type,
             'message' => $activity->message,
             'icon' => $activity->icon,
             'icon_bg' => $activity->icon_bg,
             'icon_color' => $activity->icon_color,
-            'created_at' => $activity->created_at?->toIso8601String(),
-            'created_at_human' => $activity->created_at?->diffForHumans(),
+            'created_at' => $activity->created_at?->diffForHumans(),
             'username' => $activity->username,
             'metadata' => $activity->metadata,
-        ], $payload['recent_activity']), true);
+        ], $payload['recent_activity']);
 
         return response()->json([
             'success' => true,
@@ -474,14 +205,12 @@ class AdminPageController extends BasePageController
     {
         $timeRange = request('range', '24h');
 
-        $window = self::metricWindow(is_string($timeRange) ? $timeRange : '');
-
-        if ($window['daily']) {
-            $cpuHistory = $this->systemMetricsService->getDailyMetrics('cpu', $window['count']);
-            $ramHistory = $this->systemMetricsService->getDailyMetrics('ram', $window['count']);
+        if ($timeRange === '30d') {
+            $cpuHistory = $this->systemMetricsService->getDailyMetrics('cpu', 30);
+            $ramHistory = $this->systemMetricsService->getDailyMetrics('ram', 30);
         } else {
-            $cpuHistory = $this->systemMetricsService->getHourlyMetrics('cpu', $window['count']);
-            $ramHistory = $this->systemMetricsService->getHourlyMetrics('ram', $window['count']);
+            $cpuHistory = $this->systemMetricsService->getHourlyMetrics('cpu', 24);
+            $ramHistory = $this->systemMetricsService->getHourlyMetrics('ram', 24);
         }
 
         return response()->json([

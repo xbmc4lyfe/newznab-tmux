@@ -560,32 +560,6 @@ final class Par2PacketAccumulatorTest extends TestCase
         ];
     }
 
-    public function test_rust_native_and_php_fallback_produce_identical_states_and_files(): void
-    {
-        $bytes = file_get_contents(__DIR__.'/../Fixtures/par2/rename-index.par2');
-        $this->assertIsString($bytes);
-
-        $native = new Par2PacketAccumulator;
-        $native->append(substr($bytes, 0, 500), useNative: true);
-        $php = new Par2PacketAccumulator;
-        $php->append(substr($bytes, 0, 500), useNative: false);
-
-        $this->assertSame($php->exportState(), $native->exportState());
-        $this->assertSame($php->stateBytes(), $native->stateBytes());
-
-        $nativeResumed = Par2PacketAccumulator::fromState($native->exportState(), 262144, useNative: true);
-        $phpResumed = Par2PacketAccumulator::fromState($php->exportState(), 262144, useNative: false);
-
-        $nativeResumed->append(substr($bytes, 500), useNative: true);
-        $phpResumed->append(substr($bytes, 500), useNative: false);
-
-        $this->assertSame($phpResumed->exportState(), $nativeResumed->exportState());
-        $this->assertSame($phpResumed->filesBySet(), $nativeResumed->filesBySet());
-        $this->assertSame($phpResumed->descriptors(), $nativeResumed->descriptors());
-        $this->assertSame($phpResumed->isComplete(), $nativeResumed->isComplete());
-        $this->assertSame($phpResumed->hasCompleteMainInventory(), $nativeResumed->hasCompleteMainInventory());
-    }
-
     /** @return list<string> */
     private function fixturePackets(): array
     {

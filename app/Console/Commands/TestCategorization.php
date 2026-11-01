@@ -5,26 +5,10 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Services\Categorization\CategorizationService;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Console\Command;
-use Throwable;
 
 class TestCategorization extends Command
 {
-    public const string FFI_CDEF = <<<'CDEF'
-        ssize_t nntmux_cat_pipe_cmd_stats_row(const char *name_ptr, size_t name_len, const char *class_ptr, size_t class_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_cat_pipe_cmd_sample_row(const char *sample_ptr, size_t sample_len, uint8_t matched, char *out_buf, size_t out_cap);
-        ssize_t nntmux_cat_pipe_cmd_comparison_status(uint8_t matched, char *out_buf, size_t out_cap);
-        CDEF;
-
-    /** Byte length of the UTF-8 `✓`/`✗` match marks. */
-    private const int MARK_BYTES = 3;
-
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
     protected $signature = 'nntmux:test-categorization
                             {--release= : Release name to test}
                             {--poster= : Poster/From name to test}
@@ -68,7 +52,7 @@ class TestCategorization extends Command
         $this->info('Registered Categorizers:');
         $this->table(
             ['Name', 'Priority', 'Class'],
-            collect($stats)->map(fn ($s) => self::categorizerRow($s))->toArray()
+            collect($stats)->map(fn ($s) => [$s['name'], $s['priority'], $s['class']])->toArray()
         );
     }
 
@@ -96,7 +80,7 @@ class TestCategorization extends Command
         $this->info("Release: {$releaseName}");
         $this->newLine();
 
-        $matchStatus = self::comparisonStatus($comparison['match']);
+        $matchStatus = $comparison['match'] ? '<fg=green>MATCH</>' : '<fg=red>MISMATCH</>';
         $this->line("Result: {$matchStatus}");
         $this->newLine();
 
@@ -145,193 +129,17 @@ class TestCategorization extends Command
         $results = [];
         foreach ($samples as $sample) {
             $comparison = $service->compare(0, $sample);
-            $results[] = self::sampleRow(
-                $sample,
+            $results[] = [
+                substr($sample, 0, 50).(strlen($sample) > 50 ? '...' : ''),
                 $comparison['pipeline']['category_name'],
                 $comparison['legacy']['category_name'],
-                $comparison['match'],
-            );
+                $comparison['match'] ? '✓' : '✗',
+            ];
         }
 
         $this->table(
             ['Release', 'Pipeline', 'Legacy', 'Match'],
             $results
         );
-    }
-
-    /**
-     * Overrides the PHP default for this command's helpers; `null` restores the PHP default.
-     */
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi ?? false;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $ffi): void
-    {
-        self::$ffi = $ffi;
-    }
-
-    /**
-     * `[name, priority, class]` table row for one categorizer stats entry.
-     *
-     * @param  array<array-key, mixed>  $stat
-     * @return list<mixed>
-     */
-    public static function categorizerRow(array $stat): array
-    {
-        return self::$useRustFfi ? self::categorizerRowNative($stat) : self::categorizerRowPhp($stat);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $stat
-     * @return list<mixed>
-     */
-    public static function categorizerRowPhp(array $stat): array
-    {
-        return [$stat['name'], $stat['priority'], $stat['class']];
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $stat
-     * @return list<mixed>
-     */
-    public static function categorizerRowNative(array $stat): array
-    {
-        $name = $stat['name'] ?? null;
-        $class = $stat['class'] ?? null;
-        $priority = $stat['priority'] ?? null;
-        $ffi = self::ffi();
-        if ($ffi === null || ! \is_string($name) || ! \is_string($class) || ! \is_int($priority)) {
-            return self::categorizerRowPhp($stat);
-        }
-
-        $row = self::callForString($ffi, 'nntmux_cat_pipe_cmd_stats_row', \strlen($name) + \strlen($class), $name, \strlen($name), $class, \strlen($class));
-        if ($row === null || \strlen($row) !== \strlen($name) + \strlen($class)) {
-            return self::categorizerRowPhp($stat);
-        }
-
-        return [substr($row, 0, \strlen($name)), $priority, substr($row, \strlen($name))];
-    }
-
-    /**
-     * Sample comparison row: the release truncated to 50 bytes (with `...`), both category
-     * names and a `✓`/`✗` match mark.
-     *
-     * @return array{string, string, string, string}
-     */
-    public static function sampleRow(string $sample, string $pipelineName, string $legacyName, bool $match): array
-    {
-        return self::$useRustFfi
-            ? self::sampleRowNative($sample, $pipelineName, $legacyName, $match)
-            : self::sampleRowPhp($sample, $pipelineName, $legacyName, $match);
-    }
-
-    /**
-     * @return array{string, string, string, string}
-     */
-    public static function sampleRowPhp(string $sample, string $pipelineName, string $legacyName, bool $match): array
-    {
-        return [
-            substr($sample, 0, 50).(strlen($sample) > 50 ? '...' : ''),
-            $pipelineName,
-            $legacyName,
-            $match ? '✓' : '✗',
-        ];
-    }
-
-    /**
-     * @return array{string, string, string, string}
-     */
-    public static function sampleRowNative(string $sample, string $pipelineName, string $legacyName, bool $match): array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::sampleRowPhp($sample, $pipelineName, $legacyName, $match);
-        }
-
-        $row = self::callForString($ffi, 'nntmux_cat_pipe_cmd_sample_row', 64, $sample, \strlen($sample), $match ? 1 : 0);
-        if ($row === null || \strlen($row) < self::MARK_BYTES) {
-            return self::sampleRowPhp($sample, $pipelineName, $legacyName, $match);
-        }
-
-        return [substr($row, 0, -self::MARK_BYTES), $pipelineName, $legacyName, substr($row, -self::MARK_BYTES)];
-    }
-
-    /**
-     * Console-styled `MATCH`/`MISMATCH` status for a single release comparison.
-     */
-    public static function comparisonStatus(bool $match): string
-    {
-        return self::$useRustFfi ? self::comparisonStatusNative($match) : self::comparisonStatusPhp($match);
-    }
-
-    public static function comparisonStatusPhp(bool $match): string
-    {
-        return $match ? '<fg=green>MATCH</>' : '<fg=red>MISMATCH</>';
-    }
-
-    public static function comparisonStatusNative(bool $match): string
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::comparisonStatusPhp($match);
-        }
-
-        return self::callForString($ffi, 'nntmux_cat_pipe_cmd_comparison_status', 32, $match ? 1 : 0) ?? self::comparisonStatusPhp($match);
-    }
-
-    /**
-     * Calls a byte-output export with a scratch buffer, growing it once when Rust reports a larger requirement.
-     */
-    private static function callForString(FFI $ffi, string $symbol, int $estimate, mixed ...$args): ?string
-    {
-        try {
-            $capacity = 0;
-            $outBuf = RustPipelineLibrary::obtainScratch($ffi, max(1, $estimate), $capacity);
-            if ($outBuf === null) {
-                return null;
-            }
-            $written = $ffi->$symbol(...[...$args, $outBuf, $capacity]);
-            if (\is_int($written) && $written < -1 && -$written > $capacity) {
-                $outBuf = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($outBuf === null) {
-                    return null;
-                }
-                $written = $ffi->$symbol(...[...$args, $outBuf, $capacity]);
-            }
-            if (! \is_int($written) || $written < 0 || $written > $capacity) {
-                return null;
-            }
-
-            return $written === 0 ? '' : FFI::string($outBuf, $written);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === false) {
-            return null;
-        }
-
-        if (self::$ffi instanceof FFI) {
-            return self::$ffi;
-        }
-
-        try {
-            $ffi = RustPipelineLibrary::resolveDomain('w29-categorization-pipes-commands', self::FFI_CDEF, getenv('NNTMUX_PIPELINE_FFI_LIB') ?: null);
-        } catch (Throwable) {
-            $ffi = null;
-        }
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
     }
 }

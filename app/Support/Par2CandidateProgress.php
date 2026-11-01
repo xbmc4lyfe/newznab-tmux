@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Support;
 
 use App\Services\Par2PacketAccumulator;
-use FFI;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use RuntimeException;
@@ -21,37 +20,6 @@ use UnexpectedValueException;
  */
 final class Par2CandidateProgress
 {
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_par2_checkpoint_validate_arguments(int64_t release_id, const char *manifest_ptr, size_t manifest_len, const char *candidate_ptr, size_t candidate_len, int64_t segment_count, int64_t max_state_bytes);
-        int32_t nntmux_par2_checkpoint_validate_cursor(int64_t next_segment, int64_t segment_count, const char *retries_ptr, size_t retries_len, size_t retries_count);
-        int32_t nntmux_par2_checkpoint_validate_block(const char *ptr, size_t len, uint32_t is_null);
-        int32_t nntmux_par2_checkpoint_validate_identity(const char *b64_ptr, size_t b64_len, int64_t size, uint32_t has_part, int64_t part, int64_t decoded_offset, uint32_t tombstone);
-        int64_t nntmux_par2_checkpoint_stored_integer(const char *ptr, size_t len, int64_t maximum);
-        C;
-
-    private static FFI|false|null $ffi = null;
-
-    private static bool $useRustFfi = true;
-
-    public static function setUseRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    private static function resolveFfi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
     private const MAX_SEGMENTS = 1000000;
 
     public static function load(int $releaseId, string $manifestSignature, string $candidateSignature, int $segmentCount, int $maxStateBytes): ?Par2CandidateCheckpoint
@@ -282,12 +250,7 @@ final class Par2CandidateProgress
             && (int) $release->predb_id === 0 && (int) $release->isrenamed === 0 && (int) $release->proc_par2 !== 1;
     }
 
-    public static function validateArguments(int $releaseId, string $manifestSignature, string $candidateSignature, int $segmentCount, int $maxStateBytes): void
-    {
-        self::validateArgumentsPhp($releaseId, $manifestSignature, $candidateSignature, $segmentCount, $maxStateBytes);
-    }
-
-    public static function validateArgumentsPhp(int $releaseId, string $manifestSignature, string $candidateSignature, int $segmentCount, int $maxStateBytes): void
+    private static function validateArguments(int $releaseId, string $manifestSignature, string $candidateSignature, int $segmentCount, int $maxStateBytes): void
     {
         if ($releaseId < 1 || $segmentCount < 1 || $segmentCount > self::MAX_SEGMENTS || $maxStateBytes < 1 || $maxStateBytes > 4294967295
             || ! preg_match('/\A[a-f0-9]{64}\z/', $manifestSignature) || ! preg_match('/\A[a-f0-9]{64}\z/', $candidateSignature)) {
@@ -295,44 +258,8 @@ final class Par2CandidateProgress
         }
     }
 
-    public static function validateArgumentsNative(int $releaseId, string $manifestSignature, string $candidateSignature, int $segmentCount, int $maxStateBytes): bool
-    {
-        if (! self::$useRustFfi) {
-            return false;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return false;
-        }
-
-        // @phpstan-ignore method.notFound
-        $res = $ffi->nntmux_par2_checkpoint_validate_arguments(
-            $releaseId,
-            $manifestSignature,
-            \strlen($manifestSignature),
-            $candidateSignature,
-            \strlen($candidateSignature),
-            $segmentCount,
-            $maxStateBytes
-        );
-        if (! \is_int($res) || $res < 0) {
-            return false;
-        }
-        if ($res === 0) {
-            throw new InvalidArgumentException('Invalid PAR2 checkpoint identity, segment count or byte ceiling.');
-        }
-
-        return true;
-    }
-
     /** @param array<mixed> $retrySegments */
-    public static function validateCursor(int $nextSegment, array $retrySegments, int $segmentCount): void
-    {
-        self::validateCursorPhp($nextSegment, $retrySegments, $segmentCount);
-    }
-
-    /** @param array<mixed> $retrySegments */
-    public static function validateCursorPhp(int $nextSegment, array $retrySegments, int $segmentCount): void
+    private static function validateCursor(int $nextSegment, array $retrySegments, int $segmentCount): void
     {
         if ($nextSegment < 0 || $nextSegment > $segmentCount || ! array_is_list($retrySegments) || count($retrySegments) > $nextSegment) {
             throw new InvalidArgumentException('Invalid PAR2 article cursor or retry list.');
@@ -346,83 +273,11 @@ final class Par2CandidateProgress
         }
     }
 
-    /** @param array<mixed> $retrySegments */
-    public static function validateCursorNative(int $nextSegment, array $retrySegments, int $segmentCount): bool
-    {
-        if (! self::$useRustFfi) {
-            return false;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return false;
-        }
-        $count = \count($retrySegments);
-        if ($nextSegment < 0 || $nextSegment > $segmentCount || ! array_is_list($retrySegments) || $count > $nextSegment) {
-            throw new InvalidArgumentException('Invalid PAR2 article cursor or retry list.');
-        }
-
-        $packed = '';
-        foreach ($retrySegments as $retry) {
-            if (! \is_int($retry)) {
-                throw new InvalidArgumentException('Invalid or duplicate PAR2 retry segment.');
-            }
-            $packed .= \pack('q', $retry);
-        }
-
-        // @phpstan-ignore method.notFound
-        $status = $ffi->nntmux_par2_checkpoint_validate_cursor(
-            $nextSegment,
-            $segmentCount,
-            $packed === '' ? null : $packed,
-            \strlen($packed),
-            $count
-        );
-        if (! \is_int($status) || $status < 0) {
-            return false;
-        }
-        if ($status === 1) {
-            throw new InvalidArgumentException('Invalid PAR2 article cursor or retry list.');
-        }
-        if ($status === 2) {
-            throw new InvalidArgumentException('Invalid or duplicate PAR2 retry segment.');
-        }
-
-        return true;
-    }
-
-    public static function validateBlock(?string $blockedReason): void
-    {
-        self::validateBlockPhp($blockedReason);
-    }
-
-    public static function validateBlockPhp(?string $blockedReason): void
+    private static function validateBlock(?string $blockedReason): void
     {
         if ($blockedReason !== null && ! preg_match('/\A[a-z][a-z0-9_]{0,63}\z/', $blockedReason)) {
             throw new InvalidArgumentException('Invalid PAR2 checkpoint blocked reason.');
         }
-    }
-
-    public static function validateBlockNative(?string $blockedReason): bool
-    {
-        if (! self::$useRustFfi) {
-            return false;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return false;
-        }
-
-        $str = $blockedReason ?? '';
-        // @phpstan-ignore method.notFound
-        $res = $ffi->nntmux_par2_checkpoint_validate_block($str, \strlen($str), $blockedReason === null ? 1 : 0);
-        if (! \is_int($res) || $res < 0) {
-            return false;
-        }
-        if ($res === 0) {
-            throw new InvalidArgumentException('Invalid PAR2 checkpoint blocked reason.');
-        }
-
-        return true;
     }
 
     /**
@@ -447,16 +302,7 @@ final class Par2CandidateProgress
      * @param  array<string, mixed>|null  $identity
      * @return array{name_base64: string, size: int, part: ?int}|null
      */
-    public static function canonicalIdentity(?array $identity, int $decodedOffset, bool $tombstone): ?array
-    {
-        return self::canonicalIdentityPhp($identity, $decodedOffset, $tombstone);
-    }
-
-    /**
-     * @param  array<string, mixed>|null  $identity
-     * @return array{name_base64: string, size: int, part: ?int}|null
-     */
-    public static function canonicalIdentityPhp(?array $identity, int $decodedOffset, bool $tombstone): ?array
+    private static function canonicalIdentity(?array $identity, int $decodedOffset, bool $tombstone): ?array
     {
         if ($decodedOffset < 0) {
             throw new InvalidArgumentException('Invalid decoded article offset.');
@@ -478,70 +324,6 @@ final class Par2CandidateProgress
         }
 
         return ['name_base64' => $identity['name_base64'], 'size' => $identity['size'], 'part' => $identity['part']];
-    }
-
-    /**
-     * @param  array<string, mixed>|null  $identity
-     * @return array{name_base64: string, size: int, part: ?int}|null
-     */
-    public static function canonicalIdentityNative(?array $identity, int $decodedOffset, bool $tombstone, bool &$supported = false): ?array
-    {
-        $supported = false;
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return null;
-        }
-
-        $supported = true;
-        if ($decodedOffset < 0) {
-            throw new InvalidArgumentException('Invalid decoded article offset.');
-        }
-        if ($identity === null) {
-            return null;
-        }
-        if ($tombstone
-            || \count($identity) !== 3
-            || ! isset($identity['name_base64'], $identity['size'])
-            || ! \array_key_exists('part', $identity)
-            || ! \is_string($identity['name_base64'])
-            || ! \is_int($identity['size'])
-            || ($identity['part'] !== null && ! \is_int($identity['part']))) {
-            throw new InvalidArgumentException('Invalid article continuity identity.');
-        }
-
-        $b64 = $identity['name_base64'];
-        $size = $identity['size'];
-        $part = $identity['part'];
-
-        // @phpstan-ignore method.notFound
-        $status = $ffi->nntmux_par2_checkpoint_validate_identity(
-            $b64,
-            \strlen($b64),
-            $size,
-            $part !== null ? 1 : 0,
-            $part ?? 0,
-            $decodedOffset,
-            0
-        );
-        if (! \is_int($status) || $status < 0) {
-            $supported = false;
-
-            return null;
-        }
-        if ($status === 1) {
-            throw new InvalidArgumentException('Invalid decoded article offset.');
-        }
-        if ($status === 2) {
-            throw new InvalidArgumentException('Invalid article continuity identity.');
-        }
-        if ($status === 3) {
-            throw new InvalidArgumentException('Invalid article filename encoding.');
-        }
-
-        return ['name_base64' => $b64, 'size' => $size, 'part' => $part];
     }
 
     private static function decodeRow(stdClass $row, int $segmentCount): Par2CandidateCheckpoint
@@ -586,12 +368,7 @@ final class Par2CandidateProgress
         }
     }
 
-    public static function storedInteger(mixed $value, int $maximum): int
-    {
-        return self::storedIntegerPhp($value, $maximum);
-    }
-
-    public static function storedIntegerPhp(mixed $value, int $maximum): int
+    private static function storedInteger(mixed $value, int $maximum): int
     {
         if (is_int($value)) {
             if ($value < 0 || $value > $maximum) {
@@ -608,38 +385,5 @@ final class Par2CandidateProgress
         }
 
         return (int) $value;
-    }
-
-    public static function storedIntegerNative(mixed $value, int $maximum): ?int
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return null;
-        }
-
-        if (\is_int($value)) {
-            if ($value < 0 || $value > $maximum) {
-                throw new InvalidArgumentException('Invalid stored PAR2 checkpoint integer.');
-            }
-
-            return $value;
-        }
-        if (! \is_string($value)) {
-            throw new InvalidArgumentException('Invalid stored PAR2 checkpoint integer.');
-        }
-
-        // @phpstan-ignore method.notFound
-        $res = $ffi->nntmux_par2_checkpoint_stored_integer($value, \strlen($value), $maximum);
-        if (! \is_int($res) || $res === -1) {
-            return null;
-        }
-        if ($res < 0) {
-            throw new InvalidArgumentException('Invalid stored PAR2 checkpoint integer.');
-        }
-
-        return $res;
     }
 }

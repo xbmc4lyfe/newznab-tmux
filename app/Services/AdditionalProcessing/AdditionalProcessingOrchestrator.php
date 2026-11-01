@@ -11,13 +11,9 @@ use App\Services\AdditionalProcessing\DTO\ReleaseProcessingResult;
 use App\Services\AdditionalProcessing\Enums\ProcessingOutcome;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\TempWorkspaceService;
-use App\Support\RustPipelineLibrary;
 use Exception;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
-use Throwable;
 
 /**
  * Main orchestrator for additional release post-processing.
@@ -26,26 +22,6 @@ use Throwable;
 class AdditionalProcessingOrchestrator
 {
     public const int MAX_COMPRESSED_FILES_TO_CHECK = 10;
-
-    public const string FFI_CDEF = <<<'C'
-        double nntmux_aporch_elapsed_seconds(int64_t start_ns, int64_t end_ns, int32_t *status);
-        int64_t nntmux_aporch_query_limit(int64_t limit);
-        int32_t nntmux_aporch_batch_disposition(uint8_t setup_ok, int64_t total_releases);
-        int32_t nntmux_aporch_should_clear_claim(size_t token_len, int64_t release_id);
-        C;
-
-    public const int BATCH_SETUP_FAILED = 0;
-
-    public const int BATCH_EMPTY = 1;
-
-    public const int BATCH_PROCESS = 2;
-
-    public const int DEFAULT_QUERY_LIMIT = 25;
-
-    // PHP remains the production default: FFI marshaling stays below the 1.5x gate.
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
 
     /**
      * @var Collection<int, mixed>
@@ -67,16 +43,6 @@ class AdditionalProcessingOrchestrator
         private readonly ConsoleOutputService $output
     ) {}
 
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
     /**
      * Start the additional processing.
      *
@@ -97,7 +63,7 @@ class AdditionalProcessingOrchestrator
 
         $this->fetchReleases($groupID, $guidChar, $excludedReleaseIds);
 
-        if (self::batchDisposition(true, $this->totalReleases) === self::BATCH_PROCESS) {
+        if ($this->totalReleases > 0) {
             $this->output->echoDescription($this->totalReleases);
 
             return $this->processReleases($guidChar);
@@ -151,7 +117,7 @@ class AdditionalProcessingOrchestrator
                 ProcessingOutcome::Failed,
                 reason: 'No processing result was produced.',
             );
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             if ($this->config->debugMode) {
                 Log::error('processSingleGuid failed: '.$e->getMessage());
             }
@@ -180,7 +146,7 @@ class AdditionalProcessingOrchestrator
                 $workerToken !== '' ? $workerToken : bin2hex(random_bytes(16)),
             );
             $this->tempWorkspace->clearDirectory($this->mainTmpPath, true);
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             $this->lastSetupError = $e->getMessage();
             $this->output->warning('Additional post-processing skipped: '.$e->getMessage());
             Log::error('Additional post-processing temp path is unavailable', [
@@ -214,7 +180,7 @@ class AdditionalProcessingOrchestrator
         $this->claimToken = bin2hex(random_bytes(16));
         $this->releases = AdditionalCandidateQuery::claimBatch(
             $guidChar,
-            self::effectiveQueryLimit($this->config->queryLimit),
+            $this->config->queryLimit > 0 ? $this->config->queryLimit : 25,
             $this->claimToken,
             $groupID,
             $this->config->minSizeBytes,
@@ -268,7 +234,7 @@ class AdditionalProcessingOrchestrator
 
             try {
                 $results[] = $this->processor->process(new ReleaseProcessingContext($release), $this->mainTmpPath);
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 $results[] = new ReleaseProcessingResult(
                     releaseId: $releaseId,
                     guid: $releaseGuid,
@@ -286,7 +252,7 @@ class AdditionalProcessingOrchestrator
                 // re-selected on the next cycle, and the pp_timeout_count /
                 // maxpptimeoutcount machinery will eventually drop it.
             } finally {
-                if (self::shouldClearClaim($this->claimToken, $releaseId)) {
+                if ($this->claimToken !== '' && $releaseId > 0) {
                     AdditionalCandidateQuery::clearClaim($releaseId, $this->claimToken);
                 }
             }
@@ -337,134 +303,7 @@ class AdditionalProcessingOrchestrator
 
     private function elapsedSecondsSince(int $startedAtNanoseconds): float
     {
-        return self::elapsedSecondsBetween($startedAtNanoseconds, hrtime(true));
-    }
-
-    public static function elapsedSecondsBetween(int $startedAtNanoseconds, int $endedAtNanoseconds): float
-    {
-        return (self::$useRustFfi ? self::elapsedSecondsBetweenNative($startedAtNanoseconds, $endedAtNanoseconds) : null)
-            ?? self::elapsedSecondsBetweenPhp($startedAtNanoseconds, $endedAtNanoseconds);
-    }
-
-    public static function elapsedSecondsBetweenPhp(int $startedAtNanoseconds, int $endedAtNanoseconds): float
-    {
-        return ($endedAtNanoseconds - $startedAtNanoseconds) / 1_000_000_000;
-    }
-
-    public static function elapsedSecondsBetweenNative(int $startedAtNanoseconds, int $endedAtNanoseconds): ?float
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        try {
-            $status = $ffi->new('int32_t');
-            // @phpstan-ignore method.notFound
-            $value = $ffi->nntmux_aporch_elapsed_seconds($startedAtNanoseconds, $endedAtNanoseconds, FFI::addr($status));
-            // @phpstan-ignore property.notFound
-            $code = (int) $status->cdata;
-        } catch (Throwable) {
-            return null;
-        }
-
-        return $code === 1 ? (float) $value : null;
-    }
-
-    /**
-     * Batch size to claim; a non-positive configured limit falls back to the default.
-     */
-    public static function effectiveQueryLimit(int $configured): int
-    {
-        return (self::$useRustFfi ? self::effectiveQueryLimitNative($configured) : null) ?? self::effectiveQueryLimitPhp($configured);
-    }
-
-    public static function effectiveQueryLimitPhp(int $configured): int
-    {
-        return $configured > 0 ? $configured : self::DEFAULT_QUERY_LIMIT;
-    }
-
-    public static function effectiveQueryLimitNative(int $configured): ?int
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            return (int) $ffi->nntmux_aporch_query_limit($configured);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * One of the BATCH_* outcomes for a batch whose workspace setup succeeded or failed.
-     */
-    public static function batchDisposition(bool $setupSucceeded, int $totalReleases): int
-    {
-        return (self::$useRustFfi ? self::batchDispositionNative($setupSucceeded, $totalReleases) : null)
-            ?? self::batchDispositionPhp($setupSucceeded, $totalReleases);
-    }
-
-    public static function batchDispositionPhp(bool $setupSucceeded, int $totalReleases): int
-    {
-        if (! $setupSucceeded) {
-            return self::BATCH_SETUP_FAILED;
-        }
-
-        return $totalReleases > 0 ? self::BATCH_PROCESS : self::BATCH_EMPTY;
-    }
-
-    public static function batchDispositionNative(bool $setupSucceeded, int $totalReleases): ?int
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $code = (int) $ffi->nntmux_aporch_batch_disposition($setupSucceeded ? 1 : 0, $totalReleases);
-        } catch (Throwable) {
-            return null;
-        }
-
-        return \in_array($code, [self::BATCH_SETUP_FAILED, self::BATCH_EMPTY, self::BATCH_PROCESS], true) ? $code : null;
-    }
-
-    /**
-     * Whether a processed candidate still holds a claim this batch must release.
-     */
-    public static function shouldClearClaim(string $claimToken, int $releaseId): bool
-    {
-        return (self::$useRustFfi ? self::shouldClearClaimNative($claimToken, $releaseId) : null) ?? self::shouldClearClaimPhp($claimToken, $releaseId);
-    }
-
-    public static function shouldClearClaimPhp(string $claimToken, int $releaseId): bool
-    {
-        return $claimToken !== '' && $releaseId > 0;
-    }
-
-    public static function shouldClearClaimNative(string $claimToken, int $releaseId): ?bool
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            return (int) $ffi->nntmux_aporch_should_clear_claim(\strlen($claimToken), $releaseId) === 1;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi === false ? null : self::$ffi;
+        return (hrtime(true) - $startedAtNanoseconds) / 1_000_000_000;
     }
 
     /**
@@ -490,348 +329,5 @@ class AdditionalProcessingOrchestrator
         $this->totalReleases = 0;
         $this->claimToken = '';
         $this->lastSetupError = '';
-    }
-
-    public const bool W416_RUST_FFI_DEFAULT = false;
-
-    private const string W416_FFI_CDEF = 'int32_t nntmux_w416_additional_candidate_diag_orch_console_nzb(uint8_t operation, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
-
-    private static ?bool $w416UseRustFfi = null;
-
-    private static FFI|false|null $w416Ffi = null;
-
-    public static function useW416RustFfi(bool $enable = true): void
-    {
-        self::$w416UseRustFfi = $enable;
-    }
-
-    public static function usesW416RustFfi(): bool
-    {
-        return self::$w416UseRustFfi ?? self::W416_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW416RustFfi(): void
-    {
-        self::$w416UseRustFfi = null;
-        self::$w416Ffi = null;
-    }
-
-    /** @return list<int>|null */
-    private static function w416Slots(int $operation, string $input, int $count): ?array
-    {
-        if (\strlen($input) > 16_777_216) {
-            return null;
-        }
-        try {
-            self::$w416Ffi ??= RustPipelineLibrary::resolveDomain('additional', self::W416_FFI_CDEF) ?? false;
-            if (self::$w416Ffi === false) {
-                return null;
-            }
-            $bytes = $count * 8;
-            $buffer = self::$w416Ffi->new('char['.$bytes.']');
-            // @phpstan-ignore method.notFound
-            $written = self::$w416Ffi->nntmux_w416_additional_candidate_diag_orch_console_nzb($operation, $input, \strlen($input), $buffer, $bytes);
-            if ($written !== $bytes) {
-                return null;
-            }
-            $values = unpack('q*', FFI::string($buffer, $bytes));
-            if ($values === false || \count($values) !== $count) {
-                return null;
-            }
-            foreach ($values as $value) {
-                if (! \is_int($value) || $value < 0) {
-                    return null;
-                }
-            }
-
-            return array_values($values);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private static function w416Add(int $left, int $right): int
-    {
-        return $left > PHP_INT_MAX - $right ? PHP_INT_MAX : $left + $right;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $batches
-     * @return array{total: int, setup_failed: int, empty: int, processing: int, total_elapsed_ms: int, budget_exhausted: bool, invalid: int}
-     */
-    public static function summarizeOrchestrationBatch(array $batches, int $budgetMs = 60000): array
-    {
-        return self::usesW416RustFfi()
-            ? self::summarizeOrchestrationBatchNative($batches, $budgetMs)
-            : self::summarizeOrchestrationBatchPhp($batches, $budgetMs);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $batches
-     * @return array{total: int, setup_failed: int, empty: int, processing: int, total_elapsed_ms: int, budget_exhausted: bool, invalid: int}
-     */
-    public static function summarizeOrchestrationBatchPhp(array $batches, int $budgetMs = 60000): array
-    {
-        $result = ['total' => \count($batches), 'setup_failed' => 0, 'empty' => 0, 'processing' => 0, 'total_elapsed_ms' => 0, 'budget_exhausted' => false, 'invalid' => 0];
-        foreach ($batches as $row) {
-            if (! \is_array($row) || ! \is_int($row['release_count'] ?? null) || ! \is_int($row['elapsed_ms'] ?? null) || ! \is_bool($row['setup_ok'] ?? null)) {
-                $result['invalid']++;
-
-                continue;
-            }
-            $result['total_elapsed_ms'] = self::w416Add($result['total_elapsed_ms'], max(0, $row['elapsed_ms']));
-            if (! $row['setup_ok']) {
-                $result['setup_failed']++;
-            } elseif ($row['release_count'] <= 0) {
-                $result['empty']++;
-            } else {
-                $result['processing']++;
-            }
-        }
-        $result['budget_exhausted'] = $result['total'] > 0 && $result['total_elapsed_ms'] >= max(0, $budgetMs);
-
-        return $result;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $batches
-     * @return array{total: int, setup_failed: int, empty: int, processing: int, total_elapsed_ms: int, budget_exhausted: bool, invalid: int}
-     */
-    public static function summarizeOrchestrationBatchNative(array $batches, int $budgetMs = 60000): array
-    {
-        $total = \count($batches);
-        if ($total > 100_000) {
-            return self::summarizeOrchestrationBatchPhp($batches, $budgetMs);
-        }
-        $frame = pack('qqV', $budgetMs, 0, $total);
-        foreach ($batches as $row) {
-            if (! \is_array($row) || ! \is_int($row['release_count'] ?? null) || ! \is_int($row['elapsed_ms'] ?? null) || ! \is_bool($row['setup_ok'] ?? null)) {
-                return self::summarizeOrchestrationBatchPhp($batches, $budgetMs);
-            }
-            $frame .= pack('qqq', $row['setup_ok'] ? 1 : 0, $row['release_count'], $row['elapsed_ms']);
-        }
-        $slots = self::w416Slots(3, $frame, 7);
-        if ($slots === null || $slots[0] !== $total || $slots[6] !== 0 || $slots[5] > 1 || $slots[5] !== (int) ($total > 0 && $slots[4] >= max(0, $budgetMs)) || $slots[1] > $total || $slots[2] > $total || $slots[3] > $total || $total !== $slots[1] + $slots[2] + $slots[3]) {
-            return self::summarizeOrchestrationBatchPhp($batches, $budgetMs);
-        }
-
-        return [
-            'total' => $slots[0],
-            'setup_failed' => $slots[1],
-            'empty' => $slots[2],
-            'processing' => $slots[3],
-            'total_elapsed_ms' => $slots[4],
-            'budget_exhausted' => $slots[5] === 1,
-            'invalid' => $slots[6],
-        ];
-    }
-
-    // Rust is the default only while the paired W51.6 benchmark clears 1.5x on all four metrics.
-    private const bool W51_RUST_FFI_DEFAULT = true;
-
-    public const string W51_FFI_CDEF = <<<'C'
-        int32_t nntmux_w516_release_run_batch(const char *guids, size_t guids_len, const char *guid_twin, size_t guid_twin_len, const char *ints, size_t ints_len, size_t count, size_t token_len, int64_t slow_ns, int64_t *out, size_t out_count);
-        C;
-
-    public const int W51_RUN_HEADER = 28;
-
-    private const int W51_TOTAL_CAP = 1 << 62;
-
-    private const array W51_HEX_BUCKETS = [
-        '0' => 0, '1' => 1, '2' => 2, '3' => 3, '4' => 4, '5' => 5, '6' => 6, '7' => 7,
-        '8' => 8, '9' => 9, 'a' => 10, 'b' => 11, 'c' => 12, 'd' => 13, 'e' => 14, 'f' => 15,
-    ];
-
-    private const int W51_MAX_ITEMS = 1_048_576;
-
-    private static ?bool $w51RustFfi = null;
-
-    private static FFI|false|null $w51Ffi = null;
-
-    private static ?CData $w51Out = null;
-
-    private static int $w51Capacity = 0;
-
-    /**
-     * Account a batch of processed releases as {@see self::processReleases()} sees them.
-     *
-     * `$ids` sets the row count; missing GUIDs are '' and missing clocks 0. Start and end
-     * `hrtime()` nanoseconds are clamped to 0..2^62 and elapsed time to at least 0. Layout:
-     * `[0]` count, `[1]` `batchDispositionPhp(true, count)`, `[2]` claims to clear
-     * (`shouldClearClaimPhp()`), `[3]` repeated ids, `[4]` distinct ids, `[5]` GUIDs that are
-     * not 40 hex digits, `[6]` releases taking at least `$slowNs` (when positive), `[7]` total
-     * elapsed (saturating at 2^62), `[8]` longest elapsed, `[9]` its first index (-1 when
-     * empty), `[10..26]` per GUID bucket (0-f, then other), `[27]` FNV-1a digest; then per release
-     * `clear | repeated << 1 | well_formed << 2 | slow << 3 | bucket << 4 | elapsed_us << 9`.
-     *
-     * @param  array<array-key, int>  $ids
-     * @param  array<array-key, string>  $guids
-     * @param  array<array-key, int>  $startedNs
-     * @param  array<array-key, int>  $endedNs
-     * @return list<int>
-     */
-    public static function summarizeReleaseRunBatch(array $ids, array $guids, array $startedNs, array $endedNs, string $claimToken, int $slowNs): array
-    {
-        return (self::usesW51RustFfi() ? self::summarizeReleaseRunBatchNative($ids, $guids, $startedNs, $endedNs, $claimToken, $slowNs) : null)
-            ?? self::summarizeReleaseRunBatchPhp($ids, $guids, $startedNs, $endedNs, $claimToken, $slowNs);
-    }
-
-    /**
-     * @param  array<array-key, int>  $ids
-     * @param  array<array-key, string>  $guids
-     * @param  array<array-key, int>  $startedNs
-     * @param  array<array-key, int>  $endedNs
-     * @return list<int>
-     */
-    public static function summarizeReleaseRunBatchPhp(array $ids, array $guids, array $startedNs, array $endedNs, string $claimToken, int $slowNs): array
-    {
-        $ids = array_values($ids);
-        $guids = array_values($guids);
-        $startedNs = array_values($startedNs);
-        $endedNs = array_values($endedNs);
-        $count = \count($ids);
-        $out = array_fill(0, self::W51_RUN_HEADER, 0);
-        $out[0] = $count;
-        $out[1] = self::batchDispositionPhp(true, $count);
-        $out[9] = -1;
-        $seen = $rows = [];
-        $digest = 2_166_136_261;
-        foreach ($ids as $index => $id) {
-            $guid = $guids[$index] ?? '';
-            $elapsed = max(0, min(max($endedNs[$index] ?? 0, 0), self::W51_TOTAL_CAP) - min(max($startedNs[$index] ?? 0, 0), self::W51_TOTAL_CAP));
-            $clear = self::shouldClearClaimPhp($claimToken, $id);
-            $repeated = isset($seen[$id]);
-            $seen[$id] = true;
-            $wellFormed = \strlen($guid) === 40 && ctype_xdigit($guid);
-            $slow = $slowNs > 0 && $elapsed >= $slowNs;
-            $bucket = self::W51_HEX_BUCKETS[strtolower(substr($guid, 0, 1))] ?? 16;
-            $out[2] += (int) $clear;
-            $out[3] += (int) $repeated;
-            $out[5] += (int) ! $wellFormed;
-            $out[6] += (int) $slow;
-            $out[7] = $elapsed > self::W51_TOTAL_CAP - $out[7] ? self::W51_TOTAL_CAP : $out[7] + $elapsed;
-            if ($index === 0 || $elapsed > $out[8]) {
-                $out[8] = $elapsed;
-                $out[9] = $index;
-            }
-            $out[10 + $bucket]++;
-            $row = (int) $clear | (int) $repeated << 1 | (int) $wellFormed << 2 | (int) $slow << 3 | $bucket << 4 | intdiv($elapsed, 1000) << 9;
-            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
-            $rows[] = $row;
-        }
-        $out[4] = $count - $out[3];
-        $out[27] = $digest;
-
-        return [...$out, ...$rows];
-    }
-
-    /**
-     * Rust accounting, or null when PHP must compute it (unavailable library, mismatched
-     * columns or rejected input).
-     *
-     * @param  array<array-key, int>  $ids
-     * @param  array<array-key, string>  $guids
-     * @param  array<array-key, int>  $startedNs
-     * @param  array<array-key, int>  $endedNs
-     * @return list<int>|null
-     */
-    public static function summarizeReleaseRunBatchNative(array $ids, array $guids, array $startedNs, array $endedNs, string $claimToken, int $slowNs): ?array
-    {
-        $count = \count($ids);
-        $fields = self::W51_RUN_HEADER + $count;
-        $binding = $count <= self::W51_MAX_ITEMS && \count($guids) === $count && \count($startedNs) === $count && \count($endedNs) === $count
-            ? self::w51Binding($fields)
-            : null;
-        if ($binding === null) {
-            return null;
-        }
-        [$ffi, $out] = $binding;
-        [$joined, $twin] = self::w51Strings($guids);
-        try {
-            $packed = pack('q*', ...$ids, ...$startedNs, ...$endedNs);
-            // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_w516_release_run_batch($joined, \strlen($joined), $twin, \strlen($twin), $packed, \strlen($packed), $count, \strlen($claimToken), $slowNs, $out, $fields);
-
-            return self::w51Decode(\is_int($status) ? $status : -1, $out, $fields);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Run `$callback` with the Wave 51.6 Rust batch path forced on or off, then restore the previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::$w51RustFfi;
-        self::$w51RustFfi = $enabled;
-        try {
-            return $callback();
-        } finally {
-            self::$w51RustFfi = $previous;
-        }
-    }
-
-    public static function usesW51RustFfi(): bool
-    {
-        return self::$w51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * The cached Wave 51.6 binding and an output buffer of at least `$fields` values, or null.
-     *
-     * @return array{0: FFI, 1: CData}|null
-     */
-    private static function w51Binding(int $fields): ?array
-    {
-        try {
-            self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('additional_w51', self::W51_FFI_CDEF) ?? false;
-            if (self::$w51Ffi === false) {
-                return null;
-            }
-            $out = self::$w51Out;
-            if ($out === null || self::$w51Capacity < $fields) {
-                self::$w51Capacity = max(256, $fields);
-                $out = self::$w51Out = self::$w51Ffi->new('int64_t['.self::$w51Capacity.']');
-            }
-        } catch (Throwable) {
-            return null;
-        }
-
-        return [self::$w51Ffi, $out];
-    }
-
-    /**
-     * Decode `$fields` output values after a successful Wave 51.6 call.
-     *
-     * @return list<int>|null
-     */
-    private static function w51Decode(int $status, CData $out, int $fields): ?array
-    {
-        if ($status !== 1) {
-            return null;
-        }
-        $values = unpack('P*', FFI::string($out, $fields * 8));
-
-        return $values === false ? null : array_values($values);
-    }
-
-    /**
-     * NUL-joined values and, when one holds a NUL, the same list joined with 0x01 so Rust
-     * finds the separators where the two differ.
-     *
-     * @param  array<array-key, string>  $items
-     * @return array{0: string, 1: string}
-     */
-    private static function w51Strings(array $items): array
-    {
-        $joined = implode("\0", $items);
-
-        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
     }
 }

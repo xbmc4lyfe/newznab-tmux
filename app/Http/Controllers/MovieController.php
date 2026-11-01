@@ -16,143 +16,6 @@ use Illuminate\View\View;
 
 class MovieController extends BasePageController
 {
-    // Keep PHP as the production default until the Rust performance gate passes.
-    private static bool $useRustFfi = false;
-
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi ?? false;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    /** @param array<mixed> $genres
-     * @return array<string, mixed>
-     */
-    public static function browsePayload(int $category, string $title, string $actors, string $director, int $rating, string $genre, int $year, array $genres, int $nextYear): array
-    {
-        return self::$useRustFfi ? self::browsePayloadNative($category, $title, $actors, $director, $rating, $genre, $year, $genres, $nextYear) : self::browsePayloadPhp($category, $title, $actors, $director, $rating, $genre, $year, $genres, $nextYear);
-    }
-
-    /** @param array<mixed> $genres
-     * @return array<string, mixed>
-     */
-    public static function browsePayloadPhp(int $category, string $title, string $actors, string $director, int $rating, string $genre, int $year, array $genres, int $nextYear): array
-    {
-        $years = range(1903, $nextYear);
-        rsort($years);
-        $ratings = range(1, 9);
-
-        return [
-            'categories' => $category === -1 ? [] : [$category],
-            'title' => stripslashes($title),
-            'actors' => stripslashes($actors),
-            'director' => stripslashes($director),
-            'ratings' => $ratings,
-            'rating' => in_array($rating, $ratings, true) ? $rating : '',
-            'genres' => $genres,
-            'genre' => in_array($genre, $genres, true) ? $genre : '',
-            'years' => $years,
-            'year' => in_array($year, $years, true) ? $year : '',
-        ];
-    }
-
-    /** @param array<mixed> $genres
-     * @return array<string, mixed>
-     */
-    public static function browsePayloadNative(int $category, string $title, string $actors, string $director, int $rating, string $genre, int $year, array $genres, int $nextYear): array
-    {
-        $result = GetNzbController::transformNative(4, [$category, $title, $actors, $director, $rating, $genre, $year, $genres, $nextYear]);
-
-        return is_array($result) ? $result : self::browsePayloadPhp($category, $title, $actors, $director, $rating, $genre, $year, $genres, $nextYear);
-    }
-
-    /** @param array<mixed> $movie
-     * @return array<mixed>
-     */
-    public static function detailPayload(array $movie, string $imdbid): array
-    {
-        return self::$useRustFfi ? self::detailPayloadNative($movie, $imdbid) : self::detailPayloadPhp($movie, $imdbid);
-    }
-
-    /** @param array<mixed> $movie
-     * @return array<mixed>
-     */
-    public static function detailPayloadPhp(array $movie, string $imdbid): array
-    {
-        if (empty($movie['title'])) {
-            $movie['title'] = 'Unknown Title';
-        }
-        if (empty($movie['imdbid'])) {
-            $movie['imdbid'] = $imdbid;
-        }
-
-        return $movie;
-    }
-
-    /** @param array<mixed> $movie
-     * @return array<mixed>
-     */
-    public static function detailPayloadNative(array $movie, string $imdbid): array
-    {
-        $result = GetNzbController::transformNative(5, [$movie, $imdbid]);
-
-        return is_array($result) ? $result : self::detailPayloadPhp($movie, $imdbid);
-    }
-
-    /** @param array<mixed> $movie
-     * @return array<mixed>
-     */
-    public static function coverPayload(array $movie): array
-    {
-        return self::$useRustFfi ? self::coverPayloadNative($movie) : self::coverPayloadPhp($movie);
-    }
-
-    /** @param array<mixed> $movie
-     * @return array<mixed>
-     */
-    public static function coverPayloadPhp(array $movie): array
-    {
-        $payload = [];
-        foreach (['imdbid', 'videos_id', 'musicinfo_id', 'consoleinfo_id', 'bookinfo_id', 'gamesinfo_id', 'anidbid'] as $key) {
-            if (array_key_exists($key, $movie)) {
-                $payload[$key] = $movie[$key];
-            }
-        }
-
-        return $payload;
-    }
-
-    /** @param array<mixed> $movie
-     * @return array<mixed>
-     */
-    public static function coverPayloadNative(array $movie): array
-    {
-        $result = GetNzbController::transformNative(6, [$movie]);
-
-        return is_array($result) ? $result : self::coverPayloadPhp($movie);
-    }
-
-    public static function validTrailerId(string $id): bool
-    {
-        return self::$useRustFfi ? self::validTrailerIdNative($id) : self::validTrailerIdPhp($id);
-    }
-
-    public static function validTrailerIdPhp(string $id): bool
-    {
-        return $id !== '' && ctype_digit($id);
-    }
-
-    public static function validTrailerIdNative(string $id): bool
-    {
-        $result = GetNzbController::transformNative(7, [$id]);
-
-        return is_bool($result) ? $result : self::validTrailerIdPhp($id);
-    }
-
     protected MovieBrowseService $movieBrowseService;
 
     protected MovieService $movieService;
@@ -179,18 +42,7 @@ class MovieController extends BasePageController
             $category = $cat !== null ? (int) $cat->id : Category::MOVIE_ROOT;
         }
 
-        $browse = self::browsePayload(
-            $category,
-            $this->scalarInput($request, 'title'),
-            $this->scalarInput($request, 'actors'),
-            $this->scalarInput($request, 'director'),
-            $this->integerInput($request, 'rating', 0),
-            $this->scalarInput($request, 'genre'),
-            $this->integerInput($request, 'year', 0),
-            $this->movieBrowseService->getGenres(),
-            now()->addYear()->year
-        );
-        $catarray = $browse['categories'];
+        $catarray = $category !== -1 ? [$category] : [];
 
         $page = $this->resolvePage($request);
         $perPage = (int) config('nntmux.items_per_cover_page');
@@ -213,6 +65,14 @@ class MovieController extends BasePageController
             return $result;
         });
 
+        $years = range(1903, now()->addYear()->year);
+        rsort($years);
+
+        $genres = $this->movieBrowseService->getGenres();
+        $ratingInput = $this->integerInput($request, 'rating', 0);
+        $genreInput = $this->scalarInput($request, 'genre');
+        $yearInput = $this->integerInput($request, 'year', 0);
+
         $catname = $category === -1 ? 'All' : Category::find($category) ?? 'All';
 
         $this->viewData = array_merge($this->viewData, [
@@ -221,15 +81,15 @@ class MovieController extends BasePageController
             'catlist' => $moviecats,
             'category' => $category,
             'categorytitle' => $id,
-            'title' => $browse['title'],
-            'actors' => $browse['actors'],
-            'director' => $browse['director'],
-            'ratings' => $browse['ratings'],
-            'rating' => $browse['rating'],
-            'genres' => $browse['genres'],
-            'genre' => $browse['genre'],
-            'years' => $browse['years'],
-            'year' => $browse['year'],
+            'title' => stripslashes($this->scalarInput($request, 'title')),
+            'actors' => stripslashes($this->scalarInput($request, 'actors')),
+            'director' => stripslashes($this->scalarInput($request, 'director')),
+            'ratings' => range(1, 9),
+            'rating' => \in_array($ratingInput, range(1, 9), true) ? $ratingInput : '',
+            'genres' => $genres,
+            'genre' => \in_array($genreInput, $genres, true) ? $genreInput : '',
+            'years' => $years,
+            'year' => \in_array($yearInput, $years, true) ? $yearInput : '',
             'catname' => $catname,
             'resultsadd' => $movies,
             'results' => $results,
@@ -261,7 +121,15 @@ class MovieController extends BasePageController
         }
 
         // Convert Eloquent model to array
-        $movieArray = self::detailPayload($movieInfo->toArray(), $imdbid);
+        $movieArray = $movieInfo->toArray();
+
+        // Ensure we have at least the basic fields
+        if (empty($movieArray['title'])) {
+            $movieArray['title'] = 'Unknown Title';
+        }
+        if (empty($movieArray['imdbid'])) {
+            $movieArray['imdbid'] = $imdbid;
+        }
 
         // Only process fields if they exist and are not empty
         if (! empty($movieArray['genre'])) {
@@ -275,7 +143,7 @@ class MovieController extends BasePageController
         }
 
         // Add cover image URL using helper function
-        $movieArray['cover'] = getReleaseCover(self::coverPayload($movieArray));
+        $movieArray['cover'] = getReleaseCover($movieArray);
 
         // Get all releases for this movie directly (no limit)
         $releases = $this->movieBrowseService->getMovieReleases($imdbid, (array) $this->userdata->categoryexclusions);
@@ -297,7 +165,7 @@ class MovieController extends BasePageController
     public function showTrailer(Request $request)
     {
         $movieId = $this->scalarInput($request, 'id');
-        if (self::validTrailerId($movieId)) {
+        if ($movieId !== '' && ctype_digit($movieId)) {
             $mov = $this->movieService->getMovieInfo($movieId);
 
             if (! $mov) {
@@ -381,7 +249,7 @@ class MovieController extends BasePageController
                     'tmdbid' => $item->tmdbid,
                     'cover' => $item->cover,
                 ];
-                $item->cover = getReleaseCover(self::coverPayload($coverArray));
+                $item->cover = getReleaseCover($coverArray);
 
                 return $item;
             });

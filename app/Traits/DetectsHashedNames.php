@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace App\Traits;
 
-use App\Support\RustPipelineLibrary;
-
 /**
  * Trait for detecting hashed, obfuscated, and gibberish release names.
  *
@@ -17,25 +15,12 @@ use App\Support\RustPipelineLibrary;
  */
 trait DetectsHashedNames
 {
-    public const PREDB_HASHED_NAMES_POLICY = 'fce1f04abab51b4b6a731f53b57edbfdfb94dca0151f6cf4c934ac8b2fc706cf';
+    public const PREDB_HASHED_NAMES_POLICY = '3f5efc9f1145180668038a35d726463db1aa80fc2dd5d259d58ac9c2f89b22df';
 
     /**
      * Combined check: returns true if the name appears hashed or gibberish.
      */
     public function isHashedOrGibberish(string $name): bool
-    {
-        $rust = RustPipelineLibrary::isHashedOrGibberish($name);
-        if ($rust !== null) {
-            return $rust;
-        }
-
-        return $this->isHashedOrGibberishPhp($name);
-    }
-
-    /**
-     * Pure-PHP fallback for hashed/gibberish name detection.
-     */
-    public function isHashedOrGibberishPhp(string $name): bool
     {
         $cleaned = $this->stripExtensionsForAnalysis($name);
         $coreName = $this->getCoreNameWithoutSeparators($cleaned);

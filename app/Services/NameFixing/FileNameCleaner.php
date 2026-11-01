@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Services\NameFixing;
 
 use App\Support\PredbSearchDocument;
-use App\Support\RustPipelineLibrary;
 use App\Traits\DetectsHashedNames;
 
 /**
@@ -16,7 +15,7 @@ use App\Traits\DetectsHashedNames;
  */
 class FileNameCleaner
 {
-    public const PREDB_IDENTITY_POLICY = 'aff65740cbf277f19a0dbd20091251d35020d3d4d5118e2011d371a021322a3d';
+    public const PREDB_IDENTITY_POLICY = '65afde111b1c96db73695c3268de2caa001a9a46b6bf0dfb0bc04580b8ea9235';
 
     use DetectsHashedNames;
 
@@ -139,28 +138,10 @@ class FileNameCleaner
      */
     public function isKnownFileSuffix(string $suffix): bool
     {
-        if ($suffix === '') {
-            return true;
-        }
-        $strippedLen = RustPipelineLibrary::stripKnownFileSuffixesLen($suffix, preserveCodecAfterWrapper: false);
-        if ($strippedLen !== null) {
-            return $strippedLen === 0;
-        }
-
-        return $this->stripKnownFileSuffixesPhp('Title'.$suffix, preserveCodecAfterWrapper: false) === 'Title';
+        return $suffix === '' || $this->stripKnownFileSuffixes('Title'.$suffix, preserveCodecAfterWrapper: false) === 'Title';
     }
 
     private function stripKnownFileSuffixes(string $fileName, bool $preserveCodecAfterWrapper): string
-    {
-        $strippedLen = RustPipelineLibrary::stripKnownFileSuffixesLen($fileName, $preserveCodecAfterWrapper);
-        if ($strippedLen !== null) {
-            return $strippedLen === strlen($fileName) ? $fileName : substr($fileName, 0, $strippedLen);
-        }
-
-        return $this->stripKnownFileSuffixesPhp($fileName, $preserveCodecAfterWrapper);
-    }
-
-    public function stripKnownFileSuffixesPhp(string $fileName, bool $preserveCodecAfterWrapper): string
     {
         $wrappers = [
             ...self::archiveSuffixPatterns(),
@@ -231,24 +212,6 @@ class FileNameCleaner
     }
 
     private function computeForMatching(string $fileName, bool $preserveLeadingNumber): string|false
-    {
-        if (get_class($this) === self::class) {
-            $span = RustPipelineLibrary::cleanForMatchingSpan($fileName, $preserveLeadingNumber);
-            if ($span === -1) {
-                return false;
-            }
-            if ($span !== null && $span >= 0) {
-                $start = $span >> 32;
-                $len = $span & 0xFFFFFFFF;
-
-                return $start === 0 && $len === strlen($fileName) ? $fileName : substr($fileName, $start, $len);
-            }
-        }
-
-        return $this->computeForMatchingPhp($fileName, $preserveLeadingNumber);
-    }
-
-    public function computeForMatchingPhp(string $fileName, bool $preserveLeadingNumber): string|false
     {
         if (! mb_check_encoding($fileName, 'UTF-8')
             || preg_match('/(?![\x00-\x7F])\p{C}/u', $fileName) !== 0) {
@@ -412,11 +375,6 @@ class FileNameCleaner
      */
     public function isPlausibleReleaseTitle(string $title): bool
     {
-        return RustPipelineLibrary::isPlausibleReleaseTitle($title) ?? $this->isPlausibleReleaseTitlePhp($title);
-    }
-
-    public function isPlausibleReleaseTitlePhp(string $title): bool
-    {
         $t = trim($title);
 
         if ($t === '' || strlen($t) < 12) {
@@ -428,7 +386,7 @@ class FileNameCleaner
             return false;
         }
 
-        if ($this->isHashedOrGibberishPhp($t)) {
+        if ($this->looksLikeHashedName($t)) {
             return false;
         }
 
@@ -446,7 +404,7 @@ class FileNameCleaner
         if (preg_match('/[-.][A-Za-z0-9]{2,}$/', $t)) {
             return true;
         }
-        $hasTV = (bool) preg_match('/\bS\d{1,2}[Eex]\d{1,3}\b/i', $t) || SeasonPackDetector::isSeasonPackPhp($t);
+        $hasTV = (bool) preg_match('/\bS\d{1,2}[Eex]\d{1,3}\b/i', $t) || SeasonPackDetector::isSeasonPack($t);
         $hasQuality = (bool) preg_match('/\b(480p|720p|1080p|2160p|4k|webrip|web[ .-]?dl|bluray|bdrip|dvdrip|hdtv|hdrip|xvid|x264|x265|hevc|h\.?264|ts|cam|r5|proper|repack)\b/i', $t);
         if ($hasTV && $hasQuality) {
             return true;

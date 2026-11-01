@@ -10,33 +10,13 @@ use App\Models\Category;
 use App\Models\User;
 use App\Models\UserDownload;
 use App\Models\UserRequest;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Support\Carbon;
-use Throwable;
 
 class RssController extends BasePageController
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_rss_parse_category_ids(const char *input, size_t len, char *out, size_t out_cap);
-        int32_t nntmux_rss_show_id(const char *input, size_t len, int64_t *out);
-        int32_t nntmux_rss_abs_numeric_int(const char *input, size_t len, int64_t *out);
-        C;
-
-    private static FFI|false|null $rssFfi = null;
-
-    private static ?CData $rssIntOut = null;
-
-    private static ?bool $useRustFfi = null;
-
-    private static bool $adoptParseCategoryIdsFfi = false;
-
-    private static bool $adoptScalarParamFfi = false;
-
     private RSS $rss;
 
     public function __construct(RSS $rss)
@@ -48,7 +28,7 @@ class RssController extends BasePageController
     /**
      * @return JsonResponse|Response
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function myMoviesRss(Request $request)
     {
@@ -68,7 +48,7 @@ class RssController extends BasePageController
     /**
      * @return JsonResponse|Response
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function myShowsRss(Request $request)
     {
@@ -89,7 +69,7 @@ class RssController extends BasePageController
     /**
      * @return JsonResponse|Response
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function fullFeedRss(Request $request)
     {
@@ -135,7 +115,7 @@ class RssController extends BasePageController
     /**
      * @return JsonResponse|Response
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function cartRss(Request $request)
     {
@@ -172,7 +152,7 @@ class RssController extends BasePageController
     /**
      * @return JsonResponse|Response
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function categoryFeedRss(Request $request)
     {
@@ -186,7 +166,10 @@ class RssController extends BasePageController
             return $user;
         }
 
-        $categoryId = self::parseCategoryIds($categoryInput);
+        $categoryId = array_values(array_filter(
+            array_map('trim', explode(',', $categoryInput)),
+            static fn (string $categoryId): bool => preg_match('/^-?\d+$/', $categoryId) === 1
+        ));
         if ($categoryId === []) {
             return response()->json(['error' => 'Category ID is missing'], 403);
         }
@@ -201,7 +184,7 @@ class RssController extends BasePageController
     /**
      * @return JsonResponse|Response
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function trendingMoviesRss(Request $request)
     {
@@ -219,7 +202,7 @@ class RssController extends BasePageController
     /**
      * @return JsonResponse|Response
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function trendingShowsRss(Request $request)
     {
@@ -243,233 +226,23 @@ class RssController extends BasePageController
     {
         $userShow = $userAnidb = -1;
         if ($request->has('show')) {
-            $userShow = self::normalizeFeedId($request->input('show'));
+            $userShow = (int) $request->input('show') === 0 ? -1 : $request->input('show') + 0;
         } elseif ($request->has('anidb')) {
-            $userAnidb = self::normalizeFeedId($request->input('anidb'));
+            $userAnidb = (int) $request->input('anidb') === 0 ? -1 : $request->input('anidb') + 0;
         }
 
-        $userAirDate = $request->has('airdate') ? self::absNumericOrDefault($request->input('airdate'), -1) : -1;
-        $userNum = $request->has('num') ? self::absNumericOrDefault($request->input('num'), 0) : 0;
+        $userAirDate = $request->has('airdate') && is_numeric($request->input('airdate')) ? abs((int) $request->input('airdate')) : -1;
+        $userNum = $request->has('num') && is_numeric($request->input('num')) ? abs((int) $request->input('num')) : 0;
         $userLimit = $request->has('limit') && is_numeric($request->input('limit')) ? $request->input('limit') : 100;
         $outputXML = ! ($request->has('o') && $request->input('o') === 'json');
 
         return [$userShow, $userAnidb, $userAirDate, $userNum, $userLimit, $outputXML];
     }
 
-    public static function setUseRustFfi(?bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? self::$adoptParseCategoryIdsFfi;
-    }
-
-    public static function rssFfi(): ?FFI
-    {
-        return self::resolveRssFfi();
-    }
-
-    /**
-     * Category feed ids: comma-separated, trimmed, kept when they match `^-?\d+$`.
-     *
-     * @return list<string>
-     */
-    public static function parseCategoryIds(string $categoryInput): array
-    {
-        if (self::$useRustFfi ?? self::$adoptParseCategoryIdsFfi) {
-            $supported = false;
-            $native = self::parseCategoryIdsNative($categoryInput, $supported);
-            if ($supported && $native !== null) {
-                return $native;
-            }
-        }
-
-        return self::parseCategoryIdsPhp($categoryInput);
-    }
-
-    /**
-     * @param-out bool $supported
-     *
-     * @return list<string>|null
-     */
-    public static function parseCategoryIdsNative(string $categoryInput, bool &$supported = false): ?array
-    {
-        $supported = false;
-        if (self::$useRustFfi === false) {
-            return null;
-        }
-        $ffi = self::resolveRssFfi();
-        if ($ffi === null) {
-            return null;
-        }
-
-        $len = \strlen($categoryInput);
-        $capacity = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, $len + 1, $capacity);
-        if ($scratch === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_rss_parse_category_ids($categoryInput, $len, $scratch, $capacity);
-        } catch (Throwable) {
-            return null;
-        }
-        if (! \is_int($written) || $written < 0) {
-            return null;
-        }
-        $supported = true;
-
-        return $written === 0 ? [] : explode(',', FFI::string($scratch, $written));
-    }
-
-    /**
-     * @return list<string>
-     */
-    public static function parseCategoryIdsPhp(string $categoryInput): array
-    {
-        return array_values(array_filter(
-            array_map('trim', explode(',', $categoryInput)),
-            static fn (string $categoryId): bool => preg_match('/^-?\d+$/', $categoryId) === 1
-        ));
-    }
-
-    /**
-     * `show` / `anidb` request value: `-1` when it casts to `0`, otherwise its numeric value.
-     */
-    public static function normalizeFeedId(mixed $value): int|float
-    {
-        if (self::$useRustFfi ?? self::$adoptScalarParamFfi) {
-            $supported = false;
-            $native = self::normalizeFeedIdNative($value, $supported);
-            if ($supported && $native !== null) {
-                return $native;
-            }
-        }
-
-        return self::normalizeFeedIdPhp($value);
-    }
-
-    /**
-     * Handles string inputs whose PHP result is an integer; decimals, exponents, overflow and
-     * leading-numeric strings (which warn in PHP) defer to {@see normalizeFeedIdPhp()}.
-     *
-     * @param-out bool $supported
-     */
-    public static function normalizeFeedIdNative(mixed $value, bool &$supported = false): ?int
-    {
-        $supported = false;
-        if (self::$useRustFfi === false || ! \is_string($value)) {
-            return null;
-        }
-        $ffi = self::resolveRssFfi();
-        if ($ffi === null || self::$rssIntOut === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $rc = $ffi->nntmux_rss_show_id($value, \strlen($value), self::$rssIntOut);
-        } catch (Throwable) {
-            return null;
-        }
-        if ($rc !== 1) {
-            return null;
-        }
-        $supported = true;
-
-        return (int) self::$rssIntOut[0];
-    }
-
-    public static function normalizeFeedIdPhp(mixed $value): int|float
-    {
-        return (int) $value === 0 ? -1 : $value + 0;
-    }
-
-    /**
-     * `airdate` / `num` request value: `abs((int) $value)` when numeric, otherwise `$default`.
-     */
-    public static function absNumericOrDefault(mixed $value, int $default): int|float
-    {
-        if (self::$useRustFfi ?? self::$adoptScalarParamFfi) {
-            $supported = false;
-            $native = self::absNumericOrDefaultNative($value, $default, $supported);
-            if ($supported && $native !== null) {
-                return $native;
-            }
-        }
-
-        return self::absNumericOrDefaultPhp($value, $default);
-    }
-
-    /**
-     * @param-out bool $supported
-     */
-    public static function absNumericOrDefaultNative(mixed $value, int $default, bool &$supported = false): ?int
-    {
-        $supported = false;
-        if (self::$useRustFfi === false || ! \is_string($value)) {
-            return null;
-        }
-        $ffi = self::resolveRssFfi();
-        if ($ffi === null || self::$rssIntOut === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $rc = $ffi->nntmux_rss_abs_numeric_int($value, \strlen($value), self::$rssIntOut);
-        } catch (Throwable) {
-            return null;
-        }
-        if ($rc === 2) {
-            $supported = true;
-
-            return $default;
-        }
-        if ($rc !== 1) {
-            return null;
-        }
-        $supported = true;
-
-        return (int) self::$rssIntOut[0];
-    }
-
-    public static function absNumericOrDefaultPhp(mixed $value, int $default): int|float
-    {
-        return is_numeric($value) ? abs((int) $value) : $default;
-    }
-
-    private static function resolveRssFfi(): ?FFI
-    {
-        if (self::$rssFfi !== null) {
-            return self::$rssFfi === false ? null : self::$rssFfi;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
-        if ($ffi === null) {
-            self::$rssFfi = false;
-
-            return null;
-        }
-        try {
-            self::$rssIntOut = $ffi->new('int64_t[1]');
-            self::$rssFfi = $ffi;
-
-            return $ffi;
-        } catch (Throwable) {
-            self::$rssFfi = false;
-
-            return null;
-        }
-    }
-
     /**
      * @return JsonResponse|array<string, mixed>
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     private function userCheck(Request $request): JsonResponse|array
     {

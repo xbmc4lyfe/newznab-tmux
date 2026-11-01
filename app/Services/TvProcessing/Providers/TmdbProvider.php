@@ -6,27 +6,9 @@ namespace App\Services\TvProcessing\Providers;
 
 use App\Services\TmdbClient;
 use App\Services\TraktService;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
-use Throwable;
 
 class TmdbProvider extends AbstractTvProvider
 {
-    private const string MATCH_FFI_CDEF = <<<'C'
-        ssize_t nntmux_tv_provider_best_candidate_nul(const char *ours, size_t ours_len, int64_t our_year, uint32_t flags, const char *our_country, size_t our_country_len, const char *titles, size_t titles_len, const char *starteds, size_t starteds_len, const char *countries, size_t countries_len, size_t count);
-        C;
-
-    private static ?FFI $matchFfi = null;
-
-    private static bool $matchFfiResolved = false;
-
-    /**
-     * Candidate selection through Rust; null selects the benchmark-qualified production default
-     * (PHP: the batch call misses the 1.5x gate, see tests/Unit/RustTvProvidersTraktMatchingParityTest.php).
-     */
-    public ?bool $useRustMatchFfi = null;
-
     /**
      * TMDB client that throws TvProviderException on transient failures.
      */
@@ -70,9 +52,30 @@ class TmdbProvider extends AbstractTvProvider
      */
     private function matchShowInfo(array $shows, string $cleanName, ?int $year, string $country): array|false
     {
-        $highest = ($this->useRustMatchFfi ?? false)
-            ? $this->selectBestShowNative($shows, $cleanName, $year, $country)
-            : $this->selectBestShowPhp($shows, $cleanName, $year, $country);
+        $highestScore = 0.0;
+        $highest = null;
+
+        foreach ($shows as $show) {
+            if (! \is_array($show) || ! $this->checkRequiredAttr($show, 'tmdbS')) {
+                continue;
+            }
+
+            $originCountry = TmdbClient::getArray($show, 'origin_country');
+            foreach (array_unique([TmdbClient::getString($show, 'name'), TmdbClient::getString($show, 'original_name')]) as $candidateName) {
+                $score = $this->scoreCandidate(
+                    $cleanName,
+                    $year,
+                    $candidateName,
+                    TmdbClient::getString($show, 'first_air_date'),
+                    $country,
+                    (string) ($originCountry[0] ?? ''),
+                );
+                if ($score > $highestScore) {
+                    $highestScore = $score;
+                    $highest = $show;
+                }
+            }
+        }
 
         if ($highest === null) {
             return false;
@@ -99,127 +102,6 @@ class TmdbProvider extends AbstractTvProvider
         $highest['external_ids'] = TmdbClient::getArray($details, 'external_ids');
 
         return $this->formatShowInfo($highest);
-    }
-
-    /**
-     * The first search result whose name or original name scores strictly highest above zero.
-     *
-     * @param  array<int|string, mixed>  $shows
-     * @return array<int|string, mixed>|null
-     */
-    public function selectBestShowPhp(array $shows, string $cleanName, ?int $year, string $country): ?array
-    {
-        $highestScore = 0.0;
-        $highest = null;
-
-        foreach ($shows as $show) {
-            if (! \is_array($show) || ! $this->checkRequiredAttr($show, 'tmdbS')) {
-                continue;
-            }
-
-            $originCountry = TmdbClient::getArray($show, 'origin_country');
-            foreach (array_unique([TmdbClient::getString($show, 'name'), TmdbClient::getString($show, 'original_name')]) as $candidateName) {
-                $score = $this->scoreCandidate(
-                    $cleanName,
-                    $year,
-                    $candidateName,
-                    TmdbClient::getString($show, 'first_air_date'),
-                    $country,
-                    (string) ($originCountry[0] ?? ''),
-                );
-                if ($score > $highestScore) {
-                    $highestScore = $score;
-                    $highest = $show;
-                }
-            }
-        }
-
-        return $highest;
-    }
-
-    /**
-     * selectBestShowPhp() scored in one Rust call; falls back to PHP when Rust declines.
-     *
-     * @param  array<int|string, mixed>  $shows
-     * @return array<int|string, mixed>|null
-     */
-    public function selectBestShowNative(array $shows, string $cleanName, ?int $year, string $country): ?array
-    {
-        $titles = $starteds = $countries = $owners = [];
-        foreach ($shows as $key => $show) {
-            if (! \is_array($show) || ! $this->checkRequiredAttr($show, 'tmdbS')) {
-                continue;
-            }
-
-            $originCountry = TmdbClient::getArray($show, 'origin_country');
-            $started = 's'.TmdbClient::getString($show, 'first_air_date');
-            $candidateCountry = (string) ($originCountry[0] ?? '');
-            foreach (array_unique([TmdbClient::getString($show, 'name'), TmdbClient::getString($show, 'original_name')]) as $candidateName) {
-                $titles[] = $candidateName;
-                $starteds[] = $started;
-                $countries[] = $candidateCountry;
-                $owners[] = $key;
-            }
-        }
-
-        if ($titles === []) {
-            return null;
-        }
-
-        $index = self::bestCandidateIndexNative($cleanName, $year, $country, $titles, $starteds, $countries);
-        if ($index === null) {
-            return $this->selectBestShowPhp($shows, $cleanName, $year, $country);
-        }
-
-        return $index >= 0 ? $shows[$owners[$index]] : null;
-    }
-
-    /**
-     * `$candidateStarted` framing for bestCandidateIndexNative(): `i`+int, `s`+string or `n`.
-     */
-    public static function encodeCandidateStarted(mixed $started): string
-    {
-        return \is_int($started) ? 'i'.$started : (\is_string($started) ? 's'.$started : 'n');
-    }
-
-    /**
-     * Rust `nntmux_tv_provider_best_candidate_nul`: index of the first candidate scoring strictly
-     * highest above zero (as the providers' scoreCandidate() loops), -1 when none does, or null
-     * when the library is unavailable or declines (NUL bytes, titles outside ASCII/Latin-1).
-     *
-     * @param  list<string>  $titles
-     * @param  list<string>  $starteds  encodeCandidateStarted() values
-     * @param  list<string>  $countries
-     */
-    public static function bestCandidateIndexNative(string $ourName, ?int $ourYear, string $ourCountry, array $titles, array $starteds, array $countries): ?int
-    {
-        $count = \count($titles);
-        if ($count === 0 || \count($starteds) !== $count || \count($countries) !== $count) {
-            return null;
-        }
-        if (! self::$matchFfiResolved) {
-            self::$matchFfi = RustPipelineLibrary::resolveDomain('tv_provider_matching', self::MATCH_FFI_CDEF);
-            self::$matchFfiResolved = true;
-        }
-        if (self::$matchFfi === null) {
-            return null;
-        }
-
-        $titles = implode("\0", $titles);
-        $starteds = implode("\0", $starteds);
-        $countries = implode("\0", $countries);
-        try {
-            // @phpstan-ignore method.notFound
-            $index = self::$matchFfi->nntmux_tv_provider_best_candidate_nul($ourName, \strlen($ourName), $ourYear ?? 0, $ourYear !== null ? 1 : 0, $ourCountry, \strlen($ourCountry), $titles, \strlen($titles), $starteds, \strlen($starteds), $countries, \strlen($countries), $count);
-        } catch (Throwable) {
-            return null;
-        }
-
-        if ($index === -2) {
-            return -1;
-        }
-
-        return \is_int($index) && $index >= 0 && $index < $count ? $index : null;
     }
 
     public function fetchAllEpisodes(int $siteId, int $videoId): int
@@ -303,7 +185,8 @@ class TmdbProvider extends AbstractTvProvider
         $imdbId = '';
         $externalIds = TmdbClient::getArray($show, 'external_ids');
         if (! empty($externalIds['imdb_id'])) {
-            $imdbId = self::w56TmdbImdbId((string) $externalIds['imdb_id']);
+            preg_match('/tt(?P<imdbid>\d{6,})$/i', (string) $externalIds['imdb_id'], $imdb);
+            $imdbId = (string) ($imdb['imdbid'] ?? '');
         }
 
         $originCountry = TmdbClient::getArray($show, 'origin_country');
@@ -361,7 +244,7 @@ class TmdbProvider extends AbstractTvProvider
                     return (int) $ids['trakt'];
                 }
             }
-        } catch (Throwable) {
+        } catch (\Throwable) {
             // Trakt ID lookup is optional enrichment.
         }
 
@@ -391,365 +274,5 @@ class TmdbProvider extends AbstractTvProvider
             'firstaired' => TmdbClient::getString($episode, 'air_date'),
             'summary' => TmdbClient::getString($episode, 'overview'),
         ];
-    }
-
-    /** Disabled: seven paired runs missed the 1.5x common p99 gate (min common mean 1.73x, p99 1.17x; uncommon mean 2.88x, p99 2.33x; see the W44 parity test). */
-    public const bool W444_RUST_FFI_DEFAULT = false;
-
-    public const string W444_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w444_tmdb_show_name_batch(const char *input, size_t len, char *out, size_t cap);
-        C;
-
-    private const array W444_SUMMARY_KEYS = ['total_names', 'empty_name_count', 'year_suffix_count', 'imdb_id_count', 'article_prefix_count', 'colon_count', 'parenthetical_count', 'non_ascii_count', 'numeric_count'];
-
-    private static ?bool $w444UseRustFfi = null;
-
-    private static FFI|false|null $w444Ffi = null;
-
-    /** Null restores the benchmark-qualified default. */
-    public static function useW444RustFfi(?bool $enable = true): void
-    {
-        self::$w444UseRustFfi = $enable;
-    }
-
-    public static function usesW444RustFfi(): bool
-    {
-        return self::$w444UseRustFfi ?? self::W444_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW444RustFfi(): void
-    {
-        self::$w444UseRustFfi = null;
-        self::$w444Ffi = null;
-    }
-
-    /**
-     * Summarize TMDB show names as getShowInfo()/formatShowInfo() see them:
-     * the " (19xx|20xx)" suffix getShowInfo() strips, a trailing tt\d{6,} IMDB
-     * id, a leading the/a/an article, colons, parentheses, non-ASCII bytes and
-     * digits. Entries come from strings, integers, or the name, original_name
-     * or title field; other values count as empty.
-     *
-     * @param  array<array-key, mixed>  $entries
-     * @return array<string, int>
-     */
-    public static function summarizeTmdbShowNameBatch(array $entries): array
-    {
-        return self::usesW444RustFfi()
-            ? self::summarizeTmdbShowNameBatchNative($entries)
-            : self::summarizeTmdbShowNameBatchPhp($entries);
-    }
-
-    /**
-     * Rust summary; falls back to PHP when the library or input frame is unusable.
-     *
-     * @param  array<array-key, mixed>  $entries
-     * @return array<string, int>
-     */
-    public static function summarizeTmdbShowNameBatchNative(array $entries): array
-    {
-        return self::w444Call(self::w444Entries($entries)) ?? self::summarizeTmdbShowNameBatchPhp($entries);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $entries
-     * @return array<string, int>
-     */
-    public static function summarizeTmdbShowNameBatchPhp(array $entries): array
-    {
-        $summary = array_fill_keys(self::W444_SUMMARY_KEYS, 0);
-        foreach (self::w444Entries($entries) as $name) {
-            $summary['total_names']++;
-            $name = trim($name);
-            if ($name === '') {
-                $summary['empty_name_count']++;
-
-                continue;
-            }
-            $summary['year_suffix_count'] += (int) (preg_match('# \((?:19|20)\d{2}\)$#', $name) === 1);
-            $summary['imdb_id_count'] += (int) (preg_match('/tt\d{6,}$/i', $name) === 1);
-            $summary['article_prefix_count'] += (int) (preg_match('/^(?:the|a|an)\s/i', $name) === 1);
-            $summary['colon_count'] += (int) str_contains($name, ':');
-            $summary['parenthetical_count'] += (int) str_contains($name, '(');
-            $summary['non_ascii_count'] += (int) (preg_match('/[\x80-\xFF]/', $name) === 1);
-            $summary['numeric_count'] += (int) (strpbrk($name, '0123456789') !== false);
-        }
-
-        return $summary;
-    }
-
-    /** Only integer and string entries participate; objects are never cast or serialized.
-     *
-     * @param  array<array-key, mixed>  $input
-     * @return list<string>
-     */
-    private static function w444Entries(array $input): array
-    {
-        $entries = [];
-        foreach ($input as $item) {
-            if (is_array($item)) {
-                $item = $item['name'] ?? $item['original_name'] ?? $item['title'] ?? null;
-            }
-            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
-        }
-
-        return $entries;
-    }
-
-    /** @param list<string> $entries
-     * @return array<string, int>|null
-     */
-    private static function w444Call(array $entries): ?array
-    {
-        try {
-            $input = serialize([$entries]);
-            if (strlen($input) > 16777216) {
-                return null;
-            }
-            self::$w444Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w444', self::W444_FFI_CDEF) ?? false;
-            $ffi = self::$w444Ffi;
-            if ($ffi === false) {
-                return null;
-            }
-            $capacity = 0;
-            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
-            if ($out === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
-            $written = $ffi->nntmux_w444_tmdb_show_name_batch($input, strlen($input), $out, $capacity);
-            if (is_int($written) && $written < -1 && $written >= -16777216) {
-                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($out === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
-                $written = $ffi->nntmux_w444_tmdb_show_name_batch($input, strlen($input), $out, $capacity);
-            }
-            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
-                return null;
-            }
-            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
-            if (! is_array($result) || array_keys($result) !== self::W444_SUMMARY_KEYS || $result['total_names'] !== count($entries)) {
-                return null;
-            }
-            $summary = [];
-            foreach (self::W444_SUMMARY_KEYS as $key) {
-                $value = $result[$key];
-                if (! is_int($value) || $value < 0 || $value > count($entries)) {
-                    return null;
-                }
-                $summary[$key] = $value;
-            }
-
-            return $summary;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // Wave 56.4 batch helper
-    // ---------------------------------------------------------------------
-
-    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean 6.10x, p99 5.14x; uncommon mean 77.24x, p99 54.09x); see RustTmdbTvMazeTvdbPar2AccumulatorCompactFpW56ParityTest. */
-    public const bool W56_RUST_FFI_DEFAULT = true;
-
-    public const string W56_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w564_tmdb_show_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * TMDB show rows as formatShowInfo() and candidate matching see them. Each record yields
-     * four words: flags (strict Y-m-d air date 1, blank title 2, trimmed case-insensitive
-     * title match 4, tt\d{6,} IMDB id 8, non-ASCII title 16), the IMDB digits span (offset
-     * << 32 | length, or -1), the air date year (-1) and similar_text() of the lowercased
-     * trimmed title and name (-1 past 255 bytes).
-     *
-     * @param  list<string>  $imdbIds
-     * @param  list<string>  $airDates
-     * @param  list<string>  $titles
-     * @param  list<string>  $ours
-     * @return list<int>
-     */
-    public static function tmdbShowRowBatch(array $imdbIds, array $airDates, array $titles, array $ours): array
-    {
-        return self::usesW56RustFfi()
-            ? self::tmdbShowRowBatchNative($imdbIds, $airDates, $titles, $ours)
-            : self::tmdbShowRowBatchPhp($imdbIds, $airDates, $titles, $ours);
-    }
-
-    /**
-     * @param  list<string>  $imdbIds
-     * @param  list<string>  $airDates
-     * @param  list<string>  $titles
-     * @param  list<string>  $ours
-     * @return list<int>
-     */
-    public static function tmdbShowRowBatchNative(array $imdbIds, array $airDates, array $titles, array $ours): array
-    {
-        self::w56TmdbColumns($imdbIds, $airDates, $titles, $ours);
-        $count = \count($imdbIds);
-        if ($count === 0) {
-            return [];
-        }
-        $text = implode("\0", $imdbIds)."\0".implode("\0", $airDates)."\0".implode("\0", $titles)."\0".implode("\0", $ours);
-
-        return self::w56TmdbCall($text, '', $count, 4)
-            ?? self::tmdbShowRowBatchPhp($imdbIds, $airDates, $titles, $ours);
-    }
-
-    /**
-     * @param  list<string>  $imdbIds
-     * @param  list<string>  $airDates
-     * @param  list<string>  $titles
-     * @param  list<string>  $ours
-     * @return list<int>
-     */
-    public static function tmdbShowRowBatchPhp(array $imdbIds, array $airDates, array $titles, array $ours): array
-    {
-        self::w56TmdbColumns($imdbIds, $airDates, $titles, $ours);
-        $out = [];
-        foreach ($imdbIds as $i => $imdb) {
-            $date = $airDates[$i];
-            $title = trim($titles[$i]);
-            $name = trim($ours[$i]);
-            $span = self::w56TmdbImdbSpan($imdb);
-            $flags = (preg_match('/\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z/', $date) === 1 ? 1 : 0)
-                | ($title === '' ? 2 : 0)
-                | ($name !== '' && strtolower($title) === strtolower($name) ? 4 : 0)
-                | ($span >= 0 ? 8 : 0)
-                | (preg_match('/[\x80-\xff]/', $title) === 1 ? 16 : 0);
-            array_push(
-                $out,
-                $flags,
-                $span,
-                preg_match('/\A([0-9]{4})(?:-|\z)/', $date, $match) === 1 ? (int) $match[1] : -1,
-                \strlen($title) > 255 || \strlen($name) > 255 ? -1 : similar_text(strtolower($title), strtolower($name)),
-            );
-        }
-
-        return $out;
-    }
-
-    /** formatShowInfo()'s preg_match('/tt(?P<imdbid>\d{6,})$/i') capture, through the W56 toggle. */
-    private static function w56TmdbImdbId(string $raw): string
-    {
-        $span = self::usesW56RustFfi() ? self::tmdbShowRowBatchNative([$raw], [''], [''], [''])[1] : self::w56TmdbImdbSpan($raw);
-
-        return $span < 0 ? '' : substr($raw, $span >> 32, $span & 0xFFFFFFFF);
-    }
-
-    private static function w56TmdbImdbSpan(string $value): int
-    {
-        return preg_match('/tt(\d{6,})$/i', $value, $match, PREG_OFFSET_CAPTURE) === 1
-            ? ($match[1][1] << 32) | \strlen($match[1][0])
-            : -1;
-    }
-
-    public static function usesW56RustFfi(): bool
-    {
-        $enabled = self::w56RustFfiState('enabled');
-
-        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Run $callback with the W56 dispatch forced on or off, then restore the previous choice.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w56RustFfiState('enabled');
-        self::w56RustFfiState('enabled', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w56RustFfiState('enabled', $previous);
-        }
-    }
-
-    /**
-     * Equal-length list columns, or InvalidArgumentException.
-     *
-     * @param  array<array-key, mixed>  ...$columns
-     */
-    private static function w56TmdbColumns(array ...$columns): void
-    {
-        $count = \count($columns[0]);
-        foreach ($columns as $column) {
-            if (! array_is_list($column) || \count($column) !== $count) {
-                throw new \InvalidArgumentException('W56 batch columns must be lists of equal length.');
-            }
-        }
-    }
-
-    /**
-     * One FFI crossing for the batch: `$words` int64 words back per record. Null when the
-     * library is missing or declines a malformed frame, so the caller falls back to PHP.
-     *
-     * @return list<int>|null
-     */
-    private static function w56TmdbCall(string $text, string $ints, int $count, int $words): ?array
-    {
-        try {
-            /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
-            $state = self::w56RustFfiState();
-            $ffi = $state['ffi'];
-            if ($ffi === null) {
-                $ffi = RustPipelineLibrary::resolveDomain('metadata_w56', self::W56_FFI_CDEF) ?? false;
-                self::w56RustFfiState('ffi', $ffi);
-            }
-            if (! $ffi instanceof FFI) {
-                return null;
-            }
-            $need = $count * $words;
-            $out = $state['out'];
-            $cap = $state['cap'];
-            if (! $out instanceof CData || $cap < $need) {
-                $cap = max(1024, $need);
-                $out = $ffi->new('int64_t['.$cap.']');
-                self::w56RustFfiState('out', $out);
-                self::w56RustFfiState('cap', $cap);
-            }
-            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
-            $written = $ffi->nntmux_w564_tmdb_show_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
-            if ($written !== $need) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($out, $need * 8));
-
-            return $values === false ? null : array_values($values);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * W56 routing override and cached binding plus reusable output buffer, kept in a function
-     * static: no arguments returns the state, one argument reads a key ('reset' clears
-     * everything) and two arguments write a key.
-     */
-    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
-        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-        if ($op === null) {
-            return $state;
-        }
-        if ($op === 'reset') {
-            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-
-            return null;
-        }
-        if (\func_num_args() > 1) {
-            $state[$op] = $val;
-        }
-
-        return $state[$op] ?? null;
     }
 }

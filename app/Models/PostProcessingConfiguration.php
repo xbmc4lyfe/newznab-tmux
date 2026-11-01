@@ -5,9 +5,7 @@ declare(strict_types=1);
 namespace App\Models;
 
 use App\Models\Concerns\IsSingletonConfiguration;
-use App\Support\RustPipelineLibrary;
 use Illuminate\Database\Eloquent\Model;
-use Throwable;
 
 /**
  * @property int $post_threads
@@ -57,71 +55,5 @@ final class PostProcessingConfiguration extends Model
             'process_videos' => 'boolean',
             'save_audio_preview' => 'boolean',
         ];
-    }
-
-    public const string FFI_CDEF = 'ssize_t nntmux_w346_configuration_status(uint8_t operation, const int64_t *input, size_t input_count, int64_t *output, size_t output_capacity);';
-
-    // These small computations retain PHP until caller-inclusive benchmarks qualify Rust.
-    private const bool RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useRustFfi = null;
-
-    public static function setUseRustFfi(?bool $use = true): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * @param  list<int>  $input
-     * @return list<int>|null
-     */
-    private static function rustValues(int $operation, array $input, int $count): ?array
-    {
-        try {
-            $ffi = RustPipelineLibrary::resolveDomain('w346', self::FFI_CDEF);
-            if ($ffi === null) {
-                return null;
-            }
-            $length = count($input);
-            $source = $ffi->new("int64_t[{$length}]");
-            $output = $ffi->new("int64_t[{$count}]");
-            foreach ($input as $index => $value) {
-                $source[$index] = $value;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w346_configuration_status($operation, $source, $length, $output, $count);
-            if ($written !== $count) {
-                return null;
-            }
-            $values = [];
-            for ($index = 0; $index < $count; $index++) {
-                $values[] = (int) $output[$index];
-            }
-
-            return $values;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** @return array{threads: int, timeout_seconds: int, max_timeout_count: int} */
-    public static function normalizeLimits(int $threads, int $timeoutSeconds, int $maxTimeoutCount): array
-    {
-        if (self::usesRustFfi() && ($values = self::rustValues(1, [$threads, $timeoutSeconds, $maxTimeoutCount], 3)) !== null) {
-            return ['threads' => $values[0], 'timeout_seconds' => $values[1], 'max_timeout_count' => $values[2]];
-        }
-
-        return self::normalizeLimitsPhp($threads, $timeoutSeconds, $maxTimeoutCount);
-    }
-
-    /** @return array{threads: int, timeout_seconds: int, max_timeout_count: int} */
-    public static function normalizeLimitsPhp(int $threads, int $timeoutSeconds, int $maxTimeoutCount): array
-    {
-        return ['threads' => max(1, $threads), 'timeout_seconds' => max(0, $timeoutSeconds), 'max_timeout_count' => max(0, $maxTimeoutCount)];
     }
 }

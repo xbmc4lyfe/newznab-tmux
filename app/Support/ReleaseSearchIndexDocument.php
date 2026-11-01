@@ -4,48 +4,11 @@ declare(strict_types=1);
 
 namespace App\Support;
 
-use FFI;
-use FFI\CData;
-use Throwable;
-
 /**
  * Normalizes release rows into search index document fields (Manticore + Elasticsearch).
  */
 final class ReleaseSearchIndexDocument
 {
-    private const string FFI_CDEF = <<<'C'
-        int64_t nntmux_predb_validate_filename_candidate(const char *id_str, size_t id_len, int64_t id_int, uint32_t has_id_int, const char *title, size_t title_len, const char *filename, size_t filename_len, const char *source, size_t source_len);
-        ssize_t nntmux_prometheus_format_text(const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_release_plain_search_name(const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        int64_t nntmux_datetime_to_unix_utc(const char *input, size_t input_len);
-        C;
-
-    public const string W445_FFI_CDEF = 'int64_t nntmux_w445_log_index_parser_search_prometheus_doc(uint32_t mode, const char *input, size_t input_len, int64_t *out, size_t cap);';
-
-    /**
-     * The Wave 44.5 summary defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x;
-     * see tests/Unit/RustLogViewerIndexParserSearchPrometheusDocW44ParityTest.php.
-     */
-    public const bool W445_RUST_FFI_DEFAULT = true;
-
-    private const string PLAIN_SEPARATORS = '/[._-]+/';
-
-    private const int W445_NATIVE_MAX_PARTS = 1 << 22;
-
-    private const int W445_NATIVE_MAX_BYTES = 67108864;
-
-    private const int W445_OUT_CAP = 32;
-
-    private static FFI|false|null $ffi = null;
-
-    private static bool $useNative = true;
-
-    private static ?bool $useW445RustFfi = null;
-
-    private static FFI|false|null $w445Ffi = null;
-
-    private static ?CData $w445Out = null;
-
     /**
      * Fields that may be returned to browse/search consumers.
      * Sensitive release data must never be added to this list.
@@ -178,33 +141,6 @@ final class ReleaseSearchIndexDocument
 
     private static function datetimeToUnix(mixed $value): int
     {
-        if ($value === null || $value === '' || $value === 0 || $value === '0') {
-            return 0;
-        }
-        if (is_int($value) || is_float($value)) {
-            return (int) $value;
-        }
-        $str = (string) $value;
-        $len = strlen($str);
-        if (self::$useNative && ($len === 19 || $len === 10 || $len === 20) && date_default_timezone_get() === 'UTC') {
-            $ffi = self::$ffi ??= (RustPipelineLibrary::resolveDomain('search_doc_metrics', self::FFI_CDEF) ?? false);
-            if ($ffi !== false) {
-                try {
-                    // @phpstan-ignore method.notFound
-                    $ts = $ffi->nntmux_datetime_to_unix_utc($str, $len);
-                    if (is_int($ts) && $ts !== PHP_INT_MIN) {
-                        return $ts;
-                    }
-                } catch (Throwable) {
-                }
-            }
-        }
-
-        return self::datetimeToUnixPhp($value);
-    }
-
-    private static function datetimeToUnixPhp(mixed $value): int
-    {
         if ($value === null || $value === '') {
             return 0;
         }
@@ -216,165 +152,9 @@ final class ReleaseSearchIndexDocument
         return $ts !== false ? $ts : 0;
     }
 
-    /**
-     * Retains native PHP `preg_replace` under the < 1.5x FFI bailout rule (`1.04x` with per-call
-     * `FFI::string` allocation overhead); `nntmux_release_plain_search_name` remains exported in
-     * `rust/pipeline-ffi/src/search.rs` for C-ABI parity.
-     */
     private static function plainSearchName(mixed $value): string
     {
-        return trim((string) preg_replace(self::PLAIN_SEPARATORS, ' ', (string) $value));
-    }
-
-    /** Pass null to restore {@see W445_RUST_FFI_DEFAULT}. */
-    public static function useW445RustFfi(?bool $enable = true): void
-    {
-        self::$useW445RustFfi = $enable;
-    }
-
-    public static function usesW445RustFfi(): bool
-    {
-        return self::$useW445RustFfi ?? self::W445_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW445RustFfi(): void
-    {
-        self::$useW445RustFfi = null;
-    }
-
-    /**
-     * Summarizes the `plainsearchname` values {@see normalize()} would index. Rows with a non-null
-     * `plainsearchname` count as `explicit_plain`; the others derive it from `searchname` (cast to
-     * string) and count `changed` / `empty` results, `separator_runs` replaced, `plain_bytes`,
-     * `max_plain_bytes` and `distinct_plain`. Non-array rows and non-scalar searchnames are invalid.
-     *
-     * @param  array<array-key, mixed>  $rows
-     * @return array{rows: int, invalid: int, explicit_plain: int, derived: int, changed: int, empty: int, separator_runs: int, plain_bytes: int, max_plain_bytes: int, distinct_plain: int}
-     */
-    public static function summarizePlainSearchNameBatch(array $rows): array
-    {
-        return self::usesW445RustFfi() ? self::summarizePlainSearchNameBatchNative($rows) : self::summarizePlainSearchNameBatchPhp($rows);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rows
-     * @return array{rows: int, invalid: int, explicit_plain: int, derived: int, changed: int, empty: int, separator_runs: int, plain_bytes: int, max_plain_bytes: int, distinct_plain: int}
-     */
-    public static function summarizePlainSearchNameBatchPhp(array $rows): array
-    {
-        $summary = ['rows' => \count($rows), 'invalid' => 0, 'explicit_plain' => 0, 'derived' => 0, 'changed' => 0, 'empty' => 0, 'separator_runs' => 0, 'plain_bytes' => 0, 'max_plain_bytes' => 0, 'distinct_plain' => 0];
-        $distinct = [];
-        foreach (self::plainSearchNameSources($rows, $summary) as $source) {
-            $plain = trim((string) preg_replace(self::PLAIN_SEPARATORS, ' ', $source, -1, $runs));
-            $length = \strlen($plain);
-            $summary['changed'] += (int) ($plain !== $source);
-            $summary['empty'] += (int) ($plain === '');
-            $summary['separator_runs'] += $runs;
-            $summary['plain_bytes'] += $length;
-            $summary['max_plain_bytes'] = max($summary['max_plain_bytes'], $length);
-            $distinct[$plain] = true;
-        }
-        $summary['distinct_plain'] = \count($distinct);
-
-        return $summary;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rows
-     * @return array{rows: int, invalid: int, explicit_plain: int, derived: int, changed: int, empty: int, separator_runs: int, plain_bytes: int, max_plain_bytes: int, distinct_plain: int}
-     */
-    public static function summarizePlainSearchNameBatchNative(array $rows): array
-    {
-        $summary = ['rows' => \count($rows), 'invalid' => 0, 'explicit_plain' => 0, 'derived' => 0, 'changed' => 0, 'empty' => 0, 'separator_runs' => 0, 'plain_bytes' => 0, 'max_plain_bytes' => 0, 'distinct_plain' => 0];
-        $fields = self::evaluateW445Native(5, self::plainSearchNameSources($rows, $summary), 6);
-        if ($fields === null) {
-            return self::summarizePlainSearchNameBatchPhp($rows);
-        }
-        [$summary['changed'], $summary['empty'], $summary['separator_runs'], $summary['plain_bytes'], $summary['max_plain_bytes'], $summary['distinct_plain']] = $fields;
-
-        return $summary;
-    }
-
-    /**
-     * The searchname strings to derive `plainsearchname` from; tallies rows, explicit values and invalid input.
-     *
-     * @param  array<array-key, mixed>  $rows
-     * @param  array{rows: int, invalid: int, explicit_plain: int, derived: int, changed: int, empty: int, separator_runs: int, plain_bytes: int, max_plain_bytes: int, distinct_plain: int}  $summary
-     * @return list<string>
-     */
-    private static function plainSearchNameSources(array $rows, array &$summary): array
-    {
-        $sources = [];
-        foreach ($rows as $row) {
-            if (! \is_array($row)) {
-                $summary['invalid']++;
-
-                continue;
-            }
-            if (($row['plainsearchname'] ?? null) !== null) {
-                $summary['explicit_plain']++;
-
-                continue;
-            }
-            $value = $row['searchname'] ?? '';
-            if (! \is_scalar($value)) {
-                $summary['invalid']++;
-
-                continue;
-            }
-            $sources[] = (string) $value;
-        }
-        $summary['derived'] = \count($sources);
-
-        return $sources;
-    }
-
-    /**
-     * Shared Wave 44.5 bridge for the log viewer, Prometheus and search document summaries: returns
-     * exactly $fields counters, or null when the library is unavailable or declined the batch so
-     * callers fall back to PHP.
-     *
-     * @param  list<string>  $parts
-     * @return list<int>|null
-     */
-    public static function evaluateW445Native(int $mode, array $parts, int $fields): ?array
-    {
-        $ffi = self::w445Ffi();
-        $count = \count($parts);
-        if ($ffi === null || $mode < 1 || $fields < 1 || $fields > self::W445_OUT_CAP || $count > self::W445_NATIVE_MAX_PARTS) {
-            return null;
-        }
-
-        try {
-            $input = $count === 0 ? pack('V', 0) : pack('V*', $count, ...array_map('strlen', $parts)).implode('', $parts);
-            $length = \strlen($input);
-            if ($length > self::W445_NATIVE_MAX_BYTES) {
-                return null;
-            }
-            $out = self::$w445Out ??= $ffi->new('int64_t['.self::W445_OUT_CAP.']');
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w445_log_index_parser_search_prometheus_doc($mode, $input, $length, $out, self::W445_OUT_CAP);
-            if ($written !== $fields) {
-                return null;
-            }
-            $values = unpack('q*', FFI::string($out, $fields * 8));
-        } catch (Throwable) {
-            return null;
-        }
-
-        /** @var list<int>|null */
-        return \is_array($values) ? array_values($values) : null;
-    }
-
-    private static function w445Ffi(): ?FFI
-    {
-        if (self::$w445Ffi === null) {
-            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
-            self::$w445Ffi = RustPipelineLibrary::resolveDomain('search_w445', self::W445_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
-            self::$w445Out = null;
-        }
-
-        return self::$w445Ffi instanceof FFI ? self::$w445Ffi : null;
+        return trim((string) preg_replace('/[._-]+/', ' ', (string) $value));
     }
 
     private static function unixToDatetime(int $timestamp): ?string

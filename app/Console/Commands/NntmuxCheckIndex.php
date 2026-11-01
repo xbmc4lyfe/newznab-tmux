@@ -7,35 +7,14 @@ namespace App\Console\Commands;
 use App\Facades\Elasticsearch;
 use App\Services\Search\Support\ElasticsearchResponseHelper;
 use App\Services\Search\Support\ManticoreClientFactory;
-use App\Support\RustPipelineLibrary;
 use Elastic\Elasticsearch\Client as ElasticsearchClient;
 use Exception;
-use FFI;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\RequestException;
 use Illuminate\Console\Command;
-use Throwable;
 
 class NntmuxCheckIndex extends Command
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_checkindex_format_bytes(int64_t bytes, char *out, size_t out_cap);
-        int32_t nntmux_checkindex_table_code(const char *input, size_t len);
-        C;
-
-    private const array MANTICORE_TABLES = [
-        'releases_rt', 'predb_rt', 'movies_rt', 'tvshows_rt', 'music_rt',
-        'books_rt', 'games_rt', 'console_rt', 'steam_rt', 'anime_rt',
-    ];
-
-    private static FFI|false|null $checkIndexFfi = null;
-
-    private static ?bool $useRustFfi = null;
-
-    private static bool $adoptFormatBytesFfi = false;
-
-    private static bool $adoptTableNameFfi = false;
-
     /**
      * The name and signature of the console command.
      *
@@ -120,7 +99,7 @@ class NntmuxCheckIndex extends Command
             $storeSize = $stats['indices'][$index]['total']['store']['size_in_bytes'] ?? 0;
 
             $this->info('Document count: '.number_format($docCount));
-            $this->info('Index size: '.self::formatBytes($storeSize));
+            $this->info('Index size: '.$this->formatBytes($storeSize));
 
             // Get a sample document
             if ($docCount > 0) {
@@ -149,7 +128,19 @@ class NntmuxCheckIndex extends Command
     private function checkManticoreIndex(string $index): void
     {
         try {
-            $indexName = self::manticoreTableName($index);
+            $indexName = match ($index) {
+                'releases' => 'releases_rt',
+                'predb' => 'predb_rt',
+                'movies' => 'movies_rt',
+                'tvshows' => 'tvshows_rt',
+                'music' => 'music_rt',
+                'books' => 'books_rt',
+                'games' => 'games_rt',
+                'console' => 'console_rt',
+                'steam' => 'steam_rt',
+                'anime' => 'anime_rt',
+                default => 'releases_rt',
+            };
             $manticoreConfig = config('search.drivers.manticore', []);
             $host = (string) ($manticoreConfig['host'] ?? '127.0.0.1');
             $port = (int) ($manticoreConfig['port'] ?? 9308);
@@ -279,139 +270,10 @@ class NntmuxCheckIndex extends Command
         }
     }
 
-    public static function setUseRustFfi(?bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? self::$adoptFormatBytesFfi;
-    }
-
-    public static function checkIndexFfi(): ?FFI
-    {
-        return self::resolveCheckIndexFfi();
-    }
-
-    /**
-     * Manticore table for an index option; unknown options use the releases table.
-     */
-    public static function manticoreTableName(string $index): string
-    {
-        if (self::$useRustFfi ?? self::$adoptTableNameFfi) {
-            $supported = false;
-            $native = self::manticoreTableNameNative($index, $supported);
-            if ($supported && $native !== null) {
-                return $native;
-            }
-        }
-
-        return self::manticoreTableNamePhp($index);
-    }
-
-    /**
-     * @param-out bool $supported
-     */
-    public static function manticoreTableNameNative(string $index, bool &$supported = false): ?string
-    {
-        $supported = false;
-        if (self::$useRustFfi === false) {
-            return null;
-        }
-        $ffi = self::resolveCheckIndexFfi();
-        if ($ffi === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $code = $ffi->nntmux_checkindex_table_code($index, \strlen($index));
-        } catch (Throwable) {
-            return null;
-        }
-        if (! \is_int($code) || ! isset(self::MANTICORE_TABLES[$code])) {
-            return null;
-        }
-        $supported = true;
-
-        return self::MANTICORE_TABLES[$code];
-    }
-
-    public static function manticoreTableNamePhp(string $index): string
-    {
-        return match ($index) {
-            'releases' => 'releases_rt',
-            'predb' => 'predb_rt',
-            'movies' => 'movies_rt',
-            'tvshows' => 'tvshows_rt',
-            'music' => 'music_rt',
-            'books' => 'books_rt',
-            'games' => 'games_rt',
-            'console' => 'console_rt',
-            'steam' => 'steam_rt',
-            'anime' => 'anime_rt',
-            default => 'releases_rt',
-        };
-    }
-
     /**
      * Format bytes to human readable format
      */
-    public static function formatBytes(int $bytes): string
-    {
-        if (self::$useRustFfi ?? self::$adoptFormatBytesFfi) {
-            $supported = false;
-            $native = self::formatBytesNative($bytes, $supported);
-            if ($supported && $native !== null) {
-                return $native;
-            }
-        }
-
-        return self::formatBytesPhp($bytes);
-    }
-
-    /**
-     * Mirrors PHP 8.4+ `round()` (the locked platform) and float string conversion; values Rust cannot render as a
-     * plain decimal defer to {@see formatBytesPhp()}.
-     *
-     * @param-out bool $supported
-     */
-    public static function formatBytesNative(int $bytes, bool &$supported = false): ?string
-    {
-        $supported = false;
-        if (self::$useRustFfi === false) {
-            return null;
-        }
-        $precision = (int) ini_get('precision');
-        if ($precision !== 14 && $precision !== -1) {
-            return null;
-        }
-        $ffi = self::resolveCheckIndexFfi();
-        if ($ffi === null) {
-            return null;
-        }
-        $capacity = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $capacity);
-        if ($scratch === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_checkindex_format_bytes($bytes, $scratch, $capacity);
-        } catch (Throwable) {
-            return null;
-        }
-        if (! \is_int($written) || $written <= 0) {
-            return null;
-        }
-        $supported = true;
-
-        return FFI::string($scratch, $written);
-    }
-
-    public static function formatBytesPhp(int $bytes): string
+    private function formatBytes(int $bytes): string
     {
         $units = ['B', 'KB', 'MB', 'GB', 'TB'];
         $bytes = max($bytes, 0);
@@ -421,15 +283,6 @@ class NntmuxCheckIndex extends Command
         $bytes /= pow(1024, $pow);
 
         return round($bytes, 2).' '.$units[$pow];
-    }
-
-    private static function resolveCheckIndexFfi(): ?FFI
-    {
-        if (self::$checkIndexFfi === null) {
-            self::$checkIndexFfi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$checkIndexFfi === false ? null : self::$checkIndexFfi;
     }
 
     /**

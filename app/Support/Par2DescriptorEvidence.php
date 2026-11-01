@@ -5,20 +5,11 @@ declare(strict_types=1);
 namespace App\Support;
 
 use App\Services\Par2PacketAccumulator;
-use App\Services\Releases\Verification\LeaseHeartbeat;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
 
 final class Par2DescriptorEvidence
 {
-    // Single-call FFI remains opt-in until every paired mean/p99 gate reaches 1.5x.
-    private static bool $useRustFfi = false;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
     /** Validated descriptor provenance only; this version makes no eligibility claim. */
     public const PROOF_VERSION = 1;
 
@@ -48,7 +39,16 @@ final class Par2DescriptorEvidence
                         if ($guard !== null && ! $guard()) {
                             throw $aborted;
                         }
-                        $row = self::descriptorRow($snapshot['id'], $snapshot['guid'], $descriptor);
+                        $row = [
+                            'releases_id' => $snapshot['id'], 'release_guid' => $snapshot['guid'],
+                            'packet_checksum' => $descriptor['packet_checksum'],
+                            'recovery_set_id' => $descriptor['recovery_set_id'], 'file_id' => $descriptor['file_id'],
+                            'full_md5' => $descriptor['hash'], 'hash16k' => $descriptor['hash_16K'],
+                            'file_size' => $descriptor['size_decimal'],
+                            'raw_filename_base64' => base64_encode($descriptor['filename_bytes']),
+                            'descriptor_proof_version' => self::PROOF_VERSION, 'classification' => 'unknown',
+                            'classification_version' => 0, 'classification_provenance' => 'unclassified',
+                        ];
                         $checksum = $descriptor['packet_checksum'];
                         if (isset($rows[$checksum]) && $rows[$checksum] !== $row) {
                             throw new RuntimeException('PAR2 descriptor checksum identity contains different evidence.');
@@ -65,8 +65,14 @@ final class Par2DescriptorEvidence
                             throw new RuntimeException('PAR2 descriptor checksum identity contains different evidence.');
                         }
                         $row = $rows[$checksum];
-                        if (! self::evidenceRowsEqual((array) $stored, $row)) {
-                            throw new RuntimeException('PAR2 descriptor checksum identity contains different evidence.');
+                        foreach ($row as $column => $value) {
+                            $actual = $stored->{$column};
+                            if (is_int($value)) {
+                                $actual = (int) $actual;
+                            }
+                            if ($actual !== $value) {
+                                throw new RuntimeException('PAR2 descriptor checksum identity contains different evidence.');
+                            }
                         }
                         unset($rows[$checksum]);
                     }
@@ -94,82 +100,5 @@ final class Par2DescriptorEvidence
 
             throw $error;
         }
-    }
-
-    /**
-     * @param  array<string, string>  $descriptor
-     * @return array<string, int|string>
-     */
-    public static function descriptorRow(int $releaseId, string $guid, array $descriptor): array
-    {
-        return self::$useRustFfi ? (self::descriptorRowNative($releaseId, $guid, $descriptor) ?? self::descriptorRowPhp($releaseId, $guid, $descriptor)) : self::descriptorRowPhp($releaseId, $guid, $descriptor);
-    }
-
-    /**
-     * @param  array<string, string>  $descriptor
-     * @return array<string, int|string>
-     */
-    public static function descriptorRowPhp(int $releaseId, string $guid, array $descriptor): array
-    {
-        return [
-            'releases_id' => $releaseId, 'release_guid' => $guid,
-            'packet_checksum' => $descriptor['packet_checksum'],
-            'recovery_set_id' => $descriptor['recovery_set_id'], 'file_id' => $descriptor['file_id'],
-            'full_md5' => $descriptor['hash'], 'hash16k' => $descriptor['hash_16K'],
-            'file_size' => $descriptor['size_decimal'],
-            'raw_filename_base64' => base64_encode($descriptor['filename_bytes']),
-            'descriptor_proof_version' => self::PROOF_VERSION, 'classification' => 'unknown',
-            'classification_version' => 0, 'classification_provenance' => 'unclassified',
-        ];
-    }
-
-    /**
-     * @param  array<string, string>  $descriptor
-     * @return array<string, int|string>|null
-     */
-    public static function descriptorRowNative(int $releaseId, string $guid, array $descriptor): ?array
-    {
-        $result = LeaseHeartbeat::computeNative(12, [$releaseId, $guid, $descriptor])['value'] ?? null;
-
-        return is_array($result) ? $result : null;
-    }
-
-    /**
-     * @param  array<string, mixed>  $stored
-     * @param  array<string, int|string>  $incoming
-     */
-    public static function evidenceRowsEqual(array $stored, array $incoming): bool
-    {
-        return self::$useRustFfi ? (self::evidenceRowsEqualNative($stored, $incoming) ?? self::evidenceRowsEqualPhp($stored, $incoming)) : self::evidenceRowsEqualPhp($stored, $incoming);
-    }
-
-    /**
-     * @param  array<string, mixed>  $stored
-     * @param  array<string, int|string>  $incoming
-     */
-    public static function evidenceRowsEqualPhp(array $stored, array $incoming): bool
-    {
-        foreach ($incoming as $column => $value) {
-            $actual = $stored[$column];
-            if (is_int($value)) {
-                $actual = (int) $actual;
-            }
-            if ($actual !== $value) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    /**
-     * @param  array<string, mixed>  $stored
-     * @param  array<string, int|string>  $incoming
-     */
-    public static function evidenceRowsEqualNative(array $stored, array $incoming): ?bool
-    {
-        $result = LeaseHeartbeat::computeNative(13, [$stored, $incoming])['value'] ?? null;
-
-        return is_bool($result) ? $result : null;
     }
 }

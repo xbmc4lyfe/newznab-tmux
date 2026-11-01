@@ -5,13 +5,10 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
-use App\Support\RustPipelineLibrary;
 use DOMDocument;
 use DOMElement;
 use DOMXPath;
-use FFI;
 use RuntimeException;
-use Throwable;
 
 /**
  * Opt-in, latest-only crowdNFO canonical catalogue headings, including contributed names.
@@ -20,44 +17,6 @@ use Throwable;
  */
 final class CrowdnfoSource extends BoundedHttpFeedSource
 {
-    /**
-     * Wave 44.3 production default stays PHP: the paired benchmark in
-     * tests/Unit/RustReleaseContextPredbFeedsApibayXmlCrowdnfoDatsW44ParityTest.php measures
-     * 1.99-2.09x mean but 1.01-2.03x p99 on the common 32-heading batch, so p99 does not clear
-     * the 1.5x gate reliably, although uncommon batches reach 4.1-7.7x.
-     * useW443RustFfi(true) keeps the Rust helper available for parity and benchmarks.
-     * Named W443 so it stays distinct from the inherited feed toggles.
-     */
-    public const bool W443_RUST_FFI_DEFAULT = false;
-
-    public const string W443_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w443_crowdnfo_heading_batch(
-            const char *blob_ptr,
-            size_t blob_len,
-            const char *lens_ptr,
-            size_t lens_len,
-            char *out_buf,
-            size_t out_cap
-        );
-        C;
-
-    /** Scene-shaped heading: dot-separated segments, then a dash and an ASCII word group. */
-    public const string W443_SCENE_HEADING_PATTERN = '/^[^.]+\.[^.]+(?:\.[^.]+)*-[A-Za-z0-9_]+$/D';
-
-    /** Exactly 6 0x1F-separated decimals of 1-19 digits. */
-    private const string W443_FIELDS_PATTERN = '/\A(?:\d{1,19}\x1F){5}\d{1,19}\z/';
-
-    private static ?bool $w443RustFfiOverride = null;
-
-    private static FFI|false|null $w443RustFfiHandle = null;
-
-    private const NATIVE_CDEF = <<<'C'
-        int32_t nntmux_predb_html_validate_numeric_refs(const char *html, size_t len, uint32_t mode);
-        int32_t nntmux_predb_html_validate_listing_scope(const char *html, size_t len, uint32_t mode);
-        C;
-
-    private static FFI|false|null $native = null;
-
     /** libxml2 XML_ERR_ATTRIBUTE_REDEFINED. */
     private const ATTRIBUTE_REDEFINED = 42;
 
@@ -166,28 +125,6 @@ final class CrowdnfoSource extends BoundedHttpFeedSource
     /** Reject references libxml could discard before literal title validation. */
     private function validateNumericReferences(string $html): void
     {
-        // Reference-free pages do not amortize an FFI call. Keep this common
-        // case in PHP's native string search rather than regressing its latency.
-        if (! str_contains($html, '&#')) {
-            return;
-        }
-        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_sql_html', self::NATIVE_CDEF) ?? false;
-        if ($ffi !== false) {
-            // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_predb_html_validate_numeric_refs($html, strlen($html), 1);
-            if ($status === 1) {
-                return;
-            }
-            if ($status === 0) {
-                throw new RuntimeException('CROWDNFO returned an invalid character reference.');
-            }
-        }
-
-        $this->validateNumericReferencesPhp($html);
-    }
-
-    private function validateNumericReferencesPhp(string $html): void
-    {
         $offset = 0;
         while (preg_match('/&#(?:(\d+)|x([0-9a-f]+));?/i', $html, $reference, PREG_OFFSET_CAPTURE, $offset) === 1) {
             $decimal = $reference[1][0];
@@ -211,26 +148,6 @@ final class CrowdnfoSource extends BoundedHttpFeedSource
      * Require those boundaries before libxml can close a truncated listing for us.
      */
     private function validateClosedListingStructure(string $html): void
-    {
-        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_sql_html', self::NATIVE_CDEF) ?? false;
-        if ($ffi !== false) {
-            // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_predb_html_validate_listing_scope($html, strlen($html), 0);
-            if ($status === 1) {
-                return;
-            }
-            if ($status === 0) {
-                throw new RuntimeException('CROWDNFO returned an incomplete listing document.');
-            }
-            if ($status === -2) {
-                throw new RuntimeException('CROWDNFO returned an incomplete listing scope.');
-            }
-        }
-
-        $this->validateClosedListingStructurePhp($html);
-    }
-
-    private function validateClosedListingStructurePhp(string $html): void
     {
         $markup = preg_replace('~<!--.*?(?:-->|\z)|<(script|style)\b[^>]*>.*?(?:</\1\s*>|\z)~is', '', $html);
         if ($markup === null || preg_match('~</html\s*>\s*\z~i', $markup) !== 1
@@ -258,156 +175,5 @@ final class CrowdnfoSource extends BoundedHttpFeedSource
     private function classToken(string $class): string
     {
         return 'contains(concat(" ", normalize-space(@class), " "), " '.$class.' ")';
-    }
-
-    /**
-     * Enables (true) or disables (false) the Wave 44.3 Rust helper; null restores
-     * W443_RUST_FFI_DEFAULT.
-     */
-    public static function useW443RustFfi(?bool $enable = true): void
-    {
-        self::$w443RustFfiOverride = $enable;
-    }
-
-    public static function usesW443RustFfi(): bool
-    {
-        return self::$w443RustFfiOverride ?? self::W443_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW443RustFfi(): void
-    {
-        self::$w443RustFfiOverride = null;
-        self::$w443RustFfiHandle = null;
-    }
-
-    /**
-     * Heading summary for a batch of crowdNFO card titles. Each trim()med title is empty, else
-     * nonliteral when it holds an ASCII space or control byte, else truncated when it holds "..."
-     * or an ellipsis, else scene when it matches W443_SCENE_HEADING_PATTERN, else other.
-     * Non-strings count as empty titles.
-     *
-     * @param  array<array-key, mixed>  $titles
-     * @return array{total: int, empty: int, nonliteral: int, truncated: int, scene: int, other: int}
-     */
-    public static function summarizeCrowdnfoHeadingBatch(array $titles): array
-    {
-        return (self::usesW443RustFfi() ? self::summarizeCrowdnfoHeadingBatchNative($titles) : null)
-            ?? self::summarizeCrowdnfoHeadingBatchPhp($titles);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $titles
-     * @return array{total: int, empty: int, nonliteral: int, truncated: int, scene: int, other: int}
-     */
-    public static function summarizeCrowdnfoHeadingBatchPhp(array $titles): array
-    {
-        $empty = 0;
-        $nonliteral = 0;
-        $truncated = 0;
-        $scene = 0;
-        $other = 0;
-        foreach ($titles as $item) {
-            $title = trim(\is_string($item) ? $item : '');
-            if ($title === '') {
-                $empty++;
-            } elseif (preg_match('/[\x00-\x20\x7F]/', $title) === 1) {
-                $nonliteral++;
-            } elseif (str_contains($title, '...') || str_contains($title, '…')) {
-                $truncated++;
-            } elseif (preg_match(self::W443_SCENE_HEADING_PATTERN, $title) === 1) {
-                $scene++;
-            } else {
-                $other++;
-            }
-        }
-
-        return [
-            'total' => \count($titles),
-            'empty' => $empty,
-            'nonliteral' => $nonliteral,
-            'truncated' => $truncated,
-            'scene' => $scene,
-            'other' => $other,
-        ];
-    }
-
-    /**
-     * Declines (null) for non-string items so PHP counts them.
-     *
-     * @param  array<array-key, mixed>  $titles
-     * @return array{total: int, empty: int, nonliteral: int, truncated: int, scene: int, other: int}|null
-     */
-    public static function summarizeCrowdnfoHeadingBatchNative(array $titles): ?array
-    {
-        $lengths = [];
-        foreach ($titles as $item) {
-            if (! \is_string($item)) {
-                return null;
-            }
-            $lengths[] = \strlen($item);
-        }
-        $fields = self::callW443Native(implode('', $titles), pack('V*', ...$lengths));
-        if ($fields === null) {
-            return null;
-        }
-
-        return [
-            'total' => (int) $fields[0],
-            'empty' => (int) $fields[1],
-            'nonliteral' => (int) $fields[2],
-            'truncated' => (int) $fields[3],
-            'scene' => (int) $fields[4],
-            'other' => (int) $fields[5],
-        ];
-    }
-
-    /**
-     * Calls this class's Wave 44.3 export with the shared scratch buffer, retrying once at the size
-     * it asks for. Returns its fields only when they match W443_FIELDS_PATTERN: exactly the expected
-     * count of 1-19 digit decimals.
-     *
-     * @return list<string>|null
-     */
-    private static function callW443Native(string $blob, string $lens): ?array
-    {
-        $ffi = self::w443RustFfi();
-        if ($ffi === null) {
-            return null;
-        }
-
-        try {
-            $capacity = 0;
-            $buffer = RustPipelineLibrary::obtainScratch($ffi, 128, $capacity);
-            if ($buffer === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w443_crowdnfo_heading_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
-            if (\is_int($written) && $written < -1) {
-                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($buffer === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_w443_crowdnfo_heading_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
-            }
-            if (! \is_int($written) || $written < 0 || $written > $capacity) {
-                return null;
-            }
-            $raw = FFI::string($buffer, $written);
-
-            return preg_match(self::W443_FIELDS_PATTERN, $raw) === 1 ? explode("\x1F", $raw) : null;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private static function w443RustFfi(): ?FFI
-    {
-        if (self::$w443RustFfiHandle === null) {
-            self::$w443RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w443', self::W443_FFI_CDEF) ?? false;
-        }
-
-        return self::$w443RustFfiHandle === false ? null : self::$w443RustFfiHandle;
     }
 }
