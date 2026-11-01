@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use nntmux_core::{parsed_or, var_or};
 use nntmux_nntp::NntpConfig;
 use nntmux_nntp::fingerprint::Provider;
-use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
+use nntmux_runtime::{Ctx, RoleArgs, Shutdown, busy};
 use sqlx::MySqlPool;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -156,14 +156,27 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
         let once = args.once;
         tasks.spawn(async move {
             while !stop.requested() {
-                if ctx.paused().await.unwrap_or(true) {
-                    if once {
-                        return;
+                let busy = match busy::enter(&ctx, "fingerprint").await {
+                    Ok(Some(busy)) => busy,
+                    Ok(None) => {
+                        if once {
+                            return;
+                        }
+                        stop.sleep(Duration::from_secs(5)).await;
+                        continue;
                     }
-                    stop.sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-                match work_once(&ctx.db, &settings).await {
+                    Err(failure) => {
+                        error!(error = format!("{failure:#}"), "can't mark this worker busy");
+                        if once {
+                            return;
+                        }
+                        stop.sleep(IDLE).await;
+                        continue;
+                    }
+                };
+                let worked = work_once(&ctx.db, &settings).await;
+                drop(busy);
+                match worked {
                     Ok(true) => {}
                     Ok(false) => {
                         if once {
