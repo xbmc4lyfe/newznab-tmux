@@ -112,3 +112,41 @@ pub async fn inform(ctx: &Ctx, request: &ApiRequest) -> Result<Reply> {
     .await?;
     Ok(Reply::message(200, "Release Information Added!"))
 }
+
+/// `iconv('CP437', 'UTF-8//IGNORE//TRANSLIT', ...)` for bytes above ASCII.
+const CP437_HIGH: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u{a0}";
+
+pub fn cp437_to_utf8(bytes: &[u8]) -> String {
+    let high: Vec<char> = CP437_HIGH.chars().collect();
+    bytes
+        .iter()
+        .map(|&byte| {
+            if byte < 0x80 {
+                byte as char
+            } else {
+                high[usize::from(byte - 0x80)]
+            }
+        })
+        .collect()
+}
+
+/// PHP's `nl2br`: `<br />` before each line break, treating CRLF and LFCR as one.
+pub fn nl2br(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\n' | '\r' => {
+                out.push_str("<br />");
+                out.push(ch);
+                let pair = if ch == '\n' { '\r' } else { '\n' };
+                if chars.peek() == Some(&pair) {
+                    out.push(pair);
+                    chars.next();
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}

@@ -6,11 +6,16 @@ use anyhow::Result;
 use nntmux_runtime::Ctx;
 
 use crate::auth::{self, User};
+use crate::getnzb::{self, Errors};
 use crate::input::{Input, Value, php_int};
+use crate::json::{J, Style};
 use crate::params;
+use crate::present_v2;
 use crate::reply::{Reply, json_error};
 use crate::request::ApiRequest;
+use crate::rows;
 use crate::settings::Settings;
+use crate::upload;
 use crate::usage::{self, Reservation, Statistics};
 
 /// `resolveUser`: token checks, then the atomic quota reservation.
@@ -264,14 +269,17 @@ pub async fn details(
     request: &ApiRequest,
     resolved: Option<User>,
 ) -> Result<Reply> {
-    let _account = authed!(ctx, settings, request, resolved);
+    let (user, _) = authed!(ctx, settings, request, resolved);
     if !request.input.has("id") {
         return Ok(Reply::v2_error(
             400,
             "Missing parameter (guid is required for single release details)",
         ));
     }
-    Ok(not_ported())
+    match rows::by_guid_for_api(ctx, &request.input.string("id"), false).await? {
+        Some(row) => Ok(present_v2::details(&row, &user, &request.base_url())),
+        None => Ok(Reply::v2_error(404, "No such item")),
+    }
 }
 
 pub async fn get_nzb(
@@ -280,11 +288,18 @@ pub async fn get_nzb(
     request: &ApiRequest,
     resolved: Option<User>,
 ) -> Result<Reply> {
-    let _account = authed!(ctx, settings, request, resolved);
-    if request.input.string("id").is_empty() {
+    let (user, _) = authed!(ctx, settings, request, resolved);
+    let id = getnzb::scalar_id(&request.input);
+    if id.is_empty() {
         return Ok(json_error(200, "Missing parameter (id)"));
     }
-    Ok(not_ported())
+    if !getnzb::guid_exists(ctx, &getnzb::strip_suffix(&id)).await? {
+        return Ok(Reply::v2_error(
+            404,
+            "No such item (the guid you provided has no release in our database)",
+        ));
+    }
+    getnzb::download(ctx, request, &user, &id, Errors::Json, false).await
 }
 
 pub async fn nzb_add(
@@ -303,14 +318,41 @@ pub async fn nzb_add(
             "Insufficient privileges/not authorized",
         ));
     }
-    let multipart = request
-        .header("content-type")
-        .is_some_and(|value| value.starts_with("multipart/"));
-    if multipart {
-        return Ok(not_ported());
-    }
-    Ok(Reply::v2_error(
-        400,
-        "Missing parameter (nzb file is required)",
-    ))
+    let Some(nzb) = request.file("nzb").cloned() else {
+        return Ok(Reply::v2_error(
+            400,
+            "Missing parameter (nzb file is required)",
+        ));
+    };
+    let nfo = request.file("nfo").cloned();
+    let folder = settings.upload_folder.clone();
+    let staged =
+        tokio::task::spawn_blocking(move || upload::stage(folder.as_deref(), &nzb, nfo.as_ref()))
+            .await?;
+    let staged = match staged {
+        Ok(staged) => staged,
+        Err(failure) => return Ok(Reply::v2_error(failure.status, &failure.message)),
+    };
+    let described = |filename: String, kind: &str| {
+        J::obj([("filename", J::Str(filename)), ("type", J::str(kind))])
+    };
+    let body = J::obj([
+        ("success", J::Bool(true)),
+        ("status", J::str("staged")),
+        ("name", J::Str(staged.name)),
+        ("category", request.input.str("cat").map_or(J::Null, J::str)),
+        (
+            "files",
+            J::obj([
+                ("nzb", described(staged.nzb_filename, "nzb")),
+                (
+                    "nfo",
+                    staged
+                        .nfo_filename
+                        .map_or(J::Null, |name| described(name, "nfo")),
+                ),
+            ]),
+        ),
+    ]);
+    Ok(Reply::json(201, &body, Style::Unescaped))
 }
