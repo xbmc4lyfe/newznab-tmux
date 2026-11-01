@@ -11,6 +11,7 @@ use std::panic::{UnwindSafe, catch_unwind};
 
 pub mod archive;
 pub mod article_dates;
+pub mod article_fingerprint;
 pub mod article_identity;
 pub mod article_xref;
 pub mod header_filename_identity;
@@ -19,6 +20,9 @@ pub mod nntp_body;
 pub mod nntp_headers;
 pub mod par2;
 pub mod par2_source_ranges;
+pub mod per_article_obfuscation;
+mod release_names;
+pub mod sample_plan;
 pub mod seven_zip_ranges;
 
 const MAX_METADATA_INPUT_BYTES: usize = 67_108_864;
@@ -30,6 +34,8 @@ const MAX_ARTICLE_XREF_INPUT_BYTES: usize = 196_608;
 const MAX_NNTP_HEADER_INPUT_BYTES: usize = 131_072;
 const MAX_LINES_BODY_BYTES: usize = 2_000_000;
 const MAX_HEADER_FILENAME_INPUT_BYTES: usize = 4_096;
+
+const MAX_RELEASE_NAMES_INPUT_BYTES: usize = 8 * 1024 * 1024;
 
 const ABSENT_FIELD: [u8; 4] = [0xff; 4];
 
@@ -268,4 +274,12 @@ fn pack_fragments(packed: &mut Vec<u8>, fragments: &[RangeFragment<'_>]) -> Opti
         pack_field(packed, fragment.bytes)?;
     }
     Some(())
+}
+
+/// Renders the admin release list's name cells from its JSON request.
+pub fn release_names_html(input: &[u8]) -> Option<Vec<String>> {
+    if input.len() > MAX_RELEASE_NAMES_INPUT_BYTES {
+        return None;
+    }
+    guarded(|| release_names::render(input)).flatten()
 }

@@ -84,7 +84,7 @@ status = "ported"
 kind = "library"
 id = "formats:article-fingerprint"
 source = "docker/app/nzb-yenc-ffi/src/article_fingerprint.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
@@ -108,19 +108,19 @@ status = "ported"
 kind = "library"
 id = "formats:per-article-obfuscation"
 source = "docker/app/nzb-yenc-ffi/src/per_article_obfuscation.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:spot-check-sample-plan"
 source = "docker/app/nzb-yenc-ffi/src/sample_plan.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:release-names-html"
 source = "docker/app/nzb-yenc-ffi/src/release_names.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
