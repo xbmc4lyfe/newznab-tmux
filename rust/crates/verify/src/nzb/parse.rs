@@ -22,6 +22,8 @@ pub struct ParsedSegment {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ParsedFile {
     pub subject: String,
+    pub poster: String,
+    pub date: String,
     /// `group` children of the first `groups` container.
     pub groups: Vec<String>,
     /// `segment` children of the first `segments` container.
@@ -171,6 +173,8 @@ pub fn parse(xml: &[u8]) -> Result<ParsedNzb> {
 fn parsed_file(file: Node<'_, '_>, named: &impl Fn(&Node<'_, '_>, &str) -> bool) -> ParsedFile {
     let mut parsed = ParsedFile {
         subject: attribute(file, "subject").to_owned(),
+        poster: attribute(file, "poster").to_owned(),
+        date: attribute(file, "date").to_owned(),
         ..ParsedFile::default()
     };
     if let Some(groups) = file.children().find(|node| named(node, "groups")) {

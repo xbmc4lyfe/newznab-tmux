@@ -17,7 +17,8 @@ note = "nntmux-ctl postprocess additional-diagnose. The claim-queue index check 
 kind = "command"
 id = "nntmux:import-nfos"
 source = "app/Console/Commands/ImportNfos.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases import-nfos, by ws-releases with the upload manifest it shares. The releases role runs it and nntmux:import-nzbs on NZB_UPLOAD_FOLDER each round."
 
 [[entry]]
 kind = "command"
