@@ -2,7 +2,9 @@
 //! and names.
 
 pub mod archive_extraction;
+pub mod archive_naming;
 pub mod candidates;
+pub mod context;
 pub mod diagnose;
 pub mod download;
 pub mod media_source;
@@ -10,4 +12,5 @@ pub mod nzb_contents;
 pub mod par2_mapping;
 pub mod planner;
 pub mod queue;
+pub mod search_sync;
 pub mod seven_zip_listing;
