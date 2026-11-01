@@ -24,6 +24,8 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 16. **Never send a constant across a language boundary.** `XxxPipe::pipeName()` has PHP and native twins behind a toggle, just to return a fixed name. That code is older than Wave 67.1 and stays for a later slice. If a value needs no computation, return it.
 17. **Measure cleanup by what it clears.** Wave 67.1 reported 12.16x on planning for `CollectionCleanupService`, whose real work is database cleanup. A cleanup job should be measured by rows cleared per second and time spent holding locks.
 18. **Keep timing gates out of unit tests.** Four benchmark test files failed during a run on a machine with a load average above 24, then passed when rerun with load near 14. A speed gate in a unit suite fails on whatever else the machine is doing. Run benchmarks in their own job on a quiet machine, and compare trends.
+19. **Use typed values, not packed words.** The Wave 67.2 episode plan packed its result into bit fields such as `min(series, 4095) << 8`, so a larger value is silently cut to the cap. Use Rust structs inside the indexer, and return an error when a value doesn't fit.
+20. **Don't tune the cheap step.** Wave 67.2 reported 13.24x on planning how `ForkingService` splits work among workers. That plan is arithmetic on a few numbers, while the workers it starts run backfill, binaries and post-processing. Tune the workers' throughput.
 
 ## Slices
 
@@ -35,3 +37,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 3 | Wave 67.6 plans: `LogFileRepository`, `LogReader`, `LogSearcher`, `SearchQuery`, `Mcp/ProcessRunner`, their Rust module and parity test | `382db8a64` | 12, 13 |
 | 4 | Wave 67.5 plans: `LogIndex`, `LogSearchCoordinator`, `ManticoreLogSearcher`, `LogEntry`, `LogEntryParser`, their Rust module and parity test | `2a092659e` | 14, 15 |
 | 5 | Wave 67.1 plans: `XxxPipe`, `CollectionCleanupService`, `CollectionsCleaningService`, `ConfigurationProvider`, `DomainConfigurationRepository`, their Rust module and parity test | `a94d3fa42` | 16 to 18 |
+| 6 | Wave 67.2 plans: `ProcessingRuntimeStateRepository`, `ConsolesProcessor`, `EpisodeHydrationService`, `FanartTvService`, `ForkingService`, their Rust module and parity test | `43f2624bf` | 19, 20 |
