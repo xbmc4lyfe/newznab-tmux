@@ -17,6 +17,7 @@ md-5.workspace = true
 metrics.workspace = true
 nntmux-categorize.workspace = true
 nntmux-core.workspace = true
+nntmux-formats.workspace = true
 nntmux-nntp.workspace = true
 nntmux-predb.workspace = true
 nntmux-runtime.workspace = true
@@ -39,6 +40,7 @@ tracing.workspace = true
 unicode-normalization.workspace = true
 
 [dev-dependencies]
+crc32fast.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 nntmux-testkit.workspace = true

@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use nntmux_namefix::identify::archive_probe::{ArchiveProbe, NntpFetch};
 use nntmux_namefix::identify::catalog::{
-    Options, holdout, render_holdout, render_report, render_tsv, run,
+    Options, holdout, render_holdout, render_report, render_tsv, run_with_probe,
 };
 use nntmux_namefix::identify::{Hooks, SrrdbClient, SrrdbConfig};
 
@@ -44,6 +45,10 @@ enum Command {
         /// Stops asking srrDB after this many releases, chosen at random.
         #[arg(long)]
         srrdb_sample: Option<usize>,
+        /// Reads archive headers over NNTP for this many releases with no other evidence, chosen
+        /// at random. It takes the provider from the NNTP_* variables, and needs nothing else.
+        #[arg(long)]
+        archive_probe_sample: Option<usize>,
         /// The least time between srrDB requests.
         #[arg(long, default_value_t = 1000)]
         srrdb_interval_ms: u64,
@@ -72,6 +77,7 @@ fn start(cli: &Cli) -> Result<()> {
             apply,
             ref srrdb_cache,
             srrdb_sample,
+            archive_probe_sample,
             srrdb_interval_ms,
         } => {
             options.apply = apply;
@@ -84,16 +90,27 @@ fn start(cli: &Cli) -> Result<()> {
                     SrrdbClient::new(config)
                 })
                 .transpose()?;
-            options.shuffle = srrdb.is_some();
+            let fetcher = archive_probe_sample
+                .map(|_| NntpFetch::from_env())
+                .transpose()?;
+            let probe = fetcher.as_ref().map(|fetcher| {
+                ArchiveProbe::new(fetcher, archive_probe_sample.unwrap_or_default())
+            });
+            options.shuffle = srrdb.is_some() || probe.is_some();
             let hooks = srrdb.as_ref().map_or_else(Hooks::default, |client| Hooks {
                 srrdb: client,
                 ..Hooks::default()
             });
-            let report = run(&options, hooks)?;
+            let report = run_with_probe(&options, hooks, probe.as_ref())?;
             let text = render_report(&report);
             write_out(&cli.out, "report.md", &text)?;
             write_out(&cli.out, "identifications.tsv", &render_tsv(&report))?;
             print!("{text}");
+            if let Some(probe) = &probe {
+                let stats = probe.render_stats();
+                write_out(&cli.out, "archive_probe.md", &stats)?;
+                print!("\n{stats}");
+            }
             if let Some(client) = &srrdb {
                 let stats = client.render_stats();
                 write_out(&cli.out, "srrdb.md", &stats)?;

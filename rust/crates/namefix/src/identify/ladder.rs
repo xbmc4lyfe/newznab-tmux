@@ -798,6 +798,8 @@ mod tests {
                 .map(|(subject, bytes)| NzbFile {
                     subject: (*subject).to_owned(),
                     bytes: *bytes,
+                    group: None,
+                    first_message_id: None,
                 })
                 .collect(),
             payload_bytes: subjects.iter().map(|(_, bytes)| bytes).sum(),
