@@ -113,6 +113,33 @@ impl Pcre {
         Some(Match { groups, names })
     }
 
+    /// Every match, as `preg_match_all` finds them. A failed match gives none, as PHP's false did.
+    pub fn captures_all(&self, subject: &[u8]) -> Vec<Match> {
+        let Some(text) = self.haystack(subject) else {
+            return Vec::new();
+        };
+        let names: Vec<(String, usize)> = self
+            .regex
+            .capture_names()
+            .enumerate()
+            .filter_map(|(index, name)| Some((name?.to_owned(), index)))
+            .collect();
+        let mut matches = Vec::new();
+        for captures in self.regex.captures_iter(&text) {
+            let Ok(captures) = captures else {
+                return Vec::new();
+            };
+            let groups = (0..captures.len())
+                .map(|index| captures.get(index).map(|m| self.bytes(m.as_str())))
+                .collect();
+            matches.push(Match {
+                groups,
+                names: names.clone(),
+            });
+        }
+        matches
+    }
+
     /// `preg_replace` with a literal replacement. A failed match leaves the rest unchanged.
     pub fn replace_all(&self, subject: &[u8], replacement: &[u8]) -> Vec<u8> {
         let Some(text) = self.haystack(subject) else {

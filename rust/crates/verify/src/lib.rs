@@ -5,6 +5,7 @@
 pub mod barrier;
 pub mod cache;
 pub mod candidates;
+pub mod cleaning;
 pub mod collections;
 pub mod config;
 pub mod context;
