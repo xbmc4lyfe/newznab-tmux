@@ -175,10 +175,29 @@ fn split_delimiters(delimited: &str) -> Result<(&str, &str)> {
         other => other,
     };
     let body = &trimmed[open.len_utf8()..];
-    let end = body
-        .rfind(close)
+    let end = closing_delimiter(body, open, close)
         .ok_or_else(|| anyhow!("no ending delimiter {close}"))?;
     Ok((&body[..end], &body[end + close.len_utf8()..]))
+}
+
+/// PHP takes the first unescaped delimiter as the end, so `/a/b/` has modifiers `b/` and fails.
+/// Bracket delimiters nest.
+fn closing_delimiter(body: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0;
+    let mut chars = body.char_indices();
+    while let Some((at, c)) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if c == close {
+            if depth == 0 {
+                return Some(at);
+            }
+            depth -= 1;
+        } else if c == open {
+            depth += 1;
+        }
+    }
+    None
 }
 
 const SPACE: &str = r" \t\n\x0B\f\r";
@@ -295,6 +314,29 @@ fn outside_escape(chars: &[char], at: usize, utf: bool, out: &mut String) -> usi
                 i += 1;
             }
             return i;
+        }
+        // `\<` is a literal in PCRE and a word boundary in the regex crate.
+        '<' | '>' => out.push(next),
+        // PCRE's NUL and octal escapes, which the regex crate refuses.
+        '0' => {
+            let digits = chars[at + 2..]
+                .iter()
+                .take(2)
+                .take_while(|c| ('0'..='7').contains(*c))
+                .count();
+            let octal: String = chars[at + 2..at + 2 + digits].iter().collect();
+            let value = u32::from_str_radix(&octal, 8).unwrap_or(0);
+            out.push_str(&format!(r"\x{{{value:X}}}"));
+            return at + 2 + digits;
+        }
+        // These take a braced argument, which isn't a stray brace.
+        'p' | 'P' | 'x' | 'o' | 'g' | 'k' if chars.get(at + 2) == Some(&'{') => {
+            let Some(end) = chars[at + 2..].iter().position(|&c| c == '}') else {
+                out.extend(&chars[at..at + 2]);
+                return at + 2;
+            };
+            out.extend(&chars[at..=at + 2 + end]);
+            return at + 3 + end;
         }
         other => {
             out.push('\\');
@@ -461,6 +503,16 @@ mod tests {
         assert!(Pcre::new(r"/^[\d-x]+$/").unwrap().is_match(b"1-x"));
         assert!(Pcre::new(r"/^[a&&b]+$/").unwrap().is_match(b"a&b"));
         assert!(Pcre::new(r"/^[[:alpha:]]+$/").unwrap().is_match(b"abc"));
+        assert!(Pcre::new(r"/^\p{L}+$/u").unwrap().is_match("é".as_bytes()));
+        assert!(Pcre::new(r"/\x{e9}/u").unwrap().is_match("é".as_bytes()));
+        assert!(Pcre::new(r"/\x{e9}/").unwrap().is_match(b"\xe9"));
+        assert_eq!(replace(r"/\<a\>/", b"<a>"), b"_");
+        assert!(Pcre::new(r"/a\0b/").unwrap().is_match(b"a\0b"));
+        assert!(Pcre::new(r"/\012/").unwrap().is_match(b"\n"));
+        // PHP ends the pattern at the first unescaped delimiter.
+        assert!(Pcre::new("/a/b/").is_err());
+        assert!(Pcre::new(r"/a\/b/").unwrap().is_match(b"a/b"));
+        assert!(Pcre::new("{a{2}}").unwrap().is_match(b"aa"));
         assert!(Pcre::new(r"/^\Qa.b\E$/").unwrap().is_match(b"a.b"));
         assert!(!Pcre::new(r"/^\Qa.b\E$/").unwrap().is_match(b"axb"));
     }
