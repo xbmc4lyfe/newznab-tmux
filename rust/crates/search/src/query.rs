@@ -202,7 +202,7 @@ pub fn prepare_poster_query(query: &str) -> String {
     )
 }
 
-fn scope_to_field(prepared: &str, selector: &str) -> String {
+pub(crate) fn scope_to_field(prepared: &str, selector: &str) -> String {
     let prepared = php_trim(prepared);
     if prepared.is_empty() {
         String::new()
@@ -240,6 +240,27 @@ pub fn scope_release_search_query(raw: &str, prepared: &str, selector: &str) -> 
         "({primary} | {})",
         scope_to_field(&normalized_prepared, selector)
     )
+}
+
+/// Treats a name as literal text inside a quoted phrase.
+pub(crate) fn escape_literal(name: &str) -> String {
+    let mut literal = String::with_capacity(name.len());
+    for character in name.chars() {
+        if "\\()|!@~\"&/^$=<>[]{}*-?".contains(character) {
+            literal.push('\\');
+        }
+        literal.push(character);
+    }
+    literal
+}
+
+/// Keeps letters and numbers, in any script, with single spaces between the runs.
+pub(crate) fn title_tokens(title: &str) -> String {
+    let mapped: String = title
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    mapped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// `@@relaxed` is query-wide and only valid once, so per-field terms share one.

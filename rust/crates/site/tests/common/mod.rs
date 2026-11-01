@@ -118,6 +118,14 @@ pub async fn fixture() -> Option<(TestDb, Ctx)> {
         db: db.pool.clone(),
         redis,
     };
+    // Throttles key on the user id in one shared Redis, so ids must differ across test databases.
+    let start: u32 = rand::random::<u32>() % 2_000_000_000 + 1000;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE users AUTO_INCREMENT = {start}"
+    )))
+    .execute(&db.pool)
+    .await
+    .unwrap();
     Some((db, ctx))
 }
 
