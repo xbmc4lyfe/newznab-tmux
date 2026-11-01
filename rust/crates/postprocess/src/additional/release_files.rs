@@ -1,6 +1,6 @@
 //! `ReleaseFileManager`, first half: queueing the files an archive lists, naming the release from
 //! them, and the guarded finalization that writes the inventory and statuses back. PAR2 and NFO
-//! handling and naming from RAR contents follow in the next port.
+//! handling and naming from RAR or NZB contents are in [`super::release_file_evidence`].
 //!
 //! PHP's producer-naming claim was always absent (see [`super::context`]), so a rename here is
 //! accepted exactly when name fixing committed one from the identity this attempt holds. PHP also
@@ -46,6 +46,11 @@ pub struct Settings {
     /// `innerFileBlacklist`, a delimited PCRE; `None` when unset.
     pub inner_file_blacklist: Option<String>,
     pub add_par2_files: bool,
+    /// `rename_par2`: name a release in an "other" category from its PAR2 file names.
+    pub rename_par2: bool,
+    /// `echocli`. PHP passed it as the write flag of the PAR2 name check, so with it off that
+    /// check only previews.
+    pub echo_cli: bool,
     pub season_pack_max_release_files: usize,
     pub archive_retry_delay_seconds: i64,
     /// A claim older than this no longer owns its release.
@@ -106,7 +111,7 @@ impl ReleaseFiles {
         (Utc::now() - TimeDelta::seconds(self.settings.claim_ttl_seconds)).naive_utc()
     }
 
-    fn release_file_limit(&self, context: &ReleaseContext) -> usize {
+    pub(crate) fn release_file_limit(&self, context: &ReleaseContext) -> usize {
         if context.season_pack {
             self.settings.season_pack_max_release_files
         } else {
@@ -195,7 +200,7 @@ impl ReleaseFiles {
     }
 
     /// The release as name fixing takes it, or `None` once naming is deferred.
-    fn producer_entry(&self, context: &ReleaseContext) -> Option<Release> {
+    pub(crate) fn producer_entry(&self, context: &ReleaseContext) -> Option<Release> {
         if context.full_par2_evidence_deferred {
             return None;
         }
@@ -217,7 +222,7 @@ impl ReleaseFiles {
 
     /// `acceptProducerName`: a committed rename moves the evidence identity along, or defers
     /// naming when it wasn't this attempt's to make. True when a rename was accepted.
-    fn accept_producer_name(
+    pub(crate) fn accept_producer_name(
         &mut self,
         context: &mut ReleaseContext,
         proof: Option<&CommittedIdentity>,
