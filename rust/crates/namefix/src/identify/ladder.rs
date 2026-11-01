@@ -605,7 +605,10 @@ fn climb(evidence: &Evidence, context: &Context<'_>) -> (Outcome, Flags) {
 
     // A file shared with a release that already has a name.
     let donor = timed("donor", || {
-        match context.donors.find(&evidence.facts, evidence.id) {
+        match context
+            .donors
+            .find(&evidence.facts, evidence.id, evidence.size_bytes)
+        {
             DonorMatch::None => None,
             found => Some(found),
         }
@@ -732,7 +735,9 @@ fn finish_with_flags(
     context: &Context<'_>,
 ) -> (Outcome, Flags) {
     if !matches!(
-        context.donors.find(&evidence.facts, evidence.id),
+        context
+            .donors
+            .find(&evidence.facts, evidence.id, evidence.size_bytes),
         DonorMatch::None
     ) {
         flags.donor = true;
@@ -1038,7 +1043,11 @@ mod tests {
     #[test]
     fn a_shared_file_borrows_a_name() {
         let mut donors = DonorIndex::default();
-        donors.add_name(2, "Harry.Potter.2001.2160p.BluRay.x265-MarkII".to_owned());
+        donors.add_name(
+            2,
+            "Harry.Potter.2001.2160p.BluRay.x265-MarkII".to_owned(),
+            6_000_000_000,
+        );
         donors.add_key(DonorKey::Crc32, "5615b8b1:8539116558".to_owned(), 2);
         let mut evidence = release(r#""4e87cbaf1e26498892fde2da5d7bb0f6.mkv" yEnc"#);
         evidence.facts = vec![(DonorKey::Crc32, "5615b8b1:8539116558".to_owned())];
