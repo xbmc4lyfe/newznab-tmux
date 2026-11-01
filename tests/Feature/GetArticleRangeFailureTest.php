@@ -316,6 +316,38 @@ final class GetArticleRangeFailureTest extends TestCase
         $this->assertSame(1000, (int) DB::table('usenet_groups')->where('id', 7)->value('last_record'));
     }
 
+    public function test_a_failed_xover_scan_whose_repair_insert_fails_does_not_report_a_durable_queue(): void
+    {
+        ConfigurationTestBuilder::installDefaults();
+        DB::statement("CREATE TRIGGER reject_repair BEFORE INSERT ON missed_parts BEGIN SELECT RAISE(ABORT, 'repair storage unavailable'); END");
+        $nntp = $this->mock(NNTPService::class);
+        $nntp->shouldReceive('selectGroup')->with('alt.binaries.test')->andReturn(['first' => 1, 'last' => 2000]);
+        $nntp->shouldReceive('getXOVER')->once()->with('1001-1500')->andReturn(new Error('XOVER failed', 503));
+        $nntp->shouldReceive('reconnect')->once()->with(false)->andReturn(false);
+
+        $command = new class($nntp) extends GetArticleRange
+        {
+            public function __construct(private NNTPService $nntp)
+            {
+                parent::__construct();
+            }
+
+            protected function getNntp(): NNTPService
+            {
+                return $this->nntp;
+            }
+        };
+        $this->app->instance(GetArticleRange::class, $command);
+
+        $this->artisan('articles:get-range', ['mode' => 'binaries', 'group' => 'alt.binaries.test', 'first' => 1001, 'last' => 1500])
+            ->expectsOutput('Header download did not complete and this range could not be queued for repair; retry this worker.')
+            ->doesntExpectOutput('Header download did not complete; queued this range for part repair.')
+            ->assertFailed();
+
+        $this->assertSame(0, DB::table('missed_parts')->count());
+        $this->assertSame(1000, (int) DB::table('usenet_groups')->where('id', 7)->value('last_record'));
+    }
+
     public function test_an_unknown_group_queues_nothing(): void
     {
         $this->app->bind(GetArticleRange::class, fn (): GetArticleRange => new class extends GetArticleRange
