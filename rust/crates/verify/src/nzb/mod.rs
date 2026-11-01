@@ -1,8 +1,10 @@
 //! Published NZB storage. The bodies live in `release_nzb_contents`, written in the same
 //! transaction as their release and fingerprint work, so there's no filesystem staging to settle.
 
+pub mod coverage;
 pub mod document;
 pub mod fingerprint;
+pub mod parse;
 pub mod store;
 
 pub use document::document;
