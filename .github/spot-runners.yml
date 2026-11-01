@@ -1,0 +1,51 @@
+# Runners this repository asks swack-tools/spot-github-runners for.
+# Format: docs/repo-runner-specs.md in that repository.
+schema: spot-runner-spec-v1
+
+# Floor hosts run the first pool they can serve, so linux-x64 must stay first
+# and free of Docker. A spec with no servable pool holds every floor launch.
+pools:
+  # runs-on: ubuntu-latest (clippy, indexer, benchmark matrices)
+  - name: linux-x64
+    arch: x64
+    labels: [ubuntu-latest]
+    cpus: 4
+    memory_gib: 8
+    min: 0
+    max: 10
+    isa: [avx512-vbmi2] # paired-decoding requires the VBMI2 kernel
+    toolchains:
+      rust:
+        toolchains: ["1.98.0"]
+        components: [clippy, rustfmt]
+    apt_packages: [python3]
+
+  # runs-on: ubuntu-24.04 (Laravel, fingerprint worker, release presentation, pages)
+  - name: linux-x64-docker
+    arch: x64
+    labels: [ubuntu-24.04]
+    cpus: 4
+    memory_gib: 8
+    min: 0
+    max: 10
+    needs:
+      docker: true # MariaDB service containers and docker build
+    toolchains:
+      rust:
+        toolchains: ["1.98.0"]
+        components: [clippy, rustfmt]
+    apt_packages: [par2, unrar, python3]
+
+  # runs-on: ubuntu-24.04-arm (benchmark matrices)
+  - name: linux-arm64
+    arch: arm64
+    labels: [ubuntu-24.04-arm]
+    cpus: 4
+    memory_gib: 8
+    min: 0
+    max: 10
+    toolchains:
+      rust:
+        toolchains: ["1.98.0"]
+        components: [clippy, rustfmt]
+    apt_packages: [python3]
