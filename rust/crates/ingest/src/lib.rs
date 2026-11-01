@@ -2,8 +2,13 @@
 //!
 //! Owner: ws-ingest. See `rust/WORKSTREAMS.md`.
 
+pub mod blacklist;
 pub mod clean;
+pub mod config;
+pub mod groups;
 pub mod header;
+pub mod missed;
+pub mod store;
 
 use anyhow::{Result, bail};
 use clap::Subcommand;
