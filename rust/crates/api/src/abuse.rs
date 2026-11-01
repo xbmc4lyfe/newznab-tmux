@@ -2,7 +2,13 @@
 //! and, when configured, indexer apps that proxy NZB downloads.
 
 use std::net::IpAddr;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+use axum::extract::Request;
+use axum::http::header::USER_AGENT;
+use axum::middleware::Next;
+use axum::response::Response;
 
 use md5::{Digest, Md5};
 use nntmux_core::{optional, parsed_or, var_or};
@@ -313,24 +319,89 @@ fn is_public(address: &str) -> bool {
     }
 }
 
+fn agent_refusal(user_agent: &str, ip: Option<&str>, path: &str) -> Option<Reply> {
+    let lower = user_agent.to_lowercase();
+    if !BLOCKED_USER_AGENTS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return None;
+    }
+    warn!(ip, user_agent, path, "blocked abusive User-Agent");
+    Some(blocked(
+        "Access denied: Streaming services are not allowed.",
+    ))
+}
+
+async fn asn_refusal(
+    ctx: &Ctx,
+    settings: &Settings,
+    user_agent: &str,
+    ip: Option<&str>,
+    path: &str,
+) -> Option<Reply> {
+    if !settings.abuse.asn_lookup {
+        return None;
+    }
+    let address = ip.filter(|address| is_public(address))?;
+    let asn = asn_of(ctx, settings, address).await?;
+    let (_, name) = BLOCKED_ASNS
+        .iter()
+        .find(|(blocked_asn, _)| *blocked_asn == asn)?;
+    warn!(ip, asn, user_agent, path, "blocked ASN");
+    Some(blocked(&format!("Access denied: {name} is not allowed.")))
+}
+
+/// What `site::statics` serves from disk, which the web server answered before PHP.
+const STATIC_PREFIXES: [&str; 4] = ["/build/", "/assets/", "/svg/", "/storage/"];
+const STATIC_FILES: [&str; 2] = ["/favicon.ico", "/robots.txt"];
+
+static PAGE_SETTINGS: LazyLock<Option<Settings>> = LazyLock::new(|| match Settings::from_env() {
+    Ok(settings) => Some(settings),
+    Err(failure) => {
+        warn!(%failure, "abuse checks for pages are off");
+        None
+    }
+});
+
+/// The same middleware for pages, which PHP ran it on as well. Downloads and searches have their
+/// own routes, so only the user agent and network checks apply. Files the web server would have
+/// answered in PHP's setup are left alone.
+pub async fn block_pages(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    if STATIC_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+        || STATIC_FILES.contains(&path.as_str())
+    {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    let ip = nntmux_webkit::client_ip::from_parts(&parts).to_string();
+    let user_agent = parts
+        .headers
+        .get(USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let mut refusal = agent_refusal(&user_agent, Some(&ip), &path);
+    if refusal.is_none()
+        && let (Some(ctx), Some(settings)) = (parts.extensions.get::<Ctx>(), PAGE_SETTINGS.as_ref())
+    {
+        refusal = asn_refusal(ctx, settings, &user_agent, Some(&ip), &path).await;
+    }
+    match refusal {
+        Some(reply) => reply.into_response(),
+        None => next.run(Request::from_parts(parts, body)).await,
+    }
+}
+
 /// The middleware: `Some` is the refusal.
 pub async fn check(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Option<Reply> {
     let user_agent = request.header("user-agent").unwrap_or_default();
     let ip = request.client_ip();
-    let lower = user_agent.to_lowercase();
-    if BLOCKED_USER_AGENTS
-        .iter()
-        .any(|pattern| lower.contains(pattern))
-    {
-        warn!(
-            ip,
-            user_agent,
-            path = request.path,
-            "blocked abusive User-Agent"
-        );
-        return Some(blocked(
-            "Access denied: Streaming services are not allowed.",
-        ));
+    if let Some(reply) = agent_refusal(user_agent, ip.as_deref(), &request.path) {
+        return Some(reply);
     }
 
     let download = is_download(request);
@@ -368,15 +439,5 @@ pub async fn check(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Opti
         ));
     }
 
-    if config.asn_lookup
-        && let Some(address) = ip.as_ref().filter(|address| is_public(address))
-        && let Some(asn) = asn_of(ctx, settings, address).await
-        && let Some((_, name)) = BLOCKED_ASNS
-            .iter()
-            .find(|(blocked_asn, _)| *blocked_asn == asn)
-    {
-        warn!(ip, asn, user_agent, path = request.path, "blocked ASN");
-        return Some(blocked(&format!("Access denied: {name} is not allowed.")));
-    }
-    None
+    asn_refusal(ctx, settings, user_agent, ip.as_deref(), &request.path).await
 }

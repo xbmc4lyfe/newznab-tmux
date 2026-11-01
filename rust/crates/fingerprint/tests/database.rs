@@ -1,11 +1,15 @@
 use flate2::{Compression, write::GzEncoder};
 use nntmux_fingerprint::backfill;
 use nntmux_fingerprint::database::{self, Claim};
+use nntmux_fingerprint::{breaker, collect, manifest, role};
+use nntmux_nntp::fingerprint::Provider;
 use nntmux_testkit::TestDb;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::MySqlPool;
 use std::{io::Write, sync::atomic::Ordering, time::Duration};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 
 const ID: u64 = 9_900_001;
 const GUID: &str = "00000000000000000000000000990001";
@@ -274,4 +278,176 @@ async fn backfill_finds_only_what_is_not_current() {
             .unwrap(),
         ids(&[stale, stuck])
     );
+}
+
+fn settings(port: u16) -> role::Settings {
+    role::Settings {
+        worker: "test".to_owned(),
+        concurrency: 1,
+        providers: vec![Provider {
+            account: "primary".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port,
+            tls: false,
+            username: String::new(),
+            password: String::new(),
+        }],
+        alternate_percent: 0,
+        timeout_seconds: 5,
+    }
+}
+
+#[tokio::test]
+async fn the_role_collects_a_job_over_nntp() {
+    let Some(db) = TestDb::create().await.unwrap() else {
+        return;
+    };
+    let pool = db.pool.clone();
+    setup(&pool).await;
+    sqlx::query(
+        "INSERT IGNORE INTO release_fingerprint_connections (provider, slot) VALUES ('primary', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut io = BufReader::new(stream);
+        io.write_all(b"200 fixture\r\n").await.unwrap();
+        loop {
+            let mut command = String::new();
+            if io.read_line(&mut command).await.unwrap() == 0 {
+                break;
+            }
+            match command.trim() {
+                "CAPABILITIES" => io
+                    .write_all(b"101 capabilities\r\nIMPLEMENTATION Fixture\r\n.\r\n")
+                    .await
+                    .unwrap(),
+                "ARTICLE <x@y>" => {
+                    let payload = b"abc";
+                    let encoded: Vec<u8> = payload.iter().map(|b| b.wrapping_add(42)).collect();
+                    let mut response = b"220 0 <x@y> follows\r\nMessage-ID: <x@y>\r\n\r\n=ybegin line=128 size=3 name=x.rar\r\n".to_vec();
+                    response.extend(encoded);
+                    response.extend(
+                        format!(
+                            "\r\n=yend size=3 crc32={:08x}\r\n.\r\n",
+                            crc32fast::hash(payload)
+                        )
+                        .as_bytes(),
+                    );
+                    io.write_all(&response).await.unwrap();
+                }
+                other => panic!("unexpected fixture command {other}"),
+            }
+        }
+    });
+    let settings = settings(port);
+    assert!(role::work_once(&pool, &settings).await.unwrap());
+    assert!(
+        !role::work_once(&pool, &settings).await.unwrap(),
+        "nothing else is due"
+    );
+    let (status, metadata): (String, serde_json::Value) = sqlx::query_as(
+        "SELECT status, metadata FROM release_fingerprint_metadata WHERE releases_id = ?",
+    )
+    .bind(ID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "complete");
+    assert_eq!(metadata["collector"]["engine"], "rust");
+    assert_eq!(metadata["articles"][0]["yenc"]["crc_ok"], true);
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM release_fingerprint_jobs WHERE release_id = ?")
+            .bind(ID)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "complete");
+    let held: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM release_fingerprint_connections WHERE lease_token IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(held, 0);
+    server.abort();
+    assert_eq!(
+        collect::analyze(&manifest::parse(XML).unwrap(), &[]).status,
+        "partial"
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_provider_records_a_partial_result() {
+    let Some(db) = TestDb::create().await.unwrap() else {
+        return;
+    };
+    let pool = db.pool.clone();
+    setup(&pool).await;
+    sqlx::query(
+        "INSERT IGNORE INTO release_fingerprint_connections (provider, slot) VALUES ('primary', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    assert!(role::work_once(&pool, &settings(port)).await.unwrap());
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM release_fingerprint_metadata WHERE releases_id = ?")
+            .bind(ID)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "partial");
+}
+
+#[tokio::test]
+async fn the_alternate_breaker_is_shared_and_fenced() {
+    let Some(db) = TestDb::create().await.unwrap() else {
+        return;
+    };
+    let pool = db.pool.clone();
+    breaker::unavailable(&pool, "alternate").await.unwrap();
+    let blocked = breaker::begin(&pool, "alternate").await.unwrap();
+    assert_eq!(
+        blocked.skipped_reason.as_deref(),
+        Some("recent_provider_failure")
+    );
+    let unblock = "UPDATE release_fingerprint_provider_state SET blocked_until = TIMESTAMPADD(SECOND, -1, UTC_TIMESTAMP(6)) WHERE provider = 'alternate'";
+    sqlx::query(unblock).execute(&pool).await.unwrap();
+    let old_probe = breaker::begin(&pool, "alternate").await.unwrap();
+    assert!(old_probe.skipped_reason.is_none());
+    let competing = breaker::begin(&pool, "alternate").await.unwrap();
+    assert_eq!(
+        competing.skipped_reason.as_deref(),
+        Some("provider_probe_in_progress")
+    );
+    // A new failure fences the older probe's recovery.
+    breaker::unavailable(&pool, "alternate").await.unwrap();
+    breaker::reachable(&pool, "alternate", &old_probe)
+        .await
+        .unwrap();
+    let still = breaker::begin(&pool, "alternate").await.unwrap();
+    assert_eq!(
+        still.skipped_reason.as_deref(),
+        Some("recent_provider_failure")
+    );
+    sqlx::query(unblock).execute(&pool).await.unwrap();
+    let current = breaker::begin(&pool, "alternate").await.unwrap();
+    breaker::reachable(&pool, "alternate", &current)
+        .await
+        .unwrap();
+    let generation: Option<String> = sqlx::query_scalar(
+        "SELECT generation FROM release_fingerprint_provider_state WHERE provider = 'alternate'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(generation.is_none());
 }

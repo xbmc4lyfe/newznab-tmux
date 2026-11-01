@@ -22,8 +22,32 @@ use crate::config::{Provider, TlsOptions};
 pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> Io for T {}
 
+/// Counts one established connection in `nntmux_nntp_connections` while it's alive. Prometheus
+/// sums the gauge across roles, as the capacity rule did with the indexer's sockets.
+struct Established {
+    server: &'static str,
+}
+
+impl Established {
+    fn new(server: &'static str) -> Self {
+        connections_gauge(server).increment(1.0);
+        Self { server }
+    }
+}
+
+impl Drop for Established {
+    fn drop(&mut self) {
+        connections_gauge(self.server).decrement(1.0);
+    }
+}
+
+fn connections_gauge(server: &'static str) -> metrics::Gauge {
+    metrics::gauge!("nntmux_nntp_connections", "server" => server, "state" => "active")
+}
+
 pub(crate) struct Transport {
     io: BufReader<Box<dyn Io>>,
+    _established: Established,
     pub(crate) read_timeout: Duration,
     pub(crate) timed_out: bool,
 }
@@ -33,6 +57,7 @@ impl Transport {
         provider: &Provider,
         options: &TlsOptions,
         connect_timeout: Duration,
+        alternate: bool,
     ) -> Result<Self, String> {
         let address = format!("{}:{}", provider.host, provider.port);
         let stream = timeout(connect_timeout, TcpStream::connect(&address))
@@ -55,6 +80,7 @@ impl Transport {
         };
         Ok(Self {
             io: BufReader::with_capacity(65_536, io),
+            _established: Established::new(if alternate { "alternate" } else { "primary" }),
             read_timeout: provider.socket_timeout,
             timed_out: false,
         })
@@ -338,4 +364,25 @@ fn der_element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     };
     let end = header.checked_add(length)?;
     Some((tag, input.get(header..end)?, input.get(end..)?))
+}
+
+#[cfg(test)]
+mod gauge_tests {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    use super::Established;
+
+    #[test]
+    fn a_connection_counts_until_it_is_dropped() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let first = Established::new("primary");
+            let _second = Established::new("primary");
+            let sample = r#"nntmux_nntp_connections{server="primary",state="active"}"#;
+            assert!(handle.render().contains(&format!("{sample} 2")));
+            drop(first);
+            assert!(handle.render().contains(&format!("{sample} 1")));
+        });
+    }
 }
