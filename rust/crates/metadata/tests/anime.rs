@@ -175,6 +175,35 @@ async fn an_update_keeps_what_anilist_left_empty() {
 }
 
 #[tokio::test]
+async fn a_rate_limit_leaves_releases_to_retry() {
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
+    let db = &h.db.pool;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&h.mock)
+        .await;
+    let first = insert_release_in(db, "[A] One - 01", GUID, TV_ANIME).await;
+    let second = insert_release_in(
+        db,
+        "[A] Two - 01",
+        "a0000000000000000000000000000002",
+        TV_ANIME,
+    )
+    .await;
+    let settings = MetadataSettings::default();
+    let outcome = AnimeLookup::new(h.services.clone())
+        .process(&settings, 0, "")
+        .await;
+    assert!(outcome.is_err());
+    assert_eq!(anidbid(db, first).await, None);
+    assert_eq!(anidbid(db, second).await, None);
+    h.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_rate_limit_stops_the_refresh() {
     let Some(h) = harness(Keys::default()).await else {
         return;

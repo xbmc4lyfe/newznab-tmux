@@ -13,6 +13,7 @@ use sqlx::Row;
 use tracing::{error, info, warn};
 
 use crate::candidates::{SETTLED, release_scope};
+use crate::clients::anilist::is_rate_limited;
 use crate::images::Profile;
 use crate::php;
 use crate::services::Services;
@@ -312,6 +313,8 @@ impl AnimeLookup {
                 Ok(Some(row))
             }
             Ok(None) => Ok(None),
+            // A miss would be stored and never retried, so a rate limit stops the batch instead.
+            Err(failure) if is_rate_limited(&failure) => Err(failure),
             Err(failure) => {
                 error!(error = format!("{failure:#}"), "AniList search failed");
                 Ok(None)

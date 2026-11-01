@@ -16,6 +16,12 @@ const RATE_LIMIT_PER_MINUTE: usize = 20;
 const WINDOW: Duration = Duration::from_secs(60);
 const PAUSE_AFTER_429: Duration = Duration::from_secs(15 * 60);
 
+/// Whether a failure came from AniList's rate limit, so the caller should stop rather than treat
+/// the lookup as a miss.
+pub fn is_rate_limited(failure: &anyhow::Error) -> bool {
+    format!("{failure:#}").contains("rate limit exceeded")
+}
+
 const FIELDS: &str = "id idMal title { romaji english native } type format status countryOfOrigin \
     episodes duration source popularity favourites startDate { year month day } \
     endDate { year month day } description averageScore hashtag coverImage { large } genres \
