@@ -2,6 +2,15 @@
 //!
 //! Owner: ws-naming. See `rust/WORKSTREAMS.md`.
 
+pub mod checkers;
+pub mod compat;
+pub mod donor;
+pub mod extractors;
+pub mod file_prioritizer;
+pub mod identity_key;
+pub mod predb_constrained;
+pub mod result;
+
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
