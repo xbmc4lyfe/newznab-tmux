@@ -9,6 +9,8 @@ use nntmux_verify::manifest;
 use nntmux_verify::prepare;
 use support::Harness;
 
+type CandidateSummary = (u64, String, Option<u64>, Option<u64>, String);
+
 #[tokio::test]
 async fn archiving_moves_headers_into_a_ready_candidate() -> Result<()> {
     let Some(harness) = Harness::start().await? else {
@@ -197,7 +199,7 @@ async fn late_articles_for_a_published_partial_start_an_upgrading_generation() -
     let late = harness.collection("ab", 1, &[("f1", 2, &[2])], 3).await?;
     candidates::archive(&harness.verify, late).await?;
 
-    let rows: Vec<(u64, String, Option<u64>, Option<u64>, String)> = sqlx::query_as(
+    let rows: Vec<CandidateSummary> = sqlx::query_as(
         "SELECT id, status, release_id, upgrades_release_id, manifest_path FROM release_verification_candidates ORDER BY id",
     )
     .fetch_all(&harness.db())
