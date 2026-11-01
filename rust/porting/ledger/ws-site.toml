@@ -4,7 +4,7 @@
 kind = "route"
 id = "DELETE /invitations/{id}"
 source = "App\\Http\\Controllers\\InvitationController@destroy"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -14,93 +14,87 @@ status = "todo"
 
 [[entry]]
 kind = "route"
-id = "DELETE /profile_delete"
-source = "App\\Http\\Controllers\\ProfileController@destroy"
-status = "todo"
-
-[[entry]]
-kind = "route"
 id = "GET|HEAD /2fa/disable"
 source = "App\\Http\\Controllers\\PasswordSecurityController@showDisable2faForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /2fa/enable"
 source = "App\\Http\\Controllers\\PasswordSecurityController@showEnable2faForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /2fa/verify"
 source = "App\\Http\\Controllers\\PasswordSecurityController@getVerify2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /confirm-password"
 source = "App\\Http\\Controllers\\Auth\\ConfirmPasswordController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /contact-us"
 source = "App\\Http\\Controllers\\ContactUsController@showContactForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /covers/{type}/{filename}"
 source = "App\\Http\\Controllers\\CoverController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /email/verify"
 source = "App\\Http\\Controllers\\Auth\\EmailVerificationController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /email/verify/{id}/{hash}"
 source = "App\\Http\\Controllers\\Auth\\EmailVerificationController@verify"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /forgottenpassword"
 source = "App\\Http\\Controllers\\Auth\\ForgotPasswordController@showLinkRequestForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /invitation/{token}"
 source = "App\\Http\\Controllers\\InvitationController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /invitations"
 source = "App\\Http\\Controllers\\InvitationController@index"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /invitations/create"
 source = "App\\Http\\Controllers\\InvitationController@create"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /invitations/stats"
 source = "App\\Http\\Controllers\\InvitationController@stats"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /login"
 source = "App\\Http\\Controllers\\Auth\\LoginController@showLoginForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -112,79 +106,67 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /password/reset"
 source = "App\\Http\\Controllers\\Auth\\ForgotPasswordController@showLinkRequestForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /password/reset/{token}"
 source = "App\\Http\\Controllers\\Auth\\ResetPasswordController@showResetForm"
-status = "todo"
-
-[[entry]]
-kind = "route"
-id = "GET|HEAD /privacy-center"
-source = "App\\Http\\Controllers\\PrivacyCenterController@index"
-status = "todo"
-
-[[entry]]
-kind = "route"
-id = "GET|HEAD /privacy-center/export/{gdprRequest}/download"
-source = "App\\Http\\Controllers\\PrivacyCenterController@downloadExport"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /profileedit"
 source = "App\\Http\\Controllers\\ProfileController@edit"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /register"
 source = "App\\Http\\Controllers\\Auth\\RegisterController@showRegistrationForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /release-report/check"
 source = "App\\Http\\Controllers\\ReleaseReportController@checkReported"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /release-report/reasons"
 source = "App\\Http\\Controllers\\ReleaseReportController@getReasons"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /resetpassword"
 source = "App\\Http\\Controllers\\Auth\\ResetPasswordController@showLegacyResetForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /status"
 source = "App\\Http\\Controllers\\StatusPageController@showStatusPage"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /up"
 source = "Closure"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /"
 source = "App\\Http\\Controllers\\ContentController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /2fa"
 source = "App\\Http\\Controllers\\PasswordSecurityController@show2faForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -226,55 +208,56 @@ status = "todo"
 kind = "route"
 id = "GET|POST|HEAD /browse/All"
 source = "App\\Http\\Controllers\\BrowseController@index"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /browse/group"
 source = "App\\Http\\Controllers\\BrowseController@group"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /browse/tags"
 source = "App\\Http\\Controllers\\BrowseController@tags"
-status = "todo"
+status = "dropped"
+note = "The route pointed at BrowseController::tags, a method that does not exist, so it could only error."
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /browse/{parentCategory}/{id?}"
 source = "App\\Http\\Controllers\\BrowseController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /browsegroup"
 source = "App\\Http\\Controllers\\BrowseGroupController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /cart/index"
 source = "App\\Http\\Controllers\\CartController@index"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /content"
 source = "App\\Http\\Controllers\\ContentController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /details/{guid}"
 source = "App\\Http\\Controllers\\DetailsController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /failed"
 source = "App\\Http\\Controllers\\FailedReleasesController@failed"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -316,19 +299,19 @@ status = "todo"
 kind = "route"
 id = "GET|POST|HEAD /nfo/{id?}"
 source = "App\\Http\\Controllers\\NfoController@showNfo"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /privacy-policy"
 source = "App\\Http\\Controllers\\PrivacyPolicyController@privacyPolicy"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /profile"
 source = "App\\Http\\Controllers\\ProfileController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -346,7 +329,7 @@ status = "todo"
 kind = "route"
 id = "GET|POST|HEAD /terms-and-conditions"
 source = "App\\Http\\Controllers\\TermsController@terms"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -364,97 +347,97 @@ status = "todo"
 kind = "route"
 id = "POST /2fa"
 source = "App\\Http\\Controllers\\PasswordSecurityController@enable2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /2fa/verify"
 source = "App\\Http\\Controllers\\PasswordSecurityController@verify2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /2faVerify"
 source = "App\\Http\\Controllers\\PasswordSecurityController@verify2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /ajax_profile"
 source = "App\\Http\\Controllers\\AjaxController@profile"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /cart/add"
 source = "App\\Http\\Controllers\\CartController@store"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /cart/delete/{id}"
 source = "App\\Http\\Controllers\\CartController@destroy"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /confirm-password"
 source = "App\\Http\\Controllers\\Auth\\ConfirmPasswordController@store"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /contact-us"
 source = "App\\Http\\Controllers\\ContactUsController@contact"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /disable2fa"
 source = "App\\Http\\Controllers\\PasswordSecurityController@disable2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /email/verification-notification"
 source = "App\\Http\\Controllers\\Auth\\EmailVerificationController@resend"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /forgottenpassword"
 source = "App\\Http\\Controllers\\Auth\\ForgotPasswordController@showLinkRequestForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /generate2faSecret"
 source = "App\\Http\\Controllers\\PasswordSecurityController@generate2faSecret"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /invitations/store"
 source = "App\\Http\\Controllers\\InvitationController@store"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /invitations/{id}/resend"
 source = "App\\Http\\Controllers\\InvitationController@resend"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /login"
 source = "App\\Http\\Controllers\\Auth\\LoginController@login"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /logout"
 source = "App\\Http\\Controllers\\Auth\\LoginController@logout"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -484,76 +467,64 @@ status = "todo"
 kind = "route"
 id = "POST /password/reset"
 source = "App\\Http\\Controllers\\Auth\\ForgotPasswordController@showLinkRequestForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /password/update"
 source = "App\\Http\\Controllers\\Auth\\ResetPasswordController@reset"
-status = "todo"
-
-[[entry]]
-kind = "route"
-id = "POST /privacy-center/erasure"
-source = "App\\Http\\Controllers\\PrivacyCenterController@requestErasure"
-status = "todo"
-
-[[entry]]
-kind = "route"
-id = "POST /privacy-center/export"
-source = "App\\Http\\Controllers\\PrivacyCenterController@requestExport"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /profile-disable2fa"
 source = "App\\Http\\Controllers\\PasswordSecurityController@profileDisable2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /profile-security/disable-2fa"
 source = "App\\Http\\Controllers\\ProfileSecurityController@disable2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /profile/update-theme"
 source = "App\\Http\\Controllers\\ProfileController@updateTheme"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /profileedit"
 source = "App\\Http\\Controllers\\ProfileController@edit"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /profileedit/cancel2fa"
 source = "App\\Http\\Controllers\\PasswordSecurityController@cancelSetup"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /profileedit/disable2fa"
 source = "App\\Http\\Controllers\\PasswordSecurityController@disable2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /profileedit/enable2fa"
 source = "App\\Http\\Controllers\\PasswordSecurityController@enable2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /register"
 source = "App\\Http\\Controllers\\Auth\\RegisterController@register"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /release-report"
 source = "App\\Http\\Controllers\\ReleaseReportController@store"
-status = "todo"
+status = "ported"
