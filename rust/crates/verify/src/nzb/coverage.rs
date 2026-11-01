@@ -22,7 +22,7 @@ pub fn parse_document(contents: &[u8]) -> Option<ParsedNzb> {
     if contents.len() > DECODED_BYTES {
         return None;
     }
-    parse(contents).ok()
+    parse(contents).ok().filter(|nzb| !nzb.declares_entities)
 }
 
 /// The exact article IDs a document requires, or `None` when it isn't a well-formed NZB inventory.
@@ -111,7 +111,14 @@ pub async fn covered_snapshot(
             budget.remaining -= contents.len() as i64;
             contents
         }
-        Ok(None) => return Ok(None),
+        // A row too large to read and a read that failed both spend the allowance. Only a missing
+        // row is free.
+        Ok(None) => {
+            if store::exists(&mut *conn, guid).await? {
+                budget.remaining -= allowance as i64;
+            }
+            return Ok(None);
+        }
         Err(_) => {
             budget.remaining -= allowance as i64;
             return Ok(None);

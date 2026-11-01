@@ -119,3 +119,24 @@ fn coverage_and_fingerprints_match_php() {
         );
     }
 }
+
+#[test]
+fn a_password_in_any_of_several_heads_is_rejected() {
+    let file = r#"<file subject="s (1/1)"><segments><segment number="1" bytes="1">a@x</segment></segments></file>"#;
+    let facts = ReleaseFacts::default();
+    for heads in [
+        r#"<head><meta type="password">x</meta></head><head/>"#,
+        r#"<head/><head><meta type="password">x</meta></head>"#,
+    ] {
+        let document = format!("<nzb>{heads}{file}</nzb>");
+        let failure = read_manifest(document.as_bytes(), &facts).err();
+        assert!(failure.is_some_and(|error| error.is::<PasswordMetadataRejected>()));
+    }
+}
+
+#[test]
+fn a_declared_entity_is_held_for_review() {
+    let document = r#"<!DOCTYPE nzb [<!ENTITY a "b">]><nzb><file subject="s (1/1)"/></nzb>"#;
+    let failure = read_manifest(document.as_bytes(), &ReleaseFacts::default()).err();
+    assert!(failure.is_some_and(|error| error.is::<PasswordMetadataRejected>()));
+}

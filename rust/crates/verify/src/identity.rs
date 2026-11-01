@@ -15,6 +15,19 @@ fn found(regex: &Regex, text: &str) -> bool {
     regex.is_match(text).unwrap_or(false)
 }
 
+/// For a pattern PHP ran without `/u`: its case folding never reached a non-ASCII byte, where this
+/// engine would fold K to the Kelvin sign and s to the long s.
+fn found_ascii(regex: &Regex, text: &str) -> bool {
+    if text.is_ascii() {
+        return found(regex, text);
+    }
+    let masked: String = text
+        .chars()
+        .map(|c| if c.is_ascii() { c } else { '\u{FFFD}' })
+        .collect();
+    found(regex, &masked)
+}
+
 // A single-quoted name may contain apostrophes (O'Brien's, Guns N' Roses, Directors' (2026) Cut): it
 // closes at the first quote followed by a field boundary: the end, yEnc, an (n/m) or [n/m] counter, a
 // dash before another field, or another quote.
@@ -25,7 +38,7 @@ static QUOTED: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"(?i)\A(?:part\d+|vol\d+[+-]\d+|par2|rar|r\d{2,3}|\d{3}|7z|zip|tar|gz|tgz|xz|txz|bz2|tbz2|zst|zstd|lz|lz4|lzma|br|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z",
+        r"(?i)\A(?:part[0-9]+|vol[0-9]+[+-][0-9]+|par2|rar|r[0-9]{2,3}|[0-9]{3}|7z|zip|tar|gz|tgz|xz|txz|bz2|tbz2|zst|zstd|lz|lz4|lzma|br|mkv|avi|mp4|m4v|ts|nfo|sfv|nzb|epub|pdf|flac|mp3|iso|srt|txt|jpg|png)\z",
     )
 });
 static EXECUTABLE: LazyLock<Regex> = LazyLock::new(|| {
@@ -37,7 +50,8 @@ static MARKER: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)(?<![\p{L}\p{M}\p{N}_])yEnc(?![\p{L}\p{M}\p{N}_])"));
 static YENC_AFTER: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)\A\s*(?:(?:\(\d+/\d+\)|\[\d+/\d+\])\s*)?yEnc(?![\p{L}\p{M}\p{N}_])"));
-static COUNTER_BEFORE: LazyLock<Regex> = LazyLock::new(|| re(r"\[\d+/\d+\]\s*+(?:-\s*+)?\z"));
+static COUNTER_BEFORE: LazyLock<Regex> =
+    LazyLock::new(|| re(r"\[[0-9]+/[0-9]+\][ \t\n\x0B\f\r]*+(?:-[ \t\n\x0B\f\r]*+)?\z"));
 static PAR2: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)\.par2\z"));
 static PAYLOAD_EXTENSION: LazyLock<Regex> = LazyLock::new(|| re(r"\.[\p{L}\p{N}]{1,8}\z"));
 static LETTER: LazyLock<Regex> = LazyLock::new(|| re(r"\p{L}"));
@@ -73,7 +87,7 @@ fn extension(name: &str) -> &str {
 fn stem(name: &str) -> &str {
     let mut stem = name;
     while let Some(dot) = stem.rfind('.') {
-        if !found(&SUFFIX, &stem[dot + 1..]) {
+        if !found_ascii(&SUFFIX, &stem[dot + 1..]) {
             break;
         }
         stem = &stem[..dot];
@@ -170,11 +184,11 @@ fn random(name: &str) -> bool {
 }
 
 fn executable(name: &str) -> bool {
-    found(&EXECUTABLE, trimmed(name)) || found(&EXECUTABLE, bare(name))
+    found_ascii(&EXECUTABLE, trimmed(name)) || found_ascii(&EXECUTABLE, bare(name))
 }
 
 pub fn is_par2_filename(name: &str) -> bool {
-    found(&PAR2, trimmed(name)) || found(&PAR2, bare(name))
+    found_ascii(&PAR2, trimmed(name)) || found_ascii(&PAR2, bare(name))
 }
 
 /// Whether a sampled article name is evidence of a source payload: a non-PAR2 name with an extension,
@@ -230,29 +244,35 @@ pub fn matches(subject: &str, actual: &str, is_par2_packet: bool) -> bool {
     if is_par2_packet && parity_class(actual) == Some(Parity::Payload) {
         return false;
     }
-    let quoted_matches: Vec<(usize, usize, String)> = QUOTED
+    // A regex that gives up has no answer. PHP's preg_match_all returned false there, and so does this.
+    let Ok(quoted_matches) = QUOTED
         .captures_iter(subject)
-        .flatten()
         .map(|captures| {
+            let captures = captures?;
             let whole = captures.get(0).expect("group 0 always exists");
             let value = captures
                 .get(1)
                 .or_else(|| captures.get(2))
                 .map_or("", |group| group.as_str());
-            (whole.start(), whole.end(), value.to_owned())
+            Ok((whole.start(), whole.end(), value.to_owned()))
         })
-        .collect();
+        .collect::<Result<Vec<(usize, usize, String)>, fancy_regex::Error>>()
+    else {
+        return false;
+    };
     // One yEnc marker ends the declaration: a second is ambiguous, and quotes after it are metadata.
     // Markers count only outside quoted names, so a filename may contain the word yEnc.
     let mut unquoted = subject.to_owned();
     for (start, end, _) in &quoted_matches {
         unquoted.replace_range(*start..*end, &" ".repeat(end - start));
     }
-    let markers: Vec<usize> = MARKER
+    let Ok(markers) = MARKER
         .find_iter(&unquoted)
-        .flatten()
-        .map(|marker| marker.start())
-        .collect();
+        .map(|marker| marker.map(|found| found.start()))
+        .collect::<Result<Vec<usize>, _>>()
+    else {
+        return false;
+    };
     if markers.len() > 1 {
         return false;
     }
@@ -275,15 +295,23 @@ pub fn matches(subject: &str, actual: &str, is_par2_packet: bool) -> bool {
     for (start, end, value) in &quoted {
         // The filename is the quoted value that yEnc follows, optionally after a counter, else the
         // one after a [n/m] counter.
-        if found(&YENC_AFTER, &subject[*end..]) {
+        let Ok(followed) = YENC_AFTER.is_match(&subject[*end..]) else {
+            return false;
+        };
+        if followed {
             // Two quoted names each marked by yEnc leave the article's filename ambiguous.
             if declared.is_some() {
                 return false;
             }
             declared = Some(value);
         }
-        if after_counter.is_none() && found(&COUNTER_BEFORE, &subject[..*start]) {
-            after_counter = Some(value);
+        if after_counter.is_none() {
+            let Ok(counted) = COUNTER_BEFORE.is_match(&subject[..*start]) else {
+                return false;
+            };
+            if counted {
+                after_counter = Some(value);
+            }
         }
     }
     let last = quoted.last().map_or("", |(_, _, value)| value.as_str());
@@ -319,8 +347,8 @@ pub fn matches(subject: &str, actual: &str, is_par2_packet: bool) -> bool {
         return random(declared)
             || random(actual)
             || bare(actual)
-                .to_lowercase()
-                .starts_with(&token(declared).to_lowercase());
+                .to_ascii_lowercase()
+                .starts_with(&token(declared).to_ascii_lowercase());
     }
     // A readable declared name must agree on its volume and extension chain, and on its final
     // extension when that chain doesn't cover it, as well as its stem.

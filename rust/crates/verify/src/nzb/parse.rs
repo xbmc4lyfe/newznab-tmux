@@ -1,11 +1,11 @@
 //! Reads NZB XML into the elements the app trusts, traversing by namespace URI: an element in a
 //! foreign namespace is never a file, group, segment or head.
 
+use std::borrow::Cow;
+
 use anyhow::{Result, bail};
-use quick_xml::events::attributes::Attributes;
-use quick_xml::events::{BytesStart, Event};
-use quick_xml::name::ResolveResult;
-use quick_xml::{NsReader, XmlVersion};
+use encoding_rs::{Encoding, UTF_16BE, UTF_16LE};
+use roxmltree::{Document, Node, ParsingOptions};
 
 pub const CANONICAL_NAMESPACE: &str = "http://www.newzbin.com/DTD/2003/nzb";
 
@@ -45,271 +45,283 @@ pub struct ParsedMeta {
 pub struct ParsedNzb {
     /// The first `head`'s metadata.
     pub metadata: Vec<ParsedMeta>,
-    /// `head` elements in the document's namespace, and whether a later one held a password.
+    /// `head` elements in the document's namespace, and whether any of them holds a password.
     pub heads: usize,
-    pub password_in_later_head: bool,
+    pub password_in_head: bool,
     pub files: Vec<ParsedFile>,
     /// Root children named `file` in any namespace.
     pub file_elements: usize,
-    /// Whether the document declares a namespace prefix or a doctype.
-    pub has_prefixes: bool,
+    /// Whether the document declares an entity.
+    pub declares_entities: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Level {
-    Other,
-    Root,
-    Head,
-    Meta,
-    LaterMeta,
-    File,
-    Groups,
-    Group,
-    Segments,
-    Segment,
-    Skipped,
+/// libxml's limit without `XML_PARSE_HUGE`.
+const MAX_DEPTH: usize = 256;
+
+fn declares_entities(xml: &str) -> bool {
+    let bytes = xml.as_bytes();
+    bytes.windows(9).any(|window| {
+        window[..8].eq_ignore_ascii_case(b"<!ENTITY") && window[8].is_ascii_whitespace()
+    })
 }
 
-fn attribute(attributes: Attributes<'_>, name: &str) -> Result<String> {
-    for attribute in attributes {
-        let attribute = attribute?;
-        // Attributes in a namespace are other attributes.
-        if attribute.key.as_ref() == name {
-            return Ok(attribute
-                .normalized_value(XmlVersion::Implicit1_0)?
-                .into_owned());
-        }
+/// The encoding an XML declaration names, when the document opens with one.
+fn declared_encoding(xml: &[u8]) -> Option<String> {
+    let rest = xml.strip_prefix(b"<?xml")?;
+    let end = rest.windows(2).position(|pair| pair == b"?>")?;
+    let declaration = std::str::from_utf8(&rest[..end]).ok()?;
+    let (_, value) = declaration.split_once("encoding")?;
+    let value = value.trim_start().strip_prefix('=')?.trim_start();
+    let quote = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    let value = &value[1..];
+    Some(value[..value.find(quote)?].to_owned())
+}
+
+/// The document as text, by its byte order mark or else its XML declaration, as libxml reads it.
+/// Anything invalid in that encoding, or an encoding nothing here knows, is an error.
+fn decoded(xml: &[u8]) -> Result<Cow<'_, str>> {
+    let invalid = || anyhow::anyhow!("Invalid NZB.");
+    let utf16 = match xml {
+        [0xFF, 0xFE, rest @ ..] => Some((UTF_16LE, rest)),
+        [0xFE, 0xFF, rest @ ..] => Some((UTF_16BE, rest)),
+        [0x3C, 0x00, 0x3F, 0x00, ..] => Some((UTF_16LE, xml)),
+        [0x00, 0x3C, 0x00, 0x3F, ..] => Some((UTF_16BE, xml)),
+        _ => None,
+    };
+    if let Some((encoding, rest)) = utf16 {
+        return encoding
+            .decode_without_bom_handling_and_without_replacement(rest)
+            .ok_or_else(invalid);
     }
-    Ok(String::new())
+    if let Some(rest) = xml.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return Ok(Cow::Borrowed(
+            std::str::from_utf8(rest).map_err(|_| invalid())?,
+        ));
+    }
+    let label = declared_encoding(xml).unwrap_or_default();
+    match label.to_ascii_lowercase().as_str() {
+        "" | "utf-8" | "utf8" => Ok(Cow::Borrowed(
+            std::str::from_utf8(xml).map_err(|_| invalid())?,
+        )),
+        // `for_label` gives windows-1252 for this, which reads 0x80 to 0x9F differently.
+        "iso-8859-1" | "iso8859-1" | "latin1" | "latin-1" => {
+            Ok(Cow::Owned(xml.iter().map(|&byte| byte as char).collect()))
+        }
+        "us-ascii" | "ascii" if xml.is_ascii() => Ok(Cow::Borrowed(
+            std::str::from_utf8(xml).map_err(|_| invalid())?,
+        )),
+        other => Encoding::for_label(other.as_bytes())
+            .and_then(|encoding| encoding.decode_without_bom_handling_and_without_replacement(xml))
+            .ok_or_else(invalid),
+    }
 }
 
-/// Parses a document. Malformed XML, an undeclared entity or a non-NZB root is an error.
+/// Parses a document. Anything not well-formed, an undeclared entity or a non-NZB root is an error.
+///
+/// libxml recovers from an undeclared element prefix, and this refuses it, so such a document is
+/// never trusted.
 pub fn parse(xml: &[u8]) -> Result<ParsedNzb> {
-    let Ok(xml) = std::str::from_utf8(xml) else {
+    let text = decoded(xml)?;
+    let options = ParsingOptions {
+        allow_dtd: true,
+        ..ParsingOptions::default()
+    };
+    let Ok(document) = Document::parse_with_options(&text, options) else {
         bail!("Invalid NZB.");
     };
-    let mut reader = NsReader::from_str(xml);
-    reader.config_mut().check_end_names = true;
-    let mut nzb = ParsedNzb::default();
-    let mut namespace = String::new();
-    let mut stack: Vec<Level> = Vec::new();
-    let mut seen_root = false;
-    let mut first_groups = false;
-    let mut first_segments = false;
-    loop {
-        let (resolved, event) = reader.read_resolved_event()?;
-        match event {
-            Event::Start(ref element) | Event::Empty(ref element) => {
-                let empty = matches!(event, Event::Empty(_));
-                let in_namespace = match &resolved {
-                    ResolveResult::Bound(found) => AsRef::<str>::as_ref(found) == namespace,
-                    ResolveResult::Unbound => namespace.is_empty(),
-                    ResolveResult::Unknown(_) => bail!("Invalid NZB."),
-                };
-                if element
-                    .attributes()
-                    .flatten()
-                    .any(|a| a.key.as_ref().starts_with("xmlns:"))
-                {
-                    nzb.has_prefixes = true;
-                }
-                let local = element.local_name();
-                let local: &str = local.as_ref();
-                let level = if !seen_root {
-                    if stack.is_empty() {
-                        if local != "nzb" {
-                            bail!("Invalid NZB.");
-                        }
-                        namespace = match resolved {
-                            ResolveResult::Bound(found) => AsRef::<str>::as_ref(&found).to_owned(),
-                            _ => String::new(),
-                        };
-                        if !namespace.is_empty() && namespace != CANONICAL_NAMESPACE {
-                            bail!("Invalid NZB.");
-                        }
-                        seen_root = true;
-                    }
-                    Level::Root
-                } else {
-                    child_level(
-                        &mut nzb,
-                        element,
-                        stack.last().copied(),
-                        local,
-                        in_namespace,
-                        &mut first_groups,
-                        &mut first_segments,
-                    )?
-                };
-                if !empty {
-                    stack.push(level);
-                }
-            }
-            Event::End(_) => {
-                stack.pop();
-            }
-            Event::Text(text) => {
-                let decoded = text.xml10_content();
-                push_text(&mut nzb, stack.last().copied(), &decoded);
-            }
-            Event::CData(data) => {
-                let decoded = data.xml10_content();
-                push_text(&mut nzb, stack.last().copied(), &decoded);
-            }
-            Event::GeneralRef(reference) => {
-                let decoded = match reference.resolve_char_ref()? {
-                    Some(c) => c.to_string(),
-                    None => {
-                        let name = reference.xml10_content();
-                        match quick_xml::escape::resolve_predefined_entity(&name) {
-                            Some(value) => value.to_owned(),
-                            None => bail!("Invalid NZB."),
-                        }
-                    }
-                };
-                push_text(&mut nzb, stack.last().copied(), &decoded);
-            }
-            Event::DocType(_) => nzb.has_prefixes = true,
-            Event::Eof => break,
-            _ => {}
-        }
-    }
-    if !seen_root || !stack.is_empty() {
+    let root = document.root_element();
+    let namespace = root.tag_name().namespace().unwrap_or("");
+    if root.tag_name().name() != "nzb" || !["", CANONICAL_NAMESPACE].contains(&namespace) {
         bail!("Invalid NZB.");
+    }
+    if too_deep(root) {
+        bail!("Invalid NZB.");
+    }
+    let mut nzb = ParsedNzb {
+        declares_entities: declares_entities(&text),
+        ..ParsedNzb::default()
+    };
+    let named = |node: &Node<'_, '_>, name: &str| {
+        node.tag_name().name() == name && node.tag_name().namespace().unwrap_or("") == namespace
+    };
+    for child in root.children().filter(Node::is_element) {
+        if child.tag_name().name() == "file" {
+            nzb.file_elements += 1;
+        }
+        if named(&child, "head") {
+            nzb.heads += 1;
+            for meta in child.children().filter(|node| named(node, "meta")) {
+                let kind = attribute(meta, "type");
+                nzb.password_in_head |= kind == "password";
+                if nzb.heads == 1 {
+                    nzb.metadata.push(ParsedMeta {
+                        kind: kind.to_owned(),
+                        text: direct_text(meta),
+                        child_elements: element_count(meta),
+                    });
+                }
+            }
+        } else if named(&child, "file") {
+            nzb.files.push(parsed_file(child, &named));
+        }
     }
     Ok(nzb)
 }
 
-fn push_text(nzb: &mut ParsedNzb, level: Option<Level>, text: &str) {
-    match level {
-        Some(Level::Meta) => {
-            if let Some(meta) = nzb.metadata.last_mut() {
-                meta.text.push_str(text);
-            }
-        }
-        Some(Level::Group) => {
-            if let Some(group) = nzb.files.last_mut().and_then(|file| file.groups.last_mut()) {
-                group.push_str(text);
-            }
-        }
-        Some(Level::Segment) => {
-            if let Some(segment) = nzb
-                .files
-                .last_mut()
-                .and_then(|file| file.segments.last_mut())
-            {
-                segment.text.push_str(text);
-            }
-        }
-        _ => {}
+fn parsed_file(file: Node<'_, '_>, named: &impl Fn(&Node<'_, '_>, &str) -> bool) -> ParsedFile {
+    let mut parsed = ParsedFile {
+        subject: attribute(file, "subject").to_owned(),
+        ..ParsedFile::default()
+    };
+    if let Some(groups) = file.children().find(|node| named(node, "groups")) {
+        parsed.groups = groups
+            .children()
+            .filter(|node| named(node, "group"))
+            .map(direct_text)
+            .collect();
     }
+    for container in file
+        .children()
+        .filter(|node| node.is_element() && node.tag_name().name() == "segments")
+    {
+        parsed.segments_containers += 1;
+        parsed.segments_children += element_count(container);
+    }
+    if let Some(segments) = file.children().find(|node| named(node, "segments")) {
+        parsed.segments = segments
+            .children()
+            .filter(|node| named(node, "segment"))
+            .map(|segment| ParsedSegment {
+                number: attribute(segment, "number").to_owned(),
+                bytes: attribute(segment, "bytes").to_owned(),
+                text: direct_text(segment),
+                child_elements: element_count(segment),
+            })
+            .collect();
+    }
+    parsed
 }
 
-#[allow(clippy::too_many_arguments)]
-fn child_level(
-    nzb: &mut ParsedNzb,
-    element: &BytesStart<'_>,
-    parent: Option<Level>,
-    local: &str,
-    in_namespace: bool,
-    first_groups: &mut bool,
-    first_segments: &mut bool,
-) -> Result<Level> {
-    Ok(match parent {
-        Some(Level::Root) => {
-            if local == "file" {
-                nzb.file_elements += 1;
-            }
-            if !in_namespace {
-                Level::Other
-            } else if local == "file" {
-                nzb.files.push(ParsedFile {
-                    subject: attribute(element.attributes(), "subject")?,
-                    ..ParsedFile::default()
-                });
-                *first_groups = true;
-                *first_segments = true;
-                Level::File
-            } else if local == "head" {
-                nzb.heads += 1;
-                Level::Head
-            } else {
-                Level::Other
-            }
+/// Attributes in a namespace are other attributes.
+fn attribute<'a>(node: Node<'a, '_>, name: &str) -> &'a str {
+    node.attributes()
+        .find(|attribute| attribute.namespace().is_none() && attribute.name() == name)
+        .map_or("", |attribute| attribute.value())
+}
+
+fn element_count(node: Node<'_, '_>) -> usize {
+    node.children().filter(Node::is_element).count()
+}
+
+fn direct_text(node: Node<'_, '_>) -> String {
+    node.children()
+        .filter(Node::is_text)
+        .filter_map(|text| text.text())
+        .collect()
+}
+
+fn too_deep(root: Node<'_, '_>) -> bool {
+    let mut pending = vec![(root, 1)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth > MAX_DEPTH {
+            return true;
         }
-        Some(Level::Head) if in_namespace && local == "meta" => {
-            if nzb.heads == 1 {
-                nzb.metadata.push(ParsedMeta {
-                    kind: attribute(element.attributes(), "type")?,
-                    ..ParsedMeta::default()
-                });
-                Level::Meta
-            } else {
-                if attribute(element.attributes(), "type")? == "password" {
-                    nzb.password_in_later_head = true;
-                }
-                Level::LaterMeta
-            }
+        pending.extend(
+            node.children()
+                .filter(Node::is_element)
+                .map(|child| (child, depth + 1)),
+        );
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILE: &str = r#"<file subject="s (1/1)"><groups><group>g</group></groups><segments><segment number="1" bytes="1">a@x</segment></segments></file>"#;
+
+    #[test]
+    fn documents_libxml_refuses_are_refused() {
+        for document in [
+            format!("<nzb>{FILE}</nzb>junk"),
+            format!("<nzb>{FILE}</nzb><nzb/>"),
+            format!(" <?xml version=\"1.0\"?><nzb>{FILE}</nzb>"),
+            r#"<nzb><file poster="a & b" subject="s"/></nzb>"#.to_owned(),
+            r#"<nzb><file subject="a<b (1/1)"/></nzb>"#.to_owned(),
+            format!(r#"<nzb><x a="1" a="2"/>{FILE}</nzb>"#),
+            format!("<nzb>\u{1}{FILE}</nzb>"),
+            format!("<nzb>&#1;{FILE}</nzb>"),
+            format!("<nzb>\0{FILE}</nzb>"),
+            format!(
+                "<nzb>{}{}{FILE}</nzb>",
+                "<a>".repeat(300),
+                "</a>".repeat(300)
+            ),
+        ] {
+            assert!(parse(document.as_bytes()).is_err(), "{document}");
         }
-        Some(Level::Meta) => {
-            if let Some(meta) = nzb.metadata.last_mut() {
-                meta.child_elements += 1;
-            }
-            Level::Skipped
+    }
+
+    #[test]
+    fn segments_in_a_foreign_container_are_never_trusted() -> Result<()> {
+        let foreign = r#"<o:segments><segment number="1" bytes="1">evil@x</segment></o:segments>"#;
+        let alone =
+            format!(r#"<nzb xmlns:o="urn:o"><file subject="s (1/1)">{foreign}</file></nzb>"#);
+        let parsed = parse(alone.as_bytes())?;
+        assert!(parsed.files[0].segments.is_empty());
+        assert_eq!(parsed.files[0].segments_containers, 1);
+
+        let real = r#"<segments><segment number="2" bytes="1">a@x</segment></segments>"#;
+        for inner in [format!("{foreign}{real}"), format!("{real}{foreign}")] {
+            let beside =
+                format!(r#"<nzb xmlns:o="urn:o"><file subject="s (1/1)">{inner}</file></nzb>"#);
+            let parsed = parse(beside.as_bytes())?;
+            let texts: Vec<&str> = parsed.files[0]
+                .segments
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect();
+            assert_eq!(texts, ["a@x"]);
+            assert_eq!(parsed.files[0].segments_containers, 2);
         }
-        Some(Level::File) => {
-            let file = nzb.files.last_mut().expect("a file level has its file");
-            if local == "segments" {
-                file.segments_containers += 1;
-            }
-            if !in_namespace {
-                if local == "segments" {
-                    Level::Segments
-                } else {
-                    Level::Other
-                }
-            } else if local == "groups" && std::mem::take(first_groups) {
-                Level::Groups
-            } else if local == "segments" && std::mem::take(first_segments) {
-                Level::Segments
-            } else if local == "segments" {
-                Level::Skipped
-            } else {
-                Level::Other
-            }
+        Ok(())
+    }
+
+    #[test]
+    fn the_encoding_comes_from_the_document() -> Result<()> {
+        let latin1 = b"<?xml version=\"1.0\" encoding=\"iso-8859-1\"?><nzb><file subject=\"caf\xE9\"/></nzb>";
+        assert_eq!(parse(latin1)?.files[0].subject, "caf\u{e9}");
+        let doubled = b"<?xml version=\"1.0\" encoding=\"iso-8859-1\"?><nzb><file subject=\"caf\xC3\xA9\"/></nzb>";
+        assert_eq!(parse(doubled)?.files[0].subject, "caf\u{c3}\u{a9}");
+
+        let text =
+            "<?xml version=\"1.0\" encoding=\"utf-16\"?><nzb><file subject=\"caf\u{e9}\"/></nzb>";
+        let little: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let big: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        for document in [
+            [&[0xFF, 0xFE], little.as_slice()].concat(),
+            [&[0xFE, 0xFF], big.as_slice()].concat(),
+            little,
+            big,
+        ] {
+            assert_eq!(parse(&document)?.files[0].subject, "caf\u{e9}");
         }
-        Some(Level::Groups) if in_namespace && local == "group" => {
-            nzb.files
-                .last_mut()
-                .expect("groups has its file")
-                .groups
-                .push(String::new());
-            Level::Group
-        }
-        Some(Level::Segments) => {
-            let file = nzb.files.last_mut().expect("segments has its file");
-            file.segments_children += 1;
-            if in_namespace && local == "segment" {
-                file.segments.push(ParsedSegment {
-                    number: attribute(element.attributes(), "number")?,
-                    bytes: attribute(element.attributes(), "bytes")?,
-                    ..ParsedSegment::default()
-                });
-                Level::Segment
-            } else {
-                Level::Other
-            }
-        }
-        Some(Level::Segment) => {
-            if let Some(segment) = nzb
-                .files
-                .last_mut()
-                .and_then(|file| file.segments.last_mut())
-            {
-                segment.child_elements += 1;
-            }
-            Level::Skipped
-        }
-        _ => Level::Other,
-    })
+
+        assert!(parse(b"<nzb><file subject=\"caf\xE9\"/></nzb>").is_err());
+        assert!(parse(b"<?xml version=\"1.0\" encoding=\"no-such\"?><nzb/>").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn namespaced_attributes_are_other_attributes() -> Result<()> {
+        let document = r#"<nzb xmlns:o="urn:o"><file o:subject="z" subject="s"/></nzb>"#;
+        assert_eq!(parse(document.as_bytes())?.files[0].subject, "s");
+        let document =
+            r#"<nzb xmlns:o="urn:o"><head><meta o:type="password">x</meta></head></nzb>"#;
+        let parsed = parse(document.as_bytes())?;
+        assert!(!parsed.password_in_head);
+        assert_eq!(parsed.metadata[0].kind, "");
+        Ok(())
+    }
 }

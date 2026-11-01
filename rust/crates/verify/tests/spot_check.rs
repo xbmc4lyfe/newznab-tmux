@@ -263,3 +263,31 @@ async fn a_rejected_inventory_never_fetches() {
     let result = spot_check::verify(&FakeSource::default(), &options(), &manifest, true).await;
     assert!(result.header_rejected);
 }
+
+#[test]
+fn a_regex_that_gives_up_rejects_rather_than_falling_through() {
+    let junk = "' .".repeat(800);
+    let executable = format!(r#"{junk} "real.mkv" "body.exe" "x.mkv" yEnc"#);
+    assert!(!nntmux_verify::identity::matches(
+        &executable,
+        "body.exe",
+        false
+    ));
+    let parity = format!(r#"{junk} "real.par2" "body.mkv" "x.par2" yEnc"#);
+    assert!(!nntmux_verify::identity::matches(
+        &parity, "body.mkv", false
+    ));
+}
+
+#[test]
+fn byte_patterns_stay_ascii() {
+    use nntmux_verify::identity::matches;
+    assert!(matches("\"Show.١٢٣.mkv\"", "Show ١٢٣.mkv", false));
+    assert!(!matches("\"Movie.\u{212A}o\"", "movie.ko", false));
+    assert!(!matches("[1/2]\u{A0}\"a.mkv\" \"b.par2\"", "a.mkv", false));
+    assert!(!matches(
+        "\"Kq9bbbbbbbbbb.mkv\"",
+        "\u{212A}q9bbbbbbbbbb.mkv",
+        false
+    ));
+}

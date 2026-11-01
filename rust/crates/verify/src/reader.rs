@@ -64,7 +64,8 @@ static PART_COUNTER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\([0-9]+/([0-9]+)\)[ \t\n\x0B\f\r]*$").expect("valid"));
 static COUNT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[1-9][0-9]{0,6}$").expect("valid"));
 
-/// PHP's `(int)` of a numeric-leading string, saturating as it does.
+/// PHP's `(int)` of a numeric-leading string: saturating for a plain integer, and through a float
+/// for one with an exponent, whose fraction truncates and whose overflow gives 0.
 fn php_int(value: &str) -> i64 {
     let trimmed = value.trim_start_matches([' ', '\t', '\n', '\r', '\x0B', '\x0C']);
     let (negative, digits) = match trimmed.strip_prefix('-') {
@@ -72,10 +73,31 @@ fn php_int(value: &str) -> i64 {
         None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
     };
     let end = digits.bytes().take_while(u8::is_ascii_digit).count();
-    let magnitude = digits[..end]
-        .parse::<i64>()
-        .unwrap_or(if end == 0 { 0 } else { i64::MAX });
-    if negative { -magnitude } else { magnitude }
+    if end > 0 && digits[end..].starts_with(['e', 'E']) {
+        let rest = &digits[end + 1..];
+        let sign = usize::from(rest.starts_with(['-', '+']));
+        let exponent = rest[sign..].bytes().take_while(u8::is_ascii_digit).count();
+        if exponent > 0 {
+            let float: f64 = digits[..end + 1 + sign + exponent]
+                .parse()
+                .unwrap_or(f64::INFINITY);
+            let float = if negative { -float } else { float };
+            return if float.abs() < 9.2e18 {
+                float as i64
+            } else {
+                0
+            };
+        }
+    }
+    if negative {
+        format!("-{}", &digits[..end])
+            .parse::<i64>()
+            .unwrap_or(if end == 0 { 0 } else { i64::MIN })
+    } else {
+        digits[..end]
+            .parse::<i64>()
+            .unwrap_or(if end == 0 { 0 } else { i64::MAX })
+    }
 }
 
 /// Reads an NZB as a manifest. `Err` with [`PasswordMetadataRejected`] when its password metadata
@@ -85,7 +107,9 @@ pub fn read_manifest(xml: &[u8], facts: &ReleaseFacts) -> Result<Manifest> {
         bail!("NZB exceeds audit metadata budget.");
     }
     let document = parse(xml)?;
-    if document.password_in_later_head && document.heads > 1 {
+    // PHP rejected an entity reference where metadata lives, and read one elsewhere. A declared
+    // entity has no honest use in an NZB, so any declaration is held for review.
+    if document.declares_entities || (document.password_in_head && document.heads > 1) {
         return Err(PasswordMetadataRejected("Invalid NZB password metadata structure.").into());
     }
     let mut passwords = Vec::new();
@@ -124,7 +148,7 @@ pub fn read_manifest(xml: &[u8], facts: &ReleaseFacts) -> Result<Manifest> {
         expected = expected.max(declared_file_count(&file.subject));
         let declared = PART_COUNTER
             .captures(&file.subject)
-            .and_then(|captures| captures[1].parse::<i64>().ok());
+            .map(|captures| captures[1].parse::<i64>().unwrap_or(i64::MAX));
         let mut observed = 0;
         let mut numbers = HashSet::new();
         let mut segments = Vec::with_capacity(file.segments.len());
