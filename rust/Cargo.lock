@@ -2598,6 +2598,7 @@ dependencies = [
  "hex",
  "nntmux-categorize",
  "nntmux-core",
+ "nntmux-nntp",
  "nntmux-predb",
  "nntmux-runtime",
  "nntmux-testkit",

@@ -667,17 +667,8 @@ pub struct RoleSettings {
 impl RoleSettings {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            scheduled: parsed_or::<String>("RELEASE_VERIFICATION_SCHEDULED", "true".to_owned())
-                .is_ok_and(|value| {
-                    matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "(true)")
-                }),
-            worker_only: parsed_or::<String>(
-                "RELEASE_VERIFICATION_WORKER_ONLY",
-                "false".to_owned(),
-            )
-            .is_ok_and(|value| {
-                matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "(true)")
-            }),
+            scheduled: flag("RELEASE_VERIFICATION_SCHEDULED", "true"),
+            worker_only: flag("RELEASE_VERIFICATION_WORKER_ONLY", "false"),
             worker_limit: parsed_or("RELEASE_VERIFICATION_WORKER_LIMIT", 1000)?,
             worker_seconds: parsed_or("RELEASE_VERIFICATION_WORKER_SECONDS", 300)?,
         })

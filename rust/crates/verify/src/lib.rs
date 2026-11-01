@@ -28,7 +28,7 @@ pub mod spot_check;
 pub mod txn;
 pub mod worker;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Subcommand;
 use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
 
