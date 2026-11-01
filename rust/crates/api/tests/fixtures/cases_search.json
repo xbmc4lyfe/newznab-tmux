@@ -325,5 +325,13 @@
  {
   "name": "suggest_assist",
   "path": "/api/search/assist?q=Mov"
+ },
+ {
+  "name": "v1_tv_tmdb",
+  "path": "/api/v1/api?t=tvsearch&tmdbid=71&apikey=tokenposter"
+ },
+ {
+  "name": "v2_tv_trakt",
+  "path": "/api/v2/tv?api_token=tokenposter&traktid=72"
  }
 ]

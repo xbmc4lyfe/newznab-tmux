@@ -920,14 +920,14 @@ impl TvIds {
         self.imdb.chars().filter(char::is_ascii_digit).collect()
     }
 
+    /// What the index can answer for a show. Its `tmdbid` and `traktid` are movie attributes, so a
+    /// show's TMDB or Trakt id could hit a movie and hide the show; those go to SQL through
+    /// `site_sql` instead.
     fn external(&self) -> Vec<ExternalId> {
         let mut external = Vec::new();
         let number = |value: &str| Some(php_int(value)).filter(|id| *id > 0);
         if let Some(id) = number(&self.tvdb) {
             external.push(ExternalId::Tvdb(id));
-        }
-        if let Some(id) = number(&self.trakt) {
-            external.push(ExternalId::TraktId(id));
         }
         if let Some(id) = number(&self.tvrage) {
             external.push(ExternalId::Tvrage(id));
@@ -937,9 +937,6 @@ impl TvIds {
         }
         if imdb_id_is_valid(&self.imdb) {
             external.push(ExternalId::ImdbId(self.imdb_digits()));
-        }
-        if let Some(id) = number(&self.tmdb) {
-            external.push(ExternalId::TmdbId(id));
         }
         external
     }
@@ -1506,6 +1503,17 @@ mod tests {
     #[test]
     fn quoting_escapes_like_pdo() {
         assert_eq!(quote("a'b\\c"), "'a\\'b\\\\c'");
+    }
+
+    #[test]
+    fn show_tmdb_and_trakt_ids_skip_the_movie_attributes() {
+        let ids = TvIds {
+            tmdb: "71".to_owned(),
+            trakt: "72".to_owned(),
+            ..TvIds::default()
+        };
+        assert!(ids.external().is_empty());
+        assert_eq!(ids.site_sql(), ["v.trakt = 72", "v.tmdb = 71"]);
     }
 
     #[test]

@@ -2215,7 +2215,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:12 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:10 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
    "audit": [
     "/api/v2/search?id=Movie"
    ]
@@ -2256,7 +2256,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":7,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:12 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Partial.Release.2026-GRP\",\"guid\":\"8888000000000000000000000000000000000008\",\"details\":\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\",\"url\":\"http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 08 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Fri, 08 May 2026 10:00:00 +0000\",\"articles_found\":80,\"articles_expected\":100,\"files_found\":8,\"files_expected\":10,\"imdbid\":null,\"tmdbid\":null,\"traktid\":null},{\"title\":\"Adult.Release.XXX-GRP\",\"guid\":\"7777000000000000000000000000000000000007\",\"details\":\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\",\"url\":\"http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&r=tokenposter\",\"category\":6040,\"category_name\":\"XXX > x264\",\"added\":\"Thu, 07 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Thu, 07 May 2026 10:00:00 +0000\"},{\"title\":\"An.Anime.E01.1080p-GRP\",\"guid\":\"ffff000000000000000000000000000000000006\",\"details\":\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\",\"url\":\"http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&r=tokenposter\",\"category\":5070,\"category_name\":\"TV > Anime\",\"added\":\"Wed, 06 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Wed, 06 May 2026 10:00:00 +0000\",\"imdbid\":null,\"tmdbid\":null,\"traktid\":null,\"episode_title\":\"\",\"season\":0,\"episode\":0,\"tvairdate\":null,\"tvdbid\":null,\"tvrageid\":null,\"tvmazeid\":null},{\"title\":\"An.Author-A.Book.EPUB\",\"guid\":\"eeee000000000000000000000000000000000005\",\"details\":\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\",\"url\":\"http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&r=tokenposter\",\"category\":7020,\"category_name\":\"Books > Ebook\",\"added\":\"Tue, 05 May 2026 12:00:00 +0000\",\"size\":1048576,\"files\":1,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Tue, 05 May 2026 10:00:00 +0000\"},{\"title\":\"A.Game.PS4-GRP\",\"guid\":\"dddd000000000000000000000000000000000004\",\"details\":\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\",\"url\":\"http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&r=tokenposter\",\"category\":1180,\"category_name\":\"Console > PS4\",\"added\":\"Mon, 04 May 2026 12:00:00 +0000\",\"size\":21474836480,\"files\":90,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Mon, 04 May 2026 10:00:00 +0000\"},{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"The Episode\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04 00:00:00\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74},{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
+   "body": "{\"Total\":7,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:10 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Partial.Release.2026-GRP\",\"guid\":\"8888000000000000000000000000000000000008\",\"details\":\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\",\"url\":\"http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 08 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Fri, 08 May 2026 10:00:00 +0000\",\"articles_found\":80,\"articles_expected\":100,\"files_found\":8,\"files_expected\":10,\"imdbid\":null,\"tmdbid\":null,\"traktid\":null},{\"title\":\"Adult.Release.XXX-GRP\",\"guid\":\"7777000000000000000000000000000000000007\",\"details\":\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\",\"url\":\"http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&r=tokenposter\",\"category\":6040,\"category_name\":\"XXX > x264\",\"added\":\"Thu, 07 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Thu, 07 May 2026 10:00:00 +0000\"},{\"title\":\"An.Anime.E01.1080p-GRP\",\"guid\":\"ffff000000000000000000000000000000000006\",\"details\":\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\",\"url\":\"http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&r=tokenposter\",\"category\":5070,\"category_name\":\"TV > Anime\",\"added\":\"Wed, 06 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Wed, 06 May 2026 10:00:00 +0000\",\"imdbid\":null,\"tmdbid\":null,\"traktid\":null,\"episode_title\":\"\",\"season\":0,\"episode\":0,\"tvairdate\":null,\"tvdbid\":null,\"tvrageid\":null,\"tvmazeid\":null},{\"title\":\"An.Author-A.Book.EPUB\",\"guid\":\"eeee000000000000000000000000000000000005\",\"details\":\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\",\"url\":\"http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&r=tokenposter\",\"category\":7020,\"category_name\":\"Books > Ebook\",\"added\":\"Tue, 05 May 2026 12:00:00 +0000\",\"size\":1048576,\"files\":1,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Tue, 05 May 2026 10:00:00 +0000\"},{\"title\":\"A.Game.PS4-GRP\",\"guid\":\"dddd000000000000000000000000000000000004\",\"details\":\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\",\"url\":\"http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&r=tokenposter\",\"category\":1180,\"category_name\":\"Console > PS4\",\"added\":\"Mon, 04 May 2026 12:00:00 +0000\",\"size\":21474836480,\"files\":90,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Mon, 04 May 2026 10:00:00 +0000\"},{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"The Episode\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04 00:00:00\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74},{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
    "audit": [
     "/api/v2/search"
    ]
@@ -2297,7 +2297,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":7,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:13 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Partial.Release.2026-GRP\",\"guid\":\"8888000000000000000000000000000000000008\",\"details\":\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\",\"url\":\"http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 08 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Fri, 08 May 2026 10:00:00 +0000\",\"articles_found\":80,\"articles_expected\":100,\"files_found\":8,\"files_expected\":10,\"imdbid\":null,\"tmdbid\":null,\"traktid\":null},{\"title\":\"Adult.Release.XXX-GRP\",\"guid\":\"7777000000000000000000000000000000000007\",\"details\":\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\",\"url\":\"http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&r=tokenposter\",\"category\":6040,\"category_name\":\"XXX > x264\",\"added\":\"Thu, 07 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Thu, 07 May 2026 10:00:00 +0000\"},{\"title\":\"An.Anime.E01.1080p-GRP\",\"guid\":\"ffff000000000000000000000000000000000006\",\"details\":\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\",\"url\":\"http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&r=tokenposter\",\"category\":5070,\"category_name\":\"TV > Anime\",\"added\":\"Wed, 06 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Wed, 06 May 2026 10:00:00 +0000\",\"imdbid\":null,\"tmdbid\":null,\"traktid\":null,\"episode_title\":\"\",\"season\":0,\"episode\":0,\"tvairdate\":null,\"tvdbid\":null,\"tvrageid\":null,\"tvmazeid\":null},{\"title\":\"An.Author-A.Book.EPUB\",\"guid\":\"eeee000000000000000000000000000000000005\",\"details\":\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\",\"url\":\"http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&r=tokenposter\",\"category\":7020,\"category_name\":\"Books > Ebook\",\"added\":\"Tue, 05 May 2026 12:00:00 +0000\",\"size\":1048576,\"files\":1,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Tue, 05 May 2026 10:00:00 +0000\"},{\"title\":\"A.Game.PS4-GRP\",\"guid\":\"dddd000000000000000000000000000000000004\",\"details\":\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\",\"url\":\"http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&r=tokenposter\",\"category\":1180,\"category_name\":\"Console > PS4\",\"added\":\"Mon, 04 May 2026 12:00:00 +0000\",\"size\":21474836480,\"files\":90,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Mon, 04 May 2026 10:00:00 +0000\"},{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"The Episode\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04 00:00:00\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74},{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
+   "body": "{\"Total\":7,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:12 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Partial.Release.2026-GRP\",\"guid\":\"8888000000000000000000000000000000000008\",\"details\":\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\",\"url\":\"http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 08 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Fri, 08 May 2026 10:00:00 +0000\",\"articles_found\":80,\"articles_expected\":100,\"files_found\":8,\"files_expected\":10,\"imdbid\":null,\"tmdbid\":null,\"traktid\":null},{\"title\":\"Adult.Release.XXX-GRP\",\"guid\":\"7777000000000000000000000000000000000007\",\"details\":\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\",\"url\":\"http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&r=tokenposter\",\"category\":6040,\"category_name\":\"XXX > x264\",\"added\":\"Thu, 07 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Thu, 07 May 2026 10:00:00 +0000\"},{\"title\":\"An.Anime.E01.1080p-GRP\",\"guid\":\"ffff000000000000000000000000000000000006\",\"details\":\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\",\"url\":\"http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&r=tokenposter\",\"category\":5070,\"category_name\":\"TV > Anime\",\"added\":\"Wed, 06 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Wed, 06 May 2026 10:00:00 +0000\",\"imdbid\":null,\"tmdbid\":null,\"traktid\":null,\"episode_title\":\"\",\"season\":0,\"episode\":0,\"tvairdate\":null,\"tvdbid\":null,\"tvrageid\":null,\"tvmazeid\":null},{\"title\":\"An.Author-A.Book.EPUB\",\"guid\":\"eeee000000000000000000000000000000000005\",\"details\":\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\",\"url\":\"http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&r=tokenposter\",\"category\":7020,\"category_name\":\"Books > Ebook\",\"added\":\"Tue, 05 May 2026 12:00:00 +0000\",\"size\":1048576,\"files\":1,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Tue, 05 May 2026 10:00:00 +0000\"},{\"title\":\"A.Game.PS4-GRP\",\"guid\":\"dddd000000000000000000000000000000000004\",\"details\":\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\",\"url\":\"http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&r=tokenposter\",\"category\":1180,\"category_name\":\"Console > PS4\",\"added\":\"Mon, 04 May 2026 12:00:00 +0000\",\"size\":21474836480,\"files\":90,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Mon, 04 May 2026 10:00:00 +0000\"},{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"The Episode\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04 00:00:00\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74},{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
    "audit": [
     "/api/v2/search?id="
    ]
@@ -2338,7 +2338,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":6,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:13 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Partial.Release.2026-GRP\",\"guid\":\"8888000000000000000000000000000000000008\",\"details\":\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\",\"url\":\"http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 08 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Fri, 08 May 2026 10:00:00 +0000\",\"articles_found\":80,\"articles_expected\":100,\"files_found\":8,\"files_expected\":10,\"imdbid\":null,\"tmdbid\":null,\"traktid\":null},{\"title\":\"Adult.Release.XXX-GRP\",\"guid\":\"7777000000000000000000000000000000000007\",\"details\":\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\",\"url\":\"http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&r=tokenposter\",\"category\":6040,\"category_name\":\"XXX > x264\",\"added\":\"Thu, 07 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Thu, 07 May 2026 10:00:00 +0000\"}],\"pagination\":{\"next_cursor\":\"eyJpdiI6Ik1jbjFJcmlBRStiV1lDcDRKMDgyeVE9PSIsInZhbHVlIjoiUDBWMFA4WGY4M1hGT1V5RzU2NVQ5c1c2YkZxakIyTEJibC94aFcyTXdtRFg0cXkzVm5vekk5N0MyUkJCbENUZlY1cVREL1lrL0RzVU5NMExDSUNWcjBKaWs4T05wNHc4UjF5RmtxYXdmbTM4NklwWVpYQzBIYkE0dWNQUTBobjZSZHFsY2lhYS9xSjVRNXYyK2w4YnRvRUxXZDNvMGxDV3FZbWczQnhnc3NRTkc5WFBKSjBpMGV6Qm5iQ0V2VXp6OFg1UVZ1MzNmY2luUzNmWGYrbHRWZz09IiwibWFjIjoiNzIyMTMwN2Q2MTZlM2E0NjRhZTI1MmMwMWFjOGZmY2IwNWFiNGY0M2YzMGYyZThkMDg3NjViZGU2YzdkOTdjMyIsInRhZyI6IiJ9\",\"has_more\":true}}",
+   "body": "{\"Total\":6,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:13 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Partial.Release.2026-GRP\",\"guid\":\"8888000000000000000000000000000000000008\",\"details\":\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\",\"url\":\"http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 08 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Fri, 08 May 2026 10:00:00 +0000\",\"articles_found\":80,\"articles_expected\":100,\"files_found\":8,\"files_expected\":10,\"imdbid\":null,\"tmdbid\":null,\"traktid\":null},{\"title\":\"Adult.Release.XXX-GRP\",\"guid\":\"7777000000000000000000000000000000000007\",\"details\":\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\",\"url\":\"http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&r=tokenposter\",\"category\":6040,\"category_name\":\"XXX > x264\",\"added\":\"Thu, 07 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Thu, 07 May 2026 10:00:00 +0000\"}],\"pagination\":{\"next_cursor\":\"eyJpdiI6IlJTR2p2RlREUzRUeXkxc3VrT0kvaGc9PSIsInZhbHVlIjoiYURmZTZ2cnR2YUh4NjNVbFJrL2NKT01FTDg4VmtOOW5UWWJZNDRBMXVST2VYVzlXK3plckh0S2dJZU40bytITEp0THF6bjJFR3JKRHdRanlsajNlK0VZYVZLVnJuNzQ2d0t6ajJxQXc2QURuZlNrVER6bnJPMFFmNWMzUVN5OS80M1ZyaVVlV1FWN0hUY1REVVV4QjkycmJYcWdyd3YvWDl0aFJJblg1TDR6ejA0ZE92YkVXYVI0SUVJUEpMNkJNOTVKVzl1TXNaZlR4RVprekVIZUtyZz09IiwibWFjIjoiN2JhYWY5MDliMTg1N2YxOWZmYzg3MTI4OTdjZmIwOTkwZDliMTBjYzYxOWZiOGY4ZDQ2MGViMGUzNGUwYWI3MyIsInRhZyI6IiJ9\",\"has_more\":true}}",
    "audit": [
     "/api/v2/search?id=GRP&limit=2"
    ]
@@ -2379,7 +2379,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":7,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:13 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Partial.Release.2026-GRP\",\"guid\":\"8888000000000000000000000000000000000008\",\"details\":\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\",\"url\":\"http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 08 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Fri, 08 May 2026 10:00:00 +0000\",\"articles_found\":80,\"articles_expected\":100,\"files_found\":8,\"files_expected\":10,\"imdbid\":null,\"tmdbid\":null,\"traktid\":null},{\"title\":\"Adult.Release.XXX-GRP\",\"guid\":\"7777000000000000000000000000000000000007\",\"details\":\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\",\"url\":\"http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&r=tokenposter\",\"category\":6040,\"category_name\":\"XXX > x264\",\"added\":\"Thu, 07 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Thu, 07 May 2026 10:00:00 +0000\"}],\"pagination\":{\"next_cursor\":\"eyJpdiI6IlFRUmpKQ0pqYXhyZlVldmxOa0tFQUE9PSIsInZhbHVlIjoiTzhFckpocFpYMlZUbGR6NlkyU2tmdUFpTXJBODE4RGg0cVFpeExUeDlTMmtkS3lEUiszSXlsaVJyRDkybUxZWmRyWE12ZW12R3VxV1NzYWg2N0xyU256UHVmZC9sWkhVbFFqcHRndm5hSXV5Z3A5RCtNcm5FdTI1RVlTTy9UUTZ5U0ViTjNqbVlSM2dqUlJFKzloTm9WaXlRbmRxM0NnSFh5Q3pjenZjd1ZzZGFrTERXYStpR0FVN0RHM3pCaXFmSFpzWDJEWFdZN0NoZndQNzNBbzlMdz09IiwibWFjIjoiNWZiMTEyZjQxZjQ1NGJlNjU1MzRmZmRlMGE4NmNiMTQ4MjBjYjZmMmRiYTQ4YWE0ZDU2ODNmNTVkZjk2ZDA5YiIsInRhZyI6IiJ9\",\"has_more\":true}}",
+   "body": "{\"Total\":7,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:14 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Partial.Release.2026-GRP\",\"guid\":\"8888000000000000000000000000000000000008\",\"details\":\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\",\"url\":\"http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 08 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Fri, 08 May 2026 10:00:00 +0000\",\"articles_found\":80,\"articles_expected\":100,\"files_found\":8,\"files_expected\":10,\"imdbid\":null,\"tmdbid\":null,\"traktid\":null},{\"title\":\"Adult.Release.XXX-GRP\",\"guid\":\"7777000000000000000000000000000000000007\",\"details\":\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\",\"url\":\"http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&r=tokenposter\",\"category\":6040,\"category_name\":\"XXX > x264\",\"added\":\"Thu, 07 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Thu, 07 May 2026 10:00:00 +0000\"}],\"pagination\":{\"next_cursor\":\"eyJpdiI6ImdkY25mZ1I1TDlqbFpHa2hzRDlzTFE9PSIsInZhbHVlIjoicWtLT0tnVjVSeGpuTzNLcWxVNGI4S3lkMVVQazBDa09jNmRjL01WekJhN0xoU0JuQ0RJNGpkcmdTcGtmeGFoYk5xUEU2SUZoVllTS2VDVXJJa0x4RjFhWnN4SDZ4SUd6NWxNeVc1b3I5RDhLUGJkMGhmYVlJNE1HMXVKclVXQitzTjVWcjBEaFBkYUpEbldsSFdzZEU3MjZpZ2lKVkt4ZmdESU9OeVNoNWhBblpaK296VEJIZHkxTkZSL1Z5QjcvOWg1MjV3dTlZVEN3V3Y4LzlzSityZz09IiwibWFjIjoiNWU5MDA0MWE5NjNhOGRmZGJjNDdiODlkMTZlZDliOGYwNzcxZjBiNjQwMzgzMTE0ZWIyMTBlZGU3YTE5YjNhOCIsInRhZyI6IiJ9\",\"has_more\":true}}",
    "audit": [
     "/api/v2/search?limit=2"
    ]
@@ -2420,7 +2420,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":6,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:13 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"The Episode\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74},{\"title\":\"Partial.Release.2026-GRP\",\"guid\":\"8888000000000000000000000000000000000008\",\"details\":\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\",\"url\":\"http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 08 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Fri, 08 May 2026 10:00:00 +0000\",\"articles_found\":80,\"articles_expected\":100,\"files_found\":8,\"files_expected\":10,\"imdbid\":null,\"tmdbid\":null,\"traktid\":null},{\"title\":\"An.Anime.E01.1080p-GRP\",\"guid\":\"ffff000000000000000000000000000000000006\",\"details\":\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\",\"url\":\"http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&r=tokenposter\",\"category\":5070,\"category_name\":\"TV > Anime\",\"added\":\"Wed, 06 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Wed, 06 May 2026 10:00:00 +0000\",\"imdbid\":null,\"tmdbid\":null,\"traktid\":null,\"episode_title\":null,\"season\":null,\"episode\":null,\"tvairdate\":null,\"tvdbid\":null,\"tvrageid\":null,\"tvmazeid\":null}]}",
+   "body": "{\"Total\":6,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:14 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"The Episode\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74},{\"title\":\"Partial.Release.2026-GRP\",\"guid\":\"8888000000000000000000000000000000000008\",\"details\":\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\",\"url\":\"http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 08 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Fri, 08 May 2026 10:00:00 +0000\",\"articles_found\":80,\"articles_expected\":100,\"files_found\":8,\"files_expected\":10,\"imdbid\":null,\"tmdbid\":null,\"traktid\":null},{\"title\":\"An.Anime.E01.1080p-GRP\",\"guid\":\"ffff000000000000000000000000000000000006\",\"details\":\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\",\"url\":\"http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&r=tokenposter\",\"category\":5070,\"category_name\":\"TV > Anime\",\"added\":\"Wed, 06 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Wed, 06 May 2026 10:00:00 +0000\",\"imdbid\":null,\"tmdbid\":null,\"traktid\":null,\"episode_title\":null,\"season\":null,\"episode\":null,\"tvairdate\":null,\"tvdbid\":null,\"tvrageid\":null,\"tvmazeid\":null}]}",
    "audit": [
     "/api/v2/search?id=GRP&limit=3&sort=name_desc"
    ]
@@ -2461,7 +2461,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":2,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:14 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Game.PS4-GRP\",\"guid\":\"dddd000000000000000000000000000000000004\",\"details\":\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\",\"url\":\"http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&r=tokenposter\",\"category\":1180,\"category_name\":\"Console > PS4\",\"added\":\"Mon, 04 May 2026 12:00:00 +0000\",\"size\":21474836480,\"files\":90,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Mon, 04 May 2026 10:00:00 +0000\"},{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
+   "body": "{\"Total\":2,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:15 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Game.PS4-GRP\",\"guid\":\"dddd000000000000000000000000000000000004\",\"details\":\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\",\"url\":\"http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&r=tokenposter\",\"category\":1180,\"category_name\":\"Console > PS4\",\"added\":\"Mon, 04 May 2026 12:00:00 +0000\",\"size\":21474836480,\"files\":90,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Mon, 04 May 2026 10:00:00 +0000\"},{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
    "audit": [
     "/api/v2/search?minsize=2000000000"
    ]
@@ -2507,7 +2507,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:15 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:16 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
    "audit": [
     "/api/v2/search?id=Movie"
    ]
@@ -2548,7 +2548,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:15 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:16 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
    "audit": [
     "/api/v2/movies?id=Movie"
    ]
@@ -2589,7 +2589,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:16 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:17 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
    "audit": [
     "/api/v2/movies?imdbid=tt1234567"
    ]
@@ -2630,7 +2630,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:16 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:17 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}]}",
    "audit": [
     "/api/v2/movies?tmdbid=81"
    ]
@@ -2671,7 +2671,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:17 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}],\"pagination\":{\"next_cursor\":null,\"has_more\":false}}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:18 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"aaaa000000000000000000000000000000000001\",\"details\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenposter\",\"category\":2040,\"category_name\":\"Movies > HD\",\"added\":\"Fri, 01 May 2026 12:00:00 +0000\",\"size\":5368709120,\"files\":40,\"grabs\":3,\"comments\":2,\"password\":0,\"usenetdate\":\"Fri, 01 May 2026 10:00:00 +0000\",\"imdbid\":\"1234567\",\"tmdbid\":81,\"traktid\":82}],\"pagination\":{\"next_cursor\":null,\"has_more\":false}}",
    "audit": [
     "/api/v2/movies?id=Movie"
    ]
@@ -2712,7 +2712,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":0,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:17 +0000\",\"grabOldestTime\":\"\",\"results\":[]}",
+   "body": "{\"Total\":0,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:18 +0000\",\"grabOldestTime\":\"\",\"results\":[]}",
    "audit": [
     "/api/v2/audio"
    ]
@@ -2753,7 +2753,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":0,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:17 +0000\",\"grabOldestTime\":\"\",\"results\":[]}",
+   "body": "{\"Total\":0,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:18 +0000\",\"grabOldestTime\":\"\",\"results\":[]}",
    "audit": [
     "/api/v2/audio?id=Album"
    ]
@@ -2794,7 +2794,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:18 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"An.Author-A.Book.EPUB\",\"guid\":\"eeee000000000000000000000000000000000005\",\"details\":\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\",\"url\":\"http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&r=tokenposter\",\"category\":7020,\"category_name\":\"Books > Ebook\",\"added\":\"Tue, 05 May 2026 12:00:00 +0000\",\"size\":1048576,\"files\":1,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Tue, 05 May 2026 10:00:00 +0000\"}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:19 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"An.Author-A.Book.EPUB\",\"guid\":\"eeee000000000000000000000000000000000005\",\"details\":\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\",\"url\":\"http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&r=tokenposter\",\"category\":7020,\"category_name\":\"Books > Ebook\",\"added\":\"Tue, 05 May 2026 12:00:00 +0000\",\"size\":1048576,\"files\":1,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Tue, 05 May 2026 10:00:00 +0000\"}]}",
    "audit": [
     "/api/v2/books"
    ]
@@ -2835,7 +2835,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:18 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"An.Author-A.Book.EPUB\",\"guid\":\"eeee000000000000000000000000000000000005\",\"details\":\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\",\"url\":\"http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&r=tokenposter\",\"category\":7020,\"category_name\":\"Books > Ebook\",\"added\":\"Tue, 05 May 2026 12:00:00 +0000\",\"size\":1048576,\"files\":1,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Tue, 05 May 2026 10:00:00 +0000\"}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:19 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"An.Author-A.Book.EPUB\",\"guid\":\"eeee000000000000000000000000000000000005\",\"details\":\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\",\"url\":\"http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&r=tokenposter\",\"category\":7020,\"category_name\":\"Books > Ebook\",\"added\":\"Tue, 05 May 2026 12:00:00 +0000\",\"size\":1048576,\"files\":1,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Tue, 05 May 2026 10:00:00 +0000\"}]}",
    "audit": [
     "/api/v2/books?id=Book"
    ]
@@ -2876,7 +2876,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:18 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"An.Anime.E01.1080p-GRP\",\"guid\":\"ffff000000000000000000000000000000000006\",\"details\":\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\",\"url\":\"http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&r=tokenposter\",\"category\":5070,\"category_name\":\"TV > Anime\",\"added\":\"Wed, 06 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Wed, 06 May 2026 10:00:00 +0000\",\"imdbid\":null,\"tmdbid\":null,\"traktid\":null,\"episode_title\":null,\"season\":null,\"episode\":null,\"tvairdate\":null,\"tvdbid\":null,\"tvrageid\":null,\"tvmazeid\":null}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:20 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"An.Anime.E01.1080p-GRP\",\"guid\":\"ffff000000000000000000000000000000000006\",\"details\":\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\",\"url\":\"http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&r=tokenposter\",\"category\":5070,\"category_name\":\"TV > Anime\",\"added\":\"Wed, 06 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Wed, 06 May 2026 10:00:00 +0000\",\"imdbid\":null,\"tmdbid\":null,\"traktid\":null,\"episode_title\":null,\"season\":null,\"episode\":null,\"tvairdate\":null,\"tvdbid\":null,\"tvrageid\":null,\"tvmazeid\":null}]}",
    "audit": [
     "/api/v2/anime?anidbid=93"
    ]
@@ -2917,7 +2917,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:19 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"An.Anime.E01.1080p-GRP\",\"guid\":\"ffff000000000000000000000000000000000006\",\"details\":\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\",\"url\":\"http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&r=tokenposter\",\"category\":5070,\"category_name\":\"TV > Anime\",\"added\":\"Wed, 06 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Wed, 06 May 2026 10:00:00 +0000\",\"imdbid\":null,\"tmdbid\":null,\"traktid\":null,\"episode_title\":null,\"season\":null,\"episode\":null,\"tvairdate\":null,\"tvdbid\":null,\"tvrageid\":null,\"tvmazeid\":null}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:20 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"An.Anime.E01.1080p-GRP\",\"guid\":\"ffff000000000000000000000000000000000006\",\"details\":\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\",\"url\":\"http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&r=tokenposter\",\"category\":5070,\"category_name\":\"TV > Anime\",\"added\":\"Wed, 06 May 2026 12:00:00 +0000\",\"size\":1073741824,\"files\":8,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Wed, 06 May 2026 10:00:00 +0000\",\"imdbid\":null,\"tmdbid\":null,\"traktid\":null,\"episode_title\":null,\"season\":null,\"episode\":null,\"tvairdate\":null,\"tvdbid\":null,\"tvrageid\":null,\"tvmazeid\":null}]}",
    "audit": [
     "/api/v2/anime?id=Anime"
    ]
@@ -2958,7 +2958,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":0,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:19 +0000\",\"grabOldestTime\":\"\",\"results\":[]}",
+   "body": "{\"Total\":0,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:20 +0000\",\"grabOldestTime\":\"\",\"results\":[]}",
    "audit": [
     "/api/v2/anime?anidbid=93&minsize=99999999999"
    ]
@@ -2999,7 +2999,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:19 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"Some Show\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:21 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"Some Show\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74}]}",
    "audit": [
     "/api/v2/tv?id=Show"
    ]
@@ -3040,7 +3040,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:20 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"Some Show\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:21 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"Some Show\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74}]}",
    "audit": [
     "/api/v2/tv?id=Show&season=2"
    ]
@@ -3081,7 +3081,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:20 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"Some Show\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:21 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"Some Show\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74}]}",
    "audit": [
     "/api/v2/tv?tvdbid=73"
    ]
@@ -3122,7 +3122,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:20 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"Some Show\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:22 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"Some Show\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74}]}",
    "audit": [
     "/api/v2/tv?ep=3&season=2&tvdbid=73"
    ]
@@ -3163,7 +3163,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:21 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"Some Show\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74}]}",
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:22 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"Some Show\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74}]}",
    "audit": [
     "/api/v2/tv?vid=70"
    ]
@@ -3204,7 +3204,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":0,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:22 +0000\",\"grabOldestTime\":\"\",\"results\":[]}",
+   "body": "{\"Total\":0,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:23 +0000\",\"grabOldestTime\":\"\",\"results\":[]}",
    "audit": [
     "/api/v2/tv?tvdbid=999"
    ]
@@ -3245,7 +3245,7 @@
      "1"
     ]
    ],
-   "body": "{\"Total\":0,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 14:49:22 +0000\",\"grabOldestTime\":\"\",\"results\":[]}",
+   "body": "{\"Total\":0,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:24 +0000\",\"grabOldestTime\":\"\",\"results\":[]}",
    "audit": [
     "/api/v2/search?offset=20000"
    ]
@@ -3445,6 +3445,92 @@
    ],
    "body": "{\"success\":true,\"query\":\"Mov\",\"autocomplete\":[\"A Movie 2024 1080p BluRay-GRP\"],\"suggest\":null}",
    "audit": []
+  }
+ },
+ {
+  "name": "v1_tv_tmdb",
+  "path": "/api/v1/api?t=tvsearch&tmdbid=71&apikey=tokenposter",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "accept-query",
+     "application/json"
+    ],
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "1580"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:newznab=\"http://www.newznab.com/DTD/2010/feeds/attributes/\" encoding=\"utf-8\"><channel><title>NNTmux</title><description>NNTmux API Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/apihelp/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><newznab:response offset=\"0\" total=\"1\"/><newznab:apilimits apicurrent=\"0\" apimax=\"1000\" grabcurrent=\"0\" grabmax=\"1000\"/><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenposter</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</description><enclosure url=\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenposter\" length=\"734003200\" type=\"application/x-nzb\"/><newznab:attr name=\"category\" value=\"5040\"/><newznab:attr name=\"size\" value=\"734003200\"/></item></channel></rss>\n",
+   "audit": [
+    "/api/v1/api?t=tvsearch&tmdbid=71"
+   ]
+  }
+ },
+ {
+  "name": "v2_tv_trakt",
+  "path": "/api/v2/tv?api_token=tokenposter&traktid=72",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "accept-query",
+     "application/json"
+    ],
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-ratelimit-limit",
+     "2"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "1"
+    ]
+   ],
+   "body": "{\"Total\":1,\"apiCurrent\":1,\"apiMax\":1000,\"grabCurrent\":0,\"grabMax\":1000,\"apiOldestTime\":\"Sun, 01 Nov 2026 15:22:26 +0000\",\"grabOldestTime\":\"\",\"results\":[{\"title\":\"Some.Show.S02E03.720p.WEB-GRP & <more>\",\"guid\":\"bbbb000000000000000000000000000000000002\",\"details\":\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\",\"url\":\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&r=tokenposter\",\"category\":5040,\"category_name\":\"TV > HD\",\"added\":\"Sat, 02 May 2026 12:00:00 +0000\",\"size\":734003200,\"files\":12,\"grabs\":null,\"comments\":null,\"password\":0,\"usenetdate\":\"Sat, 02 May 2026 10:00:00 +0000\",\"imdbid\":\"0123456\",\"tmdbid\":71,\"traktid\":72,\"episode_title\":\"Some Show\",\"season\":2,\"episode\":3,\"tvairdate\":\"2026-03-04\",\"tvdbid\":73,\"tvrageid\":75,\"tvmazeid\":74}]}",
+   "audit": [
+    "/api/v2/tv?traktid=72"
+   ]
   }
  }
 ]
