@@ -19,6 +19,7 @@ use App\Services\Predb\PredbIdentityRebuild;
 use App\Services\ReleaseCleaningService;
 use App\Services\ReleaseCreationService;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Support\PredbSearchDocument;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;

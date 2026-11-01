@@ -33,7 +33,7 @@ use Throwable;
  */
 class NameFixingService
 {
-    public const PREDB_IDENTITY_POLICY = '1919aa942e15c30f6c3fc7c3b0a28534d22f7bd58d09efcd4497834910455f82';
+    public const PREDB_IDENTITY_POLICY = '08a1672295043f5a8c2d8ce0c7adcce823c0431bea93c4ddb04ccc6d6207b312';
 
     private const PREDB_CANDIDATE_PAGE_SIZE = 21;
 
