@@ -496,3 +496,223 @@ async fn cover_pages_need_the_category_permission() {
     }
     db.drop_database().await.unwrap();
 }
+
+async fn page(browser: &mut Browser, path: &str) -> (StatusCode, String) {
+    let (response, html) = browser.get(path).await;
+    (response.status(), html)
+}
+
+async fn act(browser: &mut Browser, path: &str, fields: &[(&str, &str)]) -> (StatusCode, String) {
+    let (response, _) = browser.post_authed(path, fields).await;
+    (response.status(), location(&response))
+}
+
+async fn add_show(db: &sqlx::MySqlPool, title: &str) -> i64 {
+    let video = sqlx::query("INSERT INTO videos (type, title, countries_id, started, source) VALUES (0, ?, 'US', NOW(), 0)")
+        .bind(title)
+        .execute(db)
+        .await
+        .unwrap()
+        .last_insert_id() as i64;
+    sqlx::query(
+        "INSERT INTO tv_info (videos_id, summary, publisher) VALUES (?, 'A summary', 'A network')",
+    )
+    .bind(video)
+    .execute(db)
+    .await
+    .unwrap();
+    video
+}
+
+async fn add_episode(db: &sqlx::MySqlPool, video: i64, release: i64, season: i64, episode: i64) {
+    let id = sqlx::query("INSERT INTO tv_episodes (videos_id, series, episode, se_complete, title, firstaired, summary) VALUES (?, ?, ?, ?, 'An episode', '2020-01-02', '')")
+        .bind(video)
+        .bind(season)
+        .bind(episode)
+        .bind(format!("S{season:02}E{episode:02}"))
+        .execute(db)
+        .await
+        .unwrap()
+        .last_insert_id() as i64;
+    sqlx::query("UPDATE releases SET videos_id = ?, tv_episodes_id = ? WHERE id = ?")
+        .bind(video)
+        .bind(id)
+        .bind(release)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn series_pages_group_by_season_and_lists_follow_shows() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let name = unique("tess");
+    let id = add_user(&db.pool, &name, true, 1).await;
+    grant(&db.pool, id, "view tv").await;
+    let mut browser = Browser::new(&ctx);
+    browser
+        .post("/login", &[("username", &name), ("password", PASSWORD)])
+        .await;
+    let group = add_group(&db.pool, &unique("alt.binaries.tv")).await;
+    let title = unique("Zed Show");
+    let video = add_show(&db.pool, &title).await;
+    let (first, _) = add_release(&db.pool, "Zed.S01E01", 5040, group).await;
+    let (second, _) = add_release(&db.pool, "Zed.S02E01", 5040, group).await;
+    add_episode(&db.pool, video, first, 1, 1).await;
+    add_episode(&db.pool, video, second, 2, 1).await;
+    let (named, _) = add_release(&db.pool, "Zed.S03E04", 5040, group).await;
+    sqlx::query("UPDATE releases SET videos_id = ? WHERE id = ?")
+        .bind(video)
+        .bind(named)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = page(&mut browser, "/series/Z").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&title));
+
+    let (status, body) = page(&mut browser, &format!("/series/{video}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Season 1 (1)")
+            && body.contains("Season 2 (1)")
+            && body.contains("Season 3 (1)")
+    );
+    assert!(body.contains("Zed.S01E01") && !body.contains("Zed.S02E01"));
+    let (_, body) = page(
+        &mut browser,
+        &format!("/series/{video}?season=2&_fragment=season"),
+    )
+    .await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["selectedSeason"], 2);
+    assert!(json["contentHtml"].as_str().unwrap().contains("Zed.S02E01"));
+
+    let (status, body) = page(&mut browser, &format!("/myshows?action=add&id={video}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("category[]"));
+    let (status, _) = page(&mut browser, &format!("/myshows?action=doadd&id={video}")).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let (status, target) = act(
+        &mut browser,
+        &format!("/myshows?action=doadd&id={video}"),
+        &[("category[]", "5040"), ("from", "//evil.example")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(target, "/myshows");
+    let stored: String = sqlx::query_scalar(
+        "SELECT categories FROM user_series WHERE users_id = ? AND videos_id = ?",
+    )
+    .bind(id)
+    .bind(video)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, "5040");
+    let (_, body) = page(&mut browser, "/myshows").await;
+    assert!(body.contains(&title));
+    let (status, body) = page(&mut browser, "/myshows/browse").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Zed.S01E01"));
+    let (status, _) = act(
+        &mut browser,
+        &format!("/myshows?action=delete&id={video}"),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, body) = page(&mut browser, "/myshows/browse").await;
+    assert!(!body.contains("Zed.S01E01"));
+
+    let (status, _) = page(&mut browser, "/trending-tv").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn my_movies_add_edit_and_browse() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let name = unique("mina");
+    let id = add_user(&db.pool, &name, true, 1).await;
+    grant(&db.pool, id, "view movies").await;
+    let mut browser = Browser::new(&ctx);
+    browser
+        .post("/login", &[("username", &name), ("password", PASSWORD)])
+        .await;
+    let group = add_group(&db.pool, &unique("alt.binaries.mov")).await;
+    let imdb = "0123456";
+    sqlx::query("INSERT INTO movieinfo (imdbid, title) VALUES (?, 'Listed Movie')")
+        .bind(imdb)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (release, _) = add_release(&db.pool, "Listed.Movie.2020", 2040, group).await;
+    sqlx::query("UPDATE releases SET imdbid = ? WHERE id = ?")
+        .bind(imdb)
+        .bind(release)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = page(&mut browser, &format!("/mymovies?id=add&imdb={imdb}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Listed Movie"));
+    let (status, _) = act(
+        &mut browser,
+        &format!("/mymovies?id=doadd&imdb={imdb}"),
+        &[("category[]", "2040")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, body) = page(&mut browser, "/mymovies").await;
+    assert!(body.contains("Listed Movie"));
+    let (status, body) = page(&mut browser, "/mymovies?id=browse").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Listed.Movie.2020"));
+    let (status, _) = act(
+        &mut browser,
+        &format!("/mymovies?id=doedit&imdb={imdb}"),
+        &[("category[]", "2030")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_, body) = page(&mut browser, "/mymovies?id=browse").await;
+    assert!(!body.contains("Listed.Movie.2020"));
+}
+
+#[tokio::test]
+async fn search_runs_exact_poster_filters_and_reports_bad_input() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let name = unique("sage");
+    let id = add_user(&db.pool, &name, true, 1).await;
+    grant(&db.pool, id, "view tv").await;
+    let mut browser = Browser::new(&ctx);
+    browser
+        .post("/login", &[("username", &name), ("password", PASSWORD)])
+        .await;
+    let group = add_group(&db.pool, &unique("alt.binaries.find")).await;
+    add_release(&db.pool, "Found.Me", 5040, group).await;
+
+    let (status, body) = page(&mut browser, "/search").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Start Your Search"));
+    let (_, body) = page(&mut browser, "/search?poster=poster%40example.com").await;
+    assert!(body.contains("Found.Me"));
+    let (_, body) = page(&mut browser, "/search?poster=POSTER%40example.com").await;
+    assert!(!body.contains("Found.Me") && body.contains("No results found"));
+    let (_, body) = page(
+        &mut browser,
+        "/search?poster=poster%40example.com&minfiles=99",
+    )
+    .await;
+    assert!(!body.contains("Found.Me"));
+    let (_, body) = page(&mut browser, "/search?minfiles=x").await;
+    assert!(body.contains("must be a whole number"));
+}
