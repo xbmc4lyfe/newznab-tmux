@@ -49,6 +49,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 clap = { version = "4", features = ["derive", "env"] }
 crc32fast = "1"
 deunicode = "1"
+encoding_rs = "0.8"
 fancy-regex = "0.17"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 form_urlencoded = "1"
@@ -63,6 +64,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 quick-xml = { version = "0.42", features = ["serialize"] }
 rand = "0.9"
+roxmltree = "0.21"
 redis = { version = "1", default-features = false, features = ["aio", "connection-manager", "tokio-rustls-comp", "script"] }
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["cookies", "gzip", "json", "rustls", "stream"] }

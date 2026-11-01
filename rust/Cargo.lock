@@ -2080,6 +2080,7 @@ dependencies = [
  "multer",
  "nntmux-core",
  "nntmux-runtime",
+ "nntmux-search",
  "nntmux-testkit",
  "nntmux-webkit",
  "quick-xml",
@@ -2093,6 +2094,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "tempfile",
+ "thiserror",
  "tokio",
  "tower",
  "tracing",
@@ -2170,8 +2172,24 @@ name = "nntmux-fingerprint"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "crc32fast",
+ "flate2",
+ "hex",
+ "md-5 0.10.6",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "nntmux-verify",
+ "nntmux-yenc",
+ "quick-xml",
+ "rand 0.9.5",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
@@ -2453,10 +2471,12 @@ name = "nntmux-verify"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "crc32fast",
  "deunicode",
+ "encoding_rs",
  "fancy-regex",
  "flate2",
  "futures-util",
@@ -2464,9 +2484,11 @@ dependencies = [
  "nntmux-core",
  "nntmux-runtime",
  "nntmux-testkit",
+ "nntmux-yenc",
  "rand 0.9.5",
  "redis",
  "regex",
+ "roxmltree",
  "serde",
  "serde_json",
  "sha1 0.10.7",
@@ -2475,6 +2497,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -3114,6 +3137,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

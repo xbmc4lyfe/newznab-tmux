@@ -1,0 +1,393 @@
+{
+    "plain": {
+        "xml": "<nzb><file poster=\"p\" date=\"1\" subject=\"[01/03] - &quot;a.rar&quot; yEnc (1/2)\"><groups><group>alt.binaries.a</group></groups><segments><segment number=\"1\" bytes=\"10\">one@x</segment><segment number=\"2\" bytes=\"20\"> &lt;two@x&gt; </segment></segments></file></nzb>",
+        "manifest": {
+            "subject": "Search",
+            "fromname": "From",
+            "date": "2026-01-02 03:04:05",
+            "groups_id": 3,
+            "regex_id": 0,
+            "expected_files": 3,
+            "groups": [
+                "alt.binaries.a"
+            ],
+            "files": [
+                {
+                    "key": "b6568f7c608325744aa387478078d410dcc58d65047e90014dd91461e6f0a3ea",
+                    "subject": "[01/03] - \"a.rar\" yEnc",
+                    "totalparts": 2,
+                    "totalparts_inferred": false,
+                    "segments": [
+                        {
+                            "number": 1,
+                            "bytes": 10,
+                            "messageid": "one@x"
+                        },
+                        {
+                            "number": 2,
+                            "bytes": 20,
+                            "messageid": "<two@x>"
+                        }
+                    ]
+                }
+            ],
+            "metadata_source": "audit"
+        },
+        "ids": [
+            "one@x",
+            "two@x"
+        ],
+        "fingerprint": "af9283ed7e64433f9c602071a8b5687af7eee244"
+    },
+    "namespaced": {
+        "xml": "<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"[01/03] - &quot;a.rar&quot; yEnc (1/2)\"><groups><group>alt.binaries.a</group></groups><segments><segment number=\"1\" bytes=\"10\">one@x</segment><segment number=\"2\" bytes=\"20\"> &lt;two@x&gt; </segment></segments></file></nzb>",
+        "manifest": {
+            "subject": "Search",
+            "fromname": "From",
+            "date": "2026-01-02 03:04:05",
+            "groups_id": 3,
+            "regex_id": 0,
+            "expected_files": 3,
+            "groups": [
+                "alt.binaries.a"
+            ],
+            "files": [
+                {
+                    "key": "b6568f7c608325744aa387478078d410dcc58d65047e90014dd91461e6f0a3ea",
+                    "subject": "[01/03] - \"a.rar\" yEnc",
+                    "totalparts": 2,
+                    "totalparts_inferred": false,
+                    "segments": [
+                        {
+                            "number": 1,
+                            "bytes": 10,
+                            "messageid": "one@x"
+                        },
+                        {
+                            "number": 2,
+                            "bytes": 20,
+                            "messageid": "<two@x>"
+                        }
+                    ]
+                }
+            ],
+            "metadata_source": "audit"
+        },
+        "ids": [
+            "one@x",
+            "two@x"
+        ],
+        "fingerprint": "af9283ed7e64433f9c602071a8b5687af7eee244"
+    },
+    "head": {
+        "xml": "<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head><meta type=\"nntmux:declared-file-count\">7</meta><meta type=\"nntmux:verification-mode\">spot-check</meta><meta type=\"password\">pa&amp;ss</meta><meta type=\"password\"></meta></head><file poster=\"p\" date=\"1\" subject=\"[01/03] - &quot;a.rar&quot; yEnc (1/2)\"><groups><group>alt.binaries.a</group></groups><segments><segment number=\"1\" bytes=\"10\">one@x</segment><segment number=\"2\" bytes=\"20\"> &lt;two@x&gt; </segment></segments></file></nzb>",
+        "manifest": {
+            "subject": "Search",
+            "fromname": "From",
+            "date": "2026-01-02 03:04:05",
+            "groups_id": 3,
+            "regex_id": 0,
+            "expected_files": 7,
+            "groups": [
+                "alt.binaries.a"
+            ],
+            "files": [
+                {
+                    "key": "b6568f7c608325744aa387478078d410dcc58d65047e90014dd91461e6f0a3ea",
+                    "subject": "[01/03] - \"a.rar\" yEnc",
+                    "totalparts": 2,
+                    "totalparts_inferred": false,
+                    "segments": [
+                        {
+                            "number": 1,
+                            "bytes": 10,
+                            "messageid": "one@x"
+                        },
+                        {
+                            "number": 2,
+                            "bytes": 20,
+                            "messageid": "<two@x>"
+                        }
+                    ]
+                }
+            ],
+            "metadata_source": "audit",
+            "passwords": [
+                "pa&ss",
+                ""
+            ],
+            "verification_mode": "spot_check"
+        },
+        "ids": [
+            "one@x",
+            "two@x"
+        ],
+        "fingerprint": "af9283ed7e64433f9c602071a8b5687af7eee244"
+    },
+    "two_heads_password": {
+        "xml": "<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head/><head><meta type=\"password\">x</meta></head><file poster=\"p\" date=\"1\" subject=\"[01/03] - &quot;a.rar&quot; yEnc (1/2)\"><groups><group>alt.binaries.a</group></groups><segments><segment number=\"1\" bytes=\"10\">one@x</segment><segment number=\"2\" bytes=\"20\"> &lt;two@x&gt; </segment></segments></file></nzb>",
+        "error": "password",
+        "ids": [
+            "one@x",
+            "two@x"
+        ],
+        "fingerprint": "af9283ed7e64433f9c602071a8b5687af7eee244"
+    },
+    "password_child": {
+        "xml": "<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head><meta type=\"password\"><b>x</b></meta></head><file poster=\"p\" date=\"1\" subject=\"[01/03] - &quot;a.rar&quot; yEnc (1/2)\"><groups><group>alt.binaries.a</group></groups><segments><segment number=\"1\" bytes=\"10\">one@x</segment><segment number=\"2\" bytes=\"20\"> &lt;two@x&gt; </segment></segments></file></nzb>",
+        "error": "password",
+        "ids": [
+            "one@x",
+            "two@x"
+        ],
+        "fingerprint": "af9283ed7e64433f9c602071a8b5687af7eee244"
+    },
+    "no_files": {
+        "xml": "<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head/></nzb>",
+        "error": "invalid",
+        "fingerprint": null
+    },
+    "wrong_root": {
+        "xml": "<feed><file poster=\"p\" date=\"1\" subject=\"[01/03] - &quot;a.rar&quot; yEnc (1/2)\"><groups><group>alt.binaries.a</group></groups><segments><segment number=\"1\" bytes=\"10\">one@x</segment><segment number=\"2\" bytes=\"20\"> &lt;two@x&gt; </segment></segments></file></feed>",
+        "error": "invalid",
+        "fingerprint": null
+    },
+    "wrong_namespace": {
+        "xml": "<nzb xmlns=\"urn:other\"><file poster=\"p\" date=\"1\" subject=\"[01/03] - &quot;a.rar&quot; yEnc (1/2)\"><groups><group>alt.binaries.a</group></groups><segments><segment number=\"1\" bytes=\"10\">one@x</segment><segment number=\"2\" bytes=\"20\"> &lt;two@x&gt; </segment></segments></file></nzb>",
+        "error": "invalid",
+        "fingerprint": null
+    },
+    "malformed": {
+        "xml": "<nzb><file></nzb>",
+        "error": "invalid",
+        "fingerprint": null
+    },
+    "no_counter": {
+        "xml": "<nzb><file subject=\"plain name\"><groups><group>g</group><group>g</group></groups><segments><segment number=\"3\" bytes=\"5\">a@x</segment><segment number=\"3\" bytes=\"5\">b@x</segment></segments></file></nzb>",
+        "manifest": {
+            "subject": "Search",
+            "fromname": "From",
+            "date": "2026-01-02 03:04:05",
+            "groups_id": 3,
+            "regex_id": 0,
+            "expected_files": 0,
+            "groups": [
+                "g"
+            ],
+            "files": [
+                {
+                    "key": "c11b3df4c524d2ce08d88abf2d79a7a31dddaa5b6402f75834c5d49f6dd6f2ca",
+                    "subject": "plain name",
+                    "totalparts": 3,
+                    "totalparts_inferred": true,
+                    "segments": [
+                        {
+                            "number": 3,
+                            "bytes": 5,
+                            "messageid": "a@x"
+                        },
+                        {
+                            "number": 3,
+                            "bytes": 5,
+                            "messageid": "b@x"
+                        }
+                    ]
+                }
+            ],
+            "metadata_source": "audit",
+            "conflict": true
+        },
+        "ids": [
+            "a@x",
+            "b@x"
+        ],
+        "fingerprint": "5f121c84d0ebe825788cab20e0173da18bbd4af0"
+    },
+    "foreign_file": {
+        "xml": "<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\" xmlns:o=\"urn:o\"><o:file subject=\"x\"><segments/></o:file><file poster=\"p\" date=\"1\" subject=\"[01/03] - &quot;a.rar&quot; yEnc (1/2)\"><groups><group>alt.binaries.a</group></groups><segments><segment number=\"1\" bytes=\"10\">one@x</segment><segment number=\"2\" bytes=\"20\"> &lt;two@x&gt; </segment></segments></file></nzb>",
+        "manifest": {
+            "subject": "Search",
+            "fromname": "From",
+            "date": "2026-01-02 03:04:05",
+            "groups_id": 3,
+            "regex_id": 0,
+            "expected_files": 3,
+            "groups": [
+                "alt.binaries.a"
+            ],
+            "files": [
+                {
+                    "key": "b6568f7c608325744aa387478078d410dcc58d65047e90014dd91461e6f0a3ea",
+                    "subject": "[01/03] - \"a.rar\" yEnc",
+                    "totalparts": 2,
+                    "totalparts_inferred": false,
+                    "segments": [
+                        {
+                            "number": 1,
+                            "bytes": 10,
+                            "messageid": "one@x"
+                        },
+                        {
+                            "number": 2,
+                            "bytes": 20,
+                            "messageid": "<two@x>"
+                        }
+                    ]
+                }
+            ],
+            "metadata_source": "audit"
+        },
+        "fingerprint": "af9283ed7e64433f9c602071a8b5687af7eee244"
+    },
+    "foreign_segment": {
+        "xml": "<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\" xmlns:o=\"urn:o\"><file subject=\"s\"><groups><group>g</group></groups><segments><o:segment number=\"1\" bytes=\"1\">f@x</o:segment><segment number=\"1\" bytes=\"1\">k@x</segment></segments></file></nzb>",
+        "manifest": {
+            "subject": "Search",
+            "fromname": "From",
+            "date": "2026-01-02 03:04:05",
+            "groups_id": 3,
+            "regex_id": 0,
+            "expected_files": 0,
+            "groups": [
+                "g"
+            ],
+            "files": [
+                {
+                    "key": "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89",
+                    "subject": "s",
+                    "totalparts": 1,
+                    "totalparts_inferred": true,
+                    "segments": [
+                        {
+                            "number": 1,
+                            "bytes": 1,
+                            "messageid": "k@x"
+                        }
+                    ]
+                }
+            ],
+            "metadata_source": "audit"
+        },
+        "fingerprint": "fdd69f691285642d296cd3d4c5bfd487f8223003"
+    },
+    "bad_number": {
+        "xml": "<nzb><file subject=\"s\"><segments><segment number=\"0\" bytes=\"1\">a@x</segment></segments></file></nzb>",
+        "manifest": {
+            "subject": "Search",
+            "fromname": "From",
+            "date": "2026-01-02 03:04:05",
+            "groups_id": 3,
+            "regex_id": 0,
+            "expected_files": 0,
+            "groups": [],
+            "files": [
+                {
+                    "key": "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89",
+                    "subject": "s",
+                    "totalparts": 0,
+                    "totalparts_inferred": true,
+                    "segments": [
+                        {
+                            "number": 0,
+                            "bytes": 1,
+                            "messageid": "a@x"
+                        }
+                    ]
+                }
+            ],
+            "metadata_source": "audit",
+            "conflict": true
+        },
+        "fingerprint": "9a5f76d0e1f9e7a2f49091b11e61198d20f79e21"
+    },
+    "bad_id": {
+        "xml": "<nzb><file subject=\"s\"><segments><segment number=\"1\" bytes=\"1\">a b@x</segment></segments></file></nzb>",
+        "manifest": {
+            "subject": "Search",
+            "fromname": "From",
+            "date": "2026-01-02 03:04:05",
+            "groups_id": 3,
+            "regex_id": 0,
+            "expected_files": 0,
+            "groups": [],
+            "files": [
+                {
+                    "key": "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89",
+                    "subject": "s",
+                    "totalparts": 1,
+                    "totalparts_inferred": true,
+                    "segments": [
+                        {
+                            "number": 1,
+                            "bytes": 1,
+                            "messageid": "a b@x"
+                        }
+                    ]
+                }
+            ],
+            "metadata_source": "audit"
+        },
+        "fingerprint": null
+    },
+    "two_segments": {
+        "xml": "<nzb><file subject=\"s\"><segments><segment number=\"1\" bytes=\"1\">a@x</segment></segments><segments><segment number=\"2\" bytes=\"1\">b@x</segment></segments></file></nzb>",
+        "manifest": {
+            "subject": "Search",
+            "fromname": "From",
+            "date": "2026-01-02 03:04:05",
+            "groups_id": 3,
+            "regex_id": 0,
+            "expected_files": 0,
+            "groups": [],
+            "files": [
+                {
+                    "key": "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89",
+                    "subject": "s",
+                    "totalparts": 1,
+                    "totalparts_inferred": true,
+                    "segments": [
+                        {
+                            "number": 1,
+                            "bytes": 1,
+                            "messageid": "a@x"
+                        }
+                    ]
+                }
+            ],
+            "metadata_source": "audit"
+        },
+        "fingerprint": "9a5f76d0e1f9e7a2f49091b11e61198d20f79e21"
+    },
+    "cdata": {
+        "xml": "<nzb><file subject=\"s\"><segments><segment number=\"1\" bytes=\"1\"><![CDATA[c@x]]></segment></segments></file></nzb>",
+        "manifest": {
+            "subject": "Search",
+            "fromname": "From",
+            "date": "2026-01-02 03:04:05",
+            "groups_id": 3,
+            "regex_id": 0,
+            "expected_files": 0,
+            "groups": [],
+            "files": [
+                {
+                    "key": "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89",
+                    "subject": "s",
+                    "totalparts": 1,
+                    "totalparts_inferred": true,
+                    "segments": [
+                        {
+                            "number": 1,
+                            "bytes": 1,
+                            "messageid": "c@x"
+                        }
+                    ]
+                }
+            ],
+            "metadata_source": "audit"
+        },
+        "ids": [
+            "c@x"
+        ],
+        "fingerprint": "dae887031472b08b76df273ee1ac8c577684644e"
+    }
+}
