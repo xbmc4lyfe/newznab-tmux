@@ -190,9 +190,7 @@ pub fn matches_predb_filename_evidence(file_name: &str, query: &str) -> bool {
 
 pub fn extract_filename_from_path(path: &str) -> &str {
     match path.rfind(['\\', '/']) {
-        Some(index) if index + 1 < path.len() && !path[index + 1..].contains('\n') => {
-            &path[index + 1..]
-        }
+        Some(index) if index + 1 < path.len() => &path[index + 1..],
         _ => path,
     }
 }
@@ -239,6 +237,29 @@ pub fn format_search_name(title: &str, normalized_fallback: Option<&str>) -> Str
     let dotted = replace_all(rx!(r"[ _]+"), formatted, ".");
     let dotted = replace_all(rx!(r"\.{2,}"), &dotted, ".");
     trim_chars(&dotted, " .-_\t\r\n").to_owned()
+}
+
+/// `fixerCleaner`: strips transport markers from a candidate name, and every non-ASCII byte.
+pub fn fixer_cleaner(name: &str) -> String {
+    let mut clean = unwrap_nzbsplit(name).unwrap_or_else(|| name.to_owned());
+    for re in [
+        rx!(i r"[.\-_](sample|proof|thumbs?)$"),
+        rx!(i r"\.(par2?|nfo|sfv|nzb|rar|r\d{2,3}|zip)$"),
+        rx!(i r"\.part\d+(\.rar)?$"),
+        rx!(i r"\.vol\d+\+\d+\.par2$"),
+        // `.par2` is already gone, so a bare volume marker can remain.
+        rx!(i r"\.vol\d+[+-]\d+$"),
+        rx!(i r#"\d{1,3}\.rev"?$"#),
+        rx!(i r"^(Release Name|sample[-_])"),
+    ] {
+        clean = replace_all(re, &clean, "");
+    }
+    let clean = replace_all(rx!(r"\s\s+"), &clean, " ");
+    let ascii: String = clean
+        .chars()
+        .filter(|c| matches!(*c, '\x20'..='\x7F'))
+        .collect();
+    trim_chars(&ascii, PHP_WS).to_owned()
 }
 
 /// Whether a title looks like a valid release name.

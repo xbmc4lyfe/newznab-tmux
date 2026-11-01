@@ -9,6 +9,9 @@ use sqlx::MySqlPool;
 use crate::filename::exact_value;
 use crate::selector::PredbHit;
 
+/// A hung Manticore must not stall release creation or an import.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct PredbIndex {
     client: Client,
@@ -25,8 +28,12 @@ impl PredbIndex {
     }
 
     pub fn at(base: String, table: String) -> Self {
+        let client = Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_default();
         Self {
-            client: Client::new(),
+            client,
             base: Some(base),
             table,
         }

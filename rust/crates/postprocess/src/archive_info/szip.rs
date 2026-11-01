@@ -4,8 +4,10 @@
 //! all-defined flag returns no flags and reads no bytes, so empty-stream markers and undefined
 //! digests derail the parse, and the caller falls back to the 7-Zip client.
 
+use std::mem::size_of;
+
 use super::reader::{
-    Cursor, FileRecord, Parse, Thrown, find, int64, truncated_name, utf16le_to_utf8,
+    Cursor, FileRecord, MAX_SCAN_WORK, Parse, Thrown, find, int64, truncated_name, utf16le_to_utf8,
     windows_to_unix,
 };
 
@@ -170,6 +172,7 @@ impl SzipReader {
             return Ok(None);
         };
         let (offset, next) = (header.offset, header.next_offset);
+        self.cursor.budget.retain(size_of::<Header>())?;
         self.headers.push(header);
         if self.cursor.offset != next {
             self.cursor.seek(next)?;
@@ -194,7 +197,14 @@ impl SzipReader {
                 positions.push((position, true));
             }
         }
+        let began = self.cursor.budget.work();
+        let held = self.cursor.budget.retained();
         for (position, encoded) in positions {
+            // Candidates that fail are dropped, so what they held comes back.
+            self.cursor.budget.restore_retained(held);
+            if self.cursor.budget.work() - began > MAX_SCAN_WORK {
+                return None;
+            }
             let offset = i64::try_from(position).ok()? + start;
             if self
                 .cursor
@@ -207,9 +217,11 @@ impl SzipReader {
                 && sane_streams_info(&header)
             {
                 self.marker_position = Some(Some(offset));
+                self.cursor.budget.restore_retained(held);
                 return Some(offset);
             }
         }
+        self.cursor.budget.restore_retained(held);
         None
     }
 
@@ -384,7 +396,7 @@ impl SzipReader {
                 total_out = total_out.saturating_add(num_out);
                 if flags & 0x20 != 0 {
                     let size = self.read_number()?;
-                    self.cursor.read(size)?;
+                    self.cursor.skip(size)?;
                 }
                 if method == METHOD_7Z_AES {
                     folder.is_encrypted = 1;
@@ -402,12 +414,13 @@ impl SzipReader {
                 let output = self.read_number()?;
                 folder.bind_pairs.push((input, output));
             }
-            let packed = total_in - bind_pair_count;
+            let packed = total_in.saturating_sub(bind_pair_count);
             if packed > 1 {
                 for _ in 0..packed {
                     self.read_number()?;
                 }
             }
+            self.cursor.budget.retain(size_of::<Folder>())?;
             folders.push(folder);
         }
         Ok(folders)
@@ -461,6 +474,9 @@ impl SzipReader {
         if total > self.cursor.length.saturating_mul(8) {
             return Err(Thrown);
         }
+        self.cursor
+            .budget
+            .retain_count(total, 2 * size_of::<i64>())?;
         if id == PROPERTY_CRC {
             let (defined, crcs) = self.read_digests(needed)?;
             let mut digest = 0_usize;
@@ -496,6 +512,10 @@ impl SzipReader {
             return Err(Thrown);
         }
         let count_usize = usize::try_from(count).map_err(|_| Thrown)?;
+        // Each file can become a file list entry too.
+        self.cursor
+            .budget
+            .retain_count(count, size_of::<SevenZipFile>() + size_of::<FileRecord>())?;
         header.files = vec![
             SevenZipFile {
                 has_stream: true,
@@ -529,6 +549,7 @@ impl SzipReader {
                         while self.cursor.offset < self.cursor.length {
                             let data = self.cursor.read(2)?;
                             if data == [0, 0] {
+                                self.cursor.budget.retain(name.len())?;
                                 file.name = Some(utf16le_to_utf8(&name));
                                 break;
                             }
@@ -583,9 +604,7 @@ impl SzipReader {
                 PROPERTY_ANTI => {
                     self.read_booleans(empty_stream_count, false)?;
                 }
-                _ => {
-                    self.cursor.read(size)?;
-                }
+                _ => self.cursor.skip(size)?,
             }
         }
         let mut empty_index = 0_usize;
@@ -656,6 +675,7 @@ impl SzipReader {
             if count > limit {
                 return Err(Thrown);
             }
+            self.cursor.budget.retain_count(count, size_of::<i64>())?;
             return Ok(vec![1; usize::try_from(count).map_err(|_| Thrown)?]);
         }
         Ok(Vec::new())
@@ -663,6 +683,7 @@ impl SzipReader {
 
     fn read_digests(&mut self, count: i64) -> Parse<(Vec<i64>, Vec<i64>)> {
         let defined = self.read_booleans(count, true)?;
+        self.cursor.budget.retain_count(count, size_of::<i64>())?;
         let mut crcs = Vec::new();
         for index in 0..usize::try_from(count).map_err(|_| Thrown)? {
             if defined.get(index).copied().unwrap_or(0) != 0 {

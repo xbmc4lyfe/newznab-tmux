@@ -12,7 +12,9 @@ mod mailer;
 mod pages;
 mod profile;
 mod releases;
+mod search;
 mod statics;
+mod tv;
 pub mod validate;
 
 use axum::Router;
@@ -26,6 +28,8 @@ pub fn router() -> Router<Ctx> {
         .merge(profile::router())
         .merge(browse::router())
         .merge(covers::router())
+        .merge(tv::router())
+        .merge(search::router())
         .merge(details::router())
         .merge(details::failed_router());
     nntmux_webkit::stack(pages)

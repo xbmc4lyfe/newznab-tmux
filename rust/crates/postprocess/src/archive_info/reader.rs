@@ -2,13 +2,129 @@
 //! the file record. Port of `ArchiveReader`.
 
 use std::fs::File;
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// `ArchiveReader::$maxReadBytes`. In-memory data past this isn't seen at all.
 pub const MAX_READ_BYTES: i64 = 1_048_576;
 /// `ArchiveReader::$maxFilenameLength`.
 pub const MAX_FILENAME_LENGTH: usize = 256;
+
+/// What one top-level archive and everything nested in it may hold in memory. Corrupt counts and
+/// overlapping records multiply small inputs, and PHP's `memory_limit` was what stopped them.
+pub const MAX_RETAINED_BYTES: i64 = 256 * 1024 * 1024;
+/// Bytes read, plus [`READ_COST`] per read. Overlapping candidates make parsing quadratic.
+pub const MAX_WORK: i64 = 4 * 1024 * 1024 * 1024;
+/// The part of that one search for a header in a fragment may use. A plain text article alone
+/// can ask for gigabytes of CRC, and giving up there just means no header was found.
+pub const MAX_SCAN_WORK: i64 = 512 * 1024 * 1024;
+const READ_COST: i64 = 64;
+/// A single read from a file. PAR2 reads whole recovery packets to check them.
+const MAX_FILE_READ: i64 = 1024 * 1024 * 1024;
+
+/// Limits shared by a top-level archive and everything nested in it. Running out reads as the
+/// data ending, so the listing comes back partial and callers treat it as they treat truncation.
+#[derive(Debug)]
+pub struct Budget {
+    retained: AtomicI64,
+    work: AtomicI64,
+    work_limit: i64,
+    nested: AtomicI64,
+    extractions: AtomicI64,
+    extracted: AtomicI64,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self::with_work_limit(MAX_WORK)
+    }
+}
+
+impl Budget {
+    /// A file whose reader only moves forward can need more work than it has corrupt candidates.
+    pub fn with_work_limit(work_limit: i64) -> Self {
+        Self {
+            retained: AtomicI64::new(0),
+            work: AtomicI64::new(0),
+            work_limit,
+            nested: AtomicI64::new(0),
+            extractions: AtomicI64::new(0),
+            extracted: AtomicI64::new(0),
+        }
+    }
+
+    /// Accounts for memory about to be kept.
+    pub fn retain(&self, bytes: usize) -> Parse<()> {
+        let bytes = i64::try_from(bytes).map_err(|_| Thrown)?;
+        self.retain_count(bytes, 1)
+    }
+
+    /// As [`Self::retain`], for `count` items of `size` bytes, before allocating them.
+    pub fn retain_count(&self, count: i64, size: usize) -> Parse<()> {
+        let size = i64::try_from(size).map_err(|_| Thrown)?;
+        let bytes = count.max(0).saturating_mul(size);
+        // A charge that doesn't fit leaves the total alone, so smaller ones can still pass.
+        if bytes > MAX_RETAINED_BYTES
+            || self.retained.fetch_add(bytes, Ordering::Relaxed) + bytes > MAX_RETAINED_BYTES
+        {
+            self.retained
+                .fetch_max(MAX_RETAINED_BYTES, Ordering::Relaxed);
+            return Err(Thrown);
+        }
+        Ok(())
+    }
+
+    pub fn retained(&self) -> i64 {
+        self.retained.load(Ordering::Relaxed)
+    }
+
+    /// Hands back what a discarded parse held.
+    pub fn restore_retained(&self, mark: i64) {
+        self.retained.store(mark, Ordering::Relaxed);
+    }
+
+    pub fn work(&self) -> i64 {
+        self.work.load(Ordering::Relaxed)
+    }
+
+    pub fn work_exhausted(&self) -> bool {
+        self.work() >= self.work_limit
+    }
+
+    fn spend_work(&self, amount: i64) -> Parse<()> {
+        if self
+            .work
+            .fetch_add(amount, Ordering::Relaxed)
+            .saturating_add(amount)
+            > self.work_limit
+        {
+            self.work.fetch_max(self.work_limit, Ordering::Relaxed);
+            return Err(Thrown);
+        }
+        Ok(())
+    }
+
+    /// False once `limit` nested archives have been opened.
+    pub fn admit_nested(&self, limit: i64) -> bool {
+        self.nested.fetch_add(1, Ordering::Relaxed) < limit
+    }
+
+    /// False once `limit` files have been unpacked.
+    pub fn admit_extraction(&self, limit: i64) -> bool {
+        self.extractions.fetch_add(1, Ordering::Relaxed) < limit
+    }
+
+    /// Bytes unpacked so far.
+    pub fn extracted(&self) -> i64 {
+        self.extracted.load(Ordering::Relaxed)
+    }
+
+    pub fn add_extracted(&self, bytes: i64) {
+        self.extracted.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
 
 /// A read or seek out of bounds, or a PHP warning Laravel would have turned into an exception.
 /// Every parser loop treats it as the end of readable data unless `error` was set too.
@@ -49,6 +165,7 @@ impl Source {
 #[derive(Clone, Debug)]
 pub struct Cursor {
     source: Source,
+    pub budget: Arc<Budget>,
     pub start: i64,
     pub end: i64,
     pub length: i64,
@@ -57,7 +174,11 @@ pub struct Cursor {
 
 impl Cursor {
     /// `setData` or `open`. An `Err` is the reader's error message.
-    pub fn open(source: Source, range: Option<(i64, i64)>) -> Result<Self, String> {
+    pub fn open(
+        source: Source,
+        range: Option<(i64, i64)>,
+        budget: Arc<Budget>,
+    ) -> Result<Self, String> {
         let (start, mut end) = range.unwrap_or((0, 0));
         if start < 0 || end < 0 {
             return Err(format!(
@@ -83,6 +204,7 @@ impl Cursor {
         }
         Ok(Self {
             source,
+            budget,
             start,
             end,
             length,
@@ -102,9 +224,24 @@ impl Cursor {
         if count < 1 || new_position > self.length {
             return Err(Thrown);
         }
+        self.budget.spend_work(count.saturating_add(READ_COST))?;
         let bytes = self.bytes_at(self.start + self.offset, count)?;
         self.offset = new_position;
         Ok(bytes)
+    }
+
+    /// `read`, for bytes nothing looks at.
+    pub fn skip(&mut self, count: i64) -> Parse<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let new_position = self.offset.checked_add(count).ok_or(Thrown)?;
+        if count < 1 || new_position > self.length {
+            return Err(Thrown);
+        }
+        self.budget.spend_work(READ_COST)?;
+        self.offset = new_position;
+        Ok(())
     }
 
     fn bytes_at(&self, position: i64, count: i64) -> Parse<Vec<u8>> {
@@ -116,6 +253,9 @@ impl Cursor {
                 .map(<[u8]>::to_vec)
                 .ok_or(Thrown),
             Source::File(file, _) => {
+                if i64::try_from(count).map_err(|_| Thrown)? > MAX_FILE_READ {
+                    return Err(Thrown);
+                }
                 let mut buffer = vec![0; count];
                 file.read_exact_at(&mut buffer, u64::try_from(from).map_err(|_| Thrown)?)
                     .map_err(|_| Thrown)?;
@@ -163,9 +303,40 @@ impl Cursor {
 
     /// `getRange`, for an absolute range of the source.
     pub fn absolute_range(&self, start: i64, end: i64) -> Option<Vec<u8>> {
-        let mut window = Self::open(self.source.clone(), Some((start, end))).ok()?;
+        let mut window =
+            Self::open(self.source.clone(), Some((start, end)), self.budget.clone()).ok()?;
         let length = window.length;
         window.read(length).ok()
+    }
+
+    /// Writes this window to `output` without holding it in memory.
+    pub fn copy_to(&self, output: &mut impl Write) -> std::io::Result<()> {
+        const CHUNK: usize = 64 * 1024;
+        let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        let start = u64::try_from(self.start).map_err(|_| invalid())?;
+        let length = usize::try_from(self.length).map_err(|_| invalid())?;
+        match &self.source {
+            Source::Memory(data) => {
+                let from = usize::try_from(start).map_err(|_| invalid())?;
+                let bytes = from
+                    .checked_add(length)
+                    .and_then(|to| data.get(from..to))
+                    .ok_or_else(invalid)?;
+                output.write_all(bytes)
+            }
+            Source::File(file, _) => {
+                let mut buffer = vec![0; CHUNK.min(length)];
+                let mut copied = 0_usize;
+                while copied < length {
+                    let take = CHUNK.min(length - copied);
+                    let position = start + u64::try_from(copied).map_err(|_| invalid())?;
+                    file.read_exact_at(&mut buffer[..take], position)?;
+                    output.write_all(&buffer[..take])?;
+                    copied += take;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -293,7 +464,7 @@ mod tests {
     #[test]
     fn memory_sources_stop_at_the_read_limit() -> Result<(), String> {
         let data = Arc::new(vec![0_u8; 2_000_000]);
-        let cursor = Cursor::open(Source::Memory(data), None)?;
+        let cursor = Cursor::open(Source::Memory(data), None, Arc::default())?;
         assert_eq!(cursor.length, MAX_READ_BYTES);
         Ok(())
     }
@@ -302,11 +473,11 @@ mod tests {
     fn ranges_are_checked() {
         let source = || Source::Memory(Arc::new(vec![0_u8; 10]));
         assert_eq!(
-            Cursor::open(source(), Some((5, 20))).unwrap_err(),
+            Cursor::open(source(), Some((5, 20)), Arc::default()).unwrap_err(),
             "Byte range (5-20) is invalid"
         );
-        assert!(Cursor::open(source(), Some((5, 3))).is_err());
-        let window = Cursor::open(source(), Some((2, 4))).expect("valid");
+        assert!(Cursor::open(source(), Some((5, 3)), Arc::default()).is_err());
+        let window = Cursor::open(source(), Some((2, 4)), Arc::default()).expect("valid");
         assert_eq!(window.length, 3);
     }
 }

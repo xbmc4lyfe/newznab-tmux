@@ -751,6 +751,7 @@ async fn adult_page(
         categories: &categories,
         excluded: &excluded,
         group: None,
+        ..BrowseFilter::default()
     };
     let total = browse_count(&ctx.db, &filter).await?;
     let limit = per_page();

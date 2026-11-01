@@ -12,6 +12,7 @@ pub mod reader;
 pub mod szip;
 pub mod zip;
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -19,19 +20,34 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 
 use self::par2::Par2Reader;
 use self::rar::RarReader;
-use self::reader::{Cursor, Source, Thrown};
+use self::reader::{Budget, Cursor, MAX_RETAINED_BYTES, MAX_WORK, Source, Thrown};
 pub use self::reader::{FileRecord, ListEntry};
 use self::szip::SzipReader;
 use self::zip::ZipReader;
 use crate::config;
 
 pub const MAIN_SOURCE: &str = "main";
+
+/// Archives inside archives past this aren't opened. Each level is stack, and PHP never went
+/// this deep on anything real.
+pub const MAX_NESTED_DEPTH: u32 = 8;
+/// Nested archives opened per top-level archive. Overlapping entries make these exponential.
+pub const MAX_NESTED_ARCHIVES: i64 = 1024;
+/// Files unpacked per top-level archive. Each holds a descriptor until the listing is done.
+pub const MAX_EXTRACTIONS: i64 = 64;
+/// Bytes unpacked per top-level archive, which is also the disk one release can take here.
+pub const MAX_EXTRACTED_BYTES: i64 = 4 * 1024 * 1024 * 1024;
+const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(120);
+const NESTING_LIMIT: &str = "The archive is nested past what can be read";
+const EXTRACTION_LIMIT: &str = "The archive unpacks past what can be read";
 
 /// The archive types, as `ArchiveInfo` names them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -180,7 +196,11 @@ pub struct ArchiveInfo {
     unrar: Option<PathBuf>,
     children: Option<Vec<(Vec<u8>, ArchiveInfo)>>,
     temporary: bool,
-    temp_files: Vec<NamedTempFile>,
+    temp_files: Vec<TempPath>,
+    /// The in-memory source as a file, for the RAR client.
+    source_file: Option<TempPath>,
+    depth: u32,
+    budget: Arc<Budget>,
 }
 
 impl ArchiveInfo {
@@ -192,15 +212,20 @@ impl ArchiveInfo {
             fragment,
             None,
             unrar.map(Path::to_path_buf),
+            0,
+            Arc::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open(
         source: Source,
         file_path: Option<PathBuf>,
         fragment: bool,
         range: Option<(i64, i64)>,
         unrar: Option<PathBuf>,
+        depth: u32,
+        budget: Arc<Budget>,
     ) -> Result<Self> {
         let mut info = Self {
             kind: Kind::None,
@@ -214,8 +239,11 @@ impl ArchiveInfo {
             children: None,
             temporary: false,
             temp_files: Vec::new(),
+            source_file: None,
+            depth,
+            budget: budget.clone(),
         };
-        match Cursor::open(info.source.clone(), range) {
+        match Cursor::open(info.source.clone(), range, budget) {
             Ok(cursor) => {
                 info.select_reader(&cursor)?;
                 if info.reader.is_none() {
@@ -227,7 +255,13 @@ impl ArchiveInfo {
         Ok(info)
     }
 
-    fn open_file(path: &Path, fragment: bool, unrar: Option<PathBuf>) -> Result<Self> {
+    fn open_file(
+        path: &Path,
+        fragment: bool,
+        unrar: Option<PathBuf>,
+        depth: u32,
+        budget: Arc<Budget>,
+    ) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let size = i64::try_from(file.metadata()?.len())?;
         Self::open(
@@ -236,7 +270,29 @@ impl ArchiveInfo {
             fragment,
             None,
             unrar,
+            depth,
+            budget,
         )
+    }
+
+    /// An entry that can't be read, kept so its error gets listed.
+    fn readerless(&self, error: String) -> Self {
+        Self {
+            kind: Kind::None,
+            source: self.source.clone(),
+            file_path: None,
+            fragment: self.fragment,
+            reader: None,
+            own_error: error,
+            readerless: true,
+            unrar: self.unrar.clone(),
+            children: None,
+            temporary: false,
+            temp_files: Vec::new(),
+            source_file: None,
+            depth: self.depth + 1,
+            budget: self.budget.clone(),
+        }
     }
 
     /// The reader with the earliest marker. A later reader wins a tie, and a marker at zero ends
@@ -253,7 +309,7 @@ impl ArchiveInfo {
         ] {
             let mut reader = match Reader::open(kind, cursor.clone(), self.fragment) {
                 Ok(reader) => reader,
-                Err(_) if kind == Kind::Sfv => continue,
+                Err(_) if kind == Kind::Sfv || cursor.budget.work_exhausted() => continue,
                 Err(failure) => return Err(failure),
             };
             if !reader.error().is_empty() {
@@ -327,14 +383,27 @@ impl ArchiveInfo {
             return Ok(());
         }
         let records = self.records()?;
+        let mut stored: HashMap<&[u8], &FileRecord> = HashMap::new();
+        for record in records.iter().filter(|record| record.range.is_some()) {
+            stored.entry(&record.name).or_insert(record);
+        }
         let mut children: Vec<(Vec<u8>, Self)> = Vec::new();
         for record in &records {
             if !has_archive_extension(&record.name) {
                 continue;
             }
-            let Some(child) = self.child(&record.name, &records)? else {
+            let Some(entry) = stored.get(record.name.as_slice()) else {
                 continue;
             };
+            // One error is enough to make the listing partial, and later entries would hit the
+            // same limit.
+            if self.depth >= MAX_NESTED_DEPTH || !self.budget.admit_nested(MAX_NESTED_ARCHIVES) {
+                let child = self.readerless(NESTING_LIMIT.to_owned());
+                children.retain(|(name, _)| *name != record.name);
+                children.push((record.name.clone(), child));
+                break;
+            }
+            let child = self.child(entry)?;
             if child.kind == Kind::None && !child.readerless {
                 continue;
             }
@@ -350,33 +419,15 @@ impl ArchiveInfo {
         Ok(())
     }
 
-    /// `getArchive`: the archive stored as this named entry, if any.
-    fn child(&mut self, name: &[u8], records: &[FileRecord]) -> Result<Option<Self>> {
-        let Some(record) = records
-            .iter()
-            .find(|record| record.name == name && record.range.is_some())
-        else {
-            return Ok(None);
-        };
+    /// `getArchive`: the archive stored as this entry.
+    fn child(&mut self, record: &FileRecord) -> Result<Self> {
         let compressed = record.compressed.unwrap_or(0) != 0;
         let encrypted = record.pass != 0;
         if compressed && !encrypted && self.can_extract() {
-            return self.extracted_child(name).map(Some);
+            return self.extracted_child(&record.name);
         }
         let mut child = if compressed || encrypted {
-            Self {
-                kind: Kind::None,
-                source: self.source.clone(),
-                file_path: self.file_path.clone(),
-                fragment: self.fragment,
-                reader: None,
-                own_error: String::new(),
-                readerless: true,
-                unrar: self.unrar.clone(),
-                children: None,
-                temporary: false,
-                temp_files: Vec::new(),
-            }
+            self.readerless(String::new())
         } else {
             // `explode('-', ...)` reads a negative end as an empty string, so as zero.
             let range = record.range.map(|(start, end)| (start, end.max(0)));
@@ -386,6 +437,8 @@ impl ArchiveInfo {
                 self.fragment,
                 range,
                 self.unrar.clone(),
+                self.depth + 1,
+                self.budget.clone(),
             )?
         };
         if compressed {
@@ -394,50 +447,59 @@ impl ArchiveInfo {
         if child.is_encrypted() || encrypted {
             child.own_error = "The archive is encrypted and cannot be read".to_owned();
         }
-        Ok(Some(child))
+        Ok(child)
     }
 
     fn extracted_child(&mut self, name: &[u8]) -> Result<Self> {
-        let temp = NamedTempFile::new().context("creating a temp file for an inner archive")?;
-        let outcome = self.extract_file(name, temp.path());
+        if !self.budget.admit_extraction(MAX_EXTRACTIONS) {
+            let mut child = self.readerless(EXTRACTION_LIMIT.to_owned());
+            child.temporary = true;
+            return Ok(child);
+        }
+        let temp = NamedTempFile::new()
+            .context("creating a temp file for an inner archive")?
+            .into_temp_path();
+        let outcome = self.extract_file(name, &temp);
         let mut child = match outcome {
-            Ok(()) => Self::open_file(temp.path(), self.fragment, self.unrar.clone())?,
-            Err(message) => Self {
-                kind: Kind::None,
-                source: self.source.clone(),
-                file_path: None,
-                fragment: self.fragment,
-                reader: None,
-                own_error: message,
-                readerless: true,
-                unrar: self.unrar.clone(),
-                children: None,
-                temporary: false,
-                temp_files: Vec::new(),
-            },
+            Ok(()) => Self::open_file(
+                &temp,
+                self.fragment,
+                self.unrar.clone(),
+                self.depth + 1,
+                self.budget.clone(),
+            )?,
+            Err(message) => self.readerless(message),
         };
         child.temporary = true;
         self.temp_files.push(temp);
         Ok(child)
     }
 
-    /// `RarInfo::extractFile`: `unrar p` into `destination`. `Err` is the reader's error text.
+    /// The path the RAR client reads this archive from.
+    fn client_source(&mut self) -> Result<PathBuf, String> {
+        if let Some(path) = &self.file_path {
+            return Ok(path.clone());
+        }
+        if let Some(path) = &self.source_file {
+            return Ok(path.to_path_buf());
+        }
+        let mut temp = NamedTempFile::new().map_err(|failure| failure.to_string())?;
+        let data = self.source.stored_data().unwrap_or_default();
+        temp.write_all(data)
+            .map_err(|failure| failure.to_string())?;
+        let temp = temp.into_temp_path();
+        let path = temp.to_path_buf();
+        self.source_file = Some(temp);
+        Ok(path)
+    }
+
+    /// `RarInfo::extractFile`: `unrar p` into `destination`, within what's left to unpack.
+    /// `Err` is the reader's error text.
     fn extract_file(&mut self, name: &[u8], destination: &Path) -> Result<(), String> {
         let Some(client) = self.unrar.clone() else {
             return Err("An external client and valid data source are needed".to_owned());
         };
-        let source = match &self.file_path {
-            Some(path) => path.clone(),
-            None => {
-                let mut temp = NamedTempFile::new().map_err(|failure| failure.to_string())?;
-                let data = self.source.stored_data().unwrap_or_default();
-                temp.write_all(data)
-                    .map_err(|failure| failure.to_string())?;
-                let path = temp.path().to_path_buf();
-                self.temp_files.push(temp);
-                path
-            }
-        };
+        let source = self.client_source()?;
         let filename: Vec<u8> = name
             .iter()
             .filter(|byte| **byte != 0)
@@ -453,11 +515,44 @@ impl ArchiveInfo {
             .stdin(Stdio::null())
             .spawn()
             .map_err(|failure| failure.to_string())?;
-        let mut errors = Vec::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_end(&mut errors);
+        let stderr = child.stderr.take().map(|mut stderr| {
+            thread::spawn(move || {
+                let mut errors = Vec::new();
+                let _ = stderr.read_to_end(&mut errors);
+                errors
+            })
+        });
+        let allowance = MAX_EXTRACTED_BYTES - self.budget.extracted();
+        let written = || {
+            std::fs::metadata(destination)
+                .ok()
+                .and_then(|meta| i64::try_from(meta.len()).ok())
+                .unwrap_or(0)
+        };
+        let started = Instant::now();
+        let mut pause = Duration::from_millis(1);
+        let mut within_limits = true;
+        loop {
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(_)) | Err(_) => break,
+            }
+            if written() > allowance || started.elapsed() > EXTRACTION_TIMEOUT {
+                within_limits = false;
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(50));
         }
-        let _ = child.wait();
+        self.budget.add_extracted(written());
+        let errors = stderr
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        if !within_limits {
+            return Err(EXTRACTION_LIMIT.to_owned());
+        }
         let errors = String::from_utf8_lossy(&errors);
         if !errors.is_empty() && !errors.contains("All OK") {
             return Err(errors.into_owned());
@@ -485,12 +580,23 @@ impl ArchiveInfo {
             let Some(cursor) = child.reader.as_ref().and_then(Reader::cursor) else {
                 continue;
             };
-            let bytes = cursor
-                .absolute_range(cursor.start, cursor.end)
-                .unwrap_or_default();
+            if !self.budget.admit_extraction(MAX_EXTRACTIONS)
+                || cursor.length > MAX_EXTRACTED_BYTES - self.budget.extracted()
+            {
+                child.own_error = EXTRACTION_LIMIT.to_owned();
+                continue;
+            }
             let mut temp = NamedTempFile::new().context("creating a temp file")?;
-            temp.write_all(&bytes)?;
-            let mut opened = Self::open_file(temp.path(), child.fragment, child.unrar.clone())?;
+            cursor.copy_to(&mut temp)?;
+            self.budget.add_extracted(cursor.length);
+            let temp = temp.into_temp_path();
+            let mut opened = Self::open_file(
+                &temp,
+                child.fragment,
+                child.unrar.clone(),
+                child.depth,
+                self.budget.clone(),
+            )?;
             opened.temporary = true;
             *child = opened;
             self.temp_files.push(temp);
@@ -552,6 +658,15 @@ impl ArchiveInfo {
             }
             let branch = format!("{source} > {}", String::from_utf8_lossy(name));
             let files = child.entries()?;
+            // Every row carries the branch, and a deep one is kilobytes.
+            let rows = i64::try_from(files.len()).unwrap_or(MAX_RETAINED_BYTES);
+            if self.budget.retain_count(rows, branch.len()).is_err() {
+                list.push(ListEntry::Error {
+                    error: NESTING_LIMIT.to_owned(),
+                    source: branch,
+                });
+                continue;
+            }
             if !child.error().is_empty() || files.is_empty() {
                 let error = if child.error().is_empty() {
                     "No files found".to_owned()
@@ -654,11 +769,24 @@ fn has_archive_extension(name: &[u8]) -> bool {
         || extension.first() == Some(&b'r') && digits(&extension[1..])
 }
 
+/// Whether `SfvInfo` would accept these bytes.
+pub fn is_sfv(data: &[u8]) -> bool {
+    Cursor::open(
+        Source::Memory(Arc::new(data.to_vec())),
+        None,
+        Arc::default(),
+    )
+    .is_ok_and(
+        |mut cursor| !matches!(par2::parse_sfv(&mut cursor), Err(message) if !message.is_empty()),
+    )
+}
+
 /// `Par2Info` over bytes. `setData` without the fragment flag.
 pub fn par2_from_data(data: Arc<Vec<u8>>) -> Result<Par2Reader, String> {
     Ok(Par2Reader::analyze(Cursor::open(
         Source::Memory(data),
         None,
+        Arc::default(),
     )?))
 }
 
@@ -669,8 +797,11 @@ pub fn par2_from_file(path: &Path) -> Result<Par2Reader, String> {
         .metadata()
         .map_err(|failure| failure.to_string())
         .and_then(|meta| i64::try_from(meta.len()).map_err(|failure| failure.to_string()))?;
+    // Packets only move forward, so a large file needs its size in work and nothing worse.
+    let budget = Budget::with_work_limit(MAX_WORK.max(size.saturating_mul(2)));
     Ok(Par2Reader::analyze(Cursor::open(
         Source::File(Arc::new(file), size),
         None,
+        Arc::new(budget),
     )?))
 }

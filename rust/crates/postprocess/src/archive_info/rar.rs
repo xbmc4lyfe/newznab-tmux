@@ -1,9 +1,11 @@
 //! RAR 1.5 to 5.0 block parsing and file lists. Port of `RarInfo`, and `SrrInfo`, which is the
 //! same reader with no file data in it.
 
+use std::mem::size_of;
+
 use super::reader::{
-    Cursor, FileRecord, Parse, Thrown, dos_to_unix, find, int64, php_empty, truncated_name,
-    utf16le_to_utf8, windows_to_unix,
+    Cursor, FileRecord, MAX_SCAN_WORK, Parse, Thrown, dos_to_unix, find, int64, php_empty,
+    truncated_name, utf16le_to_utf8, windows_to_unix,
 };
 
 const BLOCK_MAIN: i64 = 0x73;
@@ -184,7 +186,7 @@ impl RarReader {
         self.process_block(&mut block)?;
         let offset = block.offset;
         let next = block.next_offset;
-        self.blocks.push(block);
+        self.keep(block)?;
         if self.is_encrypted {
             return Ok(false);
         }
@@ -196,6 +198,15 @@ impl RarReader {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// A block costs its row too, since each one can become a file list entry.
+    fn keep(&mut self, block: Block) -> Parse<()> {
+        self.cursor
+            .budget
+            .retain(size_of::<Block>() + size_of::<FileRecord>() + block.file_name.len())?;
+        self.blocks.push(block);
+        Ok(())
     }
 
     fn analyze_srr(&mut self) {
@@ -229,7 +240,7 @@ impl RarReader {
             SRR_STORED_FILE => {
                 let size = self.cursor.u16()?;
                 block.file_name = self.cursor.read(size)?;
-                self.cursor.read(block.add_size)?;
+                self.cursor.skip(block.add_size)?;
             }
             SRR_OSO_HASH => {
                 self.cursor.read(16)?;
@@ -244,7 +255,7 @@ impl RarReader {
         }
         let offset = block.offset;
         let next = block.next_offset;
-        self.blocks.push(block);
+        self.keep(block)?;
         if self.cursor.offset != next {
             self.cursor.seek(next)?;
         }
@@ -259,11 +270,15 @@ impl RarReader {
     fn find_file_header(&mut self) -> Option<i64> {
         let start = self.cursor.offset;
         let buffer = self.cursor.marker_buffer().ok()?;
+        let began = self.cursor.budget.work();
         for (position, _) in buffer
             .iter()
             .enumerate()
             .filter(|(_, byte)| i64::from(**byte) == BLOCK_FILE)
         {
+            if self.cursor.budget.work() - began > MAX_SCAN_WORK {
+                return None;
+            }
             let offset = i64::try_from(position).ok()? + start;
             let Ok(found) = self.try_file_header(offset) else {
                 continue;
@@ -484,7 +499,7 @@ impl RarReader {
                 block.file_name = self.cursor.read(block.name_size)?;
                 if !quick_open && block.head_type == R50_BLOCK_SERVICE {
                     if block.file_name == b"CMT" {
-                        self.cursor.read(data_size)?;
+                        self.cursor.skip(data_size)?;
                     } else if block.file_name == b"QO" {
                         self.process_quick_open_records(data_size)?;
                     }
@@ -674,7 +689,11 @@ impl RarReader {
                 Some(size) if size != 0 => size,
                 _ => block.data_size.ok_or(Thrown)?,
             };
-            let start = self.cursor.start + block.offset + block.head_size;
+            let start = self
+                .cursor
+                .start
+                .saturating_add(block.offset)
+                .saturating_add(block.head_size);
             let end = self.cursor.end.min(start.saturating_add(pack_size) - 1);
             record.range = Some((start, end));
         }
@@ -723,13 +742,26 @@ fn sane_file_header(block: &Block) -> bool {
     fail < 3
 }
 
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0_u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+            bit += 1;
+        }
+        table[index] = crc;
+        index += 1;
+    }
+    table
+};
+
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffff_u32;
     for byte in data {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
-        }
+        crc = (crc >> 8) ^ CRC_TABLE[usize::from((crc as u8) ^ *byte)];
     }
     !crc
 }

@@ -1,5 +1,7 @@
 //! ZIP record parsing and file lists. Port of `ZipInfo`.
 
+use std::mem::size_of;
+
 use super::reader::{Cursor, FileRecord, Parse, Thrown, dos_to_unix, find, int64, truncated_name};
 
 const RECORD_CENTRAL_FILE: u32 = 0x0201_4b50;
@@ -118,6 +120,9 @@ impl ZipReader {
         };
         self.process_record(&mut record)?;
         let next = record.next_offset;
+        self.cursor
+            .budget
+            .retain(size_of::<Record>() + size_of::<FileRecord>() + record.file_name.len())?;
         self.records.push(record);
         if self.cursor.offset != next {
             self.cursor.seek(next)?;
@@ -234,7 +239,7 @@ impl ZipReader {
                     record.disk_start = Some(self.cursor.u32()?);
                 }
             } else {
-                self.cursor.read(size)?;
+                self.cursor.skip(size)?;
             }
         }
         Ok(())

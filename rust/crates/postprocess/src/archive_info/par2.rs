@@ -18,6 +18,9 @@ pub const PACKET_FILEVER: &[u8; 16] = b"PAR 2.0\x00IFSC\x00\x00\x00\x00";
 pub const PACKET_RECOVERY: &[u8; 16] = b"PAR 2.0\x00RecvSlic";
 pub const PACKET_CREATOR: &[u8; 16] = b"PAR 2.0\x00Creator\x00";
 
+/// A file id as kept: a 32-character hex string.
+const ID_SIZE: usize = 32 + std::mem::size_of::<String>();
+
 #[derive(Clone, Debug, Default)]
 pub struct Packet {
     pub offset: i64,
@@ -92,6 +95,9 @@ impl Par2Reader {
         }
         self.process_packet(&mut packet)?;
         let (offset, next) = (packet.offset, packet.next_offset);
+        self.cursor
+            .budget
+            .retain(std::mem::size_of::<Packet>() + packet.file_name.len())?;
         self.packets.push(packet);
         if self.cursor.offset != next {
             self.cursor.seek(next)?;
@@ -132,11 +138,13 @@ impl Par2Reader {
             self.cursor.read(8)?;
             let recoverable = self.cursor.u32()?;
             for _ in 0..recoverable {
+                self.cursor.budget.retain(ID_SIZE)?;
                 packet
                     .recoverable_ids
                     .push(hex::encode(self.cursor.read(16)?));
             }
             while self.cursor.offset < packet.next_offset {
+                self.cursor.budget.retain(ID_SIZE)?;
                 packet.other_ids.push(hex::encode(self.cursor.read(16)?));
             }
         } else if &packet.kind == PACKET_FILEDESC {
@@ -157,7 +165,7 @@ impl Par2Reader {
             self.cursor.u32()?;
         } else if &packet.kind == PACKET_CREATOR {
             let length = packet.offset + packet.head_length - self.cursor.offset;
-            self.cursor.read(length)?;
+            self.cursor.skip(length)?;
         }
         Ok(())
     }

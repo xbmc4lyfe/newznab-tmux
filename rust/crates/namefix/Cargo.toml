@@ -7,16 +7,26 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
 clap.workspace = true
 nntmux-categorize.workspace = true
 nntmux-core.workspace = true
 nntmux-predb.workspace = true
 nntmux-runtime.workspace = true
+nntmux-search.workspace = true
+redis.workspace = true
 regex.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 unicode-normalization.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+nntmux-testkit.workspace = true
 
 [lints]
 workspace = true
