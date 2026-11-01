@@ -17,6 +17,7 @@ use flate2::read::GzDecoder;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
+use super::archive_probe::ArchiveProbe;
 use super::donor::{DonorIndex, DonorKey, DonorMatch, MIN_DONOR_HASHED_SIZE, size_can_identify};
 use super::ladder::{Context, Evidence, Flags, Hooks, Identification, Outcome, identify};
 use super::local_predb::{LocalPredb, PredbRow, parse_size_mib};
@@ -476,6 +477,16 @@ fn for_each_target<T: Send>(
 }
 
 pub fn run(options: &Options, hooks: Hooks<'_>) -> Result<Report> {
+    run_with_probe(options, hooks, None)
+}
+
+/// [`run`], and `probe` reads archive headers for releases with no other evidence, then climbs
+/// the ladder again with what it found.
+pub fn run_with_probe(
+    options: &Options,
+    hooks: Hooks<'_>,
+    probe: Option<&ArchiveProbe<'_>>,
+) -> Result<Report> {
     let started = Instant::now();
     let catalog_path = options.data_dir.join("catalog.db");
     let nzbs_path = options.data_dir.join("nzbs.db");
@@ -495,7 +506,18 @@ pub fn run(options: &Options, hooks: Hooks<'_>) -> Result<Report> {
     }
     let target_count = targets.len();
     let answers = for_each_target(&nzbs_path, options.threads, targets, |target| {
-        let (outcome, flags) = identify(target, &context);
+        let (mut outcome, flags) = identify(target, &context);
+        if let Some(probe) = probe
+            && !matches!(outcome, Outcome::Identified(_))
+            && flags.obfuscated_only()
+            && let Some(enriched) = probe.enrich(target)
+        {
+            let (second, _) = identify(&enriched, &context);
+            probe.record_outcome(&second);
+            if matches!(second, Outcome::Identified(_)) {
+                outcome = second;
+            }
+        }
         Answer {
             outcome,
             flags,
