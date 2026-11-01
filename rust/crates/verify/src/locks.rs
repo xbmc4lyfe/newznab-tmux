@@ -575,6 +575,11 @@ impl WorkerLocks {
         self.session.admitting_unpaused("worker").await
     }
 
+    /// Whether this worker already holds a candidate's stable lock, as far as it knows.
+    pub fn holds_candidate(&self, id: i64) -> bool {
+        self.candidates.contains_key(&id)
+    }
+
     pub async fn try_candidate(&mut self, id: i64) -> Result<bool> {
         if let Some(lock) = self.candidates.get(&id).cloned() {
             return Ok(self.session.holds(&lock).await);

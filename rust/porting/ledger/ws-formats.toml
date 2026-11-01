@@ -42,85 +42,85 @@ note = "C ABI behind an off-by-default feature; production used the lenient kern
 kind = "library"
 id = "formats:archive-metadata"
 source = "docker/app/nzb-yenc-ffi/src/formats.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:par2"
 source = "docker/app/nzb-yenc-ffi/src/par2.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:par2-source-ranges"
 source = "docker/app/nzb-yenc-ffi/src/par2_source_ranges.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:seven-zip-ranges"
 source = "docker/app/nzb-yenc-ffi/src/seven_zip_ranges.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:article-identity"
 source = "docker/app/nzb-yenc-ffi/src/article_identity.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:article-xref"
 source = "docker/app/nzb-yenc-ffi/src/article_xref.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:article-dates"
 source = "docker/app/nzb-yenc-ffi/src/article_dates.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:article-fingerprint"
 source = "docker/app/nzb-yenc-ffi/src/article_fingerprint.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:nntp-headers"
 source = "docker/app/nzb-yenc-ffi/src/nntp_headers.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:nntp-body"
 source = "docker/app/nzb-yenc-ffi/src/nntp_body.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:header-filename-identity"
 source = "docker/app/nzb-yenc-ffi/src/header_filename_identity.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:per-article-obfuscation"
 source = "docker/app/nzb-yenc-ffi/src/per_article_obfuscation.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:spot-check-sample-plan"
 source = "docker/app/nzb-yenc-ffi/src/sample_plan.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:release-names-html"
 source = "docker/app/nzb-yenc-ffi/src/release_names.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"

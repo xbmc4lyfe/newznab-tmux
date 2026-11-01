@@ -2,7 +2,9 @@
 
 use std::fmt::Write;
 
-#[derive(Clone, Debug, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum J {
     Null,
     Bool(bool),
