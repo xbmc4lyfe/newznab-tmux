@@ -16,7 +16,9 @@ use crate::release::Release;
 use crate::service::{CandidateSearch, IncompleteMatch, NameFixer, Par2Outcome, Par2Probe};
 use crate::update::{FixerCleaner, ReleaseSearch, ReleaseUpdater};
 
-const LEFT_GUIDS: [&str; 16] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"];
+const LEFT_GUIDS: [&str; 16] = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f",
+];
 
 /// `nntmux-ctl namefix ...`
 #[derive(Debug, Subcommand)]
@@ -79,7 +81,6 @@ struct Backends {
     search: Arc<dyn ReleaseSearch>,
     candidates: Arc<dyn CandidateSearch>,
     cleaner: FixerCleaner,
-    par2: Box<dyn Par2Probe>,
 }
 
 fn backends(_ctx: &Ctx) -> Result<Backends> {
@@ -87,7 +88,6 @@ fn backends(_ctx: &Ctx) -> Result<Backends> {
         search: Arc::new(crate::update::NoSearch),
         candidates: Arc::new(Unavailable),
         cleaner: nntmux_predb::filename::fixer_cleaner,
-        par2: Box::new(DeferPar2),
     })
 }
 
@@ -95,7 +95,12 @@ struct Unavailable;
 
 #[async_trait::async_trait]
 impl CandidateSearch for Unavailable {
-    async fn release_candidates_page(&self, _title: &str, _limit: u64, _after: i64) -> Result<crate::service::CandidatePage> {
+    async fn release_candidates_page(
+        &self,
+        _title: &str,
+        _limit: u64,
+        _after: i64,
+    ) -> Result<crate::service::CandidatePage> {
         bail!("The configured search backend is unavailable for paged PreDB matching.")
     }
 }
@@ -112,14 +117,26 @@ impl Par2Probe for DeferPar2 {
 
 async fn fixer(ctx: &Ctx, config: FixNamesConfig, backends: &Backends) -> Result<NameFixer> {
     let categorizer = Categorizer::load(&ctx.db).await?;
-    let updater = ReleaseUpdater::new(ctx.db.clone(), categorizer, backends.search.clone(), backends.cleaner);
+    let updater = ReleaseUpdater::new(
+        ctx.db.clone(),
+        categorizer,
+        backends.search.clone(),
+        backends.cleaner,
+    );
     Ok(NameFixer::new(updater, config))
 }
 
 pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
     let backends = backends(&ctx)?;
     match command {
-        Command::FixNames { method, update, category, set_status, limit, show } => {
+        Command::FixNames {
+            method,
+            update,
+            category,
+            set_status,
+            limit,
+            show,
+        } => {
             let mut config = FixNamesConfig::from_env();
             config.batch_limit = Some(limit.max(1));
             let categories = match category.as_str() {
@@ -130,15 +147,25 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
             let mut fixer = fixer(&ctx, config, &backends).await?;
             run_method(&mut fixer, method, update, categories, set_status, show).await
         }
-        Command::FixNamesGroup { kind, guid_char, limit, thread, workers } => match kind.as_str() {
+        Command::FixNamesGroup {
+            kind,
+            guid_char,
+            limit,
+            thread,
+            workers,
+        } => match kind.as_str() {
             "standard" => {
                 let Some(guid) = guid_char else {
                     bail!("--guid-char is required for standard type");
                 };
-                let Backends { search, candidates, cleaner, par2 } = backends;
-                let backends = Backends { search, candidates, cleaner, par2: Box::new(DeferPar2) };
-                let mut par2 = par2;
-                let (checked, fixed) = standard_pass(&ctx, &guid, limit.max(1) as usize, &backends, par2.as_mut()).await?;
+                let (checked, fixed) = standard_pass(
+                    &ctx,
+                    &guid,
+                    limit.max(1) as usize,
+                    &backends,
+                    &mut DeferPar2,
+                )
+                .await?;
                 if checked == 0 {
                     println!("No releases to process");
                 } else {
@@ -148,10 +175,13 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 Ok(())
             }
             "predbft" => {
-                let (processed, incomplete) = predbft_pass(&ctx, thread, workers, limit, &backends).await?;
+                let (processed, incomplete) =
+                    predbft_pass(&ctx, thread, workers, limit, &backends).await?;
                 println!("Processed {processed} PreDB entries");
                 if incomplete > 0 {
-                    bail!("{incomplete} PreDB entries remain unsearched after incomplete matching.");
+                    bail!(
+                        "{incomplete} PreDB entries remain unsearched after incomplete matching."
+                    );
                 }
                 Ok(())
             }
@@ -161,27 +191,73 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
         Command::MatchPrefiles { limit, show } => {
             let limit = match limit.as_str() {
                 "full" => None,
-                number => Some(number.parse::<i64>().context("Limit must be \"full\" or a numeric value.")?),
+                number => Some(
+                    number
+                        .parse::<i64>()
+                        .context("Limit must be \"full\" or a numeric value.")?,
+                ),
             };
             let mut fixer = fixer(&ctx, FixNamesConfig::from_env(), &backends).await?;
             fixer.match_prefiles(limit, show).await
         }
-        Command::FixNzbsplit { dry_run, include_renamed } => fix_nzbsplit(&ctx, dry_run, include_renamed, &backends).await,
+        Command::FixNzbsplit {
+            dry_run,
+            include_renamed,
+        } => fix_nzbsplit(&ctx, dry_run, include_renamed, &backends).await,
     }
 }
 
-async fn run_method(fixer: &mut NameFixer, method: u32, write: bool, categories: i32, status: bool, show: bool) -> Result<()> {
+async fn run_method(
+    fixer: &mut NameFixer,
+    method: u32,
+    write: bool,
+    categories: i32,
+    status: bool,
+    show: bool,
+) -> Result<()> {
     let time = if method % 2 == 1 { 1 } else { 2 };
     match method {
-        3 | 4 => fixer.fix_names_with_nfo(time, write, categories, status, show).await,
-        5 | 6 => fixer.fix_names_with_files(time, write, categories, status, show).await,
+        3 | 4 => {
+            fixer
+                .fix_names_with_nfo(time, write, categories, status, show)
+                .await
+        }
+        5 | 6 => {
+            fixer
+                .fix_names_with_files(time, write, categories, status, show)
+                .await
+        }
         7 | 8 => bail!("PAR2 renaming isn't ported yet"),
-        9 | 10 => fixer.fix_names_with_media(time, write, categories, status, show).await,
-        11 | 12 => fixer.fix_xxx_names_with_files(time, write, categories, status, show).await,
-        13 | 14 => fixer.fix_names_with_srr(time, write, categories, status, show).await,
-        15 | 16 => fixer.fix_names_with_par_hash(time, write, categories, status, show).await,
-        17 | 18 => fixer.fix_names_with_media_movie_name(time, write, categories, status, show).await,
-        19 | 20 => fixer.fix_names_with_crc(time, write, categories, status, show).await,
+        9 | 10 => {
+            fixer
+                .fix_names_with_media(time, write, categories, status, show)
+                .await
+        }
+        11 | 12 => {
+            fixer
+                .fix_xxx_names_with_files(time, write, categories, status, show)
+                .await
+        }
+        13 | 14 => {
+            fixer
+                .fix_names_with_srr(time, write, categories, status, show)
+                .await
+        }
+        15 | 16 => {
+            fixer
+                .fix_names_with_par_hash(time, write, categories, status, show)
+                .await
+        }
+        17 | 18 => {
+            fixer
+                .fix_names_with_media_movie_name(time, write, categories, status, show)
+                .await
+        }
+        19 | 20 => {
+            fixer
+                .fix_names_with_crc(time, write, categories, status, show)
+                .await
+        }
         other => bail!("Unknown method {other}. Use 3 to 20."),
     }
 }
@@ -212,15 +288,22 @@ async fn with_lock<T>(
 }
 
 /// Reserves a batch, newest first, and resumes below it next time.
-async fn reserve_standard_batch(ctx: &Ctx, config: &FixNamesConfig, left_guid: &str, limit: usize) -> Result<Vec<Release>> {
+async fn reserve_standard_batch(
+    ctx: &Ctx,
+    config: &FixNamesConfig,
+    left_guid: &str,
+    limit: usize,
+) -> Result<Vec<Release>> {
     let key = format!("rename:standard:cursor:{left_guid}");
     let reserved = with_lock(ctx, &key, 120, async |redis| {
         let cursor: Option<i64> = redis.get(&key).await.unwrap_or(None);
         let cursor = cursor.unwrap_or(0).max(0);
         let before = (cursor > 0).then_some(cursor);
-        let mut releases = queries::standard_candidate_batch(&ctx.db, config, left_guid, limit, before).await?;
+        let mut releases =
+            queries::standard_candidate_batch(&ctx.db, config, left_guid, limit, before).await?;
         if releases.is_empty() && cursor > 0 {
-            releases = queries::standard_candidate_batch(&ctx.db, config, left_guid, limit, None).await?;
+            releases =
+                queries::standard_candidate_batch(&ctx.db, config, left_guid, limit, None).await?;
         }
         match releases.iter().map(|release| release.id).min() {
             Some(lowest) => {
@@ -251,7 +334,12 @@ async fn standard_pass(
 
 /// A bounded id window. Unfinished titles stay eligible and come back when the window wraps,
 /// including after a worker crashes or its backend fails.
-async fn reserve_predb_batch(ctx: &Ctx, worker: i64, workers: i64, limit: i64) -> Result<Vec<PredbTitle>> {
+async fn reserve_predb_batch(
+    ctx: &Ctx,
+    worker: i64,
+    workers: i64,
+    limit: i64,
+) -> Result<Vec<PredbTitle>> {
     let count = workers.clamp(1, 16);
     let slot = worker.clamp(1, count) - 1;
     let key = format!("predb:fulltext:v1:{count}:{slot}");
@@ -263,7 +351,9 @@ async fn reserve_predb_batch(ctx: &Ctx, worker: i64, workers: i64, limit: i64) -
             (last >= 0 && last <= max).then_some((last, max))
         });
         let highest = async || -> Result<i64> {
-            let max: Option<u64> = sqlx::query_scalar("SELECT MAX(id) FROM predb").fetch_one(&ctx.db).await?;
+            let max: Option<u64> = sqlx::query_scalar("SELECT MAX(id) FROM predb")
+                .fetch_one(&ctx.db)
+                .await?;
             Ok(max.unwrap_or(0) as i64)
         };
         let (last, mut max) = match parsed {
@@ -290,7 +380,13 @@ async fn reserve_predb_batch(ctx: &Ctx, worker: i64, workers: i64, limit: i64) -
 }
 
 /// `(processed, incomplete)`. An incomplete title stays unsearched for a later pass.
-async fn predbft_pass(ctx: &Ctx, thread: i64, workers: i64, limit: i64, backends: &Backends) -> Result<(u64, u64)> {
+async fn predbft_pass(
+    ctx: &Ctx,
+    thread: i64,
+    workers: i64,
+    limit: i64,
+    backends: &Backends,
+) -> Result<(u64, u64)> {
     let titles = reserve_predb_batch(ctx, thread, workers, limit).await?;
     if titles.is_empty() {
         return Ok((0, 0));
@@ -299,9 +395,15 @@ async fn predbft_pass(ctx: &Ctx, thread: i64, workers: i64, limit: i64, backends
     let (mut processed, mut incomplete) = (0, 0);
     for pre in &titles {
         processed += 1;
-        let outcome = match fixer.match_predb_fulltext(pre, backends.candidates.as_ref()).await {
+        let outcome = match fixer
+            .match_predb_fulltext(pre, backends.candidates.as_ref())
+            .await
+        {
             Ok(outcome) if outcome.retry => {
-                tracing::warn!(predb = pre.predb_id, "current release evidence could not be completely confirmed");
+                tracing::warn!(
+                    predb = pre.predb_id,
+                    "current release evidence could not be completely confirmed"
+                );
                 incomplete += 1;
                 continue;
             }
@@ -325,7 +427,11 @@ async fn predbft_pass(ctx: &Ctx, thread: i64, workers: i64, limit: i64, backends
         } else {
             "UPDATE predb SET searched = ? WHERE id = ? AND searched = 0"
         };
-        sqlx::query(sql).bind(searched).bind(pre.predb_id).execute(&ctx.db).await?;
+        sqlx::query(sql)
+            .bind(searched)
+            .bind(pre.predb_id)
+            .execute(&ctx.db)
+            .await?;
     }
     Ok((processed, incomplete))
 }
@@ -359,7 +465,7 @@ async fn fixrelnames(ctx: &Ctx, kind: &str, backends: Backends) -> Result<()> {
         return Ok(());
     }
     let workers = guids.len() as i64;
-    let backends = Arc::new(backends_without_par2(backends));
+    let backends = Arc::new(backends);
     let mut failures = 0;
     for (chunk_index, chunk) in guids.chunks(threads).enumerate() {
         let mut tasks = tokio::task::JoinSet::new();
@@ -399,21 +505,34 @@ async fn fixrelnames(ctx: &Ctx, kind: &str, backends: Backends) -> Result<()> {
     Ok(())
 }
 
-fn backends_without_par2(backends: Backends) -> Backends {
-    Backends { par2: Box::new(DeferPar2), ..backends }
-}
-
-async fn fix_nzbsplit(ctx: &Ctx, dry_run: bool, include_renamed: bool, backends: &Backends) -> Result<()> {
+async fn fix_nzbsplit(
+    ctx: &Ctx,
+    dry_run: bool,
+    include_renamed: bool,
+    backends: &Backends,
+) -> Result<()> {
     let categorizer = Categorizer::load(&ctx.db).await?;
-    let renamed = if include_renamed { "" } else { " AND isrenamed = 0" };
-    let filter = format!("(name LIKE '%\\_\\_NZBSPLIT\\_\\_%' OR searchname LIKE '%\\_\\_NZBSPLIT\\_\\_%'){renamed}");
-    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM releases WHERE {filter}")))
-        .fetch_one(&ctx.db)
-        .await?;
+    let renamed = if include_renamed {
+        ""
+    } else {
+        " AND isrenamed = 0"
+    };
+    let filter = format!(
+        "(name LIKE '%\\_\\_NZBSPLIT\\_\\_%' OR searchname LIKE '%\\_\\_NZBSPLIT\\_\\_%'){renamed}"
+    );
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM releases WHERE {filter}"
+    )))
+    .fetch_one(&ctx.db)
+    .await?;
     if count == 0 {
         println!(
             "{}",
-            if include_renamed { "No NZBSPLIT-wrapped releases found." } else { "No unrenamed NZBSPLIT-wrapped releases found." }
+            if include_renamed {
+                "No NZBSPLIT-wrapped releases found."
+            } else {
+                "No unrenamed NZBSPLIT-wrapped releases found."
+            }
         );
         return Ok(());
     }
@@ -424,8 +543,17 @@ async fn fix_nzbsplit(ctx: &Ctx, dry_run: bool, include_renamed: bool, backends:
     let mut after = 0i64;
     let mut updated = 0;
     loop {
-        let rows: Vec<(i64, Option<String>, Option<String>, Option<String>, i64, i32)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(select.clone())).bind(after).fetch_all(&ctx.db).await?;
+        let rows: Vec<(
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            i32,
+        )> = sqlx::query_as(sqlx::AssertSqlSafe(select.clone()))
+            .bind(after)
+            .fetch_all(&ctx.db)
+            .await?;
         let Some(last) = rows.last().map(|row| row.0) else {
             break;
         };
@@ -437,7 +565,14 @@ async fn fix_nzbsplit(ctx: &Ctx, dry_run: bool, include_renamed: bool, backends:
             let Some(new_title) = new_title else {
                 continue;
             };
-            let decision = categorizer.determine(&ctx.db, group, &new_title, fromname.as_deref().unwrap_or("")).await?;
+            let decision = categorizer
+                .determine(
+                    &ctx.db,
+                    group,
+                    &new_title,
+                    fromname.as_deref().unwrap_or(""),
+                )
+                .await?;
             if dry_run {
                 println!(
                     "[dry-run] #{id} {} -> {new_title} ({category} -> {})",
@@ -486,7 +621,8 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
                 return Ok(false);
             }
             let guid = LEFT_GUIDS[slot % LEFT_GUIDS.len()];
-            let (checked, _) = standard_pass(&ctx, guid, per_run as usize, &backends, &mut DeferPar2).await?;
+            let (checked, _) =
+                standard_pass(&ctx, guid, per_run as usize, &backends, &mut DeferPar2).await?;
             let workers = threads.clamp(1, 16);
             let worker = (slot as i64 % workers) + 1;
             let (processed, _) = predbft_pass(&ctx, worker, workers, per_run, &backends).await?;

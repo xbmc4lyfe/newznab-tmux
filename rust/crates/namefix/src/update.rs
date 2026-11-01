@@ -7,11 +7,14 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use nntmux_categorize::Categorizer;
 use nntmux_predb::filename::{
-    OriginalFilenameEvidence, clean_for_matching, exact_value, extract_filename_from_path, format_search_name,
-    has_control, is_literal_technical_scene_title, is_plausible_release_title, matches_predb_filename_evidence,
-    normalize_candidate_title, strip_file_suffixes,
+    OriginalFilenameEvidence, clean_for_matching, exact_value, extract_filename_from_path,
+    format_search_name, has_control, is_literal_technical_scene_title, is_plausible_release_title,
+    matches_predb_filename_evidence, normalize_candidate_title, strip_file_suffixes,
 };
-use nntmux_predb::season::{episode_identity, has_non_single_episode_evidence, is_ancillary_name, is_episode_name, is_season_pack};
+use nntmux_predb::season::{
+    episode_identity, has_non_single_episode_evidence, is_ancillary_name, is_episode_name,
+    is_season_pack,
+};
 use serde_json::Value;
 use sqlx::{MySql, MySqlConnection, MySqlPool, QueryBuilder, Row};
 
@@ -20,8 +23,16 @@ use crate::release::{Release, Snapshot};
 
 const TV_LOOKUP_PENDING: i32 = 0;
 const MAX_WITNESSES: usize = 256;
-const SINGLE_UPDATE_COLUMNS: [&str; 8] =
-    ["predb_id", "proc_nfo", "proc_files", "proc_par2", "proc_uid", "proc_hash16k", "proc_srr", "proc_crc32"];
+const SINGLE_UPDATE_COLUMNS: [&str; 8] = [
+    "predb_id",
+    "proc_nfo",
+    "proc_files",
+    "proc_par2",
+    "proc_uid",
+    "proc_hash16k",
+    "proc_srr",
+    "proc_crc32",
+];
 
 /// What name fixing needs from the search index.
 #[async_trait]
@@ -150,15 +161,33 @@ impl ReleaseUpdater {
         }
         if predb_id > 0 {
             return self
-                .update_confirmed(release, name, method, write, kind, name_status, predb_id, filename_evidence, guard)
+                .update_confirmed(
+                    release,
+                    name,
+                    method,
+                    write,
+                    kind,
+                    name_status,
+                    predb_id,
+                    filename_evidence,
+                    guard,
+                )
                 .await;
         }
         if has_snapshot || self.relid != release.id {
             let literal = is_literal_technical_scene_title(name);
-            let cleaned = if literal { name.to_owned() } else { (self.fixer_cleaner)(name) };
+            let cleaned = if literal {
+                name.to_owned()
+            } else {
+                (self.fixer_cleaner)(name)
+            };
             // Normalize and sanity-check candidates from untrusted sources.
             let normalized = normalize_candidate_title(&cleaned);
-            let mut new_name = if literal { name.to_owned() } else { format_search_name(&cleaned, Some(&normalized)) };
+            let mut new_name = if literal {
+                name.to_owned()
+            } else {
+                format_search_name(&cleaned, Some(&normalized))
+            };
             if !is_trusted_source(kind, method) && !is_plausible_release_title(&normalized) {
                 self.done = true;
                 return Ok(());
@@ -171,22 +200,48 @@ impl ReleaseUpdater {
                 }
                 if kind == "PAR2, " && !literal {
                     new_name = ucwords(&new_name);
-                    if let Some(caps) = nntmux_categorize::rx!(i r"(.+?)\.[a-z0-9]{2,3}(PAR2)?$").captures(name.as_bytes()) {
+                    if let Some(caps) = nntmux_categorize::rx!(i r"(.+?)\.[a-z0-9]{2,3}(PAR2)?$")
+                        .captures(name.as_bytes())
+                    {
                         new_name = String::from_utf8_lossy(&caps[1]).into_owned();
                     }
                 }
                 // Strip any path, then edge punctuation.
                 let first = new_name.split('\\').next().unwrap_or("").to_owned();
-                let trimmed = nntmux_categorize::pcre::replace_all(nntmux_categorize::rx!(r"^[=_.:\s-]+"), &first, "");
-                let trimmed = nntmux_categorize::pcre::replace_all(nntmux_categorize::rx!(r"[=_.:\s-]+$"), &trimmed, "");
-                let title = if literal { trimmed } else { floor_bytes(&trimmed, 299) };
+                let trimmed = nntmux_categorize::pcre::replace_all(
+                    nntmux_categorize::rx!(r"^[=_.:\s-]+"),
+                    &first,
+                    "",
+                );
+                let trimmed = nntmux_categorize::pcre::replace_all(
+                    nntmux_categorize::rx!(r"[=_.:\s-]+$"),
+                    &trimmed,
+                    "",
+                );
+                let title = if literal {
+                    trimmed
+                } else {
+                    floor_bytes(&trimmed, 299)
+                };
 
                 if !write && !self.allows_archive_naming_preview(release, &title).await? {
                     return Ok(());
                 }
                 if write {
                     let expected = has_snapshot.then(|| release.clone());
-                    if !self.perform_update(release, &title, kind, name_status, 0, expected.as_ref(), None, guard).await? {
+                    if !self
+                        .perform_update(
+                            release,
+                            &title,
+                            kind,
+                            name_status,
+                            0,
+                            expected.as_ref(),
+                            None,
+                            guard,
+                        )
+                        .await?
+                    {
                         self.relid = 0;
                         return Ok(());
                     }
@@ -224,12 +279,26 @@ impl ReleaseUpdater {
         let mut title = title.to_owned();
         if !write {
             let mut tx = self.db.begin().await?;
-            let accepted = match lock_identity(&mut tx, release, predb_id, &title, evidence, guard.as_deref_mut()).await? {
+            let accepted = match lock_identity(
+                &mut tx,
+                release,
+                predb_id,
+                &title,
+                evidence,
+                guard.as_deref_mut(),
+            )
+            .await?
+            {
                 None => false,
                 Some(canonical) => match lock_snapshot(&mut tx, release).await? {
                     Some(current)
-                        if !renames_season_pack_to_episode(current.searchname.as_deref().unwrap_or(""), &canonical)
-                            && allows_archive_naming_locked(&mut tx, &current, &canonical, evidence).await? =>
+                        if !renames_season_pack_to_episode(
+                            current.searchname.as_deref().unwrap_or(""),
+                            &canonical,
+                        ) && allows_archive_naming_locked(
+                            &mut tx, &current, &canonical, evidence,
+                        )
+                        .await? =>
                     {
                         title = canonical;
                         true
@@ -244,7 +313,8 @@ impl ReleaseUpdater {
         }
         if exact_value(&title) == exact_value(release.searchname.as_deref().unwrap_or("")) {
             if write {
-                self.attach_predb_snapshot(release, predb_id, Some(&title), evidence, guard).await?;
+                self.attach_predb_snapshot(release, predb_id, Some(&title), evidence, guard)
+                    .await?;
             } else {
                 self.matched = true;
                 self.done = true;
@@ -252,7 +322,18 @@ impl ReleaseUpdater {
             return Ok(());
         }
         if write
-            && !self.perform_update(release, &title, kind, name_status, predb_id, Some(release), evidence, guard).await?
+            && !self
+                .perform_update(
+                    release,
+                    &title,
+                    kind,
+                    name_status,
+                    predb_id,
+                    Some(release),
+                    evidence,
+                    guard,
+                )
+                .await?
         {
             return Ok(());
         }
@@ -287,7 +368,9 @@ impl ReleaseUpdater {
         if exact_value(title) == exact_value(release.searchname.as_deref().unwrap_or("")) {
             let mut tx = self.db.begin().await?;
             if lock_snapshot(&mut tx, release).await?.is_none()
-                || lock_canonical_title(&mut tx, predb_id, title, None).await?.is_none()
+                || lock_canonical_title(&mut tx, predb_id, title, None)
+                    .await?
+                    .is_none()
             {
                 return Ok(false);
             }
@@ -304,21 +387,44 @@ impl ReleaseUpdater {
                 return Ok(false);
             }
             let after = lock_snapshot(&mut tx, release).await?;
-            if lock_canonical_title(&mut tx, predb_id, title, None).await?.is_none() {
+            if lock_canonical_title(&mut tx, predb_id, title, None)
+                .await?
+                .is_none()
+            {
                 return Ok(false);
             }
             tx.commit().await?;
-            self.after_commit(release.id, Written {
+            self.after_commit(
+                release.id,
+                Written {
                     identity: identity_pair(&before, after.as_ref()),
-                clear_par2: release.snapshot(),
-                ..Written::default()
-            })
+                    clear_par2: release.snapshot(),
+                    ..Written::default()
+                },
+            )
             .await?;
         } else {
-            if !self.perform_update(release, title, "PreDB FT Exact, ", true, predb_id, Some(release), None, None).await? {
+            if !self
+                .perform_update(
+                    release,
+                    title,
+                    "PreDB FT Exact, ",
+                    true,
+                    predb_id,
+                    Some(release),
+                    None,
+                    None,
+                )
+                .await?
+            {
                 return Ok(false);
             }
-            tracing::debug!(release = release.id, title, source, "renamed by PreDB title");
+            tracing::debug!(
+                release = release.id,
+                title,
+                source,
+                "renamed by PreDB title"
+            );
         }
         self.relid = release.id;
         self.matched = true;
@@ -365,7 +471,8 @@ impl ReleaseUpdater {
         .bind(snapshot.id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((guid, name, searchname, predb_id, category, renamed, categorized, pp)) = after else {
+        let Some((guid, name, searchname, predb_id, category, renamed, categorized, pp)) = after
+        else {
             return Ok(false);
         };
         if guid != snapshot.guid
@@ -380,13 +487,21 @@ impl ReleaseUpdater {
             return Ok(false);
         }
         tx.commit().await?;
-        let after = Snapshot { id: snapshot.id, guid, name, searchname };
-        self.after_commit(release.id, Written {
-            identity: Some((snapshot, after.clone())),
-            clear_par2: Some(after),
-            search: true,
-            ..Written::default()
-        })
+        let after = Snapshot {
+            id: snapshot.id,
+            guid,
+            name,
+            searchname,
+        };
+        self.after_commit(
+            release.id,
+            Written {
+                identity: Some((snapshot, after.clone())),
+                clear_par2: Some(after),
+                search: true,
+                ..Written::default()
+            },
+        )
         .await?;
         self.matched = true;
         self.done = true;
@@ -411,12 +526,22 @@ impl ReleaseUpdater {
         let mut tx = self.db.begin().await?;
         let mut canonical = title.to_owned();
         if predb_id > 0 {
-            match lock_identity(&mut tx, authority, predb_id, title, evidence, guard.as_deref_mut()).await? {
+            match lock_identity(
+                &mut tx,
+                authority,
+                predb_id,
+                title,
+                evidence,
+                guard.as_deref_mut(),
+            )
+            .await?
+            {
                 Some(value) => canonical = value,
                 None => return Ok(false),
             }
         } else if let Some(guard) = guard.as_deref_mut()
-            && (lock_snapshot(&mut tx, authority).await?.is_none() || !guard.accepted(&mut tx).await?)
+            && (lock_snapshot(&mut tx, authority).await?.is_none()
+                || !guard.accepted(&mut tx).await?)
         {
             return Ok(false);
         }
@@ -433,13 +558,20 @@ impl ReleaseUpdater {
         let Some(actual) = actual else {
             return Ok(false);
         };
-        if predb_id > 0 && renames_season_pack_to_episode(actual.searchname.as_deref().unwrap_or(""), &canonical) {
+        if predb_id > 0
+            && renames_season_pack_to_episode(
+                actual.searchname.as_deref().unwrap_or(""),
+                &canonical,
+            )
+        {
             return Ok(false);
         }
         if !allows_archive_naming_locked(&mut tx, &actual, &canonical, evidence).await? {
             // Only an otherwise current canonical filename attempt may be retried after
             // finalization supplies its missing archive proof.
-            if predb_id > 0 && evidence.is_some() && is_episode_name(&canonical)
+            if predb_id > 0
+                && evidence.is_some()
+                && is_episode_name(&canonical)
                 && let Some(expected) = expected
             {
                 self.episode_deferred = lock_unlinked(&mut tx, expected).await?.is_some();
@@ -451,7 +583,8 @@ impl ReleaseUpdater {
             completed.searchname = Some(canonical.clone());
         }
 
-        let mut update = QueryBuilder::<MySql>::new("UPDATE releases SET videos_id = 0, tv_episodes_id = ");
+        let mut update =
+            QueryBuilder::<MySql>::new("UPDATE releases SET videos_id = 0, tv_episodes_id = ");
         update
             .push_bind(TV_LOOKUP_PENDING)
             .push(", tv_lookup_attempts = 0, tv_lookup_retry_at = NULL, imdbid = NULL, book_lookup_attempts = 0, \
@@ -499,7 +632,12 @@ impl ReleaseUpdater {
             .and_then(|after| identity_pair(&actual, Some(&after.clone())));
 
         // Lost authority rolls the whole write back.
-        if predb_id > 0 && lock_canonical_title(&mut tx, predb_id, title, evidence).await?.as_deref() != Some(canonical.as_str()) {
+        if predb_id > 0
+            && lock_canonical_title(&mut tx, predb_id, title, evidence)
+                .await?
+                .as_deref()
+                != Some(canonical.as_str())
+        {
             self.committed = None;
             return Ok(false);
         }
@@ -518,12 +656,17 @@ impl ReleaseUpdater {
             poster: release.fromname.clone().unwrap_or_default(),
             expected: completed.clone(),
         };
-        self.after_commit(release.id, Written {
-            identity,
-            event: Some(event),
-            clear_par2: (predb_id > 0 || renamed_by_status).then_some(completed).flatten(),
-            search: true,
-        })
+        self.after_commit(
+            release.id,
+            Written {
+                identity,
+                event: Some(event),
+                clear_par2: (predb_id > 0 || renamed_by_status)
+                    .then_some(completed)
+                    .flatten(),
+                search: true,
+            },
+        )
         .await?;
         self.fixed += 1;
         Ok(true)
@@ -550,7 +693,8 @@ impl ReleaseUpdater {
     /// `RecategorizeReleaseAfterNameFix`: only while the release still has the fixed name.
     async fn recategorize(&self, event: &NameFixed) -> Result<()> {
         if let Some(expected) = &event.expected
-            && (expected.id != event.release_id || expected.searchname.as_deref() != Some(event.new_name.as_str()))
+            && (expected.id != event.release_id
+                || expected.searchname.as_deref() != Some(event.new_name.as_str()))
         {
             return Ok(());
         }
@@ -575,7 +719,10 @@ impl ReleaseUpdater {
         let group: i64 = row.try_get("groups_id")?;
         let fromname: Option<String> = row.try_get("fromname")?;
         let poster = fromname.unwrap_or_else(|| event.poster.clone());
-        let decision = self.categorizer.determine(&self.db, group, &event.new_name, &poster).await?;
+        let decision = self
+            .categorizer
+            .determine(&self.db, group, &event.new_name, &poster)
+            .await?;
         let current: i32 = row.try_get("categories_id")?;
         let categorized: i32 = row.try_get("iscategorized")?;
         if current == decision.category && categorized == 1 {
@@ -602,7 +749,11 @@ impl ReleaseUpdater {
             return Ok(());
         }
         let sql = format!("UPDATE releases SET {column} = ? WHERE id = ?");
-        sqlx::query(sqlx::AssertSqlSafe(sql)).bind(status).bind(id).execute(&self.db).await?;
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(status)
+            .bind(id)
+            .execute(&self.db)
+            .await?;
         if (column == "proc_par2" && status == 1) || (column == "predb_id" && status > 0) {
             let row: Option<(String, Option<String>, Option<String>)> =
                 sqlx::query_as("SELECT guid, name, searchname FROM releases WHERE id = ?")
@@ -610,20 +761,39 @@ impl ReleaseUpdater {
                     .fetch_optional(&self.db)
                     .await?;
             if let Some((guid, name, searchname)) = row {
-                crate::par2_progress::forget_completed_snapshot(&self.db, &Snapshot { id, guid, name, searchname }).await?;
+                crate::par2_progress::forget_completed_snapshot(
+                    &self.db,
+                    &Snapshot {
+                        id,
+                        guid,
+                        name,
+                        searchname,
+                    },
+                )
+                .await?;
             }
         }
         Ok(())
     }
 
     /// Updates a status only while the captured release stays unchanged and unlinked.
-    pub async fn update_snapshot_column(&self, release: &Release, column: &str, status: i64) -> Result<bool> {
-        self.update_snapshot_status(&self.db, release, column, status, 0).await
+    pub async fn update_snapshot_column(
+        &self,
+        release: &Release,
+        column: &str,
+        status: i64,
+    ) -> Result<bool> {
+        self.update_snapshot_status(&self.db, release, column, status, 0)
+            .await
     }
 
     /// Completes filename inspection only while the identity and PreDB link stay unchanged, and
     /// only while the filename evidence behind the decision still holds.
-    pub async fn complete_filename_snapshot(&self, release: &Release, guard: &mut FilenameGuard) -> Result<bool> {
+    pub async fn complete_filename_snapshot(
+        &self,
+        release: &Release,
+        guard: &mut FilenameGuard,
+    ) -> Result<bool> {
         if release.predb_id < 0 {
             return Ok(false);
         }
@@ -636,12 +806,18 @@ impl ReleaseUpdater {
         Ok(false)
     }
 
-    async fn try_complete_filename(&self, release: &Release, guard: &mut FilenameGuard) -> Result<bool> {
+    async fn try_complete_filename(
+        &self,
+        release: &Release,
+        guard: &mut FilenameGuard,
+    ) -> Result<bool> {
         let mut tx = self.db.begin().await?;
         if lock_snapshot(&mut tx, release).await?.is_none() || !guard.accepted(&mut tx).await? {
             return Ok(false);
         }
-        let done = self.update_snapshot_status(&mut *tx, release, "proc_files", 1, release.predb_id).await?;
+        let done = self
+            .update_snapshot_status(&mut *tx, release, "proc_files", 1, release.predb_id)
+            .await?;
         if done && !guard.accepted(&mut tx).await? {
             return Ok(false);
         }
@@ -667,7 +843,13 @@ impl ReleaseUpdater {
             return Ok(false);
         }
         let mut update = QueryBuilder::<MySql>::new("UPDATE releases SET ");
-        update.push(column).push(" = ").push_bind(status).push(" WHERE predb_id = ").push_bind(expected_predb).push(" AND");
+        update
+            .push(column)
+            .push(" = ")
+            .push_bind(status)
+            .push(" WHERE predb_id = ")
+            .push_bind(expected_predb)
+            .push(" AND");
         release.push_snapshot(&mut update);
         let updated = update.build().execute(executor).await?.rows_affected() > 0;
         Ok(updated)
@@ -696,7 +878,16 @@ impl ReleaseUpdater {
         }
         let title = expected_title.unwrap_or(searchname).to_owned();
         let mut tx = self.db.begin().await?;
-        let Some(canonical) = lock_identity(&mut tx, release, predb_id, &title, evidence, guard.as_deref_mut()).await? else {
+        let Some(canonical) = lock_identity(
+            &mut tx,
+            release,
+            predb_id,
+            &title,
+            evidence,
+            guard.as_deref_mut(),
+        )
+        .await?
+        else {
             return Ok(false);
         };
         let Some(before) = lock_snapshot(&mut tx, release).await? else {
@@ -718,7 +909,11 @@ impl ReleaseUpdater {
         if !after.as_ref().is_some_and(|after| linked(after.predb_id)) {
             return Ok(false);
         }
-        if lock_canonical_title(&mut tx, predb_id, &title, evidence).await?.as_deref() != Some(canonical.as_str()) {
+        if lock_canonical_title(&mut tx, predb_id, &title, evidence)
+            .await?
+            .as_deref()
+            != Some(canonical.as_str())
+        {
             return Ok(false);
         }
         if let Some(guard) = guard.as_deref_mut()
@@ -727,11 +922,14 @@ impl ReleaseUpdater {
             return Ok(false);
         }
         tx.commit().await?;
-        self.after_commit(release.id, Written {
-            identity: identity_pair(&before, after.as_ref()),
-            clear_par2: attached.then(|| release.snapshot()).flatten(),
-            ..Written::default()
-        })
+        self.after_commit(
+            release.id,
+            Written {
+                identity: identity_pair(&before, after.as_ref()),
+                clear_par2: attached.then(|| release.snapshot()).flatten(),
+                ..Written::default()
+            },
+        )
         .await?;
         self.relid = release.id;
         self.matched = true;
@@ -740,7 +938,12 @@ impl ReleaseUpdater {
     }
 
     /// Read-only preview evidence. The guarded write validates it again.
-    pub async fn current_predb_title(&self, predb_id: i64, title: &str, evidence: Option<&str>) -> Result<Option<String>> {
+    pub async fn current_predb_title(
+        &self,
+        predb_id: i64,
+        title: &str,
+        evidence: Option<&str>,
+    ) -> Result<Option<String>> {
         let mut conn = self.db.acquire().await?;
         canonical_title(&mut conn, predb_id, title, evidence, false).await
     }
@@ -773,7 +976,9 @@ impl ReleaseUpdater {
         if candidates.is_empty() {
             return Ok(None);
         }
-        let mut query = QueryBuilder::<MySql>::new("SELECT CAST(id AS SIGNED), title FROM predb WHERE title IN (");
+        let mut query = QueryBuilder::<MySql>::new(
+            "SELECT CAST(id AS SIGNED), title FROM predb WHERE title IN (",
+        );
         let mut separated = query.separated(", ");
         for candidate in &candidates {
             separated.push_bind(candidate.clone());
@@ -783,7 +988,11 @@ impl ReleaseUpdater {
         for candidate in &candidates {
             let identity = exact_value(candidate);
             // The last row with an identity wins, as PHP's keyed array does.
-            if let Some((id, title)) = rows.iter().rev().find(|(_, title)| exact_value(title) == identity) {
+            if let Some((id, title)) = rows
+                .iter()
+                .rev()
+                .find(|(_, title)| exact_value(title) == identity)
+            {
                 return Ok(Some((title.clone(), *id)));
             }
         }
@@ -795,19 +1004,26 @@ fn is_concurrency_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<sqlx::Error>()
         .and_then(sqlx::Error::as_database_error)
-        .and_then(|db| db.code().map(|code| matches!(code.as_ref(), "40001" | "HY000" | "1213" | "1205")))
+        .and_then(|db| {
+            db.code()
+                .map(|code| matches!(code.as_ref(), "40001" | "HY000" | "1213" | "1205"))
+        })
         .unwrap_or(false)
 }
 
 /// `PREDB_REGEX` hits over the whole text.
 pub fn predb_regex_hits(text: &str) -> Vec<String> {
-    predb_regex().find_iter(text).map(|hit| hit.as_str().to_owned()).collect()
+    predb_regex()
+        .find_iter(text)
+        .map(|hit| hit.as_str().to_owned())
+        .collect()
 }
 
 /// A scene release name: `/([\w.'()\[\]-]+(?:[\s._-]+[\w.'()\[\]-]+)+[-.][\w]+)/ui`.
 pub fn predb_regex() -> &'static regex::Regex {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)([\w.'()\[\]-]+(?:[\s._-]+[\w.'()\[\]-]+)+[-.][\w]+)").expect("static pattern")
+        regex::Regex::new(r"(?i)([\w.'()\[\]-]+(?:[\s._-]+[\w.'()\[\]-]+)+[-.][\w]+)")
+            .expect("static pattern")
     });
     &RE
 }
@@ -815,7 +1031,10 @@ pub fn predb_regex() -> &'static regex::Regex {
 fn identity_pair(before: &Release, after: Option<&Release>) -> Option<(Snapshot, Snapshot)> {
     let before = before.snapshot()?;
     let after = after?.snapshot()?;
-    (!before.guid.is_empty() && before.id == after.id && before.guid == after.guid && before.name == after.name)
+    (!before.guid.is_empty()
+        && before.id == after.id
+        && before.guid == after.guid
+        && before.name == after.name)
         .then_some((before, after))
 }
 
@@ -888,7 +1107,10 @@ fn ucwords(value: &str) -> String {
 }
 
 /// The current row, under a lock, while it still has the observed identity.
-pub async fn lock_snapshot(conn: &mut MySqlConnection, release: &Release) -> Result<Option<Release>> {
+pub async fn lock_snapshot(
+    conn: &mut MySqlConnection,
+    release: &Release,
+) -> Result<Option<Release>> {
     select_locked(conn, release, "").await
 }
 
@@ -896,7 +1118,11 @@ async fn lock_unlinked(conn: &mut MySqlConnection, release: &Release) -> Result<
     select_locked(conn, release, " predb_id = 0 AND").await
 }
 
-async fn select_locked(conn: &mut MySqlConnection, release: &Release, prefix: &str) -> Result<Option<Release>> {
+async fn select_locked(
+    conn: &mut MySqlConnection,
+    release: &Release,
+    prefix: &str,
+) -> Result<Option<Release>> {
     let mut query = QueryBuilder::<MySql>::new(
         "SELECT id AS releases_id, guid, name, searchname, fromname, groups_id, categories_id, predb_id, isrenamed FROM releases WHERE",
     );
@@ -952,16 +1178,24 @@ async fn canonical_title(
     } else {
         "SELECT title, filename FROM predb WHERE id = ?"
     };
-    let row: Option<(String, String)> = sqlx::query_as(sql).bind(predb_id).fetch_optional(&mut *conn).await?;
+    let row: Option<(String, String)> = sqlx::query_as(sql)
+        .bind(predb_id)
+        .fetch_optional(&mut *conn)
+        .await?;
     let Some((current, filename)) = row else {
         return Ok(None);
     };
-    if current.chars().count() > 255 || has_control(&current) || exact_value(&current) != exact_value(title) {
+    if current.chars().count() > 255
+        || has_control(&current)
+        || exact_value(&current) != exact_value(title)
+    {
         return Ok(None);
     }
     match evidence {
         None => Ok(Some(current)),
-        Some(evidence) => Ok(OriginalFilenameEvidence::new(evidence).accepts(&current, &filename).then_some(current)),
+        Some(evidence) => Ok(OriginalFilenameEvidence::new(evidence)
+            .accepts(&current, &filename)
+            .then_some(current)),
     }
 }
 
@@ -979,13 +1213,17 @@ pub async fn allows_archive_naming_locked(
     let Some(candidate_identity) = episode_identity(candidate) else {
         return Ok(false);
     };
-    let guid = release.guid.as_deref().ok_or_else(|| anyhow!("release has no guid"))?;
+    let guid = release
+        .guid
+        .as_deref()
+        .ok_or_else(|| anyhow!("release has no guid"))?;
     // The release lock serializes both observations and generation changes.
-    let actual: Option<u64> = sqlx::query_scalar("SELECT id FROM releases WHERE id = ? AND guid = ? FOR UPDATE")
-        .bind(release.id)
-        .bind(guid)
-        .fetch_optional(&mut *conn)
-        .await?;
+    let actual: Option<u64> =
+        sqlx::query_scalar("SELECT id FROM releases WHERE id = ? AND guid = ? FOR UPDATE")
+            .bind(release.id)
+            .bind(guid)
+            .fetch_optional(&mut *conn)
+            .await?;
     if actual.is_none() {
         return Ok(false);
     }
@@ -1008,17 +1246,25 @@ pub async fn allows_archive_naming_locked(
         // compatibility, but reject positively known packs.
         return Ok(names.len() <= MAX_WITNESSES && !has_non_single_episode_evidence(&names));
     };
-    if release_guid != guid || version != 1 || !matches!(scope.as_str(), "unknown" | "incomplete" | "complete_single" | "multi_episode") {
+    if release_guid != guid
+        || version != 1
+        || !matches!(
+            scope.as_str(),
+            "unknown" | "incomplete" | "complete_single" | "multi_episode"
+        )
+    {
         bail!("Malformed archive naming evidence.");
     }
     let names = decode_witnesses(&files)?;
     if scope != "complete_single" || has_non_single_episode_evidence(&names) {
         return Ok(false);
     }
-    let digest: Option<String> = sqlx::query_scalar("SELECT source_digest FROM release_nzb_contents WHERE guid = ? LOCK IN SHARE MODE")
-        .bind(guid)
-        .fetch_optional(&mut *conn)
-        .await?;
+    let digest: Option<String> = sqlx::query_scalar(
+        "SELECT source_digest FROM release_nzb_contents WHERE guid = ? LOCK IN SHARE MODE",
+    )
+    .bind(guid)
+    .fetch_optional(&mut *conn)
+    .await?;
     if digest.as_deref() != Some(source.as_str()) {
         return Ok(false);
     }
@@ -1032,7 +1278,9 @@ pub async fn allows_archive_naming_locked(
             None => {
                 // A canonical filename mapping resolves one opaque payload, whatever its
                 // extension, but not an unclassified sibling.
-                let matches = query.as_deref().is_some_and(|query| matches_predb_filename_evidence(name, query));
+                let matches = query
+                    .as_deref()
+                    .is_some_and(|query| matches_predb_filename_evidence(name, query));
                 if resolved_opaque || !matches {
                     return Ok(false);
                 }
@@ -1042,12 +1290,17 @@ pub async fn allows_archive_naming_locked(
     }
     for name in &names {
         if evidence.is_some() {
-            if query.as_deref().is_some_and(|query| matches_predb_filename_evidence(name, query)) {
+            if query
+                .as_deref()
+                .is_some_and(|query| matches_predb_filename_evidence(name, query))
+            {
                 return Ok(true);
             }
         } else {
             let title = strip_file_suffixes(extract_filename_from_path(name));
-            if exact_value(&normalize_candidate_title(&title)) == exact_value(&normalize_candidate_title(candidate)) {
+            if exact_value(&normalize_candidate_title(&title))
+                == exact_value(&normalize_candidate_title(candidate))
+            {
                 return Ok(true);
             }
         }
@@ -1056,14 +1309,24 @@ pub async fn allows_archive_naming_locked(
 }
 
 fn decode_witnesses(json: &str) -> Result<Vec<String>> {
-    let parsed: Value = serde_json::from_str(json).map_err(|_| anyhow!("Malformed archive filename witnesses."))?;
-    let list = parsed.as_array().ok_or_else(|| anyhow!("Malformed archive filename witnesses."))?;
+    let parsed: Value =
+        serde_json::from_str(json).map_err(|_| anyhow!("Malformed archive filename witnesses."))?;
+    let list = parsed
+        .as_array()
+        .ok_or_else(|| anyhow!("Malformed archive filename witnesses."))?;
     let mut names = Vec::with_capacity(list.len());
     let mut bytes = 0;
     for value in list {
-        let name = value.as_str().ok_or_else(|| anyhow!("Malformed archive filename witness."))?;
+        let name = value
+            .as_str()
+            .ok_or_else(|| anyhow!("Malformed archive filename witness."))?;
         bytes += name.len();
-        if name.is_empty() || name.len() > 4096 || names.len() >= MAX_WITNESSES || bytes > 32768 || names.iter().any(|n: &String| n == name) {
+        if name.is_empty()
+            || name.len() > 4096
+            || names.len() >= MAX_WITNESSES
+            || bytes > 32768
+            || names.iter().any(|n: &String| n == name)
+        {
             bail!("Unbounded archive filename witnesses.");
         }
         names.push(name.to_owned());

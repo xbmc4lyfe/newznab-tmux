@@ -40,21 +40,41 @@ impl Source {
 
     fn exists(self) -> &'static str {
         match self {
-            Self::Nfo => "EXISTS (SELECT 1 FROM release_nfos source_nfo WHERE source_nfo.releases_id = r.id)",
-            Self::Files => "EXISTS (SELECT 1 FROM release_files source_file WHERE source_file.releases_id = r.id)",
-            Self::Srr => "EXISTS (SELECT 1 FROM release_files source_srr WHERE source_srr.releases_id = r.id AND (source_srr.name LIKE '%.srr' OR source_srr.name LIKE '%.srs'))",
-            Self::Crc => "EXISTS (SELECT 1 FROM release_files source_crc WHERE source_crc.releases_id = r.id AND source_crc.crc32 IS NOT NULL AND source_crc.crc32 != '')",
-            Self::Uid => "EXISTS (SELECT 1 FROM media_infos source_media WHERE source_media.releases_id = r.id AND source_media.unique_id IS NOT NULL AND source_media.unique_id != '')",
-            Self::Hash => "EXISTS (SELECT 1 FROM par_hashes source_hash WHERE source_hash.releases_id = r.id AND source_hash.hash != '')",
+            Self::Nfo => {
+                "EXISTS (SELECT 1 FROM release_nfos source_nfo WHERE source_nfo.releases_id = r.id)"
+            }
+            Self::Files => {
+                "EXISTS (SELECT 1 FROM release_files source_file WHERE source_file.releases_id = r.id)"
+            }
+            Self::Srr => {
+                "EXISTS (SELECT 1 FROM release_files source_srr WHERE source_srr.releases_id = r.id AND (source_srr.name LIKE '%.srr' OR source_srr.name LIKE '%.srs'))"
+            }
+            Self::Crc => {
+                "EXISTS (SELECT 1 FROM release_files source_crc WHERE source_crc.releases_id = r.id AND source_crc.crc32 IS NOT NULL AND source_crc.crc32 != '')"
+            }
+            Self::Uid => {
+                "EXISTS (SELECT 1 FROM media_infos source_media WHERE source_media.releases_id = r.id AND source_media.unique_id IS NOT NULL AND source_media.unique_id != '')"
+            }
+            Self::Hash => {
+                "EXISTS (SELECT 1 FROM par_hashes source_hash WHERE source_hash.releases_id = r.id AND source_hash.hash != '')"
+            }
             Self::Par2 => "r.nzbstatus = 1",
-            Self::Xxx => "EXISTS (SELECT 1 FROM release_files source_xxx WHERE source_xxx.releases_id = r.id AND source_xxx.name LIKE '%SDPORN%')",
-            Self::MediaMovie => "EXISTS (SELECT 1 FROM media_infos source_movie WHERE source_movie.releases_id = r.id AND source_movie.movie_name IS NOT NULL AND source_movie.movie_name != '')",
+            Self::Xxx => {
+                "EXISTS (SELECT 1 FROM release_files source_xxx WHERE source_xxx.releases_id = r.id AND source_xxx.name LIKE '%SDPORN%')"
+            }
+            Self::MediaMovie => {
+                "EXISTS (SELECT 1 FROM media_infos source_movie WHERE source_movie.releases_id = r.id AND source_movie.movie_name IS NOT NULL AND source_movie.movie_name != '')"
+            }
         }
     }
 }
 
 fn others_group() -> String {
-    cat::OTHERS_GROUP.iter().map(i32::to_string).collect::<Vec<_>>().join(",")
+    cat::OTHERS_GROUP
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// `TMUX_FIX_NAMES_*` settings.
@@ -76,31 +96,52 @@ pub struct FixNamesConfig {
 impl FixNamesConfig {
     pub fn from_env() -> Self {
         fn parsed<T: std::str::FromStr>(name: &str, default: T) -> T {
-            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
         }
         Self {
-            batch_limit: std::env::var("TMUX_FIX_NAMES_BATCH_LIMIT").ok().and_then(|v| v.parse().ok()).filter(|v| *v > 0),
-            category: std::env::var("TMUX_FIX_NAMES_CATEGORY").unwrap_or_else(|_| "other".to_owned()),
+            batch_limit: std::env::var("TMUX_FIX_NAMES_BATCH_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0),
+            category: std::env::var("TMUX_FIX_NAMES_CATEGORY")
+                .unwrap_or_else(|_| "other".to_owned()),
             full_backlog: !matches!(
-                std::env::var("TMUX_FIX_NAMES_FULL_BACKLOG").unwrap_or_default().to_ascii_lowercase().as_str(),
+                std::env::var("TMUX_FIX_NAMES_FULL_BACKLOG")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .as_str(),
                 "0" | "false" | "off" | "no"
             ),
             par2_budget_seconds: parsed("TMUX_FIX_NAMES_PAR2_BUDGET_SECONDS", 60u64).max(1),
             par2_max_releases: parsed("TMUX_FIX_NAMES_PAR2_MAX_RELEASES", 300usize).max(1),
             par2_max_local_skips: parsed("TMUX_FIX_NAMES_PAR2_MAX_LOCAL_SKIPS", 3000usize),
             par2_max_probes: parsed("TMUX_FIX_NAMES_PAR2_MAX_PROBES", 4usize).max(1),
-            par2_max_probe_bytes: parsed("TMUX_FIX_NAMES_PAR2_MAX_PROBE_BYTES", 2_097_152usize).max(1),
-            par2_max_state_bytes: parsed("TMUX_FIX_NAMES_PAR2_MAX_STATE_BYTES", 8_388_608usize).max(1),
+            par2_max_probe_bytes: parsed("TMUX_FIX_NAMES_PAR2_MAX_PROBE_BYTES", 2_097_152usize)
+                .max(1),
+            par2_max_state_bytes: parsed("TMUX_FIX_NAMES_PAR2_MAX_STATE_BYTES", 8_388_608usize)
+                .max(1),
         }
     }
 }
 
 /// `time` is 1 for the past six hours. `categories` is 1 for misc, 2 for all, 3 for PreDB
 /// linking only, which ignores processing status.
-fn push_candidate_where(query: &mut QueryBuilder<'_, MySql>, source: Source, time: i32, categories: i32) {
-    query.push(" r.predb_id = 0 AND (").push(source.exists()).push(")");
+fn push_candidate_where(
+    query: &mut QueryBuilder<MySql>,
+    source: Source,
+    time: i32,
+    categories: i32,
+) {
+    query
+        .push(" r.predb_id = 0 AND (")
+        .push(source.exists())
+        .push(")");
     if categories != 3 {
-        query.push(" AND (r.isrenamed = 0 OR r.categories_id IN (")
+        query
+            .push(" AND (r.isrenamed = 0 OR r.categories_id IN (")
             .push_bind(cat::OTHER_MISC)
             .push(", ")
             .push_bind(cat::OTHER_HASHED)
@@ -112,7 +153,10 @@ fn push_candidate_where(query: &mut QueryBuilder<'_, MySql>, source: Source, tim
         query.push(" AND r.adddate > NOW() - INTERVAL 6 HOUR");
     }
     if categories == 1 {
-        query.push(" AND r.categories_id IN (").push(others_group()).push(")");
+        query
+            .push(" AND r.categories_id IN (")
+            .push(others_group())
+            .push(")");
     }
     // An in-place upgrade resets each source's status while its rows still describe the
     // smaller NZB, so a partial awaiting late articles is renamed once settled.
@@ -135,30 +179,49 @@ pub async fn candidate_batch(
     limit: usize,
     through_id: Option<i64>,
 ) -> Result<Vec<Release>> {
-    let batch = if limit == BATCH_SIZE { config.batch_limit.unwrap_or(limit) } else { limit };
+    let batch = if limit == BATCH_SIZE {
+        config.batch_limit.unwrap_or(limit)
+    } else {
+        limit
+    };
     let mut query = QueryBuilder::<MySql>::new("SELECT ");
-    query.push(Release::CANDIDATE_COLUMNS).push(" FROM releases r WHERE");
+    query
+        .push(Release::CANDIDATE_COLUMNS)
+        .push(" FROM releases r WHERE");
     push_candidate_where(&mut query, source, time, categories);
     query.push(" AND r.id > ").push_bind(after_id);
     if let Some(through) = through_id {
         query.push(" AND r.id <= ").push_bind(through);
     }
-    query.push(" ORDER BY r.id ASC LIMIT ").push_bind(batch.max(1) as i64);
+    query
+        .push(" ORDER BY r.id ASC LIMIT ")
+        .push_bind(batch.max(1) as i64);
     rows(query, db).await
 }
 
-pub async fn count_candidates(db: &MySqlPool, source: Source, time: i32, categories: i32) -> Result<i64> {
+pub async fn count_candidates(
+    db: &MySqlPool,
+    source: Source,
+    time: i32,
+    categories: i32,
+) -> Result<i64> {
     let mut query = QueryBuilder::<MySql>::new("SELECT COUNT(*) FROM releases r WHERE");
     push_candidate_where(&mut query, source, time, categories);
     Ok(query.build_query_scalar().fetch_one(db).await?)
 }
 
-async fn rows(mut query: QueryBuilder<'_, MySql>, db: &MySqlPool) -> Result<Vec<Release>> {
-    query.build().fetch_all(db).await?.iter().map(|row| Ok(Release::from_row(row)?)).collect()
+async fn rows(mut query: QueryBuilder<MySql>, db: &MySqlPool) -> Result<Vec<Release>> {
+    let found: Vec<sqlx::mysql::MySqlRow> = query.build().fetch_all(db).await?;
+    found
+        .iter()
+        .map(|row| Ok(Release::from_row(row)?))
+        .collect()
 }
 
 pub async fn high_watermark(db: &MySqlPool) -> Result<i64> {
-    let highest: Option<u64> = sqlx::query_scalar("SELECT MAX(id) FROM releases").fetch_one(db).await?;
+    let highest: Option<u64> = sqlx::query_scalar("SELECT MAX(id) FROM releases")
+        .fetch_one(db)
+        .await?;
     Ok(highest.unwrap_or(0) as i64)
 }
 
@@ -185,12 +248,17 @@ pub async fn standard_candidate_batch(
              OR r.proc_crc32 = 0)",
         );
     if config.category != "all" {
-        query.push(" AND r.categories_id IN (").push(others_group()).push(")");
+        query
+            .push(" AND r.categories_id IN (")
+            .push(others_group())
+            .push(")");
     }
     if let Some(before) = before_id {
         query.push(" AND r.id < ").push_bind(before);
     }
-    query.push(" ORDER BY r.id DESC LIMIT ").push_bind(limit.max(1) as i64);
+    query
+        .push(" ORDER BY r.id DESC LIMIT ")
+        .push_bind(limit.max(1) as i64);
     rows(query, db).await
 }
 
@@ -211,7 +279,7 @@ pub struct MediaRow {
     pub file_name: Option<String>,
 }
 
-fn id_list(query: &mut QueryBuilder<'_, MySql>, ids: &[i64]) {
+fn id_list(query: &mut QueryBuilder<MySql>, ids: &[i64]) {
     let mut separated = query.separated(", ");
     for id in ids {
         separated.push_bind(*id);
@@ -239,7 +307,11 @@ pub async fn nfo_rows(db: &MySqlPool, ids: &[i64]) -> Result<HashMap<i64, String
     Ok(nfos)
 }
 
-pub async fn file_rows(db: &MySqlPool, ids: &[i64], source: Source) -> Result<HashMap<i64, Vec<FileRow>>> {
+pub async fn file_rows(
+    db: &MySqlPool,
+    ids: &[i64],
+    source: Source,
+) -> Result<HashMap<i64, Vec<FileRow>>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -250,7 +322,9 @@ pub async fn file_rows(db: &MySqlPool, ids: &[i64], source: Source) -> Result<Ha
         Source::Xxx => " AND rf.name LIKE '%SDPORN%'",
         other => bail!("Unsupported release-file source [{other:?}]."),
     };
-    let mut query = QueryBuilder::<MySql>::new("SELECT rf.releases_id, rf.name, rf.crc32 FROM release_files rf WHERE rf.releases_id IN (");
+    let mut query = QueryBuilder::<MySql>::new(
+        "SELECT rf.releases_id, rf.name, rf.crc32 FROM release_files rf WHERE rf.releases_id IN (",
+    );
     id_list(&mut query, ids);
     query.push(filter).push(" ORDER BY rf.releases_id, rf.name");
     let rows: Vec<FileRow> = query.build_query_as().fetch_all(db).await?;
@@ -282,7 +356,9 @@ pub async fn legacy_hash_rows(db: &MySqlPool, ids: &[i64]) -> Result<HashMap<i64
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut query = QueryBuilder::<MySql>::new("SELECT ph.releases_id, ph.hash FROM par_hashes ph WHERE ph.releases_id IN (");
+    let mut query = QueryBuilder::<MySql>::new(
+        "SELECT ph.releases_id, ph.hash FROM par_hashes ph WHERE ph.releases_id IN (",
+    );
     id_list(&mut query, ids);
     query.push(
         " AND NOT EXISTS (SELECT 1 FROM par_file_hashes strong WHERE strong.releases_id = ph.releases_id) \
@@ -374,7 +450,10 @@ pub async fn crc_donors(db: &MySqlPool, crcs: &[String]) -> Result<HashMap<Strin
     .await
 }
 
-pub async fn hash_evidence_generation(conn: &mut MySqlConnection, release_id: i64) -> Result<String> {
+pub async fn hash_evidence_generation(
+    conn: &mut MySqlConnection,
+    release_id: i64,
+) -> Result<String> {
     let (last, total): (Option<i64>, i64) = sqlx::query_as(
         "SELECT CAST(MAX(id) AS SIGNED), COUNT(*) FROM par_file_hashes WHERE releases_id = ?",
     )
@@ -404,7 +483,10 @@ fn is_size_decimal(value: &str) -> bool {
 }
 
 fn is_md5(value: &str) -> bool {
-    value.len() == 32 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// All target keys take part in one catalogue snapshot; the 257th distinct donor is a flood
@@ -433,9 +515,17 @@ pub async fn full_hash_donors_for_release(
             known = true;
             count += 1;
             cursor = id;
-            if guid != expected_guid || !is_md5(&hash16k) || !is_md5(&full_md5) || !is_size_decimal(&size) {
+            if guid != expected_guid
+                || !is_md5(&hash16k)
+                || !is_md5(&full_md5)
+                || !is_size_decimal(&size)
+            {
                 let generation = hash_evidence_generation(conn, release_id).await?;
-                return Ok(FullHashDonors { known: true, generation, ..FullHashDonors::default() });
+                return Ok(FullHashDonors {
+                    known: true,
+                    generation,
+                    ..FullHashDonors::default()
+                });
             }
             if size != "0" {
                 usable = true;
@@ -453,10 +543,19 @@ pub async fn full_hash_donors_for_release(
     }
     let generation = format!("{cursor}:{count}");
     if !usable {
-        return Ok(FullHashDonors { known, generation, ..FullHashDonors::default() });
+        return Ok(FullHashDonors {
+            known,
+            generation,
+            ..FullHashDonors::default()
+        });
     }
     if !multiple {
-        return Ok(FullHashDonors { known: true, usable: true, generation, ..FullHashDonors::default() });
+        return Ok(FullHashDonors {
+            known: true,
+            usable: true,
+            generation,
+            ..FullHashDonors::default()
+        });
     }
     let inventory: Option<(i64, i64)> = sqlx::query_as(
         "SELECT CAST(evidence_last_id AS SIGNED), CAST(evidence_count AS SIGNED) FROM par_file_hash_inventories \
@@ -468,7 +567,12 @@ pub async fn full_hash_donors_for_release(
     .fetch_optional(&mut *conn)
     .await?;
     if inventory != Some((cursor, count)) {
-        return Ok(FullHashDonors { known: true, usable: true, generation, ..FullHashDonors::default() });
+        return Ok(FullHashDonors {
+            known: true,
+            usable: true,
+            generation,
+            ..FullHashDonors::default()
+        });
     }
     let donors: Vec<Donor> = sqlx::query_as(
         "SELECT DISTINCT r.id AS releases_id, CAST(0 AS SIGNED) AS relsize, r.searchname, \
@@ -541,7 +645,11 @@ pub struct PredbTitle {
 }
 
 /// Counts only enough eligible titles to fill the launcher's worker capacity.
-pub async fn count_predb_launcher_candidates(db: &MySqlPool, per_run: i64, workers: i64) -> Result<i64> {
+pub async fn count_predb_launcher_candidates(
+    db: &MySqlPool,
+    per_run: i64,
+    workers: i64,
+) -> Result<i64> {
     if per_run <= 0 || workers <= 0 {
         return Ok(0);
     }
@@ -583,11 +691,18 @@ pub async fn predb_batch(
 }
 
 fn escape_like(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// SQL LIKE only discovers candidates; the caller confirms a literal title.
-pub async fn confirm_predb_candidates(db: &MySqlPool, ids: &[i64], title: &str) -> Result<Vec<Release>> {
+pub async fn confirm_predb_candidates(
+    db: &MySqlPool,
+    ids: &[i64],
+    title: &str,
+) -> Result<Vec<Release>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -607,11 +722,16 @@ pub async fn confirm_predb_candidates(db: &MySqlPool, ids: &[i64], title: &str) 
 }
 
 /// Only enumerated candidates, for a concurrent attachment to the intended row.
-pub async fn linked_predb_candidates(db: &MySqlPool, ids: &[i64], predb_id: i64) -> Result<Vec<Option<String>>> {
+pub async fn linked_predb_candidates(
+    db: &MySqlPool,
+    ids: &[i64],
+    predb_id: i64,
+) -> Result<Vec<Option<String>>> {
     if ids.is_empty() || predb_id <= 0 {
         return Ok(Vec::new());
     }
-    let mut query = QueryBuilder::<MySql>::new("SELECT r.searchname FROM releases r WHERE r.id IN (");
+    let mut query =
+        QueryBuilder::<MySql>::new("SELECT r.searchname FROM releases r WHERE r.id IN (");
     id_list(&mut query, ids);
     query.push(" AND r.predb_id = ").push_bind(predb_id);
     Ok(query.build_query_scalar().fetch_all(db).await?)
@@ -622,12 +742,12 @@ pub async fn existing_predb_links(db: &MySqlPool, predb_id: i64) -> Result<Vec<O
     if predb_id <= 0 {
         return Ok(Vec::new());
     }
-    Ok(
-        sqlx::query_scalar("SELECT r.searchname FROM releases r WHERE r.predb_id = ? ORDER BY r.id ASC LIMIT 17")
-            .bind(predb_id)
-            .fetch_all(db)
-            .await?,
+    Ok(sqlx::query_scalar(
+        "SELECT r.searchname FROM releases r WHERE r.predb_id = ? ORDER BY r.id ASC LIMIT 17",
     )
+    .bind(predb_id)
+    .fetch_all(db)
+    .await?)
 }
 
 const PREFILE_WHERE: &str = "r.predb_id = 0 AND r.isrenamed = 0";
@@ -638,11 +758,22 @@ pub async fn count_prefile_candidates(db: &MySqlPool) -> Result<i64> {
         "SELECT COUNT(*) FROM releases r WHERE {PREFILE_WHERE} AND r.categories_id IN ({}){PREFILE_FILES}",
         others_group()
     );
-    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(sql)).fetch_one(db).await?)
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .fetch_one(db)
+        .await?)
 }
 
-pub async fn prefile_candidate_batch(db: &MySqlPool, cursor: i64, limit: usize, descending: bool) -> Result<Vec<Release>> {
-    let (operator, direction) = if descending { ("<", "DESC") } else { (">", "ASC") };
+pub async fn prefile_candidate_batch(
+    db: &MySqlPool,
+    cursor: i64,
+    limit: usize,
+    descending: bool,
+) -> Result<Vec<Release>> {
+    let (operator, direction) = if descending {
+        ("<", "DESC")
+    } else {
+        (">", "ASC")
+    };
     let sql = format!(
         "SELECT r.id AS releases_id, r.guid, r.name, r.searchname, r.fromname, r.groups_id, r.categories_id \
          FROM releases r WHERE {PREFILE_WHERE} AND r.categories_id IN ({}) AND r.id {operator} ?{PREFILE_FILES} \

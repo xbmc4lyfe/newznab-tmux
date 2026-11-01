@@ -2,7 +2,6 @@
 //! fulltext sweep.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -16,7 +15,9 @@ use crate::donor;
 use crate::extractors;
 use crate::file_prioritizer as files;
 use crate::guard::{FilenameGuard, FilenamePass, collect_pass};
-use crate::queries::{self, Donor as DonorRow, FileRow, FixNamesConfig, MediaRow, PredbTitle, Source};
+use crate::queries::{
+    self, Donor as DonorRow, FileRow, FixNamesConfig, MediaRow, PredbTitle, Source,
+};
 use crate::release::{Release, parse_generation};
 use crate::update::{ReleaseUpdater, lock_snapshot, predb_regex};
 
@@ -35,7 +36,12 @@ pub struct CandidatePage {
 /// Discovery for the PreDB fulltext sweep. An outage is an error, never "no candidates".
 #[async_trait]
 pub trait CandidateSearch: Send + Sync {
-    async fn release_candidates_page(&self, title: &str, limit: u64, after_id: i64) -> Result<CandidatePage>;
+    async fn release_candidates_page(
+        &self,
+        title: &str,
+        limit: u64,
+        after_id: i64,
+    ) -> Result<CandidatePage>;
 }
 
 /// The result of probing a release's PAR2 files.
@@ -106,14 +112,24 @@ fn valid_catalogue_title(title: &str) -> bool {
 
 impl NameFixer {
     pub fn new(updater: ReleaseUpdater, config: FixNamesConfig) -> Self {
-        Self { updater, config, total: 0 }
+        Self {
+            updater,
+            config,
+            total: 0,
+        }
     }
 
     fn db(&self) -> sqlx::MySqlPool {
         self.updater.db.clone()
     }
 
-    async fn start_batch(&mut self, source: Source, time: i32, categories: i32, message: &str) -> Result<bool> {
+    async fn start_batch(
+        &mut self,
+        source: Source,
+        time: i32,
+        categories: i32,
+        message: &str,
+    ) -> Result<bool> {
         self.total = queries::count_candidates(&self.db(), source, time, categories).await?;
         if self.total == 0 {
             println!("Nothing to fix.");
@@ -123,8 +139,24 @@ impl NameFixer {
         Ok(true)
     }
 
-    async fn next_batch(&self, source: Source, time: i32, categories: i32, after_id: i64) -> Result<Vec<Release>> {
-        queries::candidate_batch(&self.db(), &self.config, source, time, categories, after_id, queries::BATCH_SIZE, None).await
+    async fn next_batch(
+        &self,
+        source: Source,
+        time: i32,
+        categories: i32,
+        after_id: i64,
+    ) -> Result<Vec<Release>> {
+        queries::candidate_batch(
+            &self.db(),
+            &self.config,
+            source,
+            time,
+            categories,
+            after_id,
+            queries::BATCH_SIZE,
+            None,
+        )
+        .await
     }
 
     fn found(&self, write: bool, kind: &str) {
@@ -132,7 +164,9 @@ impl NameFixer {
         if write {
             println!("{fixed} releases have had their names changed out of: {checked}{kind}.");
         } else {
-            println!("{fixed} releases could have their names changed. {checked}{kind} were checked.");
+            println!(
+                "{fixed} releases could have their names changed. {checked}{kind} were checked."
+            );
         }
     }
 
@@ -148,15 +182,27 @@ impl NameFixer {
         len == self.config.batch_limit.unwrap_or(queries::BATCH_SIZE)
     }
 
-    pub async fn fix_names_with_nfo(&mut self, time: i32, write: bool, categories: i32, status: bool, show: bool) -> Result<()> {
+    pub async fn fix_names_with_nfo(
+        &mut self,
+        time: i32,
+        write: bool,
+        categories: i32,
+        status: bool,
+        show: bool,
+    ) -> Result<()> {
         println!("Fixing search names {} using .nfo files.", window(time));
         let pre_id_only = categories == 3;
-        if !self.start_batch(Source::Nfo, time, categories, " releases to process.").await? {
+        if !self
+            .start_batch(Source::Nfo, time, categories, " releases to process.")
+            .await?
+        {
             return Ok(());
         }
         let mut after = 0;
         loop {
-            let releases = self.next_batch(Source::Nfo, time, categories, after).await?;
+            let releases = self
+                .next_batch(Source::Nfo, time, categories, after)
+                .await?;
             let Some(last) = releases.last().map(|r| r.id) else {
                 break;
             };
@@ -168,11 +214,14 @@ impl NameFixer {
                 match nfos.get(&release.id) {
                     None => {
                         if write && status {
-                            self.updater.update_snapshot_column(release, "proc_nfo", 1).await?;
+                            self.updater
+                                .update_snapshot_column(release, "proc_nfo", 1)
+                                .await?;
                         }
                     }
                     Some(text) => {
-                        self.process_nfo(release, text, write, status, true, !pre_id_only, true).await?;
+                        self.process_nfo(release, text, write, status, true, !pre_id_only, true)
+                            .await?;
                         self.progress(show);
                     }
                 }
@@ -186,14 +235,26 @@ impl NameFixer {
         Ok(())
     }
 
-    pub async fn fix_names_with_files(&mut self, time: i32, write: bool, categories: i32, status: bool, show: bool) -> Result<()> {
+    pub async fn fix_names_with_files(
+        &mut self,
+        time: i32,
+        write: bool,
+        categories: i32,
+        status: bool,
+        show: bool,
+    ) -> Result<()> {
         println!("Fixing search names {} using file names.", window(time));
-        if !self.start_batch(Source::Files, time, categories, " file names to process.").await? {
+        if !self
+            .start_batch(Source::Files, time, categories, " file names to process.")
+            .await?
+        {
             return Ok(());
         }
         let mut after = 0;
         loop {
-            let releases = self.next_batch(Source::Files, time, categories, after).await?;
+            let releases = self
+                .next_batch(Source::Files, time, categories, after)
+                .await?;
             let Some(last) = releases.last().map(|r| r.id) else {
                 break;
             };
@@ -201,7 +262,8 @@ impl NameFixer {
             let rows = queries::file_rows(&self.db(), &ids, Source::Files).await?;
             for release in &releases {
                 let rows = rows.get(&release.id).map_or(&[][..], Vec::as_slice);
-                self.process_file_candidates(release, rows, write, status, true).await?;
+                self.process_file_candidates(release, rows, write, status, true)
+                    .await?;
                 self.progress(show);
             }
             after = last;
@@ -213,14 +275,31 @@ impl NameFixer {
         Ok(())
     }
 
-    pub async fn fix_names_with_srr(&mut self, time: i32, write: bool, categories: i32, status: bool, show: bool) -> Result<()> {
+    pub async fn fix_names_with_srr(
+        &mut self,
+        time: i32,
+        write: bool,
+        categories: i32,
+        status: bool,
+        show: bool,
+    ) -> Result<()> {
         println!("Fixing search names {} using SRR file names.", window(time));
-        if !self.start_batch(Source::Srr, time, categories, " srr file extensions to process.").await? {
+        if !self
+            .start_batch(
+                Source::Srr,
+                time,
+                categories,
+                " srr file extensions to process.",
+            )
+            .await?
+        {
             return Ok(());
         }
         let mut after = 0;
         loop {
-            let releases = self.next_batch(Source::Srr, time, categories, after).await?;
+            let releases = self
+                .next_batch(Source::Srr, time, categories, after)
+                .await?;
             let Some(last) = releases.last().map(|r| r.id) else {
                 break;
             };
@@ -230,12 +309,16 @@ impl NameFixer {
                 self.updater.reset();
                 self.updater.increment_checked();
                 for row in rows.get(&release.id).map_or(&[][..], Vec::as_slice) {
-                    if self.srr_name_check(release, &row.name, write, "SRR, ", status).await? {
+                    if self
+                        .srr_name_check(release, &row.name, write, "SRR, ", status)
+                        .await?
+                    {
                         break;
                     }
                 }
                 if !self.updater.matched {
-                    self.mark_processed(write, status, "proc_srr", release.id).await?;
+                    self.mark_processed(write, status, "proc_srr", release.id)
+                        .await?;
                 }
                 self.progress(show);
             }
@@ -248,14 +331,26 @@ impl NameFixer {
         Ok(())
     }
 
-    pub async fn fix_names_with_crc(&mut self, time: i32, write: bool, categories: i32, status: bool, show: bool) -> Result<()> {
+    pub async fn fix_names_with_crc(
+        &mut self,
+        time: i32,
+        write: bool,
+        categories: i32,
+        status: bool,
+        show: bool,
+    ) -> Result<()> {
         println!("Fixing search names {} using CRC32.", window(time));
-        if !self.start_batch(Source::Crc, time, categories, " CRC32's to process.").await? {
+        if !self
+            .start_batch(Source::Crc, time, categories, " CRC32's to process.")
+            .await?
+        {
             return Ok(());
         }
         let mut after = 0;
         loop {
-            let releases = self.next_batch(Source::Crc, time, categories, after).await?;
+            let releases = self
+                .next_batch(Source::Crc, time, categories, after)
+                .await?;
             let Some(last) = releases.last().map(|r| r.id) else {
                 break;
             };
@@ -269,7 +364,8 @@ impl NameFixer {
                 let rows = rows.get(&release.id).map_or(&[][..], Vec::as_slice);
                 self.crc_pass(release, rows, &donors, write, status).await?;
                 if !self.updater.matched {
-                    self.mark_processed(write, status, "proc_crc32", release.id).await?;
+                    self.mark_processed(write, status, "proc_crc32", release.id)
+                        .await?;
                 }
                 self.progress(show);
             }
@@ -297,28 +393,56 @@ impl NameFixer {
             if crc.is_empty() {
                 continue;
             }
-            let bucket = prioritized.entry(files::get_crc_priority(&row.name)).or_default();
+            let bucket = prioritized
+                .entry(files::get_crc_priority(&row.name))
+                .or_default();
             if !bucket.contains(&crc) {
                 bucket.push(crc);
             }
         }
         for crc in prioritized.values().flatten() {
             let list = donors.get(crc).map_or(&[][..], Vec::as_slice);
-            if self.apply_donor_match(release, list, 5, "crcCheck: CRC32", "CRC32, ", write, status).await? {
+            if self
+                .apply_donor_match(
+                    release,
+                    list,
+                    5,
+                    "crcCheck: CRC32",
+                    "CRC32, ",
+                    write,
+                    status,
+                )
+                .await?
+            {
                 break;
             }
         }
         Ok(())
     }
 
-    pub async fn fix_names_with_media(&mut self, time: i32, write: bool, categories: i32, status: bool, show: bool) -> Result<()> {
-        println!("Fixing search names {} using mediainfo Unique_IDs.", window(time));
-        if !self.start_batch(Source::Uid, time, categories, " unique ids to process.").await? {
+    pub async fn fix_names_with_media(
+        &mut self,
+        time: i32,
+        write: bool,
+        categories: i32,
+        status: bool,
+        show: bool,
+    ) -> Result<()> {
+        println!(
+            "Fixing search names {} using mediainfo Unique_IDs.",
+            window(time)
+        );
+        if !self
+            .start_batch(Source::Uid, time, categories, " unique ids to process.")
+            .await?
+        {
             return Ok(());
         }
         let mut after = 0;
         loop {
-            let releases = self.next_batch(Source::Uid, time, categories, after).await?;
+            let releases = self
+                .next_batch(Source::Uid, time, categories, after)
+                .await?;
             let Some(last) = releases.last().map(|r| r.id) else {
                 break;
             };
@@ -335,12 +459,24 @@ impl NameFixer {
                         continue;
                     }
                     let list = donors.get(&uid).map_or(&[][..], Vec::as_slice);
-                    if self.apply_donor_match(release, list, 10, "uidCheck: Unique_ID", "UID, ", write, status).await? {
+                    if self
+                        .apply_donor_match(
+                            release,
+                            list,
+                            10,
+                            "uidCheck: Unique_ID",
+                            "UID, ",
+                            write,
+                            status,
+                        )
+                        .await?
+                    {
                         break;
                     }
                 }
                 if !self.updater.matched {
-                    self.mark_processed(write, status, "proc_uid", release.id).await?;
+                    self.mark_processed(write, status, "proc_uid", release.id)
+                        .await?;
                 }
                 self.progress(show);
             }
@@ -353,14 +489,26 @@ impl NameFixer {
         Ok(())
     }
 
-    pub async fn fix_names_with_par_hash(&mut self, time: i32, write: bool, categories: i32, status: bool, show: bool) -> Result<()> {
+    pub async fn fix_names_with_par_hash(
+        &mut self,
+        time: i32,
+        write: bool,
+        categories: i32,
+        status: bool,
+        show: bool,
+    ) -> Result<()> {
         println!("Fixing search names {} using PAR2 hash_16K.", window(time));
-        if !self.start_batch(Source::Hash, time, categories, " hash_16K to process.").await? {
+        if !self
+            .start_batch(Source::Hash, time, categories, " hash_16K to process.")
+            .await?
+        {
             return Ok(());
         }
         let mut after = 0;
         loop {
-            let releases = self.next_batch(Source::Hash, time, categories, after).await?;
+            let releases = self
+                .next_batch(Source::Hash, time, categories, after)
+                .await?;
             let Some(last) = releases.last().map(|r| r.id) else {
                 break;
             };
@@ -372,7 +520,8 @@ impl NameFixer {
                 self.updater.reset();
                 self.updater.increment_checked();
                 let rows = hashes.get(&release.id).map_or(&[][..], Vec::as_slice);
-                self.process_par2_hash(release, rows, &donors, write, status).await?;
+                self.process_par2_hash(release, rows, &donors, write, status)
+                    .await?;
                 self.progress(show);
             }
             after = last;
@@ -410,7 +559,10 @@ impl NameFixer {
         .bind(release.id)
         .fetch_optional(&mut *tx)
         .await?;
-        if retry.as_ref().is_some_and(|(retry_guid, waiting)| *retry_guid == guid && *waiting) {
+        if retry
+            .as_ref()
+            .is_some_and(|(retry_guid, waiting)| *retry_guid == guid && *waiting)
+        {
             return Ok(false);
         }
         let strong = queries::full_hash_donors_for_release(&mut tx, release.id, &guid).await?;
@@ -420,7 +572,11 @@ impl NameFixer {
                 return Ok(false);
             }
             let candidates: Vec<donor::Donor> = strong.donors.iter().map(selectable).collect();
-            let chosen = if strong.usable && !strong.overflow { donor::select_canonical(&candidates) } else { None };
+            let chosen = if strong.usable && !strong.overflow {
+                donor::select_canonical(&candidates)
+            } else {
+                None
+            };
             if queries::hash_evidence_generation(&mut tx, release.id).await? != strong.generation {
                 return Ok(false);
             }
@@ -455,9 +611,17 @@ impl NameFixer {
             if write && status {
                 let mut tx = db.begin().await?;
                 if par2_snapshot_matches(&mut tx, &release).await?
-                    && queries::hash_evidence_generation(&mut tx, release.id).await? == strong.generation
+                    && queries::hash_evidence_generation(&mut tx, release.id).await?
+                        == strong.generation
                 {
-                    defer_par2_hash(&mut tx, &release, &guid, &strong.generation, retry.is_some()).await?;
+                    defer_par2_hash(
+                        &mut tx,
+                        &release,
+                        &guid,
+                        &strong.generation,
+                        retry.is_some(),
+                    )
+                    .await?;
                 }
                 tx.commit().await?;
             }
@@ -469,7 +633,18 @@ impl NameFixer {
                 continue;
             }
             let list = legacy_donors.get(hash).map_or(&[][..], Vec::as_slice);
-            if self.apply_donor_match(&release, list, 5, "hashCheck: PAR2 hash_16K", "PAR2 hash, ", write, status).await? {
+            if self
+                .apply_donor_match(
+                    &release,
+                    list,
+                    5,
+                    "hashCheck: PAR2 hash_16K",
+                    "PAR2 hash, ",
+                    write,
+                    status,
+                )
+                .await?
+            {
                 return Ok(true);
             }
         }
@@ -506,27 +681,61 @@ impl NameFixer {
         let current = release.searchname.as_deref().unwrap_or("");
         if exact_value(&searchname) == exact_value(current) {
             if write {
-                self.updater.attach_predb_snapshot(release, predb_id, None, None, None).await?;
+                self.updater
+                    .attach_predb_snapshot(release, predb_id, None, None, None)
+                    .await?;
             }
             return Ok(self.updater.matched);
         }
         self.updater
-            .update_release(release, &searchname, method, write, kind, status, predb_id, None, None)
+            .update_release(
+                release,
+                &searchname,
+                method,
+                write,
+                kind,
+                status,
+                predb_id,
+                None,
+                None,
+            )
             .await?;
         Ok(self.updater.matched)
     }
 
     /// Check an SRR or SRS file for a release name.
-    async fn srr_name_check(&mut self, release: &Release, text: &str, write: bool, kind: &str, status: bool) -> Result<bool> {
+    async fn srr_name_check(
+        &mut self,
+        release: &Release,
+        text: &str,
+        write: bool,
+        kind: &str,
+        status: bool,
+    ) -> Result<bool> {
         let lower = text.to_ascii_lowercase();
-        let extracted = if !text.contains('\n') && text.len() > 4 && (lower.ends_with(".srr") || lower.ends_with(".srs")) {
+        let extracted = if !text.contains('\n')
+            && text.len() > 4
+            && (lower.ends_with(".srr") || lower.ends_with(".srs"))
+        {
             &text[..text.len() - 4]
         } else {
             return Ok(false);
         };
         let name = nntmux_predb::filename::extract_filename_from_path(extracted);
         if predb_regex().is_match(name) {
-            self.updater.update_release(release, name, "fileCheck: SRR extension", write, kind, status, 0, None, None).await?;
+            self.updater
+                .update_release(
+                    release,
+                    name,
+                    "fileCheck: SRR extension",
+                    write,
+                    kind,
+                    status,
+                    0,
+                    None,
+                    None,
+                )
+                .await?;
             return Ok(self.updater.matched);
         }
         Ok(false)
@@ -559,7 +768,10 @@ impl NameFixer {
                     if *id <= 0 || !valid_catalogue_title(title) || !expected.contains(&identity) {
                         return Ok(false);
                     }
-                    if !identities.iter().any(|(known, value)| known == id && *value == identity) {
+                    if !identities
+                        .iter()
+                        .any(|(known, value)| known == id && *value == identity)
+                    {
                         identities.push((*id, identity));
                     }
                 }
@@ -567,25 +779,63 @@ impl NameFixer {
                     return Ok(false);
                 }
                 let (id, title) = &rows[0];
-                self.updater.update_release(release, title, "preDB: NFO literal match", write, "NFO, ", status, *id, None, None).await?;
+                self.updater
+                    .update_release(
+                        release,
+                        title,
+                        "preDB: NFO literal match",
+                        write,
+                        "NFO, ",
+                        status,
+                        *id,
+                        None,
+                        None,
+                    )
+                    .await?;
                 return Ok(self.updater.matched);
             }
             if allow_extraction {
                 if let Some(result) = extractors::extract_from_nfo(text) {
                     let method = format!("nfoCheck: {}", result.method);
-                    self.updater.update_release(release, &result.new_name, &method, write, "NFO, ", status, 0, None, None).await?;
+                    self.updater
+                        .update_release(
+                            release,
+                            &result.new_name,
+                            &method,
+                            write,
+                            "NFO, ",
+                            status,
+                            0,
+                            None,
+                            None,
+                        )
+                        .await?;
                 }
                 if !self.updater.matched && allow_pattern_fallback {
                     let identity = extractors::identity_text(text);
                     if let Some(result) = checkers::check(&identity) {
                         let method = result.formatted_method();
-                        self.updater.update_release(release, &result.new_name, &method, write, "NFO, ", status, 0, None, None).await?;
+                        self.updater
+                            .update_release(
+                                release,
+                                &result.new_name,
+                                &method,
+                                write,
+                                "NFO, ",
+                                status,
+                                0,
+                                None,
+                                None,
+                            )
+                            .await?;
                     }
                 }
             }
         }
         if !self.updater.matched && mark_processed && write && status {
-            self.updater.update_snapshot_column(release, "proc_nfo", 1).await?;
+            self.updater
+                .update_snapshot_column(release, "proc_nfo", 1)
+                .await?;
         }
         Ok(self.updater.matched)
     }
@@ -608,7 +858,16 @@ impl NameFixer {
         let pass = collect_pass(&self.db(), &prioritized, 0).await;
         let mut guard = FilenameGuard::new(release.id, &pass, 0, filenames.clone());
         for (filename, hit) in pass.unique_matches() {
-            self.apply_filename_match(release, &filename, &hit, write, "Filenames, ", status, &mut guard).await?;
+            self.apply_filename_match(
+                release,
+                &filename,
+                &hit,
+                write,
+                "Filenames, ",
+                status,
+                &mut guard,
+            )
+            .await?;
             if self.updater.matched {
                 break;
             }
@@ -619,7 +878,17 @@ impl NameFixer {
                 if let Some(result) = extractors::extract_from_file(&lookup.filename) {
                     let method = format!("fileCheck: {}", result.method);
                     self.updater
-                        .update_release(release, &result.new_name, &method, write, "Filenames, ", status, 0, None, Some(&mut guard))
+                        .update_release(
+                            release,
+                            &result.new_name,
+                            &method,
+                            write,
+                            "Filenames, ",
+                            status,
+                            0,
+                            None,
+                            Some(&mut guard),
+                        )
                         .await?;
                 }
                 if self.updater.matched {
@@ -628,7 +897,8 @@ impl NameFixer {
             }
         }
         if !self.updater.matched && all_complete {
-            self.complete_filename_pass(release, &filenames, write, status, &mut guard, &pass).await?;
+            self.complete_filename_pass(release, &filenames, write, status, &mut guard, &pass)
+                .await?;
         }
         Ok(())
     }
@@ -655,7 +925,9 @@ impl NameFixer {
         }
         let mut release = release.clone();
         release.observed.isrenamed = Some(release.isrenamed);
-        self.updater.complete_filename_snapshot(&release, guard).await?;
+        self.updater
+            .complete_filename_snapshot(&release, guard)
+            .await?;
         Ok(())
     }
 
@@ -673,31 +945,67 @@ impl NameFixer {
         if hit.id <= 0 {
             return Ok(false);
         }
-        if !write && self.updater.current_predb_title(hit.id, &hit.title, Some(filename)).await?.is_none() {
+        if !write
+            && self
+                .updater
+                .current_predb_title(hit.id, &hit.title, Some(filename))
+                .await?
+                .is_none()
+        {
             return Ok(false);
         }
         if exact_value(&hit.title) == exact_value(release.searchname.as_deref().unwrap_or("")) {
             if write {
-                self.updater.attach_predb_snapshot(release, hit.id, Some(&hit.title), Some(filename), Some(guard)).await?;
+                self.updater
+                    .attach_predb_snapshot(
+                        release,
+                        hit.id,
+                        Some(&hit.title),
+                        Some(filename),
+                        Some(guard),
+                    )
+                    .await?;
             }
             return Ok(self.updater.matched);
         }
         self.updater
-            .update_release(release, &hit.title, "PreDb: Filename match", write, kind, status, hit.id, Some(filename), Some(guard))
+            .update_release(
+                release,
+                &hit.title,
+                "PreDb: Filename match",
+                write,
+                kind,
+                status,
+                hit.id,
+                Some(filename),
+                Some(guard),
+            )
             .await?;
         Ok(self.updater.matched)
     }
 
     /// Fix XXX release names using specific file names.
-    pub async fn fix_xxx_names_with_files(&mut self, time: i32, write: bool, categories: i32, status: bool, show: bool) -> Result<()> {
+    pub async fn fix_xxx_names_with_files(
+        &mut self,
+        time: i32,
+        write: bool,
+        categories: i32,
+        status: bool,
+        show: bool,
+    ) -> Result<()> {
         println!("Fixing search names {} using file names.", window(time));
         let kind = "Filenames, ";
-        if !self.start_batch(Source::Xxx, time, categories, " xxx file names to process.").await? {
+        if !self
+            .start_batch(Source::Xxx, time, categories, " xxx file names to process.")
+            .await?
+        {
             return Ok(());
         }
         let mut after = 0;
         loop {
-            let releases = self.next_batch(Source::Xxx, time, categories, after).await?;
+            let releases = self
+                .next_batch(Source::Xxx, time, categories, after)
+                .await?;
             let Some(last) = releases.last().map(|r| r.id) else {
                 break;
             };
@@ -710,7 +1018,10 @@ impl NameFixer {
                 let pass = collect_pass(&self.db(), &filenames, 0).await;
                 let mut guard = FilenameGuard::new(release.id, &pass, 0, filenames.clone());
                 for (filename, hit) in pass.unique_matches() {
-                    self.apply_filename_match(release, &filename, &hit, write, kind, status, &mut guard).await?;
+                    self.apply_filename_match(
+                        release, &filename, &hit, write, kind, status, &mut guard,
+                    )
+                    .await?;
                     if self.updater.matched {
                         break;
                     }
@@ -718,10 +1029,22 @@ impl NameFixer {
                 let all_complete = pass.complete() && !pass.has_matches();
                 if !self.updater.matched && all_complete {
                     for lookup in pass.lookups.iter().filter(|lookup| !lookup.evidence) {
-                        if let Some(caps) = nntmux_categorize::rx!(i r"^.+?SDPORN").find(lookup.filename.as_bytes()) {
+                        if let Some(caps) =
+                            nntmux_categorize::rx!(i r"^.+?SDPORN").find(lookup.filename.as_bytes())
+                        {
                             let name = String::from_utf8_lossy(caps.as_bytes()).into_owned();
                             self.updater
-                                .update_release(release, &name, "fileCheck: XXX SDPORN", write, kind, status, 0, None, Some(&mut guard))
+                                .update_release(
+                                    release,
+                                    &name,
+                                    "fileCheck: XXX SDPORN",
+                                    write,
+                                    kind,
+                                    status,
+                                    0,
+                                    None,
+                                    Some(&mut guard),
+                                )
                                 .await?;
                             if self.updater.matched {
                                 break;
@@ -730,7 +1053,10 @@ impl NameFixer {
                     }
                 }
                 if !self.updater.matched && all_complete {
-                    self.complete_filename_pass(release, &filenames, write, status, &mut guard, &pass).await?;
+                    self.complete_filename_pass(
+                        release, &filenames, write, status, &mut guard, &pass,
+                    )
+                    .await?;
                 }
                 self.progress(show);
             }
@@ -743,14 +1069,34 @@ impl NameFixer {
         Ok(())
     }
 
-    pub async fn fix_names_with_media_movie_name(&mut self, time: i32, write: bool, categories: i32, status: bool, show: bool) -> Result<()> {
-        println!("Fixing search names {} using Mediainfo movie_name.", window(time));
-        if !self.start_batch(Source::MediaMovie, time, categories, " mediainfo movie names to process.").await? {
+    pub async fn fix_names_with_media_movie_name(
+        &mut self,
+        time: i32,
+        write: bool,
+        categories: i32,
+        status: bool,
+        show: bool,
+    ) -> Result<()> {
+        println!(
+            "Fixing search names {} using Mediainfo movie_name.",
+            window(time)
+        );
+        if !self
+            .start_batch(
+                Source::MediaMovie,
+                time,
+                categories,
+                " mediainfo movie names to process.",
+            )
+            .await?
+        {
             return Ok(());
         }
         let mut after = 0;
         loop {
-            let releases = self.next_batch(Source::MediaMovie, time, categories, after).await?;
+            let releases = self
+                .next_batch(Source::MediaMovie, time, categories, after)
+                .await?;
             let Some(last) = releases.last().map(|r| r.id) else {
                 break;
             };
@@ -760,12 +1106,16 @@ impl NameFixer {
                 self.updater.increment_checked();
                 self.updater.reset();
                 for row in media.get(&release.id).map_or(&[][..], Vec::as_slice) {
-                    if self.media_movie_name_check(release, row, write, "Mediainfo, ", status).await? {
+                    if self
+                        .media_movie_name_check(release, row, write, "Mediainfo, ", status)
+                        .await?
+                    {
                         break;
                     }
                 }
                 if !self.updater.matched {
-                    self.mark_processed(write, status, "proc_uid", release.id).await?;
+                    self.mark_processed(write, status, "proc_uid", release.id)
+                        .await?;
                 }
                 self.progress(show);
             }
@@ -778,13 +1128,26 @@ impl NameFixer {
         Ok(())
     }
 
-    async fn media_movie_name_check(&mut self, release: &Release, row: &MediaRow, write: bool, kind: &str, status: bool) -> Result<bool> {
-        let Some(movie) = row.movie_name.as_deref().filter(|m| !m.is_empty() && *m != "0") else {
+    async fn media_movie_name_check(
+        &mut self,
+        release: &Release,
+        row: &MediaRow,
+        write: bool,
+        kind: &str,
+        status: bool,
+    ) -> Result<bool> {
+        let Some(movie) = row
+            .movie_name
+            .as_deref()
+            .filter(|m| !m.is_empty() && *m != "0")
+        else {
             return Ok(false);
         };
         let new_name = if let Some(hit) = predb_regex().find(movie) {
             hit.as_str().to_owned()
-        } else if let Some(caps) = nntmux_categorize::rx!(i r"(.+),(\sRMZ\.cr)?$").captures(movie.as_bytes()) {
+        } else if let Some(caps) =
+            nntmux_categorize::rx!(i r"(.+),(\sRMZ\.cr)?$").captures(movie.as_bytes())
+        {
             String::from_utf8_lossy(&caps[1]).into_owned()
         } else {
             movie.to_owned()
@@ -792,10 +1155,11 @@ impl NameFixer {
         if new_name.is_empty() || !valid_catalogue_title(&new_name) {
             return Ok(false);
         }
-        let rows: Vec<(i64, String)> = sqlx::query_as("SELECT CAST(id AS SIGNED), title FROM predb WHERE title = ? LIMIT 2")
-            .bind(&new_name)
-            .fetch_all(&self.db())
-            .await?;
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT CAST(id AS SIGNED), title FROM predb WHERE title = ? LIMIT 2")
+                .bind(&new_name)
+                .fetch_all(&self.db())
+                .await?;
         if !rows.is_empty() {
             if rows.len() != 1 {
                 return Ok(false);
@@ -804,17 +1168,42 @@ impl NameFixer {
             if *id <= 0 || exact_value(title) != exact_value(&new_name) {
                 return Ok(false);
             }
-            let hits = [PredbHit { id: *id, title: title.clone(), filename: String::new(), source: String::new() }];
+            let hits = [PredbHit {
+                id: *id,
+                title: title.clone(),
+                filename: String::new(),
+                source: String::new(),
+            }];
             let Some(found) = select_best_match(&new_name, &hits, None) else {
                 return Ok(false);
             };
             self.updater
-                .update_release(release, &found.title, "MediaInfo: Exact PreDB Title", write, kind, status, found.id, None, None)
+                .update_release(
+                    release,
+                    &found.title,
+                    "MediaInfo: Exact PreDB Title",
+                    write,
+                    kind,
+                    status,
+                    found.id,
+                    None,
+                    None,
+                )
                 .await?;
             return Ok(self.updater.matched);
         }
         self.updater
-            .update_release(release, &new_name, "MediaInfo: Movie Name", write, kind, status, release.predb_id, None, None)
+            .update_release(
+                release,
+                &new_name,
+                "MediaInfo: Movie Name",
+                write,
+                kind,
+                status,
+                release.predb_id,
+                None,
+                None,
+            )
             .await?;
         Ok(self.updater.matched)
     }
@@ -835,16 +1224,32 @@ impl NameFixer {
         let files_by_release = queries::file_rows(&db, &ids, Source::Files).await?;
         let media = queries::media_rows(&db, &ids).await?;
         let hashes = queries::legacy_hash_rows(&db, &ids).await?;
-        let uid_donors = queries::uid_donors(&db, &distinct(media.values().flatten().filter_map(|r| r.uid.clone()))).await?;
-        let crc_donors = queries::crc_donors(&db, &distinct(files_by_release.values().flatten().filter_map(|r| r.crc32.clone()))).await?;
-        let hash_donors = queries::hash_donors(&db, &distinct(hashes.values().flatten().cloned())).await?;
+        let uid_donors = queries::uid_donors(
+            &db,
+            &distinct(media.values().flatten().filter_map(|r| r.uid.clone())),
+        )
+        .await?;
+        let crc_donors = queries::crc_donors(
+            &db,
+            &distinct(
+                files_by_release
+                    .values()
+                    .flatten()
+                    .filter_map(|r| r.crc32.clone()),
+            ),
+        )
+        .await?;
+        let hash_donors =
+            queries::hash_donors(&db, &distinct(hashes.values().flatten().cloned())).await?;
         let fixed_before = self.updater.fixed;
 
         for release in &releases {
             self.updater.increment_checked();
             self.updater.reset();
             let release_media = media.get(&release.id).map_or(&[][..], Vec::as_slice);
-            let release_files = files_by_release.get(&release.id).map_or(&[][..], Vec::as_slice);
+            let release_files = files_by_release
+                .get(&release.id)
+                .map_or(&[][..], Vec::as_slice);
 
             if release.proc_uid == 0 {
                 self.updater.reset();
@@ -854,19 +1259,35 @@ impl NameFixer {
                         continue;
                     }
                     let list = uid_donors.get(&uid).map_or(&[][..], Vec::as_slice);
-                    if self.apply_donor_match(release, list, 10, "uidCheck: Unique_ID", "UID, ", true, true).await? {
+                    if self
+                        .apply_donor_match(
+                            release,
+                            list,
+                            10,
+                            "uidCheck: Unique_ID",
+                            "UID, ",
+                            true,
+                            true,
+                        )
+                        .await?
+                    {
                         break;
                     }
                 }
                 if !self.updater.matched {
                     for row in release_media {
-                        if self.media_movie_name_check(release, row, true, "Mediainfo, ", true).await? {
+                        if self
+                            .media_movie_name_check(release, row, true, "Mediainfo, ", true)
+                            .await?
+                        {
                             break;
                         }
                     }
                 }
                 if !self.updater.matched {
-                    self.updater.update_single_column("proc_uid", 1, release.id).await?;
+                    self.updater
+                        .update_single_column("proc_uid", 1, release.id)
+                        .await?;
                 }
             }
             if self.updater.matched {
@@ -874,9 +1295,12 @@ impl NameFixer {
             }
             if release.proc_crc32 == 0 {
                 self.updater.reset();
-                self.crc_pass(release, release_files, &crc_donors, true, true).await?;
+                self.crc_pass(release, release_files, &crc_donors, true, true)
+                    .await?;
                 if !self.updater.matched {
-                    self.updater.update_single_column("proc_crc32", 1, release.id).await?;
+                    self.updater
+                        .update_single_column("proc_crc32", 1, release.id)
+                        .await?;
                 }
             }
             if self.updater.matched {
@@ -885,12 +1309,17 @@ impl NameFixer {
             if release.proc_srr == 0 {
                 self.updater.reset();
                 for row in release_files {
-                    if self.srr_name_check(release, &row.name, true, "SRR, ", true).await? {
+                    if self
+                        .srr_name_check(release, &row.name, true, "SRR, ", true)
+                        .await?
+                    {
                         break;
                     }
                 }
                 if !self.updater.matched {
-                    self.updater.update_single_column("proc_srr", 1, release.id).await?;
+                    self.updater
+                        .update_single_column("proc_srr", 1, release.id)
+                        .await?;
                 }
             }
             if self.updater.matched {
@@ -899,20 +1328,23 @@ impl NameFixer {
             if release.proc_hash16k == 0 {
                 self.updater.reset();
                 let rows = hashes.get(&release.id).map_or(&[][..], Vec::as_slice);
-                self.process_par2_hash(release, rows, &hash_donors, true, true).await?;
+                self.process_par2_hash(release, rows, &hash_donors, true, true)
+                    .await?;
             }
             if self.updater.matched {
                 continue;
             }
             if release.proc_nfo == 0 {
                 let text = nfos.get(&release.id).cloned().unwrap_or_default();
-                self.process_nfo(release, &text, true, true, true, true, true).await?;
+                self.process_nfo(release, &text, true, true, true, true, true)
+                    .await?;
             }
             if self.updater.matched {
                 continue;
             }
             if release.proc_files == 0 {
-                self.process_file_candidates(release, release_files, true, true, false).await?;
+                self.process_file_candidates(release, release_files, true, true, false)
+                    .await?;
             }
             if self.updater.matched {
                 continue;
@@ -921,7 +1353,11 @@ impl NameFixer {
                 self.updater.reset();
                 match par2.probe(release).await? {
                     Par2Outcome::Renamed => self.updater.fixed += 1,
-                    Par2Outcome::NoMatch => self.updater.update_single_column("proc_par2", 1, release.id).await?,
+                    Par2Outcome::NoMatch => {
+                        self.updater
+                            .update_single_column("proc_par2", 1, release.id)
+                            .await?
+                    }
                     Par2Outcome::Retryable | Par2Outcome::Deferred => {}
                 }
             }
@@ -940,34 +1376,56 @@ impl NameFixer {
         search: &dyn CandidateSearch,
     ) -> Result<FulltextOutcome> {
         let title = pre.title.as_str();
-        let unmatched = FulltextOutcome { updated: 0, matched: false, retry: false };
+        let unmatched = FulltextOutcome {
+            updated: 0,
+            matched: false,
+            retry: false,
+        };
         static SHAPE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(r"([\w()]+[\s._-]){2,}[\w()]+-\w+").expect("static pattern")
         });
-        if title.chars().count() > 255 || title.chars().any(char::is_control) || title.len() < 15 || !SHAPE.is_match(title) {
+        if title.chars().count() > 255
+            || title.chars().any(char::is_control)
+            || title.len() < 15
+            || !SHAPE.is_match(title)
+        {
             return Ok(unmatched);
         }
         let predb_id = pre.predb_id as i64;
         let mut matched = false;
-        let matches = self.paged_literal_candidates(title, predb_id, &mut matched, search).await?;
+        let matches = self
+            .paged_literal_candidates(title, predb_id, &mut matched, search)
+            .await?;
         if matches.len() >= 16 {
-            let (link_matched, link_retry) =
-                if matched { (true, false) } else { self.predb_link_completion(predb_id, title).await? };
-            return Ok(FulltextOutcome { updated: -1, matched: link_matched, retry: link_retry });
+            let (link_matched, link_retry) = if matched {
+                (true, false)
+            } else {
+                self.predb_link_completion(predb_id, title).await?
+            };
+            return Ok(FulltextOutcome {
+                updated: -1,
+                matched: link_matched,
+                retry: link_retry,
+            });
         }
         let mut matching = 0;
         let mut retry = false;
         for release in &matches {
-            if self.updater.update_predb_candidate(release, title, predb_id, &pre.source).await? {
+            if self
+                .updater
+                .update_predb_candidate(release, title, predb_id, &pre.source)
+                .await?
+            {
                 matching += 1;
                 matched = true;
                 continue;
             }
-            let current: Option<(i64, Option<String>, Option<String>)> =
-                sqlx::query_as("SELECT CAST(predb_id AS SIGNED), name, searchname FROM releases WHERE id = ?")
-                    .bind(release.id)
-                    .fetch_optional(&self.db())
-                    .await?;
+            let current: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT CAST(predb_id AS SIGNED), name, searchname FROM releases WHERE id = ?",
+            )
+            .bind(release.id)
+            .fetch_optional(&self.db())
+            .await?;
             let Some((current_predb, name, searchname)) = current else {
                 continue;
             };
@@ -976,7 +1434,8 @@ impl NameFixer {
             if current_predb == predb_id && exact_value(&searchname) == exact_value(title) {
                 matched = true;
             } else if current_predb == 0
-                && (has_literal_predb_title(&name, title) || has_literal_predb_title(&searchname, title))
+                && (has_literal_predb_title(&name, title)
+                    || has_literal_predb_title(&searchname, title))
             {
                 retry = true;
             }
@@ -986,13 +1445,20 @@ impl NameFixer {
             matched = link_matched;
             retry = retry || link_retry;
         }
-        Ok(FulltextOutcome { updated: matching, matched, retry })
+        Ok(FulltextOutcome {
+            updated: matching,
+            matched,
+            retry,
+        })
     }
 
     async fn predb_link_completion(&self, predb_id: i64, title: &str) -> Result<(bool, bool)> {
         let links = queries::existing_predb_links(&self.db(), predb_id).await?;
         let identity = exact_value(title);
-        if links.iter().any(|name| exact_value(name.as_deref().unwrap_or("")) == identity) {
+        if links
+            .iter()
+            .any(|name| exact_value(name.as_deref().unwrap_or("")) == identity)
+        {
             return Ok((true, false));
         }
         Ok((false, links.len() >= 17))
@@ -1008,11 +1474,17 @@ impl NameFixer {
         let mut matches: BTreeMap<i64, Release> = BTreeMap::new();
         let mut after = 0;
         for _ in 0..PREDB_CANDIDATE_MAX_PAGES {
-            let page = search.release_candidates_page(title, PREDB_CANDIDATE_PAGE_SIZE, after).await?;
+            let page = search
+                .release_candidates_page(title, PREDB_CANDIDATE_PAGE_SIZE, after)
+                .await?;
             if page.ids.len() as u64 > PREDB_CANDIDATE_PAGE_SIZE
                 || (page.has_more && (page.ids.len() as u64) < PREDB_CANDIDATE_PAGE_SIZE)
             {
-                return Err(IncompleteMatch("PreDB fulltext matching is incomplete: invalid candidate page boundaries.".into()).into());
+                return Err(IncompleteMatch(
+                    "PreDB fulltext matching is incomplete: invalid candidate page boundaries."
+                        .into(),
+                )
+                .into());
             }
             let mut last = after;
             for id in &page.ids {
@@ -1040,7 +1512,11 @@ impl NameFixer {
             }
             after = last;
         }
-        Err(IncompleteMatch("PreDB fulltext matching is incomplete: the 210-candidate scan budget was reached.".into()).into())
+        Err(IncompleteMatch(
+            "PreDB fulltext matching is incomplete: the 210-candidate scan budget was reached."
+                .into(),
+        )
+        .into())
     }
 
     /// `checkName`: for other flows that hold one text. Returns whether it matched.
@@ -1056,18 +1532,44 @@ impl NameFixer {
         mark_processed: bool,
     ) -> Result<bool> {
         if kind == "NFO, " {
-            return self.process_nfo(release, text, write, status, !pre_id_only, false, mark_processed && !pre_id_only).await;
+            return self
+                .process_nfo(
+                    release,
+                    text,
+                    write,
+                    status,
+                    !pre_id_only,
+                    false,
+                    mark_processed && !pre_id_only,
+                )
+                .await;
         }
         if kind == "Filenames, " {
-            return self.check_filename(release, text, write, status, pre_id_only, mark_processed).await;
+            return self
+                .check_filename(release, text, write, status, pre_id_only, mark_processed)
+                .await;
         }
         if let Some((title, id)) = self.updater.check_predb_match(text).await? {
             if exact_value(&title) == exact_value(release.searchname.as_deref().unwrap_or("")) {
                 if write {
-                    self.updater.attach_predb_snapshot(release, id, None, None, None).await?;
+                    self.updater
+                        .attach_predb_snapshot(release, id, None, None, None)
+                        .await?;
                 }
             } else {
-                self.updater.update_release(release, &title, "preDB: Match", write, kind, status, id, None, None).await?;
+                self.updater
+                    .update_release(
+                        release,
+                        &title,
+                        "preDB: Match",
+                        write,
+                        kind,
+                        status,
+                        id,
+                        None,
+                        None,
+                    )
+                    .await?;
             }
             return Ok(self.updater.matched);
         }
@@ -1077,11 +1579,35 @@ impl NameFixer {
         if kind == "PAR2, " {
             if let Some(result) = extractors::extract_from_file(text) {
                 let method = format!("fileCheck: {}", result.method);
-                self.updater.update_release(release, &result.new_name, &method, write, kind, status, 0, None, None).await?;
+                self.updater
+                    .update_release(
+                        release,
+                        &result.new_name,
+                        &method,
+                        write,
+                        kind,
+                        status,
+                        0,
+                        None,
+                        None,
+                    )
+                    .await?;
             }
         } else if let Some(result) = checkers::check(text) {
             let method = result.formatted_method();
-            self.updater.update_release(release, &result.new_name, &method, write, kind, status, 0, None, None).await?;
+            self.updater
+                .update_release(
+                    release,
+                    &result.new_name,
+                    &method,
+                    write,
+                    kind,
+                    status,
+                    0,
+                    None,
+                    None,
+                )
+                .await?;
         }
         if write && status && mark_processed && !self.updater.matched {
             let column = match kind {
@@ -1093,7 +1619,9 @@ impl NameFixer {
                 _ => None,
             };
             if let Some(column) = column {
-                self.updater.update_single_column(column, 1, release.id).await?;
+                self.updater
+                    .update_single_column(column, 1, release.id)
+                    .await?;
             }
         }
         Ok(self.updater.matched)
@@ -1110,28 +1638,46 @@ impl NameFixer {
     ) -> Result<bool> {
         let kind = "Filenames, ";
         self.updater.reset();
-        let inventory: Vec<String> = sqlx::query_scalar("SELECT name FROM release_files WHERE releases_id = ?")
-            .bind(release.id)
-            .fetch_all(&self.db())
-            .await?;
+        let inventory: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM release_files WHERE releases_id = ?")
+                .bind(release.id)
+                .fetch_all(&self.db())
+                .await?;
         let pass = collect_pass(&self.db(), &[text.to_owned()], 0).await;
         let mut guard = FilenameGuard::new(release.id, &pass, 0, inventory.clone());
         let had_evidence = pass.lookups.first().is_none_or(|lookup| lookup.evidence);
         let mut complete = pass.complete();
         if let Some((filename, hit)) = pass.unique_matches().into_iter().next() {
-            let matched = self.apply_filename_match(release, &filename, &hit, write, kind, status, &mut guard).await?;
+            let matched = self
+                .apply_filename_match(release, &filename, &hit, write, kind, status, &mut guard)
+                .await?;
             if write && !matched {
                 complete = false;
             }
         }
-        if !pre_id_only && !self.updater.matched && !had_evidence
+        if !pre_id_only
+            && !self.updater.matched
+            && !had_evidence
             && let Some(result) = extractors::extract_from_file(text)
         {
             let method = format!("fileCheck: {}", result.method);
-            self.updater.update_release(release, &result.new_name, &method, write, kind, status, 0, None, Some(&mut guard)).await?;
+            self.updater
+                .update_release(
+                    release,
+                    &result.new_name,
+                    &method,
+                    write,
+                    kind,
+                    status,
+                    0,
+                    None,
+                    Some(&mut guard),
+                )
+                .await?;
         }
         if !pre_id_only && write && status && mark_processed && complete && !self.updater.matched {
-            self.complete_filename_pass(release, &inventory, write, status, &mut guard, &pass).await?;
+            self.complete_filename_pass(release, &inventory, write, status, &mut guard, &pass)
+                .await?;
         }
         Ok(self.updater.matched)
     }
@@ -1158,19 +1704,45 @@ impl NameFixer {
         let pass = collect_pass(&self.db(), &files::prioritize_for_pre_db(files_list), 8).await;
         let mut guard = FilenameGuard::new(release.id, &pass, 8, inventory);
         for (filename, hit) in pass.unique_matches() {
-            let same = exact_value(&hit.title) == exact_value(release.searchname.as_deref().unwrap_or(""));
+            let same =
+                exact_value(&hit.title) == exact_value(release.searchname.as_deref().unwrap_or(""));
             let has_snapshot = release.guid.is_some() && release.name.is_some();
             if same && write {
-                if !self.updater.attach_predb_snapshot(release, hit.id, Some(&hit.title), Some(&filename), Some(&mut guard)).await? {
+                if !self
+                    .updater
+                    .attach_predb_snapshot(
+                        release,
+                        hit.id,
+                        Some(&hit.title),
+                        Some(&filename),
+                        Some(&mut guard),
+                    )
+                    .await?
+                {
                     continue;
                 }
             } else if !write && !has_snapshot {
-                if self.updater.current_predb_title(hit.id, &hit.title, Some(&filename)).await?.is_none() {
+                if self
+                    .updater
+                    .current_predb_title(hit.id, &hit.title, Some(&filename))
+                    .await?
+                    .is_none()
+                {
                     continue;
                 }
                 if !same {
                     self.updater
-                        .update_release(release, &hit.title, "file matched source: ", false, "PreDB file match, ", status, hit.id, Some(&filename), Some(&mut guard))
+                        .update_release(
+                            release,
+                            &hit.title,
+                            "file matched source: ",
+                            false,
+                            "PreDB file match, ",
+                            status,
+                            hit.id,
+                            Some(&filename),
+                            Some(&mut guard),
+                        )
                         .await?;
                     if !self.updater.matched {
                         continue;
@@ -1178,7 +1750,17 @@ impl NameFixer {
                 }
             } else {
                 self.updater
-                    .update_release(release, &hit.title, "file matched source: ", write, "PreDB file match, ", status, hit.id, Some(&filename), Some(&mut guard))
+                    .update_release(
+                        release,
+                        &hit.title,
+                        "file matched source: ",
+                        write,
+                        "PreDB file match, ",
+                        status,
+                        hit.id,
+                        Some(&filename),
+                        Some(&mut guard),
+                    )
                     .await?;
                 if !self.updater.matched {
                     continue;
@@ -1206,17 +1788,25 @@ impl NameFixer {
         let mut cursor = if limited { i64::MAX } else { 0 };
         while counter < total {
             let batch_limit = (queries::BATCH_SIZE as i64).min(total - counter) as usize;
-            let batch = queries::prefile_candidate_batch(&self.db(), cursor, batch_limit, limited).await?;
+            let batch =
+                queries::prefile_candidate_batch(&self.db(), cursor, batch_limit, limited).await?;
             let Some(last) = batch.last().map(|r| r.id) else {
                 break;
             };
             let ids: Vec<i64> = batch.iter().map(|r| r.id).collect();
             let rows = queries::file_rows(&self.db(), &ids, Source::Files).await?;
             for release in &batch {
-                let mut names: Vec<String> =
-                    rows.get(&release.id).map_or(&[][..], Vec::as_slice).iter().map(|row| row.name.clone()).collect();
+                let mut names: Vec<String> = rows
+                    .get(&release.id)
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .map(|row| row.name.clone())
+                    .collect();
                 names.sort_by_key(|name| std::cmp::Reverse(name.len()));
-                if self.match_predb_file_names(release, &names, true, true, Some(names.clone())).await? {
+                if self
+                    .match_predb_file_names(release, &names, true, true, Some(names.clone()))
+                    .await?
+                {
                     counted += 1;
                 }
                 counter += 1;
@@ -1226,7 +1816,10 @@ impl NameFixer {
             }
             cursor = last;
         }
-        println!("Renamed {counted} releases in {} seconds.", started.elapsed().as_secs());
+        println!(
+            "Renamed {counted} releases in {} seconds.",
+            started.elapsed().as_secs()
+        );
         Ok(())
     }
 
@@ -1261,14 +1854,20 @@ fn selectable(row: &DonorRow) -> donor::Donor {
 }
 
 fn window(time: i32) -> &'static str {
-    if time == 1 { "in the past 6 hours" } else { "since the beginning" }
+    if time == 1 {
+        "in the past 6 hours"
+    } else {
+        "since the beginning"
+    }
 }
 
 async fn literal_titles(db: &sqlx::MySqlPool, titles: &[String]) -> Result<Vec<(i64, String)>> {
     if titles.is_empty() {
         return Ok(Vec::new());
     }
-    let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("SELECT CAST(id AS SIGNED), title FROM predb WHERE title IN (");
+    let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "SELECT CAST(id AS SIGNED), title FROM predb WHERE title IN (",
+    );
     let mut separated = query.separated(", ");
     for title in titles {
         separated.push_bind(title.clone());
@@ -1293,7 +1892,8 @@ async fn defer_par2_hash(
     generation: &str,
     exists: bool,
 ) -> Result<()> {
-    let (last, count) = parse_generation(generation).ok_or_else(|| anyhow!("malformed hash generation"))?;
+    let (last, count) =
+        parse_generation(generation).ok_or_else(|| anyhow!("malformed hash generation"))?;
     // Only while the release and its hash evidence are what was examined.
     let current: (i64, i64) = sqlx::query_as(
         "SELECT COALESCE(CAST(MAX(id) AS SIGNED), 0), COUNT(*) FROM par_file_hashes WHERE releases_id = ?",

@@ -72,7 +72,11 @@ impl Release {
             match row.try_get::<Option<i64>, _>(name) {
                 Ok(value) => Ok(value.unwrap_or(0) as i32),
                 Err(sqlx::Error::ColumnNotFound(_)) => Ok(0),
-                Err(_) => Ok(row.try_get::<Option<i32>, _>(name).ok().flatten().unwrap_or(0)),
+                Err(_) => Ok(row
+                    .try_get::<Option<i32>, _>(name)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0)),
             }
         };
         let text = |name: &str| -> Result<Option<String>, sqlx::Error> {
@@ -118,20 +122,33 @@ impl Release {
 
     /// Appends the identity and every observed condition to a `WHERE` on `releases`. An observed
     /// value that's malformed matches nothing, rather than widening the write.
-    pub fn push_snapshot(&self, query: &mut QueryBuilder<'_, MySql>) {
+    pub fn push_snapshot(&self, query: &mut QueryBuilder<MySql>) {
         query.push(" id = ").push_bind(self.id);
         if let Some(claim) = &self.observed.additional_claim {
             match (&claim.token, &claim.claimed_at) {
                 (None, None) => {
                     query.push(" AND additional_pp_claimed_at IS NULL AND additional_pp_claim_token IS NULL");
                 }
-                (Some(token), None) if token.is_empty() => query.push(" AND 1 = 0").into(),
-                (Some(token), Some(stamp)) if !token.is_empty() && is_datetime(stamp) => {
-                    query.push(" AND additional_pp_claimed_at = ").push_bind(stamp.clone());
-                    query.push(" AND additional_pp_claimed_at >= ").push_bind(claim.stale_before.clone());
-                    query.push(" AND HEX(additional_pp_claim_token) = HEX(").push_bind(token.clone()).push(")");
+                (Some(token), None) if token.is_empty() => {
+                    query.push(
+                        " AND additional_pp_claimed_at IS NULL AND additional_pp_claim_token = ''",
+                    );
                 }
-                _ => query.push(" AND 1 = 0").into(),
+                (Some(token), Some(stamp)) if !token.is_empty() && is_datetime(stamp) => {
+                    query
+                        .push(" AND additional_pp_claimed_at = ")
+                        .push_bind(stamp.clone());
+                    query
+                        .push(" AND additional_pp_claimed_at >= ")
+                        .push_bind(claim.stale_before.clone());
+                    query
+                        .push(" AND HEX(additional_pp_claim_token) = HEX(")
+                        .push_bind(token.clone())
+                        .push(")");
+                }
+                _ => {
+                    query.push(" AND 1 = 0");
+                }
             }
         }
         if let Some(isrenamed) = self.observed.isrenamed {
@@ -145,11 +162,17 @@ impl Release {
                     query.push(" AND (SELECT COUNT(*) FROM par_file_hashes pfh WHERE pfh.releases_id = releases.id) = ")
                         .push_bind(count);
                 }
-                None => query.push(" AND 1 = 0").into(),
+                None => {
+                    query.push(" AND 1 = 0");
+                }
             }
         }
         if let Some(digest) = &self.observed.archive_source_digest {
-            if digest.len() == 64 && digest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            if digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            {
                 query
                     .push(" AND EXISTS (SELECT 1 FROM release_archive_naming_evidence e WHERE e.releases_id = releases.id \
                            AND CAST(e.release_guid AS BINARY) = CAST(releases.guid AS BINARY) AND e.source_sha256 = ")
@@ -159,7 +182,11 @@ impl Release {
                 query.push(" AND 1 = 0");
             }
         }
-        for (column, value) in [("guid", &self.guid), ("name", &self.name), ("searchname", &self.searchname)] {
+        for (column, value) in [
+            ("guid", &self.guid),
+            ("name", &self.name),
+            ("searchname", &self.searchname),
+        ] {
             match value {
                 None => {
                     query.push(format_args!(" AND {column} IS NULL"));

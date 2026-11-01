@@ -255,7 +255,10 @@ pub fn fixer_cleaner(name: &str) -> String {
         clean = replace_all(re, &clean, "");
     }
     let clean = replace_all(rx!(r"\s\s+"), &clean, " ");
-    let ascii: String = clean.chars().filter(|c| matches!(*c, '\x20'..='\x7F')).collect();
+    let ascii: String = clean
+        .chars()
+        .filter(|c| matches!(*c, '\x20'..='\x7F'))
+        .collect();
     trim_chars(&ascii, PHP_WS).to_owned()
 }
 

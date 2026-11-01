@@ -33,7 +33,10 @@ impl FilenamePass {
     }
 
     pub fn filenames(&self) -> Vec<String> {
-        self.lookups.iter().map(|lookup| lookup.filename.clone()).collect()
+        self.lookups
+            .iter()
+            .map(|lookup| lookup.filename.clone())
+            .collect()
     }
 
     /// Every match, when all agree on one catalogue identity and the pass is complete.
@@ -83,7 +86,12 @@ fn classify(filename: &str, minimum_length: usize) -> (Observation, Eligible) {
     }
 }
 
-fn apply(observation: &mut Observation, result: Lookup, evidence: &OriginalFilenameEvidence, query: &str) {
+fn apply(
+    observation: &mut Observation,
+    result: Lookup,
+    evidence: &OriginalFilenameEvidence,
+    query: &str,
+) {
     observation.complete = result != Lookup::Unknown;
     observation.evidence = result != Lookup::Absent;
     if let Lookup::Unique(candidate) = result {
@@ -92,7 +100,11 @@ fn apply(observation: &mut Observation, result: Lookup, evidence: &OriginalFilen
 }
 
 /// Certified uniqueness doesn't bypass generic-name and scoring policy.
-fn best_match(query: &str, evidence: &OriginalFilenameEvidence, candidate: &Candidate) -> Option<PredbHit> {
+fn best_match(
+    query: &str,
+    evidence: &OriginalFilenameEvidence,
+    candidate: &Candidate,
+) -> Option<PredbHit> {
     if !evidence.accepts(&candidate.title, &candidate.filename) {
         return None;
     }
@@ -105,13 +117,21 @@ fn best_match(query: &str, evidence: &OriginalFilenameEvidence, candidate: &Cand
     let found = select_best_match(&evidence.stem, &hits, Some(evidence))
         .or_else(|| select_best_match(&evidence.basename, &hits, Some(evidence)))
         .or_else(|| select_best_match(query, &hits, Some(evidence)))?;
-    (found.id == candidate.id as i64 && exact_value(&found.title) == exact_value(&candidate.title)).then(|| found.clone())
+    (found.id == candidate.id as i64 && exact_value(&found.title) == exact_value(&candidate.title))
+        .then(|| found.clone())
 }
 
 /// Observes every filename in one authority envelope.
-pub async fn collect_pass(db: &MySqlPool, filenames: &[String], minimum_length: usize) -> FilenamePass {
+pub async fn collect_pass(
+    db: &MySqlPool,
+    filenames: &[String],
+    minimum_length: usize,
+) -> FilenamePass {
     let (mut lookups, eligible) = split(filenames, minimum_length);
-    let evidences: Vec<_> = eligible.iter().map(|(_, evidence, _)| evidence.clone()).collect();
+    let evidences: Vec<_> = eligible
+        .iter()
+        .map(|(_, evidence, _)| evidence.clone())
+        .collect();
     let results = identity::lookup_many(db, &evidences).await;
     for ((index, evidence, query), result) in eligible.iter().zip(results) {
         apply(&mut lookups[*index], result, evidence, query);
@@ -119,9 +139,16 @@ pub async fn collect_pass(db: &MySqlPool, filenames: &[String], minimum_length: 
     FilenamePass { lookups }
 }
 
-async fn collect_pass_in(conn: &mut MySqlConnection, filenames: &[String], minimum_length: usize) -> FilenamePass {
+async fn collect_pass_in(
+    conn: &mut MySqlConnection,
+    filenames: &[String],
+    minimum_length: usize,
+) -> FilenamePass {
     let (mut lookups, eligible) = split(filenames, minimum_length);
-    let evidences: Vec<_> = eligible.iter().map(|(_, evidence, _)| evidence.clone()).collect();
+    let evidences: Vec<_> = eligible
+        .iter()
+        .map(|(_, evidence, _)| evidence.clone())
+        .collect();
     let results = identity::lookup_many_in(conn, &evidences).await;
     for ((index, evidence, query), result) in eligible.iter().zip(results) {
         apply(&mut lookups[*index], result, evidence, query);
@@ -129,7 +156,13 @@ async fn collect_pass_in(conn: &mut MySqlConnection, filenames: &[String], minim
     FilenamePass { lookups }
 }
 
-fn split(filenames: &[String], minimum_length: usize) -> (Vec<Observation>, Vec<(usize, OriginalFilenameEvidence, String)>) {
+fn split(
+    filenames: &[String],
+    minimum_length: usize,
+) -> (
+    Vec<Observation>,
+    Vec<(usize, OriginalFilenameEvidence, String)>,
+) {
     let mut lookups = Vec::with_capacity(filenames.len());
     let mut eligible = Vec::new();
     for (index, filename) in filenames.iter().enumerate() {
@@ -150,10 +183,12 @@ fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
 
 /// The current file names, read under a shared lock so newly committed ones show.
 async fn locked_inventory(conn: &mut MySqlConnection, release_id: i64) -> Result<Vec<String>> {
-    Ok(sqlx::query_scalar("SELECT name FROM release_files WHERE releases_id = ? LOCK IN SHARE MODE")
-        .bind(release_id)
-        .fetch_all(conn)
-        .await?)
+    Ok(sqlx::query_scalar(
+        "SELECT name FROM release_files WHERE releases_id = ? LOCK IN SHARE MODE",
+    )
+    .bind(release_id)
+    .fetch_all(conn)
+    .await?)
 }
 
 /// Fails closed once it has failed: the inventory must be unchanged and the pass reproduce.
@@ -166,7 +201,12 @@ pub struct FilenameGuard {
 }
 
 impl FilenameGuard {
-    pub fn new(release_id: i64, pass: &FilenamePass, minimum_length: usize, inventory: Vec<String>) -> Self {
+    pub fn new(
+        release_id: i64,
+        pass: &FilenamePass,
+        minimum_length: usize,
+        inventory: Vec<String>,
+    ) -> Self {
         Self {
             release_id,
             pass: pass.clone(),
