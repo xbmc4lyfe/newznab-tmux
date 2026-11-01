@@ -4,13 +4,19 @@
 
 pub mod barrier;
 pub mod cache;
+pub mod candidates;
+pub mod collections;
 pub mod config;
 pub mod context;
+pub mod groups;
 pub mod inventory;
 pub mod ledger;
 pub mod locks;
 pub mod manifest;
 pub mod nzb;
+pub mod prepare;
+pub mod reader;
+pub mod releases;
 pub mod txn;
 
 use anyhow::{Result, bail};
@@ -20,6 +26,8 @@ use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
 use crate::cache::Cache;
 use crate::config::VerificationConfig;
 use crate::context::Verify;
+use crate::locks::WorkerLocks;
+use crate::prepare::PrepareOptions;
 
 fn context(ctx: &Ctx) -> Result<Verify> {
     Ok(Verify::new(
@@ -36,6 +44,21 @@ pub async fn run(_ctx: Ctx, _args: RoleArgs, _stop: Shutdown) -> Result<()> {
 /// `nntmux-ctl verify ...`
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Separate complete header inventories from uploads waiting for articles.
+    PrepareCandidates {
+        /// Maximum metadata records inspected.
+        #[arg(long, default_value_t = 5000)]
+        limit: i64,
+        /// Stop starting metadata reads after this duration.
+        #[arg(long, default_value_t = 30)]
+        max_seconds: u64,
+        /// Maximum dirty candidates whose late headers are archived.
+        #[arg(long, default_value_t = 200)]
+        dirty_limit: i64,
+        /// Stop starting dirty-candidate archives after this duration.
+        #[arg(long, default_value_t = 20)]
+        dirty_seconds: u64,
+    },
     /// Copy legacy verification manifest files referenced by candidates into the database.
     ImportManifests {
         /// Candidates read per page.
@@ -68,6 +91,24 @@ pub enum Command {
 pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
     let verify = context(&ctx)?;
     match command {
+        Command::PrepareCandidates {
+            limit,
+            max_seconds,
+            dirty_limit,
+            dirty_seconds,
+        } => {
+            let mut locks = WorkerLocks::new(&verify.db, &verify.config).await?;
+            let options = PrepareOptions {
+                limit: limit.max(1),
+                max_seconds: max_seconds.max(1),
+                dirty_limit: dirty_limit.max(1),
+                dirty_seconds: dirty_seconds.max(1),
+            };
+            if !prepare::run_pass(&verify, &mut locks, options).await? {
+                println!("Candidate preparation or exclusive maintenance is already running.");
+            }
+            Ok(())
+        }
         Command::ImportManifests {
             batch,
             limit,
