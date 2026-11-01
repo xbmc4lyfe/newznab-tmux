@@ -70,7 +70,7 @@ where
             writer,
             "[{now}] {}.{}: ",
             self.role,
-            event.metadata().level()
+            level_name(*event.metadata().level())
         )?;
         context.format_fields(writer.by_ref(), event)?;
         writeln!(writer)
