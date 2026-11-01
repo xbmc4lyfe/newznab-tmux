@@ -2174,8 +2174,26 @@ name = "nntmux-search"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "chrono",
  "clap",
+ "hex",
+ "hmac 0.12.1",
+ "nntmux-core",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "rand 0.9.5",
+ "redis",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]
