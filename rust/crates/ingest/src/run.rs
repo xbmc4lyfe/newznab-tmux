@@ -158,7 +158,8 @@ pub fn plan_safe_backfill(
                 first: u64::try_from(first).ok()?,
                 last: u64::try_from(last).ok()?,
                 contiguous: false,
-                repair: false,
+                // A backfill-only group gets no update pass to repair what backfill deferred.
+                repair: index == 0,
             }))
         })
         .collect()
@@ -400,7 +401,7 @@ impl Runner {
         let Some((name, our_first, their_first)) = found else {
             return Ok(PassResult::default());
         };
-        let jobs = plan_safe_backfill(
+        let mut jobs = plan_safe_backfill(
             &name,
             our_first,
             their_first,
@@ -408,6 +409,11 @@ impl Runner {
             i64::try_from(config.backfill_threads).unwrap_or(1),
             i64::try_from(config.message_buffer).unwrap_or(i64::MAX),
         );
+        // Without part repair nothing would fetch a deferred range, so don't let a sibling move the
+        // cursor past one: take only the newest range, and retry it next pass if it fails.
+        if !config.part_repair {
+            jobs.truncate(1);
+        }
         // These ranges run side by side, each deferring to part repair if it can't run.
         let plan = jobs
             .into_iter()
