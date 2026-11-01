@@ -4,6 +4,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
+use reqwest::StatusCode;
 use serde_json::{Value, json};
 
 use crate::candidates::{self, Claim};
@@ -53,9 +55,8 @@ impl RemotePublisher {
             "reason": result.reason,
             "evidence": spot_check::evidence(manifest)?,
         });
-        let response = self.send(&payload).await?;
-        let status = response.status();
-        let body: Value = response.json().await.unwrap_or(Value::Null);
+        let (status, body) = self.send(&payload).await?;
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         if !status.is_success() {
             if let Some(reason) = body["deferred"].as_str() {
                 // Handled as a local publication's deferral: back to waiting for late articles.
@@ -72,26 +73,29 @@ impl RemotePublisher {
         Ok(body["release_id"].as_i64())
     }
 
-    async fn send(&self, payload: &Value) -> Result<reqwest::Response> {
+    /// The body is part of the attempt: an answer lost halfway is no answer.
+    async fn send(&self, payload: &Value) -> Result<(StatusCode, Bytes)> {
         let mut attempt = 1;
         loop {
-            let sent = self
-                .client
-                .post(&self.url)
-                .header("accept", "application/json")
-                .json(payload)
-                .send()
-                .await;
-            match sent {
-                Ok(response) => return Ok(response),
+            match self.attempt(payload).await {
                 Err(_) if attempt < ATTEMPTS => {
                     attempt += 1;
                     tokio::time::sleep(RETRY_DELAY).await;
                 }
-                Err(failure) => {
-                    return Err(failure).context("Remote publication could not reach the primary");
-                }
+                done => return done.context("Remote publication could not reach the primary"),
             }
         }
+    }
+
+    async fn attempt(&self, payload: &Value) -> reqwest::Result<(StatusCode, Bytes)> {
+        let response = self
+            .client
+            .post(&self.url)
+            .header("accept", "application/json")
+            .json(payload)
+            .send()
+            .await?;
+        let status = response.status();
+        Ok((status, response.bytes().await?))
     }
 }

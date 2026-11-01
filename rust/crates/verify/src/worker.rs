@@ -806,11 +806,6 @@ pub async fn run_role(ctx: Ctx, args: RoleArgs, stop: Shutdown, verify: Verify) 
         stop.token().cancelled().await;
         return Ok(());
     }
-    if std::env::var("RELEASE_VERIFICATION_PUBLISH_URL").is_ok_and(|url| !url.is_empty()) {
-        bail!(
-            "Publishing through a primary host isn't ported yet; unset RELEASE_VERIFICATION_PUBLISH_URL."
-        );
-    }
     let worker = Arc::new(Worker::new(&ctx, verify.clone()).await?);
     let first = WorkerLocks::new(&verify.db, &verify.config)
         .await?

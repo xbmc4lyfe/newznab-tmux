@@ -521,6 +521,14 @@ fn internal_error(failure: &anyhow::Error) -> Response {
         .into_response()
 }
 
+/// A client that gives up mustn't roll back a publication under way, nor stop the work after its
+/// commit: dropping a handler would do both. Its retry finds the release.
+async fn detached<T: Send + 'static>(
+    work: impl Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    tokio::spawn(work).await?
+}
+
 async fn publish_single(
     State(ctx): State<Ctx>,
     Extension(shared): Extension<Arc<Shared>>,
@@ -537,13 +545,18 @@ async fn publish_single(
                 .into_response();
         }
     };
-    let service = match shared.publication(&ctx).await {
-        Ok(service) => service,
+    let done = detached(async move {
+        let service = shared.publication(&ctx).await?;
+        let mut gate = Gate::new(false);
+        let done = service.publish_item(&item, &mut gate, false).await;
+        gate.close().await;
+        Ok(done)
+    })
+    .await;
+    let done = match done {
+        Ok(done) => done,
         Err(failure) => return internal_error(&failure),
     };
-    let mut gate = Gate::new(false);
-    let done = service.publish_item(&item, &mut gate, false).await;
-    gate.close().await;
     match done.status {
         "published" => Json(json!({"release_id": done.release_id})).into_response(),
         "deferred" => (StatusCode::CONFLICT, Json(json!({"deferred": done.error}))).into_response(),
@@ -559,7 +572,7 @@ async fn publish_batch(
     Extension(shared): Extension<Arc<Shared>>,
     body: Bytes,
 ) -> Response {
-    let limits = &shared.settings;
+    let limits = shared.settings.clone();
     if body.len() > limits.batch_bytes {
         let error = format!("Batch body exceeds {} bytes.", limits.batch_bytes);
         return (
@@ -591,11 +604,18 @@ async fn publish_batch(
         )
             .into_response();
     }
-    let service = match shared.publication(&ctx).await {
-        Ok(service) => service,
+    let items = items.clone();
+    let results = detached(async move {
+        let service = shared.publication(&ctx).await?;
+        Ok(service
+            .publish_batch(&items, shared.settings.batch_seconds)
+            .await)
+    })
+    .await;
+    let results = match results {
+        Ok(results) => results,
         Err(failure) => return internal_error(&failure),
     };
-    let results = service.publish_batch(items, limits.batch_seconds).await;
     Json(json!({"protocol": BATCH_PROTOCOL, "results": results})).into_response()
 }
 

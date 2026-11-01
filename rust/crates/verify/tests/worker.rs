@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use nntmux_nntp::{NntpConfig, Provider, TlsOptions};
-use nntmux_runtime::Shutdown;
+use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
 use nntmux_verify::candidates;
 use nntmux_verify::spot_check::{ArticleBudgetExceeded, ArticleSource};
 use nntmux_verify::worker::{NntpSource, RunOptions, Worker};
@@ -456,5 +456,36 @@ async fn a_lost_response_after_commit_still_counts_as_published() -> Result<()> 
             .join("status.json")
             .exists()
     );
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn the_role_runs_on_a_host_that_publishes_through_the_primary() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let server = MockServer::start().await;
+    queued(&harness).await?;
+    let verify = harness.with_config(|config| {
+        config.publish_url = Some(server.uri());
+        config.candidate_workers = 1;
+    });
+    let redis = redis::Client::open(std::env::var("TEST_REDIS_URL")?)?
+        .get_connection_manager()
+        .await?;
+    let ctx = Ctx {
+        config: Arc::new(nntmux_core::Config::from_env()?),
+        db: harness.db(),
+        redis,
+    };
+    let args = RoleArgs {
+        concurrency: 1,
+        idle_seconds: 0,
+        once: true,
+    };
+    nntmux_verify::worker::run_role(ctx, args, Shutdown::default(), verify).await?;
+    // The role got as far as verifying; with no provider here the attempt failed and will retry.
+    let (status, reason, _) = candidate_state(&harness).await?;
+    assert_eq!(status, "unknown", "{reason:?}");
     harness.finish().await
 }
