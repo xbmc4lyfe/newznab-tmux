@@ -191,6 +191,12 @@ async fn blacklist_rules_apply_by_field_and_group() -> Result<()> {
     };
     assert_eq!(crap::remove(pool, &delete).await?, 0);
 
+    let unreadable = crap::Options {
+        blacklist_id: Some("1.5".to_owned()),
+        ..options("blacklist", false)
+    };
+    assert!(crap::remove(pool, &unreadable).await.is_err());
+
     assert_eq!(crap::remove(pool, &options("blacklist", true)).await?, 2);
     assert_eq!(crap::remove(pool, &options("blfiles", true)).await?, 1);
     assert_eq!(guids(pool).await?, vec!["disa0000", "keep0000"]);
@@ -226,6 +232,45 @@ async fn delete_criteria_fail_closed() -> Result<()> {
             "{bad}"
         );
     }
+    // An empty pattern is refused, not turned into a match on everything.
+    for empty in ["", " ", "%", "_ %"] {
+        for args in [
+            DeleteArgs {
+                group_like: Some(empty.to_owned()),
+                ..DeleteArgs::default()
+            },
+            DeleteArgs {
+                name_like: Some(empty.to_owned()),
+                ..DeleteArgs::default()
+            },
+            DeleteArgs {
+                search_like: Some(empty.to_owned()),
+                ..DeleteArgs::default()
+            },
+            DeleteArgs {
+                poster_like: Some(empty.to_owned()),
+                ..DeleteArgs::default()
+            },
+        ] {
+            assert!(delete::build_filter(pool, &args.criteria()?).await.is_err());
+        }
+    }
+    let halfway = DeleteArgs {
+        hours_old: Some("0.5".to_owned()),
+        ..DeleteArgs::default()
+    };
+    sqlx::query("UPDATE releases SET adddate = NOW() - INTERVAL 10 MINUTE")
+        .execute(pool)
+        .await?;
+    let filter = delete::build_filter(pool, &halfway.criteria()?).await?;
+    assert_eq!(
+        filter.count(pool).await?,
+        0,
+        "half an hour rounds up, as PHP's literal did"
+    );
+    sqlx::query("UPDATE releases SET adddate = UTC_TIMESTAMP()")
+        .execute(pool)
+        .await?;
     assert!(Criterion::parse("ignore")?.is_none());
     assert!(Criterion::parse("name=equals").is_err());
     assert!(Criterion::parse("name=equals=a=b").is_err());
@@ -237,7 +282,28 @@ async fn delete_criteria_fail_closed() -> Result<()> {
     };
     let filter = delete::build_filter(pool, &args.criteria()?).await?;
     assert_eq!(filter.count(pool).await?, 1);
+    let doomed: i64 =
+        sqlx::query_scalar("SELECT CAST(id AS SIGNED) FROM releases WHERE guid = 'bbbb0000'")
+            .fetch_one(pool)
+            .await?;
+    // Without a user: only the release side of this row matters here.
+    let mut conn = pool.acquire().await?;
+    sqlx::query("SET FOREIGN_KEY_CHECKS = 0")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("INSERT INTO user_downloads (users_id, hosthash, timestamp, releases_id) VALUES (1, '', NOW(), ?)")
+        .bind(doomed)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("SET FOREIGN_KEY_CHECKS = 1")
+        .execute(&mut *conn)
+        .await?;
+    drop(conn);
     assert_eq!(delete::delete_matching(pool, &filter).await?, 1);
+    let downloads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_downloads")
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(downloads, 0);
     assert_eq!(guids(pool).await?, vec!["aaaa0000", "cccc0000"]);
 
     let advanced = DeleteArgs {
@@ -432,6 +498,13 @@ async fn orphans_are_reported_and_kept() -> Result<()> {
         delete: true,
     };
     assert!(nzb_clean::run(pool, &refused).await.is_err());
+    let missing = nzb_clean::Options {
+        root: root.join("not-there"),
+        not_in_db: true,
+        not_on_disk: false,
+        ..refused
+    };
+    assert!(nzb_clean::run(pool, &missing).await.is_err());
     std::fs::remove_dir_all(root)?;
     Ok(())
 }

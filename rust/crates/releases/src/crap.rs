@@ -1,9 +1,11 @@
 //! `nntmux-ctl releases remove-crap`: removing unwanted releases by SQL shape and blacklist.
 //!
 //! The SQL matches PHP's `ReleaseRemoverService`, backslashes included: the server's string parser
-//! strips them before its regex engine runs. Two changes: the time filter goes before `GROUP BY`,
-//! where PHP's codec and wmv queries appended it after and so failed with a time limit, and those
-//! queries group by every selected column, which any `sql_mode` accepts.
+//! strips them before its regex engine runs. Two changes to the codec and wmv queries: the time
+//! filter goes before `GROUP BY`, and they group by every selected column, which any `sql_mode`
+//! accepts. PHP appended the filter after `GROUP BY r.id`, which made it part of the grouping
+//! expression, so a timed run returned one row per page and could delete old releases. A timed run
+//! here deletes every match in its window instead.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -75,14 +77,19 @@ struct Remover<'a> {
 pub async fn remove(pool: &MySqlPool, options: &Options) -> Result<u64> {
     let time = time_filter(options.time.trim())?;
     let kind = options.kind.trim().to_ascii_lowercase();
+    // An ID that doesn't parse must not widen to every rule.
+    let blacklist_id = match options.blacklist_id.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(id) => match id.parse::<i64>() {
+            Ok(id) => Some(id),
+            Err(_) => bail!("Error, blacklist ID must be a whole number."),
+        },
+    };
     let mut remover = Remover {
         pool,
         delete: options.delete,
         time,
-        blacklist_id: options
-            .blacklist_id
-            .as_deref()
-            .and_then(|id| id.trim().parse().ok()),
+        blacklist_id,
         count: 0,
     };
     if kind.is_empty() {

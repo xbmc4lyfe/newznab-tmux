@@ -4,7 +4,8 @@
 //! translate: a mistyped column, or a group that didn't exist, widened the delete, up to every
 //! release. Here that is an error, or for an unknown group a filter that matches nothing. Numbers
 //! are checked rather than interpolated, `--size=0` and friends count, and `rageid` is refused
-//! because that column is gone. Deleting also removes the NZB and preview files, which PHP left.
+//! because that column is gone. A pattern with nothing literal in it is refused, because it would
+//! match every release. Deleting also removes the NZB and preview files, which PHP left.
 
 use std::io::Write;
 
@@ -202,8 +203,20 @@ fn number(criterion: &Criterion) -> Result<Bind> {
     }
 }
 
-fn like(value: &str) -> String {
-    format!("%{}%", value.replace(' ', "%"))
+fn like(value: &str) -> Result<String> {
+    if value.chars().all(|c| matches!(c, ' ' | '%' | '_')) {
+        bail!("A partial match needs some text to match, not \"{value}\".");
+    }
+    Ok(format!("%{}%", value.replace(' ', "%")))
+}
+
+/// Hours for an interval, written into the statement. A bound double rounds half to even there, so
+/// half an hour would become none and a delete would reach newer releases than PHP's did.
+fn hours(criterion: &Criterion) -> Result<f64> {
+    match number(criterion)? {
+        Bind::Float(hours) => Ok(hours),
+        _ => bail!("{} needs a number", criterion.column),
+    }
 }
 
 /// Translates criteria, looking group names up. Anything untranslatable is an error.
@@ -234,12 +247,18 @@ pub async fn build_filter(pool: &MySqlPool, criteria: &[Criterion]) -> Result<Fi
                 (" AND completion < ?".to_owned(), Some(number(criterion)?))
             }
             ("adddate" | "postdate", "bigger") => (
-                format!(" AND {column} < (NOW() - INTERVAL ? HOUR)"),
-                Some(number(criterion)?),
+                format!(
+                    " AND {column} < (NOW() - INTERVAL {} HOUR)",
+                    hours(criterion)?
+                ),
+                None,
             ),
             ("adddate" | "postdate", "smaller") => (
-                format!(" AND {column} > (NOW() - INTERVAL ? HOUR)"),
-                Some(number(criterion)?),
+                format!(
+                    " AND {column} > (NOW() - INTERVAL {} HOUR)",
+                    hours(criterion)?
+                ),
+                None,
             ),
             ("fromname" | "name" | "searchname", "equals") => (
                 format!(" AND {column} = ?"),
@@ -247,7 +266,7 @@ pub async fn build_filter(pool: &MySqlPool, criteria: &[Criterion]) -> Result<Fi
             ),
             ("fromname" | "name" | "searchname", "like") => (
                 format!(" AND {column} LIKE ?"),
-                Some(Bind::Text(like(value))),
+                Some(Bind::Text(like(value)?)),
             ),
             ("groupname", "equals" | "like") => {
                 let (sql, name) = if criterion.modifier == "equals" {
@@ -258,7 +277,7 @@ pub async fn build_filter(pool: &MySqlPool, criteria: &[Criterion]) -> Result<Fi
                 } else {
                     (
                         "SELECT CAST(id AS SIGNED) FROM usenet_groups WHERE name LIKE ?",
-                        like(value),
+                        like(value)?,
                     )
                 };
                 let ids: Vec<i64> = sqlx::query_scalar(sql).bind(name).fetch_all(pool).await?;

@@ -187,6 +187,12 @@ pub async fn run(pool: &MySqlPool, options: &Options) -> Result<()> {
     if !options.not_in_db && !options.temps {
         bail!("You must specify at least one option. See: --help");
     }
+    if !options.root.is_dir() {
+        bail!(
+            "{} is not a directory. Set PATH_TO_NZBS.",
+            options.root.display()
+        );
+    }
     if options.not_in_db {
         let found = orphans(pool, &options.root).await?;
         println!("Checked: {} / Orphans: {}", found.checked, found.orphans);

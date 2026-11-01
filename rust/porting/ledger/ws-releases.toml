@@ -92,7 +92,7 @@ kind = "command"
 id = "releases:remove-crap"
 source = "app/Console/Commands/RemoveCrapReleases.php"
 status = "ported"
-note = "nntmux-ctl releases remove-crap."
+note = "nntmux-ctl releases remove-crap. Timed codec and wmv_all runs now delete every match in the window: PHP appended the time filter to GROUP BY, so it returned one row per page and could delete old releases."
 
 [[entry]]
 kind = "command"
