@@ -367,6 +367,19 @@ fn agree<'a>(names: impl Iterator<Item = &'a str>) -> Option<Agreement> {
     }
 }
 
+/// Whether the release's names hold another episode of the same show and season.
+fn has_other_episodes(title: &str, names: &[(NameSource, String)]) -> bool {
+    let wanted = name::parse(title);
+    wanted.episode.is_some()
+        && names.iter().any(|(_, candidate)| {
+            let parsed = name::parse(candidate);
+            parsed.episode.is_some()
+                && parsed.episode != wanted.episode
+                && parsed.season == wanted.season
+                && name::folded(&parsed.title) == name::folded(&wanted.title)
+        })
+}
+
 struct Named<'a> {
     name: String,
     method: &'static str,
@@ -447,7 +460,14 @@ fn climb(evidence: &Evidence, context: &Context<'_>) -> (Outcome, Flags) {
     if let Some(hits) = hits {
         flags.predb_exact = hits.iter().any(|hit| hit.1 == NameMatch::Exact);
         flags.predb_normalized = hits.iter().any(|hit| hit.1 == NameMatch::Normalized);
-        match agree(hits.iter().map(|hit| hit.0.title.as_str())) {
+        // PreDB may hold only one episode of a pack, so the names it doesn't know count here too.
+        let agreement = match agree(hits.iter().map(|hit| hit.0.title.as_str())) {
+            Some(Agreement::One(title)) if has_other_episodes(&title, &plain) => {
+                Some(Agreement::Pack(name::pack_name(&title)))
+            }
+            other => other,
+        };
+        match agreement {
             Some(Agreement::One(title)) => {
                 let hit = hits
                     .iter()
@@ -503,7 +523,7 @@ fn climb(evidence: &Evidence, context: &Context<'_>) -> (Outcome, Flags) {
                         confidence: 0.9,
                         predb: Some(hit.0),
                         donor: None,
-                        note: Some(format!("{} PreDB episodes", hits.len())),
+                        note: Some(format!("{} episodes in PreDB", hits.len())),
                     },
                 );
                 // A pack isn't one PreDB row. The row only supplied the category.
@@ -916,6 +936,26 @@ mod tests {
         )]));
         let found = identified(run(&evidence, &DonorIndex::default()));
         assert_eq!((found.method, found.predb_id), ("predb_exact", Some(10)));
+    }
+
+    #[test]
+    fn a_pack_with_one_episode_in_predb_is_still_a_pack() {
+        let mut evidence = release(r#"[01/99] "GPInOt3kYN.part001.rar" yEnc"#);
+        // E05 has a PreDB row. E07 doesn't.
+        evidence.nzb = Some(nzb(&[
+            (
+                r#""Zmora.S01E05.1080p.AMZN.WEB-DL.DDP5.1.H.264-RAWR.mkv" yEnc"#,
+                2_600_000_000,
+            ),
+            (
+                r#""Zmora.S01E07.1080p.AMZN.WEB-DL.DDP5.1.H.264-RAWR.mkv" yEnc"#,
+                2_600_000_000,
+            ),
+        ]));
+        let found = identified(run(&evidence, &DonorIndex::default()));
+        assert_eq!(found.method, "predb_pack");
+        assert_eq!(found.name, "Zmora.S01.1080p.AMZN.WEB-DL.DDP5.1.H.264-RAWR");
+        assert_eq!((found.predb_id, found.parsed.episode), (None, None));
     }
 
     #[test]
