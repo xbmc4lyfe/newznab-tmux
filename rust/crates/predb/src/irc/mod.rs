@@ -213,7 +213,11 @@ async fn reopen(
         if stop.requested() || ctx.paused().await.unwrap_or(false) {
             return Ok(None);
         }
-        match open(network, identity).await {
+        let opened = tokio::select! {
+            () = stop.token().cancelled_owned() => return Ok(None),
+            opened = open(network, identity) => opened,
+        };
+        match opened {
             Ok(connection) => return Ok(Some(connection)),
             Err(error) => {
                 tracing::warn!(
@@ -474,6 +478,24 @@ pub fn stream_entries(format: &str, message: &str) -> Vec<Entry> {
     }
 }
 
+/// Two rustls crypto providers are linked in, so rustls can't choose a default and would panic
+/// if tungstenite built its own TLS config.
+async fn connect_stream(
+    url: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    let connector = tokio_tungstenite::Connector::Rustls(client::tls_config(true)?);
+    let (socket, _) = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector)),
+    )
+    .await
+    .context("WebSocket connect timed out")?
+    .with_context(|| format!("WebSocket connect to {url}"))?;
+    Ok(socket)
+}
+
 /// Stores PREs pushed over a WebSocket feed, by the same rules as the JSON feeds. Returns an
 /// error when the connection drops or goes quiet, so the supervisor reconnects.
 async fn run_stream(
@@ -486,13 +508,7 @@ async fn run_stream(
     if !matches!(format, "predb_club" | "predb_net") {
         bail!("Unknown PreDB stream format [{format}]. Available: predb_club, predb_net");
     }
-    let (mut socket, _) = tokio::time::timeout(
-        Duration::from_secs(15),
-        tokio_tungstenite::connect_async(url),
-    )
-    .await
-    .context("WebSocket connect timed out")?
-    .with_context(|| format!("WebSocket connect to {url}"))?;
+    let mut socket = connect_stream(url).await?;
     tracing::info!(format, "stream connected");
     let mut last_frame = Instant::now();
     loop {
@@ -527,5 +543,21 @@ async fn run_stream(
             let totals = importer.import(std::slice::from_ref(&entry), false).await?;
             log_import(&entry, totals);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::connect_stream;
+
+    #[tokio::test]
+    async fn a_tls_stream_connect_fails_without_panicking() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        tokio::spawn(async move { drop(listener.accept().await) });
+        let result = connect_stream(&format!("wss://127.0.0.1:{port}/")).await;
+        assert!(result.is_err());
     }
 }

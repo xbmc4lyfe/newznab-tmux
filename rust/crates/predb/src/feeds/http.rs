@@ -174,12 +174,24 @@ pub(crate) fn throttled(headers: &HeaderMap) -> FeedError {
     }
 }
 
-pub(crate) async fn read_json(response: Response) -> FeedResult<Value> {
+/// Well above any real listing page. The role shares its process with the IRC scrapers, so one
+/// response must not be able to take them down.
+const MAX_JSON_BYTES: usize = 32 * 1024 * 1024;
+
+pub(crate) async fn read_json(mut response: Response) -> FeedResult<Value> {
     let status = response.status();
     if !status.is_success() {
         return Err(FeedError::Failed(anyhow!("HTTP {status}")));
     }
-    let bytes = response.bytes().await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len() + chunk.len() > MAX_JSON_BYTES {
+            return Err(FeedError::Failed(anyhow!(
+                "the feed's JSON response exceeds the body limit"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     Ok(serde_json::from_slice(&decode_if_gzip(&bytes)?)
         .context("the feed returned invalid JSON")?)
 }
@@ -187,9 +199,7 @@ pub(crate) async fn read_json(response: Response) -> FeedResult<Value> {
 /// JSON requests don't ask for gzip, but a server may send it anyway.
 fn decode_if_gzip(bytes: &[u8]) -> anyhow::Result<std::borrow::Cow<'_, [u8]>> {
     if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut out = Vec::new();
-        flate2::read::MultiGzDecoder::new(bytes).read_to_end(&mut out)?;
-        Ok(out.into())
+        Ok(decode_gzip(bytes, MAX_JSON_BYTES, "JSON feed")?.into())
     } else {
         Ok(bytes.into())
     }
@@ -214,5 +224,25 @@ pub fn decode_gzip(body: &[u8], maximum_bytes: usize, label: &str) -> anyhow::Re
         if rest.is_empty() {
             return Ok(decoded);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::{MAX_JSON_BYTES, decode_if_gzip};
+
+    fn gzip(size: usize) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&vec![b' '; size]).expect("write");
+        encoder.finish().expect("finish")
+    }
+
+    #[test]
+    fn json_gzip_is_decoded_within_the_limit_only() {
+        assert_eq!(decode_if_gzip(&gzip(1024)).expect("decode").len(), 1024);
+        assert!(decode_if_gzip(&gzip(MAX_JSON_BYTES + 1)).is_err());
+        assert_eq!(&*decode_if_gzip(b"[]").expect("plain"), b"[]");
     }
 }

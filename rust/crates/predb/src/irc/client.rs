@@ -84,7 +84,7 @@ impl ServerCertVerifier for ChainOnly {
     }
 }
 
-fn tls_config(verify_peer_name: bool) -> Result<Arc<ClientConfig>> {
+pub(super) fn tls_config(verify_peer_name: bool) -> Result<Arc<ClientConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()?;

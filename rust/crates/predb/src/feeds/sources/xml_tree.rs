@@ -85,6 +85,10 @@ fn resolve_reference(name: &str) -> Option<String> {
     predefined(name).map(str::to_owned)
 }
 
+/// libxml's `xmlParserMaxDepth` without `LIBXML_PARSEHUGE`. It also keeps recursion over the
+/// tree, and dropping it, within the stack.
+const MAX_DEPTH: usize = 256;
+
 /// Parses a document that is already valid UTF-8 with no DOCTYPE. `None` is any well-formedness
 /// failure.
 pub(super) fn parse(xml: &str) -> Option<XmlElement> {
@@ -123,6 +127,9 @@ pub(super) fn parse(xml: &str) -> Option<XmlElement> {
             Event::Decl(_) | Event::DocType(_) => return None,
             Event::Start(start) => {
                 if root.is_some() {
+                    return None;
+                }
+                if stack.len() > MAX_DEPTH {
                     return None;
                 }
                 stack.push(element_from(&start)?);
@@ -189,6 +196,14 @@ fn element_from(start: &quick_xml::events::BytesStart<'_>) -> Option<XmlElement>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nesting_past_libxmls_limit_is_refused() {
+        let nested = |depth: usize| format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth));
+        assert!(super::parse(&nested(257)).is_some());
+        assert!(super::parse(&nested(258)).is_none());
+        assert!(super::parse(&nested(200_000)).is_none());
+    }
+
     use super::*;
 
     #[test]

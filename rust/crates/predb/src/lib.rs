@@ -54,37 +54,59 @@ pub async fn run(ctx: Ctx, _args: RoleArgs, stop: Shutdown) -> Result<()> {
     };
 
     let config = feeds::FeedConfig::from_env();
-    let mut feed_timer = tokio::time::interval(std::time::Duration::from_secs(300));
-    let mut check_timer = tokio::time::interval(std::time::Duration::from_secs(600));
-    feed_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    check_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            () = stop.token().cancelled_owned() => break,
-            _ = feed_timer.tick() => {
-                if config.enabled && !ctx.paused().await.unwrap_or(true) {
-                    let args = feeds::command::ImportArgs {
-                        source: Vec::new(),
-                        pages: 1,
-                        since: None,
-                        max_pages: None,
-                        dry_run: false,
-                        quiet: true,
-                    };
-                    if let Err(error) = feeds::command::run(&ctx, args).await {
+    // Separate loops, so a feed backing off for minutes can't starve the title check, and either
+    // can stop partway when a shutdown arrives.
+    let feeds = async {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(300));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = stop.token().cancelled_owned() => return,
+                _ = timer.tick() => {}
+            }
+            if !config.enabled || ctx.paused().await.unwrap_or(true) {
+                continue;
+            }
+            let args = feeds::command::ImportArgs {
+                source: Vec::new(),
+                pages: 1,
+                since: None,
+                max_pages: None,
+                dry_run: false,
+                quiet: true,
+            };
+            tokio::select! {
+                () = stop.token().cancelled_owned() => return,
+                result = feeds::command::run(&ctx, args) => {
+                    if let Err(error) = result {
                         tracing::warn!(%error, "PreDB feed import failed");
                     }
                 }
             }
-            _ = check_timer.tick() => {
-                if !ctx.paused().await.unwrap_or(true)
-                    && let Err(error) = check_pre(&ctx.db, Some(3)).await
-                {
-                    tracing::warn!(%error, "PreDB title check failed");
+        }
+    };
+    let checks = async {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(600));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = stop.token().cancelled_owned() => return,
+                _ = timer.tick() => {}
+            }
+            if ctx.paused().await.unwrap_or(true) {
+                continue;
+            }
+            tokio::select! {
+                () = stop.token().cancelled_owned() => return,
+                result = check_pre(&ctx.db, Some(3)) => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "PreDB title check failed");
+                    }
                 }
             }
         }
-    }
+    };
+    tokio::join!(feeds, checks);
     if let Some(scrapers) = scrapers {
         scrapers.await.ok();
     }
