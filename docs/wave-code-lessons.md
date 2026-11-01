@@ -28,6 +28,7 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 20. **Don't tune the cheap step.** Wave 67.2 reported 13.24x on planning how `ForkingService` splits work among workers. That plan is arithmetic on a few numbers, while the workers it starts run backfill, binaries and post-processing. Tune the workers' throughput.
 21. **Say what a change does.** The #1052 pull request says "Migrate/accelerate", but it only added lines. Nothing was migrated and no caller changed. Report a migration only when production has switched and the old code is gone.
 22. **Size is a warning.** `IgdbHttpException` was already 392 lines when Wave 67.3 added 324 more. When an exception class grows that large, ask what the code is doing there.
+23. **Port what classifies, not what describes it.** Wave 66.6 added plans beside `TvPipe` and `MoviePipe`, and the pipes never called them. The real category rules stay in those pipes' own methods, so the indexer's identification work should read those methods and ignore any wave plan.
 
 ## Slices
 
@@ -41,3 +42,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 5 | Wave 67.1 plans: `XxxPipe`, `CollectionCleanupService`, `CollectionsCleaningService`, `ConfigurationProvider`, `DomainConfigurationRepository`, their Rust module and parity test | `a94d3fa42` | 16 to 18 |
 | 6 | Wave 67.2 plans: `ProcessingRuntimeStateRepository`, `ConsolesProcessor`, `EpisodeHydrationService`, `FanartTvService`, `ForkingService`, their Rust module and parity test | `43f2624bf` | 19, 20 |
 | 7 | Wave 67.3 plans: `GamesProcessor`, `GdprNotificationService`, `GenreService`, `IGDB/Client`, `IgdbHttpException`, their Rust module and parity test | `e16bffea1` | 21, 22 |
+| 8 | Wave 66.6 plans: `MiscSafetyNetPipe`, `MoviePipe`, `MusicPipe`, `PcPipe`, `TvPipe`, their Rust module and parity test | `3e4315e2d` | 23 |
