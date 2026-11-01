@@ -15,6 +15,9 @@ use nntmux_runtime::Ctx;
 use nntmux_verify::candidates::{self, Claim};
 use nntmux_verify::cleaning::ReleaseCleaner;
 use nntmux_verify::locks::{LockSession, WorkerLocks};
+use nntmux_verify::manifest::{self, Evidence};
+use nntmux_verify::remote::RemotePublisher;
+use nntmux_verify::spot_check::{VerificationResult, with_evidence};
 use serde_json::{Value, json};
 use support::Harness;
 use tower::ServiceExt;
@@ -317,5 +320,85 @@ async fn a_batch_outside_its_limits_is_refused_whole() -> Result<()> {
     let (status, answer) = post(&app, BATCH, &huge).await?;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(answer["max_bytes"], 4096);
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn the_remote_client_publishes_through_the_real_route() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let app = app(&harness, settings()).await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let claim = claimed(&harness, "d0").await?;
+    let manifest = manifest::read(
+        &harness.db(),
+        &harness.verify.config,
+        &claim.candidate.manifest_path,
+    )
+    .await?;
+    let evidence = Evidence {
+        articles: 1,
+        bytes: 100,
+        sampled_files: 1,
+        verified_file_names: vec!["movie.mkv".to_owned()],
+        ..Evidence::default()
+    };
+    let result = VerificationResult {
+        verdict: "sampled".to_owned(),
+        reason: "ok".to_owned(),
+        manifest: Some(with_evidence(&manifest, &evidence)),
+        ..VerificationResult::default()
+    };
+    let client = RemotePublisher::new(&format!("http://{address}{SINGLE}"), 30)?;
+    let release = client.publish(&claim, &result).await?.expect("a release");
+    assert_eq!(
+        release_of(&harness, claim.candidate.id).await?,
+        Some(release)
+    );
+    // The same request again, as after a response lost on the way back.
+    assert_eq!(client.publish(&claim, &result).await?, Some(release));
+    assert_eq!(harness.count("releases").await?, 1);
+    server.abort();
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn a_partial_below_its_policy_is_deferred() -> Result<()> {
+    let Some(harness) = Harness::start_with(|config| config.partial_after_hours = 1).await? else {
+        return Ok(());
+    };
+    let app = app(&harness, settings()).await?;
+    let db = harness.db();
+    sqlx::query("UPDATE ingestion_configurations SET min_files_to_form_release = 50")
+        .execute(&db)
+        .await?;
+    sqlx::query("UPDATE usenet_groups SET minfilestoformrelease = NULL")
+        .execute(&db)
+        .await?;
+    let collection = harness
+        .collection("e0", 2, &[("a", 2, &[1]), ("b", 1, &[1])], 1)
+        .await?;
+    candidates::archive(&harness.verify, collection).await?;
+    sqlx::query(
+        "UPDATE release_verification_candidates SET last_unique_at = UTC_TIMESTAMP() - INTERVAL 2 HOUR",
+    )
+    .execute(&db)
+    .await?;
+    assert_eq!(candidates::promote_partial(&harness.verify, 10).await?, 1);
+    let mut locks = WorkerLocks::new(&db, &harness.verify.config).await?;
+    assert!(locks.start(1).await?);
+    let claim = candidates::claim(&harness.verify, &mut locks, true)
+        .await?
+        .expect("a due partial");
+    locks.close().await;
+
+    let (status, answer) = post(&app, SINGLE, &item(&claim)).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert!(answer["deferred"].is_string(), "{answer}");
+    assert_eq!(harness.count("releases").await?, 0);
     harness.finish().await
 }

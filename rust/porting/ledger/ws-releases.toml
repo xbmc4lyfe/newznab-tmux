@@ -70,7 +70,8 @@ note = "Moves Redis Horizon jobs to the database queue. Run once on PHP before c
 kind = "command"
 id = "releases:forward-verified-publications"
 source = "app/Console/Commands/ForwardVerifiedPublications.php"
-status = "todo"
+status = "dropped"
+note = "The per-host outbox existed so a blocking PHP worker could free its slot while another process forwarded batches. Rust workers wait on the request without holding a process, so each publishes synchronously. RELEASE_VERIFICATION_PUBLISH_ASYNC, PUBLISH_BATCH_URL and the forwarder settings have no effect on workers; the primary still serves publish-batch."
 
 [[entry]]
 kind = "command"

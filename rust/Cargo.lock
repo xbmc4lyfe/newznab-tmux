@@ -2755,6 +2755,7 @@ dependencies = [
  "rand 0.9.5",
  "redis",
  "regex",
+ "reqwest",
  "roxmltree",
  "serde",
  "serde_json",
@@ -2765,6 +2766,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "wiremock",
 ]
 
 [[package]]
