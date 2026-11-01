@@ -17,6 +17,10 @@ pub struct VerificationConfig {
     pub deterministic_retry_seconds: i64,
     pub partial_after_hours: i64,
     pub partial_ready_limit: i64,
+    /// Limits on the articles one spot check samples.
+    pub spot_check_articles: i64,
+    pub spot_check_bytes: i64,
+    pub spot_check_article_bytes: i64,
     /// Candidate worker slots on this host.
     pub candidate_workers: i64,
     /// Hosts sharing one database schedule disjoint slots: this host runs `slot_offset + 1` through
@@ -42,6 +46,12 @@ impl VerificationConfig {
             )?,
             partial_after_hours: parsed_or("RELEASE_VERIFICATION_PARTIAL_AFTER_HOURS", 4)?,
             partial_ready_limit: parsed_or("RELEASE_VERIFICATION_PARTIAL_READY_LIMIT", 500)?,
+            spot_check_articles: parsed_or("RELEASE_VERIFICATION_SPOT_CHECK_ARTICLES", 1)?,
+            spot_check_bytes: parsed_or("RELEASE_VERIFICATION_SPOT_CHECK_BYTES", 1_048_576)?,
+            spot_check_article_bytes: parsed_or(
+                "RELEASE_VERIFICATION_SPOT_CHECK_ARTICLE_BYTES",
+                1_048_576,
+            )?,
             candidate_workers: parsed_or("RELEASE_VERIFICATION_CANDIDATE_WORKERS", 2)?,
             slot_offset: parsed_or("RELEASE_VERIFICATION_SLOT_OFFSET", 0)?,
             host: var_or("RELEASE_VERIFICATION_HOST", ""),
@@ -63,6 +73,9 @@ impl VerificationConfig {
             deterministic_retry_seconds: 86_400,
             partial_after_hours: 4,
             partial_ready_limit: 500,
+            spot_check_articles: 1,
+            spot_check_bytes: 1_048_576,
+            spot_check_article_bytes: 1_048_576,
             candidate_workers: 2,
             slot_offset: 0,
             host: String::new(),
