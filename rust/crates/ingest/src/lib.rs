@@ -26,7 +26,6 @@ use crate::backfill::{Order, Target};
 use crate::get_range::{RangeMode, RangeRequest, get_range};
 use crate::run::{Connector, Job, Runner, runner};
 use crate::scan::Ingest;
-use crate::store::NoHooks;
 
 pub async fn run_update(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
     run::run_update_role(ctx, args.once, stop).await
@@ -93,7 +92,7 @@ pub enum Command {
         group: Option<String>,
         max: Option<u64>,
     },
-    /// update:backfill: all, alph, date, or a group name, with an optional quantity.
+    /// update:backfill: all, alph, date, safe, or a group name, with an optional quantity.
     UpdateBackfill {
         #[arg(default_value = "all")]
         mode: String,
@@ -224,7 +223,7 @@ async fn one_group(runner: &Runner, command: Command) -> Result<()> {
     let mut ingest = Ingest::new(
         &runner.pool,
         &runner.config,
-        &NoHooks,
+        runner.hooks.as_ref(),
         connection.as_mut(),
         None,
     );
@@ -286,6 +285,7 @@ async fn one_group(runner: &Runner, command: Command) -> Result<()> {
                     .backfill_all(None, Target::Articles(count), Order::Name)
                     .await
             }
+            ("safe", Some(count)) => ingest.safe_backfill(count).await,
             ("date", Some(count)) => {
                 ingest
                     .backfill_all(None, Target::Articles(count), Order::Date)
@@ -301,7 +301,7 @@ async fn one_group(runner: &Runner, command: Command) -> Result<()> {
                     .backfill_all(Some(name), Target::Articles(count), Order::Name)
                     .await
             }
-            _ => bail!("Wrong set of arguments: all, alph N, date N, GROUP, or GROUP N."),
+            _ => bail!("Wrong set of arguments: all, alph N, date N, safe N, GROUP, or GROUP N."),
         },
         other => bail!("{other:?} doesn't take one group"),
     }

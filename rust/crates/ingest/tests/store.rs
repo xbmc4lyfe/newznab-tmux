@@ -5,7 +5,7 @@ use nntmux_ingest::clean::CollectionRegex;
 use nntmux_ingest::groups::{self, Group};
 use nntmux_ingest::header::{Overview, match_subject};
 use nntmux_ingest::missed::MissedParts;
-use nntmux_ingest::store::{NoHooks, ParsedHeader, StoreLimits, store};
+use nntmux_ingest::store::{NoHooks, ParsedHeader, StoreHooks, StoreLimits, store};
 use nntmux_testkit::TestDb;
 use sqlx::MySqlPool;
 
@@ -423,5 +423,120 @@ async fn maintenance_commands_reclassify_and_collect_stats() {
 
     let totals = backfill_hourly_stats(pool, 3, false).await.unwrap();
     assert_eq!(totals.collected + totals.skipped, 3);
+    db.drop_database().await.unwrap();
+}
+
+/// Records the collections it sees and what it's told to clean up, and can fail on demand.
+#[derive(Default)]
+struct RecordingHooks {
+    fail: bool,
+    invalidated: std::sync::Mutex<Vec<Vec<u32>>>,
+    cleaned: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl StoreHooks for RecordingHooks {
+    async fn invalidate_candidates(
+        &self,
+        _: &mut sqlx::mysql::MySqlConnection,
+        collections: &[u32],
+    ) -> anyhow::Result<Vec<String>> {
+        self.invalidated.lock().unwrap().push(collections.to_vec());
+        if self.fail {
+            anyhow::bail!("scripted");
+        }
+        Ok(vec!["old.manifest".to_owned()])
+    }
+
+    async fn after_commit(&self, names: &[String]) -> anyhow::Result<()> {
+        self.cleaned.lock().unwrap().extend_from_slice(names);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn late_articles_reach_tracked_candidates_inside_the_transaction() {
+    let Some(db) = TestDb::create().await.unwrap() else {
+        return;
+    };
+    let pool = &db.pool;
+    let group = group(pool).await;
+    let subject = |part: u32| format!("Late [01/01] - \"l.rar\" yEnc ({part}/3)");
+    store(
+        pool,
+        &NoHooks,
+        LIMITS,
+        &group,
+        &no_regexes(),
+        &[header(1, &subject(1), 1)],
+    )
+    .await
+    .unwrap();
+    let (id, identity): (u32, String) =
+        sqlx::query_as("SELECT id, LOWER(HEX(collectionhash)) FROM collections")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+    // No candidate yet, so the hook stays out of it.
+    let hooks = RecordingHooks::default();
+    store(
+        pool,
+        &hooks,
+        LIMITS,
+        &group,
+        &no_regexes(),
+        &[header(2, &subject(2), 1)],
+    )
+    .await
+    .unwrap();
+    assert!(hooks.invalidated.lock().unwrap().is_empty());
+
+    sqlx::query(
+        "INSERT INTO release_verification_candidates
+         (identity, source_identity, groups_id, manifest_path, manifest_bytes, manifest_hash,
+          last_unique_at, next_attempt_at, status)
+         VALUES ('i', ?, ?, 'old.manifest', 1, 'h', NOW(), NOW(), 'pending')",
+    )
+    .bind(&identity)
+    .bind(group.id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // A failing hook rolls the chunk back and leaves nothing to clean up.
+    let failing = RecordingHooks {
+        fail: true,
+        ..RecordingHooks::default()
+    };
+    let failed = store(
+        pool,
+        &failing,
+        LIMITS,
+        &group,
+        &no_regexes(),
+        &[header(3, &subject(3), 1)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed, [3]);
+    assert_eq!(count(pool, "parts").await, 2);
+    assert!(failing.cleaned.lock().unwrap().is_empty());
+
+    let hooks = RecordingHooks::default();
+    let failed = store(
+        pool,
+        &hooks,
+        LIMITS,
+        &group,
+        &no_regexes(),
+        &[header(3, &subject(3), 1)],
+    )
+    .await
+    .unwrap();
+    assert!(failed.is_empty());
+    assert_eq!(count(pool, "parts").await, 3);
+    assert_eq!(*hooks.invalidated.lock().unwrap(), [vec![id]]);
+    assert_eq!(*hooks.cleaned.lock().unwrap(), ["old.manifest"]);
     db.drop_database().await.unwrap();
 }

@@ -58,6 +58,26 @@ impl Ingest<'_> {
         Ok(())
     }
 
+    /// Backfills the first group, by name, that hasn't reached the safe backfill date.
+    pub async fn safe_backfill(&mut self, count: u64) -> Result<()> {
+        let name: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM usenet_groups WHERE backfill = 1
+             AND first_record_postdate BETWEEN ? AND NOW() ORDER BY name LIMIT 1",
+        )
+        .bind(self.config.safe_backfill_date)
+        .fetch_optional(self.pool)
+        .await?;
+        let Some(name) = name else {
+            info!(
+                date = %self.config.safe_backfill_date,
+                "no groups to backfill: all are at the target date, or none is enabled"
+            );
+            return Ok(());
+        };
+        self.backfill_all(Some(&name), Target::Articles(count), Order::Name)
+            .await
+    }
+
     pub async fn backfill_group(&mut self, group: &Group, target: Target) -> Result<()> {
         if self.stopping().await? || !capacity_available(self.pool, self.config).await? {
             return Ok(());

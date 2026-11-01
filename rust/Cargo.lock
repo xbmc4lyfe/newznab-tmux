@@ -1876,6 +1876,7 @@ dependencies = [
  "nntmux-core",
  "nntmux-runtime",
  "nntmux-testkit",
+ "nntmux-verify",
  "rand 0.9.5",
  "redis",
  "regex",

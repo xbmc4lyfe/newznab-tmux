@@ -137,7 +137,7 @@ pub fn repair_ranges(missing: &[u64], message_buffer: u64) -> Vec<Vec<u64>> {
     let mut current: Vec<u64> = Vec::new();
     for &number in missing {
         if let Some(&first) = current.first() {
-            // A float division in PHP: at a buffer of 5, a distance of 2 fits and 3 doesn't.
+            // A float division in PHP: at a buffer of 5, a distance of 1 fits and 2 doesn't.
             if ((number - first) * 4) > message_buffer {
                 ranges.push(std::mem::take(&mut current));
             }
@@ -925,7 +925,7 @@ mod tests {
             sql_chunk_size: 500,
             obfuscation_min_articles: 16,
             verification_required: false,
-            verification_pending_bytes: 0,
+            verification: nntmux_verify::config::VerificationConfig::for_tests("/tmp".into()),
         }
     }
 

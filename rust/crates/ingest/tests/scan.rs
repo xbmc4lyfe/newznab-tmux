@@ -255,7 +255,7 @@ async fn a_full_backlog_defers_the_range_without_fetching() {
     };
     let (group, mut config) = setup(&db, 1000, 900).await;
     config.verification_required = true;
-    config.verification_pending_bytes = 10;
+    config.verification.pending_bytes = 10;
     sqlx::query(
         "INSERT INTO release_verification_state (id, pending_bytes) VALUES (1, 100)
          ON DUPLICATE KEY UPDATE pending_bytes = 100",

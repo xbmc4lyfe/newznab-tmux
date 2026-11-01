@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use nntmux_core::parsed_or;
 use nntmux_runtime::{Ctx, Shutdown};
+use nntmux_verify::cache::Cache;
+use nntmux_verify::context::Verify;
 use redis::AsyncCommands;
 use sqlx::{FromRow, MySqlPool};
 use tokio::sync::Semaphore;
@@ -19,12 +21,14 @@ use crate::get_range::{RangeMode, RangeRequest, get_range};
 use crate::groups;
 use crate::nntp::Nntp;
 use crate::scan::Ingest;
-use crate::store::{NoHooks, StoreHooks};
+use crate::store::{StoreHooks, VerifyHooks};
 
 /// `Cache::forever` key PHP rotated with. Losing it only restarts the rotation.
 const ROTATION_KEY: &str = "ingest:binaries:rotation:last-group";
 /// `get_range` skipped the first 20k articles past the cursor before splitting into ranges.
 const SAFE_SKIP: i64 = 20_000;
+const PAUSED_REST: Duration = Duration::from_secs(5);
+const FAILED_REST: Duration = Duration::from_secs(60);
 
 /// Opens news server connections, one per job.
 #[async_trait]
@@ -376,6 +380,8 @@ impl Runner {
 
     /// `multiprocessing:backfill`: every backfill-enabled group.
     pub async fn backfill(&self, limit: Option<u64>) -> Result<PassResult> {
+        // PHP read no limit, or one of zero, as date mode.
+        let limit = limit.filter(|count| *count > 0);
         let names: Vec<(u32, String)> =
             sqlx::query_as("SELECT id, name FROM usenet_groups WHERE backfill = 1")
                 .fetch_all(&self.pool)
@@ -431,11 +437,16 @@ pub fn backfill_sleep(settings: &RoleSettings, collections: i64) -> u64 {
 pub async fn runner(ctx: &Ctx, stop: Option<Shutdown>) -> Result<Runner> {
     let config = Arc::new(IngestConfig::load(&ctx.db).await?);
     let seconds: u64 = parsed_or("NN_MULTIPROCESSING_MAX_CHILD_TIME", 1800)?;
+    let hooks = Arc::new(VerifyHooks(Verify::new(
+        ctx.db.clone(),
+        Cache::new(ctx.redis.clone(), "nntmux:"),
+        config.verification.clone(),
+    )));
     Ok(Runner {
         pool: ctx.db.clone(),
         config,
         connector: crate::connector()?,
-        hooks: Arc::new(NoHooks),
+        hooks,
         stop,
         job_timeout: Duration::from_secs(seconds),
     })
@@ -444,20 +455,8 @@ pub async fn runner(ctx: &Ctx, stop: Option<Shutdown>) -> Result<Runner> {
 /// `nntmux-worker ingest`: safe update passes, resting `binaries_timer` between them.
 pub async fn run_update_role(ctx: Ctx, once: bool, stop: Shutdown) -> Result<()> {
     while !stop.requested() {
-        let mut rest = Duration::from_secs(5);
-        if !ctx.paused().await.unwrap_or(false) {
-            let settings = role_settings(&ctx.db).await?;
-            rest = Duration::from_secs(u64::from(settings.binaries_timer).max(1));
-            if settings.binaries_enabled {
-                let runner = runner(&ctx, Some(stop.clone())).await?;
-                let result = runner.safe_binaries(Some(ctx.redis.clone())).await?;
-                info!(
-                    finished = result.finished,
-                    failed = result.failed,
-                    "update pass done"
-                );
-            }
-        }
+        let outcome = update_pass(&ctx, &stop).await;
+        let rest = rest_after(outcome, once)?;
         if once {
             return Ok(());
         }
@@ -466,39 +465,78 @@ pub async fn run_update_role(ctx: Ctx, once: bool, stop: Shutdown) -> Result<()>
     Ok(())
 }
 
+async fn update_pass(ctx: &Ctx, stop: &Shutdown) -> Result<Duration> {
+    if ctx.paused().await? {
+        return Ok(PAUSED_REST);
+    }
+    let settings = role_settings(&ctx.db).await?;
+    if settings.binaries_enabled {
+        let runner = runner(ctx, Some(stop.clone())).await?;
+        let result = runner.safe_binaries(Some(ctx.redis.clone())).await?;
+        info!(
+            finished = result.finished,
+            failed = result.failed,
+            "update pass done"
+        );
+    }
+    Ok(Duration::from_secs(
+        u64::from(settings.binaries_timer).max(1),
+    ))
+}
+
 /// `nntmux-worker backfill`: the configured backfill mode, held while collections are over the
 /// kill threshold, as they back up when releases can't keep up.
 pub async fn run_backfill_role(ctx: Ctx, once: bool, stop: Shutdown) -> Result<()> {
     while !stop.requested() {
-        let mut rest = Duration::from_secs(5);
-        if !ctx.paused().await.unwrap_or(false) {
-            let settings = role_settings(&ctx.db).await?;
-            let collections: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collections")
-                .fetch_one(&ctx.db)
-                .await?;
-            rest = Duration::from_secs(backfill_sleep(&settings, collections).max(1));
-            let limit = i64::from(settings.collections_kill_threshold);
-            let held = limit > 0 && limit < collections;
-            if !held && matches!(settings.backfill_mode, 1 | 4) {
-                let runner = runner(&ctx, Some(stop.clone())).await?;
-                let result = if settings.backfill_mode == 1 {
-                    runner.backfill(None).await?
-                } else {
-                    runner.safe_backfill().await?
-                };
-                info!(
-                    finished = result.finished,
-                    failed = result.failed,
-                    "backfill pass done"
-                );
-            }
-        }
+        let outcome = backfill_pass(&ctx, &stop).await;
+        let rest = rest_after(outcome, once)?;
         if once {
             return Ok(());
         }
         stop.sleep(rest).await;
     }
     Ok(())
+}
+
+async fn backfill_pass(ctx: &Ctx, stop: &Shutdown) -> Result<Duration> {
+    if ctx.paused().await? {
+        return Ok(PAUSED_REST);
+    }
+    let settings = role_settings(&ctx.db).await?;
+    let collections: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collections")
+        .fetch_one(&ctx.db)
+        .await?;
+    let limit = i64::from(settings.collections_kill_threshold);
+    let held = limit > 0 && limit < collections;
+    if !held && matches!(settings.backfill_mode, 1 | 4) {
+        let runner = runner(ctx, Some(stop.clone())).await?;
+        let result = if settings.backfill_mode == 1 {
+            runner.backfill(None).await?
+        } else {
+            runner.safe_backfill().await?
+        };
+        info!(
+            finished = result.finished,
+            failed = result.failed,
+            "backfill pass done"
+        );
+    }
+    Ok(Duration::from_secs(
+        backfill_sleep(&settings, collections).max(1),
+    ))
+}
+
+/// A failed pass doesn't end a role, as a transient server failure didn't end a tmux pane. A
+/// `--once` run reports it.
+fn rest_after(outcome: Result<Duration>, once: bool) -> Result<Duration> {
+    match outcome {
+        Ok(rest) => Ok(rest),
+        Err(failure) if once => Err(failure),
+        Err(failure) => {
+            error!(error = format!("{failure:#}"), "header pass failed");
+            Ok(FAILED_REST)
+        }
+    }
 }
 
 #[cfg(test)]

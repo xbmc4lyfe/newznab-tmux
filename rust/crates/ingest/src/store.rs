@@ -10,6 +10,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use nntmux_core::pcre::latin1;
+use nntmux_verify::candidates;
+use nntmux_verify::context::Verify;
+use nntmux_verify::manifest;
 use rand::Rng;
 use sqlx::mysql::{MySqlConnection, MySqlDatabaseError};
 use sqlx::{AssertSqlSafe, Connection, MySqlPool};
@@ -36,15 +39,41 @@ pub struct ParsedHeader {
     pub subject: SubjectMatch,
 }
 
-/// What happens inside the header transaction beyond ingest's own tables.
+/// What happens around the header transaction beyond ingest's own tables.
 #[async_trait]
 pub trait StoreHooks: Send + Sync {
-    /// Late articles arrived for collections with a verification candidate in progress.
+    /// Late articles arrived for collections with a verification candidate in progress. Runs
+    /// inside the transaction. Returns what [`StoreHooks::after_commit`] should clean up.
     async fn invalidate_candidates(
         &self,
         connection: &mut MySqlConnection,
         collections: &[u32],
-    ) -> Result<()>;
+    ) -> Result<Vec<String>>;
+
+    /// Runs once the transaction has committed, with the names `invalidate_candidates` returned.
+    async fn after_commit(&self, names: &[String]) -> Result<()>;
+}
+
+/// Verification's own handling of late articles.
+pub struct VerifyHooks(pub Verify);
+
+#[async_trait]
+impl StoreHooks for VerifyHooks {
+    async fn invalidate_candidates(
+        &self,
+        connection: &mut MySqlConnection,
+        collections: &[u32],
+    ) -> Result<Vec<String>> {
+        let ids: Vec<i64> = collections.iter().copied().map(i64::from).collect();
+        candidates::invalidate_hot_collections(&self.0, connection, &ids).await
+    }
+
+    async fn after_commit(&self, names: &[String]) -> Result<()> {
+        for name in names {
+            manifest::delete_if_unreferenced(&self.0.db, &self.0.config, name).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Leaves verification candidates alone.
@@ -52,7 +81,15 @@ pub struct NoHooks;
 
 #[async_trait]
 impl StoreHooks for NoHooks {
-    async fn invalidate_candidates(&self, _: &mut MySqlConnection, _: &[u32]) -> Result<()> {
+    async fn invalidate_candidates(
+        &self,
+        _: &mut MySqlConnection,
+        _: &[u32],
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn after_commit(&self, _: &[String]) -> Result<()> {
         Ok(())
     }
 }
@@ -270,13 +307,22 @@ async fn store_attempt(
     refresh_binaries(&mut transaction, &touched, chunk).await?;
     let collection_ids: BTreeSet<u32> = collections.values().copied().collect();
     refresh_collections(&mut transaction, &collection_ids, chunk).await?;
-    if !tracked.is_empty() {
+    let unreferenced = if tracked.is_empty() {
+        Vec::new()
+    } else {
         hooks
             .invalidate_candidates(&mut transaction, &tracked)
             .await
-            .context("invalidating verification candidates")?;
-    }
+            .context("invalidating verification candidates")?
+    };
     transaction.commit().await?;
+    // The headers are safe by now, so a manifest left behind must not fail the chunk.
+    if let Err(failure) = hooks.after_commit(&unreferenced).await {
+        warn!(
+            error = format!("{failure:#}"),
+            "couldn't delete unreferenced manifests"
+        );
+    }
     Ok(())
 }
 
