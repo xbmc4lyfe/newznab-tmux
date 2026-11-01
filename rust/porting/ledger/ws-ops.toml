@@ -315,7 +315,7 @@ status = "todo"
 kind = "schedule"
 id = "command: 'multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBac"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
