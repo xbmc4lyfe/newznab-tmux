@@ -62,26 +62,27 @@ pub use writes::{MovieDocument, TvShowDocument};
 /// Retries due index failures until told to stop. Holds off while processing is paused.
 pub async fn run_sync(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
     let client = SearchClient::from_ctx(&ctx)?;
-    sync_loop(&client, &ctx.db, || ctx.paused(), &args, &stop).await
+    let gate = || nntmux_runtime::busy::enter(&ctx, "search-sync");
+    sync_loop(&client, &ctx.db, gate, &args, &stop).await
 }
 
 /// A database or Manticore failure waits for the next pass, since the failure rows are durable
 /// and the old schedule simply ran again a minute later. With `--once` it's the exit code.
 #[doc(hidden)]
-pub async fn sync_loop<P, F>(
+pub async fn sync_loop<P, F, G>(
     client: &SearchClient,
     db: &MySqlPool,
-    paused: P,
+    gate: P,
     args: &RoleArgs,
     stop: &Shutdown,
 ) -> Result<()>
 where
     P: Fn() -> F,
-    F: Future<Output = Result<bool>>,
+    F: Future<Output = Result<Option<G>>>,
 {
     let idle = Duration::from_secs(args.idle_seconds);
     while !stop.requested() {
-        let pass = sync_pass(client, db, paused().await).await;
+        let pass = sync_pass(client, db, gate().await).await;
         if args.once {
             return pass;
         }
@@ -93,11 +94,16 @@ where
     Ok(())
 }
 
-async fn sync_pass(client: &SearchClient, db: &MySqlPool, paused: Result<bool>) -> Result<()> {
-    // Unknown state: claim nothing until the database answers.
-    if paused? {
+/// The gate's guard stays held for the whole pass, so a drain waits for it. `None` means paused.
+async fn sync_pass<G>(
+    client: &SearchClient,
+    db: &MySqlPool,
+    gate: Result<Option<G>>,
+) -> Result<()> {
+    // Unknown state: claim nothing until the database and Redis answer.
+    let Some(_held) = gate? else {
         return Ok(());
-    }
+    };
     let report = client.repair(db, SYNC_BATCH).await?;
     if report.due > 0 {
         info!(

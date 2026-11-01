@@ -7,13 +7,35 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+chrono-tz = "0.10"
 clap.workspace = true
+deunicode.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+md-5.workspace = true
+nntmux-core.workspace = true
+nntmux-predb.workspace = true
 nntmux-runtime.workspace = true
+nntmux-search.workspace = true
+rand.workspace = true
+redis.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+webp = "0.3"
 
 [dev-dependencies]
 nntmux-testkit.workspace = true
-tokio.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+tempfile.workspace = true
+wiremock.workspace = true
 
 [lints]
 workspace = true

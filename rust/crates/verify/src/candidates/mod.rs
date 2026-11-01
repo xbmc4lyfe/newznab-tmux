@@ -3,6 +3,7 @@
 //! Lock order everywhere: an upload's collection, then its candidates in primary-key order, then
 //! manifest rows, then the capacity ledger as the last lock request before commit.
 
+mod admit;
 mod archive;
 mod deferrals;
 mod expiry;
@@ -15,6 +16,7 @@ use sqlx::{MySql, MySqlConnection, QueryBuilder};
 
 use crate::config::VerificationConfig;
 
+pub use admit::{AdmissionDeferred, CandidateAdmission, enqueue_with_admission};
 pub use archive::{MetadataBudgetExceeded, archive};
 pub use deferrals::{KeptCollection, archive_each, forget_deferrals, unlocked_ids};
 pub use expiry::expire;
