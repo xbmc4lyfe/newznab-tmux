@@ -150,3 +150,20 @@ pub async fn hit(ctx: &Ctx, settings: &Settings, name: &str, max: i64, decay: u6
         }
     }
 }
+
+const INCREMENT: &str = "local count = redis.call('incr', KEYS[1])
+if count == 1 then redis.call('expire', KEYS[1], ARGV[1]) end
+return count";
+
+/// A counter whose window starts at its first write, so it all expires together.
+pub async fn increment(ctx: &Ctx, settings: &Settings, name: &str, ttl: u64) {
+    let mut redis = ctx.redis.clone();
+    let counted: redis::RedisResult<i64> = redis::Script::new(INCREMENT)
+        .key(key(settings, name))
+        .arg(ttl.max(1))
+        .invoke_async(&mut redis)
+        .await;
+    if let Err(failure) = counted {
+        warn!(error = %failure, "redis increment failed");
+    }
+}
