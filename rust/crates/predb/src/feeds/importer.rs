@@ -8,10 +8,10 @@ use anyhow::{Result, anyhow, bail};
 use chrono::NaiveDateTime;
 use sqlx::{MySqlPool, Row};
 
-use super::index::PredbIndex;
 use super::{Entry, PRE_NONUKE};
 use crate::filename::exact_value;
 use crate::identity::{self, InsertOutcome, NewPredb};
+use crate::index::PredbIndex;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Totals {

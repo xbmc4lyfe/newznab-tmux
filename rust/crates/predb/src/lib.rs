@@ -22,6 +22,7 @@ macro_rules! frx {
 pub mod feeds;
 pub mod filename;
 pub mod identity;
+pub mod index;
 pub mod season;
 pub mod selector;
 
@@ -32,6 +33,8 @@ use serde_json::json;
 use sqlx::MySqlPool;
 
 use crate::filename::exact_value;
+
+pub use crate::index::{PredbIndex, PredbMatch, match_pre};
 
 pub async fn run(_ctx: Ctx, _args: RoleArgs, _stop: Shutdown) -> Result<()> {
     bail!("the predb role isn't ported yet")

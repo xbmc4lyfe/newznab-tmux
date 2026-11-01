@@ -8,11 +8,11 @@ use nntmux_runtime::Ctx;
 
 use super::http::FeedHttp;
 use super::importer::{Importer, Totals};
-use super::index::PredbIndex;
 use super::{
     Entry, FeedConfig, FeedError, FeedResult, FeedSource, MANUAL_ONLY_SOURCES, SINGLE_PAGE_SOURCES,
     sources,
 };
+use crate::index::PredbIndex;
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct ImportArgs {

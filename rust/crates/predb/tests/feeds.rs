@@ -1,10 +1,10 @@
 //! Feed parsing against `fixtures/generate_feed_golden.php`, plus the importer and command flow
 //! against a real database and a mock server.
 
+use nntmux_predb::PredbIndex;
 use nntmux_predb::feeds::command::{ImportArgs, import, parse_since, rate_limit_wait_seconds};
 use nntmux_predb::feeds::http::FeedHttp;
 use nntmux_predb::feeds::importer::{Importer, Totals};
-use nntmux_predb::feeds::index::PredbIndex;
 use nntmux_predb::feeds::sources::*;
 use nntmux_predb::feeds::{
     Entry, FeedConfig, FeedError, PRE_NUKED, PRE_UNNUKED, size_from_megabytes,

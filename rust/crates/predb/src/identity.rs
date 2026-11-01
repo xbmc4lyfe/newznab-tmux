@@ -116,7 +116,16 @@ fn is_generation(value: &str) -> bool {
 }
 
 /// The triggers are what keep the index honest, so nothing certifies without all three.
+/// READ COMMITTED matters as much: `lock_state` is a current read, so under REPEATABLE READ a
+/// transaction with an earlier read would pair the current state with an old snapshot of keys
+/// and rows, and could answer Unique or Absent for a catalogue that has moved on.
 async fn assert_schema(tx: &mut MySqlConnection) -> Result<()> {
+    let isolation: String = sqlx::query_scalar("SELECT @@session.tx_isolation")
+        .fetch_one(&mut *tx)
+        .await?;
+    if isolation != "READ-COMMITTED" {
+        bail!("PreDB identity needs READ COMMITTED, not {isolation}");
+    }
     let triggers: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() \
          AND EVENT_OBJECT_TABLE = 'predb' AND TRIGGER_NAME IN \
@@ -448,6 +457,7 @@ pub async fn insert_irc(pool: &MySqlPool, row: &IrcRow) -> Result<LegacyOutcome>
     if row.title.is_empty() || row.title == "0" {
         return Ok(LegacyOutcome::Noop);
     }
+    let php_set = |value: &Option<String>| value.clone().filter(|v| !v.is_empty() && v != "0");
     let mut tx = pool.begin().await?;
     let before = fence(&mut tx).await?;
     let exists: Option<u64> = sqlx::query_scalar("SELECT id FROM predb WHERE title = ? LIMIT 1")
@@ -463,15 +473,15 @@ pub async fn insert_irc(pool: &MySqlPool, row: &IrcRow) -> Result<LegacyOutcome>
          COALESCE(?, 0), COALESCE(?, 0), COALESCE(?, 0), COALESCE(?, ''), COALESCE(?, NOW()))",
     )
     .bind(&row.title)
-    .bind(&row.size)
-    .bind(&row.category)
-    .bind(&row.source)
-    .bind(&row.reason)
-    .bind(&row.files)
-    .bind(row.request_id)
-    .bind(row.group_id)
-    .bind(row.nuked)
-    .bind(&row.filename)
+    .bind(php_set(&row.size))
+    .bind(php_set(&row.category))
+    .bind(php_set(&row.source))
+    .bind(php_set(&row.reason))
+    .bind(php_set(&row.files))
+    .bind(row.request_id.filter(|v| *v != 0))
+    .bind(row.group_id.filter(|v| *v != 0))
+    .bind(row.nuked.filter(|v| *v != 0))
+    .bind(php_set(&row.filename))
     .bind(row.predate)
     .execute(&mut *tx)
     .await;
@@ -495,6 +505,7 @@ pub async fn update_irc(
 ) -> Result<LegacyOutcome> {
     if !(1..=MAX_OWNER_ID).contains(&id)
         || row.title.is_empty()
+        || row.title == "0"
         || exact_value(observed_title) != exact_value(&row.title)
     {
         return Ok(LegacyOutcome::Stale);
@@ -514,9 +525,9 @@ pub async fn update_irc(
         return Ok(LegacyOutcome::Stale);
     }
     let non_empty = |v: &Option<String>| v.clone().filter(|v| !v.is_empty() && v != "0");
-    let new_source = non_empty(&row.source).filter(|_| current_source.is_empty());
-    let new_category =
-        non_empty(&row.category).filter(|_| category.as_deref().unwrap_or("").is_empty());
+    let new_source =
+        non_empty(&row.source).filter(|_| non_empty(&Some(current_source.clone())).is_none());
+    let new_category = non_empty(&row.category).filter(|_| non_empty(&category).is_none());
     let new_filename = non_empty(&row.filename);
     let (size, reason, files) = (
         non_empty(&row.size),
@@ -649,7 +660,7 @@ pub async fn rebuild_start(pool: &MySqlPool) -> Result<(String, u64, u64)> {
             .fetch_one(&mut *tx)
             .await?;
     let until = max_predb.unwrap_or(0).max(max_owner.unwrap_or(0));
-    if until > MAX_OWNER_ID {
+    if until > MAX_OWNER_ID || has_id_zero(&mut tx).await? {
         bail!("Unsupported PreDB rebuild owner domain");
     }
     let mut bytes = [0u8; 16];
@@ -667,6 +678,17 @@ pub async fn rebuild_start(pool: &MySqlPool) -> Result<(String, u64, u64)> {
     .await?;
     tx.commit().await?;
     Ok((generation, state.epoch, until))
+}
+
+/// A manually inserted id 0 sits below every cursor, so traversal would silently skip it.
+async fn has_id_zero(tx: &mut MySqlConnection) -> Result<bool> {
+    let zero: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM predb WHERE id = 0) + \
+         (SELECT COUNT(*) FROM predb_identity_revisions WHERE predb_id = 0)",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    Ok(zero != 0)
 }
 
 fn check_generation(generation: &str) -> Result<()> {
@@ -778,6 +800,9 @@ pub async fn rebuild_certify(pool: &MySqlPool, generation: &str) -> Result<()> {
     let (epoch, cursor, until) = active_build(&mut tx, generation).await?;
     if !next_owners(&mut tx, cursor, until, 1).await?.is_empty() {
         bail!("PreDB rebuild inventory is incomplete.");
+    }
+    if has_id_zero(&mut tx).await? {
+        bail!("PreDB rebuild inventory changed.");
     }
     for sql in [
         "SELECT COUNT(*) FROM predb WHERE id > ?",

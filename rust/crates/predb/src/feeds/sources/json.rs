@@ -24,7 +24,7 @@ fn integer(value: &Value) -> Option<i64> {
     number(value).map(|n| n as i64)
 }
 
-fn text<'a>(value: &'a Value) -> Option<&'a str> {
+fn text(value: &Value) -> Option<&str> {
     value.as_str().filter(|text| !text.is_empty())
 }
 
