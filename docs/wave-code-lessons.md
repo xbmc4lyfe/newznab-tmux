@@ -59,3 +59,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 20 | Wave 64.4 plans: `MediaSourcePlan`, `Par2FileEntry`, `PersistenceMetrics`, `ArchivedMediaSlicer`, `ContainerSplicer`, their Rust module and parity test | `2a50c0765` | None new |
 | 21 | Wave 64.2 plans: `ProcessingConfiguration`, `ConsoleOutputService`, `AdditionalBatchResult`, `AdditionalWorkPlan`, `ArchiveCandidate`, their Rust module and parity test | `1597eaab5` | None new |
 | 22 | Wave 64.5 plans: `FfmpegFrameGrabber`, `FrameQualityScorer`, `ImageCandidateRanker`, `ImageInspector`, `MediaArticleFetcher`, their Rust module and parity test | `1190c6e0b` | 25 |
+| 23 | Wave 64.1 plans: `AdditionalCandidateQuery`, `AdditionalProcessingDiagnostics`, `AdditionalProcessingOrchestrator`, `AdditionalWorkPlanner`, `ArchiveExtractionService`, their Rust module and parity test | `cee15b3d9` | None new |
