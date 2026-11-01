@@ -1,0 +1,777 @@
+{
+    "cases": [
+        {
+            "name": "standard-index-and-volumes",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http:\/\/www.newzbin.com\/DTD\/2003\/nzb\"><file poster=\"p@x\" date=\"1\" subject=\"[ 1\/9 ] - &quot;Some.Show.S01E01.rar&quot; yEnc (1\/3)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"700000\">r1a@x<\/segment><segment number=\"2\" bytes=\"700000\">r1b@x<\/segment><segment number=\"3\" bytes=\"100\">r1c@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"[1\/3] - &quot;Some.Show.S01E01.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"40000\">idx@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"[2\/3] - &quot;Some.Show.S01E01.vol000+01.par2&quot; yEnc (1\/50)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"700000\">v1-1@x<\/segment><segment number=\"2\" bytes=\"700000\">v1-2@x<\/segment><segment number=\"3\" bytes=\"700000\">v1-3@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"[3\/3] - &quot;Some.Show.S01E01.vol001+02.par2&quot; yEnc (1\/90)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"700000\">v2-1@x<\/segment><\/segments><\/file><\/nzb>",
+            "max_bytes": 2097152,
+            "parsed": true,
+            "candidates": [
+                {
+                    "subject": "[1\/3] - \"Some.Show.S01E01.par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "idx@x",
+                            "bytes": 40000
+                        }
+                    ],
+                    "signature": "c65ff1311623f0a68cf5fa59d234ba9b36b5b92830538b16703baa5866f06a2e",
+                    "family": "Some.Show.S01E01.par2"
+                },
+                {
+                    "subject": "[2\/3] - \"Some.Show.S01E01.vol000+01.par2\" yEnc (1\/50)",
+                    "explicit": true,
+                    "classification": "volume",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "v1-1@x",
+                            "bytes": 700000
+                        },
+                        {
+                            "number": 2,
+                            "id": "v1-2@x",
+                            "bytes": 700000
+                        },
+                        {
+                            "number": 3,
+                            "id": "v1-3@x",
+                            "bytes": 700000
+                        }
+                    ],
+                    "signature": "92f8882e8bd4dfc559fa0a2642d78bdaff351b0d3f3dfca39e76ddc6605dfc6b",
+                    "family": "Some.Show.S01E01.par2"
+                },
+                {
+                    "subject": "[3\/3] - \"Some.Show.S01E01.vol001+02.par2\" yEnc (1\/90)",
+                    "explicit": true,
+                    "classification": "volume",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "v2-1@x",
+                            "bytes": 700000
+                        }
+                    ],
+                    "signature": "505b3455e5eab9fccb8b13146c831bf748a0d98d6889f192fcec48791e264fbc",
+                    "family": "Some.Show.S01E01.par2"
+                }
+            ],
+            "manifest": "[{\"subject\":\"[ 1\\\/9 ] - \\\"Some.Show.S01E01.rar\\\" yEnc (1\\\/3)\",\"classification\":\"excluded\",\"segments\":[{\"number\":\"1\",\"id\":\"r1a@x\",\"bytes\":\"700000\"},{\"number\":\"2\",\"id\":\"r1b@x\",\"bytes\":\"700000\"},{\"number\":\"3\",\"id\":\"r1c@x\",\"bytes\":\"100\"}]},{\"subject\":\"[1\\\/3] - \\\"Some.Show.S01E01.par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"idx@x\",\"bytes\":\"40000\"}]},{\"subject\":\"[2\\\/3] - \\\"Some.Show.S01E01.vol000+01.par2\\\" yEnc (1\\\/50)\",\"classification\":\"volume\",\"segments\":[{\"number\":\"1\",\"id\":\"v1-1@x\",\"bytes\":\"700000\"},{\"number\":\"2\",\"id\":\"v1-2@x\",\"bytes\":\"700000\"},{\"number\":\"3\",\"id\":\"v1-3@x\",\"bytes\":\"700000\"}]},{\"subject\":\"[3\\\/3] - \\\"Some.Show.S01E01.vol001+02.par2\\\" yEnc (1\\\/90)\",\"classification\":\"volume\",\"segments\":[{\"number\":\"1\",\"id\":\"v2-1@x\",\"bytes\":\"700000\"}]}]",
+            "non_explicit_bytes": 1400100,
+            "structure_valid": true,
+            "signature": "307f3500f55c1a3b2225cf8ad0d85b57a381530231123f4a2dab011b05f85b44"
+        },
+        {
+            "name": "volumes-before-index-reordered",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http:\/\/www.newzbin.com\/DTD\/2003\/nzb\"><file poster=\"p@x\" date=\"1\" subject=\"&quot;Other.vol000+01.PAR2&quot; yEnc (1\/2)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"500\">ov1@x<\/segment><segment number=\"2\" bytes=\"500\">ov2@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;Some.vol000+01.par2&quot; yEnc (1\/2)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"500\">sv1@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;Some.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"500\">si@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;Some.vol001+02.par2&quot; yEnc (1\/2)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"500\">sv2@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;video.mkv&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"500\">m@x<\/segment><\/segments><\/file><\/nzb>",
+            "max_bytes": 2097152,
+            "parsed": true,
+            "candidates": [
+                {
+                    "subject": "\"Some.par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "si@x",
+                            "bytes": 500
+                        }
+                    ],
+                    "signature": "ef1694ef723840a2d3c795c979160ec09b2706a9dc42cb583dc9fa8999cb3f91",
+                    "family": "Some.par2"
+                },
+                {
+                    "subject": "\"Some.vol000+01.par2\" yEnc (1\/2)",
+                    "explicit": true,
+                    "classification": "volume",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "sv1@x",
+                            "bytes": 500
+                        }
+                    ],
+                    "signature": "c7acab5462f17006e780727e302732c22db065dd01c10d05eebcf54a99ba9dda",
+                    "family": "Some.par2"
+                },
+                {
+                    "subject": "\"video.mkv\" yEnc (1\/1)",
+                    "explicit": false,
+                    "classification": "hidden",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "m@x",
+                            "bytes": 500
+                        }
+                    ],
+                    "signature": "45800fc31d81856b7227a3a98b751c2511105a4623fc8e6f1d512c82efad4c62",
+                    "family": null
+                },
+                {
+                    "subject": "\"Other.vol000+01.PAR2\" yEnc (1\/2)",
+                    "explicit": true,
+                    "classification": "volume",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "ov1@x",
+                            "bytes": 500
+                        },
+                        {
+                            "number": 2,
+                            "id": "ov2@x",
+                            "bytes": 500
+                        }
+                    ],
+                    "signature": "8ad8a9a147eb0cf0078c2de6b7fda01e312b003ed12f320787bde264c6cef43f",
+                    "family": "Other.par2"
+                },
+                {
+                    "subject": "\"Some.vol001+02.par2\" yEnc (1\/2)",
+                    "explicit": true,
+                    "classification": "volume",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "sv2@x",
+                            "bytes": 500
+                        }
+                    ],
+                    "signature": "76fd17c8bd4dd0da17a7ac5301e6fbc36b280981c2af5c46b0e044666f38e118",
+                    "family": "Some.par2"
+                }
+            ],
+            "manifest": "[{\"subject\":\"\\\"Other.vol000+01.PAR2\\\" yEnc (1\\\/2)\",\"classification\":\"volume\",\"segments\":[{\"number\":\"1\",\"id\":\"ov1@x\",\"bytes\":\"500\"},{\"number\":\"2\",\"id\":\"ov2@x\",\"bytes\":\"500\"}]},{\"subject\":\"\\\"Some.vol000+01.par2\\\" yEnc (1\\\/2)\",\"classification\":\"volume\",\"segments\":[{\"number\":\"1\",\"id\":\"sv1@x\",\"bytes\":\"500\"}]},{\"subject\":\"\\\"Some.par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"si@x\",\"bytes\":\"500\"}]},{\"subject\":\"\\\"Some.vol001+02.par2\\\" yEnc (1\\\/2)\",\"classification\":\"volume\",\"segments\":[{\"number\":\"1\",\"id\":\"sv2@x\",\"bytes\":\"500\"}]},{\"subject\":\"\\\"video.mkv\\\" yEnc (1\\\/1)\",\"classification\":\"hidden\",\"segments\":[{\"number\":\"1\",\"id\":\"m@x\",\"bytes\":\"500\"}]}]",
+            "non_explicit_bytes": 500,
+            "structure_valid": true,
+            "signature": "c4ad00e643da539a41f93ba0b21aa602174f653276f68f4720864552bc1ece20"
+        },
+        {
+            "name": "unnumbered-segments-out-of-order",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http:\/\/www.newzbin.com\/DTD\/2003\/nzb\"><file poster=\"p@x\" date=\"1\" subject=\"&quot;pack.rar&quot; yEnc (1\/3)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"3\" bytes=\"5\">c@x<\/segment><segment number=\"1\" bytes=\"5\">a@x<\/segment><segment number=\"2\" bytes=\"5\">b@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;idx.par2&quot; yEnc (1\/3)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"3\" bytes=\"5\">ic@x<\/segment><segment number=\"1\" bytes=\"5\">ia@x<\/segment><segment number=\"2\" bytes=\"5\">ib@x<\/segment><\/segments><\/file><\/nzb>",
+            "max_bytes": 2097152,
+            "parsed": true,
+            "candidates": [
+                {
+                    "subject": "\"idx.par2\" yEnc (1\/3)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "ia@x",
+                            "bytes": 5
+                        },
+                        {
+                            "number": 2,
+                            "id": "ib@x",
+                            "bytes": 5
+                        },
+                        {
+                            "number": 3,
+                            "id": "ic@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "f9635b52345208496785cc01eb81a081a020e17776ca955ade146d6e4fc6e007",
+                    "family": "idx.par2"
+                }
+            ],
+            "manifest": "[{\"subject\":\"\\\"pack.rar\\\" yEnc (1\\\/3)\",\"classification\":\"excluded\",\"segments\":[{\"number\":\"3\",\"id\":\"c@x\",\"bytes\":\"5\"},{\"number\":\"1\",\"id\":\"a@x\",\"bytes\":\"5\"},{\"number\":\"2\",\"id\":\"b@x\",\"bytes\":\"5\"}]},{\"subject\":\"\\\"idx.par2\\\" yEnc (1\\\/3)\",\"classification\":\"index\",\"segments\":[{\"number\":\"3\",\"id\":\"ic@x\",\"bytes\":\"5\"},{\"number\":\"1\",\"id\":\"ia@x\",\"bytes\":\"5\"},{\"number\":\"2\",\"id\":\"ib@x\",\"bytes\":\"5\"}]}]",
+            "non_explicit_bytes": 15,
+            "structure_valid": true,
+            "signature": "cc8d377646372aafe27aa6aafe5496555218d6d481c6e91816fcd5ce1888bfab"
+        },
+        {
+            "name": "invalid-segments",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http:\/\/www.newzbin.com\/DTD\/2003\/nzb\"><file poster=\"p@x\" date=\"1\" subject=\"&quot;gap.par2&quot; yEnc (1\/3)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">a@x<\/segment><segment number=\"3\" bytes=\"5\">c@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;zero.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"0\">a@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;empty-id.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">   <\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;lead0.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"01\" bytes=\"5\">a@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;plus.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"+1\" bytes=\"5\">p@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;spaces.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\" 1 \" bytes=\" 5 \"> sp@x <\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;dup.par2&quot; yEnc (1\/2)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">a@x<\/segment><segment number=\"1\" bytes=\"5\">b@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;alpha.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"x\" bytes=\"5\">a@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;big.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"99999999999999999999\">a@x<\/segment><\/segments><\/file><\/nzb>",
+            "max_bytes": 2097152,
+            "parsed": true,
+            "candidates": [
+                {
+                    "subject": "\"gap.par2\" yEnc (1\/3)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 0,
+                            "id": "a@x",
+                            "bytes": 5
+                        },
+                        {
+                            "number": 3,
+                            "id": "c@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "2ab039f0f9e7ce0ed2b89aa8df7a29e977f241f24a350cff899f215ce4e39cae",
+                    "family": "gap.par2"
+                },
+                {
+                    "subject": "\"zero.par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 0,
+                            "id": "a@x",
+                            "bytes": 0
+                        }
+                    ],
+                    "signature": "5f96062cf6becfc09c59ba81da4c38f224853b1dae5446153599dc54ebe9404a",
+                    "family": "zero.par2"
+                },
+                {
+                    "subject": "\"empty-id.par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 0,
+                            "id": "",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "ba4f2ae40392e8bc438f325d17df4add2707cfed6af9f48a04416ba8ef595f8a",
+                    "family": "empty-id.par2"
+                },
+                {
+                    "subject": "\"lead0.par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 0,
+                            "id": "a@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "77764867a2bc2a2a02fa2257e8b1333a2c6056f6b535df4a7888c05fb3fb81fb",
+                    "family": "lead0.par2"
+                },
+                {
+                    "subject": "\"plus.par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "p@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "ea32f3e532d5efeee1122690370e91f8bce77875c48f3e673c96cf8c60de5bea",
+                    "family": "plus.par2"
+                },
+                {
+                    "subject": "\"spaces.par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "sp@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "c9e9673d02ae0834dae72609ed6af3eed22f110be67bd5a2b94b3d8b1799c8c8",
+                    "family": "spaces.par2"
+                },
+                {
+                    "subject": "\"dup.par2\" yEnc (1\/2)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 0,
+                            "id": "a@x",
+                            "bytes": 5
+                        },
+                        {
+                            "number": 1,
+                            "id": "b@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "400e69018657961685209a12f27e99d63a257fc675ee97df0c62400faa98fa61",
+                    "family": "dup.par2"
+                },
+                {
+                    "subject": "\"alpha.par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 0,
+                            "id": "a@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "2eb970978c75952180b776ee96910eeb767cb75a623b6db7110902c673d27668",
+                    "family": "alpha.par2"
+                },
+                {
+                    "subject": "\"big.par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 0,
+                            "id": "a@x",
+                            "bytes": 0
+                        }
+                    ],
+                    "signature": "defdb0c3f87bb8eeb9c9f59f3dc330e21ab8b02ea346137eaceed757257ef5d9",
+                    "family": "big.par2"
+                }
+            ],
+            "manifest": "[{\"subject\":\"\\\"gap.par2\\\" yEnc (1\\\/3)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"a@x\",\"bytes\":\"5\"},{\"number\":\"3\",\"id\":\"c@x\",\"bytes\":\"5\"}]},{\"subject\":\"\\\"zero.par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"a@x\",\"bytes\":\"0\"}]},{\"subject\":\"\\\"empty-id.par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"   \",\"bytes\":\"5\"}]},{\"subject\":\"\\\"lead0.par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"01\",\"id\":\"a@x\",\"bytes\":\"5\"}]},{\"subject\":\"\\\"plus.par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"+1\",\"id\":\"p@x\",\"bytes\":\"5\"}]},{\"subject\":\"\\\"spaces.par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\" 1 \",\"id\":\" sp@x \",\"bytes\":\" 5 \"}]},{\"subject\":\"\\\"dup.par2\\\" yEnc (1\\\/2)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"a@x\",\"bytes\":\"5\"},{\"number\":\"1\",\"id\":\"b@x\",\"bytes\":\"5\"}]},{\"subject\":\"\\\"alpha.par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"x\",\"id\":\"a@x\",\"bytes\":\"5\"}]},{\"subject\":\"\\\"big.par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"a@x\",\"bytes\":\"99999999999999999999\"}]}]",
+            "non_explicit_bytes": 0,
+            "structure_valid": false,
+            "signature": "31033cde1c645d38551921edd03eae5c6a495e804d384f5e25121c63743761a2"
+        },
+        {
+            "name": "no-segments",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http:\/\/www.newzbin.com\/DTD\/2003\/nzb\"><file poster=\"p@x\" date=\"1\" subject=\"&quot;none.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;empty.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><\/segments><\/file><\/nzb>",
+            "max_bytes": 2097152,
+            "parsed": true,
+            "error": "TypeError"
+        },
+        {
+            "name": "no-files",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http:\/\/www.newzbin.com\/DTD\/2003\/nzb\"><\/nzb>",
+            "max_bytes": 2097152,
+            "parsed": true,
+            "candidates": [],
+            "manifest": "[]",
+            "non_explicit_bytes": 0,
+            "structure_valid": false,
+            "signature": "7d41dcfae9e392da0ea61805f07521e30219cfc82c413559d48257dcd12fd6ef"
+        },
+        {
+            "name": "not-xml",
+            "xml": "this is not xml",
+            "max_bytes": 2097152,
+            "parsed": false
+        },
+        {
+            "name": "unclosed-xml",
+            "xml": "<nzb><file subject=\"a\">",
+            "max_bytes": 2097152,
+            "parsed": false
+        },
+        {
+            "name": "hidden-and-legacy",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http:\/\/www.newzbin.com\/DTD\/2003\/nzb\"><file poster=\"p@x\" date=\"1\" subject=\"Release.Name.2024.mkv\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"100000\">big@x<\/segment><segment number=\"2\" bytes=\"100000\">big2@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"qxz9f8a7s6d5f4g3h2j1k0\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"3000\">h1@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"abc123def456\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"1000\">h2@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"abc123def457\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"2000\">h3@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;movie.par&quot; something (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"900\">l1@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;movie.01&quot; something (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"800\">l2@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;movie.001&quot; other (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"800\">l3@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"obfuscated blob (1\/3)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"3000000\">ob1@x<\/segment><segment number=\"2\" bytes=\"3000000\">ob2@x<\/segment><segment number=\"3\" bytes=\"3000000\">ob3@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"hidden but huge (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"3000000\">hu@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"part.rar (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"10\">sr@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"part.nfo yEnc (2\/2)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"10\">sn@x<\/segment><\/segments><\/file><\/nzb>",
+            "max_bytes": 2097152,
+            "parsed": true,
+            "candidates": [
+                {
+                    "subject": "\"movie.par\" something (1\/1)",
+                    "explicit": false,
+                    "classification": "legacy",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "l1@x",
+                            "bytes": 900
+                        }
+                    ],
+                    "signature": "720a3701d86b76faa2e9768d1c1384b1e469079419c7e21f2e1bb69ef5cdfdb8",
+                    "family": null
+                },
+                {
+                    "subject": "\"movie.01\" something (1\/1)",
+                    "explicit": false,
+                    "classification": "legacy",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "l2@x",
+                            "bytes": 800
+                        }
+                    ],
+                    "signature": "85ae343540f94a57ce807ac70171f17683128174d3bf9548e261d708803f2aab",
+                    "family": null
+                },
+                {
+                    "subject": "\"movie.001\" other (1\/1)",
+                    "explicit": false,
+                    "classification": "legacy",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "l3@x",
+                            "bytes": 800
+                        }
+                    ],
+                    "signature": "31ccc64dda2975346315104ffd66768fc5fac0cc8ec5aad0b32edcc1cef73caf",
+                    "family": null
+                },
+                {
+                    "subject": "part.rar (1\/1)",
+                    "explicit": false,
+                    "classification": "hidden",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "sr@x",
+                            "bytes": 10
+                        }
+                    ],
+                    "signature": "da9fecd1f32143c338d910a111314a2908c42fb743dc9c29ecf11ab8deed57a3",
+                    "family": null
+                },
+                {
+                    "subject": "abc123def456",
+                    "explicit": false,
+                    "classification": "hidden",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "h2@x",
+                            "bytes": 1000
+                        }
+                    ],
+                    "signature": "4e3fc977ce69d29563bf7065ca7b6cee2ac5634babe229667eb5eef8cb6672d7",
+                    "family": null
+                },
+                {
+                    "subject": "abc123def457",
+                    "explicit": false,
+                    "classification": "hidden",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "h3@x",
+                            "bytes": 2000
+                        }
+                    ],
+                    "signature": "58d78cc60a7ffeedc45f7ad455cbe9b9e31ce34f1a722fcb7070cc0baa9e3f24",
+                    "family": null
+                },
+                {
+                    "subject": "qxz9f8a7s6d5f4g3h2j1k0",
+                    "explicit": false,
+                    "classification": "hidden",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "h1@x",
+                            "bytes": 3000
+                        }
+                    ],
+                    "signature": "88d35a81d8b3baed795882bf182b1bca55f56969acccec3f13ff0723f51f183a",
+                    "family": null
+                }
+            ],
+            "manifest": "[{\"subject\":\"Release.Name.2024.mkv\",\"classification\":\"excluded\",\"segments\":[{\"number\":\"1\",\"id\":\"big@x\",\"bytes\":\"100000\"},{\"number\":\"2\",\"id\":\"big2@x\",\"bytes\":\"100000\"}]},{\"subject\":\"qxz9f8a7s6d5f4g3h2j1k0\",\"classification\":\"hidden\",\"segments\":[{\"number\":\"1\",\"id\":\"h1@x\",\"bytes\":\"3000\"}]},{\"subject\":\"abc123def456\",\"classification\":\"hidden\",\"segments\":[{\"number\":\"1\",\"id\":\"h2@x\",\"bytes\":\"1000\"}]},{\"subject\":\"abc123def457\",\"classification\":\"hidden\",\"segments\":[{\"number\":\"1\",\"id\":\"h3@x\",\"bytes\":\"2000\"}]},{\"subject\":\"\\\"movie.par\\\" something (1\\\/1)\",\"classification\":\"legacy\",\"segments\":[{\"number\":\"1\",\"id\":\"l1@x\",\"bytes\":\"900\"}]},{\"subject\":\"\\\"movie.01\\\" something (1\\\/1)\",\"classification\":\"legacy\",\"segments\":[{\"number\":\"1\",\"id\":\"l2@x\",\"bytes\":\"800\"}]},{\"subject\":\"\\\"movie.001\\\" other (1\\\/1)\",\"classification\":\"legacy\",\"segments\":[{\"number\":\"1\",\"id\":\"l3@x\",\"bytes\":\"800\"}]},{\"subject\":\"obfuscated blob (1\\\/3)\",\"classification\":\"excluded\",\"segments\":[{\"number\":\"1\",\"id\":\"ob1@x\",\"bytes\":\"3000000\"},{\"number\":\"2\",\"id\":\"ob2@x\",\"bytes\":\"3000000\"},{\"number\":\"3\",\"id\":\"ob3@x\",\"bytes\":\"3000000\"}]},{\"subject\":\"hidden but huge (1\\\/1)\",\"classification\":\"excluded\",\"segments\":[{\"number\":\"1\",\"id\":\"hu@x\",\"bytes\":\"3000000\"}]},{\"subject\":\"part.rar (1\\\/1)\",\"classification\":\"hidden\",\"segments\":[{\"number\":\"1\",\"id\":\"sr@x\",\"bytes\":\"10\"}]},{\"subject\":\"part.nfo yEnc (2\\\/2)\",\"classification\":\"excluded\",\"segments\":[{\"number\":\"1\",\"id\":\"sn@x\",\"bytes\":\"10\"}]}]",
+            "non_explicit_bytes": 12208520,
+            "structure_valid": true,
+            "signature": "e4b0260d23f66620af95a411c2e54ae7beb029f7f330a24d64a12f2a4a9ea31f"
+        },
+        {
+            "name": "hidden-small-limit",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http:\/\/www.newzbin.com\/DTD\/2003\/nzb\"><file poster=\"p@x\" date=\"1\" subject=\"abc123def456\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"1000\">h2@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"abc123def457\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"2000\">h3@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"abc123def458\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"2001\">h4@x<\/segment><\/segments><\/file><\/nzb>",
+            "max_bytes": 2000,
+            "parsed": true,
+            "candidates": [
+                {
+                    "subject": "abc123def456",
+                    "explicit": false,
+                    "classification": "hidden",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "h2@x",
+                            "bytes": 1000
+                        }
+                    ],
+                    "signature": "4e3fc977ce69d29563bf7065ca7b6cee2ac5634babe229667eb5eef8cb6672d7",
+                    "family": null
+                },
+                {
+                    "subject": "abc123def457",
+                    "explicit": false,
+                    "classification": "hidden",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "h3@x",
+                            "bytes": 2000
+                        }
+                    ],
+                    "signature": "58d78cc60a7ffeedc45f7ad455cbe9b9e31ce34f1a722fcb7070cc0baa9e3f24",
+                    "family": null
+                }
+            ],
+            "manifest": "[{\"subject\":\"abc123def456\",\"classification\":\"hidden\",\"segments\":[{\"number\":\"1\",\"id\":\"h2@x\",\"bytes\":\"1000\"}]},{\"subject\":\"abc123def457\",\"classification\":\"hidden\",\"segments\":[{\"number\":\"1\",\"id\":\"h3@x\",\"bytes\":\"2000\"}]},{\"subject\":\"abc123def458\",\"classification\":\"excluded\",\"segments\":[{\"number\":\"1\",\"id\":\"h4@x\",\"bytes\":\"2001\"}]}]",
+            "non_explicit_bytes": 5001,
+            "structure_valid": true,
+            "signature": "69eadc52cb2fd1d0472cd716fc72030db180ec2789e8069927d9b9ee226cbea7"
+        },
+        {
+            "name": "duplicate-files",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http:\/\/www.newzbin.com\/DTD\/2003\/nzb\"><file poster=\"p@x\" date=\"1\" subject=\"&quot;dup.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">a@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;dup.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">a@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;dup.vol000+01.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">v@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"&quot;dup.vol000+01.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">v@x<\/segment><\/segments><\/file><\/nzb>",
+            "max_bytes": 2097152,
+            "parsed": true,
+            "candidates": [
+                {
+                    "subject": "\"dup.par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "a@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "46e0da91f8c8c926a40db7593d01214f2f1cb27d984729654561bc8bbc33dd63",
+                    "family": "dup.par2"
+                },
+                {
+                    "subject": "\"dup.vol000+01.par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "volume",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "v@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "efc904db702c04316effb6be404c6d6b21f4a367091eb132e577cfb002590a04",
+                    "family": "dup.par2"
+                }
+            ],
+            "manifest": "[{\"subject\":\"\\\"dup.par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"a@x\",\"bytes\":\"5\"}]},{\"subject\":\"\\\"dup.par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"a@x\",\"bytes\":\"5\"}]},{\"subject\":\"\\\"dup.vol000+01.par2\\\" yEnc (1\\\/1)\",\"classification\":\"volume\",\"segments\":[{\"number\":\"1\",\"id\":\"v@x\",\"bytes\":\"5\"}]},{\"subject\":\"\\\"dup.vol000+01.par2\\\" yEnc (1\\\/1)\",\"classification\":\"volume\",\"segments\":[{\"number\":\"1\",\"id\":\"v@x\",\"bytes\":\"5\"}]}]",
+            "non_explicit_bytes": 0,
+            "structure_valid": true,
+            "signature": "0da15c2de1e583fd3b09573d35219623f574ddd48d66d3755d001a271ae7b3d2"
+        },
+        {
+            "name": "entities-and-unicode",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http:\/\/www.newzbin.com\/DTD\/2003\/nzb\"><file poster=\"p@x\" date=\"1\" subject=\"&quot;R&amp;D &lt;Caf\u00e9&gt; \\u{1F600} &apos;q&apos; \\&quot;x\\&quot;.par2&quot; yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">id&amp;1@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"path\/with\/slashes \u00e9t\u00e9.vol003+04.par2 yEnc (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">id2@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"  [01\/10] &quot;Spaced Name.vol010+20.PAR2&quot;  (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">id3@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"[01\/10] Bare.Name.par2 trailing (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">id4@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"Bare.Name.vol1+1.par2\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">id5@x<\/segment><\/segments><\/file><\/nzb>",
+            "max_bytes": 2097152,
+            "parsed": true,
+            "candidates": [
+                {
+                    "subject": "\"R&D <Caf\u00e9> \\u{1F600} 'q' \\\"x\\\".par2\" yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "id&1@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "28532806f4eb221fb7a3cd52023972d15f57451a65d60ff2cda20df42a48d019",
+                    "family": null
+                },
+                {
+                    "subject": "[01\/10] Bare.Name.par2 trailing (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "id4@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "a6c928640a19e4267b22dcb8a9672f1805d9ca653dc6da1daa281c56a5f8e05b",
+                    "family": "Bare.Name.par2"
+                },
+                {
+                    "subject": "Bare.Name.vol1+1.par2",
+                    "explicit": true,
+                    "classification": "volume",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "id5@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "89220fa4156298ebe3c757b60ddac53dc3450aea2e63290452c63a7fe39934ef",
+                    "family": "Bare.Name.par2"
+                },
+                {
+                    "subject": "path\/with\/slashes \u00e9t\u00e9.vol003+04.par2 yEnc (1\/1)",
+                    "explicit": true,
+                    "classification": "volume",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "id2@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "10a7117f5a4c2e44d480b060b8abe7638764cbd0be13298d3e7b82143523bb4b",
+                    "family": "\u00e9t\u00e9.par2"
+                },
+                {
+                    "subject": "  [01\/10] \"Spaced Name.vol010+20.PAR2\"  (1\/1)",
+                    "explicit": true,
+                    "classification": "volume",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "id3@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "3fbd795976d5c864a2d5f9cd7957ef39e4b7eb774655b11eaf5a5fcb24a70ac4",
+                    "family": "Spaced Name.par2"
+                }
+            ],
+            "manifest": "[{\"subject\":\"\\\"R&D <Caf\\u00e9> \\\\u{1F600} 'q' \\\\\\\"x\\\\\\\".par2\\\" yEnc (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"id&1@x\",\"bytes\":\"5\"}]},{\"subject\":\"path\\\/with\\\/slashes \\u00e9t\\u00e9.vol003+04.par2 yEnc (1\\\/1)\",\"classification\":\"volume\",\"segments\":[{\"number\":\"1\",\"id\":\"id2@x\",\"bytes\":\"5\"}]},{\"subject\":\"  [01\\\/10] \\\"Spaced Name.vol010+20.PAR2\\\"  (1\\\/1)\",\"classification\":\"volume\",\"segments\":[{\"number\":\"1\",\"id\":\"id3@x\",\"bytes\":\"5\"}]},{\"subject\":\"[01\\\/10] Bare.Name.par2 trailing (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"id4@x\",\"bytes\":\"5\"}]},{\"subject\":\"Bare.Name.vol1+1.par2\",\"classification\":\"volume\",\"segments\":[{\"number\":\"1\",\"id\":\"id5@x\",\"bytes\":\"5\"}]}]",
+            "non_explicit_bytes": 0,
+            "structure_valid": true,
+            "signature": "013c11c9ba5776e6bbae7dee39bc48d0396147b4d6962531352589967d4b4011"
+        },
+        {
+            "name": "multipart-par2-index",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><nzb xmlns=\"http:\/\/www.newzbin.com\/DTD\/2003\/nzb\"><file poster=\"p@x\" date=\"1\" subject=\"&quot;Many.par2&quot; yEnc (1\/2)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">m1@x<\/segment><segment number=\"2\" bytes=\"5\">m2@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"(&quot;Single.par2&quot;) (1\/1)\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">s@x<\/segment><\/segments><\/file><file poster=\"p@x\" date=\"1\" subject=\"no-extension-but-par2-in-name.par2\"><groups><group>alt.binaries.test<\/group><\/groups><segments><segment number=\"1\" bytes=\"5\">n@x<\/segment><\/segments><\/file><\/nzb>",
+            "max_bytes": 2097152,
+            "parsed": true,
+            "candidates": [
+                {
+                    "subject": "\"Many.par2\" yEnc (1\/2)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "m1@x",
+                            "bytes": 5
+                        },
+                        {
+                            "number": 2,
+                            "id": "m2@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "3243966a6eba29f5bb2c8a8a8578b8e041c62fcae99d2fd7d9bd4fa5711b4189",
+                    "family": "Many.par2"
+                },
+                {
+                    "subject": "(\"Single.par2\") (1\/1)",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "s@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "d401f46ff8f25ce6be6c7e64527d70a3852b1ad0f470157a9f0f02af07ffac8a",
+                    "family": "Single.par2"
+                },
+                {
+                    "subject": "no-extension-but-par2-in-name.par2",
+                    "explicit": true,
+                    "classification": "index",
+                    "segments": [
+                        {
+                            "number": 1,
+                            "id": "n@x",
+                            "bytes": 5
+                        }
+                    ],
+                    "signature": "845cbe0a6c8d7ef49cd03cb993c07371fe86a66cdc466044fcd937715ba13c25",
+                    "family": "no-extension-but-par2-in-name.par2"
+                }
+            ],
+            "manifest": "[{\"subject\":\"\\\"Many.par2\\\" yEnc (1\\\/2)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"m1@x\",\"bytes\":\"5\"},{\"number\":\"2\",\"id\":\"m2@x\",\"bytes\":\"5\"}]},{\"subject\":\"(\\\"Single.par2\\\") (1\\\/1)\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"s@x\",\"bytes\":\"5\"}]},{\"subject\":\"no-extension-but-par2-in-name.par2\",\"classification\":\"index\",\"segments\":[{\"number\":\"1\",\"id\":\"n@x\",\"bytes\":\"5\"}]}]",
+            "non_explicit_bytes": 0,
+            "structure_valid": true,
+            "signature": "e18be9dd28cd6fd8905c60c620b4c0689cbf9e0430bad86fedc77ec899ef1904"
+        }
+    ],
+    "subjects": [
+        {
+            "subject": "\"a.par2\" yEnc (1\/1)",
+            "parts": 1,
+            "family": "a.par2"
+        },
+        {
+            "subject": "[1\/3] - \"A.B.vol000+01.par2\" yEnc (1\/50)",
+            "parts": 50,
+            "family": "A.B.par2"
+        },
+        {
+            "subject": "x (3\/4)",
+            "parts": 4,
+            "family": null
+        },
+        {
+            "subject": "x [3\/4]",
+            "parts": 4,
+            "family": null
+        },
+        {
+            "subject": "x 3\/4",
+            "parts": 4,
+            "family": null
+        },
+        {
+            "subject": "x (0\/0)",
+            "parts": 0,
+            "family": null
+        },
+        {
+            "subject": "x 5)",
+            "parts": 5,
+            "family": null
+        },
+        {
+            "subject": "plain",
+            "parts": 0,
+            "family": null
+        },
+        {
+            "subject": "a (1\/99999999999999999999)",
+            "parts": 9223372036854775807,
+            "family": null
+        },
+        {
+            "subject": "trailing newline (2\/2)\n",
+            "parts": 2,
+            "family": null
+        },
+        {
+            "subject": "[02\/10] bare.vol01+02.PAR2 more",
+            "parts": 0,
+            "family": "bare.par2"
+        },
+        {
+            "subject": "  \t'quoted.par2' ",
+            "parts": 0,
+            "family": "quoted.par2"
+        },
+        {
+            "subject": "weird.\"thing.par2\"",
+            "parts": 0,
+            "family": "thing.par2"
+        },
+        {
+            "subject": "A.PAR2",
+            "parts": 0,
+            "family": "A.PAR2"
+        },
+        {
+            "subject": "dir\/a.par2",
+            "parts": 0,
+            "family": "dir\/a.par2"
+        }
+    ]
+}
