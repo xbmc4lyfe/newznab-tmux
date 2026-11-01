@@ -562,6 +562,15 @@ impl WorkerLocks {
         Ok(self.exclusive)
     }
 
+    /// Whether this session still holds the exclusive worker gate from `try_exclusive`. A lost
+    /// lock session releases it, and a barrier may then take it.
+    pub async fn holds_exclusive(&mut self) -> bool {
+        match self.global.clone() {
+            Some(global) if self.exclusive => self.session.holds(&global).await,
+            _ => false,
+        }
+    }
+
     /// Stops every host's workers from claiming and waits up to `seconds` for them to finish.
     pub async fn drain(&mut self, seconds: f64) -> Result<bool> {
         self.close().await;

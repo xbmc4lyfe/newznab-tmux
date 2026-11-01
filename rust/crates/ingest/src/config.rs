@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use nntmux_core::parsed_or;
+use nntmux_verify::config::VerificationConfig;
 use sqlx::{MySqlPool, Row};
 
 #[derive(Clone, Debug)]
@@ -32,7 +33,7 @@ pub struct IngestConfig {
     /// Skip a range's articles randomised per article once this many share a subject shape.
     pub obfuscation_min_articles: usize,
     pub verification_required: bool,
-    pub verification_pending_bytes: i64,
+    pub verification: VerificationConfig,
 }
 
 impl IngestConfig {
@@ -73,10 +74,7 @@ impl IngestConfig {
             sql_chunk_size: clamp_chunk(sql_chunk_size, 1000),
             obfuscation_min_articles: obfuscation_min_articles(obfuscation),
             verification_required: php_bool_env("RELEASE_VERIFICATION_REQUIRED", true),
-            verification_pending_bytes: parsed_or(
-                "RELEASE_VERIFICATION_PENDING_BYTES",
-                10_737_418_240,
-            )?,
+            verification: VerificationConfig::from_env()?,
         })
     }
 }
@@ -110,14 +108,7 @@ pub async fn capacity_available(pool: &MySqlPool, config: &IngestConfig) -> Resu
     if !config.verification_required {
         return Ok(true);
     }
-    let pending: Option<u64> =
-        sqlx::query_scalar("SELECT pending_bytes FROM release_verification_state WHERE id = 1")
-            .fetch_optional(pool)
-            .await?;
-    let capacity = config.verification_pending_bytes;
-    let reserve = (capacity / 10).min(33_554_432);
-    let pending = i64::try_from(pending.unwrap_or(0)).unwrap_or(i64::MAX);
-    Ok(pending < capacity - reserve)
+    nntmux_verify::ledger::capacity_available(pool, &config.verification).await
 }
 
 #[cfg(test)]

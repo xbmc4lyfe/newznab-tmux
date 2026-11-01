@@ -28,7 +28,7 @@ fn compile(pattern: &str) -> Regex {
     Regex::new(&format!("(?-u){pattern}")).expect("a valid built-in regex")
 }
 
-/// One overview line, in the RFC 3977 field order.
+/// One overview line.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Overview {
     pub number: u64,
@@ -38,45 +38,6 @@ pub struct Overview {
     pub message_id: Vec<u8>,
     pub bytes: i64,
     pub xref: Vec<u8>,
-}
-
-impl Overview {
-    /// Parses a tab-separated line. A line without a usable article number returns None, since
-    /// no number could be stored or repaired for it.
-    pub fn parse(line: &[u8]) -> Option<Self> {
-        let mut fields = line.split(|&byte| byte == b'\t');
-        let number = std::str::from_utf8(fields.next()?)
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
-        let mut next = || fields.next().unwrap_or_default();
-        let subject = next().to_vec();
-        let from = next().to_vec();
-        let date = next().to_vec();
-        let message_id = next().to_vec();
-        let _references = next();
-        let bytes = php_int(next());
-        let _lines = next();
-        let xref = next();
-        let xref = strip_xref_prefix(xref).to_vec();
-        Some(Self {
-            number,
-            subject,
-            from,
-            date,
-            message_id,
-            bytes,
-            xref,
-        })
-    }
-}
-
-fn strip_xref_prefix(xref: &[u8]) -> &[u8] {
-    match xref.get(..6) {
-        Some(prefix) if prefix.eq_ignore_ascii_case(b"Xref: ") => &xref[6..],
-        _ => xref,
-    }
 }
 
 /// `(int)` on a string: leading whitespace and digits, saturating, zero when there are none.
