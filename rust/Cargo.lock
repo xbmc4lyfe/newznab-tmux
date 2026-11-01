@@ -2163,8 +2163,22 @@ name = "nntmux-predb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "hex",
+ "md-5 0.10.6",
+ "nntmux-categorize",
+ "nntmux-core",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "rand 0.9.5",
+ "regex",
+ "reqwest",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
