@@ -16,8 +16,8 @@ use crate::transport::tls_config;
 
 pub const MAX_BODY: usize = 2_000_000;
 const MAX_HEADERS: usize = 65_536;
-pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+pub trait Io: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> Io for T {}
 /// Keeps recorded server text small. Servers choose how long this text is.
 fn bounded(s: &str) -> String {
     let mut end = s.len().min(120);

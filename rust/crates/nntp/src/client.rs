@@ -360,6 +360,11 @@ impl NntpClient {
                 "Failed to read from socket...!"
             }));
         };
+        // A line cut off by a timeout or a hangup isn't a reply, whatever it starts with.
+        if !line.ends_with(b"\n") {
+            self.lose_connection();
+            return Err(NntpError::transport("Failed to read from socket...!"));
+        }
         let line = php_trim(&line);
         // A short or non-numeric reply reads as code 0, which no command accepts.
         let code = line
@@ -447,12 +452,14 @@ impl NntpClient {
         self.send_group(group).await
     }
 
+    /// The recorded group only changes once the server has selected it, because a refused
+    /// GROUP leaves the previous selection in force.
     async fn send_group(&mut self, group: &str) -> Result<GroupSummary, NntpError> {
-        self.current_group = group.to_string();
         let code = self.send_command(&format!("GROUP {group}")).await?;
         match code {
             211 => {
                 let summary = self.parse_group_summary()?;
+                self.current_group = group.to_string();
                 self.selected_summary = Some(summary.clone());
                 Ok(summary)
             }
