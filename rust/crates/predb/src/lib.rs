@@ -2,6 +2,23 @@
 //!
 //! Owner: ws-naming. See `rust/WORKSTREAMS.md`.
 
+/// A lazily compiled pattern that needs lookaround: `frx!("...")` or `frx!(i "...")`.
+#[macro_export]
+macro_rules! frx {
+    (i $pattern:expr) => {{
+        static RE: std::sync::LazyLock<nntmux_core::pcre::Pcre> = std::sync::LazyLock::new(|| {
+            nntmux_core::pcre::Pcre::with_flags($pattern, "i").expect("static pattern")
+        });
+        &*RE
+    }};
+    ($pattern:expr) => {{
+        static RE: std::sync::LazyLock<nntmux_core::pcre::Pcre> = std::sync::LazyLock::new(|| {
+            nntmux_core::pcre::Pcre::with_flags($pattern, "").expect("static pattern")
+        });
+        &*RE
+    }};
+}
+
 pub mod filename;
 pub mod identity;
 pub mod season;

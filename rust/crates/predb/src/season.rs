@@ -2,15 +2,15 @@
 //! episode file names inside them. Season tokens must stand alone between separators, so audio
 //! and codec tokens such as DTS5.1, Atmos7.1 or x264 are never mistaken for a season.
 
-use fancy_regex::{Captures, Regex};
 use nntmux_categorize::pcre::{PHP_WS, trim_chars};
-use nntmux_categorize::{frx, mi, rx};
+use nntmux_categorize::{mi, rx};
+use nntmux_core::pcre::{Match, Pcre};
 
-fn season_word() -> &'static Regex {
+fn season_word() -> &'static Pcre {
     frx!(i r"(?:^|[._ \-\[(])Seasons?[._ ]?\d{1,2}(?=$|[._ \-\])])")
 }
 
-fn complete() -> &'static Regex {
+fn complete() -> &'static Pcre {
     frx!(i r"(?:^|[._ \-\[(])Complete[._ ](?:Series|Seasons?)(?=$|[._ \-\])])")
 }
 
@@ -25,16 +25,21 @@ fn sample(base: &str) -> bool {
     mi!(base, r"(?:^|[._ \-])(?:sample|proof)(?:$|[._ \-])")
 }
 
-fn found(re: &Regex, value: &str) -> bool {
-    re.is_match(value).unwrap_or(false)
+fn found(re: &Pcre, value: &str) -> bool {
+    re.is_match(value.as_bytes())
 }
 
-fn caps<'a>(re: &Regex, value: &'a str) -> Option<Captures<'a>> {
-    re.captures(value).ok().flatten()
+fn caps(re: &Pcre, value: &str) -> Option<Match> {
+    re.captures(value.as_bytes())
 }
 
-fn group<'a>(caps: &Captures<'a>, name: &str) -> &'a str {
-    caps.name(name).map_or("", |m| m.as_str())
+fn group(caps: &Match, name: &str) -> String {
+    caps.named()
+        .into_iter()
+        .find(|(group, _)| *group == name)
+        .map_or_else(String::new, |(_, value)| {
+            String::from_utf8_lossy(value).into_owned()
+        })
 }
 
 /// Whether a release name describes a whole season (or several) rather than an episode.
@@ -95,8 +100,9 @@ pub fn episode_identity(name: &str) -> Option<String> {
         &base,
     )?;
     let rest = group(&m, "rest");
+    let rest = rest.as_str();
     let prefix = group(&m, "prefix");
-    if is_episode_name(prefix)
+    if is_episode_name(&prefix)
         || is_episode_name(rest)
         || mi!(rest, r"^[a-z0-9]")
         || mi!(
@@ -111,7 +117,7 @@ pub fn episode_identity(name: &str) -> Option<String> {
     {
         return None;
     }
-    let key = show_key(prefix);
+    let key = show_key(&prefix);
     if key.is_empty() {
         return None;
     }
@@ -277,19 +283,20 @@ fn parse_episode(name: &str) -> Option<Episode> {
             &base,
         )
     })?;
-    let prefix = trim_chars(group(&m, "prefix"), PHP_WS);
+    let prefix = group(&m, "prefix");
+    let prefix = trim_chars(&prefix, PHP_WS);
     if prefix.is_empty() {
         return None;
     }
     Some(Episode {
         name: base.clone(),
         prefix: prefix.to_owned(),
-        sep: group(&m, "sep").to_owned(),
+        sep: group(&m, "sep"),
         key: show_key(prefix),
         season: group(&m, "season").parse().unwrap_or(0),
-        season_digits: group(&m, "season").to_owned(),
+        season_digits: group(&m, "season"),
         episode: group(&m, "episode").parse().unwrap_or(0),
-        rest: group(&m, "rest").to_owned(),
+        rest: group(&m, "rest"),
     })
 }
 
