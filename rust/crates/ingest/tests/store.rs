@@ -300,8 +300,6 @@ async fn missed_parts_queue_counts_attempts() {
     assert_eq!(pending.len(), 100);
     assert_eq!(pending[..2], [5, 6]);
 
-    missed.increment_range(pool, group, 7, 8).await.unwrap();
-    assert_eq!(attempts(7).await, 1);
     missed.increment_up_to(pool, group, 5).await.unwrap();
     assert_eq!(attempts(5).await, 3);
     assert_eq!(missed.pending(pool, group).await.unwrap()[0], 6);

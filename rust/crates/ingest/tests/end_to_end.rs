@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use nntmux_ingest::client::ClientConnector;
 use nntmux_ingest::config::IngestConfig;
-use nntmux_ingest::run::Runner;
+use nntmux_ingest::get_range::RangeMode;
+use nntmux_ingest::nntp::Nntp;
+use nntmux_ingest::run::{Connector, GroupJobs, Job, RangeJob, Runner};
 use nntmux_ingest::store::NoHooks;
 use nntmux_nntp::{NntpConfig, Provider, TlsOptions};
 use nntmux_testkit::TestDb;
@@ -16,6 +18,15 @@ use tokio::net::TcpListener;
 const GROUP: &str = "alt.binaries.ingest.test";
 const FIRST: u64 = 501;
 const LAST: u64 = 1500;
+
+struct Refused;
+
+#[async_trait::async_trait]
+impl Connector for Refused {
+    async fn connect(&self) -> anyhow::Result<Box<dyn Nntp>> {
+        anyhow::bail!("refused")
+    }
+}
 
 fn row(number: u64) -> String {
     format!(
@@ -53,7 +64,7 @@ fn answer(line: &str) -> String {
         return format!("211 1000 {FIRST} {LAST} {GROUP}\r\n");
     }
     if upper.starts_with("LIST OVERVIEW.FMT") {
-        return "215 format\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\nBytes:\r\nLines:\r\nXref:full\r\n.\r\n".to_owned();
+        return "215 format\r\nSubject:\r\nFrom:\r\nDate:\r\nMessage-ID:\r\nReferences:\r\n:bytes\r\n:lines\r\nXref:full\r\n.\r\n".to_owned();
     }
     if upper.starts_with("LIST ACTIVE") {
         return format!("215 groups\r\n{GROUP} {LAST} {FIRST} y\r\nalt.not.ours 9 1 y\r\n.\r\n");
@@ -167,6 +178,19 @@ async fn a_safe_pass_walks_a_group_through_the_real_client() {
         .unwrap();
     assert_eq!(cross, [GROUP]);
 
+    // An exhausted group isn't picked, so it can't keep others from their turn.
+    sqlx::query("INSERT INTO short_groups (name, first_record, last_record) VALUES ('exhausted.group', 5, 9)")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO usenet_groups (name, backfill, last_record, first_record, first_record_postdate)
+         VALUES ('exhausted.group', 1, 9, 5, '2013-01-01 00:00:00')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
     let result = runner.safe_backfill().await.unwrap();
     // 499 older articles, over the budget of 200 for each of 2 threads, in chunks of 100.
     assert_eq!((result.finished, result.failed), (4, 0));
@@ -176,5 +200,33 @@ async fn a_safe_pass_walks_a_group_through_the_real_client() {
         .await
         .unwrap();
     assert_eq!(first, 600);
+
+    // A job that can't connect still leaves its range queued, since siblings can pass it.
+    sqlx::query("DELETE FROM missed_parts")
+        .execute(pool)
+        .await
+        .unwrap();
+    let unreachable = Runner {
+        connector: Arc::new(Refused),
+        ..runner.clone()
+    };
+    let plan = vec![GroupJobs {
+        group: 1,
+        jobs: vec![Job::Range(RangeJob {
+            mode: RangeMode::Backfill,
+            group: GROUP.to_owned(),
+            first: 590,
+            last: 591,
+            contiguous: false,
+            repair: false,
+        })],
+    }];
+    assert_eq!(unreachable.run(plan, 1).await.failed, 1);
+    let queued: Vec<u64> =
+        sqlx::query_scalar("SELECT numberid FROM missed_parts ORDER BY numberid")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(queued, [590, 591]);
     db.drop_database().await.unwrap();
 }

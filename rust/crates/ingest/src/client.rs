@@ -101,10 +101,11 @@ fn overview(row: &OverviewRow) -> Option<Overview> {
         .trim()
         .parse()
         .ok()?;
-    let bytes = match row.get("Bytes") {
-        Some(bytes) if !bytes.is_empty() => bytes,
-        _ => row.get(":bytes").unwrap_or_default(),
-    };
+    // A server advertising `:bytes` has its field named `:byte` by the client's format parser.
+    let bytes = ["Bytes", ":bytes", ":byte"]
+        .iter()
+        .find_map(|name| row.get(name).filter(|value| !value.is_empty()))
+        .unwrap_or_default();
     Some(Overview {
         number,
         subject: field("Subject"),

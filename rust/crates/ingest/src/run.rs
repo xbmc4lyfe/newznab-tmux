@@ -19,6 +19,7 @@ use crate::backfill::{Order, Target};
 use crate::config::IngestConfig;
 use crate::get_range::{RangeMode, RangeRequest, get_range};
 use crate::groups;
+use crate::missed::MissedParts;
 use crate::nntp::Nntp;
 use crate::scan::Ingest;
 use crate::store::{StoreHooks, VerifyHooks};
@@ -209,13 +210,15 @@ impl Runner {
                         break;
                     };
                     if runner.stop.as_ref().is_some_and(Shutdown::requested) {
-                        break;
+                        runner.defer_parallel_range(&job).await;
+                        continue;
                     }
                     match runner.run_job(&job).await {
                         Ok(()) => result.finished += 1,
                         Err(failure) => {
                             result.failed += 1;
                             error!(?job, error = format!("{failure:#}"), "header job failed");
+                            runner.defer_parallel_range(&job).await;
                         }
                     }
                 }
@@ -236,6 +239,39 @@ impl Runner {
             }
         }
         total
+    }
+
+    /// A sibling can move the cursor past a parallel range that didn't finish, and then nothing
+    /// would ever fetch it. Covers what `get_range` can't see: a timeout, a failed connection, or
+    /// a stop before it started. Queuing a range twice changes nothing.
+    async fn defer_parallel_range(&self, job: &Job) {
+        let Job::Range(range) = job else {
+            return;
+        };
+        if range.contiguous {
+            return;
+        }
+        let missed = MissedParts::new(
+            self.config.part_repair_limit,
+            self.config.part_repair_max_tries,
+            self.config.sql_chunk_size,
+        );
+        let deferred = match groups::by_name(&self.pool, &range.group).await {
+            Ok(Some(group)) => {
+                missed
+                    .defer_range(&self.pool, range.first, range.last, group.id)
+                    .await
+            }
+            Ok(None) => return,
+            Err(failure) => Err(failure),
+        };
+        if let Err(failure) = deferred {
+            error!(
+                ?job,
+                error = format!("{failure:#}"),
+                "couldn't queue a range for part repair"
+            );
+        }
     }
 
     async fn run_job(&self, job: &Job) -> Result<()> {
@@ -355,6 +391,7 @@ impl Runner {
              FROM usenet_groups g INNER JOIN short_groups a ON g.name = a.name
              WHERE g.first_record IS NOT NULL AND g.first_record_postdate IS NOT NULL
              AND g.backfill = 1 AND (NOW() - INTERVAL {interval} DAY) < g.first_record_postdate
+             AND g.first_record > a.first_record
              GROUP BY a.name, a.last_record, g.name, g.first_record {order} LIMIT 1"
         );
         let found: Option<(String, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))

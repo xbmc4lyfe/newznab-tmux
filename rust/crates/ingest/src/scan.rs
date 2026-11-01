@@ -415,12 +415,9 @@ impl<'a> Ingest<'a> {
             return Err(failure);
         }
 
+        // A failed part repair counts one attempt, when `part_repair` finishes its pass. PHP also
+        // counted it here, so one transient failure used up two of the three tries.
         let Some(headers) = self.download(&group.name, first, last, part_repair).await? else {
-            if part_repair {
-                self.missed
-                    .increment_range(self.pool, group.id, first, last)
-                    .await?;
-            }
             return Ok(ScanOutcome::default());
         };
         if headers.is_empty() {

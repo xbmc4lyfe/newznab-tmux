@@ -448,3 +448,27 @@ async fn a_binaries_range_queues_what_the_server_skipped_before_moving_the_curso
     assert_eq!(missed_numbers(&db.pool).await, [1002]);
     db.drop_database().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_failed_part_repair_uses_one_attempt() {
+    let Some(db) = TestDb::create().await.unwrap() else {
+        return;
+    };
+    let (group, mut config) = setup(&db, 1000, 900).await;
+    config.part_repair_max_tries = 3;
+    let mut server = FakeServer::with_articles([], 1, 1040);
+    server.xover_failures = VecDeque::from([failure(502)]);
+    let mut ingest = Ingest::new(&db.pool, &config, &NoHooks, &mut server, None);
+    ingest
+        .missed()
+        .add(&db.pool, &[500], group.id)
+        .await
+        .unwrap();
+    ingest.part_repair(&group).await.unwrap();
+    let attempts: i8 = sqlx::query_scalar("SELECT attempts FROM missed_parts WHERE numberid = 500")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 2);
+    db.drop_database().await.unwrap();
+}
