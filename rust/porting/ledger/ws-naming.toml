@@ -23,7 +23,7 @@ status = "ported"
 kind = "command"
 id = "multiprocessing:fixrelnames"
 source = "app/Console/Commands/ProcessFixRelNames.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -59,13 +59,13 @@ status = "ported"
 kind = "command"
 id = "releases:fix-names"
 source = "app/Console/Commands/FixReleaseNames.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "releases:fix-names-group"
 source = "app/Console/Commands/ReleasesFixNamesGroup.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
