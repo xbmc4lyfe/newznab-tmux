@@ -17,7 +17,7 @@
 
 ### Manticore `releases_rt` signed columns
 - In Manticore, `integer` is unsigned 32-bit, so negative values such as `passwordstatus = -1` would be stored as large positives. The `releases_rt` schema in `rust/crates/search/src/registry.rs` uses `bigint` for `passwordstatus` and `haspreview` to keep them signed.
-- Manticore can't `ALTER` attribute types in place. Changing a column type means dropping and recreating the table: `nntmux-ctl search create-indexes --drop`, then `nntmux-ctl search reconcile --all` to repopulate. Do this in a maintenance window with `search-sync` stopped.
+- Manticore can't `ALTER` attribute types in place. Changing a column type means dropping and recreating that one table: `nntmux-ctl search create-indexes --drop --index <name>`, then `nntmux-ctl search reconcile --all --reindex` to repopulate it (add `--predb` for the PreDB table). Without `--index`, `--drop` drops every Manticore table; without `--reindex`, reconcile only reports. Do this in a maintenance window with `search-sync` stopped.
 
 ### Commands
 - Operator commands are `nntmux-ctl <crate> <command>` (see `rust/crates/ctl/src/main.rs`). Run `nntmux-ctl --help` for the list.
