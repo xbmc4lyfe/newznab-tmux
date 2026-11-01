@@ -42,12 +42,12 @@ const LEVELS: [&str; 8] = [
 
 static HEADER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?s)^\[(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?)\]\s+([\w.\-]+)\.([A-Z]+):\s?((?s-u:.*))$",
+        r"(?s-u)^\[(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?)\]\s+([\w.\-]+)\.([A-Z]+):\s?(.*)$",
     )
     .expect("a valid pattern")
 });
 static PLAIN_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*\[?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})").expect("a valid pattern")
+    Regex::new(r"(?-u)^\s*\[?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})").expect("a valid pattern")
 });
 
 /// Whether a run should do anything: the viewer's index is on and logs go to files.
@@ -330,6 +330,10 @@ fn walk(directory: &Path, root: &Path, files: &mut Vec<LogFile>) -> Result<()> {
             walk(&entry.path(), root, files)?;
         } else if kind.is_file() {
             let absolute = entry.path();
+            // One unreadable file mustn't stall every other file's indexing.
+            if File::open(&absolute).is_err() {
+                continue;
+            }
             let metadata = entry.metadata()?;
             files.push(LogFile {
                 path: absolute
@@ -374,10 +378,8 @@ fn head(path: &Path, length: u64) -> (String, u64) {
 struct Tracked {
     #[sqlx(try_from = "u64")]
     id: i64,
-    #[sqlx(try_from = "u64")]
-    device: i64,
-    #[sqlx(try_from = "u64")]
-    inode: i64,
+    device: u64,
+    inode: u64,
     head_hash: String,
     head_length: u32,
     structured: bool,
@@ -504,7 +506,7 @@ impl<'a> LogIndexer<'a> {
         for file in files {
             let row = rows
                 .iter()
-                .find(|row| row.device as u64 == file.device && row.inode as u64 == file.inode);
+                .find(|row| row.device == file.device && row.inode == file.inode);
             if row.is_some_and(|row| tracked.iter().any(|(seen, _)| seen.id == row.id)) {
                 continue;
             }
@@ -775,6 +777,14 @@ mod tests {
         let (_dir, path) = log(&format!("[2026-11-01T17:00:00Z] a.INFO: start\n{long}\n"));
         let batch = read_batch(&path, true, 0, 0, 1 << 30, true, 10).unwrap();
         assert!(batch.entries[0].truncated);
+    }
+
+    #[test]
+    fn rust_warnings_keep_their_level_and_only_ascii_names_are_headers() {
+        let (_dir, path) = log("[2026-11-01T17:00:00.000+00:00] ingest.WARNING: careful\n");
+        let batch = read_batch(&path, true, 0, 0, 1 << 30, true, 10).unwrap();
+        assert_eq!(batch.entries[0].level.as_deref(), Some("warning"));
+        assert!(!HEADER.is_match("[2026-11-01T17:00:00Z] ingést.INFO: x".as_bytes()));
     }
 
     #[test]

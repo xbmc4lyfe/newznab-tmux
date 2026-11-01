@@ -39,6 +39,16 @@ const BUCKETS: [f64; 16] = [
 /// Daily log files kept per role.
 pub const LOG_FILES_KEPT: usize = 14;
 
+/// The viewer's level names, which are Monolog's: it has `WARNING` and no `TRACE`.
+fn level_name(level: tracing::Level) -> &'static str {
+    match level {
+        tracing::Level::ERROR => "ERROR",
+        tracing::Level::WARN => "WARNING",
+        tracing::Level::INFO => "INFO",
+        tracing::Level::DEBUG | tracing::Level::TRACE => "DEBUG",
+    }
+}
+
 /// The header format documented above.
 struct LogFileFormat {
     role: String,
@@ -80,23 +90,29 @@ pub fn init_for_role(log_filter: &str, json: bool, role: Option<&str>) -> Result
     } else {
         tracing_subscriber::fmt::layer().boxed()
     };
+    // Log files serve the viewer, so a bad volume must not stop the role: stdout still has the logs.
     let files = match (role, nntmux_core::optional("NNTMUX_LOG_DIR")) {
         (Some(role), Some(directory)) => {
-            let appender = tracing_appender::rolling::RollingFileAppender::builder()
+            match tracing_appender::rolling::RollingFileAppender::builder()
                 .rotation(tracing_appender::rolling::Rotation::DAILY)
                 .filename_prefix(role)
                 .filename_suffix("log")
                 .max_log_files(LOG_FILES_KEPT)
                 .build(&directory)
-                .with_context(|| format!("opening the log directory {directory}"))?;
-            Some(
-                tracing_subscriber::fmt::layer()
-                    .with_ansi(false)
-                    .event_format(LogFileFormat {
-                        role: role.to_owned(),
-                    })
-                    .with_writer(std::sync::Mutex::new(appender)),
-            )
+            {
+                Ok(appender) => Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .event_format(LogFileFormat {
+                            role: role.to_owned(),
+                        })
+                        .with_writer(std::sync::Mutex::new(appender)),
+                ),
+                Err(failure) => {
+                    eprintln!("not writing log files to {directory}: {failure}");
+                    None
+                }
+            }
         }
         _ => None,
     };
@@ -151,4 +167,16 @@ pub async fn serve(
         .await;
     upkeep.abort();
     served.context("serving metrics")
+}
+
+#[cfg(test)]
+mod log_file_tests {
+    use super::*;
+
+    #[test]
+    fn levels_use_the_viewers_names() {
+        assert_eq!(level_name(tracing::Level::WARN), "WARNING");
+        assert_eq!(level_name(tracing::Level::TRACE), "DEBUG");
+        assert_eq!(level_name(tracing::Level::ERROR), "ERROR");
+    }
 }

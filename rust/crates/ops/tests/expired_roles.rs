@@ -88,7 +88,7 @@ async fn expired_users_move_to_their_pending_role_or_back_to_the_default() -> Re
         .await?;
     sqlx::query(
         "INSERT INTO role_promotions (name, applicable_roles, additional_days, is_active) VALUES \
-         ('extra', ?, 10, 1), ('other', '[99]', 500, 1), ('off', ?, 500, 0)",
+         ('extra', ?, 10, 1), ('everyone', '[]', 5, 1), ('other', '[99]', 500, 1), ('off', ?, 500, 0)",
     )
     .bind(format!("[{vip}]"))
     .bind(format!("[{vip}]"))
@@ -149,7 +149,7 @@ async fn expired_users_move_to_their_pending_role_or_back_to_the_default() -> Re
             .bind(stacked)
             .fetch_one(db)
             .await?;
-    let expected = Utc::now().naive_utc() + TimeDelta::days(375);
+    let expected = Utc::now().naive_utc() + TimeDelta::days(380);
     assert!((expiry - expected).num_minutes().abs() < 5, "{expiry}");
     let (is_stacked, pending): (bool, Option<i64>) = sqlx::query_as(
         "SELECT h.is_stacked, CAST(u.pending_roles_id AS SIGNED) FROM user_role_history h JOIN users u ON u.id = h.user_id WHERE u.id = ?",

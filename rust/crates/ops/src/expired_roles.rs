@@ -186,23 +186,29 @@ struct Change<'a> {
     reason: &'a str,
 }
 
-/// The user's row, their permission role and the history entry change together.
+/// The user's row, their permission role and the history entry change together. Returns false if an
+/// admin changed the user's expiry after it was read, which leaves the user alone.
 async fn apply(
     db: &MySqlPool,
     user: &ExpiringUser,
     change: Change<'_>,
     now: NaiveDateTime,
-) -> Result<()> {
+) -> Result<bool> {
     let mut tx = db.begin().await?;
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE users SET roles_id = ?, rolechangedate = ?, pending_roles_id = NULL, \
-         pending_role_start_date = NULL, updated_at = NOW() WHERE id = ?",
+         pending_role_start_date = NULL, updated_at = NOW() WHERE id = ? AND rolechangedate <=> ?",
     )
     .bind(change.new_role)
     .bind(change.new_expiry)
     .bind(user.id)
+    .bind(user.rolechangedate)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        return Ok(false);
+    }
     sync_role(&mut tx, user.id, change.new_role).await?;
     sqlx::query(
         "INSERT INTO user_role_history (user_id, old_role_id, new_role_id, old_expiry_date, new_expiry_date, \
@@ -220,11 +226,12 @@ async fn apply(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
-/// Days a role grants: its years, plus every promotion active now that applies to it.
-async fn granted_days(db: &MySqlPool, role: i64) -> Result<Option<i64>> {
+/// Days a role grants: its years, plus every promotion active now that applies to it. A promotion
+/// naming no roles applies to all of them.
+async fn granted_days(db: &MySqlPool, role: i64, now: NaiveDateTime) -> Result<Option<i64>> {
     let years: Option<i32> = sqlx::query_scalar("SELECT addyears FROM roles WHERE id = ?")
         .bind(role)
         .fetch_optional(db)
@@ -234,9 +241,11 @@ async fn granted_days(db: &MySqlPool, role: i64) -> Result<Option<i64>> {
     };
     let promotions: i64 = sqlx::query_scalar(
         "SELECT CAST(COALESCE(SUM(additional_days), 0) AS SIGNED) FROM role_promotions WHERE is_active = 1 \
-         AND (start_date IS NULL OR start_date <= NOW()) AND (end_date IS NULL OR end_date >= NOW()) \
-         AND JSON_CONTAINS(applicable_roles, CAST(? AS CHAR))",
+         AND (start_date IS NULL OR start_date <= ?) AND (end_date IS NULL OR end_date >= ?) \
+         AND (JSON_LENGTH(applicable_roles) = 0 OR JSON_CONTAINS(applicable_roles, CAST(? AS CHAR)))",
     )
+    .bind(now)
+    .bind(now)
     .bind(role)
     .fetch_one(db)
     .await?;
@@ -260,7 +269,7 @@ async fn process_expired(ctx: &Ctx, now: DateTime<Utc>) -> Result<(u64, u64)> {
                 .is_some_and(|start| start <= moment)
         });
         let outcome = if let Some(role) = pending {
-            match granted_days(db, role).await {
+            match granted_days(db, role, moment).await {
                 // A pending role that no longer exists leaves the user for an admin to sort out.
                 Ok(None) => continue,
                 Ok(Some(days)) => {
@@ -271,8 +280,8 @@ async fn process_expired(ctx: &Ctx, now: DateTime<Utc>) -> Result<(u64, u64)> {
                         stacked: true,
                         reason: "stacked_role_activated",
                     };
-                    apply(db, &user, change, moment).await.map(|()| {
-                        activated += 1;
+                    apply(db, &user, change, moment).await.map(|applied| {
+                        activated += u64::from(applied);
                     })
                 }
                 Err(failure) => Err(failure),
@@ -285,11 +294,12 @@ async fn process_expired(ctx: &Ctx, now: DateTime<Utc>) -> Result<(u64, u64)> {
                 reason: "role_expired",
             };
             match apply(db, &user, change, moment).await {
-                Ok(()) => {
+                Ok(true) => {
                     send(ctx, &expired_mail(&user)).await;
                     downgraded += 1;
                     Ok(())
                 }
+                Ok(false) => Ok(()),
                 Err(failure) => Err(failure),
             }
         };

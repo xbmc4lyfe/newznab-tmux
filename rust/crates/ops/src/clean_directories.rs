@@ -10,8 +10,8 @@ const MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
 
 fn directories() -> [PathBuf; 2] {
     [
-        PathBuf::from(var_or("TEMP_UNRAR_PATH", "resources/tmp/unrar")),
-        PathBuf::from(var_or("TEMP_UNZIP_PATH", "resources/tmp/unzip")),
+        PathBuf::from(var_or("TEMP_UNRAR_PATH", "storage/tmp/unrar")),
+        PathBuf::from(var_or("TEMP_UNZIP_PATH", "storage/tmp/unzip")),
     ]
 }
 
@@ -26,20 +26,33 @@ pub fn clean(root: &Path, max_age: Duration, now: SystemTime) -> Result<u64> {
     let mut deleted = 0;
     for entry in entries {
         let entry = entry?;
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            deleted += clean(&entry.path(), max_age, now)?;
-            // Only succeeds if the directory is now empty, which is what's wanted.
-            let _ = std::fs::remove_dir(entry.path());
-        } else {
-            let modified = entry.metadata()?.modified()?;
-            if now.duration_since(modified).is_ok_and(|age| age > max_age) {
-                std::fs::remove_file(entry.path())?;
-                deleted += 1;
-            }
+        // Extraction workers remove their own files, so one can vanish at any point here.
+        let removed = clean_entry(&entry, max_age, now);
+        match removed {
+            Ok(count) => deleted += count,
+            Err(failure)
+                if failure
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(failure) => return Err(failure),
         }
     }
     Ok(deleted)
+}
+
+fn clean_entry(entry: &std::fs::DirEntry, max_age: Duration, now: SystemTime) -> Result<u64> {
+    if entry.file_type()?.is_dir() {
+        let deleted = clean(&entry.path(), max_age, now)?;
+        // Only succeeds if the directory is now empty, which is what's wanted.
+        let _ = std::fs::remove_dir(entry.path());
+        return Ok(deleted);
+    }
+    let modified = entry.metadata()?.modified()?;
+    if now.duration_since(modified).is_ok_and(|age| age > max_age) {
+        std::fs::remove_file(entry.path())?;
+        return Ok(1);
+    }
+    Ok(0)
 }
 
 pub async fn clean_all() -> Result<u64> {
