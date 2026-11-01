@@ -54,12 +54,10 @@ pub fn tasks() -> Vec<Task<Ctx>> {
                 },
             )
         },
-        Task {
-            enabled: metrics_export::enabled,
-            ..task("processing-stats", EveryMinutes(1), |ctx| {
-                Box::pin(async move { processing_stats::publish(&ctx).await })
-            })
-        },
+        // Always on: the post-processing kill switch reads this as well as the export.
+        task("processing-stats", EveryMinutes(1), |ctx| {
+            Box::pin(async move { processing_stats::publish(&ctx).await })
+        }),
         Task {
             enabled: log_index::enabled,
             ..task("nntmux:index-logs", EveryMinutes(1), |ctx| {

@@ -3,7 +3,7 @@
 //! and the once-a-minute export reads that.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -427,7 +427,24 @@ async fn table_counts(db: &MySqlPool) -> Result<BTreeMap<String, i64>> {
     Ok(counts)
 }
 
-/// Computes and publishes the snapshot for the exporter.
+/// `total_work` from the latest published snapshot, without running the counts. `None` means there's
+/// no snapshot younger than `max_age`, which the caller has to decide about.
+pub async fn published_total_work(ctx: &Ctx, max_age: Duration) -> Result<Option<i64>> {
+    let mut redis = ctx.redis.clone();
+    let body: Option<String> = redis.get(snapshot_key(ctx)).await?;
+    Ok(body.and_then(|body| fresh_total_work(&body, Utc::now().timestamp(), max_age)))
+}
+
+fn fresh_total_work(body: &str, now: i64, max_age: Duration) -> Option<i64> {
+    let snapshot: Value = serde_json::from_str(body).ok()?;
+    let age = now - snapshot["collected_at"].as_i64()?;
+    if u64::try_from(age.max(0)).ok()? > max_age.as_secs() {
+        return None;
+    }
+    snapshot["counts"]["total_work"].as_i64()
+}
+
+/// Computes and publishes the snapshot for the exporter and the post-processing kill switch.
 pub async fn publish(ctx: &Ctx) -> Result<()> {
     let snapshot = collect(ctx).await?;
     let mut redis = ctx.redis.clone();
@@ -440,4 +457,23 @@ pub async fn publish(ctx: &Ctx) -> Result<()> {
         .await
         .context("publishing the processing snapshot")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_work_is_only_read_from_a_fresh_snapshot() {
+        let body = json!({"collected_at": 1000, "counts": {"total_work": 42}}).to_string();
+        let limit = Duration::from_secs(300);
+        assert_eq!(fresh_total_work(&body, 1200, limit), Some(42));
+        assert_eq!(fresh_total_work(&body, 1300, limit), Some(42));
+        assert_eq!(fresh_total_work(&body, 1301, limit), None);
+        assert_eq!(fresh_total_work("not json", 1000, limit), None);
+        assert_eq!(
+            fresh_total_work(r#"{"collected_at":1000,"counts":{}}"#, 1000, limit),
+            None
+        );
+    }
 }
