@@ -55,19 +55,20 @@ impl Pager {
             url: url(number),
             current: number == current,
         };
+        // Laravel's UrlWindow with `onEachSide(3)`.
         const EACH_SIDE: u64 = 3;
-        let window = EACH_SIDE * 2 + 2;
+        let window = EACH_SIDE + 4;
         let mut links = Vec::new();
-        if last < window + 6 {
+        if last < EACH_SIDE * 2 + 8 {
             links.extend((1..=last).map(page));
         } else if current <= window {
-            links.extend((1..=window + EACH_SIDE - 1).map(page));
+            links.extend((1..=window + EACH_SIDE).map(page));
             links.push(PageLink::Gap);
             links.extend((last - 1..=last).map(page));
-        } else if current > last.saturating_sub(window) {
+        } else if current > last - window {
             links.extend((1..=2).map(page));
             links.push(PageLink::Gap);
-            links.extend((last - (window + EACH_SIDE - 2)..=last).map(page));
+            links.extend((last - (window + EACH_SIDE)..=last).map(page));
         } else {
             links.extend((1..=2).map(page));
             links.push(PageLink::Gap);
@@ -82,12 +83,12 @@ impl Pager {
             current,
             last,
             first_item: if shown {
-                (current - 1) * per_page + 1
+                (current - 1).saturating_mul(per_page) + 1
             } else {
                 0
             },
             last_item: if shown {
-                (current * per_page).min(total)
+                current.saturating_mul(per_page).min(total)
             } else {
                 0
             },
@@ -103,7 +104,7 @@ impl Pager {
 
     /// The SQL offset for the current page.
     pub fn offset(&self) -> u64 {
-        (self.current - 1) * self.per_page
+        self.current.saturating_sub(1).saturating_mul(self.per_page)
     }
 }
 
@@ -136,7 +137,8 @@ mod tests {
         let at = |page| numbers(&Pager::new("/x", &[], 1000, 10, page)).join(" ");
         assert_eq!(at(1), "1 2 3 4 5 6 7 8 9 10 … 99 100");
         assert_eq!(at(50), "1 2 … 47 48 49 50 51 52 53 … 99 100");
-        assert_eq!(at(100), "1 2 … 91 92 93 94 95 96 97 98 99 100");
+        assert_eq!(at(100), "1 2 … 90 91 92 93 94 95 96 97 98 99 100");
+        assert_eq!(at(8), "1 2 … 5 6 7 8 9 10 11 … 99 100");
     }
 
     #[test]
@@ -157,5 +159,6 @@ mod tests {
         let pager = Pager::new("/x", &[], 5, 10, 9);
         assert_eq!((pager.first_item, pager.last_item), (0, 0));
         assert_eq!(pager.offset(), 80);
+        assert_eq!(Pager::new("/x", &[], 5, 10, u64::MAX).offset(), u64::MAX);
     }
 }

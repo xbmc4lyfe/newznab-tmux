@@ -15,6 +15,7 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    nntmux_webkit::config::require_app_key()?;
     let config = Config::from_env()?;
     let metrics = nntmux_telemetry::init(&config.log_filter, config.log_json)?;
     let stop = Shutdown::on_signals()?;

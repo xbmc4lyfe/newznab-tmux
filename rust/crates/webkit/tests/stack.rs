@@ -68,7 +68,7 @@ fn app(ctx: Ctx) -> Router {
     let limited = Router::new()
         .route("/limited", get(|| async { "ok" }))
         .route_layer(from_fn(|request, next| {
-            throttle::limit(request, next, 2, 60)
+            throttle::limit(request, next, "test", 2, 60)
         }));
     let router = private
         .merge(limited)

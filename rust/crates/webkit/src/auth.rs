@@ -20,6 +20,7 @@ use tracing::{error, warn};
 use crate::client_ip;
 use crate::config::{self, constant_time_eq, hmac_hex};
 use crate::error::WebError;
+use crate::guard;
 use crate::session::{Session, random_string};
 use crate::user::{Access, User};
 
@@ -87,11 +88,15 @@ pub fn hash_password(password: &str) -> Result<String> {
 
 /// Marks the session signed in. The caller regenerates the session ID.
 pub fn login(session: &Session, user: &User) {
+    clear_two_factor(session);
+    session.forget(TWO_FACTOR_VIA_DEVICE);
     session.put(LOGIN_KEY, user.id);
     session.put(PASSWORD_KEY, password_fingerprint(&user.password));
 }
 
 pub fn logout(session: &Session) {
+    clear_two_factor(session);
+    session.forget(TWO_FACTOR_VIA_DEVICE);
     session.forget(LOGIN_KEY);
     session.forget(PASSWORD_KEY);
     session.forget(TOKEN_KEY);
@@ -215,7 +220,7 @@ pub async fn layer(mut request: Request, next: Next) -> Response {
         match user_from_remember(&ctx, request.headers()).await {
             Ok(Some(found)) if found.eligible_for_authentication() => {
                 login(&session, &found);
-                session.regenerate();
+                session.migrate();
                 user = Some(found);
             }
             Ok(_) => clear_remember = true,
@@ -228,7 +233,7 @@ pub async fn layer(mut request: Request, next: Next) -> Response {
         let fingerprint = password_fingerprint(&found.password);
         match session.get_str(PASSWORD_KEY) {
             Some(stored) if !constant_time_eq(&stored, &fingerprint) => {
-                return end_session(&session, request.headers().contains_key("x-requested-with"));
+                return end_session(&session, guard::expects_json(request.headers()));
             }
             Some(_) => {}
             None => session.put(PASSWORD_KEY, fingerprint),
@@ -340,7 +345,9 @@ fn two_factor_still_valid(session: &Session) -> bool {
             return false;
         }
     }
-    session.put(TWO_FACTOR_TIME, Utc::now().timestamp());
+    if config::otp_keep_alive() {
+        session.put(TWO_FACTOR_TIME, Utc::now().timestamp());
+    }
     true
 }
 

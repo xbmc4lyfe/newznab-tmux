@@ -16,9 +16,15 @@ pub fn app_url() -> String {
 }
 
 /// `APP_KEY` signs cookies and links and hashes trusted-device tokens, so rows Laravel wrote
-/// stay valid. Fails closed: with no key set, signatures use a fixed value only in tests.
+/// stay valid. `nntmux-web` refuses to start without it, through [`require_app_key`], so the
+/// fixed value only ever signs in tests.
 pub fn app_key() -> String {
     optional("APP_KEY").unwrap_or_else(|| "nntmux-test-key".to_owned())
+}
+
+pub fn require_app_key() -> anyhow::Result<()> {
+    anyhow::ensure!(optional("APP_KEY").is_some(), "APP_KEY must be set");
+    Ok(())
 }
 
 pub fn session_cookie() -> String {
@@ -44,6 +50,13 @@ pub fn cookie_domain() -> Option<String> {
 pub fn otp_enabled() -> bool {
     matches!(
         var_or("OTP_ENABLED", "false").as_str(),
+        "1" | "true" | "on" | "yes"
+    )
+}
+
+pub fn otp_keep_alive() -> bool {
+    matches!(
+        var_or("OTP_KEEP_ALIVE", "true").as_str(),
         "1" | "true" | "on" | "yes"
     )
 }

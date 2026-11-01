@@ -50,8 +50,15 @@ pub async fn clear(ctx: &Ctx, key: &str) {
     }
 }
 
-/// `from_fn(|r, n| throttle::limit(r, n, 6, 60))` is `throttle:6,1`.
-pub async fn limit(request: Request, next: Next, max: u64, window_seconds: u64) -> Response {
+/// `from_fn(|r, n| throttle::limit(r, n, "2fa", 6, 60))` is `throttle:6,1`. Routes sharing a name
+/// share a budget, so aliases of one form don't multiply it.
+pub async fn limit(
+    request: Request,
+    next: Next,
+    name: &str,
+    max: u64,
+    window_seconds: u64,
+) -> Response {
     let Some(ctx) = request.extensions().get::<Ctx>().cloned() else {
         return next.run(request).await;
     };
@@ -61,24 +68,33 @@ pub async fn limit(request: Request, next: Next, max: u64, window_seconds: u64) 
             let (parts, body) = request.into_parts();
             let ip = client_ip::from_parts(&parts).to_string();
             let request = Request::from_parts(parts, body);
-            return check(&ctx, request, next, &format!("ip{ip}"), max, window_seconds).await;
+            return check(
+                &ctx,
+                request,
+                next,
+                name,
+                &format!("ip{ip}"),
+                max,
+                window_seconds,
+            )
+            .await;
         }
     };
-    check(&ctx, request, next, &who, max, window_seconds).await
+    check(&ctx, request, next, name, &who, max, window_seconds).await
 }
 
 async fn check(
     ctx: &Ctx,
     request: Request,
     next: Next,
+    name: &str,
     who: &str,
     max: u64,
     window_seconds: u64,
 ) -> Response {
     let key = format!(
-        "{}throttle:{}:{max}:{window_seconds}:{who}",
-        key_prefix(),
-        request.uri().path()
+        "{}throttle:{name}:{max}:{window_seconds}:{who}",
+        key_prefix()
     );
     let json = expects_json(request.headers());
     match hit(ctx, &key, window_seconds).await {

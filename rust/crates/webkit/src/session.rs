@@ -196,8 +196,16 @@ impl Session {
         self.lock().stored.data.remove("_token");
     }
 
-    /// A new ID for the same data. Call on every privilege change, to stop session fixation.
+    /// A new ID and CSRF token for the same data. Call on every privilege change, to stop session
+    /// fixation: a planted cookie's ID and token both stop working.
     pub fn regenerate(&self) {
+        self.migrate();
+        self.regenerate_token();
+    }
+
+    /// A new ID that keeps the CSRF token, for a sign-in the visitor didn't submit a form for.
+    /// A remember cookie can sign in mid-POST, and that POST's token must stay good.
+    pub fn migrate(&self) {
         let mut inner = self.lock();
         let old = std::mem::replace(&mut inner.id, random_string(40));
         inner.retired.push(old);
@@ -331,6 +339,16 @@ mod tests {
         assert_eq!(session.get_i64("login_web"), Some(7));
         let (_, retired, _) = session.snapshot();
         assert_eq!(retired, vec![before]);
+    }
+
+    #[test]
+    fn regenerate_rotates_the_token_and_migrate_keeps_it() {
+        let session = Session::new();
+        let token = session.token();
+        session.migrate();
+        assert_eq!(session.token(), token);
+        session.regenerate();
+        assert_ne!(session.token(), token);
     }
 
     #[test]
