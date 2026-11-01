@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crc32fast.workspace = true
@@ -27,6 +28,7 @@ nntmux-yenc.workspace = true
 roxmltree.workspace = true
 rand.workspace = true
 redis.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
@@ -39,6 +41,7 @@ unicode-normalization.workspace = true
 
 [dev-dependencies]
 nntmux-testkit.workspace = true
+wiremock.workspace = true
 
 [lints]
 workspace = true
