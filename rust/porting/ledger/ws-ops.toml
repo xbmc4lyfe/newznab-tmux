@@ -10,7 +10,7 @@ status = "ported"
 kind = "command"
 id = "monitoring:export-metrics"
 source = "app/Console/Commands/ExportMonitoringMetrics.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -30,13 +30,13 @@ note = "Self-update for a checkout-based install. Deploys now ship images, and `
 kind = "command"
 id = "nntmux:check-service-health"
 source = "app/Console/Commands/CheckServiceHealth.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:check-service-uptime"
 source = "app/Console/Commands/CheckServiceUptime.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -93,13 +93,15 @@ note = "Self-update for a checkout-based install. Deploys now ship images, and `
 kind = "command"
 id = "nntmux:offset-populate"
 source = "app/Console/Commands/NntmuxOffsetPopulate.php"
-status = "todo"
+status = "dropped"
+note = "`nntmux-ctl ops populate --parallel` fetches and inserts id windows concurrently in one process, which is what these forked workers were for."
 
 [[entry]]
 kind = "command"
 id = "nntmux:offset-worker"
 source = "app/Console/Commands/NntmuxOffsetWorker.php"
-status = "todo"
+status = "dropped"
+note = "`nntmux-ctl ops populate --parallel` fetches and inserts id windows concurrently in one process, which is what these forked workers were for."
 
 [[entry]]
 kind = "command"
@@ -111,7 +113,7 @@ status = "ported"
 kind = "command"
 id = "nntmux:populate"
 source = "app/Console/Commands/NntmuxPopulateSearchIndexes.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -206,18 +208,6 @@ source = "app/Console/Commands/TmuxStop.php"
 status = "ported"
 
 [[entry]]
-kind = "route"
-id = "POST /internal/release-verification/publish"
-source = "App\\Http\\Controllers\\ReleaseVerificationPublicationController"
-status = "todo"
-
-[[entry]]
-kind = "route"
-id = "POST /internal/release-verification/publish-batch"
-source = "App\\Http\\Controllers\\ReleaseVerificationPublicationBatchController"
-status = "todo"
-
-[[entry]]
 kind = "schedule"
 id = "call: function () {"
 source = "routes/console.php"
@@ -309,7 +299,7 @@ status = "ported"
 kind = "schedule"
 id = "command: 'monitoring:export-metrics --scheduled')->everyMinute()->withoutOverlapping(5)->when(stati"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -321,7 +311,7 @@ status = "ported"
 kind = "schedule"
 id = "command: 'nntmux:check-service-health')->everyMinute()->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"

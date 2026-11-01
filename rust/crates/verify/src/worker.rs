@@ -34,6 +34,7 @@ use crate::manifest;
 use crate::metadata::Resolver;
 use crate::prepare::{self, PrepareOptions};
 use crate::publisher::{Outcome, PublishError, publish};
+use crate::remote::RemotePublisher;
 use crate::spot_check::{
     self, ArticleBudgetExceeded, ArticleSource, SpotCheckOptions, VerificationResult,
 };
@@ -139,6 +140,8 @@ pub struct Worker {
     pub predb: PredbIndex,
     pub categorizer: Categorizer,
     pub nntp: Arc<NntpConfig>,
+    /// Set on a host that publishes through the primary.
+    remote: Option<RemotePublisher>,
     /// Reads the operators' pause between candidates. Absent in tests.
     ctx: Option<Ctx>,
     /// Fairness turns, which outlive a run's locks.
@@ -170,6 +173,7 @@ impl Worker {
     pub async fn new(ctx: &Ctx, verify: Verify) -> Result<Self> {
         Ok(Self {
             categorizer: Categorizer::load(&ctx.db).await?,
+            remote: remote_publisher(&verify)?,
             verify,
             cleaner: ReleaseCleaner::new(),
             predb: PredbIndex::new(&ctx.config.manticore),
@@ -186,6 +190,7 @@ impl Worker {
     pub async fn for_tests(verify: Verify, nntp: Arc<NntpConfig>) -> Result<Self> {
         Ok(Self {
             categorizer: Categorizer::load(&verify.db).await?,
+            remote: remote_publisher(&verify)?,
             verify,
             cleaner: ReleaseCleaner::new(),
             predb: PredbIndex::disabled(),
@@ -441,6 +446,10 @@ impl Worker {
         if !locks.held().await || !locks.protects(claim.id()).await || !locks.admitting().await? {
             bail!("Verification worker locks were lost.");
         }
+        if let Some(remote) = &self.remote {
+            self.publish_remotely(remote, claim, &result).await?;
+            return Ok((result, bytes));
+        }
         let resolver = Resolver {
             db: &verify.db,
             cleaner: &self.cleaner,
@@ -453,6 +462,52 @@ impl Worker {
             bail!("Publication did not produce a verified current release.");
         }
         Ok((result, bytes))
+    }
+
+    /// A response can be lost after the primary commits, on every retry too. Only the exact
+    /// published generation counts as success then.
+    async fn publish_remotely(
+        &self,
+        remote: &RemotePublisher,
+        claim: &Claim,
+        result: &VerificationResult,
+    ) -> Result<()> {
+        let verify = &self.verify;
+        let mut conn = verify.db.acquire().await?;
+        candidates::heartbeat(
+            &mut conn,
+            verify.config.lease_seconds,
+            claim.id(),
+            &claim.token,
+        )
+        .await?;
+        drop(conn);
+        match remote.publish(claim, result).await {
+            Ok(Some(release)) => {
+                info!(candidate = claim.id(), release, "published by the primary");
+            }
+            Ok(None) => {
+                if !self.settled_without_release(claim).await? {
+                    bail!("Publication did not produce a verified current release.");
+                }
+                info!(candidate = claim.id(), "settled by the primary");
+            }
+            Err(failure) => {
+                let published: Option<u64> = sqlx::query_scalar(
+                    "SELECT release_id FROM release_verification_candidates \
+                     WHERE id = ? AND version = ? AND manifest_hash = ? AND release_id IS NOT NULL",
+                )
+                .bind(claim.id())
+                .bind(claim.candidate.version)
+                .bind(&claim.candidate.manifest_hash)
+                .fetch_optional(&verify.db)
+                .await?;
+                if published.is_none() {
+                    return Err(failure);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// What the monitoring collector reads. Failing to write it never fails a candidate.
@@ -734,14 +789,13 @@ impl RoleSettings {
     }
 }
 
-/// A remote host mustn't publish directly over the database.
-pub fn refuse_remote_publication() -> Result<()> {
-    if std::env::var("RELEASE_VERIFICATION_PUBLISH_URL").is_ok_and(|url| !url.is_empty()) {
-        bail!(
-            "Publishing through a primary host isn't ported yet; unset RELEASE_VERIFICATION_PUBLISH_URL."
-        );
-    }
-    Ok(())
+fn remote_publisher(verify: &Verify) -> Result<Option<RemotePublisher>> {
+    let config = &verify.config;
+    config
+        .publish_url
+        .as_deref()
+        .map(|url| RemotePublisher::new(url, config.publish_timeout))
+        .transpose()
 }
 
 /// The `verify` role: one loop per configured slot, and candidate preparation on the primary host.
@@ -751,11 +805,6 @@ pub async fn run_role(ctx: Ctx, args: RoleArgs, stop: Shutdown, verify: Verify) 
         info!("verification is off: RELEASE_VERIFICATION_SCHEDULED is false");
         stop.token().cancelled().await;
         return Ok(());
-    }
-    if std::env::var("RELEASE_VERIFICATION_PUBLISH_URL").is_ok_and(|url| !url.is_empty()) {
-        bail!(
-            "Publishing through a primary host isn't ported yet; unset RELEASE_VERIFICATION_PUBLISH_URL."
-        );
     }
     let worker = Arc::new(Worker::new(&ctx, verify.clone()).await?);
     let first = WorkerLocks::new(&verify.db, &verify.config)

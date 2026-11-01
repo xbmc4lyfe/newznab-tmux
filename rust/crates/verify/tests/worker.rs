@@ -10,13 +10,16 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use nntmux_nntp::{NntpConfig, Provider, TlsOptions};
-use nntmux_runtime::Shutdown;
+use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
 use nntmux_verify::candidates;
 use nntmux_verify::spot_check::{ArticleBudgetExceeded, ArticleSource};
 use nntmux_verify::worker::{NntpSource, RunOptions, Worker};
+use serde_json::{Value, json};
 use support::Harness;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn article(name: &str, payload: &[u8]) -> Vec<u8> {
     let encoded: Vec<u8> = payload
@@ -319,5 +322,170 @@ async fn an_unreachable_server_fails_the_attempt_not_the_run() -> Result<()> {
         .fetch_one(&harness.db())
         .await?;
     assert_eq!(status, "unknown");
+    harness.finish().await
+}
+
+/// A remote worker with this candidate's article, publishing through `server`.
+async fn remote_run(harness: &Harness, server: &MockServer) -> Result<()> {
+    sqlx::query("UPDATE ingestion_configurations SET min_files_to_form_release = 1")
+        .execute(&harness.db())
+        .await?;
+    sqlx::query("UPDATE usenet_groups SET minfilestoformrelease = NULL")
+        .execute(&harness.db())
+        .await?;
+    queued(harness).await?;
+    let verify = harness.with_config(|config| config.publish_url = Some(server.uri()));
+    let worker = Worker::for_tests(verify, nntp_config(1)).await?;
+    let mut source = FakeSource::default();
+    source
+        .articles
+        .insert(ID.to_owned(), article("a.rar", &[7; 100]));
+    let report = worker.run(&source, once(), &Shutdown::default()).await?;
+    assert_eq!(report.processed, 1);
+    Ok(())
+}
+
+async fn candidate_state(harness: &Harness) -> Result<(String, Option<String>, Option<String>)> {
+    Ok(
+        sqlx::query_as("SELECT status, reason, lease_token FROM release_verification_candidates")
+            .fetch_one(&harness.db())
+            .await?,
+    )
+}
+
+#[tokio::test]
+async fn a_remote_worker_sends_only_evidence_and_never_writes_the_release() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"release_id": 77})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    remote_run(&harness, &server).await?;
+    assert_eq!(harness.count("releases").await?, 0);
+
+    let sent = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&sent[0].body)?;
+    assert!(body["claim"]["version"].is_i64());
+    assert_eq!(body["claim"]["manifest_hash"].as_str().unwrap().len(), 64);
+    assert!(body["claim"]["lease_token"].is_string());
+    assert_eq!(body["evidence"]["articles"], 1);
+    assert_eq!(body["evidence"]["sampled_files"], 1);
+    assert!(body.get("manifest").is_none());
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn a_primary_error_is_a_retry_and_a_deferral_goes_back_to_waiting() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(409).set_body_json(json!({"error": "Stale verification result"})),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    remote_run(&harness, &server).await?;
+    let (status, reason, leased) = candidate_state(&harness).await?;
+    assert_eq!(status, "unknown");
+    assert!(reason.unwrap().contains("Remote publication failed: Stale"));
+    assert_eq!(leased, None);
+    harness.finish().await?;
+
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(409).set_body_json(json!({"deferred": "too few files"})),
+        )
+        .mount(&server)
+        .await;
+    remote_run(&harness, &server).await?;
+    let (status, reason, _) = candidate_state(&harness).await?;
+    assert_eq!(status, "waiting_upload", "{reason:?}");
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn a_lost_response_after_commit_still_counts_as_published() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    // Answers only after committing for the worker, then fails as if the response was lost.
+    let server = MockServer::start().await;
+    let db = harness.db();
+    Mock::given(method("POST"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let id = body["claim"]["id"].as_i64().unwrap();
+            let db = db.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    sqlx::query(
+                        "UPDATE release_verification_candidates SET release_id = 55, status = 'sampled', \
+                         lease_token = NULL WHERE id = ?",
+                    )
+                    .bind(id)
+                    .execute(&db)
+                    .await
+                    .unwrap();
+                });
+            })
+            .join()
+            .unwrap();
+            ResponseTemplate::new(502)
+        })
+        .mount(&server)
+        .await;
+    remote_run(&harness, &server).await?;
+    let (status, reason, _) = candidate_state(&harness).await?;
+    assert_eq!(status, "sampled", "{reason:?}");
+    assert!(
+        harness
+            .verify
+            .config
+            .storage_path
+            .join("status.json")
+            .exists()
+    );
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn the_role_runs_on_a_host_that_publishes_through_the_primary() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let server = MockServer::start().await;
+    queued(&harness).await?;
+    let verify = harness.with_config(|config| {
+        config.publish_url = Some(server.uri());
+        config.candidate_workers = 1;
+    });
+    let redis = redis::Client::open(std::env::var("TEST_REDIS_URL")?)?
+        .get_connection_manager()
+        .await?;
+    let ctx = Ctx {
+        config: Arc::new(nntmux_core::Config::from_env()?),
+        db: harness.db(),
+        redis,
+    };
+    let args = RoleArgs {
+        concurrency: 1,
+        idle_seconds: 0,
+        once: true,
+    };
+    nntmux_verify::worker::run_role(ctx, args, Shutdown::default(), verify).await?;
+    // The role got as far as verifying; with no provider here the attempt failed and will retry.
+    let (status, reason, _) = candidate_state(&harness).await?;
+    assert_eq!(status, "unknown", "{reason:?}");
     harness.finish().await
 }
