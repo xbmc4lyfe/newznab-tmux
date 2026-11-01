@@ -1512,9 +1512,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "metrics",
  "nntmux-core",
  "nntmux-db",
+ "nntmux-testkit",
  "redis",
  "sqlx",
  "tokio",
