@@ -1,0 +1,6194 @@
+  Exact Release-GRP  
+ + unrelated.mkv
+ - 3.1 GB
+ /fixture/artisan.php artisan worker
+ 01 Jan 2024 00:00:00 +0000
+ 01 Jan 2024 00:00:00 PST
+ 12:00:00
+ 31 Feb 2024 00:00:00 +0000
+ ? 3 : 16, 
+ ? [] : [
+ ? null : 
+ @nntmux_role 
+ ACA_NEOGEO_SELECTION_Vol.2_NSW-HR
+ BEFORE 
+ Care_Bears_Unlock_The_Magic_NSW-SUXXORS
+ FINAL_FANTASY_I-VI_Pixel_Remaster_Collection_NSW-HR
+ FRENCH 1080p BluRay x264-GROUP
+ Getsuei_no_Kusari_Sakuran_Paranoia_JPN_NSW-HR
+ Guilty_Gear_Strive_Nintendo_Switch_Edition_MULTI5_NSW-SUXXORS
+ Instant_Sports_Winter_Games_NSW-SUXXORS
+ Made_In_Abyss_Binary_Star_Falling_Into_Darkness_NSW-NiiNTENDO
+ Maho_Shisho_Ariana_Nana_Eiketsu_no_Sho_MULTI_NSW-HR
+ Marble_It_Up_Ultra_NSW-SUXXORS
+ Moai.VI.Unexpected.Guests.NSW-DELiGHT
+ Mon, 01 Jan 2024 00:00:00 +0000
+ OF.Creator.1080p
+ ORDER BY 
+ Of_the_Red_the_Light_and_the_Ayakashi_Tsuzuri_NSW-HR
+ Release.2026-GROUP
+ Synthetic.Identity.Release-TEST 
+ TAITO_MILESTONES_MULTI_NSW-HR
+ TEXT NULL
+ WHERE 0
+ Yasha_Legends_of_the_Demon_Blade_NSW-HR
+ Yggdra_Kingdom_JPN_NSW-HR
+ accent-only identity change
+ accepted
+ ambient
+ article follows
+ associative hit collection
+ bounded 
+ canonical
+ case-only subject change immediately before write
+ changed searchname
+ changed subject
+ chatter
+ cleanup failure.
+ complete
+ current replacement filename
+ decimal wire id
+ deleted release
+ duplicate identity
+ eligible, 
+ established link
+ event-worker
+ excessive limit
+ forbidden title separator 
+ from main.predb_identity_state limit 2
+ group by 
+ identical decoded recompression
+ in group 
+ incomplete
+ invalid generation 
+ is preserved.
+ leading zero decimal wire id
+ link immediately before write
+ malformed discarded directory
+ malformed identity 
+ missing optional fields
+ movie HD 
+ must be between 
+ negative cursor
+ null optional fields
+ pipe last
+ postreject
+ replaced release with same title
+ replacement immediately before write
+ retained old filename
+ terminal 
+ timezones cleared
+ title immediately before write
+ valid filename path or trailer 
+ zero limit
+ – 3..1 GB
+ – 3.1 GB
+ – 3.1 GB extra
+ – 3.1 TB
+ – 3.1 gb
+ – 700 MB
+ – commentary – 3.1 GB
+ –3.1 GB
+" AS SELECT * FROM main.
+", "2694710,
+", "2699999,
+", "ESCAPE 
+", null], [
+"a1b2c3d4.
+"candidate_predb_id":null
+"movie.screens
+"obfuscated" yEnc
+"proc_files"
+"release_id" is not null
+"releases"."late_article_candidate_id" is null
+#p2p-pre
+#pre-all
+%08x-89ab-cdef-0123-456789abcdef
+%Example.Show%
+*/10 * * * *
+*/5 * * * *
+, "Renegade
+, -3600, 
+, 1704067200, 
+, 1704070800, 
+, 1704153600, 
+, 1969, 
+, 3, 2, [
+, 302, [
+, 3024, 
+, 3600, 
+, 82800, 
+, 86400, 
+, category: 
+, false, 
+, false], [
+, files: 
+, filters: [
+, nuked: Predb::PRE_NUKED, nukeReason: 
+, null, 
+, null, [
+, null], [
+, null], ["
+, size: 
+, source: 
+, true, 
+, true, false, 7, 
+, true], 
+, true], [
+--after-id
+--binary
+--candidate-id
+--delete
+--dry-run
+--exclude-standard
+--generation
+--legacy
+--maintenance-only
+--no-summary
+--orphans
+--others
+--output must be an absolute, new JSONL file path.
+--ready-only
+--reindex
+--release-id
+--resume
+--session
+--source
+--timeout
+--wrong-episode
+-GRP.mkv
+-excluded | other !not
+../F22-GOBBLE
+../cover
+../movie.mkv
+./components/admin/verify-user.js
+.1080p.WEB-DL-GRP.mkv
+.2025.rar
+.2026-GROUP
+.2026.1080p-GRP
+.7z.00001
+.7z.0001
+.::: PRE ::: TV ::: Synthetic.Release-GRP :::.
+.::: PRE ::: TV ::: Synthetic.Release-GRP, :::.
+.::: PRE ::: TV-HD ::: Name-GRP :::.
+.::: PRE ::: TV-X264-HD ::: MASH.S02E12.1973.DUBBED.CZECH.1080p.WEB.x264-OMG :::.
+.Category::MOVIE_OTHER.
+.DTS.part12345.rar
+.DTS.rar
+.Different
+.Different.rar
+.MP3.part01.RAR.vol01+02.PAR2
+.Movie.2026.1080p.BluRay.x264-GROUP
+.Movie.2026.1080p.BluRay.x264-GROUP.mkv
+.Movie.2026.1080p.WEB-DL-GRP
+.Release-GRP
+.Scene.Release.2026-GROUP
+.add-to-cart
+.c*-*.next
+.cover.*.tmp.webp
+.download-nzb
+.flac.mkv
+.flac.rar
+.hidden.mkv
+.invalid
+.json.gz
+.mkv.001
+.mkv.mp3.par2
+.mkv.rar.par2
+.mkvJunk
+.mp3.par2
+.par2" yEnc
+.part01.rar
+.part01.rar" yEnc
+.part12345
+.part12345.rar
+.part12345678901234567890
+.part12345678901234567890.rar
+.r1000.exe
+.rar.par2
+.recovered-
+.release-detail-actions
+.release-inspection-actions
+.release-result-card
+.release-result-row
+.release-row-actions
+.report-checkbox
+.report-description-btn
+.report-trigger
+.report-trigger, .nfo-badge, .preview-badge, .sample-badge, .mediainfo-badge
+.revert-report-btn
+.self::CANONICAL.
+.self::TITLE.
+.tar.zst
+.ts.par2
+.tv_usec
+.unknown
+.unknown.par2
+.unknown.rar.par2
+.vol00+01.par2
+/*.vol*.par2
+/../../../../app/Console/Commands/NntmuxPopulateSearchIndexes.php
+/../../../config/predb_feeds.php
+/../../Fixtures/predb/crowdnfo-home.html
+/../../Fixtures/predb/nzedb-2024-05-02-subset.csv
+/../../Fixtures/predb/scnlog.xml
+/../../app/Services/Releases/ReleaseBrowseService.php
+/../../bootstrap/app.php
+/../../database/migrations/2026_10_12_120000_add_releases_poster_index.php
+/../../docker/app/php/release-presentation.h
+/../../resources/css/app.css
+/../../resources/views/browse/index.blade.php
+/../../resources/views/components/release-badges.blade.php
+/../../resources/views/components/release-bulk-actions.blade.php
+/../../resources/views/components/release-category-link.blade.php
+/../../resources/views/components/release-results-panel.blade.php
+/../../resources/views/components/release-results.blade.php
+/../../resources/views/components/release-row-actions.blade.php
+/../../resources/views/search/index.blade.php
+/../../resources/views/xxx/index.blade.php
+/../Feature/
+/../Fixtures/ManifestCompressionProbe.php
+/.advisory-seed
+/.archive-audit-*.anchor
+/.archive-source-*.lock
+/CertifiedPredbSqlFixture.php
+/Fixtures/predb/apibay.json
+/Fixtures/predb/dats-pciso-1998-subset.xml
+/Fixtures/predb/gload.xml
+/Fixtures/predb/hdworld.xml
+/Fixtures/predb/knaben-movies.json
+/Fixtures/predb/movieblog.xml
+/Fixtures/predb/nswdb.xml
+/Fixtures/predb/opentrackers-2026-10-11.json
+/Fixtures/predb/scene-archive-sql-subset.sql
+/Fixtures/predb/scnlog.xml
+/Fixtures/predb/seriousaboutsound-releases.html
+/Release.nzb
+/YencArticles.php
+/admin/release-reports
+/alternate/fixture-guid.nzb.gz
+/app/artisan.original
+/app/vendor/autoload.php
+/archive-naming-
+/artisan.original
+/audit-deletion-
+/audit-retries-
+/audit.jsonl
+/bootstrap/app.php
+/covers/preview/guid-1_thumb.webp
+/current-link
+/data/item-
+/data/movie.mkv
+/data/old/item-
+/data/stale-link
+/database/migrations/2026_10_15_150000_create_predb_identity_projection.php
+/directory/Alias.Release-GRP.rar
+/docker/app/nzb-yenc-ffi/target/release/libnzbyenc.
+/docker/app/nzb-yenc-ffi/target/release/nntmux-article-fingerprint
+/fingerprint-staged-
+/first.tmp
+/fixture-guid.nzb.gz
+/fixture.py
+/fixture/runtime.sqlite
+/foreign.par2
+/from `binaries`.*for update/
+/from `collections`.*for update/
+/from `parts`/
+/info.nfo
+/internal/release-verification/publish
+/internal/release-verification/publish-batch
+/large-source
+/later-started-
+/legacy-checkpoint
+/legacy-evidence
+/listed-size
+/manager-source-
+/manifests/*.json.gz
+/media-7z-
+/media-payload-
+/movie.mkv
+/nntmux-admin-release-report-test.sqlite
+/nntmux-mapped-flow-
+/nntmux-name-fixing-indexes-test.sqlite
+/nntmux-normalize-guids.sqlite
+/nntmux-ready-cancel-
+/nntmux-ready-final-cancel-
+/nntmux-ready-phase-
+/nntmux-release-comments.sqlite
+/nntmux-release-factory.sqlite
+/nntmux-release-failure-
+/nntmux-release-file-manager-test-
+/nntmux-release-name-fixed-test.sqlite
+/nntmux-release-refill-
+/nntmux-release-remover-test.sqlite
+/nntmux-releases-migration.sqlite
+/nntmux-releases-preflight.sqlite
+/nntmux-series-release-service-test.sqlite
+/nonexistent/offline-benchmark.so
+/old/retained.bin
+/other.bin
+/other.tmp
+/par2-fixture-
+/par2-test-
+/par2-unrelated-
+/par2-wrapper
+/primary.par2
+/publish-batch
+/ready-events
+/receipt.tmp
+/release-processor-
+/release.nzb.gz
+/repair.tmp
+/replacement.nzb.gz
+/replacement.tmp
+/reset.lock
+/resolved-main-episode-
+/scene-sql-cache-*
+/scratch/1-1
+/scratch/1-1/payload
+/scratch/audit-*
+/scratch/audit-*/articles/*
+/scratch/unregistered-audit
+/second.tmp
+/seed.nzb
+/set.par2
+/snapshot-nzbs
+/split-video-
+/srv/usenet/Chateau.Gaillard.Le.pari.fou.de.Richard.Coeur.de.Lion.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS.rar
+/state/worker.ready
+/state/zombie-pid
+/status.json
+/storage/app/nntmux-native/libnzbyenc.
+/storage/app/nntmux-native/nntmux-article-fingerprint
+/successor.tmp
+/tests/Fixtures/par2/rename-index.par2
+/tmp/ap-release/
+/tmp/monitor-exit-delay
+/tmp/monitor-started
+/tmp/monitor-stopping
+/tmp/probed-archive/
+/tmp/runtime.php
+/tmp/worker-started
+/topic/53257-
+/topic/999-
+/unregistered-audit
+/untrusted/not-a-header.h
+/upgrade.tmp
+/usr/local/bin/nntmux-article-fingerprint
+/usr/local/lib/nntmux/libnzbyenc.so
+/usr/local/lib/nntmux/release-presentation.h
+/vendor/autoload.php
+/verification/audit.jsonl
+/verification/scratch/audit-1-
+/verify-
+/worker.lock
+01.Artist.Track
+01.Artist.Track.flac
+01234567-89ab-cdef-0123-456789abcdef
+0123456789abcdef0123456789abcdef
+0123456789abcdef0123456789abcdef01234567.rar
+039vphxklmk0hwouhsfx.mkv
+0day_app
+0day_msix_installer
+1 releases have a guid that blocks
+1 releases have a guid that blocks the normalization migration.
+1 releases still carry a legacy non-UUID guid
+1.vs.1.Suzu.Matsuoka.JAPANESE.XXX.720p.WEBRiP.MP4-MFPF
+1.vs.1.Suzu.Matsuoka.JAPANESE.XXX.720p.WEBRiP.MP4-MFPF.mp4
+10.11.6-MariaDB-ubu2404
+100.Synthetic.Movie.2026.1080p-GROUP
+1038 trailing tab
+1080p.mkv
+11.4.8-MariaDB-ubu2404
+11.4.8-MariaDB-ubu2404-debug
+11.4.8-MariaDB-ubu2404-log
+11234567-89ab-cdef-0123-456789abcdef
+119.53KB
+123.Fixture.Alias.2026-GRP
+123.Fixture.Alias.2026-GRP.mkv
+123.Fixture.Alias.2026-GRP.part01.rar
+12345.rar
+123456.mkv
+1234567890123456 
+12345678901234567 
+127.0.0.1
+16-bit length
+1896 leading space
+192.168.0.0/16
+192.168.1.113
+1969-12-31
+1970-01-01T00:16:40+00:00
+1970-01-01T00:16:50+00:00
+1970-01-01T00:17:00+00:00
+1970-01-01T00:17:40+00:00
+1970-01-01T00:17:50+00:00
+1970-01-01T00:18:00+00:00
+1998-01-01-F22.Air.Dominance.Fighter-GOBBLE
+1998-02-04-Alien.Earth-RAZORISO
+1b0ObvkpLy4cDgLV0fW3GoPaxUHKj.rar
+1gabba.pw
+1techno.org
+1x01-1x02
+2 failure
+2 releases have a guid that blocks
+2.mp3.par2
+200 byte fifty scalar value boundary
+2000-01-01
+2000-01-01 00:00:00
+201 bytes valid UTF8 prefix
+2015-12-14
+2020-01-01
+2020-01-01 00:00:00
+2023-11-14 22:13:20
+2023-11-15 00:00:00
+2023-11-15 22:13:19
+2023-11-15 22:13:20
+2024-01-01
+2025-01-15 12:00:00
+2025-01-16 08:30:00
+2026-01-02 03:04:05
+2026-01-03 04:05:06
+2026-02-31
+2026-06-11 00:00:00
+2026-06-12 00:00:00
+2026-08-13 00:00:00
+2026-09-13 17:26:09
+2026-09-25garbage
+2026-09-29 12:00:00
+2026-09-30 12:00:00
+2026-10-
+2026-10-01
+2026-10-01 00:00:00
+2026-10-01 11:00:00
+2026-10-01 12:00:00
+2026-10-02 12:00:00
+2026-10-08 12:00:00
+2026-10-09 02:37:37
+2026-10-09 02:39:00
+2026-10-09 02:39:53
+2026-10-09 10:39:18
+2026-10-09 12:00:00
+2026-10-09 20:12:51
+2026-10-09 23:37:19
+2026-10-10
+2026-10-10 00:31:11
+2026-10-10 01:00:00
+2026-10-10 01:02:03
+2026-10-10 08:00:00
+2026-10-10 22:19:13
+2026-10-11
+2026-10-11 00:00:00
+2026-10-11 02:14:20
+2026-10-11 03:00:25
+2026-10-11 04:14:20
+2026-10-11 08:14:20
+2026-10-11 12:00:00
+2026-10-11 12:26:12
+2026-10-11 14:56:46
+2026-10-11 15:24:20
+2026-10-11 16:52:59
+2026-10-11 18:37:06
+2026-10-11 23:52:00
+2026-10-11T04:14:20
+2026-10-11T04:14:20+02:00
+2026-10-11T04:14:20Z
+2026-10-11T07:57:00+00:00
+2026-10-11T10:40:37+00:00
+2026-10-11T12:28:07+00:00
+2026-10-11T14:02:21+00:00
+2026-10-11T14:02:24+00:00
+2026-10-11T14:11:41+00:00
+2026-10-11T14:22:09+00:00
+2026-10-11T16:44:15+00:00
+2026-10-11T20:35:53+00:00
+2026-10-11T20:36:11+00:00
+2026-10-11T21:10:17+00:00
+2026-10-11T21:11:11+00:00
+2026-10-11T21:13:00+00:00
+2026-10-12
+2026-10-12 12:00:00
+2026-10-13 12:00:00
+2026-10-13T12:00:00Z
+2026-10-14 09:00:00
+2026-10-15
+2026-10-16T00:00:00Z
+2026-10-17 00:00:00
+2026-GRP
+2026.1080p-GRP
+2026_10_11_154028_create_release_verification_candidates_table.php
+2026_10_11_175742_create_release_verification_audit_retries_table.php
+2026_10_12_004819_create_release_verification_scratch_table.php
+2026_10_12_053000_add_shared_verification_scratch_budget.php
+2026_10_12_120000_create_release_fingerprint_metadata_table.php
+2026_10_16_010000_create_release_archive_naming_evidence_table.php
+2026_10_17_000000_create_release_verification_manifests_table
+2026_10_17_120000_create_release_verification_locks_table
+2026_10_17_180000_add_release_verification_publication_stripes
+2026_10_17_200000_add_host_to_release_verification_scratch.php
+2026_10_17_220000_add_header_check_pending_to_release_verification_candidates.php
+2026_10_18_000000_add_run_token_to_release_fingerprint_metadata.php
+2026_10_20_200000_create_database_fingerprint_storage.php
+203.0.113.9
+204 byte fifty one scalar values
+21 false prefixes hide 22nd exact
+210-candidate scan budget
+2150.5MB
+2370 leading space
+255 character canonical title
+255 characters
+256 characters
+2583 leading space
+2704 leading space
+2826 leading space
+3221 leading space
+3383 leading space
+3536 leading space
+3570 leading space
+3587 leading space
+3644 leading space
+3666 leading space
+3933 leading space
+3994 leading space
+3dsdb.xml
+403 mapped to rate-limit envelope
+42:upgrade-x
+44444444444444444444444444444444-GRP
+550e8400-e29b-41d4-a716-446655440000
+64-bit length
+7ae60ee3d802bfd4388b0f2c6e982e7a.rar
+7z header extent or checksum mismatch.
+7z marker mismatch.
+93.184.216.34
+9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+: filtered —
+: unknown — 
+:fixture!u@h PRIVMSG #fixture :PRE: [TV-X264] 
+:fixture!u@h PRIVMSG #fixture :PRE: [TV-X264] Synthetic.Second.S01E02.2026.1080p.WEB-GRP
+:fixture!u@h PRIVMSG #fixture :PRE: [TV-X264] Synthetic.Series.
+:stale-sweep
+@example.net
+@example.test
+A canonical link cannot complete a truncated enumeration.
+A changed epoch resumed the old build.
+A changed generation must not be deleted.
+A committed completion must never be retried.
+A completed rollback side effect must never replay after the next callback throws.
+A concurrent reservation must wait for the shard owner.
+A failed export fetch must clear the prior parse count.
+A failed group must fail the runner.
+A failed listing request must propagate.
+A failed move must be reported.
+A finished walk starts again from the lowest id.
+A known merge must not also prepare an unused snapshot.
+A late candidate needs a fresh, locked merge.
+A later actual miss must not inherit a prior canonical proof rejection.
+A later unrelated commit must not replay the captured publication.
+A manifest without an authoritative inventory cannot publish.
+A marker starts at zero so a failed refresh shows up.
+A missing exact group must not become an unrestricted indexed search.
+A new update attempt clears the per-attempt reason before validation.
+A nullable non-rowid owner was silently skipped.
+A pre-lock null result must not serialize the document under the lock.
+A redirect loop must fail.
+A resolved row is reopened so repair picks it up.
+A source with one allowed attempt must propagate the failure.
+A stale claimed canonical title remains rejected independently of current alias nomination.
+A stale or absent release must stop before catalogue locking.
+A stale postwrite authority result must roll back without retry.
+A terminal server error must propagate.
+A test show.
+A truncated export must not produce accepted cached entries.
+A.Σ.2026.1080p-GRP
+A.Σ.2026.1080p-GRP.mkv
+A1b2.C3d4.E5f6.G7h8.I9j0
+ABCDEF01-2345-6789-ABCD-EF0123456789
+ABSENT completion must not synchronize search.
+ACA_NEOGEO_SELECTION_Vol.2_NSW-HR
+AF_UNIX socket_pair
+ALTER TABLE `
+ALTER TABLE collections ADD COLUMN last_seen_at DATETIME NULL
+ALTER TABLE collections ADD releases_id BIGINT UNSIGNED NULL
+ALTER TABLE parts MODIFY messageid LONGTEXT NOT NULL
+ALTER TABLE predb ADD COLUMN 
+ALTER TABLE predb ADD COLUMN filename TEXT
+ALTER TABLE predb ADD COLUMN imported_at TEXT
+ALTER TABLE predb ADD COLUMN nuked INTEGER NOT NULL DEFAULT 0
+ALTER TABLE predb ADD COLUMN predate TEXT
+ALTER TABLE predb ADD COLUMN searched INTEGER DEFAULT 0
+ALTER TABLE predb ADD COLUMN searched INTEGER NOT NULL DEFAULT 0
+ALTER TABLE predb ADD COLUMN source TEXT
+ALTER TABLE predb RENAME TO legacy_predb_fixture
+ALTER TABLE predb_identity_keys DROP COLUMN source_revision
+ALTER TABLE releases ADD COLUMN 
+ALTER TABLE releases ADD COLUMN additional_pp_claim_token TEXT
+ALTER TABLE releases ADD COLUMN additional_pp_claimed_at TEXT
+ALTER TABLE releases ADD COLUMN iscategorized INTEGER DEFAULT 1
+ALTER TABLE users ADD COLUMN style TEXT
+ARMS.PROPER.NSW-BigBlueBox
+ARTISAN_BINARY
+AS diagnostic_source
+ASCII case only
+ASCII case-insensitive GUID uniqueness was not enforced.
+ASCII control
+ASCII multipart archive
+Abes_Exodus-FLT
+Accept-Encoding
+Actual subject
+Added by Release processing
+Additional-processing
+Admission must use only the already planned media fetches.
+Adobe Express Photos.Msixbundle
+Adobe msix bundle
+After-commit work must not be attributed to the callback span following state lock acquisition.
+Alias.Release-GRP
+Aliased title
+Alien.Earth-RAZORISO
+All modes pass expected verdict/evidence and exact wire protocol, with equal successful results. Fault observations never enter timings. At least 1000 eligible pairs per workload for p99 evidence.
+All source files and decoded archive entries must actually have been inspected.
+All uppercase 20 chars
+Almost.Dead.1994.1080p.WEB.h264-NoRBiT
+Almost.Dead.1994.1080p.WEB.h264-NoRBiT.mkv
+Alpha.Movie-GRP
+Ambient transaction was adopted.
+America/New_York
+American Pickers S02E06-TVP
+American.
+American.Pickers...-TVP
+American.Pickers.Die.Troedelsammler.S09E29.Auf.Kneipentour.German.DOKU.WebRip.x264-ATAX
+American.Pickers.S02E06
+American.Pickers.S02E06.Im.Bickerhimmel.GERMAN.DOKU.WS.HDTVRiP.XviD-TVP
+American.Pickers…-TVP
+An experimental-xz-index Rust library is required for Footer propagation.
+An expired lease is taken over.
+An implicit commit must not release the admission exclusion.
+An in-progress admission must hold the reconciliation ledger until commit.
+An index alone cannot reconstruct its absent protected source.
+An invalid id still goes straight to the driver.
+An oversized decoded response must be rejected.
+An oversized wire response must be rejected.
+An uncommitted admission must block reset.
+An unrelated identity must retain its headers when capacity is full.
+An unusable batch answer must be reported, not guessed at.
+An upgrade resets proc_files while release_files still describe the smaller NZB.
+Anaconda.2025.1080p.BluRay.x264-ZoroSenpai_EniaHD
+Animals.2026.2160p.NF.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-Kitsune
+Another worker
+Archive must not admit during reset.
+Archive-lock fixture cleanup failure: 
+Archive.File-GROUP.mkv
+Article unavailable.
+Artifact failure must abort the legacy reset.
+Artist.Name-Album.Title-2024-FLAC-GROUP
+Artist.Track
+Asset||Exact.Release-GRP.mkv
+Asterix_And_Obelix_XXXL_The_Ram_From_Hibernia_NSW-NiiNTENDO[0001]
+Atooi.Collection_3DS-JRP
+Audit cursor commit must fail.
+Audited release changed before deletion.
+Authoritative identity schema is not implemented.
+Authoritative verified size and inventory are required for collection publication.
+Auxiliary.
+Auxiliary.Asset
+Auxiliary.Asset.rar
+Auxiliary.Asset||
+Auxiliary.Asset||Exact.Release-GRP.mkv
+Auxiliary.Asset||Exact.Release.2026-GRP.mkv
+Auxiliary|Asset.mkv
+Awesome.Game.SteamRip
+Ayakashi_Gohan_Okawari_for_S_JPN_NSW-HR
+Año.Bisiesto.2010.1080p.BluRay.x264-GRP
+Año.Bisiesto.2010.1080p.BluRay.x264-GRP.mkv
+BEFORE DELETE ON releases
+BEFORE UPDATE ON release_verification_state
+Backend responses cannot replace authoritative SQL identity.
+Background cleanup must also advance.
+Background cleanup must leave a bounded remainder.
+Background cleanup resumes rather than rescanning the zero-sized prefix.
+Baldurs.Gate.3-TENOKE
+Base64-like token
+Base64-like token in TV group
+Batch collection lookup failed.
+Batman.Vol.3.Issue.145.2024.DC.Comics.CBZ
+Bearer test-only
+Big.One-GRP
+Bird.vs.Plane.Miracle.on.the.Hudson.2018.1080p.AMZN.WEB-DL.DDP2.0.H.264-Kitsune
+Bird.vs.Plane.Miracle.on.the.Hudson.2018.1080p.AMZN.WEB-DL.DDP2.0.H.264-Kitsune.mkv
+Birds.of.Prey.And.the.Fantabulous.Emancipation.of.One.Harley.Quinn.2020.1080p.MA.WEB-DLRip.x264-ZoroSenpai_EniaHD
+Blue.Beetle.2023.1080p.MA.WEB-DLRip.x264-SbR_EniaHD
+Both SQL owners remain ambiguous even if a backend omits one.
+Bounded complete nomination API is not implemented.
+Brandon.Sanderson.Wind.And.Truth.Audiobook.Unabridged.M4B
+Brazzers.24.01.15.Performer.Oculus.Quest3.1080p
+Build the Rust release library and enable FFI to exercise native parity.
+Build the Rust release library to test the web FFI boundary.
+Bundesliga_Manager_98_GERMAN_ISO_FF
+C b C6.U sjLBU hBk0eQ Z0J qSl Xu Y g RO elC0K hc 0r s.F F4 D sd GQ H 8 I 52 Tw
+C1 spelling collision
+CAFÉ.ÄSCENE.RELEASE.2026-GRÜP
+CBP cleanup
+CBP_INTEGRATION_DB_DATABASE
+CBP_INTEGRATION_DB_PASSWORD
+CBP_INTEGRATION_DB_USERNAME
+CIA.Les.guerres.secretes.de.l.apres-11.Septembre.Partie1sur3.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS
+CIA.Les.guerres.secretes.de.l.apres-11.Septembre.Partie1sur3.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS.rar
+CONTENT_LENGTH
+COVERING INDEX ix_collections_group_filecheck_id
+COVERING INDEX verification_manifest_path
+CREATE DATABASE `
+CREATE INDEX "
+CREATE INDEX main.predb_identity_key_owner ON predb_identity_keys 
+CREATE TABLE `
+CREATE TEMP TABLE "
+CREATE TRIGGER predb_identity_insert AFTER INSERT ON scratch_source 
+CREATE TRIGGER reject_projection_source_
+CRLF listing of names containing byte 0x85
+Cached acceptance and rejection must avoid repeated ambiguity work.
+Cafe.Movie-GRP
+Cafe.Movie.2026-GRP
+Cafe.Release.2026-GRP
+Cafe.Scene.Movie.2026.1080p.WEB-DL-GRP
+Cafe.Scene.Release.2026-GRP
+Cafe.Synthetic.2026-GRP
+Café.Movie-GRP
+Café.Movie.2026-GRP
+Café.Release.2026-GRP
+Café.Scene.Movie.2026.1080p.WEB-DL-GRP
+Café.Scene.Release.2026-GRP
+Café.Synthetic.2026-GRP
+Café.ÄScene.Release.2026-GRÜP
+Café_Scene.Movie.2026.1080p.WEB-DL-GRP
+Callback failure must not compensate the committed completion.
+Camp.Rock.3.2026.German.DL.1080p.DV.HDR.WEBRip.AV1-WOTT
+Candidate has no file inventory to spot check.
+Candidate insertion must fail.
+Cannot create the scheduler zombie fixture.
+Cannot exclusively create JSONL output: 
+Cannot start the old task wrapper.
+Cannot start the worker.
+Canonical Scene-GROUP
+Canonical.Archive.Release-GRP
+Canonical.Archive.Release-GRP/obfuscated
+Canonical.Greek-GRP
+Canonical.Name-GROUP
+Canonical.Numeric-GRP
+Canonical.Release-GRP
+Canonical.Release.2026-GRP
+Canonical.Scene-GROUP
+Canonical.Scene-GROUP.mkv
+Canonical.Title-GRP
+Capacity must reject admission.
+Capacity must reject another admission.
+Captured PDO must show all rejected completion data restored.
+Captured owner PDO must not retain the rejected completion transaction.
+Captured writer must show the entire rejected completion rolled back.
+Care_Bears_Unlock_The_Magic_NSW-SUXXORS
+Case variant
+Catalogue-Test/1.0
+Chateau.Gaillard.Le.pari.fou.de.Richard.Coeur.de.Lion.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS
+Chateau.Gaillard.Le.pari.fou.de.Richard.Coeur.de.Lion.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS.rar
+Clean Scene Releases
+Clean.Release-GRP
+Cleaner replacement
+Cleanup failure must stop the completion retry loop.
+Cleanup must not retry an irreversible callback.
+Cleanup must not roll back the callback-owned raw transaction.
+Cleanup must preserve another fixture database.
+Clear Selection
+Collation aliases must not bypass importer matchPre with a positive cleaner PreDB ID.
+Collected again once the staged generation is in place.
+Committed link points at a different canonical title
+Committed terminal audit must retain durable cleanup work.
+Competing.Release-GRP
+Complete date oracle input differs from its fixed literal fixture.
+Complete date oracle only covers its four fixed article-date fixtures.
+Complete literal basename
+Complete manifest equality for prefix placement 
+Complete prefixed manifest equals legacy manifest.
+Complete.Release [1/1] 
+Complete.Season
+Complete.Series
+Completed epochs must revisit earlier failed inserts.
+Completion and catalogue/projection mutations must roll back together.
+Compression must precede shared capacity acquisition.
+Configuration no longer admits all eight prefetched articles.
+Confirm Revert
+Conflicting PAR2
+Conflicting header identities require resolution.
+Content-Encoding
+Content-Length
+Content-Type
+Content-Type: application/json
+Contract Category
+Contract Sample
+Cool.Game.PC.Game.2024
+Could not create fixture socket pair.
+Could not create owned fixture socket pairs.
+Could not fork fixture server.
+Could not remove owned archive-lock storage.
+Could not run provenance command.
+Could not write the fixture response.
+Create Table
+Cursed.Waters.2026.1080p.AMZN.WEB-DL.DD+2.0.H.264-BobDobbs
+Cursed.Waters.2026.1080p.AMZN.WEB-DL.DD+2.0.H.264-BobDobbs.mkv
+Cyberpunk.2077-GOG
+DB_CONNECTION
+DB_DATABASE
+DEL control
+DROP DATABASE IF EXISTS `
+DROP DATABASE `
+DROP INDEX `ix_releases_add_pp_claim_queue`, 
+DROP INDEX main.predb_identity_key_owner
+DROP INDEX predb_identity_key_owner
+DROP TABLE IF EXISTS 
+DROP TABLE IF EXISTS `
+DROP TABLE IF EXISTS release_comments
+DROP TABLE IF EXISTS releases
+DROP TABLE cache_locks
+DROP TABLE legacy_predb_fixture
+DROP TABLE predb
+DROP TABLE predb_identity_keys
+DROP TABLE predb_identity_revisions
+DROP TRIGGER IF EXISTS fail_release_finalize
+DROP TRIGGER fail_audit_delete
+DROP TRIGGER fail_release_commit
+DROP TRIGGER predb_identity_insert
+Dance Hall
+Dans.les.secrets.des.Illuminati.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS
+Dans.les.secrets.des.Illuminati.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS.rar
+Database unavailable.
+Deep.Dive.2026.1080p.AMZN.WEB-DL.DD+2.0.H.264-BobDobbs
+Deep.Dive.2026.1080p.AMZN.WEB-DL.DD+2.0.H.264-BobDobbs.mkv
+Deleted.Show.S01E01.720p.HDTV.x264-GRP
+Derived cleanup must not renew the DB lease once per entry.
+Derived payload directory cannot be a symlink.
+Die.Brueder.Karamasow.Teil.3.1969.German.1080p.BluRay.x264-PL3X
+Die.Puppe.S01.Complete.German.EAC3.5.1.DL.2160p.NetflixUHD.DV.HDR.HEVC-4SF
+Die.Simpsons.S37.Complete.German.DL.720p.WEB.h264-WvF
+Different.Canonical
+Different.Current.Alias-GRP
+Different.Movie.2025-OTHER
+Different.Movie.2026-GROUP
+Different.Movie.2026.1080p-GRP.mkv
+Different.Movie.2026.1080p.mkv
+Different.Release.2025-OTHER
+Different.Title.2026-OTHER
+Digit-heavy pattern
+Directory walks must not renew the DB lease once per entry.
+Dir|Aux/Exact.Release-GRP.mkv
+Downloaded and verified
+Dropped column
+Dry run: no rows are modified.
+Dry run: nothing was written.
+Dup.Title-GRP
+Duplicate PAR2 IFSC.
+Duplicate episodes merged
+Duplicate movie
+Duplicate of one
+Duplicate stale claim
+E01.part01
+E02.part01
+E03.part01
+E04.part01
+ELDEN.RING-EMPRESS
+EPL.2026.Tottenham.vs.Brighton.18.04.720pEN60fps.Fubo
+ER.S12E13
+ER.S12E13", "
+ER.S12E13.iTALiAN.LD.HDTV.XviD-TRiBECA
+ER.S12E13.iTALiAN.LD.HDTV.XviD-TRiBECA.avi
+ER.S12E14
+EXPLAIN 
+Each candidate must supply coverage and metadata from a single read.
+Editorial Releases
+Editorial title
+Eine.Geschichte.aus.zwei.Staedten.S01.Complete.German.DL.1080p.WEB.h264-SAUERKRAUT
+Elsbeth.S04E01.1080p.HDTV.x264-SYNCOPY
+English French
+Episode 1080p
+Episode admission must account for every main video, including the validated candidate identity.
+Episode.
+Episode.1
+Episode.1080p.mkv
+Episode.2
+Episode.mkv
+Every filename observation requires a fresh backend response
+Every owned retry needs a fresh sentinel.
+Every payload and ancillary row must remain in inventory.
+Exact Release-GRP
+Exact poster browsing must not depend on the search backend.
+Exact poster browsing needs its supporting index migration.
+Exact.Kelvin.Release-GRP
+Exact.Release
+Exact.Release-GRP
+Exact.Release-GRP.DIVX
+Exact.Release-GRP.DIVX.part01.rar
+Exact.Release-GRP.DTS
+Exact.Release-GRP.DTS.rar
+Exact.Release-GRP.part01.rar.par2
+Exact.Release-GRP.rar
+Exact.Release-GRP.rar.par2
+Exact.Release-GRP.unknown
+Exact.Release.2024-GRP
+Exact.Release.2026-GROUP
+Exact.Release.2026-GROUP-part01.rar
+Exact.Release.2026-GROUP.7z.001
+Exact.Release.2026-GROUP.par2
+Exact.Release.2026-GROUP.part001.rar
+Exact.Release.2026-GROUP.part01.rar
+Exact.Release.2026-GROUP.part1.rar
+Exact.Release.2026-GROUP.r00
+Exact.Release.2026-GROUP.r105
+Exact.Release.2026-GROUP.r99
+Exact.Release.2026-GROUP.rar
+Exact.Release.2026-GROUP.tar.gz
+Exact.Release.2026-GROUP.vol001+02.par2
+Exact.Release.2026-GROUP.vol001-02.par2
+Exact.Release.2026-GROUP.vol128+32.par2
+Exact.Release.2026-GROUP.z01
+Exact.Release.2026-GRP
+Exact.Release.2026-GRP.mkv
+Exact.Release.29-GRP
+Exact.Release.rar
+Exact.Release.K.rar
+Exact.Title-GRP
+Exact.Kelvin.Release-GRP
+Exact_Release_2026-GROUP
+Exact|Release-GRP
+Exact|Release-GRP.rar
+Exact∣Release-GRP
+Exact∣Release-GRP.mkv
+Exact｜Release-GRP
+Exact｜Release-GRP.mkv
+Example Movie
+Example provider
+Example release 
+Example.Movie.2026.1080p-GRP
+Example.Movie.2026.1080p.BluRay.x264-TARGET
+Example.Movie.2026.1080p.BluRay.x264-TARGET.mkv
+Example.Movie.2026.1080p.WEB-DL.x264-GRP
+Example.Movie.2026.1080p.WEB-DL.x264-GRP.mkv
+Example.Movie.2026.1080p.WEB-GRP
+Example.Movie.2026.720p-GRP
+Example.Movie.2026.mkv
+Example.Movie.2026.par2
+Example.Show.S01.1080p-GRP
+Example.Show.S01E01.1080p-GRP
+Example.Show.S01E01.1080p-GRP.mkv
+Example.Show.S01E01.720p-GRP
+Example.Show.S01E01.mkv
+Example.Show.S01E02.1080p.WEB-DL.x264-GROUP
+Example.Show.S01E03.1080p.WEB-DL.x264-GROUP
+Example.Show.S2024.1080p-GRP
+Example.Show.S2024E01.1080p-GRP
+Example.Show.Season.1.COMPLETE.1080p-GRP
+Example.par2
+Example.rar
+Example_Film.1994.1080p.WEB-DL.DD+5.1.H.264-MixedGroup
+Excluded category
+Exercise the real five-second stream timeout.
+Exhausted epoch allowed source mutation.
+Exhausted.S01E01
+Expected a group worker command.
+Expected bound rejection.
+Expected cancellation at the phase boundary.
+Expected cancellation.
+Expected completion write boundary was not reached.
+Expected exception.
+Expected invalid page rejection.
+Expected legacy failure.
+Expected local regular file validation.
+Expected malformed archive record rejection.
+Expected owner replacement fault.
+Expected scratch bound rejection.
+Expected the fingerprint write to fail.
+Expected the held lock to block the second import.
+Expected the round to report the failed group.
+Expected the round to report the group that could not start.
+Extension Category
+Extension nodes remain excluded.
+External.Replacement
+Extra byte
+Extras/Some.Movie.nfo
+Extras/naïve – notes.txt
+Extras/readme.txt
+F22 Air Dominance Fighter-GOBBLE
+F22.Air.Dominance.Fighter-GOBBLE
+FC.Bayern.Generation.Wembley.S01E05.720p.BluRay.x264-GUACAMOLE
+FINAL_FANTASY_I-VI_Pixel_Remaster_Collection_NSW-HR
+FINGERPRINT_TEST_DATABASE_URL
+FLAC-WEB
+FOREIGN KEY constraint failed
+FOXII_x_Sagaya_x_Mada4bang_x_Oso_J_x_La_Mescla-La_File_Indienne-SINGLE-WEB-FR-2026-OND
+FROM `predb_rt`
+FROM information_schema.TABLES
+FROM media_infos mi
+FROM media_infos source_media
+FROM release_reports GROUP BY releases_id
+Failed setup must drop its database before tearDown.
+File.Name-GROUP
+File.Name-GROUP.mkv
+Filename SQL fallback must execute against the release-files schema.
+Filename discovery must not hold the completion lock.
+Filenames, 
+Film.2026.1080p.WEB-DL.DDP5.1.H.264-NTb
+Film.2026.1080p.WEB-DL.DDP5.1.H.264-NTb.mkv
+Film.2026.BD123.1080p.x264.@BS
+Film.2026.BD123.1080p.x264.@BS.rar
+Film.2026.HDTVLight.foo1080px.x264.@BS
+Film.2026.HDTVLight.foo1080px.x264.@BS.rar
+Film_With_Underscores-MiXeD
+Filtered fixture.
+Finalization should have failed.
+Fire_Emblem_Musou_JPN_New3DS-HR
+First movie
+First-scan PreDB must not rename from one complete archive while another source remains unread.
+First.Movie.2026.1080p.WEB-DL.x264-GRP
+First.Release-GRP
+Five changed collections in batches of two: three UPDATEs, not five.
+Fixture child could not be reaped.
+Fixture child exceeded observation deadline.
+Fixture connection failed.
+Fixture did not complete the exact command/RTT protocol.
+Fixture filename
+Fixture fingerprint preimage not specified
+Fixture must invalidate the lease during duplicate scanning.
+Fixture must remove the matched row before its publication revalidation.
+Fixture must retain the uppercase target spelling in SQLite metadata.
+Fixture oracle only permits bounded 32-bit sizes.
+Fixture oracle supports Main/FileDesc/IFSC/Creator only.
+Fixture provider
+Fixture publication interrupted after commit.
+Fixture real admission did not queue expected identity
+Fixture socket write failed or timed out.
+Fixture source was not relinquished by receipt owner
+Fixture verified
+Fixture verified.
+Fixture workers did not start.
+Fixture.Alias.2026-GRP
+Fixture.Alias.2026-GRP.mkv
+Fixture.Canonical.Alpha.2026-GRP
+Fixture.Canonical.Beta.2026-GRP
+Fixture.Release-GRP
+Folder/Exact_Release_2026-GROUP.mkv
+Folder/PUBLISHER-FILE-NAME.MKV
+Folder/PUBLISHER-FILE.MKV
+Follow-ups must stop once no first pass remains.
+Foreign.Movie.2025.720p-OTHER
+Formel.1.2026.GP.Singapur.Rennen.German.2160p.UHDTV.HDR.HEVC-NIMA4K
+Formula1.2026.Round17.Singapore.Race.F1TV.WEB-DL.2160p.HLG.H265.Multi-MWR
+Formula1.2026.Round17.Singapore.Race.F1TV.WEB-DL.2160p.HLG.H265.Multi-MWR.mkv
+Forza.Horizon.3.v1.0.125.2-RUNE
+Forza.Horizon.5-ElAmigos
+Four observations must share the initial/final fence.
+Foxit.PDF.Editor.Pro.14.0.4.33508.Multilingual
+Foxit.PDF.Editor.Pro.v14.0.4.Portable.x64.Multilingual
+Fresh admissions must work after reset unlocks.
+Fresh-GRP
+Fresh.Release.17
+Full retained cache must be charged before the first decoded file allocation.
+GET with another user session
+GET without session
+GROUP BY
+GROUP BY r.id
+GROUP_CONCAT
+GUID case is identity
+GUID replacement
+Game release
+Gd71jJg4qdgsblviMRr2Wg.rar
+Gears.5.XBOXONE
+Generic VR site with GearVR
+George.Orwell.1984.Novel.PDF
+German.Film-GRP
+Getsuei_no_Kusari_Sakuran_Paranoia_JPN_NSW-HR
+Gibberish in games group
+Gladiator.II.2024.1080p.BluRay.x264-HiP_EniaHD
+Godzilla.x.Kong.The.New.Empire.2024.1080p.BluRay.x264-HiDt_EniaHD
+Gran.Turismo.7.PS4.CUSA12345
+Granblue.Fantasy.Versus.Rising.Deluxe.Edition.v2.61.MULTi9-ElAmigos
+Grand.Theft.Auto.V.2015.REPACK-RELOADED
+Grand.Theft.Auto.V.2015.REPACK-RELOADED.iso
+Great.Game.Repack-FitGirl
+Group dispatch must not issue one collection lookup per enabled group.
+Group unavailable
+Guilty_Gear_Strive_Nintendo_Switch_Edition_MULTI5_NSW-SUXXORS
+HD studio match
+HTML error page
+HTML error response
+HTML named quotes
+HTML numeric quotes
+HTTP 429
+Halo.Infinite.Xbox.Series.X
+Harry Styles Songbook - 1st Edition 2026
+Harry.Potter.en.de.Orde.van.de.Feniks.DUTCH-VLiSO
+Harry.Potter.en.de.Orde.van.de.Feniks.DUTCH-VLiSO.iso
+Hashed.First
+Hashed.Second
+Hashed.Title
+Header insertion must wait for the deletion guard parent lock.
+Held partials are not counted as pending PAR2 work.
+Hex in warez group
+Hidden comment
+History of War - Issue 158, 2026
+Home.Die.Geschichte.einer.Reise.GERMAN.DOKU.WS.BDRip.XviD-TVP
+Horizon.Zero.Dawn-CODEX
+Http/Controllers/Admin/AdminPageController.php
+Http/Controllers/Admin/AdminReleaseReportController.php
+Http/Controllers/DetailsController.php
+Http/Requests/Admin/AdminReleaseReportBulkActionRequest.php
+INDEX ix_releases_fromname
+INFO: QuoVadisX.v1.0.85.MultiLanguage.WinALL.Incl.Keygen-BLiZZARD [14F 67MB]
+INFO: Synthetic.Release-GRP [2F 1.2.3MB]
+INFO: Synthetic.Release-GRP [2F 1.2MB]
+INFO: Synthetic.Release-GRP [2F 1.2MB] chatter
+INSERT INTO `predb`
+INSERT INTO `users`
+INVALID_BYTE_MARKER
+ISO UTC designator
+ISO numeric offset
+ISO-8859-1
+Identity fixture failed.
+Import must not admit during reset.
+Inception 2010 720p BluRay x264-GRP
+Incomplete PAR2 fixture.
+Incomplete XML must fail before publishing an accepted count.
+Inconsistent owner was accepted.
+Incorrect fault outcome at index 
+Independent deterministic yEnc fixture did not round-trip.
+Index change
+Index-GRP
+Indie.Title.DRM-Free-GOG
+Inject only at the independent postwrite canonical recheck.
+Injected 
+Injected schema initialization failure.
+Injection-Info
+Injection-Info: news.example.net
+Inspection must wait for the committed generation to be put in place.
+Inspection must wait for the staged generation to be resolved.
+Instant_Sports_Winter_Games_NSW-SUXXORS
+Insufficient validated recovery data.
+Invalid NZB.
+Invalid PAR2 IFSC records.
+Invalid PAR2 Main inventory.
+Invalid PAR2 Main/set ID.
+Invalid PAR2 derived file ID.
+Invalid PAR2 description.
+Invalid PAR2 metadata
+Invalid PAR2 packet MD5.
+Invalid PAR2 packet extent.
+Invalid PAR2 packet marker/header.
+Invalid or duplicate article part number.
+Invalid or duplicate article reference in candidate headers.
+Invalid sampled verdict/evidence at index 
+Invalid.Date-GRP
+Isolation levels apply to MariaDB.
+It is audited once settled.
+Its own run is ended.
+Its own run, claimed in an earlier attempt, is ended.
+JSON/gzip preparation must not own shared capacity.
+Jackass.Best.and.Last.2026.2160p.iT.WEB-DL.DTS-HD.MA.5.1.DV.HDR10P.H.265-BTBN
+Jackass.Best.and.Last.2026.2160p.iT.WEB-DL.DTS-HD.MA.5.1.DV.HDR10P.H.265-BTBN.mkv
+JacquieEtMichelTV Helena 26 09 29 VFF 720p WEB AAC 2 0 x264 NOTAG
+JacquieEtMichelTV.Angel.26.10.10.VFF.2160p.WEB.AAC.2.0.x264.NOTAG
+JacquieEtMichelTV.Helena.26.09.29.VFF.360p.WEB.AAC.2.0.x264.NOTAG
+JacquieEtMichelTV.Helena.26.09.29.VFF.576p.WEB.AAC.2.0.x264.NOTAG
+JacquieEtMichelTV.Helena.26.09.29.VFF.720p.WEB.AAC.2.0.x264.NOTAG
+Kanata.Kara.S01E02.1080p.AMZN.WEB-DL.JPN.DDP2.0.H.264-ToonsHub
+Kanata.Kara.S01E03.1080p.AMZN.WEB-DL.JPN.DDP2.0.H.264-ToonsHub
+Kazata.Kara.S01E02.1080p.AMZN.WEB-DL.JPN.DDP2.0.H.264-ToonsHub
+Known VR site with VR180
+Known-GRP
+Known.Movie.2.2026
+Known.Movie.2026
+Known.Movie.2026.1080p.WEB-DL-GRP
+Known.Movie.2026.720p.WEB-DL-GRP
+Known.Movie.2026.S01E02.1080p.AMZN.WEB-DL.REPACK-GRP
+Known.Movie.3.2026
+Known.Release-GRP
+LF instead of producer CRLF
+La.Joconde.Le.mystere.de.Mona.Lisa.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS
+La.Joconde.Le.mystere.de.Mona.Lisa.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS.rar
+La.cite.de.Troie.a-t-elle.reellement.existe.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS
+La.cite.de.Troie.a-t-elle.reellement.existe.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS.rar
+Lady.Lyne.24.01.15.Performer.Title.1080p
+Landscape Garden Design Issue 2 2026
+Lanterns.S01E03.1080p.AMZN.WEBRip.HEVC.10bit.AAC5.1-LuCY
+Latin1 accent
+Lease lost during derived cleanup.
+Lease lost during scratch scan.
+Lease lost in own scratch walk.
+Legacy nZEDb release
+Legacy release identity is not trusted.
+Legacy statuses normalized
+Legacy.S01E01
+Leon.1994-GRP
+Leon.1994.1080p.BluRay.x264-GROUP
+Leon.1994.1080p.BluRay.x264-OTHER
+Leon.1995.1080p.BluRay.x264-GROUP
+Liberte.La.statue.qui.voulait.changer.le.monde.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS
+Liberte.La.statue.qui.voulait.changer.le.monde.2026.HDTVLight.1080p.x264.VF.AC3.2.0.@BS.rar
+Linked scratch parent must prevent audit work.
+Little.Fockers.2010.UHD.BluRay.1080p.DDP.5.1.Atmos.DV.HDR.x265-faBR
+Little.Fockers.2010.UHD.BluRay.1080p.DDP.5.1.Atmos.DV.HDR.x265-faBR.mkv
+Loaded policy provenance is not implemented.
+Local Unix socket pairs are unavailable on Windows.
+Locked archive fixture hash mismatch.
+Long.Release.Name.
+LÉON.1994.1080p.BLURAY.X264-group
+Léon.1994-GRP
+Léon.1994.1080p.BluRay.x264-GROUP
+Léon.1994.HDTVLight.1080p.x264.@BS
+Léon.1994.HDTVLight.1080p.x264.@BS.rar
+Léon_天空.1994.1080p-GRP
+Léon_天空.1994.1080p-GRP – 3.1 GB
+Léon_天空.1994.DD+5.1.H.264-MixedGroup
+Léon_天空_German_Ind
+MARIO_Plus_RABBIDS_SPARKS_OF_HOPE_NSW
+MASH.S02E12.1973.DUBBED.CZECH.1080p.WEB.x264-OMG
+MASH.S02E20.1974.DUBBED.CZECH.1080p.WEB.x264-OMG
+MCN.April.22.2026.HYBRID.MAGAZINE.eBook-21A1
+MD5 hash
+MD5 hash with quotes
+MD5 in movies group
+MKV-MAIN
+MKV-SAMPLE
+MLB.2026.Cincinnati.Reds.vs.Tampa.Bay.Rays.20.04.720pEN60fps
+MLB__NZBSPLIT__f5054661a1d468cc6a8712de8217c1c9__NZBSPLIT__MLB_2026_Cincinnati_Reds_vs_Tampa_Bay_Rays_20_04_720pEN60fps.7z.075
+MOVIE-HD
+MOVIE-HD-2160p
+Made_In_Abyss_Binary_Star_Falling_Into_Darkness_NSW-NiiNTENDO
+Maho_Shisho_Ariana_Nana_Eiketsu_no_Sho_MULTI_NSW-HR
+Malformed or incomplete gzip must be rejected.
+Malformed__NZBSPLIT__payload
+Manifest integrity check failed.
+Marble_It_Up_Ultra_NSW-SUXXORS
+MariaDB PreDB session contract is unqualified.
+MariaDB integration test.
+Mario.Kart.8.Deluxe.NSW.NSP
+Mario.Kart.8.Deluxe.PROPER.NSW-BigBlueBox
+Matched 0 PreDB titles to release search names.
+Matching video parent basename
+Mean Streets-GTB
+Mean.Streets.SE.1973.DVDRip.XviD.Hungarian-GTB
+Mean.Streets.SE.1973.DVDRip.XviD.Hungarian-GTB.avi
+Mega_Man_11_NSW-VENOM
+Member sizes must be checked against their aggregate decoded limit.
+Message-ID
+Message-ID:
+Message-Id
+Metadata nominations use at most one bounded query per indexed identity.
+Microsoft Office Suite Installer
+Microsoft.To.Do.appxbundle
+Minimal release
+Missing QO service.
+Missing certificate state allowed untracked source mutation.
+Missing file-copy header.
+Missing files
+Missing fixture report: 
+Missing manager must reject.
+Missing projected field 
+Missing schema must reject installation.
+Missing transaction manager must reject the audit receipt.
+Missing.Date-GRP
+Missing.Release-GRP
+Mixed alphanumeric random
+Moai.VI.Unexpected.Guests.NSW-DELiGHT
+Models/ReleaseReport.php
+Movie HD
+Movie HD-1080p
+Movie catalogue news – 3.1 GB
+Movie partial
+Movie release
+Movie.2019.1080p.BluRay.DDP5.1.x264-GRP
+Movie.2020.1080p.BluRay-GRP
+Movie.2020.1080p.BluRay.DTS5.1-GRP
+Movie.2020.1920x1080.x264-GRP
+Movie.2020.2160p.WEB-DL.Atmos7.1-GRP
+Movie.2020/VIDEO_TS/VTS_01_1.VOB
+Movie.2026
+Movie.2026-GRP
+Movie.2026.1080p
+Movie.2026.1080p.BluRay-GRP.cd1.mkv
+Movie.2026.1080p.WEB-DL-GRP
+Movie.2026.1080p.WEB-DL-GRP.mkv
+Movie.2026.1080p.mkv
+Movie.2026.mkv
+Movie.Name.AS02.2023.1080p.AMZN.WEB-DL.x264-GROUP
+Movie.Release-GRP
+Movie.Release.
+Movie.Release.2026-WEB-GRP
+Movie.久.mkv
+Movies / Custom
+Movies / HD
+Multi-Archive & Multipart Names
+Music album
+Music catalogue news and updates
+Mutated alias
+Mutated poster
+My handpicked label
+MySQL TRUNCATE must run outside a transaction.
+Mysteres.du.Systeme.solaire.2024.HDTVLight.1080p.x264.VF.AC3.2.0.@BS
+Mysteres.du.Systeme.solaire.2024.HDTVLight.1080p.x264.VF.AC3.2.0.@BS.rar
+Män.Som.Hatar.Kvinnor.2009.1080p.BluRay.x264-GRP
+Män.Som.Hatar.Kvinnor.2009.1080p.BluRay.x264-GRP.mkv
+N:/NZB [02/11] - "landscape.garden.design.issue.2.2026.part1.rar" yEnc
+N:/NZB [1/5] - "some_lower_case_title.part1.rar"
+N:/NZB [2/5] - "History of War - Issue 158, 2026.rar"
+N:/NZB [2/8] - "Harry Styles Songbook - 1st Edition 2026.part1.rar"
+NBA.2026.Playoffs.Minnesota.Timberwolves.vs.Denver.Nuggets.Game.2.20.04.1080pEN60fps.NBC
+NBA.20260419.PHI.BOS.1080p60.ABC
+NBA__NZBSPLIT__9b1e889d7fb8d8a63c21217266069c71__NZBSPLIT__NBA_2026_Playoffs_Minnesota_Timberwolves_vs_Denver_Nuggets_Game_2_20_04_1080pEN60fps_NBC.7z.074
+NBA__NZBSPLIT__bdab31d6f79989608009e7e8eadcbe66__NZBSPLIT__NBA_20260419_PHI_BOS_1080p60_ABC.7z.073
+NFO DATA
+NNTMUX_TEST_APP_ROOT
+NNTMUX_TEST_NATIVE_LIBRARY
+NNTP is unavailable.
+NNTP unavailable
+NNTP unavailable.
+NNTmux-PreDB-Importer/1.0
+NO_ENGINE_SUBSTITUTION
+NUKE: Name-GRP [bad.release]
+NUKE: Some.Show.S01E01.720p.WEB.h264-GRP [dupe.of.other] [NUKENET]
+NUKE: Synthetic.Release-GRP [bad] [NUKENET]
+NUKE: Synthetic.Release-GRP [bad] chatter
+NZB removal
+NZB source changed before replacement.
+NZBSPLIT wrapper
+Name sorting must enumerate all matching IDs before SQL pagination.
+Namespace mismatches remain excluded.
+Namespace reset nodes remain excluded.
+Native Rust format metadata is required for DEFLATE effort integration.
+Native Rust format metadata is required for ISO descriptor integration.
+Native Rust format metadata is required for ISO path-table integration.
+Native Rust format metadata is required for Quick Open integration.
+Native Rust format metadata is required for RAR4 first file header integration.
+Native Rust format metadata is required for RAR5 time integration.
+Native Rust format metadata is required for XZ first-block integration.
+Native Rust format metadata is required for ZIP/Gzip filename authority integration.
+Native Rust format metadata is required for Zstandard integration.
+Native Rust format metadata is required for archived revision integration.
+Native Rust format metadata is required for file-copy checksum integration.
+Native Rust format metadata is required for gzip text-field integration.
+Native metadata wrapper returned null
+Native metadata wrapper returned null for 
+Native parseFormats module metadata missing.
+Native renderer was unavailable or rejected the input.
+Native wrapper was not preloaded.
+Native yEnc framing library is required for field authority integration.
+Native yEnc framing library is required for orphan-line integration.
+Native yEnc framing library is required for scan-budget integration.
+Native yEnc framing library is required for trailer-only multipart integration.
+NativeMetadataParser::parseFormats returned null.
+Naza_x_JUL-Pas_Dproblemes-SINGLE-WEB-FR-2026-OND
+Neon.Abyss.2-ElAmigos
+Nerutto Elements 2022-iDC
+Nerutto...-iDC
+Nerutto_Elements_WEB_2022
+Nerutto…-iDC
+Never filtered terminally: later articles may still satisfy the policy.
+Never swapped in.
+New.Mapping-GRP
+New.Searchname
+New.Subject
+New.Title.2020
+Next.Scene.Release.2026-GROUP
+No Such Category
+No anime releases found to process.
+No download
+No evidence was recorded.
+No held partial counts as pending naming work.
+No scan: the canonical file is the committed source.
+No signal long token
+No such group
+No unmatched TV releases found.
+No word structure long
+No write before complete discovery.
+Noise & Rejection Strings
+Nomination UNKNOWN API must remain unchanged.
+Non ASCII guid
+Nonterminal filtered pages cannot silently signal complete history.
+Normal.Release-GRP
+Not all article outcomes were returned.
+Not found.
+Not spot-checked.
+Not verified.
+Nothing is indexed until the scope ends.
+Novocaine.2025.1080p.BluRay.x264-playHD
+Novocaine.2025.1080p.BluRay.x264-playHD_EniaHD
+NubileFilms.Molly.Little.My.Little.Seductress.S50E7.26.04.07.2160p
+NubileFilms.Molly.Little.My.Little.Seductress.S50E7.26.04.07.2160p-GRP
+NubileFilms.Molly.Little.My.Little.Seductress.S50E7.26.04.07.2160p.mp4
+Nuke-GRP
+Nuked.Release-GRP
+Nuked.Without.Reason-GRP
+Nybble_and_Nibble_CD32_AMIGA-bADkARMA
+Nyuu/0.4.2
+Népali.Music-GRP
+O'Reilly Learning Rust 2nd Edition.pdf
+OF-Creator.1080p
+OF.Brazzers.Performer.Title.1080p
+OF.Creator.Images.2160p
+OF.Creator.Imagesets.2160p
+OF.Creator.Name.Video.1080p.mp4
+OF.Creator.Pack.2160p
+OF.Creator.Pack.mp4
+OF.Creator.Packs.2160p
+OF.Creator.Photoset.1080p
+OF.Creator.Title
+OF.Creator.Title.1080p
+OF.Creator.Title.2160p
+OF.Creator_Collections.1080p
+OF.Creator_Pack.2160p
+OF.Creator_Pack_mp4
+OF.Creator_Photos.1080p
+OF.Creator_Photos_Packs_mp4
+OF.Creator_Photoset.1080p
+OF.Creator_Photosets.1080p
+OF.Dolly.Orchid.Beautiful.Asian.Girl.With.Small.Tits.Shakes.Her.Ass.Nonstop.Until.I.Cum.1080p
+OF.Sadie.Summers.NEW.TRADWIFE.BG.1080p
+OF.SexBabesVR.Creator.VR180.2160p
+OF.Theapolloshow.Maya.Faye.1080p
+OF.Theapolloshow.Veronica.Grace.1080p
+OFFER.Creator.1080p
+OLD.filename COLLATE BINARY
+ORDER BY r.id ASC
+OTHER_HASHED
+OTHER_MISC
+Obfuscated / Hashed Names
+Observation deadline exceeded.
+Of.Mice.and.Men.1939.1080p.BluRay.x264
+Of_the_Red_the_Light_and_the_Ayakashi_Tsuzuri_NSW-HR
+Office installer words
+Offline benchmark https://example.test/
+Offspring-The_Year_That_Punk_Broke-UMA
+Old.Book.Title.1080p
+Old.Name
+Old.Name-
+Old.Scene-GROUP
+Old.Title
+Old.Title.2020
+One episode of a partial season pack is not a single-episode release.
+One group collection lookup failed.
+One token per scope.
+Only Fans Creator 2023 clip
+Only Fans Creator Title 1080p
+Only a real archive-proof-deferred canonical episode lookup may be repeated after finalization.
+Only spot-checked results can be published by a remote worker.
+Only the fresh ownership sentinel precedes the test probe.
+Only-Fans.Creator.Title.1080p
+OnlyFans.Creator.Imageset
+OnlyFans.Creator.Title.1080p
+Only_Fans.Creator.Title.1080p
+Opaque.Fixture
+Opaque.Subject
+Oppenheimer.2023.1080p.AMZN.WEB-DL.x264-GROUP
+Optional column detection must finish before the injected failure.
+Oracle header is truncated.
+Oracle integer is outside supported range.
+Oracle vint unsupported or truncated.
+Ordinary World 1080p/Ordinary World 1080p.mkv
+Original completion data must be restored while the callback-owned transaction stays active.
+Original native SQL rollback must precede callback-owned transaction.
+Original report
+Original report:
+Original schema initialization failure.
+Original.Release.2026-GRP
+Original.Subject
+Original.Title
+Other Show
+Other.Alias-GRP
+Other.Canonical.2026-GRP
+Other.Movie.2005.1080p.BluRay.x264-GROUP
+Other.Release.2025-GRP
+Other.Release.2025-OTHER
+Other.Release.2026-GROUP
+Other.S01E01.mkv
+Other.Scene.Release.2026-GROUP
+Other.Show.S01E01.720p.HDTV.x264-GRP
+Other.Show.S04E09.720p.HDTV.x264-GRP
+Other.Title
+Other.Title-GRP
+Otome_Game_no_Hametsu_Flag_Shikanai_Akuyaku_Reijo_ni_Tensei_Shite_Shimatta_Haran_o_Yobu_Kaizoku_JPN_
+Outer__NZBSPLIT__abcdef01__NZBSPLIT__Exact_Release-GRP_rar.rar
+Outer__NZBSPLIT__abcdef01__NZBSPLIT__Publisher_Asset-GRP.rar.par2
+Outer__NZBSPLIT__abcdef01__NZBSPLIT__İ_
+Oversized direct input must fail.
+Oversized guid release
+Oversized index metadata was accepted.
+Oversized metadata must not be archived.
+Oversized wire data must be rejected.
+Ownership loss must abort the metadata transaction.
+O’Reilly Learning Rust 2nd Edition.pdf
+P2P: Synthetic.Release-GRP [chat]
+PAR2 extension
+PAR2 hash, 
+PAR2 slice inventory mismatch.
+PAR2 source membership differs.
+PC iSO Games Scene 1998
+PC iSO Games Scene 2026
+PHP Randomizer/Mt19937
+POSIX signals are unavailable.
+POST with another user session
+POST without session
+PRAGMA foreign_keys
+PRE: Name-GRP [not-a-section]
+PRE: Synthetic.Release-GRP [chat]
+PRE: [TV-HD] 
+PRE: [TV-HD] 123456.Subject-GRP
+PRE: [TV-HD] 3456.Subject-GRP
+PRE: [TV-HD] 78.Subject-GRP
+PRE: [TV-HD] A1b2C3.Subject-GRP
+PRE: [TV-HD] ABC.Subject-GRP
+PRE: [TV-HD] Example.Subject-GRP
+PRE: [TV-X264] MASH.S02E12.1973.DUBBED.CZECH.1080p.WEB.x264-OMG
+PRE: [TV] Synthetic.Release-GRP
+PRE: [TV] Synthetic.Release-GRP,
+PREDB_IDENTITY_STATE
+PUBLISHED-CATEGORY
+Parent snapshot must be acquired before catalogue identity.
+Partial release NZB is truncated.
+Pass2.Videos2020.Collection
+Passes of one group must start at most once per interval.
+Patritcy_A.enc
+Pickers.S02E06.Im.Bickerhimmel.GERMAN.DOKU.WS.HDTVRiP.XviD-TVP
+Pop_Classics_6.26.part1
+Poster Extra
+PrEdB_iDeNtItY_kEyS
+PrEdB_iDeNtItY_rEvIsIoNs
+PrEdB_iDeNtItY_sTaTe
+Pre-lock work must not count as in-lock time.
+PreDB file match, 
+PreDB identity cannot own the callback boundary.
+PreDB identity epoch exhausted
+PreDB identity rebuild failed
+PreDB identity requires a clean callback context.
+PreDB identity state unavailable
+PreDB identity tracking requires an InnoDB table: 
+PreDB identity trigger inventory changed.
+PreDB linked
+PreDB owner identity cannot be projected completely.
+PreDB owner revision or presence changed.
+PreDB projection generation changed.
+PreDB rebuild generation, epoch or loaded policy changed.
+PreDB rebuild inventory is incomplete.
+PreDB rebuild loaded policy changed during the transaction.
+PreDB rebuild requires its own supported transaction.
+Prefixed metadata values are preserved.
+Preparation errors must propagate.
+Preparation must retain its collection parent.
+Preview/write mismatch: 
+Previously proved audit result.
+Prior|Ambient.mkv
+Private Life 2018
+Private School 1983
+Private.26.04.07.Alice.Ross.And.Nata.Gold.XXX.2160p.MP4-WRB
+Private.26.04.07.Alice.Ross.And.Nata.Gold.XXX.2160p.MP4-WRB.mp4
+Processing completed without creating useful artifacts.
+Producer naming must wait for the outer transaction to commit.
+Product cleanup cannot roll back the callback-owned native transaction.
+Professional.Font.Pack.2026.OTF.Collection
+Profile changes saved
+Profile failed.
+Project.Spark-RUNE
+Provenance command failed: 
+Public PAR2 fixture identity mismatch.
+Public PAR2 fixture inventory mismatch.
+Publication must follow durable owned SQL commit.
+Publication must never invent article IDs.
+Published NZB must independently reproduce repair: 
+Published subject total must agree with the available bodies without inventing missing article IDs.
+Publisher.Asset-GRP
+Publisher.Asset-GRP.mkv
+Publisher.Asset-GRP.rar
+Publisher.Asset-GRP.rar.mkv
+Publisher.Asset-GRP.rar.rar
+Pure hex 20 chars
+Puss.In.Boots.2011.DANiSH.1080p.BluRay.x264-WAR
+Python.3.12.2.Setup.x64
+QWERTYUIOPASDFGHJKLZ
+Query execution was interrupted
+QuoVadisX.v1.0.85.MultiLanguage.WinALL.Incl.Keygen-BLiZZARD
+RAR archive path
+RAR continuation unavailable
+RAR group unavailable
+RAR4 main header checksum mismatch.
+RAR4 marker mismatch.
+RAR5 first header checksum mismatch.
+RAR5 marker mismatch.
+READ-COMMITTED
+REFILL_WORKER
+REMOTE_ADDR
+RFC numeric offset
+ROSALÍA.Album.2026-GRP
+Race-GRP
+Random digits in ebook group
+Random in hdtv group
+Random transitions
+Rar.Only-GRP
+RarInfo FileName Match
+Rate limit exceeded, try again later
+Raw #posted @subject [1/1] yEnc
+Raw PDO transaction was adopted.
+Raw file: Flat scene release
+Reached table attestation past session check.
+Readable software package
+Readme.2026.1080p
+Ready completion sentinel.
+Ready release pass failed: 
+Reason-GRP
+Recent Releases
+Recent-GRP
+Reclassified 1 candidates
+Reclassified 2 candidates
+Recovered.Movie
+Recovered.Movie.2026.1080p.WEB-DL.x264-GRP
+Red.Dead.Redemption.2-DODI
+Redundant metrics walked retained audit scratch before the next claim.
+Reference CRC truncated.
+Reference QO service grammar unsupported.
+Reference RAR5 header partial.
+Reference RAR5 marker missing.
+Reference ambiguous hash grammar unsupported.
+Reference cached range unsupported.
+Reference extra extent invalid.
+Reference extra type unsupported.
+Reference file-copy grammar unsupported.
+Reference hash grammar unsupported.
+Reference redirection grammar unsupported.
+Reference requires an ISO descriptor sequence at sector 16.
+Reference vint exceeds bounded 35-bit grammar.
+Reference vint truncated.
+Refusing to use an occupied CBP integration database.
+Regular movie release
+Reilly 1080p"], -1, -1, -1, -1, -1, 0, 10, 
+Reilly", 
+Reilly%", "example show o
+Reilly.Episode.1080p.mkv"], [6, 
+Reindexed 2
+Rejected completion callbacks must not leak into a fresh commit.
+Rejected completion callbacks must not leak into a later unrelated commit.
+Rejected guard must not retain admitted identity.
+Rejected identities must preserve the legacy generic-cleaning fallback.
+Rejected imports must not reach admission.
+Rejected native COMMIT must release captured SQL custody.
+Rejected or preview admission must not mutate release state.
+Release 
+Release 2026-GROUP
+Release Name
+Release actions
+Release creation callbacks must run after releasing the ingestion barrier.
+Release guids are consistent.
+Release tools
+Release-GRP
+Release.
+Release..2026-GROUP
+Release.2026-GRO...
+Release.2026-GRO…
+Release.2026.1080p-GROUP_Uploader
+Release.3
+Release.91
+Release.Name
+Release.Name-GROUP
+Release.Name-GROUP.Extra
+Release.Page
+Release.nzb
+Release_2026-GROUP
+Releases of deleted shows reset
+Remote batch publication failed: Database unavailable.
+Remote publication round trip timing.
+Renamed meanwhile: left alone.
+Renamed.By.An.Upgrade
+Repair picks it up on its next run.
+Repeated inspection of the same source must preserve complete_single.
+Replacement subject
+Replacement title
+Replacement.Identity
+Replacement.Name
+Replacement.Subject
+Report reverted to reviewed status
+Reported Releases
+Requires the isolated MariaDB validation service.
+Requires the isolated verification MariaDB test database.
+Resident.Evil.4.Remake-FITGIRL
+Resumed scratch passed although its emitted article inventory fails fresh replay.
+Retention must not start after the completed window requests drain.
+Retry backoff must prevent immediate repeat attempts.
+Retry later.
+Retry-After
+Returning from the writer savepoint must not publish.
+Rollback callback failure must prevent retry.
+Rolled-back caller callbacks must not leak to a later transaction.
+Roundtrip 
+Row locks apply to MariaDB.
+Rows other workers commit are visible inside the transaction.
+Runtime regression coverage for numeric string ids.
+Rust article fingerprint is unavailable. Build it with scripts/build-nntmux-native.sh.
+S01E01-03
+S01E01-E03
+S01E01.2026.1080p.WEB-GRP
+S01E01.E02
+S01E01.S02E02
+S1.2023.Show.Name.1080p.AMZN.WEB-DL.x264-GROUP
+SCHEDULER_AUTOLOAD
+SDPORN.bin
+SDPORN.mkv
+SELECT * FROM 
+SELECT * FROM main.
+SELECT * FROM main.predb ORDER BY id
+SELECT * FROM main.sqlite_schema ORDER BY type,name
+SELECT * FROM temp.sqlite_schema ORDER BY type,name
+SELECT @@GLOBAL.max_allowed_packet AS bytes
+SELECT @@SESSION.lock_wait_timeout AS seconds
+SELECT r.* FROM releases r 
+SELECT r.id AS releases_id
+SELECT r.searchname FROM releases r
+SELECT rf.releases_id
+SELECT searchname FROM releases
+SET FOREIGN_KEY_CHECKS
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ
+SHA-1 hash
+SHA-256 hash
+SHA1 in music group
+SHOW CREATE TABLE `
+SHOW INDEX FROM `
+SQL cleanup failure
+SQLSTATE 22 index failure
+SYNTHETIC.Identity-GRP
+SYNTHETIC.MOVIE.2026-GRP
+Sample/Show.S01E02.sample.mkv
+Sample/movie-sample.mkv
+Sampled.
+Saturday.Night.Live.S52E03.Shane.Gillis.Rosalía.October.10.2026.1080p.HULU.WEB-DL.DDP5.1.H.264-None
+Saturday.Night.Live.S52E03.Shane.Gillis.Rosalía.October.10.2026.1080p.HULU.WEB-DL.DDP5.1.H.264-None.mkv
+Scene RAR release
+Scene.Movie.2026.1080p.WEB-DL-GRP
+Scene.Release.Title.2026-GROUP
+Schach.Und.Matt.2-OTHER
+Schach.Und.Matt.2-SiLENTGATE
+Search publication waits for caller commit.
+Season.1
+Second duplicate
+Second movie
+Select All
+Services/AdminDashboardSnapshotService.php
+Services/Releases/ReleaseBrowseService.php
+Services/Releases/ReleaseSearchService.php
+Set CBP_INTEGRATION_DB_DATABASE to an empty, isolated MariaDB test database.
+Set FINGERPRINT_TEST_DATABASE_URL to a new disposable database.
+Set NNTMUX_TEST_NATIVE_LIBRARY on Linux for actual native execution.
+Set VERIFICATION_LOCK_TEST_HOST to an isolated MariaDB test server.
+SexBabesVR.23.10.20.Virtual.Reality.VR180.3D.SBS.2160p-VRSins
+Short low-signal token in TV group
+Short low-signal token in movies group
+Should reject all results when none share meaningful tokens with the query
+Should select the result that shares meaningful tokens with the query
+Show Name S999 2023 1080p WEB-DL GROUP
+Show-Name-S2-2023-1080p-WEB-DL-GROUP
+Show.1x01.1080p.WEB-DL-GRP.mkv
+Show.1x01x02.1080p.WEB-DL-GRP.mkv
+Show.1x01x02.1080p.WEB.x264-GRP
+Show.1x01x02.1080p.WEB.x264-GRP.mkv
+Show.1x02.1080p.WEB-DL-GRP.mkv
+Show.1x05.HDTV.XviD-GRP
+Show.2024.01.15.Guest.720p.WEB-GRP
+Show.Complete.Series.1080p.BluRay-GRP
+Show.EP05.1080p.WEB-DL-GRP
+Show.Episode.5.1080p.WEB-DL-GRP
+Show.Name.1080p
+Show.Name.1080p.PROPER-GROUP
+Show.Name.1080p.WEB-DL-GROUP
+Show.Name.S01E01.720p.WEB.h264-GROUP
+Show.Name.S02E03.1080p.WEB.H264-GROUP
+Show.Name.S02E10.2023.1080p.AMZN.WEB-DL.x264-GROUP
+Show.Name.S03.2023-GROUP
+Show.Name.S03E05.720p.HDTV.x264-GROUP
+Show.S01-03.720p.HDTV.x264-GRP
+Show.S01-S02.720p.HDTV-G
+Show.S01-S03.1080p.BluRay.x264-GRP
+Show.S01.1080p-G
+Show.S01.1080p-GRP
+Show.S01.1080p-GRP/Show.S01E01.1080p.WEB-DL-GRP.part01.rar
+Show.S01.1080p-GRP/Show.S01E01.mkv
+Show.S01.1080p-GRP/Show.S01E02.1080p.WEB-DL-GRP.part01.rar
+Show.S01.1080p.WEB-DL-GRP
+Show.S01.1080p.WEB-DL-GRP.mkv
+Show.S01.1080p.WEB-DL.DDP5.1.H.264-GRP
+Show.S01.720p.HDTV-G
+Show.S01.720p.HDTV.x264-G
+Show.S01.Disc.2.DVDR-GRP
+Show.S01.E05.720p.HDTV-GRP
+Show.S01.Episode.5.720p-GRP
+Show.S01E%02d.1080p.WEB-DL-GRP.mkv
+Show.S01E0
+Show.S01E01
+Show.S01E01-1080p-WEB-x265-GRP
+Show.S01E01-1080p.WEB-DL-GRP.mkv
+Show.S01E01-E03.720p.HDTV-GRP
+Show.S01E01.
+Show.S01E01.1
+Show.S01E01.1080p-G.mkv
+Show.S01E01.1080p.WEB-DL-GRP
+Show.S01E01.1080p.WEB-DL-GRP.mkv
+Show.S01E01.1080p.WEB-DL-GRP.part01.rar
+Show.S01E01.1080p.WEB-DL.DDP5.1.H.264-GRP
+Show.S01E01.1080p.WEB-DL.DDP5.1.H.264-GRP.mkv
+Show.S01E01.1080p.WEB.
+Show.S01E01.1080p.WEB.H264.DDP5.1.8bit-GRP
+Show.S01E01.1080p.WEB.X264.DDP5.1-GRP
+Show.S01E01.1080p.WEB.h264-GRP
+Show.S01E01.1080p.WEB.x02-GRP
+Show.S01E01.1080p.WEB.x02-GRP.mkv
+Show.S01E01.1080p.WEB.x264-GRP
+Show.S01E01.1080p.WEB.x264.Complete.Season-GRP.mkv
+Show.S01E01.1080p.WEB.x264.E02-GRP.mkv
+Show.S01E01.1080p.WEB.x264E02-GRP.mkv
+Show.S01E01.1080p.WEB.x265-GRP
+Show.S01E01.1080p.WEB.x265.S02-GRP.mkv
+Show.S01E01.1080p.WEB.x265x02-GRP.mkv
+Show.S01E01.2160p.UHD.HEVC.HDR10-GRP
+Show.S01E01.2160p.WEB.H265.EAC3.10bit-GRP
+Show.S01E01.24.1080p.WEB-DL-GRP.mkv
+Show.S01E01.720p-G.mkv
+Show.S01E01.720p.BluRay.AVC.DTS5.1-GRP
+Show.S01E01.720p.HDTV-G.mkv
+Show.S01E01.720p.WEB-DL-GRP.mkv
+Show.S01E01.Complete.Season.1080p.WEB-DL-GRP.mkv
+Show.S01E01.Complete.Season.proof.mkv
+Show.S01E01.Copy
+Show.S01E01.Part.One.720p.HDTV.x264-G.mkv
+Show.S01E01.Pilot-GRP
+Show.S01E01.Pilot.1080p.WEB-DL-GRP.mkv
+Show.S01E01.mkv
+Show.S01E01E02.720p.HDTV-G.mkv
+Show.S01E01E02.720p.HDTV-GRP
+Show.S01E01E02.sample.mkv
+Show.S01E02
+Show.S01E02.1080p.WEB-DL-GRP
+Show.S01E02.1080p.WEB-DL-GRP.mkv
+Show.S01E02.1080p.WEB-DL-OTH.mkv
+Show.S01E02.720p-G.sample.mkv
+Show.S01E02.Chapter.One.720p.HDTV.x264-G.mkv
+Show.S01E02.REPACK.1080p-G.mkv
+Show.S01E02.The.Title.1080p.WEB-DL-GRP.mkv
+Show.S01E02.mkv
+Show.S01E02.proof.mkv
+Show.S01E03
+Show.S01E03.1080p.WEB.x265-GRP
+Show.S01E03.720p.HDTV-G.mkv
+Show.S01E03.mkv
+Show.S01E05.1080p.WEB-DL-GRP.en.srt
+Show.S01E05.1080p.WEB-DL-GRP.mkv
+Show.S01E10.1080p.WEB-DL-GRP.mkv
+Show.S02D1.PAL.DVDR-GRP
+Show.S02E01.720p.HDTV-G.mkv
+Show.S2024.1080p.WEB-DL-GRP
+Show.S2024.E01.1080p.WEB-DL-GRP
+Show.S2024.E01.1080p.WEB-DL-GRP.mkv
+Show.S2024E01.1080p.WEB-DL-GRP
+Show.S2024E01.1080p.WEB-DL-GRP.mkv
+Show.S2024E02.1080p.WEB-DL-GRP.mkv
+Show.Season.1.720p.WEB-DL-GRP
+ShowA.S01E01.1080p.WEB-DL-GRP
+ShowA.S01E01.720p-G.mkv
+ShowB.S01E02.720p-G.mkv
+Show_Name_S12_2023_1080p_WEB-DL_GROUP
+Silver.Pines-ElAmigos
+Sister.Wives.2010.S19.1080p.DSCP.WEB-DL.DDP2.0.H.265-FUZEER
+Sister.Wives.2010.S19E14.The.Truth.Will.Set.You.Free.1080p.DSCP.WEB-DL.DDP2.0.H.265-FUZEER
+Sister.Wives.2010.S19E14.The.Truth.Will.Set.You.Free.1080p.DSCP.WEB-DL.DDP2.0.H.265-FUZEER.mkv
+Skipping release file with invalid size metadata.
+Some.Anime.01
+Some.Game-SKiDROW
+Some.Game.macOS.13
+Some.Movie.2020.1080p-GRP
+Some.Movie.2024.1080p.BluRay.x264-GROUP
+Some.Movie.2024.1080p.WEB-DL.mkv
+Some.Movie.2024.FRENCH.1080p.WEB-DL.x264-GROUP
+Some.Movie.2026.1080p.@BS
+Some.Movie.2026.1080p.@BS.rar
+Some.Movie.2026.1080p.WEB.H264-NUKED
+Some.Movie.2026.720p.BluRay.x264-GRP
+Some.Movie.2026.@BS
+Some.Movie.2026.@BS.rar
+Some.Movie.HDTVLight.1080p.x264.@BS
+Some.Movie.HDTVLight.1080p.x264.@BS.rar
+Some.Release.2026.1080p.WEB.h264-GRP
+Some.Show.S01E01.1080p.WEB-DL-GRP
+Some.Show.S01E01.1080p.WEB.h264-GRP
+Some.Show.S01E01.720p.HDTV.x264-GRP
+Some.Show.S01E03.1080p.BluRay.10bit.x265-GROUP
+Some.Show.S01E03.1080p.BluRay.10bit.x265-GROUP.txt
+Some.Show.S01E03.1080p.BluRay.10bit.x265-GROUP.unknown
+Some.Show.S01E03.1080p.BluRay.10bit.x265.mkv
+Some.Show.S01E03.1080p.WEB-DL.x264-GROUP
+Some.Show.S01E03.1080p.WEB-DL.x264-GROUP.mkv
+Some.Title.2020
+SomeNewSiteVR.com.Performer.GearVR.1080p
+SomeOther.26.04.07.Random.Title.XXX.2160p.MP4-GRP
+SomeOther.26.04.07.Random.Title.XXX.2160p.MP4-GRP.mp4
+Source, state, revisions and keys must roll back together.
+Southern Charm S11E12 Even Further South 720p AMZN WEB-DL DDP2 0 H 264-NTb
+Southern Charm S11E12 Even Further South 720p AMZN WEB-DL DDP2 0 H 264-NTb.mkv
+Southern.Charm.S11E12.Even.Further.South.720p.AMZN.WEB-DL.DDP2.0.H.264-NTb
+Southern.Charm.S11E12.Even.Further.South.720p.AMZN.WEB-DL.DDP2.0.H.264-NTb.mkv
+Space.Movie-GRP
+Spot-check article identity differs from its header.
+Srr.Only-GRP
+Srr.Page
+Srr.Page0-GRP
+Staff response
+Staff response available on release details
+Staged NZB installation identity changed.
+Stale absence must not complete
+Stale absence must not rename
+Stale captured inventory must not be retried.
+Stale claim rejection is not an archive-proof deferral.
+Stale fixture
+Stale observations must not be retried after rollback.
+Stale verification result cannot publish.
+Starfield-RUNE
+StockingsVR GearVR release
+StockingsVR.com.Lady.Lyne.You.Can.Watch.with.DD.Cup.Lady.Lyne.GearVR.1080p
+Storage: not reported for the sqlite driver.
+Story.OF.Creator.1080p
+Strasse.Synthetic.2026-GRP
+Strauss.Movie-GRP
+Strauß.Movie-GRP
+Straße.Synthetic.2026-GRP
+Stuck releases requeued
+Sun, 11 Oct 2026 04:14:20
+Sun, 11 Oct 2026 04:14:20 +0200
+Sun, 11 Oct 2026 04:14:20 GMT
+Sun, 11 Oct 2026 04:14:20 UTC
+Swapped in after commit.
+Synthetic completion rollback callback failure.
+Synthetic database detail must not be exposed.
+Synthetic database detail.
+Synthetic inventory must contain 1..1024 files.
+Synthetic nested callback failure.
+Synthetic offline fixture
+Synthetic optional diagnostic read failure.
+Synthetic original completion write failure.
+Synthetic owned rollback callback failure.
+Synthetic owner replacement fault.
+Synthetic postcommit callback failure.
+Synthetic postcommit failure.
+Synthetic private connection detail.
+Synthetic private output detail.
+Synthetic private query detail.
+Synthetic publication failure.
+Synthetic rollback callback failure.
+Synthetic second rollback callback failure.
+Synthetic.
+Synthetic.Absent.Observation-GRP.mkv
+Synthetic.Absent.Release.2026-GRP.mkv
+Synthetic.Alias
+Synthetic.Alias-GRP
+Synthetic.Alias-GRP.mkv
+Synthetic.Alias-GRP.rar
+Synthetic.Alias-GRP.rar.par2
+Synthetic.Alias.2026.1080p-GROUP
+Synthetic.Alias.mkv
+Synthetic.Alpha.2026.1080p-SDPORN
+Synthetic.Ambient.Feed-GRP
+Synthetic.Asset-GRP
+Synthetic.Asset-GRP.rar.par2
+Synthetic.Beta.2026.1080p-GRP
+Synthetic.Canonical-GRP
+Synthetic.Canonical.2025-GRP
+Synthetic.Canonical.Release-GRP
+Synthetic.Canonical.Release.2026-GRP
+Synthetic.Case.Fence-GRP
+Synthetic.Catalogue.Title.
+Synthetic.Control.Release-GRP
+Synthetic.Deleted-GRP
+Synthetic.External.Observation-GRP.mkv
+Synthetic.Fallback.2026-GRP.mkv
+Synthetic.Fallback.Release.2026-GRP
+Synthetic.Filename.Alias-GRP
+Synthetic.First-GRP
+Synthetic.First-GRP.mkv
+Synthetic.First.Release.2026-GRP
+Synthetic.Hidden-GRP
+Synthetic.Identity-GRP
+Synthetic.Identity.Release-TEST
+Synthetic.Input
+Synthetic.Late-GRP
+Synthetic.Legacy-GRP
+Synthetic.Legacy.
+Synthetic.Missing-GRP.mkv
+Synthetic.Movie-GRP
+Synthetic.Movie.2026-GRP
+Synthetic.Movie.2026-GRP 
+Synthetic.Movie.2026.1080p-GROUP
+Synthetic.New-GRP
+Synthetic.New.Alias-GRP
+Synthetic.New.Catalogue.Release-GRP
+Synthetic.New||Literal.Observation-GRP.mkv
+Synthetic.Observed.Alias-GRP
+Synthetic.Observed.Long.Stale.Alias.Before.Canonical.2026-GRP
+Synthetic.Original.Release-GRP
+Synthetic.Other
+Synthetic.Other-GRP
+Synthetic.Other.
+Synthetic.Other.Release-GRP
+Synthetic.Other.mkv
+Synthetic.Positive.Observation-GRP
+Synthetic.Pretrigger.Owner-GRP
+Synthetic.Pretrigger.Owner-GRP.mkv
+Synthetic.Publication.Release-GRP
+Synthetic.Rebuild.Custody-GRP
+Synthetic.Release-GRP
+Synthetic.Release-GRP.mkv
+Synthetic.Release-GRP.rar
+Synthetic.Release.
+Synthetic.Replacement-GRP
+Synthetic.Second-GRP
+Synthetic.Second.Release.2026-GRP
+Synthetic.Second.S01E02.2026.1080p.WEB-GRP
+Synthetic.Secondary.Observation-GRP
+Synthetic.Secondary.Observation-GRP.mkv
+Synthetic.Secondary.Observation-GRP.rar
+Synthetic.Series.
+Synthetic.Series.S01E01.2026.1080p.WEB-GRP
+Synthetic.Source.Rejected-GRP
+Synthetic.Title One
+Synthetic.Title."One
+Synthetic.Uninspected.Sibling-GRP.mkv
+Synthetic.Unknown.2026-GRP
+Synthetic.Unknown.2026-GRP.mkv
+Synthetic.Unknown.Observation-GRP
+Synthetic.Unknown.Observation-GRP.mkv
+Synthetic.Unready.Feed-GRP
+Synthetic.Unsupported-GRP
+Synthetic.Untouched.Release-GRP
+Synthetic.Upload.Alias-GRP
+Synthetic.Upload.Alias-GRP.rar
+Synthetic.Valid-GRP
+Synthetic|Locally.Rejected-GRP.mkv
+TABLE_NAME
+TAITO_MILESTONES_MULTI_NSW-HR
+TEMP B-TREE
+TEST_MARIADB_HOST
+TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__
+TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__setup.7z.001
+TRUNCATE TABLE 
+TV episode
+TV-1080P-CZ
+TV-HD-CZ
+TV-SD-FR
+TV-WEB-X264
+TV-X264-HD
+Tale.of.the.Nine.Tailed.S02.2023.1080p.AMZN.WEB-DL.x264.DDP2.0-ADWeb
+Tale.of.the.Nine.Tailed.S02E10.2023.1080p.AMZN.WEB-DL.x264.DDP2.0-ADWeb
+Technical video basename
+Temporary objects shadow PreDB writer capability.
+Temporary objects shadow the PreDB identity schema.
+Temporary objects shadow the PreDB rebuild schema.
+Test Network
+Test Show
+Test policy
+Test release
+Test.Show.S01E01.720p-GROUP
+Test.Show.S02E03.720p-GROUP
+The Expanse
+The Matrix 1999 1080p BluRay x264-GRP
+The West Wing S07E01 1080p BluRay x265-iVy.mkv
+The actual source exception must survive verified cleanup unchanged.
+The archived original artisan entrypoint is missing.
+The callback that starts a new transaction must run exactly once.
+The caller retains its transaction.
+The canonical file was never touched.
+The captured original write failure must survive the cleanup wrapper.
+The collections were reconciled again.
+The consistent read retains its pre-admission snapshot.
+The consistent read still has the pre-arrival snapshot.
+The decoded raw listing is complete even though its episode identity is ambiguous.
+The deferred foreign key must fail at commit.
+The empty catalogue requires one bounded rebuild page.
+The exception should propagate.
+The failed root SQL must roll back before the callback takes its own custody.
+The failing callback must not replay on an unrelated commit.
+The false pass emitted duplicated segment numbers despite correct contiguous decoded bytes.
+The fast group should start another pass while group 2 runs.
+The final SQL state fence must follow the selected-row injection.
+The final selected-row read must be exercised.
+The finalization must roll back.
+The finite rebuild command is not implemented.
+The fixture must reach the ordinary consumer without an earlier rename.
+The fixture must stop after two complete announces.
+The fixture should stop after one channel message.
+The fixture should stop after the completed announce.
+The fixture should stop at EOF.
+The group background cursor must not be replaced by the global cursor.
+The header snapshot must not hold the shared capacity lock.
+The header snapshot must retain its collection parent lock.
+The identity check must reject the swapped file.
+The initialization failure must propagate.
+The intended actual observation order must be exercised.
+The intended release-write boundary was not exercised.
+The later matching inventory must be considered within the bounded nominations.
+The limits are read once, before the transaction.
+The local policy token must reject the changed runtime.
+The manifest the locked row names must be read and trusted before publishing.
+The migration accepted a guid that does not fit the narrowed column.
+The missing lock table must throw.
+The never-committed generation is not at the canonical path.
+The optional read must fail before opening the identity write transaction.
+The original post-commit throwable must escape unchanged.
+The overtaken run collected again from the upgraded NZB.
+The partial keeps its NZB.
+The public path must reach the real completion UPDATE before COMMIT fails.
+The reader must return after its bounded timeout.
+The real SQL rollback must precede the one allowed side effect.
+The real second-stage consumer must respect finalized archive scope.
+The repair compared against a replaced generation.
+The replaced generation is not the source.
+The retained legacy scheduler mutex is ignored without needing a cache flush.
+The scheduled stale sweep collects it again.
+The scope is closed again after the failure.
+The second declared file is still absent.
+The stale write must not be retried.
+The stored inventory, not the sender, decides.
+The total body-read deadline must be enforced.
+The unchanged query must use the match cache.
+The upgrade run still owns it.
+The verification schedule must be registered.
+The.Celebrity.Traitors.S02E04.1080p.HDTV.H264-DARKFLiX
+The.Celebrity.Traitors.S02E04.1080p.HDTV.H264-DARKFLiX.mkv
+The.Expanse.S01E02
+The.Expanse.S01E02.720p.HDTV.x264-GRP
+The.Expanse.S01E05.720p.HDTV.x264-GRP
+The.Expanse.S02.1080p.BluRay.x264-GRP
+The.Expanse.S02E03.720p.HDTV.x264-GRP
+The.Fisher.King.1991.1080p.BluRay.x264-GRP
+The.Fisher.King.1991.1080p.BluRay.x264-GRP.mkv
+The.Fix.2026.720p.NOW.WEB-DL.DD+5.1.H.264-playWEB
+The.Fix.2026.720p.NOW.WEB-DL.DD+5.1.H.264-playWEB.mkv
+The.Florist.2026.1080p.AMZN.WEB-DL.DD_5.1.H.264-playWEB
+The.Kardashians.S08E01.Slap.the.S.Outta.Her.2160p.DSNP.WEB-DL.DDP5.1.DV.HDR10Plus.H.265-Kitsune
+The.Lady.and.the.Lyne.2022.1080p.WEB-DL.x264-GROUP
+The.Last.of.Us.Part.I.PS5
+The.Legend.of.Zelda.Breath.of.the.Wild.PROPER.NSW-BigBlueBox
+The.Little.Mermaid.1989.FiNNiSH.HDR.2160p.WEB.H265-TOOSA
+The.Pragmatic.Programmer.20th.Anniversary.Edition.OReilly.2019.EPUB
+The.Red.Ball.Express.1952.BR.Remux.AVC-d3g
+The.Revenant.2015.BluRay.1080p.DDP.5.1.x264-hallowed
+The.Revenant.2015.BluRay.1080p.DDP.5.1.x264-hallowed.mkv
+The.West.Wing.S07E01.The.Ticket.1080p.BluRay.10bit.EAC3.2.0.x265-iVy
+The.Witcher.3.Wild.Hunt-PLaza
+These new-title controls must not publish an update.
+This command removes all releases, nzb files, samples, previews , nfos, truncates all article tables and resets all groups. Are you sure you want reset the DB?
+This compile-only test must not resolve a database connection.
+Timing logs must be emitted after the publication transaction ends.
+Title Match fixture
+Title-GRP
+Title-[PC]-Game
+Token overlap
+Tom.and.Jerry.2021.1080p.MA.WEB-DLRip.x264-ZoroSenpai_EniaHD
+Too large
+Trailing.Newline.Name.mkv\n
+Transactions Manager has not been set.
+Traqueur.De.Chars.S03E09.DOC.FRENCH.1080p.WEB.H264-BAWLS
+True.Title-GRP
+Truncated article
+Truncated integer.
+UNION ALL
+UPDATE predb
+UPDATE predb SET 
+UPDATE releases SET 
+UTF-16 entity declaration cannot bypass the declaration guard
+UTF-16LE
+UTF-8 character bound exceeds legacy byte bound
+UUID with dashes
+Udemy.JavaScript.Masterclass.2026.1080p
+Ueberall.nur.nicht.hier.1999.German.DL.1080p.DSNP.H264-Oergel
+Unable to connect to the requested NNTP provider.
+Unable to isolate the public search predicates.
+Unable to move temporary NZB into place.
+Unchanged_Release-GRP
+Unexpected alternate connection.
+Unexpected custom index collation was accepted.
+Unexpected fixture command: 
+Unexpected projection source mutation
+Unexpected, missing, or out-of-order fixture command.
+Unicode & Special Character Titles
+Unicode case in path
+Unicode case only
+Unicode case-only title
+Unicode control
+Unicode format control
+Unicode literal underscore
+Unicode scene title
+Unicode script and literal underscores
+Unicode title and group
+Unix socket pairs must be supported on CI Linux.
+Unknown archive filename identity case.
+Unknown archive format.
+Unknown archive stratum.
+Unknown metadata module.
+Unknown nominations must not complete filename inspection
+Unknown reference module.
+Unknown remaining archive fixture.
+Unknown remaining metadata stratum.
+Unknown sample-planning stratum.
+Unknown vendor archive fixture.
+Unknown.Count.Release
+Unknown.File.enc
+Unknown.File.rar
+Unknown.Release-GRP
+Unknown.Upload.Name
+Unrelated.Searchname
+Unrelated.Subject
+Unrelated.Title-GRP
+Unresolved.Synthetic.2026-GRP
+Unsupported PreDB identity callback manager.
+Unsupported PreDB schema table: predb_identity_state
+Unsupported batch protocol.
+Unsupported content encoding must be rejected.
+Unsupported initial helper machinery entered a rebuild.
+Unsupported metadata was treated as a current schema.
+Unsupported owner allowed partial progress.
+Unsupported owner was silently projected.
+Untrusted replacement
+Uppercase in xxx group
+Use a macOS or Linux host.
+Usenet obfuscated filename
+User-Agent
+User-Agent: Nyuu/0.4.2
+Utility Installer.msi
+VALID.SCENE.RELEASE.2026-GROUP.RAR
+VA_-_Beatport_Cuprite_-_Badaman_Chart-WEB-2026
+VA_-_Beatport_Sofian_-_D.Y.F.I.T_Chart-WEB-2026
+VERIFICATION_LOCK_TEST_HOST
+VERIFICATION_LOCK_TEST_PASSWORD
+VERIFICATION_LOCK_TEST_USERNAME
+VERIFICATION_MARIADB_PASSWORD
+VERIFICATION_MARIADB_TEST
+VERIFICATION_MARIADB_USERNAME
+VFF 2160p
+VFF 360p
+VFF 576p
+VFF 720p
+VFF 720p space separated
+VIDEO_TS/VIDEO_TS.IFO
+VIDEO_TS/VIDEO_TS.VOB
+VIDEO_TS/VTS_01_1.VOB
+VR device with known studio
+VR match
+VTS_01_1
+Valid&Scene.Movie.Release.2026-GROUP
+Valid.Metadata-GRP
+Valid.Scene.
+Valid.Scene.Release.
+Valid.Scene.Release.2025-GROUP
+Valid.Scene.Release.2026-GROUP
+Valid.Scene.Release.2026-GROUP.DTS
+Valid.Scene.Release.2026-GROUP.rar
+Valid.Scene.Release.2026-OTHER
+Valid.SceneXYRelease.Movie.2026-GROUP
+Valid.Scene_%Release.Movie.2026-GROUP
+Valid_Scene.Release.2026-GROUP
+Vegan_Food_and_Living_Monthly_May_2026_Issue_352
+Verification is waiting for scratch capacity.
+Verification lease was lost
+Verification worker slots are occupied or exclusive maintenance is running.
+Verified again.
+Verified payload below minimum size.
+Verified payload is below the configured minimum size.
+Verified payload.
+Verified policy rejection during expiry selection.
+Verified policy rejection.
+Verified release publication timing.
+Verified.Date-GRP
+Verifier must independently reject duplicate ordinals without reader metadata.
+View reports
+Visible comment
+Válid.Scene.Release.2026-GROUP
+WAR.2026.S01E02.FRENCH.WEB.H264-BAWLS
+WEBP-DATA
+WOB Klassik 4.25
+WOB Klassik 4.25.Pdf
+Waiting.S01E01
+Whole-body reads are forbidden.
+Whole-file
+Whole-pass positive assignment must roll back
+Wicked.2024.1080p.WEB-DL.H264-GRP
+Wicked.24.01.15.Performer.Name.XXX.1080p.MP4-KTR
+Wild_West_Supermarket_Simulator-Razor1911
+Wildauge.The.Midwife.2015.German.720p.BluRay.x264-TiG
+Wildauge.The.Midwife.2015.German.BDRip.x264-TiG
+Wire content must arrive as a bounded raw stream.
+With nothing staged, the NZB really is unavailable.
+Without a pre-lock result the document is inspected under the lock.
+Without a pre-lock step the locked section reads the limits itself.
+Wonka.2023.1080p.BluRay.x264-HiDt_EniaHD
+Worker batch failed.
+Worker readiness result did not match.
+Would change
+Wrapped__NZBSPLIT__0456f274737cea074abd86a89144cc7b__NZBSPLIT__Some_Movie_2026_1080p.7z.001
+Wrong category
+Wrong episode links removed
+Wrong generation was accepted.
+X-Padding: 
+Xref: server 
+Y-m-d H:i:s
+YENC_NATIVE_LIBRARY
+Yasha_Legends_of_the_Demon_Blade_NSW-HR
+Yggdra_Kingdom_JPN_NSW-HR
+ZIP continuation unavailable
+ZIP group unavailable
+ZIP local marker mismatch.
+Zards.Software.Cleanse.Uninstaller.v3.0.1.0-HERiTAGE
+Zards.Software.Cleanse.Uninstaller.v3.0.1.0-HERiTAGE.rar
+Zelda.Breath.of.the.Wild.Switch.XCI
+Zero vowel core
+Zero vowel token in movie group
+[ 01 / 10 ]-"Unknown.File.enc"
+[01/10] - "Patritcy_A.enc"
+[01/10] - "xK9mR2pL4qW7nT3vB.part01.rar"
+[01/20] - "aB3dE6gH9jK2mN5p.part01.rar" yEnc
+[01/45] - "k8Jd92LmWxPq10Z.part01.rar"
+[03/50] - First Movie.part03.rar yEnc
+[03/50] - Movie.2026.part03.rar yEnc
+[1/1] movie.mkv
+[1/25] - "Southern.Charm.S11E12.Even.Further.South.720p.AMZN.WEB-DL.DDP2.0.H.264-NTb.par2" yEnc
+[1/2] "Unknown.File.enc" "extra title"
+[1/2] "original.rar" yEnc
+[1/2] "second.enc"
+[1/2] - "
+[1/2] - "   "
+[1/2] - "   " yEnc
+[1/2] - "" yEnc
+[1/2] - "0"
+[1/2] - "Unknown.File.enc
+[1/2] - "Unknown.File.enc" extra title
+[1/2] - "Unknown.enc" extra title
+[1/2] - "original.rar" yEnc
+[1/2] movie.mkv
+[1/8] - "
+[1/9] - "039vphxklmk0hwouhsfx.mkv"
+[12345/67890] - "The.Matrix.1999.1080p.BluRay.x264-GRP.part01.rar" yEnc
+[2/10] "Gd71jJg4qdgsblviMRr2Wg.rar"
+[2/3] "1b0ObvkpLy4cDgLV0fW3GoPaxUHKj.rar"
+[DKB] Kami-tachi ni Hirowareta Otoko - S01E07 [1080p][H.265 10bit]
+[Director Cut] Some.Movie.2020
+[Group] Show Title - 08 [1080p][ABCD1234].mkv
+[Grp] Show - 01 [1080p]
+[INFO] FOR Synthetic.Release-GRP with 2F 1.2.3MB added.
+[INFO] FOR Synthetic.Release-GRP with 2F 1.2MB added.
+[NUKE] Synthetic.Release-GRP [bad] [NUKENET]
+[NUKE] Synthetic.Release-GRP [bad] chatter
+[Nyanpasu] Super Cub - 09 [1080p][HEVC][19475939]
+[OF.Creator.1080p]
+[P2P] Synthetic.Release-GRP [chat]
+[PRE]  [TV-HD]  MASH.S02E12.1973.DUBBED.CZECH.1080p.WEB.x264-OMG
+[PRE] Synthetic.Release-GRP [chat]
+[PRE] [TV-HD] Name-GRP extra
+[PRE] [TV-HD] incomplete
+[PRE] [TV] Synthetic.Release-GRP
+[PRE] [TV] Synthetic.Release-GRP,
+[QCE] Kami-tachi ni Hirowareta Otoko - 07
+[SSA] Cestvs - The Roman Fighter - 08 [480p]
+[SSA] Hetalia World Stars - 10 [480p]
+[a/b] - "Unknown.File.enc"
+] : null, 
+] ?? null, 
+], -1, -1, -1, -1, -1, 0, 1, 
+], -1, -1, -1, -1, -1, 1, 1, 
+], 8388608, 
+^blocked-
+_Extended.rar
+__NZBSPLIT__
+__NZBSPLIT__abcdef01__NZBSPLIT__Exact|Release-GRP.mkv
+__NZBSPLIT__abcdef01__NZBSPLIT__dir/Exact|Release-GRP.mkv
+__NZBSPLIT__abcdef1234__NZBSPLIT__
+__NZBSPLIT__abcdef1234__NZBSPLIT__directory/
+__NZBSPLIT__bad__NZBSPLIT__Exact|Release-GRP.mkv
+__NZBSPLIT__deadbeef01__NZBSPLIT__Show_Name+S01E02_1080p.part01.rar
+__NZBSPLIT__deadbeef01__NZBSPLIT__Some.Movie.2021.1080p.BluRay.x264-GRP.rar" yEnc (1/20)
+_fallback
+_regexes
+_thumb.jpg
+_thumb.webp
+_totalrows
+` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+`release_verification_candidates`
+a fractional budget rounds up
+a higher limit is never lowered
+a later publisher owns this file
+a lower limit is raised to cover the budget and one item
+a manifest naming an untrusted legacy release
+a manifest that no longer exists
+a missing archive beside it
+a missing archive with another spaced name beside it
+a split video piece and its later pieces
+a, button
+a.b.fixture
+aB3c.D4eF.5gH6i.J7kL8m
+aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF
+a_preflight_test
+aaaaaaaa-0000-0000-0000-000000000001
+ab12.cd34.ef56
+ab12345678
+abcdef01-2345-6789-abcd-ef0123456789
+abcdef12.blob
+abcdef12.mkv
+above saturation
+absent live owner
+absent overall file inventory remains unknown
+absolute_difference
+accent alias
+accent collation alias
+accent loss
+accent-only change
+accented case
+accented title
+accepted_admission
+accepted_capture
+action_statement
+active id
+active title
+actual header does not match nzb name
+actual movie body
+actual single episode body
+actual two episode bodies
+add-to-cart
+adddate DATETIME
+adddate_ts
+added_asc
+added_desc
+added_from
+added_to
+additional heading text
+additional_pp_claim_token
+additional_pp_claimed_at
+admin.release-reports.revert
+admin.release-reports.update-response
+admission token combined canonical 
+admission token combined witness 
+admission token episode and pack coexist 
+admission token episode beside season pack 
+admission token pack witness 
+admission token positive 
+admission token sample and proof stay ancillary 
+admitted_count
+adoption_blocker
+adoption_qualified
+advertised_byte_totals_valid
+advertised_bytes
+advertised_bytes_overflow
+advisory-fixture
+aes_extra_field
+af9458c7ea4d27c71a8496d42e65b8bb.@BS
+af9458c7ea4d27c71a8496d42e65b8bb.@BS.rar
+af9458c7ea4d27c71a8496d42e65b8bb.rar
+after commit
+after commit failure preserves published NZB
+after-cleanup-failure
+after-reset
+after_commit
+alias conflict beyond selector scoring window
+alice+usenet@example.test
+all cached exceeds projected scratch by one byte
+all cached fits exact projection without double counting visits
+all groups
+all incompatible fingerprint
+all incompatible name
+all incompatible size
+all_file_ids
+all_observed_copies_equal
+all_par2_segments
+all_report_reasons
+all_sampled_slices_valid
+already exhausted
+already expired hot archive
+already linked
+already renamed
+already-linked
+alt.binaries.*
+alt.binaries.e-book
+alt.binaries.ebooks.misc
+alt.binaries.erotica
+alt.binaries.erotica.divx
+alt.binaries.erotica.erotica
+alt.binaries.example
+alt.binaries.fixture
+alt.binaries.games
+alt.binaries.hdtv
+alt.binaries.missing
+alt.binaries.movies
+alt.binaries.multimedia
+alt.binaries.multimedia.anime.highspeed
+alt.binaries.sounds.mp3
+alt.binaries.test
+alt.binaries.warcraft
+alt.binaries.warez
+alt.crosspost
+alt.example
+alt.strict
+alt.synthetic.a
+alt.synthetic.b
+alt.test
+alt.test.
+alt.test.109
+alt.test.active
+alt.test.backfill
+alt.test.both
+alt.test.contract
+alt.test.disabled
+alt.test.empty
+alt.test.failed
+alt.test.first
+alt.test.last
+alt.test.one
+alt.test.other-flag
+alt.test.two
+alternate-guid
+alternate_article_fallback
+ambiguous ID
+ambiguous MIA flag
+ambiguous alias
+ambiguous completion
+ambiguous_format_column
+an encrypted archive with another spaced name beside it
+an encrypted same-stem 7z beside it
+an encrypted same-stem ZIP beside a split video
+an encrypted same-stem ZIP beside it
+an equal limit is left alone
+an unquoted split video piece and its later pieces
+an unreadable archive beside it
+an unreadable archive with another spaced name beside it
+an unreadable same-stem 7z beside it
+an unreadable same-stem ZIP beside it
+anime episode
+anime group name alone is enough
+anime hash pattern alone
+animetosho poster catches non-TV-looking release
+animetosho poster catches nyanpasu hevc release
+animetosho poster catches subsplease release with hash
+animetosho poster catches yuisubs nvenc release
+api.predb.net/*
+api.srrdb.com/*
+api.xrel.to/*
+api_token
+apibay.json
+apostrophe inside a different title
+app/Services/Releases/Fingerprint/NativeMetadataParser.php
+application/x-ndjson
+appx bundle
+arabic_digits_stem
+archive and media
+archive and part suffix
+archive bytes disguised as video
+archive caller transaction
+archive data
+archive extension
+archive standalone
+archive volumes inside a folder
+archive-expired
+archive.part01.rar
+archive.rar
+archive_file_metadata
+archive_legacy
+archive_read
+archive_retry_at
+archived manifest
+aria-label
+array date
+array envelope
+article cache directory symlink
+article_
+article_body_sha256
+article_bytes
+article_dates
+article_fingerprint
+article_identity
+article_identity_mismatch
+article_locator
+article_locator_is_decimal
+article_number
+article_observations
+article_segments
+article_span_mapped_bytes
+article_span_mapping_complete
+article_xref
+articles_expected
+articles_found
+artifact-cleanup
+ascii case
+ascii ellipsis
+ascii_general_ci
+asian_ep_alias
+assembled_file_byte_end_exclusive
+assembled_file_byte_start
+asserted by the uploader
+associative lookups
+associative names
+atmos audio
+attach catalogue
+attach policy
+attached semantic parentheses
+attached semantic quote text
+attributed annotation
+audio_data
+audio_flac
+audit-delete
+audit-delete_thumb.jpg
+audit-guid
+audit_cursor
+audit_retry_turn
+auto_link
+available_bytes
+avc quality
+backfill_target
+backlog-
+backslash path
+backward_offset
+bad group
+bad.ivtc
+bad.release
+bare episode
+bare identity has no file suffix
+base 11.4.8 version
+base64_token
+base_header_mtime_seconds_matches
+base_value
+baseline quantile / candidate same quantile, not a quantile of paired ratios
+batch_index
+batch_size
+bcdfghjklmnpqrstvwxz1234
+before commit
+before metadata commit
+below saturation
+bidi format control
+binaries_id
+binary log 11.4.8 version
+blake2sp_comparison_status
+blank file
+block_padding_zero
+blocked-
+body limit
+body three contradicts explicit two
+body_commands_per_rtt
+body_line_count
+body_line_framing_status
+body_message_id_differs_from_request
+body_response
+body_response_code
+body_response_matches_request
+body_response_text
+book_lookup_attempts
+book_lookup_retry_at
+book_name_normalized_at
+bookinfo_id
+boundary source count
+boundary-1024
+boundary_normalized_records
+bounded later compatible fingerprint
+bounded later compatible name
+bounded later compatible size
+bounded metadata fixture
+bounded-reference-date-clock-projection-v2
+bounded-reference-shared-projection-v1
+bracketed intact token
+bracketed prefix
+breaker-fixture
+broken gzip
+broken nzb
+budget_exceeded
+built_epoch
+bulk rejected
+byte overflow
+byte_length
+bytes_hashed
+bytes_per_second
+c1_control_byte
+c9a646d3-9c61-4cd7-8d1e-86d5e12f3e8f
+cAFE.mOVIE.2026-grp
+cache.default
+cache.stores.database
+cache.stores.fixnames_claims
+cache_expiry_medium
+cache_locks
+cache_overlap_comparison_status
+cached bytes without yenc header
+cached exact free reserve does not charge visits again
+cached first projection preserves free reserve one byte short
+cached_bytes_match_original
+cached_data_end_offset
+cached_data_preview_hex
+cached_data_sha256
+cached_data_start_offset
+cached_header
+café.mkv
+café.tar
+callback_after_state_lock_ns
+callback_status
+caller alias
+caller commits
+caller mutation
+caller rolls back
+caller-owned transaction
+caller_id
+caller_marker
+candidate IDs did not advance in order
+candidate directory symlink
+candidate expiry
+candidate-
+candidate_id
+candidate_identity
+candidate_match
+candidate_policy
+candidate_predb_id
+candidate_range_bytes_equal
+candidate_read
+candidate_scan_truncated_formats
+cannot be projected completely
+canonical 
+canonical HD prefix
+canonical UHD prefix
+canonical archive extension
+canonical archive preserved
+canonical codec preserved
+canonical intended link
+canonical rename
+canonical technical word
+canonical trailing blank
+canonical.scene-group
+cap hides newer dated catalogue rows
+cap plus one
+capabilities_raw
+capacity is full
+captured snapshot
+carriage return
+case and stacked wrappers
+case difference
+case duplicate title
+case only
+case only canonical link
+case-distinct article remains independently published
+case-only attachment
+case-only canonical intended link
+case-only new name
+case-only searchname
+case-only searchname change
+case-only subject
+case-only subject change
+case-only title
+case-search
+case_distinct
+case_insensitive_duplicate_guids
+cat_desc
+catalogue preview
+catalogue update
+catalogue.example
+categories_id
+categories_id BETWEEN 
+categorize_foreign
+categorize_web_dl
+category 3 batch
+category label
+category_ids
+category_name
+cbp:release-priority-window:cursor:group:1
+cbp:release-reconcile:cursor:all
+cbp:release-reconcile:cursor:group:1
+cbp:release-window:cursor:group:1
+cbp:retention-band:cursor
+certify with custom chunk
+changed SQL authority
+changed legacy publication is not overwritten
+changed title and filename
+changed trigger
+checksum_domain
+checksum_mismatch
+checksum_records_sha256
+checksum_valid
+checksumless mapping control
+cjk title
+claim expiry
+claim replacement
+claim timestamp
+claim-token
+claim.id
+claim_check
+claim_id
+claim_version
+claimed_at
+classic_rar
+clean title
+clean_scene
+cleaned filename
+cleaner id
+cleanup failure
+cleanup-race
+cleanup_failure_reported
+cleanup_validation
+cli-server
+client_charset
+codec regression immediate x continuation 
+codec regression named 
+codec regression opaque 
+codec regression release info 
+codec regression unsafe canonical 
+codec regression unsafe witness 
+collation index
+collected output
+collection_delay_hours
+collection_groups
+collection_policy
+collection_regex_id
+collection_regexes_id
+collections_id
+column reordered
+combining mark spelling stays literal
+combining sequence fifty one scalars
+combining sequence fifty scalars
+comic cbz
+comment_bytes_hex
+comment_bytes_hex_truncated
+comment_bytes_length
+comment_bytes_sha256
+comment_display_truncated
+comment_encoding
+comment_full_byte_length
+comment_latin1_printable
+comment_sha256
+comment_utf8_text
+comment_utf8_valid
+comments_asc
+committed-upload
+common_32k
+comparison_scope
+comparison_status
+competing link
+complete 7z
+complete Windows basename
+complete archive
+complete archive containing a pack plus another show
+complete archive containing two different shows
+complete basename under archive wrappers
+complete episode miss does not repeat a failed filename lookup
+complete listing
+complete listing of a same-stem 7z
+complete listing without encryption
+complete listing, then a control character
+complete movie miss does not repeat a failed filename lookup
+complete movie rar
+complete rar
+complete rar episode
+complete rar movie
+complete rar5
+complete rar5 episode
+complete rar5 movie
+complete replay
+complete series
+complete single-episode compressed 7z
+complete single-episode rar
+complete subset beside unread second archive
+complete: 2
+complete_crlf
+complete_single
+completion_children
+complex all incompatible retains metadata
+complex later compatible preserves repetitions
+composer.lock
+composition_to_injection_delta_seconds
+compressed 7z header and another archive missing articles
+compressed_data
+compressed_size
+compressed_size_32
+compression bomb
+compression-import
+compression_method
+config_file
+confirmed canonical write
+confirmed two-episode compressed 7z
+conflicting_article_segments
+conflicting_checksum_file_ids
+conflicting_duplicate_field_names
+conflicting_file_description_ids
+conflicting_overlaps
+conflicting_packet_offset
+conflicting_recovery_exponents
+conflicting_source_definition
+connection cleanup failure
+connection_collation
+connection_ownership
+consistent explicit two passes
+consoleinfo_id
+consumer mutation
+container-lifecycle
+content_decompressed
+content_size
+continuing rar
+contract-1@example.invalid
+contract@example.invalid
+control byte
+control bytes
+control character
+control character and no file at all
+control character beside a stored file
+control character, then a complete listing
+control character, then an encrypted entry
+control reference
+control title
+control_lines_truncated
+control_title
+coordinate_basis
+correctness_equality
+corrupt CRC
+corrupt-net
+corrupt-net and EFnet
+countries_id
+cover the fisher king
+cover.jpg
+cover.webp
+cover_thumb.webp
+coverage_ids
+covered article subset ignores metadata dedupe switch
+covered article subset is reused after verification
+covered_subset
+covered_subset_disabled
+crashed-guid
+crashed-worker
+crc32_comparison_status
+created_at
+created_utc
+crowdnfo-home.html
+crowdnfo.net
+csrf-token
+current authoritative mapping
+current clone and claim
+current row changed
+current_line
+current_password
+cursor commit failed
+cursor update after release delete
+custom_pre
+custom_releases
+cut-off listing
+cut-off listing of a same-stem 7z
+cutoff dated row
+cutoff undated import
+cyrillic_ep_alias
+daily show
+dash separated season
+data-action-url
+data-guid
+data-release-id
+data-report-release-id
+data_crc32
+data_crc32_scope
+data_partial
+data_rejection_warnings
+data_size
+data_truncated
+database cleanup failure
+database insert failure removes new NZB
+database is locked
+database retry removes rolled-back NZB
+database.connections
+database.connections.completion
+database.connections.fingerprint_test
+database.connections.interleaved_admission
+database.connections.mariadb
+database.connections.mariadb.database
+database.connections.mariadb.host
+database.connections.mariadb.password
+database.connections.mariadb.port
+database.connections.mariadb.prefix
+database.connections.mariadb.unix_socket
+database.connections.mariadb.url
+database.connections.mariadb.username
+database.connections.mysql
+database.connections.mysql.database
+database.connections.mysql.host
+database.connections.mysql.password
+database.connections.mysql.username
+database.connections.policy_filter
+database.connections.retry_queue
+database.connections.sqlite.database
+database.connections.sqlite.url
+database.connections.synthetic
+database.connections.testing.database
+database.connections.verification_backfill_other
+database.connections.verification_fixture_admin
+database.connections.verification_other
+database.connections.verification_upload_other
+database.default
+database/migrations/2026_10_11_215821_create_par2_rename_progress_table.php
+database/migrations/2026_10_11_230258_create_par2_rename_candidate_progress_table.php
+database/migrations/2026_10_12_010315_create_par_file_hash_evidence_tables.php
+database/migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php
+database/migrations/2026_10_15_190000_create_par2_descriptor_evidence_table.php
+database/migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php
+database_ownership
+database_retained_before_retry
+date_to_expires
+date_to_injection_date
+date_to_legacy_nntp_posting_date
+dates-folded
+dates-ordinary
+dates-uncommon-duplicates
+dates-uncommon-malformed
+dats-pciso-1998-subset.xml
+dats.site
+dats_pciso_1998
+db.schema
+db.transactions
+ddlvalley categories are not mapped
+ddlvalley.me
+ddlvalley.xml
+ddp audio
+deadlock detected
+decimal BMP noncharacter FFFE
+decimal BMP noncharacter FFFF
+decimal NUL reference
+decimal control reference
+decimal foreground consumes only two digits
+decimal string
+declared_base_seconds_consistency_only
+declared_block_ranges
+declared_cached_data_size
+declared_crc32_is_hex
+declared_crc32_matches
+declared_data_fully_scanned
+declared_epoch_arithmetic_only
+declared_file_byte_end_inclusive
+declared_file_byte_start
+declared_file_size
+declared_filetime_floor_seconds_consistency_only
+declared_next_header_size
+declared_range_matches_assembled_position
+decoded_bytes
+decoded_format_metadata
+decoded_segment_size
+decoded_size_matches_yenc
+decoded_size_matches_yend_size
+decoded_size_matches_ypart_range
+decomposed accent bytes
+decomposed alias
+decomposed spelling
+default_reset
+defective-admission
+defective-expiry
+deflate_compression_option_bits
+deflate_effort_status
+deflate_extra_flags_meaning
+delay_us
+delete from "releases"
+deleted record
+deleted release
+deleted_exact
+delimited PAL format
+delimited audio format
+delimited dotted codec
+delimited_pal
+descending index
+descriptor_relative_offset
+descriptor_sequence_index
+detail_limit
+details.partials.cover-actions
+details.partials.fingerprint-metadata
+details.partials.info-sidebar
+details_omitted_count
+devanagari_digits
+diagnostic read throws
+dictionary_size_bytes
+different GUID
+different accent
+different articles publish independently
+different current name
+different description association
+different detail ID
+different group
+different groups use the first episode
+different implementation
+different movie
+different name
+different parent and child
+different searchname
+different separator
+different separators
+different shows
+different title
+different title prefix
+different year
+different-case main reserved partial object
+different-case temporary source
+different-case temporary trigger target
+different-file-name.mkv
+differing_byte
+differing_reference_count
+differing_sample_offset
+direct Unicode case
+direct accent alias
+direct decomposed alias
+direct persisted singleton
+directional format control
+directory pipe
+dirty_diff_sha256
+disabled publication timing emits nothing
+disabled title
+disc word
+disc1.mkv
+discard this context
+discarded_data
+dispatch_control
+divides symbol
+divides_symbol
+dnzb_failures
+docker/app/nzb-yenc-ffi/target/release/
+docker/app/php/release-presentation-preload.php
+docker/app/php/release-presentation.h
+document_gzip
+does not support
+domain_unqualified
+don't stop me now.flac
+dotted episode
+dotted sample suffix
+dotted season pack
+dotted year season
+dotted_part001
+dotted_part01
+double episode
+double episode file
+double payload suffix
+double_pipe_syntax
+download limit leaves a third archive unread
+download-nzb
+download_buffer_bytes
+download_connections
+dp26-single-web-2022-idc/
+dropped letter
+dts audio
+dual_endian_volume_space_match
+dupe.2026-10-01
+dupe.Other.Show-GRP
+dupe.of.other
+duplicate ID
+duplicate ID conflict beyond selector scoring window
+duplicate IDs
+duplicate annotation
+duplicate attribute
+duplicate detail identity
+duplicate envelope member
+duplicate explicitly declared numbers cannot replace missing part two
+duplicate game
+duplicate literal title
+duplicate property beside a stored file
+duplicate property, then a complete listing
+duplicate removed after metadata match is not reused
+duplicate scope
+duplicate suffix-free numbers cannot replace missing part two
+duplicate title across statements
+duplicate title member
+duplicate with exact verified article inventory
+duplicate-header-id
+duplicate-id
+duplicate-only concurrent replay
+duplicate-spelling:
+duplicate.mkv
+duplicate_conflict
+duplicate_field_names
+duplicate_ids
+duplicate_message_id_count
+duplicate_search_revalidation
+duplicate_segment_number_count
+duplicate_title
+duplicates-inferred
+durable_install
+dvd disc
+dvd_structure_ifo
+dvd_structure_vob
+dvd_structure_vts
+dvd_subfolder
+e5a5b12627947bf5ac5b7e75cfa31d53.mkv
+earlier published nonmatching NZB does not hide later exact match
+ebook part rar style after normalize
+ebook pdf with book context
+editorial prefix
+editorial spaces
+editorial_title
+effective_compression_method
+effective_compression_method_source
+elapsed_ns
+eleven fields
+eligible_pairs
+email_verified_at
+embedded ASCII control
+embedded DEL control
+embedded NUL
+embedded linefeed
+embedded space
+embedded tab
+empty category
+empty category IDs
+empty dotted token
+empty export
+empty extra heading element
+empty file
+empty files
+empty gzip
+empty left
+empty listing beside a stored file
+empty name
+empty page claims more
+empty right
+empty size
+empty source
+empty title
+empty-par2-fixture
+empty_cached_range
+empty_file_copy_entry_data
+empty_part
+empty_response
+empty_title
+encoded parity wrapper
+encoded quote contract
+encoded quotes
+encoded-suffix
+encrypted 7z
+encrypted RAR entry
+encrypted ZIP entry
+encrypted archive
+encrypted archive data
+encrypted entry before the cap
+encrypted entry behind a control character
+encrypted entry behind a duplicate property
+encrypted entry past the entry cap
+encrypted entry past the output cap
+encrypted rar
+encrypted zip
+end_offset_exclusive
+enqueue caller transaction
+enqueue standalone
+episode can retain episode identity
+episode difference
+episode filename can identify a canonical season
+episode miss rar
+episode range
+episode titles are dropped
+episode variants 7z
+episode word
+episode_files
+epoch_basis
+equal ASCII
+equal Unicode
+equal binary
+equal integers
+equal leading zeros
+equal mixed
+equal signed maximum
+equal strings
+equal unsigned maximum
+erased group substring
+error_type
+escape character
+escaped equivalent member
+eszett alias
+eventually complete
+evidence_status
+exact 255 character ceiling
+exact attachment
+exact byte bound
+exact canonical archive extension
+exact conflicting assertions retains archive
+exact duplicate reconciles uncatalogued crosspost groups
+exact identical assertions safely reuses
+exact link
+exact missing assertions retains archive
+exact payload boundary episode
+exact payload boundary movie
+exact segment bound
+exact title
+exact.Release.2026-GROUP
+exact.release-grp
+exact.release-grp.dts
+exact.release-grp.dts.rar
+exact.release-grp.rar
+exact.release-grp.rar.par2
+exact.release-grp.rar.rar
+exact.release-grp.unknown
+exact.release.2024-grp
+exact.title-grp
+exact_failure_propagated
+exactly complete
+exceeds 8 bytes
+exception_class
+excessive JSON depth
+excluded other not
+excluded_categories
+excluded_category_ids
+excluded_count
+exhaust three attempts
+existing canonical link
+existing episode pattern
+existing link
+existing-
+existing-image
+existing.mkv
+expected_count
+expected_crc32
+expected_decoded_segment_size
+expected_files
+expected_md5
+expected_samples
+expected_segment_size
+explicit GMT
+explicit UTC
+explicit larger total must not be inferred down
+explicit zero total remains invalid
+exponent string
+expression index
+extensionless opaque singleton 
+extent_status
+external entity
+external_owner
+extra MIA attribute
+extra column
+extra encoded title
+extra heading element
+extra heading text
+extra quoted title
+extra semantic component before wrapper
+extra trailing record
+extra trigger
+extra unique
+extra_framing_incomplete
+extras.txt
+eztv.xml
+f22.air.dominance.fighter-gobble
+facade_application
+failed fixture
+failed-guid
+failed-head
+failed_count
+fallback_
+fallback_control
+fastest_algorithm
+fedcba34.blob
+fedcba34.mkv
+feed.reason
+ffi.enable
+ffi.preload
+ffi_mode
+ffi_preload
+ffmpeg and ffprobe are not installed.
+ffmpeg could not create 
+field_occurrences_truncated
+fifteen character group
+fifteen literals attach
+fifty characters
+fifty one characters
+file count literal
+file insert
+file matched source: 
+file matched source: srrdb
+file.Name-GROUP
+file.mkv
+file.name-group
+file.nzb
+file.rar
+fileCheck: Complete literal basename
+file_block_count
+file_count
+file_crc32
+file_extra_records
+file_header
+file_index
+file_key
+file_length
+file_list
+file_name
+file_offset_known
+file_size
+filelist-badge
+filename_bytes_hex
+filename_bytes_hex_truncated
+filename_display_truncated
+filename_encoding
+filename_full_byte_length
+filename_latin1_printable
+filename_sha256
+filename_utf8_text
+filename_utf8_valid
+files conflicting titles
+files duplicate IDs
+files numbered
+files unnumbered
+files_asc
+files_desc
+files_expected
+files_found
+files_sha256
+fileslic_file_id
+fileslic_input_slice_index
+fileslic_physical_slice_field
+fileslic_relationship
+fileslic_truncated_input_slice_index
+filetime_calendar_api_input_range_supported
+filetime_epoch_relationship_status
+filetime_unix_seconds_floor
+filetime_unix_subsecond_nanoseconds
+filter_only
+filtered after expiry selection
+filtered: 1
+final_manifests
+final_xml_gzip
+fingerprint_test
+first page canonical link
+first scan
+first scan complete rar
+first scan partial rar
+first-id
+first-uid
+first.mkv
+first.nfo
+first.par2
+first.rar
+first@example.net
+first_article_segments
+first_block
+first_block_flags
+first_block_header_available
+first_block_header_checksum_valid
+first_block_header_size
+first_block_type
+first_difference
+first_file
+first_packet_offset
+first_record
+first_record_postdate
+first_utc
+five digits
+fix_names
+fix_timer
+fixnames-test
+fixnames_claims
+fixture assertion
+fixture delete failure
+fixture insert failed
+fixture invalid candidate
+fixture other assertion
+fixture payload 
+fixture unread second archive
+fixture-guid
+fixture-subject
+fixture.example
+fixture.example.invalid
+fixture.mkv
+fixture_
+flac archive wrapper
+folder/Synthetic.Alias-GRP.mkv
+folder_part_rar
+following_footer
+font pack release
+footer_index_and_header_declarations_match
+for update
+forced after commit failure
+forced finalization failure
+forced insert failure
+forced legacy update failure
+forced timing logger failure
+forced-finalization-rollback
+foreign beyond signed range
+foreign established link after confirmation
+foreign filenames do not conflict with literal title
+foreign integers
+foreign key cascade
+foreign leading zeros
+foreign link
+foreign mixed
+foreign signed maximum
+foreign strings
+foreign unsigned maximum
+foreign_key_constraints
+forged result legacy identity cannot publish
+form feed
+format control
+format_status
+four-byte
+four-digit lower boundary
+four-digit upper boundary
+fourth.nfo
+foxit software with pdf name
+fractional float
+frame totals disagree
+frame_count
+frame_index
+frames_truncated
+framework/testing/lock-
+framework/testing/scheduler-recovery-
+framework/testing/verify-
+free_bytes
+french_accents
+fresh-defect
+fresh.file.17
+from "predb_identity_state"
+from "release_verification_locks"
+from "releases"
+from main.predb_identity_keys k
+from release_subtitles rs
+frozen-sample-
+full first batch
+full latest page still has no history paging
+full name photos
+full rollback
+full site name
+full window
+full_crc32
+full_header_name_missing
+full_sha256
+fulltext attach
+fullwidth vertical line
+fullwidth_digits
+fullwidth_line
+future dated row
+future undated import
+fuzzy_only
+g4u.html
+gabba dates include a timezone
+gabber.html
+gamesinfo_id
+gap in numbered parts despite complete byte ranges
+general_purpose_flags
+generated field
+generation one
+generation two
+generation,kind,key_digest,predb_id
+generic index failure
+generic installer
+generic preview
+genuine rename
+german_umlaut
+gibberish_no_signal
+gibberish_no_word_structure
+gibberish_random_digits
+gibberish_random_transitions
+gibberish_zero_vowels
+git_head
+git_status
+gload.to
+global failed inserts
+global invalid
+global zero
+greek_ep_alias
+greek_letters
+greek_sigma
+group difference
+group failed inserts
+group invalid
+group name
+group zero
+group-unavailable
+group_conflict
+group_name
+group_name_anime
+group_name_book
+group_only_low_signal
+groups_id
+guard_name
+guarded unconfirmed write
+guid byte case
+guid-1_thumb
+guid-1_thumb.webp
+guid-with-category
+guid-without-category
+guid_norm_
+gzip decoded
+gzip, gzip
+h264 audio and bitdepth
+h265 audio and bitdepth
+has_media_info
+has_reported
+hashCheck: 16K Hash
+hashCheck: PAR2
+hash_16K
+hash_base64_like
+hash_hex
+hash_md5
+hash_sha1
+hash_sha256
+hash_uuid
+hashed junk from the logs
+hashed payload
+hashed suffix
+haspreview INTEGER DEFAULT -1
+hd-world.cc
+hdencode TV keeps listing metadata separate
+hdencode display sizes are not metadata
+hdencode.org
+hdencode.xml
+hdencode_tv
+hdencode_tv.xml
+head-only@example.net
+head_date_identity_coverage_by_server
+head_flags
+head_matches_overview
+head_matches_single_overview_value
+head_message_id
+head_response
+head_response_code
+head_response_matches_body_response
+head_response_matches_head_field
+head_response_matches_request
+head_response_not_successful
+head_response_text
+head_set_id
+head_size
+head_size_r
+head_type
+header-budget
+header-case-differs
+header-mismatch
+header_bytes
+header_check_pending
+header_checksum_unconfirmed
+header_complete
+header_crc16_valid
+header_crc32_valid
+header_fields
+header_locked
+header_numeric_fields_valid
+header_profile
+header_range_within_sample
+header_rejected
+header_start_offset
+header_status
+header_type
+header_type_name
+header_valid
+held-by-a-worker
+held-metadata
+hello channel
+helper trigger
+hevc quality
+hex BMP noncharacter FFFE
+hex BMP noncharacter FFFF
+hex NUL reference
+hex control reference
+hex foreground
+hex foreground and background
+hex foreground consumes exactly six digits
+hex incomplete parameter preserves suffix
+hex obfuscation
+hex reset
+hex_group
+high_transition
+historical simple episode keeps legacy compatibility
+historical x02 continuation is not a singleton
+historical x264 episode keeps legacy compatibility
+historical x265 episode keeps legacy compatibility
+homefront md5
+homefront mkv
+homefront nfo
+homefront sha1
+hot collection
+http://primary.test/internal/release-verification/publish
+http://primary.test/internal/release-verification/publish-batch
+http://pushgateway.test:9091
+http://www.newzbin.com/DTD/2003/nzb
+http_status
+https://1gabba.pw/rss.xml
+https://1techno.org/rss.xml
+https://3dsdb.com/xml.php
+https://api.knaben.org/v2/browse
+https://api.knaben.org/v2/browse?*
+https://api.predb.net/
+https://api.srrdb.com/v1/search/order:date-desc
+https://api.srrdb.com/v1/search/order:date-desc/
+https://api.srrdb.com/v1/search/order:date-desc/skip:90
+https://api.xrel.to/v2/p2p/releases.json
+https://api.xrel.to/v2/release/latest.json
+https://apibay.org/precompiled/data_top100_recent.json
+https://catalogue.example/rss.xml
+https://crowdnfo.net/
+https://dats.site/exports/dat-sets/267
+https://example.org/data.sql
+https://eztvx.to/ezrss.xml
+https://fixture.example/feed/
+https://g4u.to/
+https://gabber.od.ua/0day
+https://gload.to/feed/
+https://hd-world.cc/feed/
+https://hdencode.org/tag/movies/feed/
+https://hdencode.org/tag/tv-shows/feed/
+https://images.example.test/cover.png
+https://indexer.invalid
+https://movieblog.to/feed/
+https://nfodb.net.ru/rss.xml
+https://nima4k.org/
+https://nswdb.com/xml.php
+https://other.example/topic/53257-
+https://predataba.se/api/search
+https://predb.club/api/v1/
+https://predb.club/api/v1/*
+https://predb.org/api/search
+https://predb.ovh/api/v1/
+https://raw.githubusercontent.com/nZEDb/nZEDbPre_Dumps/ae51410b04bb3c59749b68582fbc4cc1e1f02d68/dumps/1689156393/1714642832_predb_dump.csv.gz
+https://scnlog.me/feed/
+https://seriousaboutsound.net/topic/53257-
+https://synthetic.invalid/api/v1/
+https://www.ddlvalley.me/feed/
+https://www.mp3scene.info/feeds/releases/
+https://www.scnsrc.me/feed
+hyphen before resolution
+hyphen codec boundary
+hyphen part suffix
+hyphen proof suffix
+hyphen sample suffix
+hyphen thumbs suffix
+hyphen volume suffix
+hyphen_part01
+hyphenated site name
+id as releases_id
+idempotent index
+identity differs
+identity wire
+identity, gzip
+identity-ordinary
+identity-uncommon-boundary
+identity-uncommon-conflicts
+identity_changed
+identity_fixture
+identity_hints
+identity_mismatch
+identity_parser_unavailable
+identity_unconfirmed
+identity_verified
+idk_rza-everyone_knows_ 21ccf990
+ifsc_relationships_valid
+ignored.alias
+ignored.mkv
+image.default
+image.max_source_bytes
+image.max_source_pixels
+image.output_format
+image.output_quality
+image_origin_known
+import-preparation
+import:advisory-fixture
+import:current-upload
+import:uncommitted-upload
+import_name_override
+imported_at
+inactive id
+including reconstructed file
+incoming@example.test
+incoming_document
+incoming_xml_fingerprint
+incomplete 7z episode
+incomplete 7z movie
+incomplete single-episode compressed 7z
+incomplete single-episode rar
+incomplete: history paging is disabled for this source
+incomplete_mandatory_fields
+independent first
+index unavailable
+index-only manifest with unknown declared count
+index-out-of-range
+index_generation
+info | Name-GRP - 14 F & 67 MB
+info | QuoVadisX.v1.0.85.MultiLanguage.WinALL.Incl.Keygen-BLiZZARD - 14 F & 67 MB
+info | Synthetic.Release-GRP - 2 F & 1.2 MB
+info | Synthetic.Release-GRP - 2 F & 1.2.3 MB
+info-only preview
+info-only update
+info.nfo
+ingestion_configurations
+inherited-capacity
+injection-date
+injection_date
+injection_date_to_expires
+injection_date_to_legacy_nntp_posting_date
+inline editorial markup
+input_capture
+input_file_slice_checksums
+input_raw
+input_sha256
+input_slice_index
+input_slice_index_integer_range_valid
+input_type
+insert into "predb" 
+insert into "releases"
+insert or ignore into "release_files"
+inspected singleton
+inspected_block_count
+insufficient_evidence
+intact quoted subject
+integer_range_valid
+integral float
+integrity_checks_ambiguous
+integrity_status
+intended link without canonical name
+interleaved_admission
+internal prefix
+internal spaced en-dash
+interpretation_status
+interrupted-worker
+invalid JSON
+invalid UTF-8
+invalid UTF-8 title
+invalid UTF8
+invalid chunk 
+invalid event pre 
+invalid gzip
+invalid hash
+invalid id
+invalid identifier
+invalid identity
+invalid match
+invalid optional filename
+invalid reference
+invalid row 
+invalid total relation
+invalid utf8
+invalid-hash.mkv
+invalid-request
+invalid.png
+invalid_calendar_or_time
+invalid_guids
+invalid_mandatory_field_order
+invalid_octet_or_folding
+invalid_optional_field
+invalid_packet_count
+invalid_pairs
+invalid_request_identity
+invalid_segment_metadata_count
+invalid_segment_record_count
+invalid_utf8_byte
+ipsDataItem_title ipsContained_container
+irc.newer
+irc.opentrackers.org
+is_directory
+iscategorized INTEGER DEFAULT 0
+iso-copies-different
+iso-copies-equal
+iso-copies-uncommon-limit
+iso-copies-uncommon-partial
+iso9660_primary_volume_descriptor
+iso_8859_1
+iso_path_table_copies
+iso_primary_copies
+iso_primary_volume_descriptor_copies
+isolated invalid byte
+isolated-validation
+isolation_level
+isrenamed INTEGER DEFAULT 0
+ix_collection_collectionhash
+ix_collection_filecheck
+ix_collections_filecheck_filesize_groups
+ix_collections_group_filecheck_id
+ix_par_hashes_hash_releases_id
+ix_predb_searched_imported_at
+ix_predb_searched_predate_id
+ix_release_files_crc32_releases_id
+ix_releases_add_pp_claim_queue
+ix_releases_fromname
+ix_releases_nzb_creation_global_queue
+ix_releases_nzb_creation_group_queue
+i̇.Exact.Release
+i̇.Exact.Release.2026-GRP
+i̇.Exact.Release.2026-GRP.mkv
+i̇.Title-GRP
+join "audio_data"
+join "release_files"
+join "release_subtitles"
+join "releases"
+js/alpine/components/admin/features.js
+js/alpine/components/admin/verify-user.js
+js/alpine/components/release-report.js
+js/alpine/lazy-loader.js
+kanji_underscores
+kazata.kara.s1e2
+kelvin_sign
+kept.nzb
+key_derivation
+key_digest
+keys_present
+knaben-movies.json
+knaben.org
+known archive beside unknown file
+known technical wrapper rename
+known-exit
+known.mkv
+large population
+large-16384
+large.jpg
+larger than threshold
+last@example.net
+last_error
+last_record
+last_record_postdate
+last_seen_at
+last_unique_at
+last_updated
+last_utc
+late canonical link on page eight
+late competitor
+late file preserves wake-up
+late partial headers
+late-second@article
+late_article_candidate_id
+later archive cannot be downloaded
+later archive has no readable listing
+later compatible fingerprint different
+later compatible fingerprint missing
+later compatible name different
+later compatible name missing
+later compatible size different
+later compatible size missing
+later consumer
+later exact match beyond first candidate page is reused
+later volumes of the same file
+later-arrival
+later-guid
+latest_report_description
+latin1_accent_byte
+layout_status
+leading path traversal punctuation
+leading whitespace
+leap_second
+lease lost during duplicate scan cannot publish
+lease was lost
+lease_token
+lease_until
+ledger_adjust
+left angle bracket
+left join "video_data" as "vd"
+leftguid TEXT
+leftguid must be the first character of guid.
+leftguid_mismatches
+legacy ID API
+legacy constructor
+legacy direct check
+legacy end marker
+legacy first scan beside unread opaque archive
+legacy first scan complete source
+legacy manifest
+legacy outer transaction
+legacy reset failed
+legacy standalone
+legacy unpublished without NZB publishes assertions
+legacy update rollback removes new NZB
+legacy_changed
+legacy_foreign_default
+legacy_forged
+legacy_missing
+legacy_nntp_posting_date
+legacy_nntp_posting_date_to_expires
+legacy_omitted
+legacy_release_id
+legacy_second_containers
+legacy_update
+leon.1994.1080p.bluray.x264-group
+lhs_order_relative_to_rhs
+lhs_parse_status
+libnzbyenc.dylib
+libnzbyenc.so
+limit 100
+limit 128
+limit exceeded only after merging two descriptions
+line feed
+link replacement during discovery
+linked literal mismatch
+literal ampersand
+literal delimiter
+literal double pipe
+literal evidence removed
+literal first
+literal hexadecimal title
+literal numeric title
+literal punctuation
+literal single pipe
+literal subject changed after confirmation
+literal title
+literal underscores
+literal wildcard characters
+live tombstone
+local_header
+locked read
+locked-backfill-
+locked.jpg
+locked_to_misc
+logical_block_size
+logical_file_offset
+logical_file_offset_integer_range_valid
+long equality
+long long
+longer word
+lost additional claim
+lower bound
+lower_case_table_names
+lowercase full site
+lowercase of movie
+ls-files
+machdep.cpu.brand_string
+magazine issue date
+magazine issue with year
+main trigger uppercase source target
+main.sqlite_schema
+main_archive_flags
+main_definition_conflict
+main_file_id_limit
+main_file_id_limit_observations
+main_file_id_limit_reached
+main_flags
+main_header_available
+main_header_checksum_valid
+main_header_flags
+main_header_size
+main_header_type
+main_packet
+main_partial
+major_version
+malformed NULL token
+malformed UTF-8
+malformed UTF8
+malformed UTF8 first
+malformed UTF8 last
+malformed decimal
+malformed filename
+malformed filename first
+malformed filename last
+malformed first
+malformed last
+malformed prefile wrapper
+malformed wrapper
+malformed-response
+malformed_article_number
+malformed_header_whitespace
+malformed_or_unsupported_absolute_date
+malformed_response_spacing
+malformed_row
+malformed_server_name
+malformed_terminator_reserved_bytes
+malformed_terminator_version
+malformed_trailing_comment
+malformed_whitespace_or_octet
+manifest_bytes
+manifest_hash
+manifest_path
+manifest_read
+manifest_sha256
+manticore duplicate IDs
+manticore invalid ID
+manticore malformed response
+manticore timed out
+manticore transport
+many-old-versions
+mapping_status
+matches_reference
+matches_request
+matching_reference_count
+max-pages
+max_age_days
+max_bytes
+max_execution_time
+max_items
+max_releases_created
+max_size_to_form_release
+maximum_article_bytes
+maximum_articles
+maximum_compression
+maximum_header_bytes
+maximum_nonempty_bucket
+mcn magazine pattern
+md5_first_16k
+meaningful brackets
+meaningful suffix
+media extension
+media_audio_language
+media_infos
+media_movie_name
+media_video_height
+media_video_width
+mediainfo-badge
+median_ms
+memory_reset_peak_usage
+merged 7z
+merged distinct archive files
+message-id
+message_id
+metadata and nuke
+metadata duplicate with corrupt compressed NZB
+metadata duplicate with different articles
+metadata duplicate with missing NZB
+metadata extension
+metadata insert
+metadata suffix
+metadata_conflict
+metadata_expired
+metadata_resolve
+metadata_review
+metadata_size
+method not allowed
+mid-audit-arrival
+migration_data
+migrations/2026_08_04_082439_add_fix_release_name_query_indexes.php
+migrations/2026_08_13_001652_normalize_and_optimize_releases_table.php
+migrations/2026_08_14_121946_optimize_releases_claim_tokens_and_pp_index.php
+migrations/2026_10_10_000000_add_imported_at_to_predb_table.php
+migrations/2026_10_11_154028_create_release_verification_candidates_table.php
+migrations/2026_10_11_175742_create_release_verification_audit_retries_table.php
+migrations/2026_10_11_181548_add_collections_group_release_window_index.php
+migrations/2026_10_11_205937_add_manifest_path_index_to_release_verification_candidates_table.php
+migrations/2026_10_11_215821_create_par2_rename_progress_table.php
+migrations/2026_10_12_004819_create_release_verification_scratch_table.php
+migrations/2026_10_12_010315_create_par_file_hash_evidence_tables.php
+migrations/2026_10_12_053000_add_shared_verification_scratch_budget.php
+migrations/2026_10_12_120000_create_release_fingerprint_metadata_table.php
+migrations/2026_10_12_220000_create_par_file_hash_inventories_table.php
+migrations/2026_10_15_034000_create_nfo_cleanup_commits_table.php
+migrations/2026_10_15_150000_create_predb_identity_projection.php
+migrations/2026_10_16_010000_create_release_archive_naming_evidence_table.php
+migrations/2026_10_17_000000_create_release_verification_manifests_table.php
+migrations/2026_10_17_120000_create_release_verification_locks_table.php
+migrations/2026_10_17_180000_add_release_verification_publication_stripes.php
+migrations/2026_10_17_200000_add_host_to_release_verification_scratch.php
+migrations/2026_10_17_210000_create_release_verification_pauses_table.php
+migrations/2026_10_17_220000_add_header_check_pending_to_release_verification_candidates.php
+migrations/2026_10_17_230000_add_upgrades_release_id_to_release_verification_candidates.php
+migrations/2026_10_18_000000_add_run_token_to_release_fingerprint_metadata.php
+min_date
+min_files_to_form_release
+min_size_to_form_release
+minimal schema without source
+minimum title length
+minimum_stream_size_lower_bound_fits
+minor_version
+mismatched quotes
+missing GUID
+missing ID
+missing ROM name
+missing acknowledgement
+missing article
+missing author scope
+missing both
+missing byte range despite consecutive part numbers
+missing certificate generation
+missing chunk generation
+missing column
+missing completion framing
+missing description leaves the denominator unknown
+missing event pre
+missing every terminal flag
+missing field
+missing final terminator
+missing group
+missing heading
+missing hits
+missing in Manticore index: 2
+missing in Manticore index: 3
+missing legacy row cannot recreate duplicates
+missing metadata
+missing observed separator space
+missing optional proc flag
+missing parent
+missing recent scope
+missing release group suffix
+missing revision
+missing row
+missing row identity
+missing subject
+missing table
+missing third part remains incomplete without parity
+missing total
+missing trigger
+missing-crc32
+missing-header-id
+missing-parity@article
+missing@example.test
+missing_article_locator
+missing_locations
+missing_message_id
+missing_message_id_column
+missing_middle
+missing_or_ambiguous_title
+missing_or_budget_exceeded
+missing_response_text
+mixed MIA and file records
+mixed XML whitespace
+mixed case attribute
+mixed case full site UHD
+mixed case oF movie
+mixed show
+mixed show pack 7z
+mixed shows 7z
+mixed-content ID cannot be truncated to its direct text
+mlb reds rays
+mode_bytes
+mode_raw
+model_dispatcher
+model_resolver
+monitoring.enabled
+monitoring.pushgateway.url
+monitoring:export-metrics
+more explicitly remains
+more_volumes
+movie can acquire canonical identity
+movie miss rar
+movie rar
+movie remux release
+movie with dotted audio and codec
+movie zip
+movie-data
+movie.bin
+movie.mkv
+movie.nfo
+movie_1080p
+movie_4k_uhd
+movie_bluray
+movie_name
+movie_web
+movie_xvid
+movieblog.to
+movieblog.to returned an invalid RSS document.
+movieblog.xml
+movieinfo_id
+movies.partials.release-item
+mp3 parity wrapper
+mp3scene historical release days are not PRE times
+mp3scene.info
+mp3scene.xml
+msi package
+msix bundle
+mtime_comparison_status
+multi_archive
+multi_episode
+multibyte title at column limit
+multibyte title beyond byte truncation
+multipart complete bytes without part suffix
+multipart_pcrc32_status
+multipart_structure_status
+multiple MIA ROMs
+multiple heading links
+multiple members
+multiple_rows
+multiprocessing:fixrelnames predbft
+multiscript_kanji
+music-like release
+musicinfo_id
+must be retained
+must-not-be-indexed
+mutable caller ID
+mysql_search_fallback
+mysql_unicode_ci
+name byte case
+name overflow
+name_asc
+name_desc
+name_hex
+name_interpretation
+name_invalid
+named E01 and opaque same E01 
+named E01 then opaque E02 
+naming_regex_id
+native-metric-snapshot
+native_library
+native_parser_unavailable_or_input_over_budget
+nba abc feed
+nba playoffs wolves nuggets
+negation and OR operators
+negative bytes
+negative integer
+negative records
+negative string
+negative total
+nested ROM element
+nested Unicode case
+nested accent alias
+nested annotation
+nested decomposed alias
+nested duplicate ignored member
+nested field must remain
+nested heading markup
+nested rollback
+nested-import
+never-committed
+new attachment
+new checkpoint exact live free reserve charged only once
+new claim owner
+new dated row despite old import
+new filename
+new first checkpoint and retained tail exceeds by one byte
+new first checkpoint and retained tail fits exact projection
+new link during discovery
+new mapping
+new outer transaction
+new standalone
+new subject
+new undated import
+new-guid
+new-owner
+new-source
+new.name
+new@example.test
+newer source
+news.alternate.invalid
+news.alternate.invalid||plain
+news.example.net
+news.example.test
+news.example.test alt.test:42 alt.binaries.test:0043
+news.primary.invalid
+next worker
+next_attempt_at
+next_block_type
+next_crc32
+next_head_crc
+next_head_offset
+next_head_size
+next_header_checksum_valid
+next_header_crc32
+next_header_file_end_exclusive
+next_header_file_start
+next_header_kind
+next_header_observed_type
+next_header_offset
+next_header_size
+next_item_offset
+next_offset
+next_page_id
+next_size
+next_type
+nfo-badge
+nfoCheck: Title Match
+nfo_cleanup_commits
+nfodb.net.ru
+nfodb.xml
+nfostatus INTEGER DEFAULT -1
+nima4k.html
+nima4k.org
+nntmux-full-par2-
+nntmux-mapped-nzb-
+nntmux-missing-par2-executable
+nntmux-predb-test-
+nntmux-ready-cancellation-
+nntmux-ready-completion-
+nntmux-rolling-
+nntmux-rust-
+nntmux-rust-article-dates
+nntmux-rust-article-identity
+nntmux-rust-ffi
+nntmux-rust-nntp-headers
+nntmux-verify-db
+nntmux.archive_retry_delay
+nntmux.cbp.release_rolling_interval
+nntmux.concurrency_timeout
+nntmux.echocli
+nntmux.fingerprint_format
+nntmux.fingerprint_worker
+nntmux.items_per_page
+nntmux.max_pager_results
+nntmux.mysql_search_fallback
+nntmux.nzb_storage
+nntmux.release_dedupe_enabled
+nntmux.release_dedupe_lock_store
+nntmux.release_dedupe_size_tolerance
+nntmux.releases_optimize.chunk_size
+nntmux.releases_optimize.skip_preflight
+nntmux.stream_fork_output
+nntmux:reset-truncate
+nntmux:search-reconcile
+nntmux_archive_lock_test_
+nntmux_nntp
+nntmux_nntp.alternate_server
+nntmux_nntp.alternate_server_port
+nntmux_nntp.alternate_server_ssl
+nntmux_nntp.fingerprint_provider_breaker_seconds
+nntmux_nntp.server
+nntmux_release_verification_backlog_age_measurement_available 0
+nntmux_release_verification_backlog_age_measurement_available 1
+nntmux_release_verification_backlog_age_seconds 
+nntmux_release_verification_backlog_age_seconds 0
+nntmux_release_verification_backlog_age_seconds 40
+nntmux_release_verification_backlog_age_seconds 7200
+nntmux_release_verification_candidates_measurement_available 0
+nntmux_release_verification_pending_bytes 
+nntmux_release_verification_scratch_bytes 
+nntmux_release_verification_scratch_bytes 1234
+nntmux_release_verification_scratch_bytes_measurement_age_seconds 
+nntmux_release_verification_scratch_bytes_measurement_age_seconds 600
+nntmux_release_verification_scratch_bytes_measurement_available 0
+nntmux_release_verification_scratch_bytes_measurement_available 1
+nntmux_release_verification_verified_bytes_per_second 5678
+nntmux_render_release_names
+nntmux_settings.path_to_nzbs
+nntp-posting-date
+nntp_body_metadata
+no linked hit
+no nomination
+no releases to process
+no such group
+no usable articles
+no video hints
+no-file-key
+no-match completion
+no-summary-
+no_false_skipped_result
+no_hash_extra_crc32_selection_if_declared
+no_match
+no_primary_descriptor_observed
+no_release
+non ASCII group
+non-numeric detail
+non-numeric volume
+non_crlf_line_endings
+non_movie_category
+nonarray match
+nonbreaking boundary separator is not PHP trim
+nonbreaking space
+noncanonical link
+noncanonical_title
+nondecimal_part
+nonexact accent
+noninteger ID
+nonliteral_title
+nonprinting Unicode is not a spelling alias
+nonprinting name
+nonrecoverable description does not consume source constants
+nonstring name
+nonstring title
+normal singleton control
+not a numeric counter
+not a row
+not an image
+not an object
+not decimal
+not decoded
+not dotted
+not found
+not gzip
+not hexadecimal
+not terminal
+not-a-date
+not-a-guid
+not-a-number
+not-a-real-stratum
+not-an-id
+not-numeric
+not-the-lease
+not_advertised
+not_applicable_unix_seconds
+not_attempted
+not_declared
+not_evaluated_between_cache_records
+not_inspected
+not_performed
+notes.txt
+nswdb.com
+nswdb.xml
+ntfs_filesystem
+nuke_rls
+nuked_from
+nuked_status
+nukereason_from
+null category
+null files
+null flag
+null name becomes empty
+null searchname
+null size
+null source
+null subject
+num_files
+numbered_r00
+numbered_r105
+numbered_r99
+numeric difference
+numeric episode title
+numeric filename
+numeric overflow
+numeric title
+numeric-fixture-release-42
+numeric_ascii_stem
+numeric_image
+nzb-import-article:abc
+nzb_creation_attempts
+nzb_creation_claim_token
+nzb_creation_claimed_at
+nzb_creation_failure_rows
+nzb_creation_last_error
+nzb_file_count
+nzb_file_timestamp_span
+nzb_multi_operations_cart
+nzb_multi_operations_cart release-bulk-actions__button release-bulk-actions__basket
+nzb_multi_operations_delete release-bulk-actions__button release-bulk-actions__delete
+nzb_multi_operations_download
+nzb_multi_operations_download release-bulk-actions__button release-bulk-actions__download
+nzb_multi_operations_form
+nzb_password
+nzb_password_rows
+nzb_receipt
+nzedb-2024-05-02-subset.csv
+nzedb-pre-dumps
+nzedb_archive
+oF.Mice.and.Men.1939.1080p.BluRay.x264
+oNlY-FaNs.Creator.Title.2160p
+obfuscated_mixed_alphanumeric
+obfuscated_pattern
+obfuscated_uppercase
+obfuscated_usenet_filename
+object category
+object hits
+observation_timeout_seconds
+observations_omitted
+observed backslash path
+observed_additional_pp_claim
+observed_article_date_span_by_server
+observed_copies_agree
+observed_copies_differ
+observed_crc32
+observed_crc32_matches_selected_declaration
+observed_decoded_crc32
+observed_descriptor_count
+observed_file_id_count
+observed_frame_end_offset
+observed_hex
+observed_injection_date_span_by_server
+observed_legacy_nntp_posting_date_span_by_server
+observed_little_endian_value
+observed_nonempty_minute_bucket_rates_bytes_per_second
+observed_original_positions_strictly_increasing
+observed_supported_header
+observed_unverified
+occurrence_count
+occurrence_count_basis
+of.Mice.and.Men.1939.1080p.BluRay.x264
+offline source
+offline-%04d.bin
+offset_basis
+old bytes
+old dated row
+old dated row with new import
+old downloaded bytes
+old dropped-letter output
+old outage
+old status
+old undated import
+old-after-slow-query
+old-source
+old-tail
+old-three
+old.name
+older expired attempt
+omitted result legacy identity cannot publish
+one batch
+one character group
+one digit
+one episode repeated
+one episode with two encode variants
+one group
+one literal row
+one title
+one valid row
+one visible exact remains partial
+one-a@example.net
+one-b@example.net
+one-c@example.net
+one@example.net
+one_gabba
+one_gabba.xml
+one_or_more_malformed_locations
+one_techno
+one_techno.xml
+only a compressed 7z header
+only a dot
+only percent
+only punctuation
+onlyfans.Creator.Title.1080p
+opaque E02 then named E01 
+opaque episode rar
+opaque filename mapped to an episode keeps same-cycle naming
+opaque main with ancillary and sample files 
+opaque singleton 
+opaque0987654321.mkv
+opaque1234567890.mkv
+opcache.enable
+opcache.enable_cli
+opcache.preload
+opcache_cli
+opcache_enabled
+opentrackers-relay
+operating_system_name
+operation committed
+optional_byte
+optional_packet_summaries
+optional_sample_offset
+order by
+order by "filesize" asc
+order by "r"."id" asc limit 5000
+ordered_names
+ordinary batch
+ordinary dotted scene title
+ordinary movie with an unresolved video sibling
+ordinary release name is unchanged
+ordinary source
+ordinary text
+original reason
+original subject
+original-candidate
+original-claim
+original-file
+original-guid
+original-publisher
+original.rar
+original_data_sha256
+original_end_offset
+original_filename_bytes_length
+original_filename_bytes_sha256
+original_precedes_sample
+original_range_unavailable
+original_start_offset
+original_subject
+orphan gzip
+other rar
+other-data
+other-file.mkv
+other-identity
+other-reference
+other-token
+other.bin
+other.mkv
+out of range reference
+outer commit
+outer result
+outer rollback
+outer spaces cannot repair internal words
+outer transaction computes covered subset in the locked section
+outer transaction computes the exact duplicate in the locked section
+outer transaction skipped it
+outer transaction still refuses a nonmatching duplicate
+outer-missing
+outer-one
+outer-published
+outer-rollback
+outer-two
+over column limit
+overflow decimal reference
+overflow string
+overflowing bytes
+overlap_bytes
+overlength title
+overlength_title
+overlong literal title
+overlong sequence
+overlong unicode
+overlong_utf8
+oversized name
+oversized source
+oversized table SQL
+oversized-replay
+overview_article_number
+overview_attempted
+overview_format
+overview_format_invalid
+overview_format_response_code
+overview_message_id
+overview_response_code
+overview_row
+overview_row_count
+overview_rows
+p2p | #1 | SITE | Synthetic.Release-GRP, WIN!
+p2p | #1 | SITE | Synthetic.Release-GRP,, WIN!
+p2p | #1 | SP | The.Kardashians.S08E01.Slap.the.S.Outta.Her.2160p.DSNP.WEB-DL.DDP5.1.DV.HDR10Plus.H.265-Kitsune, WIN!
+p2p | #2 | BTN | Name-GRP, 2nd!
+p2p | #3 | IPT | IMPACT.x.Nightline.S05E02.The.Cornell.Seven.1080p.DSNP.WEB-DL.AAC2.0.H.264-RAWR, HDT won 2h 38m 1s ago
+p99_approx_95pct_rank_interval_ms
+p99_sample_count_sufficient
+p99_speedup
+pack without video hint
+packed by café
+packed_size
+packet_bytes
+packet_count
+packet_limit_reached
+packet_offset
+packet_summaries
+packet_type
+packet_type_counts
+paged_exact
+paired NFO
+paired_samples
+par-128@example.net
+par-a@example.net
+par-b@example.net
+par2-preflight-
+par2-ranges
+par2-ranges-checksum
+par2_binary
+par2_carrier_file_count
+par2_filename
+par2_first_16k_md5_candidate
+par2_hash_retry
+par2_ifsc_slice_to_sampled_source_bytes
+par2_rename_candidate_progress
+par2_rename_progress
+par2_to_rar_advertised_percent
+par2_vol_large
+par2_vol_minus
+par2_vol_plus
+par2j v1.3.3
+par_file_hashes
+par_hashes
+parent_category
+parse_status
+parser_engine
+parser_input_offset_zero
+part exceeds total
+part_fields
+part_number_matches
+part_rar_par2
+part_retention_hours
+partial 7z
+partial final insert
+partial first batch
+partial index
+partial next header
+partial next header episode
+partial next header movie
+partial rar
+partial response
+partial sixteenth batch
+partial write
+partial zip
+partially_covered
+password_confirmation
+passwordstatus INTEGER DEFAULT 0
+path name
+payload boundary
+payload extension
+payload.rar
+payload_bytes
+pc_game_iso
+pcntl_fork
+pcntl_signal
+pcntl_waitpid
+pcre.jit
+pending.mkv
+pending_bytes
+pending_source_metadata
+permanently destroyed
+persisted wrong declared total from earlier verifier
+persisted wrong part from earlier verifier
+phases_ns
+php /tmp/runtime.php worker 
+php /tmp/scheduled-worker.php
+php-fallback
+php_batch
+php_memory_before_bytes
+php_peak_bytes
+php_peak_increment_bytes
+php_system_cpu_us
+php_user_cpu_us
+physical_payload_bytes
+physical_regions
+pipe only stem
+pipeline_window
+plain RAR
+plain ZIP
+plain_header
+plural collections
+plural images
+plural imagesets
+plural packs
+plural photos
+plural photos with video hint
+plural photosets
+policy rejection
+policy verdict
+policy_check
+policy_filter
+policy_fingerprint
+positive sign
+posix_kill
+postdate_ts
+posted by someone - the title of the thing.rar
+posted-subject
+posted_asc
+posted_desc
+poster-a@example.com
+poster@example.com
+poster@example.test
+pp_timeout_count
+pragma_index_list
+pragma_index_xinfo
+pre | TV | Synthetic.Release-GRP
+pre | TV | Synthetic.Release-GRP,
+pre | TV-HD-CZ | MASH.S02E12.1973.DUBBED.CZECH.1080p.WEB.x264-OMG
+pre-lock step ran
+pre-reset
+preDB: Match
+pre_lock_ns
+pre_lock_phases_ns
+predataba.se
+predb-fulltext-test:
+predb-policy-child-
+predb-policy-definition-
+predb-test-database
+predb.club
+predb.club/*
+predb.club:8443
+predb.me
+predb.me/*
+predb.net
+predb.org
+predb.ovh
+predb.ovh/*
+predb.title
+predb:check 3
+predb:import-feed
+predb_club
+predb_club.json
+predb_feeds.enabled
+predb_feeds.endpoints.
+predb_feeds.endpoints.dats_pciso_1998
+predb_feeds.endpoints.nfodb
+predb_feeds.endpoints.nima4k
+predb_feeds.endpoints.nzedb_archive
+predb_feeds.endpoints.predb_club
+predb_feeds.endpoints.predb_me
+predb_feeds.endpoints.predb_net
+predb_feeds.endpoints.predb_ovh
+predb_feeds.manual_only_sources
+predb_feeds.max_body_bytes
+predb_feeds.page_size
+predb_feeds.rate_limit_max_wait_seconds
+predb_feeds.rate_limit_retries
+predb_feeds.rate_limit_wait_seconds
+predb_feeds.request_delay_ms
+predb_feeds.scene_archive_sql_file
+predb_feeds.single_page_sources
+predb_feeds.sources
+predb_feeds.user_agent
+predb_id
+predb_identity_
+predb_identity_insert
+predb_identity_key_owner
+predb_identity_keys
+predb_identity_projection_state
+predb_identity_revisions
+predb_identity_state
+predb_me
+predb_me.xml
+predb_net
+predb_net.json
+predb_org
+predb_org.json
+predb_ovh
+predb_ovh.json
+predb_rt
+prefixed_foreign
+prefixed_second_containers
+preload_script
+prepared-race
+prepared-race@article
+present-hex
+preserve outside
+preserve outside data
+preserved_divx
+preserved_dts
+pretend-upstream
+preview INFO
+preview Latin versus Greek
+preview PRE
+preview accent collision
+preview expansion collision
+preview full expanding weights
+preview trailing NBSP collision
+preview-badge
+previous NZB
+previous_nzb_preserved
+primary news.example.net
+primary row held
+primary.par2
+primary.par2@article
+primary.vol99+1.par2
+primary_identity
+primary_par2
+printf %s 
+private provider details
+private use category
+probe@benchmark.invalid
+proc_crc32
+proc_files
+proc_hash16k
+proc_nfo
+proc_open
+proc_par2
+proc_sorter
+proc_srr
+proc_uid
+profile/1294-rls-bot/
+profile/999-other/
+profile_error_type
+profile_skipped_reason
+projected_generation
+projected_revision
+proof_version
+proven empty
+provenance_end
+provider_label
+provider_probe_in_progress
+public-rename-index
+publication reference
+publication timing skips outer transactions
+publication_attempts
+publication_row_lock_ns
+published after expiry selection
+published_check
+published_shadow_exact
+publisher-file-name
+publisher-file.mkv
+punctuation differs
+punctuation mismatch
+python software runtime
+python3 
+qo-schema-fixture
+qualified_empty_entry_domain
+qualified_path_table_copy_agreement
+quality without source or codec
+queried_at_utc
+query on detail
+query_string
+queue.default
+quick_open_cache
+quoted RAR part
+quoted title
+r.fromname LIKE ?
+r.late_article_candidate_id IS NULL
+r.proc_nfo
+random hash
+range_or_size_mismatch
+rar terminal requests another volume
+rar-copy-blake
+rar-copy-crc
+rar-copy-uncommon-ambiguous
+rar-copy-uncommon-truncated
+rar-quick-open-conflict
+rar-quick-open-match
+rar-quick-open-uncommon-corrupt
+rar-quick-open-uncommon-retention
+rar/rar50_encrypted_headers.rar
+rar/rar50_quickopen.rar
+rar/solid.rar
+rar/store_method.rar
+rar4-solid
+rar4-stored
+rar5-encrypted-headers
+rar5-mixed
+rar5_copy_checksums
+rar5_quick_open
+rar_par2
+rate limit
+rate limit exceeded
+rate limited
+rate_limit_max_wait_seconds
+rate_limit_retries
+rate_limit_wait_seconds
+ratios_are
+raw BMP noncharacter FFFE
+raw BMP noncharacter FFFF
+raw form feed
+raw known suffix
+raw unknown suffix
+raw_control_lines
+raw_field_hex
+raw_hash
+raw_headers
+raw_jsonl
+raw_sha256
+readme.2026.1080p.@BS
+readme.2026.1080p.@BS.rar
+readme.txt
+ready pass temporarily failed
+ready_releases
+real INFO
+real Latin versus Greek
+real PRE
+real accent collision
+real expansion collision
+real full expanding weights
+real trailing NBSP collision
+rebuild failed
+rebuild_cursor
+rebuild_epoch
+rebuild_until_id
+recent_provider_failure
+reclassify-
+reconciliation unavailable
+record limit
+record-payload-relative
+record_count
+recoverable_file_ids
+recovered 7z
+recovery exponent conflict
+recovery_data
+recovery_exponent
+recovery_exponents
+recovery_packets
+recovery_percentage_basis
+recovery_set_id
+recovery_set_ids
+recovery_sets
+recovery_to_source_percent
+redirection_checksum_relationship
+redirection_records_ambiguous
+redirection_type_observed
+reference_byte
+reference_data_domain
+reference_descriptor_offset
+reference_empty_blake2sp_hex
+reference_empty_crc32
+reference_interpreted_name
+reference_name_relationship_status
+reference_sample_offset
+reference_selected_checksum
+reference_selection_status
+regenerated_size
+regex_id
+regular movie
+rejected_records
+release 2632544
+release 2632547
+release 2632569
+release 2632648
+release 2632656
+release 2632665
+release 2633143
+release 2645100
+release 2645104
+release 2645106
+release creation failed
+release delete
+release flag without technical format
+release identity replaced after confirmation
+release update
+release worker
+release-
+release-downtime-
+release-fingerprint
+release-fingerprint:provider-breaker:
+release-grp
+release-image-
+release-names-header-
+release-names-http-
+release-report.check
+release-report.store
+release-row-actions__basket
+release-row-actions__details
+release-row-actions__download
+release-row-actions__movies
+release-views-
+release-write
+release.NFO
+release.nfo
+release.par2
+release.part01.rar
+release.part02.rar
+release.rar
+release_archive_naming_evidence
+release_children
+release_comment_counter_mismatches
+release_comments
+release_comments.gid
+release_files
+release_fingerprint_jobs
+release_fingerprint_metadata
+release_guid
+release_id
+release_identity_sql
+release_nfos
+release_nzb_contents
+release_nzb_creation_failures
+release_nzb_passwords
+release_opt_
+release_regexes
+release_reports
+release_subtitles
+release_threads
+release_unique
+release_verification
+release_verification.bytes_per_second
+release_verification.candidate_workers
+release_verification.expiry_hours
+release_verification.free_bytes
+release_verification.lease_seconds
+release_verification.manifest_storage
+release_verification.metadata_bytes
+release_verification.partial_after_hours
+release_verification.pending_bytes
+release_verification.publication_timing_sample_every
+release_verification.publish_allowed_networks
+release_verification.publish_batch_max_bytes
+release_verification.publish_batch_max_items
+release_verification.publish_batch_seconds
+release_verification.publish_batch_url
+release_verification.publish_endpoint
+release_verification.publish_url
+release_verification.required
+release_verification.retry_seconds
+release_verification.rust_worker
+release_verification.scheduled
+release_verification.scratch_bytes
+release_verification.spot_check_articles
+release_verification.spot_check_bytes
+release_verification.storage_path
+release_verification_audit_retries
+release_verification_candidates
+release_verification_locks
+release_verification_manifests
+release_verification_scratch
+release_verification_scratch_budget
+release_verification_state
+releases as r
+releases callback
+releases hook
+releases.searchname
+releases.source
+releases:fingerprint-backfill
+releases:fix-names 3 
+releases:fix-names 4 
+releases:fix-names 7 
+releases:fix-names 8 
+releases:fix-names-group
+releases:fix-nzbsplit
+releases:identity-suggestions
+releases:normalize-guids
+releases:normalize-guids must page by primary key, never with LIMIT/OFFSET.
+releases:optimize-preflight
+releases:process --maintenance-only
+releases:reclassify-header-rejections
+releases:verify-candidates
+releases:verify-repairable
+releases_groups
+releases_id
+releases_rt
+remote.png
+rename catalogue
+rename policy
+rename quiet
+rename verbose
+renamed.part01.rar
+rendered document
+repaired original
+repeat_comparison_count
+repeated identity
+replaced identity
+replacement GUID
+replacement at same ID
+replacement current
+replacement guid
+replacement new name
+replacement old
+replacement subject
+replacement title
+replacement-candidate
+replacement-claim
+replacement-file.mkv
+replacement-guid
+replacement-name
+replacement-owner
+replacement-search
+replacement@example.test
+report.txt
+report_response_count
+reported dotted release
+reported_clock_relations
+reported_row_count_mismatch
+reposted by Anonymous - "Inception.2010.720p.BluRay.x264-GRP.rar"
+reposted_prefix
+request-case-differs
+request_delay_ms
+request_failed
+request_phases_ns
+request_status
+requested_message_id
+requested_pairs
+required.bin
+required_byte
+required_sample_offset
+reserved high bit
+reserved_bytes
+resolution embedded in another token
+resolution inside another token
+resolution missing from both
+resolution only in parent
+resolution_status
+resolved_at
+resolved_checksum_valid
+resolved_compressed_size
+resolved_crc32
+resolved_extra_flags
+resolved_filename
+resolved_filename_display_truncated
+resolved_filename_source
+resolved_filename_status
+resolved_local_header
+resolved_sha256
+resolved_uncompressed_size
+resolved_via_aes_extra_field
+responded_at
+responded_by
+response-budget
+response-mismatch
+response-report-btn
+response_code
+response_delay
+response_identity_status
+response_is_public
+response_not_successful
+response_row_count
+restricted reference grammar
+results.0
+retained CRC-valid primary article
+retained Rosalia General Filename
+retained UTF8 publisher pair
+retained accented technical title
+retained bytes
+retained capacity ownership
+retained manifest ownership
+retained prior audit state
+retained proof from the prior audit
+retained release 3118899
+retained-
+retained_record_limit
+retrieval_measurements
+retry pending
+retry then commit
+retry_attempts
+retry_delay_ms
+retry_queue
+reused id
+rev-parse
+reversed index
+revert-modal-close
+revert-report-btn
+reverted to reviewed
+reviewed_at
+reviewed_by
+rhs_minus_lhs_seconds
+rhs_parse_status
+right angle bracket
+roles_id
+rollback.jpg
+rollback.png
+rolled back
+rolled-back
+roman_numerals
+rootEl: null
+root_categories
+root_categories_id
+rosalía.album.2026-grp
+round_trip_ns
+routes/web.php
+row_missing_or_malformed_xref_column
+rss-token
+rtl_override_control
+run_token
+runtime.php
+rust-worker
+rust-worker:
+rust_batch
+rust_binary
+rust_binary_sha256
+rust_build
+rust_feed_observed
+rust_worker
+s Day New Zealand - Issue 45 April 27 2026
+s Day New Zealand - Issue 45 April 27, 2026
+same GUID changed name
+same decomposed bytes
+same detail ID
+same episode encode variants
+same generation
+same identity pending again
+same intended ID but noncanonical name
+same link already committed
+same name quiet
+same name verbose
+same title
+same title distinct IDs
+same-articles
+same-cycle
+same-name attach
+same-name attachment
+same-name candidate
+same-name preview
+same-source partial then complete listing
+sample is ignored
+sample payload
+sample-badge
+sample-relative
+sample_prefix_identity
+sample_relative
+sample_role
+sample_truncated
+sampled duplicate retains publication behavior
+sampled publication timing separates ordered phases outside transaction
+sampled retry records distinct attempts
+sampled_descriptor_sequence_terminated
+saturation boundary
+scalar category IDs
+scan_budget_exhausted
+scan_lease_lost
+scan_limit_reached
+scandinavian_umlaut
+scanned_record_limit
+scene-archive-sql
+scene-archive-sql-subset.sql
+scene-release.mkv
+scene-sql-input-
+scene-sql-replacement-
+scene_archive_sql
+scheduler-recovery
+schema_name
+schema_version
+scientific notation
+scnlog.me
+scnlog.xml
+scnsrc.me
+scnsrc_me
+scnsrc_me.xml
+scratch root is inaccessible or linked
+scratch-cleanup
+scratch_bytes
+scratch_bytes_status
+screen_only
+screenshot Dolly
+screenshot Maya
+screenshot Sadie
+screenshot Veronica
+scripts/benchmark-date-cpp.cpp
+se_complete
+search.default
+search_index_failures
+search_type
+searchname byte case
+searchname changed
+searchname reset
+season at start
+season cannot become one episode
+season range
+season without quality markers
+season word
+seasonless EP token is not a complete identity
+seasonless Episode token is not a complete identity
+second attempt capped to remaining
+second batch
+second-obfuscated-release
+second-publisher
+second-uid
+second.bin
+second.enc
+second.nfo
+second.par2
+second.rar
+second@example.net
+seconds_present
+secret-one
+secret-title
+secret-title: duplicate ID
+secret-title: query timed out
+secret-two
+segment overflow
+segment_byte_end_exclusive
+segment_byte_start
+segment_count
+segment_crc32_basis
+segment_number
+segment_number_sequence_valid
+select "id"
+select "id", "guid"
+select * from "predb"
+select * from "release_verification_state"
+select * from "releases"
+selected NZB name
+selected custom name
+selected zero
+semantic group before wrapper
+semantic underscore before wrapper
+semantic year before wrapper
+sent to metadata review
+separate fixture
+sequence_status
+seriousaboutsound-releases.html
+seriousaboutsound.net
+server_name
+server_port
+server_profiles
+server_role
+server_tls
+service_data_crc32_status
+service_data_partial
+service_header
+service_header_untrusted
+service_identifier_not_archived_file_name
+session.driver
+session.store
+set limit leaves a later archive unread
+set.par2
+set.par2@article
+set.vol00+01.par2
+set.vol01+01.par2
+set.vol99+1.par2
+setup.2026.1080p.x265-GROUP.rar
+seven-encrypted-headers
+seven-ranges
+seven-stored
+seven-zip
+seven-zip-corrupt
+seven-zip-truncated
+seven_zip
+seven_zip_next_header_from_sampled_articles
+seven_zip_split
+shadow_exact
+shared decoded budget holds without duplicate insertion
+shared intermediate boundary
+shared release info
+shared-terminal-
+short episode
+short page claims more
+short season range
+short title
+short_file_hashes_consistent
+should not be requested
+show preserves filename diagnostic
+show s01 web
+sibling-
+sibling-fingerprint
+sibling-name
+sibling-size
+simple x
+simulated interruption after database commit
+single complete article without part suffix
+single normal row
+single_digit_part
+single_page_sources
+single_pipe_syntax
+sixteen character group
+sixteen literals flood
+size literal
+size_asc
+size_desc
+size_formatted
+size_relationship
+size_relationship_status
+skipped_lines
+slash path
+slice_count
+slice_count_mismatch_file_ids
+slice_sha256
+small-dispatch
+small.jpg
+small.png
+socket_name
+some.random.release.name
+something else
+sort_dir
+sort_field
+source definition conflict
+source embedded in another token
+source headers remain but source raw cache was lost
+source without year or episode
+source-1@article
+source-2@article
+source.mkv
+source.png
+source_block_count
+source_block_count_overflow
+source_block_count_within_current_v2_limit
+source_block_limit
+source_block_size
+source_byte_end_exclusive
+source_byte_start
+source_crc32_byte_offset
+source_date
+source_definition_conflicts
+source_descriptions_valid
+source_failure
+source_file_bytes
+source_file_bytes_overflow
+source_file_count
+source_files
+source_hash_digest_offset
+source_hash_record_end_offset
+source_hash_record_index
+source_hash_record_offset
+source_header_offset
+source_identity
+source_inventory_complete
+source_line_indices
+source_location_field_offset
+source_media.unique_id IS NOT NULL
+source_number
+source_overview_column_index
+source_overview_row_index
+source_payload_offset
+source_record_end_offset
+source_record_offset
+source_rejected
+source_revision
+source_sha256
+source_unavailable
+source_unchanged
+space separated season
+space separated title
+spaced counters
+spaced display name
+spaced editorial heading
+spaced editorial title
+spaced later volumes of the same file
+spaced lowercase
+spaced name
+spaced site name
+spanish_enye
+split volume
+split_after
+split_before
+sports_4k
+spot_check
+spot_check_article_bytes
+spot_check_articles
+spot_check_bytes
+sql_accounting
+sqlite:/fixture/runtime.sqlite
+sqlite:/state/work.sqlite
+sqlite:/tmp/legacy.sqlite
+sqlite:/tmp/work.sqlite
+srrdb.json
+stable linked singleton
+stable unlinked singleton
+stacked gzip
+stacked identity
+stacked technical extensions
+stale checkpoint temporary is refunded before replacement
+stale claim
+stale clone
+stale revision
+stale-index
+standalone archival
+standard_movie
+standard_tv
+start with custom chunk
+start with empty generation
+start with generation
+start_header_available
+start_header_crc_valid
+start_offset
+stat_all_articles
+stat_commands_per_rtt
+state trigger
+state_lock_acquisition
+stats_asc
+stats_desc
+status_counts
+stop_requested
+stopped_offset
+storage cleanup failure
+storage_ownership
+storage_retained_before_retry
+stored-guid
+stored_blake2sp_matches_empty_data
+stored_crc32_matches_empty_data
+stored_digest
+stream_header_qualified
+streamed output
+strikethrough keyword and group
+string category ID
+string total
+strip-count
+strip_bad_utf8
+stripe_count
+stripe_lock_ns
+stronger overall file count remains unresolved
+structure_checksum_invalid
+structure_crc32_valid
+structure_crc_truncated
+structure_end_offset
+structure_extension_uninterpreted
+structure_flags_unsupported
+structure_partial
+structure_sha256
+structure_size_encoding_unsupported
+structure_start_offset
+structure_valid
+sub-batch
+sub_category
+subject changed
+subject conflicting titles
+subject duplicate IDs
+subject numbered
+subject reset
+subject unnumbered
+subset 7z
+substring PAL false positive
+subtitles.srt
+successful cleanup
+successful corrupt cache eviction refunds baseline before replacement
+successor-owner
+summary-
+superscript_digits
+superset conflicting assertions retains archive
+superset covers subset without assertions retains archive
+superset identical assertions safely reuses
+supported_protocol
+surrogate reference
+syntax_profile
+syntax_status
+synthetic UTF-8 prefix
+synthetic assertion
+synthetic backend failed
+synthetic backend failure
+synthetic literal technical tokens
+synthetic lookup failure
+synthetic megabyte display
+synthetic metadata fixture
+synthetic publication
+synthetic reason
+synthetic unavailable
+synthetic uploader metadata
+synthetic value
+synthetic-
+synthetic-1024
+synthetic-128
+synthetic-512
+synthetic-other
+synthetic-release-
+synthetic-release-42
+synthetic-reset-guid
+synthetic-valid
+synthetic.Original
+synthetic.alias-grp
+synthetic.alias-grp.rar
+synthetic.alias-grp.rar.par2
+synthetic.canonical-grp
+synthetic.release-grp
+synthetic@example.invalid
+synthetic@example.test
+szip/encrypted_headers.7z
+szip/store_method.7z
+table_relative_offset
+tag on one episode is dropped
+taken-over
+target_resolution_performed
+tcp://127.0.0.1:0
+technical publisher ebook
+technical suffix followed by junk
+technical word only in group
+technical word remains canonical
+techno dates are unknown
+temp helper trigger
+temp shadow
+temp source trigger
+temp.sqlite_schema
+temp_source
+temp_target
+temporary failure
+temporary trigger uppercase auxiliary target
+terminal backslash
+terminal caller ID
+terminal continuation is discarded by outer rollback
+terminal continuation rejects successor claim
+terminal continuation rejects successor source with same filename
+terminal continuation runs only after outer commit
+terminal timestamp predicate
+terminal update
+test-only
+tests/Fixtures/RemainingArchiveBenchmarkFixtures.php
+tests/Fixtures/RemainingMetadataBenchmarkFixtures.php
+tests/Fixtures/benchmark-bulk-verification.php
+tests/Fixtures/release-names-worker.php
+tests/Unit/CppDateWorkerTest.php
+tests/Unit/RemainingMetadataBenchmarkFixturesTest.php
+tests/Unit/test_date_cpp_reference.py
+testuser_
+text owner
+third source was not fetched
+third.rar
+thirteen fields
+three-digit upper boundary
+throw_logger
+thumbnail removal after NZB is removed
+tight-budget
+time_record_count
+timed_out
+timestamp_span_seconds
+timezone-free ISO timestamp
+timezone-free RFC date
+timezone-free SQL timestamp
+timezone_local_offset_unknown
+timezone_offset_minutes
+timezone_token
+timing logger failure preserves after commit exception
+timing logger failure preserves committed publication
+title case Of movie
+title_asc
+title_collation
+titles sharing a word are dropped
+tmux new-session -d -s nntmux sleep 60
+tmux respawn-pane -k -t nntmux:0.0 php /tmp/runtime.php monitor
+tmux set-option -gw remain-on-exit on
+tmux set-option -p -t 
+tmux set-option -p -t nntmux:0.0 @nntmux_role monitor
+tmux set-option -p -t nntmux:0.1 @nntmux_role binaries
+tmux split-window -d -t nntmux:0 sleep 60
+tmux.config_file
+tmux.fix_names.batch_limit
+tmux.fix_names.cache_store
+tmux.fix_names.category
+tmux.fix_names.full_backlog
+tmux.fix_names.full_backlog_interval_minutes
+tmux.fix_names.par2_scheduled
+tmux.fix_names.predbft
+tmux.fix_names.predbft_scheduled
+tmux.scheduled_health_check
+tmux.socket_name
+tmux:fix-names:full-backlog
+tmux:health-check
+tmux:health-check --auto-restart
+too long
+too many IDs
+too short
+total_bytes
+total_exact
+total_ns
+total_pages
+total_parts
+total_parts_match
+total_records
+total_relation
+total_report_count
+totalpart INTEGER DEFAULT 0
+totalparts_inferred
+tracked_dirty_diff_sha256
+trailer_fields
+trailing executable suffix
+trailing garbage
+trailing junk
+trailing newline
+trailing whitespace
+trailing_unparsed_bytes
+transaction_finalization_ns
+transliterated spelling
+transport error
+transport truncation splits UTF8
+truncated XML
+truncated closing root
+truncated codepoint
+truncated document
+truncated ellipsis
+truncated rar
+truncated rar episode
+truncated rar followed by extras
+truncated rar movie
+truncated rar with extras
+truncated row
+truncated second member
+truncated trailer
+truncated_title
+trusted unpublished legacy row
+trusted-existing
+truthy complete
+truthy evidence
+try_fuzzy
+ts parity wrapper
+tt-preserved
+turkish_dotted_i
+turkish_small_dotted
+tv:repair-links
+tv:reprocess-unmatched
+tv_episode
+tv_episodes
+tv_episodes_id
+tv_lookup_attempts
+tv_lookup_retry_at
+two character group
+two clean failures then commit
+two extensionless opaque siblings 
+two full attempts
+two independent rows
+two opaque episode siblings 
+two payload extensions
+two seasons
+two unknown-suffix opaque siblings 
+two-digit lower boundary
+two@example.net
+unassigned category
+unattested movie zip
+unattested single-episode zip
+unavailable-
+unavailable-conflicting-recovery-exponent-packets
+unavailable-conflicting-source-definition-packets
+unavailable-incomplete-or-unsupported-par2-layout
+unavailable-invalid-input-file-slice-checksums
+unavailable-multipart-structure
+unavailable-packed-recovery-layout
+unavailable-source-block-count-exceeds-current-v2-limit
+unavailable-source-block-count-overflow
+unavailable-source-block-denominator
+unavailable-source-block-size-not-in-this-volume
+unavailable-source-file-byte-total-overflow
+unavailable-unsupported-integer-range
+unavailable_reason
+unbalanced parenthesis
+unchanged mixed inventory completes
+uncommon-
+uncommon-boundary
+uncommon-conflicts
+uncommon-duplicates
+uncommon-limits
+uncommon-malformed
+uncommon_500k
+uncompressed_size
+uncompressed_size_32
+uncompressed_size_unknown
+underscore separated season
+underscored pack without video hint
+underscored photos
+underscored site name
+underscored video pack
+unescaped inner quote
+unexpected command
+unexpected pinned release
+unexpected record
+unexpected root child
+unexpected_candidate_field
+unexpected_case_main
+unexpected_case_temp
+unexpected_top_level
+unfolded_value_hex
+unicode alias
+unicode case identity
+unicode cleaner still loses accents
+unicode competitor first
+unicode competitor last
+unicode control
+unicode ellipsis
+unicode separator
+unicode_filename
+unicode_filename_display_truncated
+unicode_path_extra
+uninspected sibling
+unique alias
+unique hash held
+unique-looking index failure
+unique-valid-recovery-exponents-over-recoverable-source-blocks
+unique_id
+unique_recovery_slice_count
+unique_supported_hash_extra_replaces_crc32
+unix archive path
+unix_socket
+unknown 7z
+unknown action
+unknown age
+unknown data
+unknown escape
+unknown first
+unknown game field
+unknown id
+unknown pinned discussion
+unknown suffix
+unknown title
+unknown-suffix opaque singleton 
+unknown: 2
+unknown_desc
+unlimited stays unlimited
+unmatched quote
+unordered IDs
+unpack_version
+unpacked_file_data
+unpacked_size_effective
+unpersisted external text
+unpersisted observation
+unpublished duplicate with exact verified inventory is not reused
+unpublished lower id does not hide later exact published duplicate
+unpublished_exact
+unqualified debug suffix
+unqualified major version
+unquoted later volumes of the same file
+unrecognized escape
+unrecognized namespace
+unregistered inventory
+unregistered-audit
+unrelated anchor
+unrelated canonical link
+unrelated established link
+unrelated link
+unresolved_file_ids
+unsupported control preserved
+unsupported enclosure
+unsupported encoding
+unsupported plain text
+unsupported-coercion
+unsupported-engine
+unsupported-schema
+unsupported_absolute_timezone
+unsupported_reserved_type
+untagged 
+unterminated control reference
+unterminated string
+unterminated title field
+until_id
+untrusted_column
+unused.nzb.gz
+unverified-old@article
+update "predb_identity_state"
+update "release_verification_candidates"
+update "releases"
+update group worker
+update per group
+update per group callback
+update per group hook
+updateRelease_query
+updated_at
+upgrade-abc
+upgrade-x
+upgraded-partial
+upload-fixture
+uploader cannot supply title prefix
+uploader tag does not supply the title prefix
+uppercase dot codec
+uppercase_alnum
+upstream-provider
+url_prefix
+url_shortcut
+url_suffix
+usenet_fraction
+usenet_groups
+usenet_lowercase
+usenet_prefix
+usenet_random_file
+usenet_subject
+usenet_underscore
+user-agent
+users_id
+utc_epoch_seconds
+utf8mb4_bin
+utf8mb4_unicode_ci
+ux_releases_guid
+valid SQL authority
+valid case-only
+valid competitor first
+valid competitor last
+valid uncatalogued crosspost and invalid group
+valid wrapper pipe
+valid-release
+valid_part
+valid_timestamp_count
+validated_header_declaration
+vendor/composer/installed.json
+verification-metric-probe
+verification-metric-probe://root
+verification_backfill_other
+verification_due
+verification_fixture_
+verification_fixture_admin
+verification_manifest_path
+verification_mode
+verification_other
+verification_status
+verification_upload_other
+verified utf8mb4_unicode_ci
+verified_at
+verified_bytes
+verified_bytes_per_second
+verified_file_count
+verified_file_names
+version_major
+version_minor
+version_need_num
+version_need_os
+version_needed
+version_number
+version_number_byte_offset
+version_outside_32bit_reference_range
+version_record_count
+vertical tab
+video data
+video pack
+video training course
+video_data
+videos_id
+view adult
+view audio
+view books
+view console
+view movies
+view other
+views/admin/dashboard.blade.php
+views/admin/release-reports/index.blade.php
+views/components/release-badges.blade.php
+views/components/release-results.blade.php
+views/details/index.blade.php
+views/details/partials/*.blade.php
+visible_block_walk
+visible_comment_rows
+volume_space_blocks
+vr_device
+vr_site_generic
+waiting_for_headers
+waiting_upload
+warmup_failures
+weekday_matches_calendar
+weight_key
+whitespace string
+whitespace then NUL
+whole_file_identity_established
+whole_file_validated
+whole_image_validated
+whole_span_average_advertised_bytes_per_second
+whole_stream_validated
+wildcards cannot replace literal characters
+window_size
+windows media path
+winter olympics closing ceremony
+wire_bytes
+word ending in s
+work_budget_exhausted
+work_byte_limit
+worker exception after metadata hold preserves verdict
+worker-output:
+worker-output:109
+worker_lock
+worker_readiness
+workspace is not writable
+wrapped subject
+wrapped unknown suffix
+wrapper path
+wrapper-path
+wrapper_loaded
+write_fault
+writer_case_target
+wrong arity
+wrong author identity
+wrong author label
+wrong canonical title
+wrong dataset
+wrong declared total from provider
+wrong default
+wrong filename relationship
+wrong group
+wrong group suffix
+wrong heading role
+wrong name association
+wrong numeric link association
+wrong part from provider
+wrong root
+wrong scope
+wrong separator
+wrong table
+wrong trigger target
+wrong unit
+wrong unit casing
+wrong year
+wrong-data
+wrong-release.mkv
+wrong-request-token
+wrong-title
+wrong-token
+wrong_identity
+wrong_table
+wss://example.invalid/ws
+x episode
+x episode format
+x episodes
+x264.E02
+x264.S02
+x265.Complete.Season
+x265.E02
+xKq7Zp2Lm9Vb4Nc8Rt3Yw6
+xref-ordinary
+xref-uncommon-duplicates
+xref-uncommon-limits
+xref_format_line_indices
+xrel-p2p
+xrel.json
+xrel_p2p
+xrel_p2p.json
+xyz.1234.wvut.5678.srqp.9012.rar
+xz.123456789012
+year difference
+year inside another number
+year missing from both
+year season
+year season cannot become one episode
+year season format
+year without quality
+yenc-fixture-
+yenc.native_library
+yenc_framing_metadata
+yenc_integrity_failed
+yenc_nzb_part_number_matches
+yenc_nzb_total_parts_matches
+yenc_start_offset_not_zero
+yend_part_number
+yend_size_matches_expected
+ypart_range_valid
+z_preflight_test
+zenet and Abjects
+zenet name with parentheses
+zero bytes
+zero records
+zero width spelling collision
+zero_padding_bytes
+zero_part
+zero_vowel_token
+zero_width_space
+zip-stored
+zip/encrypted_file_aes.zip
+zip/little_file.zip
+zip_split
+zip_unicode_path_records
+zx90.cv78.bn56
+¹²³⁴⁵⁶.mkv
+ÄScene.Movie.Release.2026-GROUP
+Åland.mkv
+ÉDITEUR.Asset-GRP.mkv
+École.Synthetic.2026.1080p-GROUP
+Éditeur.Asset-GRP
+Élève Movie 2026 1080p-GRP
+Élève.Album.FLAC-GRP
+Élève.Album.FLAC-GRP.flac
+Élève.Movie.2026-PAL
+Élève.Movie.2026.1080p-ABCDEFGHIJKLMNO
+Élève.Movie.2026.1080p-ABCDEFGHIJKLMNOP
+Élève.Movie.2026.1080p-G
+Élève.Movie.2026.1080p-Grüpp
+Élève.Movie.2026.1080p.H.264-GRP
+Élève.Movie.2026.1080p.H.264-GRP.mkv
+Élève.Movie.2026.H.264-GRP
+Élève.Movie.2026.PAL-GRP
+Élève.Movie.2026.PAL-GRP.mkv
+Élève.Movie.2026.REPACK-GRP
+Élève.Movie.2026.WEB-DL-GR
+Épisode.tar
+Été_&_Österreich-GRP
+äscene.movie.release.2026-group
+école.synthetic.2026.1080p-group
+éditeur.asset-grp.rar
+éléphant.rose.2019.flac
+İ.Exact.Release.2026-GRP
+İ.Exact.Release.2026-GRP.mkv
+İ.Exact.Release.rar
+İ.Title-GRP
+Αlpha.Movie-GRP
+Επεισόδιο１２３.mkv
+ΟΣ.Title-GRP
+ΟΣ.Title-GRP.mkv
+ΟΣ.rar.par2
+ΣΥΝΘΕΤΙΚΟΣ-GRP.mkv
+Серия１２３.mkv
+١٢٣٤٥٦.mkv
+१२३४٥٦.mkv
+K.Title-GRP
+K.Title-GRP.mkv
+ⅢⅣⅤⅥ.mkv
+天空之城.1986.HDTVLight.1080p.x264.@BS
+天空之城.1986.HDTVLight.1080p.x264.@BS.rar
+日本語のタイトル 2020 1080p
+東京_Élève_2026_1080p_x265-GROUP
+東京_Élève_2026_1080p_x265-GROUP.mkv
+第１２話.mkv
+１٢٣٤٥٦.mkv

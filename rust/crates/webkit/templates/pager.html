@@ -1,0 +1,37 @@
+{% if pager.has_pages() %}
+<nav role="navigation" aria-label="Pagination Navigation" class="flex flex-col sm:flex-row gap-2 items-center justify-between">
+    <div>
+        <p class="text-sm text-gray-700 leading-5 dark:text-gray-400">
+            Showing
+            {% if pager.first_item > 0 %}<span class="font-medium">{{ pager.first_item }}</span> to <span class="font-medium">{{ pager.last_item }}</span>{% else %}0{% endif %}
+            of <span class="font-medium">{{ pager.total }}</span> results
+        </p>
+    </div>
+    <div>
+        <span class="inline-flex flex-wrap rtl:flex-row-reverse shadow-sm rounded-md">
+            {% if let Some(url) = pager.previous_url %}
+            <a href="{{ url }}" rel="prev" aria-label="Previous" class="inline-flex items-center px-2 py-2 text-sm font-medium text-gray-500 bg-white border border-gray-300 rounded-l-md hover:text-gray-400 dark:bg-gray-800 dark:border-gray-600"><i class="fas fa-chevron-left" aria-hidden="true"></i></a>
+            {% else %}
+            <span aria-disabled="true" aria-label="Previous" class="inline-flex items-center px-2 py-2 text-sm font-medium text-gray-500 bg-white border border-gray-300 cursor-not-allowed rounded-l-md dark:bg-gray-800 dark:border-gray-600"><i class="fas fa-chevron-left" aria-hidden="true"></i></span>
+            {% endif %}
+            {% for link in pager.links %}
+                {% match link %}
+                {% when nntmux_webkit::paginate::PageLink::Gap %}
+                <span aria-disabled="true" class="inline-flex items-center px-4 py-2 -ml-px text-sm font-medium text-gray-700 bg-white border border-gray-300 cursor-default dark:bg-gray-800 dark:border-gray-600 dark:text-gray-300">...</span>
+                {% when nntmux_webkit::paginate::PageLink::Page { number, url, current } %}
+                {% if *current %}
+                <span aria-current="page" class="inline-flex items-center px-4 py-2 -ml-px text-sm font-medium text-white bg-blue-600 border border-blue-600 cursor-default">{{ number }}</span>
+                {% else %}
+                <a href="{{ url }}" class="inline-flex items-center px-4 py-2 -ml-px text-sm font-medium text-gray-700 bg-white border border-gray-300 hover:text-gray-500 dark:bg-gray-800 dark:border-gray-600 dark:text-gray-300">{{ number }}</a>
+                {% endif %}
+                {% endmatch %}
+            {% endfor %}
+            {% if let Some(url) = pager.next_url %}
+            <a href="{{ url }}" rel="next" aria-label="Next" class="inline-flex items-center px-2 py-2 -ml-px text-sm font-medium text-gray-500 bg-white border border-gray-300 rounded-r-md hover:text-gray-400 dark:bg-gray-800 dark:border-gray-600"><i class="fas fa-chevron-right" aria-hidden="true"></i></a>
+            {% else %}
+            <span aria-disabled="true" aria-label="Next" class="inline-flex items-center px-2 py-2 -ml-px text-sm font-medium text-gray-500 bg-white border border-gray-300 cursor-not-allowed rounded-r-md dark:bg-gray-800 dark:border-gray-600"><i class="fas fa-chevron-right" aria-hidden="true"></i></span>
+            {% endif %}
+        </span>
+    </div>
+</nav>
+{% endif %}
