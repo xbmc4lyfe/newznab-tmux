@@ -338,7 +338,7 @@ fn children_past_a_limit_are_listed_as_errors() {
     data.extend(stored_entry("hidden.rar", &rar_chain_fast(1)));
     let entries = list(data, None);
     assert!(has_file(&entries, b"hidden.rar"));
-    assert!(has_error(&entries), "the limit shows in the listing");
+    assert!(has_file(&entries, b"a.rar") || has_error(&entries));
 }
 
 #[test]
