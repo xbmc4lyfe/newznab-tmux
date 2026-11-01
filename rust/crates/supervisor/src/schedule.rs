@@ -2,7 +2,7 @@
 //! a role now runs continuously, are in `rust/porting/ledger/ws-ops.toml` with the reason.
 
 use chrono::Weekday;
-use nntmux_runtime::Ctx;
+use nntmux_runtime::{Ctx, busy};
 
 use crate::cadence::Cadence::{self, Daily, EveryMinutes, Weekly};
 use crate::engine::Task;
@@ -25,7 +25,7 @@ fn task(
 }
 
 pub fn tasks() -> Vec<Task<Ctx>> {
-    use nntmux_ops::{accounts, activity, disposable, stats, system_metrics};
+    use nntmux_ops::{accounts, activity, disposable, resets, stats, system_metrics};
     vec![
         task("nntmux:collect-stats", EveryMinutes(15), |ctx| {
             Box::pin(async move { stats::collect(&ctx.db).await })
@@ -93,6 +93,35 @@ pub fn tasks() -> Vec<Task<Ctx>> {
         task("cleanup-api-request-logs", Cadence::Hourly, |ctx| {
             Box::pin(async move {
                 activity::cleanup_request_logs(&ctx.db).await?;
+                Ok(())
+            })
+        }),
+        // The role runs this pass unless the schedule owns it, so it has exactly one launcher.
+        Task {
+            enabled: nntmux_namefix::predbft_scheduled,
+            ..task(
+                "multiprocessing:fixrelnames predbft",
+                EveryMinutes(5),
+                |ctx| {
+                    Box::pin(async move {
+                        // Renaming is processing, so it waits out a pause and a drain sees it.
+                        let Some(_busy) = busy::enter(&ctx, "fixnames").await? else {
+                            return Ok(());
+                        };
+                        let kind = "predbft".to_owned();
+                        nntmux_namefix::ctl(ctx, nntmux_namefix::Command::Fixrelnames { kind })
+                            .await
+                    })
+                },
+            )
+        },
+        task("nntmux:remove-bad", Cadence::Hourly, |ctx| {
+            Box::pin(async move {
+                // Deleting releases is processing, so it waits out a pause and a drain sees it.
+                let Some(_busy) = busy::enter(&ctx, "remove-bad").await? else {
+                    return Ok(());
+                };
+                resets::remove_bad(&ctx.db).await?;
                 Ok(())
             })
         }),

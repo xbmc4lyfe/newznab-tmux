@@ -5,11 +5,12 @@
 pub mod accounts;
 pub mod activity;
 pub mod disposable;
+pub mod resets;
 pub mod runtime_state;
 pub mod stats;
 pub mod system_metrics;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Subcommand;
 use nntmux_runtime::{Ctx, Shutdown};
 
@@ -28,6 +29,36 @@ pub enum Command {
     DisableExpiredPromotions,
     /// Complete registration periods past their end (`nntmux:disable-expired-registration-periods`).
     DisableExpiredRegistrationPeriods,
+    /// Reset the database to a blank state, keeping settings (`nntmux:resetdb`). Local only.
+    ResetDb {
+        /// Confirm: this removes all releases, NZBs, images and article tables.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Empty article tables, reset groups, delete releases with no NZB (`nntmux:reset-truncate`).
+    ResetTruncate,
+    /// Reset post-processing for categories, or all of it (`nntmux:resetpp`).
+    ResetPp {
+        /// music, console, movie, game, tv, adult, book, misc or all. Repeat or comma separate.
+        #[arg(short, long)]
+        category: Vec<String>,
+    },
+    /// Queue a TV show's releases for TV post-processing again (`nntmux:reset-tv-show`).
+    ResetTvShow {
+        /// The show's `videos.id`.
+        videos_id: i64,
+        /// Show counts only.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Check tables and optimize any that fail (`nntmux:optimize-tables`).
+    OptimizeTables {
+        /// Table to check, or all. Repeatable.
+        #[arg(short, long)]
+        table: Vec<String>,
+    },
+    /// Delete failed releases and mark passworded ones (`nntmux:remove-bad`).
+    RemoveBad,
     /// Refresh the disposable-domain list the site reads (`disposable:update`).
     DisposableUpdate,
     /// Let workers claim work again and clear any drain (`tmux:start`).
@@ -85,6 +116,50 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
             }
             println!("Completed {} expired registration period(s).", names.len());
         }
+        Command::ResetDb { yes } => {
+            if !resets::is_local() {
+                bail!("This command can only be run in local environment");
+            }
+            if !yes {
+                bail!(
+                    "This removes all releases, NZBs, images and article tables. Pass --yes to go ahead."
+                );
+            }
+            reset_database(&ctx).await?;
+            println!("Deleted all releases, images, previews and samples.");
+        }
+        Command::ResetTruncate => {
+            let verify = verify_context(&ctx)?;
+            let deleted = resets::reset_truncate(&verify).await?;
+            println!("{deleted} releases had no nzb, deleted.");
+        }
+        Command::ResetPp { category } => {
+            let total = resets::reset_postprocessing(&ctx.db, &category).await?;
+            println!("{total} release(s) reset.");
+        }
+        Command::ResetTvShow { videos_id, dry_run } => {
+            match resets::reset_tv_show(&ctx.db, videos_id, dry_run).await? {
+                resets::TvShowReset::Reset { title, releases } => {
+                    println!("{releases} release(s) of {title} reset.");
+                }
+                resets::TvShowReset::WouldReset { title, releases } => {
+                    println!("[Dry Run] Would reset {releases} release(s) for TV show: {title}");
+                }
+                resets::TvShowReset::NoReleases => {
+                    println!("No releases found for this videos_id in TV categories");
+                }
+            }
+        }
+        Command::OptimizeTables { table } => {
+            for name in resets::optimize_tables(&ctx.db, &table).await? {
+                println!("Table {name} needed repair and was optimized.");
+            }
+            println!("Tables checked.");
+        }
+        Command::RemoveBad => {
+            let (removed, marked) = resets::remove_bad(&ctx.db).await?;
+            println!("Removed {removed} bad releases and marked {marked} as passworded.");
+        }
         Command::DisposableUpdate => {
             let path = disposable::list_path();
             let count = disposable::refresh(disposable::SOURCE, &path).await?;
@@ -122,4 +197,31 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
         Command::HealthCheck => println!("{}", runtime_state::health_check(&ctx).await?),
     }
     Ok(())
+}
+
+fn verify_context(ctx: &Ctx) -> Result<nntmux_verify::context::Verify> {
+    Ok(nntmux_verify::context::Verify::new(
+        ctx.db.clone(),
+        nntmux_verify::cache::Cache::new(ctx.redis.clone(), "nntmux:"),
+        nntmux_verify::config::VerificationConfig::from_env()?,
+    ))
+}
+
+async fn reset_database(ctx: &Ctx) -> Result<()> {
+    let verify = verify_context(ctx)?;
+    nntmux_verify::reset::run(&verify, || async {
+        resets::clear_database(&ctx.db).await?;
+        nntmux_search::SearchClient::from_ctx(ctx)?
+            .truncate_indexes(&resets::RESET_INDEXES)
+            .await?;
+        let nzbs = nntmux_core::var_or("PATH_TO_NZBS", "storage/nzb");
+        resets::remove_files(std::path::Path::new(&nzbs), &[])?;
+        let covers = nntmux_core::var_or("COVERS_PATH", "storage/covers");
+        resets::remove_files(
+            std::path::Path::new(&covers),
+            &[".gitignore", "no-cover.jpg", "no-backdrop.jpg"],
+        )?;
+        Ok(())
+    })
+    .await
 }
