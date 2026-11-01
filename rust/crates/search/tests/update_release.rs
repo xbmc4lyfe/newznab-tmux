@@ -194,3 +194,159 @@ async fn a_failed_write_records_a_retry_and_leaves_a_lease_alone() {
 
     db.drop_database().await.unwrap();
 }
+
+async fn lease(pool: &MySqlPool, id: i64) -> Option<(String, u32, Option<String>)> {
+    sqlx::query_as(
+        "SELECT operation, attempts, last_error FROM search_index_failures WHERE release_id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_deferred_scope_indexes_each_release_once_and_clears_its_leases() {
+    let Some(live) = live().await else {
+        return;
+    };
+    let pool = &live.db.pool;
+    seed_release(pool, 701).await;
+    seed_release(pool, 702).await;
+    // A stale row with no release: the scope removes its document.
+    let mut scope = live.client.defer_release_updates(pool);
+    scope.update_release(701).await;
+    scope.update_release(701).await;
+    scope.update_release(702).await;
+    scope.update_release(703).await;
+
+    let held = lease(pool, 701).await.unwrap();
+    assert_eq!(held.0, "deferred");
+    assert_eq!(held.1, 0);
+    assert!(held.2.unwrap().starts_with("deferred:"));
+    let page = live.client.search_releases(&all_releases()).await.unwrap();
+    assert!(page.ids.is_empty(), "nothing is written before finish");
+
+    // Another worker's failure on 702 stays on the marker for repair.
+    sqlx::query("UPDATE search_index_failures SET attempts = 1 WHERE release_id = 702")
+        .execute(pool)
+        .await
+        .unwrap();
+    scope.finish().await;
+
+    let page = live.client.search_releases(&all_releases()).await.unwrap();
+    assert_eq!(page.ids.len(), 2);
+    assert!(lease(pool, 701).await.is_none());
+    assert!(lease(pool, 703).await.is_none());
+    let kept = lease(pool, 702).await.unwrap();
+    assert_eq!((kept.0.as_str(), kept.1), ("deferred", 1));
+    let due: bool = sqlx::query_scalar(
+        "SELECT next_attempt_at <= UTC_TIMESTAMP() + INTERVAL 1 SECOND FROM search_index_failures WHERE release_id = 702",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(due, "handed to repair at once");
+
+    live.client
+        .sql(&format!("DROP TABLE {}", live.table))
+        .await
+        .unwrap();
+    live.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_live_lease_is_respected_and_a_dead_one_taken_over() {
+    let Some(live) = live().await else {
+        return;
+    };
+    let pool = &live.db.pool;
+    seed_release(pool, 801).await;
+    seed_release(pool, 802).await;
+    let until = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(600);
+    let expired = chrono::Utc::now().naive_utc() - chrono::Duration::seconds(5);
+    for (id, at) in [(801, until), (802, expired)] {
+        sqlx::query("INSERT INTO search_index_failures (release_id, operation, attempts, last_error, next_attempt_at) VALUES (?, 'deferred', 0, 'deferred:other', ?)")
+            .bind(id)
+            .bind(at)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    let mut scope = live.client.defer_release_updates(pool);
+    scope.update_release(801).await;
+    scope.update_release(802).await;
+
+    // No lease of its own on 801, so it's indexed now, and the other scope keeps its lease.
+    let page = live.client.search_releases(&all_releases()).await.unwrap();
+    assert_eq!(page.ids, [801]);
+    assert_eq!(
+        lease(pool, 801).await.unwrap().2.as_deref(),
+        Some("deferred:other")
+    );
+    assert_ne!(
+        lease(pool, 802).await.unwrap().2.as_deref(),
+        Some("deferred:other")
+    );
+
+    scope.finish().await;
+    assert!(lease(pool, 802).await.is_none());
+    assert!(lease(pool, 801).await.is_some());
+
+    live.client
+        .sql(&format!("DROP TABLE {}", live.table))
+        .await
+        .unwrap();
+    live.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn update_releases_refreshes_removes_and_reports_failures() {
+    let Some(live) = live().await else {
+        return;
+    };
+    let pool = &live.db.pool;
+    seed_release(pool, 901).await;
+    seed_release(pool, 902).await;
+    sqlx::query("INSERT INTO search_index_failures (release_id, operation, attempts, next_attempt_at) VALUES (901, 'upsert', 2, NOW())")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(
+        live.client
+            .update_releases(pool, &[901, 902, 902, -1, 903])
+            .await
+            .is_empty()
+    );
+    let page = live.client.search_releases(&all_releases()).await.unwrap();
+    assert_eq!(page.ids.len(), 2);
+    let resolved: bool = sqlx::query_scalar(
+        "SELECT resolved_at IS NOT NULL FROM search_index_failures WHERE release_id = 901",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(resolved);
+
+    assert!(live.client.delete_releases(pool, &[901, 902, 901]).await);
+    let page = live.client.search_releases(&all_releases()).await.unwrap();
+    assert!(page.ids.is_empty());
+    assert!(!live.client.delete_releases(pool, &[0]).await);
+
+    let mut config = SearchConfig::new("http://127.0.0.1:9");
+    config.retry_delay_ms = 0;
+    let unreachable = SearchClient::new(config, None).unwrap();
+    assert_eq!(unreachable.update_releases(pool, &[901]).await, [901]);
+    let operation: String =
+        sqlx::query_scalar("SELECT operation FROM search_index_failures WHERE release_id = 901")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(operation, "upsert");
+
+    live.client
+        .sql(&format!("DROP TABLE {}", live.table))
+        .await
+        .unwrap();
+    live.db.drop_database().await.unwrap();
+}

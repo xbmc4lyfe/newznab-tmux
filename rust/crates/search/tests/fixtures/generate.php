@@ -164,6 +164,18 @@ foreach ([
     $external[$name] = ['sets' => $sets, 'limit' => $limit, 'bodies' => $driver->manticoreSearch->bodies];
 }
 
+$lookups = [];
+foreach ([
+    'candidates' => static fn (ManticoreSearchDriver $d) => $d->searchReleaseCandidatesPage('Dead.Circus (2019)!', 21, 5),
+    'exact' => static fn (ManticoreSearchDriver $d) => $d->matchPredbExact('Some.Release-GRP [x]'),
+    'filename' => static fn (ManticoreSearchDriver $d) => $d->searchPredbFilenameCandidates('some.release.nfo'),
+] as $name => $call) {
+    $driver = driverWith();
+    $driver->manticoreSearch = new RecordingClient(['host' => '127.0.0.1', 'port' => 1]);
+    $call($driver);
+    $lookups[$name] = $driver->manticoreSearch->bodies;
+}
+
 // Results from a real Manticore, through the real client.
 $documents = json_decode((string) file_get_contents($here.'/documents.json'), true, flags: JSON_THROW_ON_ERROR);
 $port = (int) (getenv('TEST_MANTICORE_HTTP_PORT') ?: 39308);
@@ -223,12 +235,24 @@ $results['tv'] = [['lost', $live->searchTvShows('lost')], ['nosuch', $live->sear
 $results['movies'] = [['matrix', $live->searchMovies('matrix')], ['keanu', $live->searchMovies('keanu')]];
 $results['movies_by_fields'] = [[ordered(['title' => 'matrix', 'director' => 'wachowski', 'bogus' => 'x']), $live->searchMoviesByFields(['title' => 'matrix', 'director' => 'wachowski', 'bogus' => 'x'])]];
 $results['movie_external'] = [[['imdbid' => '0133093'], $live->searchMovieByExternalIds(['imdbid' => '0133093'])], [['tmdbid' => 404], $live->searchMovieByExternalIds(['tmdbid' => 404])]];
+$results['candidates'] = [];
+foreach ([['dead circus', 1, 0], ['dead circus', 21, 0], ['dead circus', 21, 1], ['...', 21, 0], ['nosuch', 21, 0]] as [$title, $limit, $after]) {
+    $results['candidates'][] = [$title, $limit, $after, $live->searchReleaseCandidatesPage($title, $limit, $after)];
+}
+$results['predb_exact'] = [];
+foreach (['Some.Release-GRP', 'some.release-grp', 'some.release.nfo', 'Some.Release', '...', 'nosuch'] as $name) {
+    $results['predb_exact'][] = [$name, $live->matchPredbExact($name)];
+}
+$results['predb_filename'] = [];
+foreach (['some.release.nfo', 'some', 'nosuch', '*', '0'] as $term) {
+    $results['predb_filename'][] = [$term, $live->searchPredbFilenameCandidates($term)];
+}
 foreach ($indexes as $table) {
     $live->manticoreSearch->sql('DROP TABLE IF EXISTS '.$table, true);
 }
 
 file_put_contents($here.'/golden.json', json_encode(
-    ['pure' => $pure, 'requests' => $requests, 'external_requests' => $external, 'results' => $results],
+    ['pure' => $pure, 'requests' => $requests, 'external_requests' => $external, 'lookups' => $lookups, 'results' => $results],
     JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE
 )."\n");
 echo "wrote golden.json\n";

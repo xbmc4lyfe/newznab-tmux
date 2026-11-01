@@ -1,8 +1,10 @@
 //! The read API that `api`, `site` and the workers call, from `ManticoreSearchDriver`.
 
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use std::time::Instant;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tracing::{debug, warn};
@@ -10,8 +12,9 @@ use tracing::{debug, warn};
 use crate::cache;
 use crate::document::ReleaseDocument;
 use crate::query::{
-    build_field_search_expression, escape_string, extract_suggestion, fuzzy_clean, has_negation,
-    levenshtein, php_empty, php_trim, prepare_user_search_query, scope_release_search_query,
+    build_field_search_expression, escape_literal, escape_string, extract_suggestion, fuzzy_clean,
+    has_negation, levenshtein, php_empty, php_trim, prepare_user_search_query,
+    scope_release_search_query, scope_to_field, title_tokens,
 };
 use crate::registry::{
     PROFILE_FUZZY_DISTANCE, RANKER, SecondaryIndex, autocomplete_fields, field_weights,
@@ -114,7 +117,7 @@ struct ParsedHits {
 }
 
 /// Manticore sends ids as numbers, but as strings above the range JSON numbers cover safely.
-fn parse_id(id: &Value) -> Result<i64, SearchError> {
+pub(crate) fn parse_id(id: &Value) -> Result<i64, SearchError> {
     id.as_i64()
         .or_else(|| id.as_str().and_then(|text| text.parse().ok()))
         .ok_or_else(|| SearchError::Malformed(format!("bad document id {id}")))
@@ -714,23 +717,12 @@ impl SearchClient {
                 DEFAULT_LIMIT,
             )
             .await?;
-        let text = |row: &Map<String, Value>, field: &str| {
-            row.get(field)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
-        };
         Ok(hits
             .id
             .iter()
             .zip(&hits.data)
             .filter(|(id, _)| **id > 0)
-            .map(|(id, row)| PredbHit {
-                id: *id,
-                title: text(row, "title"),
-                filename: text(row, "filename"),
-                source: text(row, "source"),
-            })
+            .map(|(id, row)| predb_hit(*id, row))
             .collect())
     }
 
@@ -840,28 +832,194 @@ impl SearchClient {
         Ok(None)
     }
 
-    /// The PreDB row whose title or filename is exactly `name`.
-    pub async fn match_predb_exact(&self, _name: &str) -> Result<Option<PredbHit>, SearchError> {
-        Err(SearchError::NotPorted("match_predb_exact"))
+    /// The PreDB row whose title or filename is exactly `name`, ignoring case.
+    pub async fn match_predb_exact(&self, name: &str) -> Result<Option<PredbHit>, SearchError> {
+        if !name.chars().any(char::is_alphanumeric) {
+            return Ok(None);
+        }
+        let literal = escape_literal(name);
+        let wanted = name.to_lowercase();
+        let table = self.config.indexes.table("predb");
+        for field in ["title", "filename"] {
+            // These are full-text fields, so the phrase anchors to the whole field, and the
+            // comparison below decides the match.
+            let body = json!({
+                "table": table,
+                "limit": 5,
+                "query": {"bool": {"must": [{
+                    "query_string": format!("@{field} \"^{literal}$\"")
+                }]}},
+            });
+            let hits = parse_hits(&self.search(&body).await?)?;
+            for (id, row) in hits.ids.iter().zip(&hits.sources) {
+                let hit = predb_hit(*id, row);
+                let value = if field == "title" {
+                    &hit.title
+                } else {
+                    &hit.filename
+                };
+                if hit.id > 0 && !hit.title.is_empty() && value.to_lowercase() == wanted {
+                    return Ok(Some(hit));
+                }
+            }
+        }
+        Ok(None)
     }
 
-    /// PreDB rows that could own this filename, or None when the result can't be trusted.
+    /// PreDB rows that could own this filename, for attaching an identity. Ok(None) means the
+    /// result can't be trusted to be complete: a full window, a warning, an estimated total or
+    /// a row outside what the table can hold. This skips the cache, which can't attest either.
     pub async fn search_predb_filename_candidates(
         &self,
-        _term: &str,
+        term: &str,
     ) -> Result<Option<Vec<PredbHit>>, SearchError> {
-        Err(SearchError::NotPorted("search_predb_filename_candidates"))
+        let prepared = prepare_user_search_query(term);
+        if php_empty(&prepared) {
+            return Ok(None);
+        }
+        let expression = format!(
+            "@@relaxed {}",
+            scope_release_search_query(term, &prepared, "@(title,filename)")
+        );
+        let body = json!({
+            "table": self.config.indexes.table("predb"),
+            "max_matches": 1000,
+            "limit": 1000,
+            "strip_bad_utf8": false,
+            "query": {"bool": {"must": [{"query_string": expression}]}},
+        });
+        let response = self.search(&body).await?;
+        let rows = response.pointer("/hits/hits").and_then(Value::as_array);
+        let total = response.pointer("/hits/total").and_then(Value::as_u64);
+        let warned = response
+            .get("warning")
+            .is_some_and(|warning| !warning.is_null() && warning.as_str() != Some(""));
+        let (Some(rows), Some(total)) = (rows, total) else {
+            return Ok(None);
+        };
+        // A full window is denied even when the total agrees: max_matches bounds what Manticore
+        // nominates, so it doesn't prove there's nothing more.
+        if response.get("timed_out") != Some(&Value::Bool(false))
+            || warned
+            || response
+                .pointer("/hits/total_relation")
+                .and_then(Value::as_str)
+                != Some("eq")
+            || total != rows.len() as u64
+            || rows.len() >= 1000
+        {
+            return Ok(None);
+        }
+        Ok(rows.iter().map(filename_candidate).collect())
     }
 
-    /// Releases that may match a title, a page at a time by ascending id.
+    /// Releases that may match a title, a page at a time by ascending id. The title is data, not
+    /// search syntax, and the caller confirms the literal match. A title with no letters or
+    /// numbers can't be searched, which is a `RejectedQuery`, not an empty page.
     pub async fn search_release_candidates_page(
         &self,
-        _title: &str,
-        _limit: u64,
-        _after_id: i64,
+        title: &str,
+        limit: u64,
+        after_id: i64,
     ) -> Result<ReleaseCandidates, SearchError> {
-        Err(SearchError::NotPorted("search_release_candidates_page"))
+        if !(1..=1000).contains(&limit) || after_id < 0 {
+            return Err(SearchError::InvalidArgument(
+                "candidate pages take a limit from 1 to 1000 and a nonnegative cursor",
+            ));
+        }
+        self.require_available().await?;
+        let tokens = title_tokens(title);
+        if tokens.is_empty() {
+            return Err(SearchError::RejectedQuery(
+                "the title has no letters or numbers".to_owned(),
+            ));
+        }
+        let prepared = prepare_user_search_query(&tokens);
+        let expression = format!(
+            "@@relaxed ({} | {})",
+            scope_to_field(&prepared, "@name"),
+            scope_to_field(&prepared, "@searchname")
+        );
+        let body = json!({
+            "table": self.config.indexes.table("releases"),
+            "strip_bad_utf8": true,
+            "query": {"bool": {"must": [
+                {"query_string": expression},
+                {"range": {"id": {"gt": after_id}}},
+            ]}},
+            "sort": [{"id": "asc"}],
+            "options": {"ranker": RANKER, "field_weights": field_weights("releases")},
+            "max_matches": limit + 1,
+            "limit": limit + 1,
+        });
+        let response = self.search(&body).await?;
+        if response.get("timed_out") == Some(&Value::Bool(true)) {
+            return Err(SearchError::Malformed(
+                "the release candidate response was partial".to_owned(),
+            ));
+        }
+        let mut ids = parse_hits(&response)?.ids;
+        let mut previous = after_id;
+        for id in &ids {
+            if *id <= previous {
+                return Err(SearchError::Malformed(
+                    "the release candidate response lost its cursor order".to_owned(),
+                ));
+            }
+            previous = *id;
+        }
+        let window = usize::try_from(limit).unwrap_or(usize::MAX);
+        if ids.len() > window + 1 {
+            return Err(SearchError::Malformed(
+                "the release candidate response overran its window".to_owned(),
+            ));
+        }
+        let has_more = ids.len() > window;
+        ids.truncate(window);
+        Ok(ReleaseCandidates { ids, has_more })
     }
+}
+
+fn predb_hit(id: i64, row: &Map<String, Value>) -> PredbHit {
+    let text = |field: &str| {
+        row.get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    PredbHit {
+        id,
+        title: text("title"),
+        filename: text("filename"),
+        source: text("source"),
+    }
+}
+
+/// A hit that's safe to attach as an identity, or None. The limits are the source columns'
+/// sizes, not truncation targets. `U+FFFD` is refused because the HTTP layer writes it over
+/// bytes that weren't UTF-8, which PHP refused directly.
+fn filename_candidate(row: &Value) -> Option<PredbHit> {
+    static CONTROL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\p{C}").expect("valid pattern"));
+
+    let source = row.get("_source")?.as_object()?;
+    let id = parse_id(row.get("_id")?).ok().filter(|id| *id > 0)?;
+    let optional = |field: &str| match source.get(field) {
+        None | Some(Value::Null) => Some(""),
+        Some(value) => value.as_str(),
+    };
+    let title = source.get("title")?.as_str().filter(|t| !t.is_empty())?;
+    let filename = optional("filename")?;
+    let origin = optional("source")?;
+    for (value, maximum) in [(title, 255), (filename, 255), (origin, 50)] {
+        if value.chars().count() > maximum || value.contains('\u{FFFD}') {
+            return None;
+        }
+    }
+    if CONTROL.is_match(title) || CONTROL.is_match(filename) || title.contains(['/', '\\', '|']) {
+        return None;
+    }
+    Some(predb_hit(id, source))
 }
 
 fn first_field<'a>(source: &'a Map<String, Value>, fields: &[&str]) -> Option<&'a str> {
