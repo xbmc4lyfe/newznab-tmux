@@ -2,7 +2,7 @@ name: Benchmark Pages
 
 on:
   push:
-    branches: [master]
+    branches: [rust-native]
   pull_request:
     paths:
       - '.github/workflows/benchmark-pages.yml'
@@ -27,7 +27,7 @@ on:
   workflow_run:
     workflows: ['Rust', 'Rust indexer', 'rust-clippy analyze']
     types: [in_progress, completed]
-    branches: [master]
+    branches: [rust-native]
   workflow_dispatch:
 
 permissions:
@@ -37,9 +37,9 @@ env:
   PYTHONDONTWRITEBYTECODE: 1
 
 # Serialize collection as well as deployment. Old completion events refresh the
-# current master, and cannot publish an older rendered snapshot after a new one.
+# current rust-native, and cannot publish an older rendered snapshot after a new one.
 concurrency:
-  group: benchmark-pages-${{ github.event_name == 'pull_request' && github.ref || 'master' }}
+  group: benchmark-pages-${{ github.event_name == 'pull_request' && github.ref || 'rust-native' }}
   cancel-in-progress: false
 
 jobs:
@@ -59,7 +59,7 @@ jobs:
           if [[ "$EVENT_NAME" == 'pull_request' ]]; then
             sha="$EVENT_SHA"
           else
-            sha=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/master --jq .object.sha)
+            sha=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/rust-native --jq .object.sha)
           fi
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
@@ -105,8 +105,8 @@ jobs:
       (github.event_name != 'workflow_run' ||
        ((github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
         github.event.workflow_run.head_repository.full_name == github.repository &&
-        github.event.workflow_run.head_branch == 'master')) &&
-      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/master')
+        github.event.workflow_run.head_branch == 'rust-native')) &&
+      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/rust-native')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -130,31 +130,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BUILD_SHA: ${{ steps.identity.outputs.sha }}
         run: python3 -B scripts/benchmark-pages.py --sha="$BUILD_SHA" --output=benchmark-site
-      # Before the cutover master still holds the PHP and the rewrite sits on rust-native, which
-      # dispatches this workflow on each push; measure that branch too. After the cutover the
-      # checkout is the rewrite (no app/), so neither step runs. The denominator is the committed
-      # baseline in scripts/rewrite-metrics/subsystems.toml, which needs no PHP.
-      - name: Check out rust-native for the rewrite ledgers
-        if: hashFiles('app/**/*.php') != ''
-        continue-on-error: true
-        uses: actions/checkout@v5
-        with:
-          ref: rust-native
-          path: rewrite-rust-native
-          persist-credentials: false
-      - name: Set up the PHP that app/ is written for
-        if: hashFiles('app/**/*.php') != ''
-        continue-on-error: true
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.5'
-          coverage: none
       - name: Measure rewrite progress
         continue-on-error: true
         timeout-minutes: 5
         run: |
           set -o pipefail
-          progress=(python3 -B scripts/rewrite-metrics/progress.py --master=. --output=benchmark-site/rewrite-progress.json)
+          progress=(python3 -B scripts/rewrite-metrics/progress.py --rust-native=. --output=benchmark-site/rewrite-progress.json)
           if [[ -d rewrite-rust-native/.git ]]; then
             progress+=(--rust-native=rewrite-rust-native)
           fi
@@ -190,18 +171,18 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Check that master still matches the rendered build
+      - name: Check that rust-native still matches the rendered build
         id: current
         env:
           GH_TOKEN: ${{ github.token }}
           BUILD_SHA: ${{ needs.build.outputs.sha }}
         run: |
-          current=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/master --jq .object.sha)
+          current=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/rust-native --jq .object.sha)
           [[ "$current" =~ ^[0-9a-f]{40}$ ]] || exit 1
           if [[ "$current" == "$BUILD_SHA" ]]; then
             echo 'matches=true' >> "$GITHUB_OUTPUT"
           else
-            echo 'Master advanced; its queued refresh will publish the new build.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'rust-native advanced; its queued refresh will publish the new build.' >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/configure-pages@v5
         if: steps.current.outputs.matches == 'true'
@@ -226,19 +207,19 @@ jobs:
           BUILD_SHA: ${{ needs.build.outputs.sha }}
           PAGE_URL: ${{ steps.deployment.outputs.page_url }}
         run: |
-          current=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/master --jq .object.sha)
+          current=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/rust-native --jq .object.sha)
           [[ "$current" =~ ^[0-9a-f]{40}$ ]] || exit 1
           if [[ "$current" != "$BUILD_SHA" ]]; then
-            echo 'Master advanced; publication verification is superseded by its queued refresh.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'rust-native advanced; publication verification is superseded by its queued refresh.' >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           if python3 -B scripts/verify-benchmark-pages.py verify --manifest=expected-publication/publication.json --sha="$BUILD_SHA" --url="$PAGE_URL"; then
             echo "Verified every published file against tested source $BUILD_SHA." >> "$GITHUB_STEP_SUMMARY"
           else
-            current=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/master --jq .object.sha)
+            current=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/rust-native --jq .object.sha)
             [[ "$current" =~ ^[0-9a-f]{40}$ ]] || exit 1
             if [[ "$current" != "$BUILD_SHA" ]]; then
-              echo 'Master advanced; publication verification is superseded by its queued refresh.' >> "$GITHUB_STEP_SUMMARY"
+              echo 'rust-native advanced; publication verification is superseded by its queued refresh.' >> "$GITHUB_STEP_SUMMARY"
             else
               echo 'Current-source publication verification failed.' >> "$GITHUB_STEP_SUMMARY"
               exit 1

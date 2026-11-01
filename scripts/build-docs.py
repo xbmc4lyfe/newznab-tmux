@@ -94,9 +94,9 @@ def rewrite_progress(report_path):
         branch = (f' <code>rust-native</code> at {commit_link(rust_native["commit"])} has {int(rust_native["live_php"]):,} lines of live PHP '
                   f'and {int(rust_native["rust_lines"]):,} lines of Rust in its crates, because its PHP was deleted before the port began.')
     if int(master['live_php']) == 0:
-        master_note = f'<code>master</code> at {commit_link(master["commit"])} has no live PHP left.'
+        master_note = f'<code>rust-native</code> at {commit_link(master["commit"])} has no live PHP left.'
     else:
-        master_note = (f'<code>master</code> at {commit_link(master["commit"])} still has {int(master["live_php"]):,} lines of live PHP, '
+        master_note = (f'<code>rust-native</code> at {commit_link(master["commit"])} still has {int(master["live_php"]):,} lines of live PHP, '
                        f'{float(master["removed_pct"]):.1f}% fewer than the baseline.')
     return (
         f'<p class="rewrite-figure"><strong>{headline:.1f}%</strong> of the way to replacing PHP with Rust</p>'
@@ -105,7 +105,7 @@ def rewrite_progress(report_path):
         f'Each subsystem counts by the share of its entry points that are ported or dropped: {int(entries["done"]):,} of {int(entries["total"]):,} so far. '
         f'Shared code follows the average of the others.</p>'
         f'<p>{master_note}{branch}</p>'
-        '<table><thead><tr><th>Subsystem</th><th>Entry points done</th><th>PHP at baseline</th><th>PHP on master</th><th>Rust in the workspace</th></tr></thead>'
+        '<table><thead><tr><th>Subsystem</th><th>Entry points done</th><th>PHP at baseline</th><th>PHP on rust-native</th><th>Rust in the workspace</th></tr></thead>'
         f'<tbody>{rows}</tbody></table>')
 
 
@@ -179,22 +179,22 @@ def build(source, output, benchmark_page=None):
             body = heading + benchmark.partition(heading)[2]
             body = re.sub(r'</?(?:body|html)\s*>', '', body, flags=re.IGNORECASE)
             values = dict(TITLE='Current benchmark report', NAVIGATION=navigation('performance'),
-                          CONTENT=body, SOURCE_URL=f'{REPOSITORY}/blob/master/scripts/benchmark-pages.py',
-                          EDIT_URL=f'{REPOSITORY}/edit/master/scripts/benchmark-pages.py', PAGE_CLASS='document')
+                          CONTENT=body, SOURCE_URL=f'{REPOSITORY}/blob/rust-native/scripts/benchmark-pages.py',
+                          EDIT_URL=f'{REPOSITORY}/edit/rust-native/scripts/benchmark-pages.py', PAGE_CLASS='document')
             benchmark = re.sub(r'\{\{([A-Z_]+)\}\}', lambda match: values.get(match[1], match[0]), template)
         (output / 'performance-current.html').write_text(benchmark, encoding='utf-8')
     elif not (output / 'performance-current.html').exists():
         values = dict(TITLE='Current benchmark report', NAVIGATION=navigation('performance'),
                       CONTENT='<h1>Current benchmark report</h1><p>Current benchmark collection is unavailable in this build. No performance conclusion can be drawn from this placeholder.</p><p><a href="performance.html">Read the performance evidence guide</a>.</p>',
-                      SOURCE_URL=f'{REPOSITORY}/blob/master/scripts/benchmark-pages.py',
-                      EDIT_URL=f'{REPOSITORY}/edit/master/scripts/benchmark-pages.py', PAGE_CLASS='document')
+                      SOURCE_URL=f'{REPOSITORY}/blob/rust-native/scripts/benchmark-pages.py',
+                      EDIT_URL=f'{REPOSITORY}/edit/rust-native/scripts/benchmark-pages.py', PAGE_CLASS='document')
         placeholder = re.sub(r'\{\{([A-Z_]+)\}\}', lambda match: values.get(match[1], match[0]), template)
         (output / 'performance-current.html').write_text(placeholder, encoding='utf-8')
     search = []
     for slug, title, fragment, plain in documents:
         values = dict(TITLE=escape(title), NAVIGATION=navigation(slug), CONTENT=fragment,
-                      SOURCE_URL=f'{REPOSITORY}/blob/master/github-pages/docs/content/{slug}.html',
-                      EDIT_URL=f'{REPOSITORY}/edit/master/github-pages/docs/content/{slug}.html',
+                      SOURCE_URL=f'{REPOSITORY}/blob/rust-native/github-pages/docs/content/{slug}.html',
+                      EDIT_URL=f'{REPOSITORY}/edit/rust-native/github-pages/docs/content/{slug}.html',
                       PAGE_CLASS='overview' if slug == 'index' else 'document')
         # Single substitution pass: content containing a placeholder stays content.
         rendered = re.sub(r'\{\{([A-Z_]+)\}\}', lambda match: values.get(match[1], match[0]), template)
