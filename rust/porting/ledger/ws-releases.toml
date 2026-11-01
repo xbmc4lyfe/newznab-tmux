@@ -17,7 +17,8 @@ note = "nntmux-ctl releases delete. Unknown criteria now fail, an unknown group 
 kind = "command"
 id = "nntmux:import-nzbs"
 source = "app/Console/Commands/ImportNzbs.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases import-nzbs, reading NZB_UPLOAD_FOLDER by default, including the uploads crates/api stages. NZBs are only admitted for verification. PHP uploads part way through a custody journal are held for review, so drain them before cutover."
 
 [[entry]]
 kind = "command"
@@ -114,7 +115,8 @@ status = "ported"
 kind = "command"
 id = "releases:verify-candidates"
 source = "app/Console/Commands/VerifyReleaseCandidates.php"
-status = "todo"
+status = "ported"
+note = "The verify role, and nntmux-ctl verify candidates by hand. Prefetching across candidates isn't ported: PHP only used it with RELEASE_VERIFICATION_SAMPLE_BATCH_SIZE above its default of 1."
 
 [[entry]]
 kind = "command"
