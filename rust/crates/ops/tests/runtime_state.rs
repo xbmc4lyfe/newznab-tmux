@@ -101,7 +101,7 @@ async fn a_timed_out_drain_names_the_roles_and_restores() -> Result<()> {
         return Ok(());
     };
     runtime_state::start(&ctx).await?;
-    let work = busy::mark(&ctx, "releases").await;
+    let work = busy::mark(&ctx, "releases").await?;
 
     let failure = runtime_state::drain(&ctx, 0, Some("deploy-1"), &Shutdown::default())
         .await
@@ -134,7 +134,7 @@ async fn a_drain_waits_for_work_to_finish() -> Result<()> {
         return Ok(());
     };
     runtime_state::start(&ctx).await?;
-    let work = busy::mark(&ctx, "verify").await;
+    let work = busy::mark(&ctx, "verify").await?;
     let draining = tokio::spawn({
         let ctx = ctx.clone();
         async move { runtime_state::drain(&ctx, 30, None, &Shutdown::default()).await }
@@ -158,7 +158,7 @@ async fn stop_lasts_until_start_and_clears_a_drain() -> Result<()> {
     let signals = Shutdown::default();
     runtime_state::start(&ctx).await?;
     runtime_state::drain(&ctx, 5, Some("deploy-1"), &signals).await?;
-    let work = busy::mark(&ctx, "ingest").await;
+    let work = busy::mark(&ctx, "ingest").await?;
     let remaining = runtime_state::stop(&ctx, false, 0, &signals).await?;
     assert_eq!(remaining, ["ingest"]);
     assert_eq!(flags(&ctx).await?, (false, true));
