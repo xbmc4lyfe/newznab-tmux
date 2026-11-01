@@ -29,13 +29,15 @@ fn task(
 
 /// Stops a slow export before its next runs pile up behind it.
 const EXPORT_LIMIT: Duration = Duration::from_secs(240);
+/// The command line's default, which `Default` doesn't carry.
+const TV_REPAIR_CHUNK: i64 = 1000;
 /// A wedged service can't hold the every-minute health checks for long.
 const HEALTH_LIMIT: Duration = Duration::from_secs(300);
 
 pub fn tasks() -> Vec<Task<Ctx>> {
     use nntmux_ops::{
-        accounts, activity, disposable, metrics_export, processing_stats, resets, site_status,
-        stats, system_metrics,
+        accounts, activity, clean_directories, disposable, expired_roles, log_index,
+        metrics_export, processing_stats, resets, site_status, stats, system_metrics,
     };
     vec![
         Task {
@@ -52,12 +54,74 @@ pub fn tasks() -> Vec<Task<Ctx>> {
                 },
             )
         },
+        // Always on: the post-processing kill switch reads this as well as the export.
+        task("processing-stats", EveryMinutes(1), |ctx| {
+            Box::pin(async move { processing_stats::publish(&ctx).await })
+        }),
         Task {
-            enabled: metrics_export::enabled,
-            ..task("processing-stats", EveryMinutes(1), |ctx| {
-                Box::pin(async move { processing_stats::publish(&ctx).await })
+            enabled: log_index::enabled,
+            ..task("nntmux:index-logs", EveryMinutes(1), |ctx| {
+                Box::pin(async move {
+                    let client = nntmux_search::SearchClient::from_ctx(&ctx)?;
+                    log_index::LogIndexer::from_env(&client, &ctx.db)?
+                        .run(&[])
+                        .await?;
+                    Ok(())
+                })
             })
         },
+        task(
+            "tv:reprocess-missing-episodes --scheduled --limit=500",
+            EveryMinutes(30),
+            |ctx| {
+                Box::pin(async move {
+                    let Some(_busy) = busy::enter(&ctx, "tv-episodes").await? else {
+                        return Ok(());
+                    };
+                    let options = nntmux_metadata::TvMissingEpisodesOptions {
+                        scheduled: true,
+                        limit: 500,
+                        ..Default::default()
+                    };
+                    nntmux_metadata::tv_reprocess_missing_episodes(&ctx, options).await
+                })
+            },
+        ),
+        task(
+            "tv:repair-links --legacy --stuck --orphans --limit=50000",
+            Daily {
+                hour: 5,
+                minute: 15,
+            },
+            |ctx| {
+                Box::pin(async move {
+                    let Some(_busy) = busy::enter(&ctx, "tv-repair").await? else {
+                        return Ok(());
+                    };
+                    let options = nntmux_metadata::TvRepairLinksOptions {
+                        legacy: true,
+                        stuck: true,
+                        orphans: true,
+                        limit: 50_000,
+                        chunk: TV_REPAIR_CHUNK,
+                        ..Default::default()
+                    };
+                    nntmux_metadata::tv_repair_links(&ctx, options).await
+                })
+            },
+        ),
+        task("nntmux:update-expired-roles", Cadence::MIDNIGHT, |ctx| {
+            Box::pin(async move {
+                expired_roles::update_expired_roles(&ctx).await?;
+                Ok(())
+            })
+        }),
+        task("clean:directories", Cadence::Hourly, |_| {
+            Box::pin(async move {
+                clean_directories::clean_all().await?;
+                Ok(())
+            })
+        }),
         task("nntmux:check-service-health", EveryMinutes(1), |ctx| {
             Box::pin(async move {
                 tokio::time::timeout(

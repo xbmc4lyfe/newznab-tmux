@@ -83,3 +83,11 @@ kind = "command"
 id = "nntmux:fetch-movie"
 source = "app/Console/Commands/FetchMovieByImdb.php"
 status = "ported"
+note = "Moved from ws-ops."
+
+[[entry]]
+kind = "command"
+id = "nntmux:populate-steam-apps"
+source = "app/Console/Commands/NntmuxPopulateSteamApps.php"
+status = "todo"
+note = "Moved from ws-ops."

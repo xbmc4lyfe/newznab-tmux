@@ -2363,6 +2363,9 @@ name = "nntmux-ctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "bcrypt",
+ "chrono",
  "clap",
  "nntmux-admin",
  "nntmux-categorize",
@@ -2380,7 +2383,12 @@ dependencies = [
  "nntmux-runtime",
  "nntmux-search",
  "nntmux-telemetry",
+ "nntmux-testkit",
  "nntmux-verify",
+ "nntmux-webkit",
+ "rand 0.9.5",
+ "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -2588,6 +2596,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "futures-util",
+ "hex",
  "nntmux-categorize",
  "nntmux-core",
  "nntmux-metadata",
@@ -2599,9 +2608,11 @@ dependencies = [
  "nntmux-verify",
  "nntmux-webkit",
  "redis",
+ "regex",
  "reqwest",
  "rustix",
  "serde_json",
+ "sha1 0.10.7",
  "sqlx",
  "tempfile",
  "tokio",
@@ -2614,16 +2625,23 @@ name = "nntmux-postprocess"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "crc32fast",
  "hex",
  "md-5 0.10.6",
  "nntmux-core",
+ "nntmux-nntp",
+ "nntmux-namefix",
+ "nntmux-nntp",
  "nntmux-metadata",
+ "rust-native
  "nntmux-runtime",
  "nntmux-testkit",
  "nntmux-verify",
+ "nntmux-yenc",
+ "quick-xml",
  "rand 0.9.5",
  "serde",
  "serde_json",
@@ -2795,9 +2813,11 @@ dependencies = [
  "metrics",
  "nntmux-admin",
  "nntmux-core",
+ "nntmux-metadata",
  "nntmux-namefix",
  "nntmux-ops",
  "nntmux-runtime",
+ "nntmux-search",
  "nntmux-testkit",
  "redis",
  "serde_json",
@@ -2812,11 +2832,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "metrics",
  "metrics-exporter-prometheus",
+ "nntmux-core",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
 ]
 
@@ -2906,6 +2930,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "ipnet",
+ "md-5 0.10.6",
  "nntmux-core",
  "nntmux-runtime",
  "nntmux-testkit",
@@ -4292,6 +4317,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4632,6 +4663,19 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]

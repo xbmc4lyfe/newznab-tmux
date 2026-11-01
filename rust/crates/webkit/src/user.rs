@@ -2,7 +2,10 @@
 
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use sqlx::{FromRow, MySqlPool};
+use md5::{Digest, Md5};
+use sqlx::{FromRow, MySql, MySqlPool, Transaction};
+
+use crate::session::random_string;
 
 /// Spatie's `model_type` for users, as Laravel stored it.
 pub const USER_MODEL: &str = "App\\Models\\User";
@@ -218,6 +221,64 @@ pub async fn category_exclusions(
     hidden.sort_unstable();
     hidden.dedup();
     Ok(hidden)
+}
+
+/// Inserts the account with its role and the view permissions that role allows, which is what
+/// the observer and `grantInheritedPermissions` did. Category access checks direct permissions.
+pub async fn create_user(
+    tx: &mut Transaction<'_, MySql>,
+    username: &str,
+    email: &str,
+    password_hash: &str,
+    host: &str,
+    role: i32,
+    invites: i32,
+) -> Result<i64> {
+    let rate_limit: Option<i32> = sqlx::query_scalar("SELECT rate_limit FROM roles WHERE id = ?")
+        .bind(role)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let api_token = hex::encode(Md5::digest(random_string(40).as_bytes()));
+    let id = sqlx::query(
+        "INSERT INTO users (username, email, password, host, roles_id, notes, invites, api_token, rate_limit,
+                            verified, email_verified_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, 0, NULL, NOW(), NOW())",
+    )
+    .bind(username)
+    .bind(email)
+    .bind(password_hash)
+    .bind(host)
+    .bind(role)
+    .bind(invites)
+    .bind(api_token)
+    .bind(rate_limit.unwrap_or(60))
+    .execute(&mut **tx)
+    .await?
+    .last_insert_id();
+    sqlx::query("INSERT INTO model_has_roles (role_id, model_type, model_id) VALUES (?, ?, ?)")
+        .bind(role)
+        .bind(USER_MODEL)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    let names = CATEGORY_PERMISSIONS
+        .iter()
+        .map(|(name, _)| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let grant = format!(
+        "INSERT INTO model_has_permissions (permission_id, model_type, model_id)
+         SELECT p.id, ?, ? FROM permissions p
+         JOIN role_has_permissions rp ON rp.permission_id = p.id
+         WHERE rp.role_id = ? AND p.name IN ({names})"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(grant))
+        .bind(USER_MODEL)
+        .bind(id)
+        .bind(role)
+        .execute(&mut **tx)
+        .await?;
+    Ok(id as i64)
 }
 
 #[cfg(test)]

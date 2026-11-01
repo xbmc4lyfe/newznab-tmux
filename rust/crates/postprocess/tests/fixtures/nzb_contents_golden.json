@@ -1,0 +1,4489 @@
+{
+    "documents": [
+        {
+            "name": "rar set",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"[1/4] - &quot;Movie.2160p.part02.rar&quot; yEnc (1/2)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">b1@x</segment><segment bytes=\"1000\" number=\"2\">b2@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"[2/4] - &quot;Movie.2160p.part01.rar&quot; yEnc (1/2)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"2\">a2@x</segment><segment bytes=\"1000\" number=\"1\">a1@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"[3/4] - &quot;Movie.2160p.par2&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">p@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"[4/4] - &quot;Movie.2160p.vol00+01.par2&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"77\" number=\"1\">v@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "[2/4] - \"Movie.2160p.part01.rar\" yEnc (1/2)",
+                    "segments": [
+                        "a1@x",
+                        "a2@x"
+                    ],
+                    "size": 2000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "[1/4] - \"Movie.2160p.part02.rar\" yEnc (1/2)",
+                    "segments": [
+                        "b1@x",
+                        "b2@x"
+                    ],
+                    "size": 2000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "[3/4] - \"Movie.2160p.par2\" yEnc (1/1)",
+                    "segments": [
+                        "p@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "[4/4] - \"Movie.2160p.vol00+01.par2\" yEnc (1/1)",
+                    "segments": [
+                        "v@x"
+                    ],
+                    "size": 77,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": [
+                {
+                    "name": "Movie.2160p.part02.rar",
+                    "firstMessageId": "b1@x"
+                },
+                {
+                    "name": "Movie.2160p.part01.rar",
+                    "firstMessageId": "a1@x"
+                },
+                {
+                    "name": "Movie.2160p.par2",
+                    "firstMessageId": "p@x"
+                },
+                {
+                    "name": "Movie.2160p.vol00+01.par2",
+                    "firstMessageId": "v@x"
+                }
+            ]
+        },
+        {
+            "name": "one big mkv",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;Show.S01E01.1080p.WEB-DL.mkv&quot; yEnc (1/3)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">m1@x</segment><segment bytes=\"1000\" number=\"2\">m2@x</segment><segment bytes=\"1000\" number=\"3\">m3@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"Show.S01E01.1080p.WEB-DL.mkv\" yEnc (1/3)",
+                    "segments": [
+                        "m1@x",
+                        "m2@x",
+                        "m3@x"
+                    ],
+                    "size": 3000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": [
+                {
+                    "name": "Show.S01E01.1080p.WEB-DL.mkv",
+                    "firstMessageId": "m1@x"
+                }
+            ]
+        },
+        {
+            "name": "split mkv",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;Film.mkv.001&quot; yEnc (1/2)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">f1@x</segment><segment bytes=\"1000\" number=\"2\">f2@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"&quot;Film.mkv.002&quot; yEnc (1/2)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">g1@x</segment><segment bytes=\"1000\" number=\"2\">g2@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"&quot;Film.mkv.010&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">h1@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"Film.mkv.001\" yEnc (1/2)",
+                    "segments": [
+                        "f1@x",
+                        "f2@x"
+                    ],
+                    "size": 2000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "\"Film.mkv.002\" yEnc (1/2)",
+                    "segments": [
+                        "g1@x",
+                        "g2@x"
+                    ],
+                    "size": 2000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "\"Film.mkv.010\" yEnc (1/1)",
+                    "segments": [
+                        "h1@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": [
+                {
+                    "name": "Film.mkv.001",
+                    "firstMessageId": "f1@x"
+                },
+                {
+                    "name": "Film.mkv.002",
+                    "firstMessageId": "g1@x"
+                },
+                {
+                    "name": "Film.mkv.010",
+                    "firstMessageId": "h1@x"
+                }
+            ]
+        },
+        {
+            "name": "merged by strip count",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"Pack 1 of 3 &quot;data.bin&quot; yEnc\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">d1@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"Pack 2 of 3 &quot;data.bin&quot; yEnc\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"2\">d2@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "Pack 2 of 3 \"data.bin\" yEnc",
+                    "segments": [
+                        "d1@x",
+                        "d2@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 2,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": null
+        },
+        {
+            "name": "old rar naming",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;Old.r00&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">r0@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"&quot;Old.rar&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">r@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"&quot;Old.r01&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">r1@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"Old.rar\" yEnc (1/1)",
+                    "segments": [
+                        "r@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "\"Old.r00\" yEnc (1/1)",
+                    "segments": [
+                        "r0@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "\"Old.r01\" yEnc (1/1)",
+                    "segments": [
+                        "r1@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": [
+                {
+                    "name": "Old.r00",
+                    "firstMessageId": "r0@x"
+                },
+                {
+                    "name": "Old.rar",
+                    "firstMessageId": "r@x"
+                },
+                {
+                    "name": "Old.r01",
+                    "firstMessageId": "r1@x"
+                }
+            ]
+        },
+        {
+            "name": "missing header segment",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;Late.mkv&quot; yEnc (2/2)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"2\">l2@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"Late.mkv\" yEnc (2/2)",
+                    "segments": [
+                        "l2@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": false
+                }
+            ],
+            "inventory": null
+        },
+        {
+            "name": "unnumbered segments",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;Loose.mkv&quot; yEnc (1/2)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\">u2@x</segment><segment bytes=\"12abc\">u1@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"Loose.mkv\" yEnc (1/2)",
+                    "segments": [
+                        "u2@x",
+                        "u1@x"
+                    ],
+                    "size": 1012,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": null
+        },
+        {
+            "name": "case and numbers",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;b10.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">n10@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"&quot;B2.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">n2@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"&quot;b2.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">nb2@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"&quot;a 01.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">a01@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"&quot;a 1.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">a1x@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"B2.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "n2@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "\"a 01.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "a01@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "\"a 1.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "a1x@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "\"b2.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "nb2@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "\"b10.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "n10@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": [
+                {
+                    "name": "b10.mkv",
+                    "firstMessageId": "n10@x"
+                },
+                {
+                    "name": "B2.mkv",
+                    "firstMessageId": "n2@x"
+                },
+                {
+                    "name": "b2.mkv",
+                    "firstMessageId": "nb2@x"
+                },
+                {
+                    "name": "a 01.mkv",
+                    "firstMessageId": "a01@x"
+                },
+                {
+                    "name": "a 1.mkv",
+                    "firstMessageId": "a1x@x"
+                }
+            ]
+        },
+        {
+            "name": "declared count ok",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head><meta type=\"nntmux:declared-file-count\">1</meta></head><file poster=\"p\" date=\"1\" subject=\"&quot;Ok.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">ok@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"Ok.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "ok@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": [
+                {
+                    "name": "Ok.mkv",
+                    "firstMessageId": "ok@x"
+                }
+            ]
+        },
+        {
+            "name": "declared count too high",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head><meta type=\"nntmux:declared-file-count\">2</meta></head><file poster=\"p\" date=\"1\" subject=\"&quot;Ok.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">ok@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"Ok.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "ok@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": null
+        },
+        {
+            "name": "unsafe name",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;../escape.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">e@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"../escape.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "e@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": null
+        },
+        {
+            "name": "dot name",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;.hidden.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">e@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\".hidden.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "e@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": null
+        },
+        {
+            "name": "part count mismatch",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;Short.mkv&quot; yEnc (1/3)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">s1@x</segment><segment bytes=\"1000\" number=\"2\">s2@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"Short.mkv\" yEnc (1/3)",
+                    "segments": [
+                        "s1@x",
+                        "s2@x"
+                    ],
+                    "size": 2000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": null
+        },
+        {
+            "name": "duplicate first article",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;One.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">same@x</segment></segments></file><file poster=\"p\" date=\"1\" subject=\"&quot;Two.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">same@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"One.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "same@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                },
+                {
+                    "title": "\"Two.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "same@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": null
+        },
+        {
+            "name": "bare subject",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"Bare.Name.mkv yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">bare@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "Bare.Name.mkv yEnc (1/1)",
+                    "segments": [
+                        "bare@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": [
+                {
+                    "name": "Bare.Name.mkv",
+                    "firstMessageId": "bare@x"
+                }
+            ]
+        },
+        {
+            "name": "entity",
+            "xml": "<?xml version=\"1.0\"?><!DOCTYPE nzb [<!ENTITY x \"y\">]><nzb><file subject=\"&quot;E.mkv&quot; yEnc (1/1)\"><segments><segment number=\"1\" bytes=\"1\">e@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"E.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "e@x"
+                    ],
+                    "size": 1,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": null
+        },
+        {
+            "name": "escaped text",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;Amp &amp;amp; Co.mkv&quot; yEnc (1/1)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">a&amp;b@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"Amp &amp; Co.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "a&b@x"
+                    ],
+                    "size": 1000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": [
+                {
+                    "name": "Amp &amp; Co.mkv",
+                    "firstMessageId": "a&b@x"
+                }
+            ]
+        },
+        {
+            "name": "control bytes",
+            "xml": "<nzb>\u000f<file subject=\"&quot;C.mkv&quot; yEnc (1/1)\"><segments><segment number=\"1\" bytes=\"5\">c@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"C.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "c@x"
+                    ],
+                    "size": 5,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": null
+        },
+        {
+            "name": "other control byte",
+            "xml": "<nzb>\u0001<file subject=\"&quot;C.mkv&quot; yEnc (1/1)\"><segments><segment number=\"1\" bytes=\"5\">c@x</segment></segments></file></nzb>",
+            "files": [],
+            "inventory": null
+        },
+        {
+            "name": "wrong root",
+            "xml": "<notnzb><file subject=\"x\"/></notnzb>",
+            "files": [],
+            "inventory": null
+        },
+        {
+            "name": "broken",
+            "xml": "<nzb><file subject=\"x\">",
+            "files": [],
+            "inventory": null
+        },
+        {
+            "name": "cut after a file",
+            "xml": "<nzb><file subject=\"&quot;A.mkv&quot; yEnc (1/1)\"><segments><segment number=\"1\" bytes=\"5\">a@x</segment></segments></file>",
+            "files": [],
+            "inventory": null
+        },
+        {
+            "name": "cut inside a later file",
+            "xml": "<nzb><file subject=\"&quot;A.mkv&quot; yEnc (1/1)\"><segments><segment number=\"1\" bytes=\"5\">a@x</segment></segments></file><file subject=\"&quot;B.mkv&quot; yEnc (1/1)\"><segments>",
+            "files": [],
+            "inventory": null
+        },
+        {
+            "name": "repeated segment number",
+            "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><file poster=\"p\" date=\"1\" subject=\"&quot;Twice.mkv&quot; yEnc (1/2)\"><groups><group>alt.binaries.test</group></groups><segments><segment bytes=\"1000\" number=\"1\">t1@x</segment><segment bytes=\"1000\" number=\"1\">t2@x</segment></segments></file></nzb>",
+            "files": [
+                {
+                    "title": "\"Twice.mkv\" yEnc (1/2)",
+                    "segments": [
+                        "t1@x",
+                        "t2@x"
+                    ],
+                    "size": 2000,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": null
+        },
+        {
+            "name": "empty nzb",
+            "xml": "<nzb/>",
+            "files": [],
+            "inventory": null
+        },
+        {
+            "name": "uppercase root",
+            "xml": "<NZB><file subject=\"&quot;U.mkv&quot; yEnc (1/1)\"><segments><segment number=\"1\" bytes=\"9\">u@x</segment></segments></file></NZB>",
+            "files": [
+                {
+                    "title": "\"U.mkv\" yEnc (1/1)",
+                    "segments": [
+                        "u@x"
+                    ],
+                    "size": 9,
+                    "filecount": 1,
+                    "firstsegment": true
+                }
+            ],
+            "inventory": [
+                {
+                    "name": "U.mkv",
+                    "firstMessageId": "u@x"
+                }
+            ]
+        }
+    ],
+    "strnatcmp": [
+        [
+            "a",
+            "a",
+            0
+        ],
+        [
+            "a",
+            "A",
+            1
+        ],
+        [
+            "a",
+            "a1",
+            -1
+        ],
+        [
+            "a",
+            "a01",
+            -1
+        ],
+        [
+            "a",
+            "a001",
+            -1
+        ],
+        [
+            "a",
+            "a2",
+            -1
+        ],
+        [
+            "a",
+            "a10",
+            -1
+        ],
+        [
+            "a",
+            "a 1",
+            -1
+        ],
+        [
+            "a",
+            "a  1",
+            -1
+        ],
+        [
+            "a",
+            " a1",
+            -1
+        ],
+        [
+            "a",
+            "a1b",
+            -1
+        ],
+        [
+            "a",
+            "a1.5",
+            -1
+        ],
+        [
+            "a",
+            "a1.10",
+            -1
+        ],
+        [
+            "a",
+            "x0.5",
+            -1
+        ],
+        [
+            "a",
+            "x0.05",
+            -1
+        ],
+        [
+            "a",
+            "1",
+            1
+        ],
+        [
+            "a",
+            "01",
+            1
+        ],
+        [
+            "a",
+            "10",
+            1
+        ],
+        [
+            "a",
+            "9",
+            1
+        ],
+        [
+            "a",
+            "",
+            1
+        ],
+        [
+            "a",
+            "part01",
+            -1
+        ],
+        [
+            "a",
+            "part1",
+            -1
+        ],
+        [
+            "a",
+            "z",
+            -1
+        ],
+        [
+            "a",
+            "Z",
+            1
+        ],
+        [
+            "a",
+            "img12.png",
+            -1
+        ],
+        [
+            "a",
+            "img10.png",
+            -1
+        ],
+        [
+            "a",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "a",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "A",
+            "a",
+            -1
+        ],
+        [
+            "A",
+            "A",
+            0
+        ],
+        [
+            "A",
+            "a1",
+            -1
+        ],
+        [
+            "A",
+            "a01",
+            -1
+        ],
+        [
+            "A",
+            "a001",
+            -1
+        ],
+        [
+            "A",
+            "a2",
+            -1
+        ],
+        [
+            "A",
+            "a10",
+            -1
+        ],
+        [
+            "A",
+            "a 1",
+            -1
+        ],
+        [
+            "A",
+            "a  1",
+            -1
+        ],
+        [
+            "A",
+            " a1",
+            -1
+        ],
+        [
+            "A",
+            "a1b",
+            -1
+        ],
+        [
+            "A",
+            "a1.5",
+            -1
+        ],
+        [
+            "A",
+            "a1.10",
+            -1
+        ],
+        [
+            "A",
+            "x0.5",
+            -1
+        ],
+        [
+            "A",
+            "x0.05",
+            -1
+        ],
+        [
+            "A",
+            "1",
+            1
+        ],
+        [
+            "A",
+            "01",
+            1
+        ],
+        [
+            "A",
+            "10",
+            1
+        ],
+        [
+            "A",
+            "9",
+            1
+        ],
+        [
+            "A",
+            "",
+            1
+        ],
+        [
+            "A",
+            "part01",
+            -1
+        ],
+        [
+            "A",
+            "part1",
+            -1
+        ],
+        [
+            "A",
+            "z",
+            -1
+        ],
+        [
+            "A",
+            "Z",
+            -1
+        ],
+        [
+            "A",
+            "img12.png",
+            -1
+        ],
+        [
+            "A",
+            "img10.png",
+            -1
+        ],
+        [
+            "A",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "A",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "a1",
+            "a",
+            1
+        ],
+        [
+            "a1",
+            "A",
+            1
+        ],
+        [
+            "a1",
+            "a1",
+            0
+        ],
+        [
+            "a1",
+            "a01",
+            1
+        ],
+        [
+            "a1",
+            "a001",
+            1
+        ],
+        [
+            "a1",
+            "a2",
+            -1
+        ],
+        [
+            "a1",
+            "a10",
+            -1
+        ],
+        [
+            "a1",
+            "a 1",
+            0
+        ],
+        [
+            "a1",
+            "a  1",
+            0
+        ],
+        [
+            "a1",
+            " a1",
+            0
+        ],
+        [
+            "a1",
+            "a1b",
+            -1
+        ],
+        [
+            "a1",
+            "a1.5",
+            -1
+        ],
+        [
+            "a1",
+            "a1.10",
+            -1
+        ],
+        [
+            "a1",
+            "x0.5",
+            -1
+        ],
+        [
+            "a1",
+            "x0.05",
+            -1
+        ],
+        [
+            "a1",
+            "1",
+            1
+        ],
+        [
+            "a1",
+            "01",
+            1
+        ],
+        [
+            "a1",
+            "10",
+            1
+        ],
+        [
+            "a1",
+            "9",
+            1
+        ],
+        [
+            "a1",
+            "",
+            1
+        ],
+        [
+            "a1",
+            "part01",
+            -1
+        ],
+        [
+            "a1",
+            "part1",
+            -1
+        ],
+        [
+            "a1",
+            "z",
+            -1
+        ],
+        [
+            "a1",
+            "Z",
+            1
+        ],
+        [
+            "a1",
+            "img12.png",
+            -1
+        ],
+        [
+            "a1",
+            "img10.png",
+            -1
+        ],
+        [
+            "a1",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "a1",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "a01",
+            "a",
+            1
+        ],
+        [
+            "a01",
+            "A",
+            1
+        ],
+        [
+            "a01",
+            "a1",
+            -1
+        ],
+        [
+            "a01",
+            "a01",
+            0
+        ],
+        [
+            "a01",
+            "a001",
+            1
+        ],
+        [
+            "a01",
+            "a2",
+            -1
+        ],
+        [
+            "a01",
+            "a10",
+            -1
+        ],
+        [
+            "a01",
+            "a 1",
+            -1
+        ],
+        [
+            "a01",
+            "a  1",
+            -1
+        ],
+        [
+            "a01",
+            " a1",
+            -1
+        ],
+        [
+            "a01",
+            "a1b",
+            -1
+        ],
+        [
+            "a01",
+            "a1.5",
+            -1
+        ],
+        [
+            "a01",
+            "a1.10",
+            -1
+        ],
+        [
+            "a01",
+            "x0.5",
+            -1
+        ],
+        [
+            "a01",
+            "x0.05",
+            -1
+        ],
+        [
+            "a01",
+            "1",
+            1
+        ],
+        [
+            "a01",
+            "01",
+            1
+        ],
+        [
+            "a01",
+            "10",
+            1
+        ],
+        [
+            "a01",
+            "9",
+            1
+        ],
+        [
+            "a01",
+            "",
+            1
+        ],
+        [
+            "a01",
+            "part01",
+            -1
+        ],
+        [
+            "a01",
+            "part1",
+            -1
+        ],
+        [
+            "a01",
+            "z",
+            -1
+        ],
+        [
+            "a01",
+            "Z",
+            1
+        ],
+        [
+            "a01",
+            "img12.png",
+            -1
+        ],
+        [
+            "a01",
+            "img10.png",
+            -1
+        ],
+        [
+            "a01",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "a01",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "a001",
+            "a",
+            1
+        ],
+        [
+            "a001",
+            "A",
+            1
+        ],
+        [
+            "a001",
+            "a1",
+            -1
+        ],
+        [
+            "a001",
+            "a01",
+            -1
+        ],
+        [
+            "a001",
+            "a001",
+            0
+        ],
+        [
+            "a001",
+            "a2",
+            -1
+        ],
+        [
+            "a001",
+            "a10",
+            -1
+        ],
+        [
+            "a001",
+            "a 1",
+            -1
+        ],
+        [
+            "a001",
+            "a  1",
+            -1
+        ],
+        [
+            "a001",
+            " a1",
+            -1
+        ],
+        [
+            "a001",
+            "a1b",
+            -1
+        ],
+        [
+            "a001",
+            "a1.5",
+            -1
+        ],
+        [
+            "a001",
+            "a1.10",
+            -1
+        ],
+        [
+            "a001",
+            "x0.5",
+            -1
+        ],
+        [
+            "a001",
+            "x0.05",
+            -1
+        ],
+        [
+            "a001",
+            "1",
+            1
+        ],
+        [
+            "a001",
+            "01",
+            1
+        ],
+        [
+            "a001",
+            "10",
+            1
+        ],
+        [
+            "a001",
+            "9",
+            1
+        ],
+        [
+            "a001",
+            "",
+            1
+        ],
+        [
+            "a001",
+            "part01",
+            -1
+        ],
+        [
+            "a001",
+            "part1",
+            -1
+        ],
+        [
+            "a001",
+            "z",
+            -1
+        ],
+        [
+            "a001",
+            "Z",
+            1
+        ],
+        [
+            "a001",
+            "img12.png",
+            -1
+        ],
+        [
+            "a001",
+            "img10.png",
+            -1
+        ],
+        [
+            "a001",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "a001",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "a2",
+            "a",
+            1
+        ],
+        [
+            "a2",
+            "A",
+            1
+        ],
+        [
+            "a2",
+            "a1",
+            1
+        ],
+        [
+            "a2",
+            "a01",
+            1
+        ],
+        [
+            "a2",
+            "a001",
+            1
+        ],
+        [
+            "a2",
+            "a2",
+            0
+        ],
+        [
+            "a2",
+            "a10",
+            -1
+        ],
+        [
+            "a2",
+            "a 1",
+            1
+        ],
+        [
+            "a2",
+            "a  1",
+            1
+        ],
+        [
+            "a2",
+            " a1",
+            1
+        ],
+        [
+            "a2",
+            "a1b",
+            1
+        ],
+        [
+            "a2",
+            "a1.5",
+            1
+        ],
+        [
+            "a2",
+            "a1.10",
+            1
+        ],
+        [
+            "a2",
+            "x0.5",
+            -1
+        ],
+        [
+            "a2",
+            "x0.05",
+            -1
+        ],
+        [
+            "a2",
+            "1",
+            1
+        ],
+        [
+            "a2",
+            "01",
+            1
+        ],
+        [
+            "a2",
+            "10",
+            1
+        ],
+        [
+            "a2",
+            "9",
+            1
+        ],
+        [
+            "a2",
+            "",
+            1
+        ],
+        [
+            "a2",
+            "part01",
+            -1
+        ],
+        [
+            "a2",
+            "part1",
+            -1
+        ],
+        [
+            "a2",
+            "z",
+            -1
+        ],
+        [
+            "a2",
+            "Z",
+            1
+        ],
+        [
+            "a2",
+            "img12.png",
+            -1
+        ],
+        [
+            "a2",
+            "img10.png",
+            -1
+        ],
+        [
+            "a2",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "a2",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "a10",
+            "a",
+            1
+        ],
+        [
+            "a10",
+            "A",
+            1
+        ],
+        [
+            "a10",
+            "a1",
+            1
+        ],
+        [
+            "a10",
+            "a01",
+            1
+        ],
+        [
+            "a10",
+            "a001",
+            1
+        ],
+        [
+            "a10",
+            "a2",
+            1
+        ],
+        [
+            "a10",
+            "a10",
+            0
+        ],
+        [
+            "a10",
+            "a 1",
+            1
+        ],
+        [
+            "a10",
+            "a  1",
+            1
+        ],
+        [
+            "a10",
+            " a1",
+            1
+        ],
+        [
+            "a10",
+            "a1b",
+            1
+        ],
+        [
+            "a10",
+            "a1.5",
+            1
+        ],
+        [
+            "a10",
+            "a1.10",
+            1
+        ],
+        [
+            "a10",
+            "x0.5",
+            -1
+        ],
+        [
+            "a10",
+            "x0.05",
+            -1
+        ],
+        [
+            "a10",
+            "1",
+            1
+        ],
+        [
+            "a10",
+            "01",
+            1
+        ],
+        [
+            "a10",
+            "10",
+            1
+        ],
+        [
+            "a10",
+            "9",
+            1
+        ],
+        [
+            "a10",
+            "",
+            1
+        ],
+        [
+            "a10",
+            "part01",
+            -1
+        ],
+        [
+            "a10",
+            "part1",
+            -1
+        ],
+        [
+            "a10",
+            "z",
+            -1
+        ],
+        [
+            "a10",
+            "Z",
+            1
+        ],
+        [
+            "a10",
+            "img12.png",
+            -1
+        ],
+        [
+            "a10",
+            "img10.png",
+            -1
+        ],
+        [
+            "a10",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "a10",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "a 1",
+            "a",
+            1
+        ],
+        [
+            "a 1",
+            "A",
+            1
+        ],
+        [
+            "a 1",
+            "a1",
+            0
+        ],
+        [
+            "a 1",
+            "a01",
+            1
+        ],
+        [
+            "a 1",
+            "a001",
+            1
+        ],
+        [
+            "a 1",
+            "a2",
+            -1
+        ],
+        [
+            "a 1",
+            "a10",
+            -1
+        ],
+        [
+            "a 1",
+            "a 1",
+            0
+        ],
+        [
+            "a 1",
+            "a  1",
+            0
+        ],
+        [
+            "a 1",
+            " a1",
+            0
+        ],
+        [
+            "a 1",
+            "a1b",
+            -1
+        ],
+        [
+            "a 1",
+            "a1.5",
+            -1
+        ],
+        [
+            "a 1",
+            "a1.10",
+            -1
+        ],
+        [
+            "a 1",
+            "x0.5",
+            -1
+        ],
+        [
+            "a 1",
+            "x0.05",
+            -1
+        ],
+        [
+            "a 1",
+            "1",
+            1
+        ],
+        [
+            "a 1",
+            "01",
+            1
+        ],
+        [
+            "a 1",
+            "10",
+            1
+        ],
+        [
+            "a 1",
+            "9",
+            1
+        ],
+        [
+            "a 1",
+            "",
+            1
+        ],
+        [
+            "a 1",
+            "part01",
+            -1
+        ],
+        [
+            "a 1",
+            "part1",
+            -1
+        ],
+        [
+            "a 1",
+            "z",
+            -1
+        ],
+        [
+            "a 1",
+            "Z",
+            1
+        ],
+        [
+            "a 1",
+            "img12.png",
+            -1
+        ],
+        [
+            "a 1",
+            "img10.png",
+            -1
+        ],
+        [
+            "a 1",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "a 1",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "a  1",
+            "a",
+            1
+        ],
+        [
+            "a  1",
+            "A",
+            1
+        ],
+        [
+            "a  1",
+            "a1",
+            0
+        ],
+        [
+            "a  1",
+            "a01",
+            1
+        ],
+        [
+            "a  1",
+            "a001",
+            1
+        ],
+        [
+            "a  1",
+            "a2",
+            -1
+        ],
+        [
+            "a  1",
+            "a10",
+            -1
+        ],
+        [
+            "a  1",
+            "a 1",
+            0
+        ],
+        [
+            "a  1",
+            "a  1",
+            0
+        ],
+        [
+            "a  1",
+            " a1",
+            0
+        ],
+        [
+            "a  1",
+            "a1b",
+            -1
+        ],
+        [
+            "a  1",
+            "a1.5",
+            -1
+        ],
+        [
+            "a  1",
+            "a1.10",
+            -1
+        ],
+        [
+            "a  1",
+            "x0.5",
+            -1
+        ],
+        [
+            "a  1",
+            "x0.05",
+            -1
+        ],
+        [
+            "a  1",
+            "1",
+            1
+        ],
+        [
+            "a  1",
+            "01",
+            1
+        ],
+        [
+            "a  1",
+            "10",
+            1
+        ],
+        [
+            "a  1",
+            "9",
+            1
+        ],
+        [
+            "a  1",
+            "",
+            1
+        ],
+        [
+            "a  1",
+            "part01",
+            -1
+        ],
+        [
+            "a  1",
+            "part1",
+            -1
+        ],
+        [
+            "a  1",
+            "z",
+            -1
+        ],
+        [
+            "a  1",
+            "Z",
+            1
+        ],
+        [
+            "a  1",
+            "img12.png",
+            -1
+        ],
+        [
+            "a  1",
+            "img10.png",
+            -1
+        ],
+        [
+            "a  1",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "a  1",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            " a1",
+            "a",
+            1
+        ],
+        [
+            " a1",
+            "A",
+            1
+        ],
+        [
+            " a1",
+            "a1",
+            0
+        ],
+        [
+            " a1",
+            "a01",
+            1
+        ],
+        [
+            " a1",
+            "a001",
+            1
+        ],
+        [
+            " a1",
+            "a2",
+            -1
+        ],
+        [
+            " a1",
+            "a10",
+            -1
+        ],
+        [
+            " a1",
+            "a 1",
+            0
+        ],
+        [
+            " a1",
+            "a  1",
+            0
+        ],
+        [
+            " a1",
+            " a1",
+            0
+        ],
+        [
+            " a1",
+            "a1b",
+            -1
+        ],
+        [
+            " a1",
+            "a1.5",
+            -1
+        ],
+        [
+            " a1",
+            "a1.10",
+            -1
+        ],
+        [
+            " a1",
+            "x0.5",
+            -1
+        ],
+        [
+            " a1",
+            "x0.05",
+            -1
+        ],
+        [
+            " a1",
+            "1",
+            1
+        ],
+        [
+            " a1",
+            "01",
+            1
+        ],
+        [
+            " a1",
+            "10",
+            1
+        ],
+        [
+            " a1",
+            "9",
+            1
+        ],
+        [
+            " a1",
+            "",
+            1
+        ],
+        [
+            " a1",
+            "part01",
+            -1
+        ],
+        [
+            " a1",
+            "part1",
+            -1
+        ],
+        [
+            " a1",
+            "z",
+            -1
+        ],
+        [
+            " a1",
+            "Z",
+            1
+        ],
+        [
+            " a1",
+            "img12.png",
+            -1
+        ],
+        [
+            " a1",
+            "img10.png",
+            -1
+        ],
+        [
+            " a1",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            " a1",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "a1b",
+            "a",
+            1
+        ],
+        [
+            "a1b",
+            "A",
+            1
+        ],
+        [
+            "a1b",
+            "a1",
+            1
+        ],
+        [
+            "a1b",
+            "a01",
+            1
+        ],
+        [
+            "a1b",
+            "a001",
+            1
+        ],
+        [
+            "a1b",
+            "a2",
+            -1
+        ],
+        [
+            "a1b",
+            "a10",
+            -1
+        ],
+        [
+            "a1b",
+            "a 1",
+            1
+        ],
+        [
+            "a1b",
+            "a  1",
+            1
+        ],
+        [
+            "a1b",
+            " a1",
+            1
+        ],
+        [
+            "a1b",
+            "a1b",
+            0
+        ],
+        [
+            "a1b",
+            "a1.5",
+            1
+        ],
+        [
+            "a1b",
+            "a1.10",
+            1
+        ],
+        [
+            "a1b",
+            "x0.5",
+            -1
+        ],
+        [
+            "a1b",
+            "x0.05",
+            -1
+        ],
+        [
+            "a1b",
+            "1",
+            1
+        ],
+        [
+            "a1b",
+            "01",
+            1
+        ],
+        [
+            "a1b",
+            "10",
+            1
+        ],
+        [
+            "a1b",
+            "9",
+            1
+        ],
+        [
+            "a1b",
+            "",
+            1
+        ],
+        [
+            "a1b",
+            "part01",
+            -1
+        ],
+        [
+            "a1b",
+            "part1",
+            -1
+        ],
+        [
+            "a1b",
+            "z",
+            -1
+        ],
+        [
+            "a1b",
+            "Z",
+            1
+        ],
+        [
+            "a1b",
+            "img12.png",
+            -1
+        ],
+        [
+            "a1b",
+            "img10.png",
+            -1
+        ],
+        [
+            "a1b",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "a1b",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "a1.5",
+            "a",
+            1
+        ],
+        [
+            "a1.5",
+            "A",
+            1
+        ],
+        [
+            "a1.5",
+            "a1",
+            1
+        ],
+        [
+            "a1.5",
+            "a01",
+            1
+        ],
+        [
+            "a1.5",
+            "a001",
+            1
+        ],
+        [
+            "a1.5",
+            "a2",
+            -1
+        ],
+        [
+            "a1.5",
+            "a10",
+            -1
+        ],
+        [
+            "a1.5",
+            "a 1",
+            1
+        ],
+        [
+            "a1.5",
+            "a  1",
+            1
+        ],
+        [
+            "a1.5",
+            " a1",
+            1
+        ],
+        [
+            "a1.5",
+            "a1b",
+            -1
+        ],
+        [
+            "a1.5",
+            "a1.5",
+            0
+        ],
+        [
+            "a1.5",
+            "a1.10",
+            -1
+        ],
+        [
+            "a1.5",
+            "x0.5",
+            -1
+        ],
+        [
+            "a1.5",
+            "x0.05",
+            -1
+        ],
+        [
+            "a1.5",
+            "1",
+            1
+        ],
+        [
+            "a1.5",
+            "01",
+            1
+        ],
+        [
+            "a1.5",
+            "10",
+            1
+        ],
+        [
+            "a1.5",
+            "9",
+            1
+        ],
+        [
+            "a1.5",
+            "",
+            1
+        ],
+        [
+            "a1.5",
+            "part01",
+            -1
+        ],
+        [
+            "a1.5",
+            "part1",
+            -1
+        ],
+        [
+            "a1.5",
+            "z",
+            -1
+        ],
+        [
+            "a1.5",
+            "Z",
+            1
+        ],
+        [
+            "a1.5",
+            "img12.png",
+            -1
+        ],
+        [
+            "a1.5",
+            "img10.png",
+            -1
+        ],
+        [
+            "a1.5",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "a1.5",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "a1.10",
+            "a",
+            1
+        ],
+        [
+            "a1.10",
+            "A",
+            1
+        ],
+        [
+            "a1.10",
+            "a1",
+            1
+        ],
+        [
+            "a1.10",
+            "a01",
+            1
+        ],
+        [
+            "a1.10",
+            "a001",
+            1
+        ],
+        [
+            "a1.10",
+            "a2",
+            -1
+        ],
+        [
+            "a1.10",
+            "a10",
+            -1
+        ],
+        [
+            "a1.10",
+            "a 1",
+            1
+        ],
+        [
+            "a1.10",
+            "a  1",
+            1
+        ],
+        [
+            "a1.10",
+            " a1",
+            1
+        ],
+        [
+            "a1.10",
+            "a1b",
+            -1
+        ],
+        [
+            "a1.10",
+            "a1.5",
+            1
+        ],
+        [
+            "a1.10",
+            "a1.10",
+            0
+        ],
+        [
+            "a1.10",
+            "x0.5",
+            -1
+        ],
+        [
+            "a1.10",
+            "x0.05",
+            -1
+        ],
+        [
+            "a1.10",
+            "1",
+            1
+        ],
+        [
+            "a1.10",
+            "01",
+            1
+        ],
+        [
+            "a1.10",
+            "10",
+            1
+        ],
+        [
+            "a1.10",
+            "9",
+            1
+        ],
+        [
+            "a1.10",
+            "",
+            1
+        ],
+        [
+            "a1.10",
+            "part01",
+            -1
+        ],
+        [
+            "a1.10",
+            "part1",
+            -1
+        ],
+        [
+            "a1.10",
+            "z",
+            -1
+        ],
+        [
+            "a1.10",
+            "Z",
+            1
+        ],
+        [
+            "a1.10",
+            "img12.png",
+            -1
+        ],
+        [
+            "a1.10",
+            "img10.png",
+            -1
+        ],
+        [
+            "a1.10",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "a1.10",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "x0.5",
+            "a",
+            1
+        ],
+        [
+            "x0.5",
+            "A",
+            1
+        ],
+        [
+            "x0.5",
+            "a1",
+            1
+        ],
+        [
+            "x0.5",
+            "a01",
+            1
+        ],
+        [
+            "x0.5",
+            "a001",
+            1
+        ],
+        [
+            "x0.5",
+            "a2",
+            1
+        ],
+        [
+            "x0.5",
+            "a10",
+            1
+        ],
+        [
+            "x0.5",
+            "a 1",
+            1
+        ],
+        [
+            "x0.5",
+            "a  1",
+            1
+        ],
+        [
+            "x0.5",
+            " a1",
+            1
+        ],
+        [
+            "x0.5",
+            "a1b",
+            1
+        ],
+        [
+            "x0.5",
+            "a1.5",
+            1
+        ],
+        [
+            "x0.5",
+            "a1.10",
+            1
+        ],
+        [
+            "x0.5",
+            "x0.5",
+            0
+        ],
+        [
+            "x0.5",
+            "x0.05",
+            1
+        ],
+        [
+            "x0.5",
+            "1",
+            1
+        ],
+        [
+            "x0.5",
+            "01",
+            1
+        ],
+        [
+            "x0.5",
+            "10",
+            1
+        ],
+        [
+            "x0.5",
+            "9",
+            1
+        ],
+        [
+            "x0.5",
+            "",
+            1
+        ],
+        [
+            "x0.5",
+            "part01",
+            1
+        ],
+        [
+            "x0.5",
+            "part1",
+            1
+        ],
+        [
+            "x0.5",
+            "z",
+            -1
+        ],
+        [
+            "x0.5",
+            "Z",
+            1
+        ],
+        [
+            "x0.5",
+            "img12.png",
+            1
+        ],
+        [
+            "x0.5",
+            "img10.png",
+            1
+        ],
+        [
+            "x0.5",
+            "rfc822.txt",
+            1
+        ],
+        [
+            "x0.5",
+            "rfc1.txt",
+            1
+        ],
+        [
+            "x0.05",
+            "a",
+            1
+        ],
+        [
+            "x0.05",
+            "A",
+            1
+        ],
+        [
+            "x0.05",
+            "a1",
+            1
+        ],
+        [
+            "x0.05",
+            "a01",
+            1
+        ],
+        [
+            "x0.05",
+            "a001",
+            1
+        ],
+        [
+            "x0.05",
+            "a2",
+            1
+        ],
+        [
+            "x0.05",
+            "a10",
+            1
+        ],
+        [
+            "x0.05",
+            "a 1",
+            1
+        ],
+        [
+            "x0.05",
+            "a  1",
+            1
+        ],
+        [
+            "x0.05",
+            " a1",
+            1
+        ],
+        [
+            "x0.05",
+            "a1b",
+            1
+        ],
+        [
+            "x0.05",
+            "a1.5",
+            1
+        ],
+        [
+            "x0.05",
+            "a1.10",
+            1
+        ],
+        [
+            "x0.05",
+            "x0.5",
+            -1
+        ],
+        [
+            "x0.05",
+            "x0.05",
+            0
+        ],
+        [
+            "x0.05",
+            "1",
+            1
+        ],
+        [
+            "x0.05",
+            "01",
+            1
+        ],
+        [
+            "x0.05",
+            "10",
+            1
+        ],
+        [
+            "x0.05",
+            "9",
+            1
+        ],
+        [
+            "x0.05",
+            "",
+            1
+        ],
+        [
+            "x0.05",
+            "part01",
+            1
+        ],
+        [
+            "x0.05",
+            "part1",
+            1
+        ],
+        [
+            "x0.05",
+            "z",
+            -1
+        ],
+        [
+            "x0.05",
+            "Z",
+            1
+        ],
+        [
+            "x0.05",
+            "img12.png",
+            1
+        ],
+        [
+            "x0.05",
+            "img10.png",
+            1
+        ],
+        [
+            "x0.05",
+            "rfc822.txt",
+            1
+        ],
+        [
+            "x0.05",
+            "rfc1.txt",
+            1
+        ],
+        [
+            "1",
+            "a",
+            -1
+        ],
+        [
+            "1",
+            "A",
+            -1
+        ],
+        [
+            "1",
+            "a1",
+            -1
+        ],
+        [
+            "1",
+            "a01",
+            -1
+        ],
+        [
+            "1",
+            "a001",
+            -1
+        ],
+        [
+            "1",
+            "a2",
+            -1
+        ],
+        [
+            "1",
+            "a10",
+            -1
+        ],
+        [
+            "1",
+            "a 1",
+            -1
+        ],
+        [
+            "1",
+            "a  1",
+            -1
+        ],
+        [
+            "1",
+            " a1",
+            -1
+        ],
+        [
+            "1",
+            "a1b",
+            -1
+        ],
+        [
+            "1",
+            "a1.5",
+            -1
+        ],
+        [
+            "1",
+            "a1.10",
+            -1
+        ],
+        [
+            "1",
+            "x0.5",
+            -1
+        ],
+        [
+            "1",
+            "x0.05",
+            -1
+        ],
+        [
+            "1",
+            "1",
+            0
+        ],
+        [
+            "1",
+            "01",
+            0
+        ],
+        [
+            "1",
+            "10",
+            -1
+        ],
+        [
+            "1",
+            "9",
+            -1
+        ],
+        [
+            "1",
+            "",
+            1
+        ],
+        [
+            "1",
+            "part01",
+            -1
+        ],
+        [
+            "1",
+            "part1",
+            -1
+        ],
+        [
+            "1",
+            "z",
+            -1
+        ],
+        [
+            "1",
+            "Z",
+            -1
+        ],
+        [
+            "1",
+            "img12.png",
+            -1
+        ],
+        [
+            "1",
+            "img10.png",
+            -1
+        ],
+        [
+            "1",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "1",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "01",
+            "a",
+            -1
+        ],
+        [
+            "01",
+            "A",
+            -1
+        ],
+        [
+            "01",
+            "a1",
+            -1
+        ],
+        [
+            "01",
+            "a01",
+            -1
+        ],
+        [
+            "01",
+            "a001",
+            -1
+        ],
+        [
+            "01",
+            "a2",
+            -1
+        ],
+        [
+            "01",
+            "a10",
+            -1
+        ],
+        [
+            "01",
+            "a 1",
+            -1
+        ],
+        [
+            "01",
+            "a  1",
+            -1
+        ],
+        [
+            "01",
+            " a1",
+            -1
+        ],
+        [
+            "01",
+            "a1b",
+            -1
+        ],
+        [
+            "01",
+            "a1.5",
+            -1
+        ],
+        [
+            "01",
+            "a1.10",
+            -1
+        ],
+        [
+            "01",
+            "x0.5",
+            -1
+        ],
+        [
+            "01",
+            "x0.05",
+            -1
+        ],
+        [
+            "01",
+            "1",
+            0
+        ],
+        [
+            "01",
+            "01",
+            0
+        ],
+        [
+            "01",
+            "10",
+            -1
+        ],
+        [
+            "01",
+            "9",
+            -1
+        ],
+        [
+            "01",
+            "",
+            1
+        ],
+        [
+            "01",
+            "part01",
+            -1
+        ],
+        [
+            "01",
+            "part1",
+            -1
+        ],
+        [
+            "01",
+            "z",
+            -1
+        ],
+        [
+            "01",
+            "Z",
+            -1
+        ],
+        [
+            "01",
+            "img12.png",
+            -1
+        ],
+        [
+            "01",
+            "img10.png",
+            -1
+        ],
+        [
+            "01",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "01",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "10",
+            "a",
+            -1
+        ],
+        [
+            "10",
+            "A",
+            -1
+        ],
+        [
+            "10",
+            "a1",
+            -1
+        ],
+        [
+            "10",
+            "a01",
+            -1
+        ],
+        [
+            "10",
+            "a001",
+            -1
+        ],
+        [
+            "10",
+            "a2",
+            -1
+        ],
+        [
+            "10",
+            "a10",
+            -1
+        ],
+        [
+            "10",
+            "a 1",
+            -1
+        ],
+        [
+            "10",
+            "a  1",
+            -1
+        ],
+        [
+            "10",
+            " a1",
+            -1
+        ],
+        [
+            "10",
+            "a1b",
+            -1
+        ],
+        [
+            "10",
+            "a1.5",
+            -1
+        ],
+        [
+            "10",
+            "a1.10",
+            -1
+        ],
+        [
+            "10",
+            "x0.5",
+            -1
+        ],
+        [
+            "10",
+            "x0.05",
+            -1
+        ],
+        [
+            "10",
+            "1",
+            1
+        ],
+        [
+            "10",
+            "01",
+            1
+        ],
+        [
+            "10",
+            "10",
+            0
+        ],
+        [
+            "10",
+            "9",
+            1
+        ],
+        [
+            "10",
+            "",
+            1
+        ],
+        [
+            "10",
+            "part01",
+            -1
+        ],
+        [
+            "10",
+            "part1",
+            -1
+        ],
+        [
+            "10",
+            "z",
+            -1
+        ],
+        [
+            "10",
+            "Z",
+            -1
+        ],
+        [
+            "10",
+            "img12.png",
+            -1
+        ],
+        [
+            "10",
+            "img10.png",
+            -1
+        ],
+        [
+            "10",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "10",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "9",
+            "a",
+            -1
+        ],
+        [
+            "9",
+            "A",
+            -1
+        ],
+        [
+            "9",
+            "a1",
+            -1
+        ],
+        [
+            "9",
+            "a01",
+            -1
+        ],
+        [
+            "9",
+            "a001",
+            -1
+        ],
+        [
+            "9",
+            "a2",
+            -1
+        ],
+        [
+            "9",
+            "a10",
+            -1
+        ],
+        [
+            "9",
+            "a 1",
+            -1
+        ],
+        [
+            "9",
+            "a  1",
+            -1
+        ],
+        [
+            "9",
+            " a1",
+            -1
+        ],
+        [
+            "9",
+            "a1b",
+            -1
+        ],
+        [
+            "9",
+            "a1.5",
+            -1
+        ],
+        [
+            "9",
+            "a1.10",
+            -1
+        ],
+        [
+            "9",
+            "x0.5",
+            -1
+        ],
+        [
+            "9",
+            "x0.05",
+            -1
+        ],
+        [
+            "9",
+            "1",
+            1
+        ],
+        [
+            "9",
+            "01",
+            1
+        ],
+        [
+            "9",
+            "10",
+            -1
+        ],
+        [
+            "9",
+            "9",
+            0
+        ],
+        [
+            "9",
+            "",
+            1
+        ],
+        [
+            "9",
+            "part01",
+            -1
+        ],
+        [
+            "9",
+            "part1",
+            -1
+        ],
+        [
+            "9",
+            "z",
+            -1
+        ],
+        [
+            "9",
+            "Z",
+            -1
+        ],
+        [
+            "9",
+            "img12.png",
+            -1
+        ],
+        [
+            "9",
+            "img10.png",
+            -1
+        ],
+        [
+            "9",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "9",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "",
+            "a",
+            -1
+        ],
+        [
+            "",
+            "A",
+            -1
+        ],
+        [
+            "",
+            "a1",
+            -1
+        ],
+        [
+            "",
+            "a01",
+            -1
+        ],
+        [
+            "",
+            "a001",
+            -1
+        ],
+        [
+            "",
+            "a2",
+            -1
+        ],
+        [
+            "",
+            "a10",
+            -1
+        ],
+        [
+            "",
+            "a 1",
+            -1
+        ],
+        [
+            "",
+            "a  1",
+            -1
+        ],
+        [
+            "",
+            " a1",
+            -1
+        ],
+        [
+            "",
+            "a1b",
+            -1
+        ],
+        [
+            "",
+            "a1.5",
+            -1
+        ],
+        [
+            "",
+            "a1.10",
+            -1
+        ],
+        [
+            "",
+            "x0.5",
+            -1
+        ],
+        [
+            "",
+            "x0.05",
+            -1
+        ],
+        [
+            "",
+            "1",
+            -1
+        ],
+        [
+            "",
+            "01",
+            -1
+        ],
+        [
+            "",
+            "10",
+            -1
+        ],
+        [
+            "",
+            "9",
+            -1
+        ],
+        [
+            "",
+            "",
+            0
+        ],
+        [
+            "",
+            "part01",
+            -1
+        ],
+        [
+            "",
+            "part1",
+            -1
+        ],
+        [
+            "",
+            "z",
+            -1
+        ],
+        [
+            "",
+            "Z",
+            -1
+        ],
+        [
+            "",
+            "img12.png",
+            -1
+        ],
+        [
+            "",
+            "img10.png",
+            -1
+        ],
+        [
+            "",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "part01",
+            "a",
+            1
+        ],
+        [
+            "part01",
+            "A",
+            1
+        ],
+        [
+            "part01",
+            "a1",
+            1
+        ],
+        [
+            "part01",
+            "a01",
+            1
+        ],
+        [
+            "part01",
+            "a001",
+            1
+        ],
+        [
+            "part01",
+            "a2",
+            1
+        ],
+        [
+            "part01",
+            "a10",
+            1
+        ],
+        [
+            "part01",
+            "a 1",
+            1
+        ],
+        [
+            "part01",
+            "a  1",
+            1
+        ],
+        [
+            "part01",
+            " a1",
+            1
+        ],
+        [
+            "part01",
+            "a1b",
+            1
+        ],
+        [
+            "part01",
+            "a1.5",
+            1
+        ],
+        [
+            "part01",
+            "a1.10",
+            1
+        ],
+        [
+            "part01",
+            "x0.5",
+            -1
+        ],
+        [
+            "part01",
+            "x0.05",
+            -1
+        ],
+        [
+            "part01",
+            "1",
+            1
+        ],
+        [
+            "part01",
+            "01",
+            1
+        ],
+        [
+            "part01",
+            "10",
+            1
+        ],
+        [
+            "part01",
+            "9",
+            1
+        ],
+        [
+            "part01",
+            "",
+            1
+        ],
+        [
+            "part01",
+            "part01",
+            0
+        ],
+        [
+            "part01",
+            "part1",
+            -1
+        ],
+        [
+            "part01",
+            "z",
+            -1
+        ],
+        [
+            "part01",
+            "Z",
+            1
+        ],
+        [
+            "part01",
+            "img12.png",
+            1
+        ],
+        [
+            "part01",
+            "img10.png",
+            1
+        ],
+        [
+            "part01",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "part01",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "part1",
+            "a",
+            1
+        ],
+        [
+            "part1",
+            "A",
+            1
+        ],
+        [
+            "part1",
+            "a1",
+            1
+        ],
+        [
+            "part1",
+            "a01",
+            1
+        ],
+        [
+            "part1",
+            "a001",
+            1
+        ],
+        [
+            "part1",
+            "a2",
+            1
+        ],
+        [
+            "part1",
+            "a10",
+            1
+        ],
+        [
+            "part1",
+            "a 1",
+            1
+        ],
+        [
+            "part1",
+            "a  1",
+            1
+        ],
+        [
+            "part1",
+            " a1",
+            1
+        ],
+        [
+            "part1",
+            "a1b",
+            1
+        ],
+        [
+            "part1",
+            "a1.5",
+            1
+        ],
+        [
+            "part1",
+            "a1.10",
+            1
+        ],
+        [
+            "part1",
+            "x0.5",
+            -1
+        ],
+        [
+            "part1",
+            "x0.05",
+            -1
+        ],
+        [
+            "part1",
+            "1",
+            1
+        ],
+        [
+            "part1",
+            "01",
+            1
+        ],
+        [
+            "part1",
+            "10",
+            1
+        ],
+        [
+            "part1",
+            "9",
+            1
+        ],
+        [
+            "part1",
+            "",
+            1
+        ],
+        [
+            "part1",
+            "part01",
+            1
+        ],
+        [
+            "part1",
+            "part1",
+            0
+        ],
+        [
+            "part1",
+            "z",
+            -1
+        ],
+        [
+            "part1",
+            "Z",
+            1
+        ],
+        [
+            "part1",
+            "img12.png",
+            1
+        ],
+        [
+            "part1",
+            "img10.png",
+            1
+        ],
+        [
+            "part1",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "part1",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "z",
+            "a",
+            1
+        ],
+        [
+            "z",
+            "A",
+            1
+        ],
+        [
+            "z",
+            "a1",
+            1
+        ],
+        [
+            "z",
+            "a01",
+            1
+        ],
+        [
+            "z",
+            "a001",
+            1
+        ],
+        [
+            "z",
+            "a2",
+            1
+        ],
+        [
+            "z",
+            "a10",
+            1
+        ],
+        [
+            "z",
+            "a 1",
+            1
+        ],
+        [
+            "z",
+            "a  1",
+            1
+        ],
+        [
+            "z",
+            " a1",
+            1
+        ],
+        [
+            "z",
+            "a1b",
+            1
+        ],
+        [
+            "z",
+            "a1.5",
+            1
+        ],
+        [
+            "z",
+            "a1.10",
+            1
+        ],
+        [
+            "z",
+            "x0.5",
+            1
+        ],
+        [
+            "z",
+            "x0.05",
+            1
+        ],
+        [
+            "z",
+            "1",
+            1
+        ],
+        [
+            "z",
+            "01",
+            1
+        ],
+        [
+            "z",
+            "10",
+            1
+        ],
+        [
+            "z",
+            "9",
+            1
+        ],
+        [
+            "z",
+            "",
+            1
+        ],
+        [
+            "z",
+            "part01",
+            1
+        ],
+        [
+            "z",
+            "part1",
+            1
+        ],
+        [
+            "z",
+            "z",
+            0
+        ],
+        [
+            "z",
+            "Z",
+            1
+        ],
+        [
+            "z",
+            "img12.png",
+            1
+        ],
+        [
+            "z",
+            "img10.png",
+            1
+        ],
+        [
+            "z",
+            "rfc822.txt",
+            1
+        ],
+        [
+            "z",
+            "rfc1.txt",
+            1
+        ],
+        [
+            "Z",
+            "a",
+            -1
+        ],
+        [
+            "Z",
+            "A",
+            1
+        ],
+        [
+            "Z",
+            "a1",
+            -1
+        ],
+        [
+            "Z",
+            "a01",
+            -1
+        ],
+        [
+            "Z",
+            "a001",
+            -1
+        ],
+        [
+            "Z",
+            "a2",
+            -1
+        ],
+        [
+            "Z",
+            "a10",
+            -1
+        ],
+        [
+            "Z",
+            "a 1",
+            -1
+        ],
+        [
+            "Z",
+            "a  1",
+            -1
+        ],
+        [
+            "Z",
+            " a1",
+            -1
+        ],
+        [
+            "Z",
+            "a1b",
+            -1
+        ],
+        [
+            "Z",
+            "a1.5",
+            -1
+        ],
+        [
+            "Z",
+            "a1.10",
+            -1
+        ],
+        [
+            "Z",
+            "x0.5",
+            -1
+        ],
+        [
+            "Z",
+            "x0.05",
+            -1
+        ],
+        [
+            "Z",
+            "1",
+            1
+        ],
+        [
+            "Z",
+            "01",
+            1
+        ],
+        [
+            "Z",
+            "10",
+            1
+        ],
+        [
+            "Z",
+            "9",
+            1
+        ],
+        [
+            "Z",
+            "",
+            1
+        ],
+        [
+            "Z",
+            "part01",
+            -1
+        ],
+        [
+            "Z",
+            "part1",
+            -1
+        ],
+        [
+            "Z",
+            "z",
+            -1
+        ],
+        [
+            "Z",
+            "Z",
+            0
+        ],
+        [
+            "Z",
+            "img12.png",
+            -1
+        ],
+        [
+            "Z",
+            "img10.png",
+            -1
+        ],
+        [
+            "Z",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "Z",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "img12.png",
+            "a",
+            1
+        ],
+        [
+            "img12.png",
+            "A",
+            1
+        ],
+        [
+            "img12.png",
+            "a1",
+            1
+        ],
+        [
+            "img12.png",
+            "a01",
+            1
+        ],
+        [
+            "img12.png",
+            "a001",
+            1
+        ],
+        [
+            "img12.png",
+            "a2",
+            1
+        ],
+        [
+            "img12.png",
+            "a10",
+            1
+        ],
+        [
+            "img12.png",
+            "a 1",
+            1
+        ],
+        [
+            "img12.png",
+            "a  1",
+            1
+        ],
+        [
+            "img12.png",
+            " a1",
+            1
+        ],
+        [
+            "img12.png",
+            "a1b",
+            1
+        ],
+        [
+            "img12.png",
+            "a1.5",
+            1
+        ],
+        [
+            "img12.png",
+            "a1.10",
+            1
+        ],
+        [
+            "img12.png",
+            "x0.5",
+            -1
+        ],
+        [
+            "img12.png",
+            "x0.05",
+            -1
+        ],
+        [
+            "img12.png",
+            "1",
+            1
+        ],
+        [
+            "img12.png",
+            "01",
+            1
+        ],
+        [
+            "img12.png",
+            "10",
+            1
+        ],
+        [
+            "img12.png",
+            "9",
+            1
+        ],
+        [
+            "img12.png",
+            "",
+            1
+        ],
+        [
+            "img12.png",
+            "part01",
+            -1
+        ],
+        [
+            "img12.png",
+            "part1",
+            -1
+        ],
+        [
+            "img12.png",
+            "z",
+            -1
+        ],
+        [
+            "img12.png",
+            "Z",
+            1
+        ],
+        [
+            "img12.png",
+            "img12.png",
+            0
+        ],
+        [
+            "img12.png",
+            "img10.png",
+            1
+        ],
+        [
+            "img12.png",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "img12.png",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "img10.png",
+            "a",
+            1
+        ],
+        [
+            "img10.png",
+            "A",
+            1
+        ],
+        [
+            "img10.png",
+            "a1",
+            1
+        ],
+        [
+            "img10.png",
+            "a01",
+            1
+        ],
+        [
+            "img10.png",
+            "a001",
+            1
+        ],
+        [
+            "img10.png",
+            "a2",
+            1
+        ],
+        [
+            "img10.png",
+            "a10",
+            1
+        ],
+        [
+            "img10.png",
+            "a 1",
+            1
+        ],
+        [
+            "img10.png",
+            "a  1",
+            1
+        ],
+        [
+            "img10.png",
+            " a1",
+            1
+        ],
+        [
+            "img10.png",
+            "a1b",
+            1
+        ],
+        [
+            "img10.png",
+            "a1.5",
+            1
+        ],
+        [
+            "img10.png",
+            "a1.10",
+            1
+        ],
+        [
+            "img10.png",
+            "x0.5",
+            -1
+        ],
+        [
+            "img10.png",
+            "x0.05",
+            -1
+        ],
+        [
+            "img10.png",
+            "1",
+            1
+        ],
+        [
+            "img10.png",
+            "01",
+            1
+        ],
+        [
+            "img10.png",
+            "10",
+            1
+        ],
+        [
+            "img10.png",
+            "9",
+            1
+        ],
+        [
+            "img10.png",
+            "",
+            1
+        ],
+        [
+            "img10.png",
+            "part01",
+            -1
+        ],
+        [
+            "img10.png",
+            "part1",
+            -1
+        ],
+        [
+            "img10.png",
+            "z",
+            -1
+        ],
+        [
+            "img10.png",
+            "Z",
+            1
+        ],
+        [
+            "img10.png",
+            "img12.png",
+            -1
+        ],
+        [
+            "img10.png",
+            "img10.png",
+            0
+        ],
+        [
+            "img10.png",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "img10.png",
+            "rfc1.txt",
+            -1
+        ],
+        [
+            "rfc822.txt",
+            "a",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "A",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "a1",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "a01",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "a001",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "a2",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "a10",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "a 1",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "a  1",
+            1
+        ],
+        [
+            "rfc822.txt",
+            " a1",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "a1b",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "a1.5",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "a1.10",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "x0.5",
+            -1
+        ],
+        [
+            "rfc822.txt",
+            "x0.05",
+            -1
+        ],
+        [
+            "rfc822.txt",
+            "1",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "01",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "10",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "9",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "part01",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "part1",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "z",
+            -1
+        ],
+        [
+            "rfc822.txt",
+            "Z",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "img12.png",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "img10.png",
+            1
+        ],
+        [
+            "rfc822.txt",
+            "rfc822.txt",
+            0
+        ],
+        [
+            "rfc822.txt",
+            "rfc1.txt",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "a",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "A",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "a1",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "a01",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "a001",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "a2",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "a10",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "a 1",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "a  1",
+            1
+        ],
+        [
+            "rfc1.txt",
+            " a1",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "a1b",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "a1.5",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "a1.10",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "x0.5",
+            -1
+        ],
+        [
+            "rfc1.txt",
+            "x0.05",
+            -1
+        ],
+        [
+            "rfc1.txt",
+            "1",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "01",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "10",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "9",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "part01",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "part1",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "z",
+            -1
+        ],
+        [
+            "rfc1.txt",
+            "Z",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "img12.png",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "img10.png",
+            1
+        ],
+        [
+            "rfc1.txt",
+            "rfc822.txt",
+            -1
+        ],
+        [
+            "rfc1.txt",
+            "rfc1.txt",
+            0
+        ]
+    ]
+}

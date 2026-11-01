@@ -17,7 +17,8 @@ use tracing::info;
 async fn main() -> Result<()> {
     nntmux_webkit::config::require_app_key()?;
     let config = Config::from_env()?;
-    let metrics = nntmux_telemetry::init(&config.log_filter, config.log_json)?;
+    let metrics =
+        nntmux_telemetry::init_for_role(&config.log_filter, config.log_json, Some("web"))?;
     let stop = Shutdown::on_signals()?;
     let health = tokio::spawn(nntmux_telemetry::serve(
         config.health_addr,
@@ -35,6 +36,8 @@ async fn main() -> Result<()> {
                 .merge(nntmux_admin::router())
                 .layer(from_fn(nntmux_api::block_pages)),
         )
+        // After every route, so each request is labelled with the pattern it matched.
+        .route_layer(from_fn(nntmux_telemetry::http::track))
         .layer(TraceLayer::new_for_http())
         // The web stack's layers run before the state exists, so they read it from here.
         .layer(Extension(ctx.clone()))
