@@ -67,6 +67,7 @@ foreach (array_keys($variants) as $name) {
         'scene' => $cleaner->looksLikeSceneRelease($name),
         'tech' => $cleaner->isLiteralTechnicalSceneTitle($name),
         'title' => $cleaner->cleanForTitleMatch($name),
+        'fixer' => (new App\Services\ReleaseCleaningService)->fixerCleaner($name),
         'payload' => $unwrapper->literalPayload($name),
         'trail' => $unwrapper->stripLiteralSubjectTrailer($name),
         'base' => $evidence->basename, 'stem' => $evidence->stem,

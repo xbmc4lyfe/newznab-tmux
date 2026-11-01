@@ -241,6 +241,26 @@ pub fn format_search_name(title: &str, normalized_fallback: Option<&str>) -> Str
     trim_chars(&dotted, " .-_\t\r\n").to_owned()
 }
 
+/// `fixerCleaner`: strips transport markers from a candidate name, and every non-ASCII byte.
+pub fn fixer_cleaner(name: &str) -> String {
+    let mut clean = unwrap_nzbsplit(name).unwrap_or_else(|| name.to_owned());
+    for re in [
+        rx!(i r"[.\-_](sample|proof|thumbs?)$"),
+        rx!(i r"\.(par2?|nfo|sfv|nzb|rar|r\d{2,3}|zip)$"),
+        rx!(i r"\.part\d+(\.rar)?$"),
+        rx!(i r"\.vol\d+\+\d+\.par2$"),
+        // `.par2` is already gone, so a bare volume marker can remain.
+        rx!(i r"\.vol\d+[+-]\d+$"),
+        rx!(i r#"\d{1,3}\.rev"?$"#),
+        rx!(i r"^(Release Name|sample[-_])"),
+    ] {
+        clean = replace_all(re, &clean, "");
+    }
+    let clean = replace_all(rx!(r"\s\s+"), &clean, " ");
+    let ascii: String = clean.chars().filter(|c| matches!(*c, '\x20'..='\x7F')).collect();
+    trim_chars(&ascii, PHP_WS).to_owned()
+}
+
 /// Whether a title looks like a valid release name.
 pub fn is_plausible_release_title(title: &str) -> bool {
     let t = trim_chars(title, PHP_WS);

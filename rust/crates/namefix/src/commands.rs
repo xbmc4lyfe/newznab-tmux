@@ -86,7 +86,7 @@ fn backends(_ctx: &Ctx) -> Result<Backends> {
     Ok(Backends {
         search: Arc::new(crate::update::NoSearch),
         candidates: Arc::new(Unavailable),
-        cleaner: |name| name.to_owned(),
+        cleaner: nntmux_predb::filename::fixer_cleaner,
         par2: Box::new(DeferPar2),
     })
 }
