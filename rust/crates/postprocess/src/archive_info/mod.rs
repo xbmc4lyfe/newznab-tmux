@@ -532,11 +532,7 @@ impl ArchiveInfo {
         let started = Instant::now();
         let mut pause = Duration::from_millis(1);
         let mut within_limits = true;
-        loop {
-            match child.try_wait() {
-                Ok(None) => {}
-                Ok(Some(_)) | Err(_) => break,
-            }
+        while let Ok(None) = child.try_wait() {
             if written() > allowance || started.elapsed() > EXTRACTION_TIMEOUT {
                 within_limits = false;
                 let _ = child.kill();
