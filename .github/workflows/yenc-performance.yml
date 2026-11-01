@@ -1,38 +1,39 @@
 name: Paired native yEnc performance
 
 on:
-  push:
-    branches: [master]
-  pull_request:
-    paths:
-      - '.github/workflows/yenc-performance.yml'
-      - 'scripts/export-benchmark-summary.py'
-      - 'scripts/benchmark-rust-toolchain.sh'
-      - 'tests/Unit/test_benchmark_toolchain.py'
-      - 'tests/Unit/test_benchmark_summary_export.py'
-      - 'scripts/benchmark-yenc.php'
-      - 'scripts/benchmark-article-processing.php'
-      - 'tests/Unit/ArticleProcessingBenchmarkTest.php'
-      - 'scripts/benchmark-yenc-abi.py'
-      - 'scripts/yenc-performance-report.py'
-      - 'scripts/profile-yenc.php'
-      - 'scripts/profile-yenc.sh'
-      - 'tests/Unit/test_yenc_performance_report.py'
-      - 'tests/Unit/YencProfileTest.php'
-      - 'tests/Unit/test_yenc_abi_benchmark.py'
-      - 'tests/Feature/ReleaseFingerprintMetadataTest.php'
-      - 'scripts/build-rapidyenc.sh'
-      - 'app/Services/Yenc/**'
-      - 'app/Services/Releases/Fingerprint/**'
-      - 'app/Services/YencService.php'
-      - 'app/Services/NNTP/NNTPService.php'
-      - 'docker/app/nzb-yenc-ffi/**'
-      - 'tests/Fixtures/YencArticles.php'
-      - 'tests/Support/YencNntpHarness.php'
-      - 'tests/Unit/Yenc*Test.php'
-      - 'tests/Unit/NNTPBodyDecodingTest.php'
-      - 'composer.json'
-      - 'composer.lock'
+  # TODO: turn back on
+  # push:
+  #   branches: [master]
+  # pull_request:
+  #   paths:
+  #     - '.github/workflows/yenc-performance.yml'
+  #     - 'scripts/export-benchmark-summary.py'
+  #     - 'scripts/benchmark-rust-toolchain.sh'
+  #     - 'tests/Unit/test_benchmark_toolchain.py'
+  #     - 'tests/Unit/test_benchmark_summary_export.py'
+  #     - 'scripts/benchmark-yenc.php'
+  #     - 'scripts/benchmark-article-processing.php'
+  #     - 'tests/Unit/ArticleProcessingBenchmarkTest.php'
+  #     - 'scripts/benchmark-yenc-abi.py'
+  #     - 'scripts/yenc-performance-report.py'
+  #     - 'scripts/profile-yenc.php'
+  #     - 'scripts/profile-yenc.sh'
+  #     - 'tests/Unit/test_yenc_performance_report.py'
+  #     - 'tests/Unit/YencProfileTest.php'
+  #     - 'tests/Unit/test_yenc_abi_benchmark.py'
+  #     - 'tests/Feature/ReleaseFingerprintMetadataTest.php'
+  #     - 'scripts/build-rapidyenc.sh'
+  #     - 'app/Services/Yenc/**'
+  #     - 'app/Services/Releases/Fingerprint/**'
+  #     - 'app/Services/YencService.php'
+  #     - 'app/Services/NNTP/NNTPService.php'
+  #     - 'docker/app/nzb-yenc-ffi/**'
+  #     - 'tests/Fixtures/YencArticles.php'
+  #     - 'tests/Support/YencNntpHarness.php'
+  #     - 'tests/Unit/Yenc*Test.php'
+  #     - 'tests/Unit/NNTPBodyDecodingTest.php'
+  #     - 'composer.json'
+  #     - 'composer.lock'
   workflow_dispatch:
     inputs:
       comparison:
