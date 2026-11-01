@@ -536,7 +536,12 @@ async fn cover_page(
     sub: Option<String>,
 ) -> WebResult {
     let db = &ctx.db;
-    let mut category = input.int("t", kind.root);
+    // A movie looked up by id spans every category, as PHP's `has('imdb') ? -1` did.
+    let mut category = if kind.root == 2000 && input.has("imdb") {
+        -1
+    } else {
+        input.int("t", kind.root)
+    };
     let mut path = kind.path.to_owned();
     let mut list_url = kind.list_url.to_owned();
     if let Some(sub) = &sub {
