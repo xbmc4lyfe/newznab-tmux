@@ -20,8 +20,9 @@ class BtcPaymentController extends BasePageController
     public function btcPayCallback(Request $request): Response
     {
         $hashCheck = 'sha256='.hash_hmac('sha256', $request->getContent(), config('nntmux.btcpay_webhook_secret'));
-        if ($hashCheck !== $request->header('btcpay-sig')) {
-            Log::channel('btc_payment')->error('BTCPay webhook hash check failed: '.$request->header('btcpay-sig'));
+        $signature = $request->header('btcpay-sig');
+        if (! is_string($signature) || ! hash_equals($hashCheck, $signature)) {
+            Log::channel('btc_payment')->error('BTCPay webhook hash check failed: '.(is_string($signature) ? $signature : ''));
 
             return response('Not Found', 404);
         }
