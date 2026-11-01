@@ -26,6 +26,8 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 18. **Keep timing gates out of unit tests.** Four benchmark test files failed during a run on a machine with a load average above 24, then passed when rerun with load near 14. A speed gate in a unit suite fails on whatever else the machine is doing. Run benchmarks in their own job on a quiet machine, and compare trends.
 19. **Use typed values, not packed words.** The Wave 67.2 episode plan packed its result into bit fields such as `min(series, 4095) << 8`, so a larger value is silently cut to the cap. Use Rust structs inside the indexer, and return an error when a value doesn't fit.
 20. **Don't tune the cheap step.** Wave 67.2 reported 13.24x on planning how `ForkingService` splits work among workers. That plan is arithmetic on a few numbers, while the workers it starts run backfill, binaries and post-processing. Tune the workers' throughput.
+21. **Say what a change does.** The #1052 pull request says "Migrate/accelerate", but it only added lines. Nothing was migrated and no caller changed. Report a migration only when production has switched and the old code is gone.
+22. **Size is a warning.** `IgdbHttpException` was already 392 lines when Wave 67.3 added 324 more. When an exception class grows that large, ask what the code is doing there.
 
 ## Slices
 
@@ -38,3 +40,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 4 | Wave 67.5 plans: `LogIndex`, `LogSearchCoordinator`, `ManticoreLogSearcher`, `LogEntry`, `LogEntryParser`, their Rust module and parity test | `2a092659e` | 14, 15 |
 | 5 | Wave 67.1 plans: `XxxPipe`, `CollectionCleanupService`, `CollectionsCleaningService`, `ConfigurationProvider`, `DomainConfigurationRepository`, their Rust module and parity test | `a94d3fa42` | 16 to 18 |
 | 6 | Wave 67.2 plans: `ProcessingRuntimeStateRepository`, `ConsolesProcessor`, `EpisodeHydrationService`, `FanartTvService`, `ForkingService`, their Rust module and parity test | `43f2624bf` | 19, 20 |
+| 7 | Wave 67.3 plans: `GamesProcessor`, `GdprNotificationService`, `GenreService`, `IGDB/Client`, `IgdbHttpException`, their Rust module and parity test | `e16bffea1` | 21, 22 |
