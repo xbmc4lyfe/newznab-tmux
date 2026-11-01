@@ -41,6 +41,7 @@ use axum::{Extension, Router};
 use nntmux_runtime::Ctx;
 
 pub use crate::abuse::AbuseConfig;
+pub use crate::abuse::block_pages;
 use crate::pipeline::{Endpoint, dispatch};
 use crate::rss::Feed;
 pub use crate::settings::Settings;

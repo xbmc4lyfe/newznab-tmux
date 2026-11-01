@@ -13,6 +13,8 @@ crc32fast.workspace = true
 flate2.workspace = true
 hex.workspace = true
 md-5.workspace = true
+nntmux-core.workspace = true
+nntmux-nntp.workspace = true
 nntmux-runtime.workspace = true
 nntmux-verify.workspace = true
 nntmux-yenc.workspace = true
@@ -24,6 +26,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 nntmux-testkit.workspace = true
