@@ -29,6 +29,7 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 21. **Say what a change does.** The #1052 pull request says "Migrate/accelerate", but it only added lines. Nothing was migrated and no caller changed. Report a migration only when production has switched and the old code is gone.
 22. **Size is a warning.** `IgdbHttpException` was already 392 lines when Wave 67.3 added 324 more. When an exception class grows that large, ask what the code is doing there.
 23. **Port what classifies, not what describes it.** Wave 66.6 added plans beside `TvPipe` and `MoviePipe`, and the pipes never called them. The real category rules stay in those pipes' own methods, so the indexer's identification work should read those methods and ignore any wave plan.
+24. **Tests must not lean on the ones before them.** Deleting a Wave 65.3 parity test made `test_provider_query_listener_records_normalized_durations` fail with `Target class [db] does not exist` when it runs after other tests, though it passes alone. It reads a global facade left by whichever test ran earlier. Give each test its own state, so deleting one can't break another.
 
 ## Slices
 
@@ -51,3 +52,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 14 | Wave 65.6 plans: `CategoryData`, `DetailsData`, `ReleaseData`, `ReleaseRows`, `XmlResponseContext`, their Rust module and parity test | `2b3558d2c` | None new |
 | 15 | Wave 65.4 plans: `UsenetDownloadService`, `AdminDashboardSnapshotService`, `AnidbService`, `ArchiveProcessingService`, `BlacklistService`, their Rust module and parity test | `0ff724f0b` | None new |
 | 16 | Wave 65.2 plans: `NzbContentParser`, `ReleaseFileManager`, `ReleaseFilesArchiveFallback`, `ReleaseProcessor`, `ReleaseSearchSyncCoordinator`, their Rust module and parity test | `2c608b686` | None new |
+| 17 | Wave 65.3 plans: `SevenZipListingParser`, `MediaByteBudget`, `PersistenceMetricsCollector`, `ProcessingMetrics`, `ReleaseProcessingContext`, their Rust module and parity test | `df5fa307b` | 24 |
