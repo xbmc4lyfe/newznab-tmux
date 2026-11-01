@@ -2007,9 +2007,12 @@ dependencies = [
  "anyhow",
  "clap",
  "nntmux-runtime",
+ "nntmux-search",
+ "nntmux-testkit",
  "regex",
  "serde_json",
  "sqlx",
+ "tokio",
 ]
 
 [[package]]

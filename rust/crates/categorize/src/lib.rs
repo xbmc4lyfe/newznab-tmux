@@ -4,6 +4,7 @@
 //! Owner: ws-naming. See `rust/WORKSTREAMS.md`.
 
 pub mod cat;
+pub mod commands;
 pub mod names;
 pub mod pcre;
 pub mod rules;
@@ -207,6 +208,14 @@ pub enum Command {
         #[arg(long)]
         list_categorizers: bool,
     },
+    /// Re-categorizes releases by name and group (`nntmux:recategorize-releases`).
+    Recategorize(commands::RecategorizeArgs),
+    /// Previews or repairs `OF.` releases in XXX categories (`releases:recategorize-onlyfans`).
+    RecategorizeOnlyfans {
+        /// Apply the corrections. Otherwise preview only.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 const RULE_SETS: [(&str, u32); 10] = [
@@ -276,6 +285,10 @@ pub async fn ctl(ctx: RuntimeCtx, command: Command) -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Command::Recategorize(args) => commands::recategorize(&ctx, args).await,
+        Command::RecategorizeOnlyfans { apply } => {
+            commands::recategorize_onlyfans(&ctx, apply).await
         }
     }
 }
