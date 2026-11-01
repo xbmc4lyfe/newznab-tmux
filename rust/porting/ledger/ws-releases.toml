@@ -78,7 +78,7 @@ note = "The per-host outbox existed so a blocking PHP worker could free its slot
 kind = "command"
 id = "releases:identity-suggestions"
 source = "app/Console/Commands/ReleaseIdentitySuggestions.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
