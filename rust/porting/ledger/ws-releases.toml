@@ -132,7 +132,8 @@ status = "ported"
 kind = "job"
 id = "CollectReleaseFingerprintMetadata"
 source = "app/Jobs/CollectReleaseFingerprintMetadata.php"
-status = "todo"
+status = "ported"
+note = "The fingerprint role, from rust/fingerprint-worker. The PHP job only enqueued database work, which store::enqueue_fingerprint does."
 
 [[entry]]
 kind = "service"

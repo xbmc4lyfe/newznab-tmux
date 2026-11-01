@@ -2246,6 +2246,8 @@ dependencies = [
  "flate2",
  "hex",
  "md-5 0.10.6",
+ "nntmux-core",
+ "nntmux-nntp",
  "nntmux-runtime",
  "nntmux-testkit",
  "nntmux-verify",
@@ -2258,6 +2260,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
