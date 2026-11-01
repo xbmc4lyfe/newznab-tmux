@@ -10,7 +10,7 @@ status = "todo"
 kind = "command"
 id = "irc:scrape"
 source = "app/Console/Commands/IrcScraperCommand.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
