@@ -70,7 +70,7 @@ status = "ported"
 kind = "command"
 id = "tv:reprocess-unmatched"
 source = "app/Console/Commands/ReprocessUnmatchedTvReleases.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
