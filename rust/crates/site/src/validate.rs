@@ -21,6 +21,15 @@ pub fn valid_email(email: &str) -> bool {
         && !domain.contains("..")
 }
 
+/// PHP's `FILTER_VALIDATE_EMAIL` for choosing the login column: unlike the form rule above it
+/// wants a dotted domain, so a username like `bob@home` still signs in as a username.
+pub fn login_is_email(login: &str) -> bool {
+    valid_email(login)
+        && login
+            .rsplit_once('@')
+            .is_some_and(|(_, domain)| domain.contains('.'))
+}
+
 /// The composition half of `Password::min(8)->letters()->mixedCase()->numbers()->symbols()`.
 pub fn password_policy_errors(password: &str) -> Vec<&'static str> {
     let mut errors = Vec::new();
@@ -226,6 +235,8 @@ mod tests {
         assert!(!valid_email("a b@example.com"));
         assert!(!valid_email("nodomain@"));
         assert!(!valid_email("twoats@@example.com"));
+        assert!(login_is_email("bob@example.com"));
+        assert!(!login_is_email("bob@home"));
     }
 
     #[tokio::test]

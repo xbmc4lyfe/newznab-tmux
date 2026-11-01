@@ -46,13 +46,13 @@ status = "ported"
 kind = "route"
 id = "GET|HEAD /contact-us"
 source = "App\\Http\\Controllers\\ContactUsController@showContactForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /covers/{type}/{filename}"
 source = "App\\Http\\Controllers\\CoverController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -148,13 +148,13 @@ status = "ported"
 kind = "route"
 id = "GET|HEAD /release-report/check"
 source = "App\\Http\\Controllers\\ReleaseReportController@checkReported"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /release-report/reasons"
 source = "App\\Http\\Controllers\\ReleaseReportController@getReasons"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -166,7 +166,7 @@ status = "ported"
 kind = "route"
 id = "GET|HEAD /status"
 source = "App\\Http\\Controllers\\StatusPageController@showStatusPage"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -178,7 +178,7 @@ status = "ported"
 kind = "route"
 id = "GET|POST|HEAD /"
 source = "App\\Http\\Controllers\\ContentController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -262,7 +262,7 @@ status = "todo"
 kind = "route"
 id = "GET|POST|HEAD /content"
 source = "App\\Http\\Controllers\\ContentController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -322,7 +322,7 @@ status = "todo"
 kind = "route"
 id = "GET|POST|HEAD /privacy-policy"
 source = "App\\Http\\Controllers\\PrivacyPolicyController@privacyPolicy"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -346,7 +346,7 @@ status = "todo"
 kind = "route"
 id = "GET|POST|HEAD /terms-and-conditions"
 source = "App\\Http\\Controllers\\TermsController@terms"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -406,7 +406,7 @@ status = "ported"
 kind = "route"
 id = "POST /contact-us"
 source = "App\\Http\\Controllers\\ContactUsController@contact"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -556,4 +556,4 @@ status = "ported"
 kind = "route"
 id = "POST /release-report"
 source = "App\\Http\\Controllers\\ReleaseReportController@store"
-status = "todo"
+status = "ported"

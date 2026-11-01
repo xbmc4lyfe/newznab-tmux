@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use askama::Template;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -5,6 +7,7 @@ use axum::http::header::SET_COOKIE;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use nntmux_runtime::Ctx;
 use nntmux_webkit::auth::{self, log_failed_login};
+use nntmux_webkit::session::random_string;
 use nntmux_webkit::{
     ClientIp, Input, MaybeUser, Session, User, WebResult, config, guard, throttle,
 };
@@ -16,6 +19,9 @@ use crate::validate;
 const GENERIC_FAILURE: &str =
     "Username or email and password combination used does not match our records!";
 pub(crate) const BREACH_WARNING: &str = "Security Alert: Your password has been found in a data breach. We strongly recommend changing it immediately in your account settings.";
+/// Checked when no account matches, so a miss costs the same time as a real check.
+static DUMMY_HASH: LazyLock<String> =
+    LazyLock::new(|| auth::hash_password(&random_string(40)).unwrap_or_default());
 const MAX_ATTEMPTS: u64 = 3;
 const DECAY_SECONDS: u64 = 120;
 
@@ -90,13 +96,18 @@ pub async fn submit(
         return Ok(failed(&ctx, &session, &key, &username, &ip, &messages).await);
     }
 
-    let column = if validate::valid_email(&username) {
+    let column = if validate::login_is_email(&username) {
         "email"
     } else {
         "username"
     };
     let found = User::find_by(&ctx.db, column, &username).await?;
-    let Some(user) = found.filter(|user| auth::verify_password(&password, &user.password)) else {
+    // Hash either way, so timing doesn't say whether the account exists.
+    let hash = found
+        .as_ref()
+        .map_or(DUMMY_HASH.as_str(), |user| user.password.as_str());
+    let matches = auth::verify_password(&password, hash);
+    let Some(user) = found.filter(|_| matches) else {
         return Ok(failed(&ctx, &session, &key, &username, &ip, GENERIC_FAILURE).await);
     };
     if !user.eligible_for_authentication() {

@@ -19,8 +19,10 @@ use crate::{mailer, validate};
 
 const DEFAULT_ROLE: i32 = 1;
 const DEFAULT_INVITES: i32 = 1;
-const STATUS_OPEN: i32 = 1;
-const STATUS_INVITE: i32 = 2;
+/// `App\\Enums\\RegistrationStatus`.
+const STATUS_OPEN: i32 = 0;
+const STATUS_INVITE: i32 = 1;
+const STATUS_CLOSED: i32 = 2;
 
 #[derive(Template)]
 #[template(path = "auth/register.html")]
@@ -55,7 +57,7 @@ pub(crate) async fn registration_status(ctx: &Ctx) -> Result<RegistrationStatus>
     .await?
     .map(|status: i64| status as i32);
     let manual = manual
-        .filter(|status| (1..=3).contains(status))
+        .filter(|status| (STATUS_OPEN..=STATUS_CLOSED).contains(status))
         .unwrap_or(STATUS_OPEN);
     let period: Option<(String, NaiveDateTime)> = sqlx::query_as(
         "SELECT name, ends_at FROM registration_periods
@@ -186,10 +188,11 @@ async fn validate_form(ctx: &Ctx, input: &Input) -> Result<Vec<(&'static str, St
             "username",
             "The username field must be at least 5 characters.".to_owned(),
         ));
-    } else if username.chars().count() > 255 {
+    } else if username.chars().count() > 50 {
+        // `users.username` is varchar(50). Laravel let longer names through to a database error.
         errors.push((
             "username",
-            "The username field must not be greater than 255 characters.".to_owned(),
+            "The username field must not be greater than 50 characters.".to_owned(),
         ));
     } else {
         let taken: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE username = ?")
@@ -414,11 +417,16 @@ pub async fn submit(
         let mut tx = ctx.db.begin().await?;
         let id = create_user(&mut tx, &username, &email, &hash, &ip, role, invites).await?;
         if let Some(found) = &invitation {
-            sqlx::query("UPDATE invitations SET used_at = NOW(), used_by = ?, is_active = 0, updated_at = NOW() WHERE id = ?")
-                .bind(id)
-                .bind(found.id)
-                .execute(&mut *tx)
-                .await?;
+            let spent = sqlx::query(
+                "UPDATE invitations SET used_at = NOW(), used_by = ?, is_active = 0, updated_at = NOW()
+                 WHERE id = ? AND used_at IS NULL",
+            )
+            .bind(id)
+            .bind(found.id)
+            .execute(&mut *tx)
+            .await?;
+            // A parallel submit got here first. Dropping the transaction undoes the account.
+            anyhow::ensure!(spent.rows_affected() == 1, "the invitation was already used");
         }
         tx.commit().await?;
         anyhow::Ok(id)
@@ -468,7 +476,7 @@ mod tests {
 
     #[test]
     fn a_scheduled_period_overrides_a_closed_site() {
-        let status = resolve_status(3, period());
+        let status = resolve_status(STATUS_CLOSED, period());
         assert!(status.is_open && status.scheduled_override);
         assert_eq!(
             status.message,
@@ -479,7 +487,7 @@ mod tests {
         assert_eq!(plain.message, "Registrations are currently open.");
         assert!(resolve_status(STATUS_INVITE, None).is_invite_only);
         assert_eq!(
-            resolve_status(3, None).message,
+            resolve_status(STATUS_CLOSED, None).message,
             "Registrations are currently closed."
         );
     }

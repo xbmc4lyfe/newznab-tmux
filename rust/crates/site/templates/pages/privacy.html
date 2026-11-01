@@ -118,9 +118,11 @@
             <div class="px-6 py-4 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 text-center">
                 <span class="text-sm text-gray-600 dark:text-gray-400">
                     <i class="fas fa-calendar-alt mr-1"></i>
-                    Last updated: {{ now()->format('F j, Y') }}
+                    Last updated: {{ last_updated }}
                 </span>
             </div>
         </div>
     </div>
 </div>
+
+{% endblock %}

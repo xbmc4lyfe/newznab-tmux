@@ -17,7 +17,9 @@ use nntmux_core::var_or;
 use nntmux_runtime::Ctx;
 use nntmux_webkit::assets::public_dir;
 use nntmux_webkit::page::resolve_entities;
-use nntmux_webkit::{ClientIp, CurrentUser, Input, Layout, MaybeUser, Session, WebError, WebResult, config, guard};
+use nntmux_webkit::{
+    ClientIp, CurrentUser, Input, Layout, MaybeUser, Session, WebError, WebResult, config, guard,
+};
 use serde_json::json;
 use sqlx::FromRow;
 
@@ -86,7 +88,11 @@ impl ContentItem {
     }
 
     fn title_or_untitled(&self) -> &str {
-        if self.title.is_empty() { "Untitled" } else { &self.title }
+        if self.title.is_empty() {
+            "Untitled"
+        } else {
+            &self.title
+        }
     }
 
     /// `Str::limit(..., 150)`
@@ -110,10 +116,16 @@ struct ContentPage {
     header_description: &'static str,
 }
 
-const CONTENT_COLUMNS: &str = "CAST(id AS SIGNED) AS id, title, body, metadescription, metakeywords";
+const CONTENT_COLUMNS: &str =
+    "CAST(id AS SIGNED) AS id, title, body, metadescription, metakeywords";
 const ORDERED: &str = "ORDER BY contenttype, COALESCE(ordinal, 1000000) ASC, id ASC";
 
-async fn content(State(ctx): State<Ctx>, layout: Layout, input: Input, MaybeUser(signed_in): MaybeUser) -> WebResult {
+async fn content(
+    State(ctx): State<Ctx>,
+    layout: Layout,
+    input: Input,
+    MaybeUser(signed_in): MaybeUser,
+) -> WebResult {
     let role = match &signed_in {
         None => ROLE_EVERYONE,
         Some(auth) if auth.access.has_role("Admin") => ROLE_ADMIN,
@@ -124,31 +136,65 @@ async fn content(State(ctx): State<Ctx>, layout: Layout, input: Input, MaybeUser
     let page = input.str("page");
     let (rows, front): (Vec<ContentRow>, bool) = if id == 0 && page == "content" {
         let sql = format!("SELECT {CONTENT_COLUMNS} FROM content WHERE id <> 1 {ORDERED}");
-        (sqlx::query_as(sqlx::AssertSqlSafe(sql)).fetch_all(&ctx.db).await?, false)
+        (
+            sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .fetch_all(&ctx.db)
+                .await?,
+            false,
+        )
     } else if id != 0 && !page.is_empty() {
-        let visible = if matches!(role, ROLE_ADMIN | ROLE_MODERATOR) { "1 = 1" } else { "(role = ? OR role = ?)" };
-        let sql = format!("SELECT {CONTENT_COLUMNS} FROM content WHERE id = ? AND {visible} LIMIT 1");
+        let visible = if matches!(role, ROLE_ADMIN | ROLE_MODERATOR) {
+            "1 = 1"
+        } else {
+            "(role = ? OR role = ?)"
+        };
+        let sql =
+            format!("SELECT {CONTENT_COLUMNS} FROM content WHERE id = ? AND {visible} LIMIT 1");
         let mut query = sqlx::query_as(sqlx::AssertSqlSafe(sql)).bind(id);
         if !matches!(role, ROLE_ADMIN | ROLE_MODERATOR) {
             query = query.bind(ROLE_EVERYONE).bind(role);
         }
         (query.fetch_all(&ctx.db).await?, false)
     } else {
-        let sql = format!("SELECT {CONTENT_COLUMNS} FROM content WHERE status = 1 AND contenttype = ? {ORDERED}");
-        (sqlx::query_as(sqlx::AssertSqlSafe(sql)).bind(TYPE_INDEX).fetch_all(&ctx.db).await?, true)
+        let sql = format!(
+            "SELECT {CONTENT_COLUMNS} FROM content WHERE status = 1 AND contenttype = ? {ORDERED}"
+        );
+        (
+            sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .bind(TYPE_INDEX)
+                .fetch_all(&ctx.db)
+                .await?,
+            true,
+        )
     };
     if rows.is_empty() {
-        return Ok((StatusCode::NOT_FOUND, Json(json!({"message": "There is nothing to see here, no content provided."}))).into_response());
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({"message": "There is nothing to see here, no content provided."})),
+        )
+            .into_response());
     }
     let layout = if front {
         let first = &rows[0];
-        let title = if first.title.is_empty() { "Contents page" } else { first.title.as_str() };
-        layout.titled(title, first.metakeywords.clone(), first.metadescription.clone())
+        let title = if first.title.is_empty() {
+            "Contents page"
+        } else {
+            first.title.as_str()
+        };
+        layout.titled(
+            title,
+            first.metakeywords.clone(),
+            first.metadescription.clone(),
+        )
     } else {
         layout.titled("Contents page", "contents", "This is the contents page.")
     };
     let page = ContentPage {
-        header_title: if front { layout.username.clone() } else { "Content".to_owned() },
+        header_title: if front {
+            layout.username.clone()
+        } else {
+            "Content".to_owned()
+        },
         header_eyebrow: if front { "Welcome" } else { "Explore the site" },
         header_description: if front {
             "Discover the latest site information and start exploring the index."
@@ -166,24 +212,53 @@ async fn content(State(ctx): State<Ctx>, layout: Layout, input: Input, MaybeUser
 #[template(path = "pages/terms.html")]
 struct TermsPage {
     layout: Layout,
+    last_updated: String,
+}
+
+/// Both legal pages print today's date as their last update, as the Blade views did.
+fn today() -> String {
+    Utc::now().format("%B %-d, %Y").to_string()
 }
 
 async fn terms(layout: Layout) -> WebResult {
     let app = config::app_name();
-    let layout = layout.titled(format!("{app} - Terms and conditions"), "terms,conditions", format!("Terms and Conditions for {app}"));
-    Ok(Html(TermsPage { layout }.render()?).into_response())
+    let layout = layout.titled(
+        format!("{app} - Terms and conditions"),
+        "terms,conditions",
+        format!("Terms and Conditions for {app}"),
+    );
+    Ok(Html(
+        TermsPage {
+            layout,
+            last_updated: today(),
+        }
+        .render()?,
+    )
+    .into_response())
 }
 
 #[derive(Template)]
 #[template(path = "pages/privacy.html")]
 struct PrivacyPage {
     layout: Layout,
+    last_updated: String,
 }
 
 async fn privacy(layout: Layout) -> WebResult {
     let app = config::app_name();
-    let layout = layout.titled(format!("{app} - Privacy Policy"), "privacy,policy,data protection", format!("Privacy Policy for {app}"));
-    Ok(Html(PrivacyPage { layout }.render()?).into_response())
+    let layout = layout.titled(
+        format!("{app} - Privacy Policy"),
+        "privacy,policy,data protection",
+        format!("Privacy Policy for {app}"),
+    );
+    Ok(Html(
+        PrivacyPage {
+            layout,
+            last_updated: today(),
+        }
+        .render()?,
+    )
+    .into_response())
 }
 
 #[derive(Template)]
@@ -205,9 +280,15 @@ struct ContactPage {
 fn contact_page(layout: Layout, session: &Session, sent: bool) -> WebResult {
     let app = config::app_name();
     let captcha = Captcha::from_env();
-    let error_captcha = captcha.as_ref().and_then(|captcha| session.error(captcha.field()));
+    let error_captcha = captcha
+        .as_ref()
+        .and_then(|captcha| session.error(captcha.field()));
     let page = ContactPage {
-        layout: layout.titled(format!("Contact {app}"), "contact us,contact,get in touch,email", format!("Contact us at {app} and submit your feedback")),
+        layout: layout.titled(
+            format!("Contact {app}"),
+            "contact us,contact,get in touch,email",
+            format!("Contact us at {app} and submit your feedback"),
+        ),
         sent,
         errors: session.errors(),
         old_username: session.old("username"),
@@ -231,38 +312,68 @@ fn contact_errors(username: &str, email: &str, comment: &str) -> Vec<(&'static s
     if username.is_empty() {
         errors.push(("username", "The username field is required.".to_owned()));
     } else if username.chars().count() > 255 {
-        errors.push(("username", "The username field must not be greater than 255 characters.".to_owned()));
+        errors.push((
+            "username",
+            "The username field must not be greater than 255 characters.".to_owned(),
+        ));
     }
     if email.is_empty() {
         errors.push(("useremail", "The useremail field is required.".to_owned()));
     } else if !validate::valid_email(email) {
-        errors.push(("useremail", "The useremail field must be a valid email address.".to_owned()));
+        errors.push((
+            "useremail",
+            "The useremail field must be a valid email address.".to_owned(),
+        ));
     } else if email.chars().count() > 255 {
-        errors.push(("useremail", "The useremail field must not be greater than 255 characters.".to_owned()));
+        errors.push((
+            "useremail",
+            "The useremail field must not be greater than 255 characters.".to_owned(),
+        ));
     }
     if comment.is_empty() {
         errors.push(("comment", "The comment field is required.".to_owned()));
     } else if comment.chars().count() < 10 {
-        errors.push(("comment", "The comment field must be at least 10 characters.".to_owned()));
+        errors.push((
+            "comment",
+            "The comment field must be at least 10 characters.".to_owned(),
+        ));
     }
     errors
 }
 
-async fn contact_submit(State(ctx): State<Ctx>, layout: Layout, session: Session, input: Input, ClientIp(ip): ClientIp) -> WebResult {
+async fn contact_submit(
+    State(ctx): State<Ctx>,
+    layout: Layout,
+    session: Session,
+    input: Input,
+    ClientIp(ip): ClientIp,
+) -> WebResult {
     let username = input.str("username");
     let email = input.str("useremail");
     let comment = input.str("comment");
     let mut errors = contact_errors(&username, &email, &comment);
-    if let Some(error) = captcha_error(&input, &ip.to_string(), "Please complete the human verification.").await {
+    if let Some(error) = captcha_error(
+        &input,
+        &ip.to_string(),
+        "Please complete the human verification.",
+    )
+    .await
+    {
         errors.push(error);
     }
     if !errors.is_empty() {
         session.flash_errors(&errors);
-        session.flash_input(&[("username", username), ("useremail", email), ("comment", comment)]);
+        session.flash_input(&[
+            ("username", username),
+            ("useremail", email),
+            ("comment", comment),
+        ]);
         return Ok(Redirect::to("/contact-us").into_response());
     }
     if let Some(mailbox) = mailer::site_mailbox() {
-        let body = format!("Values submitted from contact form: username : {username}\nuseremail : {email}\ncomment : {comment}");
+        let body = format!(
+            "Values submitted from contact form: username : {username}\nuseremail : {email}\ncomment : {comment}"
+        );
         mailer::send_contact(&ctx, &mailbox, &email, &body).await?;
     }
     contact_page(layout, &session, true)
@@ -314,20 +425,36 @@ impl Health {
 
     fn banner(self) -> &'static str {
         match self {
-            Self::Operational => "border-green-500/50 bg-green-600 text-white dark:bg-green-900 dark:text-green-200",
-            Self::Degraded => "border-yellow-500/50 bg-yellow-500 text-yellow-950 dark:bg-yellow-900 dark:text-yellow-200",
-            Self::Maintenance => "border-blue-500/50 bg-blue-600 text-white dark:bg-blue-900 dark:text-blue-200",
-            Self::PartialOutage => "border-orange-500/50 bg-orange-600 text-white dark:bg-orange-900 dark:text-orange-200",
-            Self::MajorOutage => "border-red-500/50 bg-red-600 text-white dark:bg-red-900 dark:text-red-200",
+            Self::Operational => {
+                "border-green-500/50 bg-green-600 text-white dark:bg-green-900 dark:text-green-200"
+            }
+            Self::Degraded => {
+                "border-yellow-500/50 bg-yellow-500 text-yellow-950 dark:bg-yellow-900 dark:text-yellow-200"
+            }
+            Self::Maintenance => {
+                "border-blue-500/50 bg-blue-600 text-white dark:bg-blue-900 dark:text-blue-200"
+            }
+            Self::PartialOutage => {
+                "border-orange-500/50 bg-orange-600 text-white dark:bg-orange-900 dark:text-orange-200"
+            }
+            Self::MajorOutage => {
+                "border-red-500/50 bg-red-600 text-white dark:bg-red-900 dark:text-red-200"
+            }
         }
     }
 
     fn badge(self) -> String {
         let colors = match self {
-            Self::Operational => "bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200",
-            Self::Degraded => "bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200",
+            Self::Operational => {
+                "bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200"
+            }
+            Self::Degraded => {
+                "bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200"
+            }
             Self::Maintenance => "bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200",
-            Self::PartialOutage => "bg-orange-100 dark:bg-orange-900 text-orange-800 dark:text-orange-200",
+            Self::PartialOutage => {
+                "bg-orange-100 dark:bg-orange-900 text-orange-800 dark:text-orange-200"
+            }
             Self::MajorOutage => "bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200",
         };
         format!("{BADGE} {colors}")
@@ -394,7 +521,11 @@ impl IncidentView {
     }
 
     fn services_or_dash(&self) -> &str {
-        if self.services.is_empty() { "—" } else { &self.services }
+        if self.services.is_empty() {
+            "—"
+        } else {
+            &self.services
+        }
     }
 }
 
@@ -445,19 +576,31 @@ async fn load_incidents(ctx: &Ctx, condition: &str, order: &str) -> Result<Vec<I
          HAVING SUM(s.check_type = 'http') > 0
          ORDER BY {order}"
     );
-    type Row = (String, String, String, String, DateTime<Utc>, Option<DateTime<Utc>>, Option<String>);
-    let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql)).fetch_all(&ctx.db).await?;
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&ctx.db)
+        .await?;
     Ok(rows
         .into_iter()
-        .map(|(title, description, status, impact, started, resolved, services)| IncidentView {
-            title,
-            description,
-            status,
-            impact,
-            services: services.unwrap_or_default(),
-            started: stamp(started),
-            resolved: resolved.map(stamp).unwrap_or_default(),
-        })
+        .map(
+            |(title, description, status, impact, started, resolved, services)| IncidentView {
+                title,
+                description,
+                status,
+                impact,
+                services: services.unwrap_or_default(),
+                started: stamp(started),
+                resolved: resolved.map(stamp).unwrap_or_default(),
+            },
+        )
         .collect())
 }
 
@@ -471,13 +614,15 @@ async fn status(State(ctx): State<Ctx>, layout: Layout) -> WebResult {
     .await?;
     let services: Vec<ServiceView> = rows
         .into_iter()
-        .map(|(name, health, uptime, response_time_ms, checked)| ServiceView {
-            name,
-            uptime,
-            response_time_ms,
-            checked_ago: checked.map(|at| time_ago(at, now)).unwrap_or_default(),
-            status: Health::parse(&health),
-        })
+        .map(
+            |(name, health, uptime, response_time_ms, checked)| ServiceView {
+                name,
+                uptime,
+                response_time_ms,
+                checked_ago: checked.map(|at| time_ago(at, now)).unwrap_or_default(),
+                status: Health::parse(&health),
+            },
+        )
         .collect();
     let overall = services
         .iter()
@@ -498,11 +643,28 @@ async fn status(State(ctx): State<Ctx>, layout: Layout) -> WebResult {
     for (heading, incident) in resolved_rows {
         match resolved.last_mut() {
             Some(day) if day.heading == heading => day.incidents.push(incident),
-            _ => resolved.push(ResolvedDay { heading, incidents: vec![incident] }),
+            _ => resolved.push(ResolvedDay {
+                heading,
+                incidents: vec![incident],
+            }),
         }
     }
-    let layout = layout.titled("Service status", "", "Current status of site services, incidents, and uptime.");
-    Ok(Html(StatusPage { layout, overall, services, active, resolved }.render()?).into_response())
+    let layout = layout.titled(
+        "Service status",
+        "",
+        "Current status of site services, incidents, and uptime.",
+    );
+    Ok(Html(
+        StatusPage {
+            layout,
+            overall,
+            services,
+            active,
+            resolved,
+        }
+        .render()?,
+    )
+    .into_response())
 }
 
 fn valid_cover_filename(filename: &str) -> bool {
@@ -510,9 +672,14 @@ fn valid_cover_filename(filename: &str) -> bool {
         return false;
     };
     let mut chars = stem.chars();
-    chars.next().is_some_and(|first| first.is_ascii_alphanumeric())
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        && matches!(extension.to_ascii_lowercase().as_str(), "webp" | "jpg" | "jpeg" | "png" | "gif")
+        && matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "webp" | "jpg" | "jpeg" | "png" | "gif"
+        )
 }
 
 /// `-1-cover.jpg` and `0.webp` are ids of nothing: answer with the placeholder without looking.
@@ -520,7 +687,10 @@ fn invalid_numeric_cover(filename: &str) -> bool {
     let Some((stem, extension)) = filename.rsplit_once('.') else {
         return false;
     };
-    if !matches!(extension.to_ascii_lowercase().as_str(), "webp" | "jpg" | "jpeg") {
+    if !matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "webp" | "jpg" | "jpeg"
+    ) {
         return false;
     }
     let number = stem.strip_suffix("-cover").unwrap_or(stem);
@@ -553,7 +723,11 @@ fn cover_candidates(kind: &str, filename: &str) -> Vec<(String, String)> {
     }
     bases
         .into_iter()
-        .flat_map(|base| extensions.iter().map(move |extension| (base.clone(), extension.clone())))
+        .flat_map(|base| {
+            extensions
+                .iter()
+                .map(move |extension| (base.clone(), extension.clone()))
+        })
         .collect()
 }
 
@@ -562,21 +736,48 @@ fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
         [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
         [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
         [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => Some("image/webp"),
         _ => None,
     }
 }
 
 async fn placeholder() -> Result<Response, WebError> {
     let path = public_dir().join("assets/images/no-cover.png");
-    let bytes = tokio::fs::read(path).await.map_err(|_| WebError::NotFound)?;
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|_| WebError::NotFound)?;
     Ok(([(header::CONTENT_TYPE, "image/png")], bytes).into_response())
 }
 
 async fn cover(Path((kind, filename)): Path<(String, String)>) -> WebResult {
     const KINDS: [&str; 13] = [
-        "anime", "audio", "audiosample", "book", "console", "games", "movies", "music", "preview", "sample", "tvrage",
-        "video", "tvshows",
+        "anime",
+        "audio",
+        "audiosample",
+        "book",
+        "console",
+        "games",
+        "movies",
+        "music",
+        "preview",
+        "sample",
+        "tvrage",
+        "video",
+        "tvshows",
     ];
     const NUMERIC: [&str; 6] = ["anime", "book", "console", "games", "music", "tvshows"];
     if !KINDS.contains(&kind.as_str()) || !valid_cover_filename(&filename) {
@@ -597,7 +798,10 @@ async fn cover(Path((kind, filename)): Path<(String, String)>) -> WebResult {
                 let mut response = bytes.into_response();
                 let headers = response.headers_mut();
                 headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
-                headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000"));
+                headers.insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=31536000"),
+                );
                 return Ok(response);
             }
         }
@@ -623,10 +827,21 @@ fn validation_failed(field: &str, message: &str) -> Response {
         .into_response()
 }
 
-async fn report_store(State(ctx): State<Ctx>, CurrentUser(signed_in): CurrentUser, input: Input) -> WebResult {
+async fn report_store(
+    State(ctx): State<Ctx>,
+    CurrentUser(signed_in): CurrentUser,
+    input: Input,
+) -> WebResult {
     let release = input.get("release_id");
-    let Some(release_id) = release.as_deref().and_then(|value| value.parse::<i64>().ok()) else {
-        let message = if release.is_none() { "The release id field is required." } else { "The release id field must be an integer." };
+    let Some(release_id) = release
+        .as_deref()
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        let message = if release.is_none() {
+            "The release id field is required."
+        } else {
+            "The release id field must be an integer."
+        };
         return Ok(validation_failed("release_id", message));
     };
     let reason = input.str("reason");
@@ -634,11 +849,20 @@ async fn report_store(State(ctx): State<Ctx>, CurrentUser(signed_in): CurrentUse
         return Ok(validation_failed("reason", "The reason field is required."));
     }
     if reason.chars().count() > 255 {
-        return Ok(validation_failed("reason", "The reason field must not be greater than 255 characters."));
+        return Ok(validation_failed(
+            "reason",
+            "The reason field must not be greater than 255 characters.",
+        ));
     }
     let description = input.get("description");
-    if description.as_ref().is_some_and(|text| text.chars().count() > 1000) {
-        return Ok(validation_failed("description", "The description field must not be greater than 1000 characters."));
+    if description
+        .as_ref()
+        .is_some_and(|text| text.chars().count() > 1000)
+    {
+        return Ok(validation_failed(
+            "description",
+            "The description field must not be greater than 1000 characters.",
+        ));
     }
 
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM releases WHERE id = ?")
@@ -646,10 +870,18 @@ async fn report_store(State(ctx): State<Ctx>, CurrentUser(signed_in): CurrentUse
         .fetch_one(&ctx.db)
         .await?;
     if exists == 0 {
-        return Ok((StatusCode::NOT_FOUND, Json(json!({"success": false, "message": "Release not found."}))).into_response());
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({"success": false, "message": "Release not found."})),
+        )
+            .into_response());
     }
     if has_reported(&ctx, release_id, signed_in.user.id).await? {
-        return Ok((StatusCode::CONFLICT, Json(json!({"success": false, "message": "You have already reported this release."}))).into_response());
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({"success": false, "message": "You have already reported this release."})),
+        )
+            .into_response());
     }
     sqlx::query(
         "INSERT INTO release_reports (releases_id, users_id, reason, description, status, created_at, updated_at)
@@ -665,11 +897,13 @@ async fn report_store(State(ctx): State<Ctx>, CurrentUser(signed_in): CurrentUse
 }
 
 async fn has_reported(ctx: &Ctx, release_id: i64, user_id: i64) -> Result<bool> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_reports WHERE releases_id = ? AND users_id = ?")
-        .bind(release_id)
-        .bind(user_id)
-        .fetch_one(&ctx.db)
-        .await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM release_reports WHERE releases_id = ? AND users_id = ?",
+    )
+    .bind(release_id)
+    .bind(user_id)
+    .fetch_one(&ctx.db)
+    .await?;
     Ok(count > 0)
 }
 
@@ -678,10 +912,21 @@ async fn report_reasons() -> Response {
     Json(json!({ "reasons": reasons })).into_response()
 }
 
-async fn report_check(State(ctx): State<Ctx>, CurrentUser(signed_in): CurrentUser, input: Input) -> WebResult {
+async fn report_check(
+    State(ctx): State<Ctx>,
+    CurrentUser(signed_in): CurrentUser,
+    input: Input,
+) -> WebResult {
     let release = input.get("release_id");
-    let Some(release_id) = release.as_deref().and_then(|value| value.parse::<i64>().ok()) else {
-        let message = if release.is_none() { "The release id field is required." } else { "The release id field must be an integer." };
+    let Some(release_id) = release
+        .as_deref()
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        let message = if release.is_none() {
+            "The release id field is required."
+        } else {
+            "The release id field must be an integer."
+        };
         return Ok(validation_failed("release_id", message));
     };
     let reported = has_reported(&ctx, release_id, signed_in.user.id).await?;
@@ -709,7 +954,10 @@ mod tests {
         assert!(invalid_numeric_cover("0-cover.webp"));
         assert!(!invalid_numeric_cover("12-cover.jpg"));
         assert!(!invalid_numeric_cover("abc.jpg"));
-        assert!(!invalid_numeric_cover("0.png"), "PHP's pattern covers webp and jpeg only");
+        assert!(
+            !invalid_numeric_cover("0.png"),
+            "PHP's pattern covers webp and jpeg only"
+        );
     }
 
     #[test]
@@ -734,8 +982,14 @@ mod tests {
         assert!(Health::MajorOutage.severity() > Health::Maintenance.severity());
         assert_eq!(Health::parse("nonsense"), Health::Operational);
         let now = Utc::now();
-        assert_eq!(time_ago(now - chrono::Duration::minutes(1), now), "1 minute ago");
-        assert_eq!(time_ago(now - chrono::Duration::hours(5), now), "5 hours ago");
+        assert_eq!(
+            time_ago(now - chrono::Duration::minutes(1), now),
+            "1 minute ago"
+        );
+        assert_eq!(
+            time_ago(now - chrono::Duration::hours(5), now),
+            "5 hours ago"
+        );
     }
 
     #[test]
@@ -743,6 +997,9 @@ mod tests {
         assert!(contact_errors("name", "a@example.com", "a long enough note").is_empty());
         let errors = contact_errors("", "bad", "short");
         assert_eq!(errors.len(), 3);
-        assert_eq!(errors[2].1, "The comment field must be at least 10 characters.");
+        assert_eq!(
+            errors[2].1,
+            "The comment field must be at least 10 characters."
+        );
     }
 }

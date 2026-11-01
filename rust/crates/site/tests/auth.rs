@@ -2,170 +2,13 @@
 //! when the test services aren't set. The breached-password check calls the live range API and
 //! fails open without a network.
 
-use axum::Router;
-use axum::body::{Body, to_bytes};
-use axum::extract::Extension;
-use axum::http::{Request, StatusCode, header};
-use axum::response::Response;
-use nntmux_runtime::Ctx;
-use nntmux_site::router;
-use nntmux_testkit::TestDb;
+use axum::http::{StatusCode, header};
 use nntmux_webkit::auth;
-use nntmux_webkit::mail::outbox_key;
-use redis::AsyncCommands;
 use totp_rs::{Algorithm, Builder, Secret};
-use tower::ServiceExt;
 
-const PASSWORD: &str = "Vq7!correct-horse-battery-xyzzy";
+mod common;
 
-struct Browser {
-    app: Router,
-    cookies: Vec<(String, String)>,
-    /// Each browser is its own address, so login lockouts don't cross tests.
-    ip: String,
-}
-
-impl Browser {
-    fn new(ctx: &Ctx) -> Self {
-        let app = router()
-            .layer(Extension(ctx.clone()))
-            .with_state(ctx.clone());
-        let unique: u32 = rand::random();
-        let ip = format!("198.51.{}.{}", unique % 250, (unique >> 8) % 250);
-        Self {
-            app,
-            cookies: Vec::new(),
-            ip,
-        }
-    }
-
-    async fn send(
-        &mut self,
-        request: axum::http::request::Builder,
-        body: String,
-    ) -> (Response, String) {
-        let cookies = self
-            .cookies
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        let request = request
-            .header(header::COOKIE, cookies)
-            .header("x-forwarded-for", self.ip.clone())
-            .body(Body::from(body))
-            .unwrap();
-        let response = self.app.clone().oneshot(request).await.unwrap();
-        for value in response.headers().get_all(header::SET_COOKIE) {
-            let (pair, attributes) = value.to_str().unwrap().split_once(';').unwrap();
-            let (name, value) = pair.split_once('=').unwrap();
-            self.cookies.retain(|(existing, _)| existing != name);
-            if !attributes.contains("Max-Age=0") {
-                self.cookies.push((name.to_owned(), value.to_owned()));
-            }
-        }
-        let (parts, body) = response.into_parts();
-        let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
-        (
-            Response::from_parts(parts, Body::empty()),
-            String::from_utf8_lossy(&bytes).into_owned(),
-        )
-    }
-
-    async fn get(&mut self, path: &str) -> (Response, String) {
-        self.send(Request::get(path), String::new()).await
-    }
-
-    /// Posts a form with the CSRF token a real page would hold.
-    async fn post(&mut self, path: &str, fields: &[(&str, &str)]) -> (Response, String) {
-        let (_, html) = self.get("/login").await;
-        let token = extract_token(&html);
-        let mut body = format!("_token={token}");
-        for (key, value) in fields {
-            let encoded: String = nntmux_webkit::config::encode_component(value);
-            body.push_str(&format!("&{key}={encoded}"));
-        }
-        let request =
-            Request::post(path).header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
-        self.send(request, body).await
-    }
-
-    fn has_cookie(&self, name: &str) -> bool {
-        self.cookies.iter().any(|(existing, _)| existing == name)
-    }
-}
-
-fn extract_token(html: &str) -> String {
-    let marker = "name=\"csrf-token\" content=\"";
-    let start = html.find(marker).expect("the page has a CSRF meta tag") + marker.len();
-    html[start..start + 40].to_owned()
-}
-
-fn location(response: &Response) -> String {
-    response.headers()[header::LOCATION]
-        .to_str()
-        .unwrap()
-        .to_owned()
-}
-
-async fn fixture() -> Option<(TestDb, Ctx)> {
-    let db = TestDb::create().await.unwrap()?;
-    let redis_url = std::env::var("TEST_REDIS_URL").ok()?;
-    let mut config = nntmux_core::Config::from_env().unwrap();
-    config.redis_url = redis_url.clone();
-    let client = redis::Client::open(redis_url).unwrap();
-    let redis = redis::aio::ConnectionManager::new(client).await.unwrap();
-    let ctx = Ctx {
-        config: std::sync::Arc::new(config),
-        db: db.pool.clone(),
-        redis,
-    };
-    Some((db, ctx))
-}
-
-async fn add_user(db: &sqlx::MySqlPool, name: &str, verified: bool, roles_id: i32) -> i64 {
-    sqlx::query(
-        "INSERT INTO users (username, email, password, roles_id, api_token, verified, email_verified_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, IF(?, NOW(), NULL), NOW())",
-    )
-    .bind(name)
-    .bind(format!("{name}@example.com"))
-    .bind(auth::hash_password(PASSWORD).unwrap())
-    .bind(roles_id)
-    .bind(format!("token-{name}"))
-    .bind(verified)
-    .bind(verified)
-    .execute(db)
-    .await
-    .unwrap()
-    .last_insert_id() as i64
-}
-
-/// A unique login, so parallel tests' Redis keys and mail can't collide.
-fn unique(prefix: &str) -> String {
-    format!("{prefix}{:08x}", rand::random::<u32>())
-}
-
-async fn take_mail(ctx: &Ctx, to: &str) -> Vec<serde_json::Value> {
-    let mut redis = ctx.redis.clone();
-    let all: Vec<String> = redis.lrange(outbox_key(), 0, -1).await.unwrap();
-    let mut mine = Vec::new();
-    for raw in all {
-        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        if parsed["to"] == to {
-            let _: i64 = redis.lrem(outbox_key(), 1, &raw).await.unwrap();
-            mine.push(parsed);
-        }
-    }
-    mine
-}
-
-fn link_in(mail: &serde_json::Value, marker: &str) -> String {
-    let text = mail["text"].as_str().unwrap();
-    let start = text.find(marker).expect("the mail has the link");
-    let tail = &text[start..];
-    tail.split_whitespace().next().unwrap().to_owned()
-}
+use common::*;
 
 #[tokio::test]
 async fn login_logout_and_failures() {
@@ -225,17 +68,6 @@ async fn login_logout_and_failures() {
     db.drop_database().await.unwrap();
 }
 
-impl Browser {
-    /// Logging out needs a token from a page a signed-in user can open.
-    async fn post_with_token(&mut self, path: &str) -> (Response, String) {
-        let (_, html) = self.get("/confirm-password").await;
-        let token = extract_token(&html);
-        let request =
-            Request::post(path).header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
-        self.send(request, format!("_token={token}")).await
-    }
-}
-
 #[tokio::test]
 async fn three_failures_lock_the_form() {
     let Some((db, ctx)) = fixture().await else {
@@ -256,11 +88,6 @@ async fn three_failures_lock_the_form() {
     assert_eq!(location(&response), "/login");
     assert!(!browser_is_signed_in(&mut browser).await);
     db.drop_database().await.unwrap();
-}
-
-async fn browser_is_signed_in(browser: &mut Browser) -> bool {
-    let (response, _) = browser.get("/login").await;
-    response.status() != StatusCode::OK
 }
 
 #[tokio::test]
@@ -557,7 +384,7 @@ async fn closed_registration_refuses_and_an_invitation_opens_invite_only() {
     let Some((db, ctx)) = fixture().await else {
         return;
     };
-    sqlx::query("UPDATE registration_configurations SET status = 2")
+    sqlx::query("UPDATE registration_configurations SET status = 1")
         .execute(&db.pool)
         .await
         .unwrap();
@@ -627,6 +454,54 @@ async fn closed_registration_refuses_and_an_invitation_opens_invite_only() {
         .unwrap();
     assert_eq!(active, 0);
 
+    db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn closed_registration_refuses_even_an_invitation() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    sqlx::query("UPDATE registration_configurations SET status = 2")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let inviter = add_user(&db.pool, &unique("inviter"), true, 1).await;
+    let name = unique("kevin");
+    let email = format!("{name}@example.com");
+    let token = unique("tok");
+    sqlx::query(
+        "INSERT INTO invitations (token, email, invited_by, expires_at, is_active, created_at)
+         VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 DAY), 1, NOW())",
+    )
+    .bind(&token)
+    .bind(&email)
+    .bind(inviter)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let mut browser = Browser::new(&ctx);
+    let (_, html) = browser.get(&format!("/register?invitecode={token}")).await;
+    assert!(html.contains("currently closed"));
+    assert!(!html.contains("Create Account"));
+    browser
+        .post(
+            "/register",
+            &[
+                ("username", &name),
+                ("email", &email),
+                ("password", PASSWORD),
+                ("password_confirmation", PASSWORD),
+                ("invitecode", &token),
+            ],
+        )
+        .await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = ?")
+        .bind(&email)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
     db.drop_database().await.unwrap();
 }
 

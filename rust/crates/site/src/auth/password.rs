@@ -200,17 +200,13 @@ pub async fn reset(
     if !errors.is_empty() {
         return Ok(fail(&errors));
     }
+    // One message for both, so this form can't be used to probe for accounts.
+    let invalid = [("email", "This password reset token is invalid.".to_owned())];
     let Some(user) = User::find_by(&ctx.db, "email", &email).await? else {
-        return Ok(fail(&[(
-            "email",
-            "We can't find a user with that email address.".to_owned(),
-        )]));
+        return Ok(fail(&invalid));
     };
     if !token_is_valid(&ctx, &user.email, &token).await? {
-        return Ok(fail(&[(
-            "email",
-            "This password reset token is invalid.".to_owned(),
-        )]));
+        return Ok(fail(&invalid));
     }
     sqlx::query("UPDATE users SET password = ?, remember_token = ?, resetguid = NULL, updated_at = NOW() WHERE id = ?")
         .bind(auth::hash_password(&password)?)
