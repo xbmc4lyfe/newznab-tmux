@@ -6,6 +6,7 @@ use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 
 /// `ArchiveReader::$maxReadBytes`. In-memory data past this isn't seen at all.
 pub const MAX_READ_BYTES: i64 = 1_048_576;
@@ -16,10 +17,10 @@ pub const MAX_FILENAME_LENGTH: usize = 256;
 /// overlapping records multiply small inputs, and PHP's `memory_limit` was what stopped them.
 pub const MAX_RETAINED_BYTES: i64 = 256 * 1024 * 1024;
 /// Bytes read, plus [`READ_COST`] per read. Overlapping candidates make parsing quadratic.
-pub const MAX_WORK: i64 = 4 * 1024 * 1024 * 1024;
-/// The part of that one search for a header in a fragment may use. A plain text article alone
-/// can ask for gigabytes of CRC, and giving up there just means no header was found.
-pub const MAX_SCAN_WORK: i64 = 512 * 1024 * 1024;
+pub const MAX_WORK: i64 = 16 * 1024 * 1024 * 1024;
+/// The part of that one search for a header in a fragment may use. A whole article of plain text
+/// asks for about 2 GiB of CRC, and a real header can sit at the end of it.
+pub const MAX_SCAN_WORK: i64 = 4 * 1024 * 1024 * 1024;
 const READ_COST: i64 = 64;
 /// A single read from a file. PAR2 reads whole recovery packets to check them.
 const MAX_FILE_READ: i64 = 1024 * 1024 * 1024;
@@ -34,6 +35,8 @@ pub struct Budget {
     nested: AtomicI64,
     extractions: AtomicI64,
     extracted: AtomicI64,
+    open_files: AtomicI64,
+    started: Instant,
 }
 
 impl Default for Budget {
@@ -52,6 +55,8 @@ impl Budget {
             nested: AtomicI64::new(0),
             extractions: AtomicI64::new(0),
             extracted: AtomicI64::new(0),
+            open_files: AtomicI64::new(0),
+            started: Instant::now(),
         }
     }
 
@@ -61,11 +66,12 @@ impl Budget {
         self.retain_count(bytes, 1)
     }
 
-    /// As [`Self::retain`], for `count` items of `size` bytes, before allocating them.
+    /// As [`Self::retain`], for `count` items of `size` bytes, before allocating them. Filling
+    /// them is work too, and a scan hands the memory back but not the time.
     pub fn retain_count(&self, count: i64, size: usize) -> Parse<()> {
         let size = i64::try_from(size).map_err(|_| Thrown)?;
         let bytes = count.max(0).saturating_mul(size);
-        // A charge that doesn't fit leaves the total alone, so smaller ones can still pass.
+        self.spend_work(bytes)?;
         if bytes > MAX_RETAINED_BYTES
             || self.retained.fetch_add(bytes, Ordering::Relaxed) + bytes > MAX_RETAINED_BYTES
         {
@@ -93,6 +99,11 @@ impl Budget {
         self.work() >= self.work_limit
     }
 
+    /// Whether a limit has been hit, so what's read from here on can't be trusted to be whole.
+    pub fn exhausted(&self) -> bool {
+        self.work_exhausted() || self.retained() >= MAX_RETAINED_BYTES
+    }
+
     fn spend_work(&self, amount: i64) -> Parse<()> {
         if self
             .work
@@ -114,6 +125,16 @@ impl Budget {
     /// False once `limit` files have been unpacked.
     pub fn admit_extraction(&self, limit: i64) -> bool {
         self.extractions.fetch_add(1, Ordering::Relaxed) < limit
+    }
+
+    /// False once `limit` unpacked archives are being held open.
+    pub fn admit_open_file(&self, limit: i64) -> bool {
+        self.open_files.fetch_add(1, Ordering::Relaxed) < limit
+    }
+
+    /// How long this archive has been read for.
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 
     /// Bytes unpacked so far.

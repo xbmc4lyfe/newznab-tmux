@@ -169,6 +169,79 @@ fn has_error(entries: &[ListEntry]) -> bool {
     })
 }
 
+/// Records named `.sfv` over a shared tail of SFV lines, so each child holds every row.
+fn sfv_flood(children: usize, length: usize) -> Vec<u8> {
+    let mut data = Vec::new();
+    for index in 0..children {
+        data.extend(zip_rec(&format!("{index:04}.sfv"), 0x0fff_ffff));
+        data.extend(b"x ab\n");
+    }
+    data.extend([0x50, 0x4b, 3, 4]);
+    data.extend([0_u8; 26]);
+    while data.len() < length {
+        data.extend(b"a 00\n");
+    }
+    data
+}
+
+/// Each candidate claims millions of streams without reading a byte for them.
+fn digest_scan(length: usize) -> Vec<u8> {
+    let unit = [
+        0x01, 0x04, 0x07, 0x0b, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0c, 0x01, 0x00, 0x08, 0x0d, 0xe0,
+        0x00, 0x00, 0x7f, 0x0a, 0x00,
+    ];
+    unit.iter().copied().cycle().take(length).collect()
+}
+
+/// A stored entry of a ZIP.
+fn stored_entry(name: &str, data: &[u8]) -> Vec<u8> {
+    let size = u32::try_from(data.len()).expect("small");
+    let mut entry = vec![0x50, 0x4b, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 0x21, 0x21];
+    entry.extend(le32(1));
+    entry.extend(le32(size));
+    entry.extend(le32(size));
+    entry.extend(u16::try_from(name.len()).expect("short").to_le_bytes());
+    entry.extend(0_u16.to_le_bytes());
+    entry.extend(name.as_bytes());
+    entry.extend(data);
+    entry
+}
+
+/// A RAR 1.5 file block, with no marker before it, whose header's CRC holds.
+fn rar_file_block(name: &str) -> Vec<u8> {
+    let mut block = vec![0x74, 0, 0];
+    block.extend(u16::try_from(32 + name.len()).expect("short").to_le_bytes());
+    block.extend(le32(10));
+    block.extend(le32(10));
+    block.push(3);
+    block.extend(le32(0));
+    block.extend(le32(0x2121_0000));
+    block.push(29);
+    block.push(0x30);
+    block.extend(u16::try_from(name.len()).expect("short").to_le_bytes());
+    block.extend(le32(0));
+    block.extend(name.as_bytes());
+    let crc = crc32fast::hash(&block) & 0xffff;
+    let mut out = u16::try_from(crc).expect("masked").to_le_bytes().to_vec();
+    out.extend(block);
+    out
+}
+
+fn client(directory: &Path, script: &str) -> std::path::PathBuf {
+    let path = directory.join("unrar");
+    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("the client");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("its mode");
+    path
+}
+
+fn has_file(entries: &[ListEntry], name: &[u8]) -> bool {
+    entries.iter().any(|entry| match entry {
+        ListEntry::File(file) => file.name == name,
+        ListEntry::Nested(inner) => has_file(inner, name),
+        ListEntry::Error { .. } => false,
+    })
+}
+
 /// Lists `data` on a worker-sized stack, in a time a worker can afford.
 fn list(data: Vec<u8>, unrar: Option<&Path>) -> Vec<ListEntry> {
     let unrar = unrar.map(Path::to_path_buf);
@@ -239,4 +312,84 @@ fn extraction_stops_at_its_count() {
     std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).expect("its mode");
     let entries = list(comp_entries(2_000), Some(&client));
     assert!(has_error(&entries));
+}
+
+#[test]
+fn sfv_rows_count_against_the_memory_limit() {
+    let entries = list(sfv_flood(40, 256 * 1024), None);
+    assert!(has_error(&entries), "the limit shows in the listing");
+}
+
+#[test]
+fn a_digest_scan_stops() {
+    list(digest_scan(1_048_576), None);
+}
+
+/// A child past a limit has to show, or an encrypted archive could hide behind junk.
+#[test]
+fn children_past_a_limit_are_listed_as_errors() {
+    let mut data = Vec::new();
+    for index in 0..16 {
+        data.extend(stored_entry(
+            &format!("junk{index}.zip"),
+            &vec![0x74; 60_000],
+        ));
+    }
+    data.extend(stored_entry("hidden.rar", &rar_chain_fast(1)));
+    let entries = list(data, None);
+    assert!(has_file(&entries, b"hidden.rar"));
+    assert!(has_error(&entries), "the limit shows in the listing");
+}
+
+#[test]
+fn plain_text_can_hold_a_real_header_at_its_end() {
+    let line: &[u8] = b"the quick brown fox went to the store to get that thing that it wanted\n";
+    let mut data: Vec<u8> = line.iter().copied().cycle().take(800_000).collect();
+    data.extend(rar_file_block("next_part.mkv"));
+    let entries = list(data, None);
+    assert!(has_file(&entries, b"next_part.mkv"));
+}
+
+/// Numeric extensions are common in real archives, and most aren't archives.
+#[test]
+fn many_entries_that_only_look_like_archives_cost_nothing() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let client = client(directory.path(), "echo not an archive");
+    let mut data = b"Rar!\x1a\x07\x00".to_vec();
+    for index in 0..70 {
+        let name = format!("man/tool{index:02}.1");
+        data.extend([0, 0, 0x74, 0, 0]);
+        data.extend(u16::try_from(32 + name.len()).expect("short").to_le_bytes());
+        data.extend(le32(1));
+        data.extend(le32(1));
+        data.push(3);
+        data.extend(le32(0));
+        data.extend(le32(0x2121_0000));
+        data.push(29);
+        data.push(0x33);
+        data.extend(u16::try_from(name.len()).expect("short").to_le_bytes());
+        data.extend(le32(0));
+        data.extend(name.as_bytes());
+        data.push(0);
+    }
+    data.extend([0_u8; 8]);
+    assert!(!has_error(&list(data, Some(&client))));
+}
+
+#[test]
+fn a_client_error_is_cut_short() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let client = client(directory.path(), "head -c 10000000 /dev/zero >&2");
+    let entries = list(comp_entries(1), Some(&client));
+    let longest = entries
+        .iter()
+        .map(|entry| match entry {
+            ListEntry::Error { error, .. } => error.len(),
+            _ => 0,
+        })
+        .max();
+    assert!(
+        longest.is_some_and(|length| length <= 512 * 1024),
+        "{longest:?}"
+    );
 }

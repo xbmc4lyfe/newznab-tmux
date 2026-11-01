@@ -18,6 +18,20 @@ const FILE_DESCRIPTOR_USED: i64 = 0x0008;
 const FILE_CDR_ENCRYPTED: i64 = 0x2000;
 const EXTRA_ZIP64: i64 = 0x0001;
 
+fn is_record(kind: u32) -> bool {
+    matches!(
+        kind,
+        RECORD_CENTRAL_FILE
+            | RECORD_LOCAL_FILE
+            | RECORD_SIGNATURE
+            | RECORD_ENDCENTRAL
+            | RECORD_Z64_ENDCENTRAL
+            | RECORD_Z64_ENDCENTRAL_LOC
+            | RECORD_ARCHIVE_EXTRA
+            | RECORD_DATA_DESCR
+    )
+}
+
 #[derive(Clone, Debug, Default)]
 struct Record {
     offset: i64,
@@ -98,19 +112,9 @@ impl ZipReader {
     fn one_record(&mut self) -> Parse<bool> {
         let offset = self.cursor.offset;
         let kind = u32::try_from(self.cursor.u32()?).map_err(|_| Thrown)?;
-        if !matches!(
-            kind,
-            RECORD_CENTRAL_FILE
-                | RECORD_LOCAL_FILE
-                | RECORD_SIGNATURE
-                | RECORD_ENDCENTRAL
-                | RECORD_Z64_ENDCENTRAL
-                | RECORD_Z64_ENDCENTRAL_LOC
-                | RECORD_ARCHIVE_EXTRA
-                | RECORD_DATA_DESCR
-        ) {
+        if !is_record(kind) {
             // A bad signature resumes the search one byte on.
-            self.cursor.seek(self.cursor.offset - 3)?;
+            self.resynchronize(offset + 1)?;
             return Ok(true);
         }
         let mut record = Record {
@@ -132,6 +136,30 @@ impl ZipReader {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Moves to the next record signature at or after `from`, or to the last bytes, which are too
+    /// few to read as one. In chunks, because a file's data can be gigabytes to search through.
+    fn resynchronize(&mut self, from: i64) -> Parse<()> {
+        const CHUNK: i64 = 64 * 1024;
+        let mut at = from;
+        loop {
+            self.cursor.seek(at)?;
+            let take = (self.cursor.length - at).min(CHUNK);
+            if take < 4 {
+                return Ok(());
+            }
+            let chunk = self.cursor.read(take)?;
+            let found = chunk.windows(4).position(|bytes| {
+                is_record(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            });
+            if let Some(found) = found {
+                return self
+                    .cursor
+                    .seek(at + i64::try_from(found).map_err(|_| Thrown)?);
+            }
+            at += take - 3;
+        }
     }
 
     fn process_record(&mut self, record: &mut Record) -> Parse<()> {

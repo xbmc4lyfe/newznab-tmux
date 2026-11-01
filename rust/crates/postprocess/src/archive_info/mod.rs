@@ -15,11 +15,11 @@ pub mod zip;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,8 +41,14 @@ pub const MAIN_SOURCE: &str = "main";
 pub const MAX_NESTED_DEPTH: u32 = 8;
 /// Nested archives opened per top-level archive. Overlapping entries make these exponential.
 pub const MAX_NESTED_ARCHIVES: i64 = 1024;
-/// Files unpacked per top-level archive. Each holds a descriptor until the listing is done.
-pub const MAX_EXTRACTIONS: i64 = 64;
+/// Files unpacked per top-level archive. Anything with a numeric extension counts, so real
+/// archives reach dozens.
+pub const MAX_EXTRACTIONS: i64 = 1024;
+/// Unpacked archives held open per top-level archive, at one descriptor each.
+pub const MAX_OPEN_EXTRACTED: i64 = 128;
+/// All the unpacking one top-level archive may wait for.
+const EXTRACTION_TOTAL_TIME: Duration = Duration::from_secs(300);
+const MAX_CLIENT_ERROR_BYTES: u64 = 64 * 1024;
 /// Bytes unpacked per top-level archive, which is also the disk one release can take here.
 pub const MAX_EXTRACTED_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -246,7 +252,13 @@ impl ArchiveInfo {
         match Cursor::open(info.source.clone(), range, budget) {
             Ok(cursor) => {
                 info.select_reader(&cursor)?;
-                if info.reader.is_none() {
+                if info.budget.exhausted() {
+                    // What the readers saw can't be trusted to be all there is.
+                    info.kind = Kind::None;
+                    info.reader = None;
+                    info.readerless = true;
+                    info.own_error = NESTING_LIMIT.to_owned();
+                } else if info.reader.is_none() {
                     info.own_error = "Source is not a supported archive type".to_owned();
                 }
             }
@@ -397,7 +409,10 @@ impl ArchiveInfo {
             };
             // One error is enough to make the listing partial, and later entries would hit the
             // same limit.
-            if self.depth >= MAX_NESTED_DEPTH || !self.budget.admit_nested(MAX_NESTED_ARCHIVES) {
+            if self.depth >= MAX_NESTED_DEPTH
+                || self.budget.exhausted()
+                || !self.budget.admit_nested(MAX_NESTED_ARCHIVES)
+            {
                 let child = self.readerless(NESTING_LIMIT.to_owned());
                 children.retain(|(name, _)| *name != record.name);
                 children.push((record.name.clone(), child));
@@ -451,7 +466,9 @@ impl ArchiveInfo {
     }
 
     fn extracted_child(&mut self, name: &[u8]) -> Result<Self> {
-        if !self.budget.admit_extraction(MAX_EXTRACTIONS) {
+        if self.budget.elapsed() >= EXTRACTION_TOTAL_TIME
+            || !self.budget.admit_extraction(MAX_EXTRACTIONS)
+        {
             let mut child = self.readerless(EXTRACTION_LIMIT.to_owned());
             child.temporary = true;
             return Ok(child);
@@ -461,17 +478,27 @@ impl ArchiveInfo {
             .into_temp_path();
         let outcome = self.extract_file(name, &temp);
         let mut child = match outcome {
-            Ok(()) => Self::open_file(
+            Ok(()) => match Self::open_file(
                 &temp,
                 self.fragment,
                 self.unrar.clone(),
                 self.depth + 1,
                 self.budget.clone(),
-            )?,
+            ) {
+                Ok(child) => child,
+                // Out of descriptors, for one: this entry can't be read, the rest may be.
+                Err(failure) => self.readerless(format!("{failure:#}")),
+            },
             Err(message) => self.readerless(message),
         };
+        if child.reader.is_some() && !self.budget.admit_open_file(MAX_OPEN_EXTRACTED) {
+            child = self.readerless(EXTRACTION_LIMIT.to_owned());
+        }
         child.temporary = true;
-        self.temp_files.push(temp);
+        // Only a child reading it needs the file kept.
+        if child.reader.is_some() {
+            self.temp_files.push(temp);
+        }
         Ok(child)
     }
 
@@ -515,13 +542,19 @@ impl ArchiveInfo {
             .stdin(Stdio::null())
             .spawn()
             .map_err(|failure| failure.to_string())?;
-        let stderr = child.stderr.take().map(|mut stderr| {
+        let (errors_sender, errors_receiver) = mpsc::channel();
+        if let Some(mut stderr) = child.stderr.take() {
             thread::spawn(move || {
                 let mut errors = Vec::new();
-                let _ = stderr.read_to_end(&mut errors);
-                errors
-            })
-        });
+                let _ = stderr
+                    .by_ref()
+                    .take(MAX_CLIENT_ERROR_BYTES)
+                    .read_to_end(&mut errors);
+                let _ = errors_sender.send(errors);
+                // It must keep draining, or a client with more to say never exits.
+                let _ = io::copy(&mut stderr, &mut io::sink());
+            });
+        }
         let allowance = MAX_EXTRACTED_BYTES - self.budget.extracted();
         let written = || {
             std::fs::metadata(destination)
@@ -533,7 +566,10 @@ impl ArchiveInfo {
         let mut pause = Duration::from_millis(1);
         let mut within_limits = true;
         while let Ok(None) = child.try_wait() {
-            if written() > allowance || started.elapsed() > EXTRACTION_TIMEOUT {
+            if written() > allowance
+                || started.elapsed() > EXTRACTION_TIMEOUT
+                || self.budget.elapsed() > EXTRACTION_TOTAL_TIME
+            {
                 within_limits = false;
                 let _ = child.kill();
                 let _ = child.wait();
@@ -543,8 +579,9 @@ impl ArchiveInfo {
             pause = (pause * 2).min(Duration::from_millis(50));
         }
         self.budget.add_extracted(written());
-        let errors = stderr
-            .and_then(|reader| reader.join().ok())
+        // Something the client left behind can hold the pipe open past its exit.
+        let errors = errors_receiver
+            .recv_timeout(Duration::from_secs(1))
             .unwrap_or_default();
         if !within_limits {
             return Err(EXTRACTION_LIMIT.to_owned());
@@ -576,7 +613,9 @@ impl ArchiveInfo {
             let Some(cursor) = child.reader.as_ref().and_then(Reader::cursor) else {
                 continue;
             };
-            if !self.budget.admit_extraction(MAX_EXTRACTIONS)
+            if self.budget.elapsed() >= EXTRACTION_TOTAL_TIME
+                || !self.budget.admit_extraction(MAX_EXTRACTIONS)
+                || !self.budget.admit_open_file(MAX_OPEN_EXTRACTED)
                 || cursor.length > MAX_EXTRACTED_BYTES - self.budget.extracted()
             {
                 child.own_error = EXTRACTION_LIMIT.to_owned();

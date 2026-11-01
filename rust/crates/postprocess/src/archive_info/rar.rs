@@ -742,28 +742,8 @@ fn sane_file_header(block: &Block) -> bool {
     fail < 3
 }
 
-const CRC_TABLE: [u32; 256] = {
-    let mut table = [0_u32; 256];
-    let mut index = 0;
-    while index < 256 {
-        let mut crc = index as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
-            bit += 1;
-        }
-        table[index] = crc;
-        index += 1;
-    }
-    table
-};
-
 pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff_u32;
-    for byte in data {
-        crc = (crc >> 8) ^ CRC_TABLE[usize::from((crc as u8) ^ *byte)];
-    }
-    !crc
+    crc32fast::hash(data)
 }
 
 /// `RarUnicodeFilename::decode`: UTF-16LE from the standard name plus the unicode data, or

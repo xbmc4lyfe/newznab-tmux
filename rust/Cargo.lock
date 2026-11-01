@@ -2404,6 +2404,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "crc32fast",
  "hex",
  "md-5 0.10.6",
  "nntmux-core",

@@ -4,6 +4,7 @@
 //! that one bad checksum invalidates the whole file, which additional processing depends on.
 
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::sync::LazyLock;
 
 use md5::{Digest, Md5};
@@ -206,11 +207,18 @@ impl Par2Reader {
             return Vec::new();
         }
         let mut rows = self.file_list();
+        let positions: HashMap<String, usize> = rows
+            .iter()
+            .enumerate()
+            .map(|(position, row)| (row.0.clone(), position))
+            .collect();
         for packet in &self.packets {
             if &packet.kind != PACKET_FILEDESC {
                 continue;
             }
-            if let Some(row) = rows.iter_mut().find(|row| row.0 == packet.file_id)
+            if let Some(row) = positions
+                .get(&packet.file_id)
+                .and_then(|position| rows.get_mut(*position))
                 && row.1.is_none()
             {
                 row.1 = Some(describe(packet, false));
@@ -305,14 +313,25 @@ pub fn parse_sfv(cursor: &mut Cursor) -> Result<Vec<FileRecord>, String> {
     let Ok(data) = cursor.marker_buffer() else {
         return Err(String::new());
     };
+    let held = cursor.budget.retained();
     let mut files = Vec::new();
     for line in split_lines(&data) {
         if line.first() == Some(&b';') {
             continue;
         }
         let Some(found) = SFV_LINE.captures(php_trim_bytes(line)) else {
+            cursor.budget.restore_retained(held);
             return Err("Not a valid SFV file".to_owned());
         };
+        let name = found.group(1).unwrap_or_default();
+        // Running out reads as the data ending. The caller sees the limit was hit.
+        if cursor
+            .budget
+            .retain(size_of::<FileRecord>() + name.len())
+            .is_err()
+        {
+            break;
+        }
         files.push(FileRecord {
             name: found.group(1).unwrap_or_default().to_vec(),
             checksum: found
