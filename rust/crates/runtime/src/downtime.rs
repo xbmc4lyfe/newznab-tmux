@@ -81,14 +81,19 @@ pub async fn enter(pool: &MySqlPool, delay_hours: i64) -> Result<Barrier> {
 
 pub async fn record_activity_on(pool: &MySqlPool) -> Result<()> {
     let barrier = Barrier::lock(pool).await?;
+    let result = record_locked(pool).await;
+    barrier.release().await;
+    result
+}
+
+async fn record_locked(pool: &MySqlPool) -> Result<()> {
     let delay: Option<u32> = sqlx::query_scalar(
         "SELECT collection_delay_hours FROM ingestion_configurations WHERE id = 1",
     )
     .fetch_optional(pool)
     .await?;
-    let result = compensate_locked(pool, delay.map_or(2, i64::from), true, usize::MAX).await;
-    barrier.release().await;
-    result.map(|_| ())
+    compensate_locked(pool, delay.map_or(2, i64::from), true, usize::MAX).await?;
+    Ok(())
 }
 
 pub async fn note_ingestion_on(pool: &MySqlPool) -> Result<()> {
