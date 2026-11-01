@@ -1,0 +1,577 @@
+[
+ {
+  "name": "rss_health",
+  "path": "/rss/health"
+ },
+ {
+  "name": "rss_health_post",
+  "method": "POST",
+  "path": "/rss/health",
+  "ignore_body": true
+ },
+ {
+  "name": "api_fallback",
+  "path": "/api/nope"
+ },
+ {
+  "name": "api_fallback_deep",
+  "path": "/api/nope/deeper"
+ },
+ {
+  "name": "api_fallback_post",
+  "method": "POST",
+  "path": "/api/nope"
+ },
+ {
+  "name": "api_method_not_allowed",
+  "method": "DELETE",
+  "path": "/api/v1/api"
+ },
+ {
+  "name": "api_v2_method_not_allowed",
+  "method": "POST",
+  "path": "/api/v2/search"
+ },
+ {
+  "name": "options_v1",
+  "method": "OPTIONS",
+  "path": "/api/v1/api"
+ },
+ {
+  "name": "options_v2_search",
+  "method": "OPTIONS",
+  "path": "/api/v2/search"
+ },
+ {
+  "name": "options_v2_tv_origin",
+  "method": "OPTIONS",
+  "path": "/api/v2/tv",
+  "headers": {
+   "Origin": "https://x.test"
+  }
+ },
+ {
+  "name": "preflight",
+  "method": "OPTIONS",
+  "path": "/api/v2/movies",
+  "headers": {
+   "Origin": "https://x.test",
+   "Access-Control-Request-Method": "QUERY",
+   "Access-Control-Request-Headers": "content-type"
+  }
+ },
+ {
+  "name": "caps_xml",
+  "path": "/api/v1/api?t=caps"
+ },
+ {
+  "name": "caps_c_json",
+  "path": "/api/v1/api?t=c&o=json"
+ },
+ {
+  "name": "caps_closed_registration",
+  "path": "/api/v1/api?t=caps&o=json",
+  "setup": [
+   "UPDATE registration_configurations SET status = 2;"
+  ]
+ },
+ {
+  "name": "caps_invite_registration",
+  "path": "/api/v1/api?t=caps",
+  "setup": [
+   "UPDATE registration_configurations SET status = 1;"
+  ]
+ },
+ {
+  "name": "caps_period_overrides_closed",
+  "path": "/api/v1/api?t=caps&o=json",
+  "setup": [
+   "UPDATE registration_configurations SET status = 2;",
+   "INSERT INTO registration_periods (name, starts_at, ends_at, is_enabled) VALUES ('open', '2020-01-01 00:00:00', '2099-01-01 00:00:00', 1);"
+  ]
+ },
+ {
+  "name": "caps_post",
+  "method": "POST",
+  "path": "/api/v1/api",
+  "headers": {
+   "Content-Type": "application/x-www-form-urlencoded"
+  },
+  "body": "t=caps"
+ },
+ {
+  "name": "caps_query",
+  "method": "QUERY",
+  "path": "/api/v1/api",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"t\":\"caps\"}"
+ },
+ {
+  "name": "v1_missing_t",
+  "path": "/api/v1/api"
+ },
+ {
+  "name": "v1_bad_t",
+  "path": "/api/v1/api?t=%3Cbad%3E%26"
+ },
+ {
+  "name": "v1_query_get_unavailable",
+  "method": "QUERY",
+  "path": "/api/v1/api",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"t\":\"get\"}"
+ },
+ {
+  "name": "v1_query_nzbadd_unavailable",
+  "method": "QUERY",
+  "path": "/api/v1/api?t=nzbadd",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{}"
+ },
+ {
+  "name": "v1_query_wrong_type",
+  "method": "QUERY",
+  "path": "/api/v1/api",
+  "headers": {
+   "Content-Type": "text/plain"
+  },
+  "body": "{\"t\":\"caps\"}"
+ },
+ {
+  "name": "v1_query_bad_json",
+  "method": "QUERY",
+  "path": "/api/v1/api",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{nope"
+ },
+ {
+  "name": "v1_missing_apikey",
+  "path": "/api/v1/api?t=search"
+ },
+ {
+  "name": "v1_empty_apikey",
+  "path": "/api/v1/api?t=search&apikey="
+ },
+ {
+  "name": "v1_wrong_apikey",
+  "path": "/api/v1/api?t=search&apikey=nope"
+ },
+ {
+  "name": "v1_unverified_apikey",
+  "path": "/api/v1/api?t=search&apikey=tokenunverified"
+ },
+ {
+  "name": "v1_deleted_apikey",
+  "path": "/api/v1/api?t=search&apikey=tokendeleted"
+ },
+ {
+  "name": "v1_disabled_apikey",
+  "path": "/api/v1/api?t=search&apikey=tokendisabled"
+ },
+ {
+  "name": "v1_quota_exhausted",
+  "path": "/api/v1/api?t=search&apikey=tokenalice",
+  "setup": [
+   "INSERT INTO user_requests (users_id, request, timestamp) SELECT 1, 'x', NOW() FROM seq_1_to_10;"
+  ]
+ },
+ {
+  "name": "v1_empty_q",
+  "path": "/api/v1/api?t=search&apikey=tokenalice&q="
+ },
+ {
+  "name": "v1_empty_maxage",
+  "path": "/api/v1/api?t=search&apikey=tokenalice&q=x&maxage="
+ },
+ {
+  "name": "v1_bad_maxage",
+  "path": "/api/v1/api?t=search&apikey=tokenalice&q=x&maxage=abc"
+ },
+ {
+  "name": "v1_empty_sort",
+  "path": "/api/v1/api?t=search&apikey=tokenalice&q=x&sort=%20"
+ },
+ {
+  "name": "v1_bad_sort",
+  "path": "/api/v1/api?t=search&apikey=tokenalice&q=x&sort=name"
+ },
+ {
+  "name": "v1_tv_empty_rid",
+  "path": "/api/v1/api?t=tvsearch&apikey=tokenalice&rid="
+ },
+ {
+  "name": "v1_movie_empty_imdb",
+  "path": "/api/v1/api?t=movie&apikey=tokenalice&imdbid="
+ },
+ {
+  "name": "v1_music_empty_q",
+  "path": "/api/v1/api?t=music&apikey=tokenalice&q="
+ },
+ {
+  "name": "v1_book_empty_q",
+  "path": "/api/v1/api?t=book&apikey=tokenalice&q="
+ },
+ {
+  "name": "v1_anime_missing",
+  "path": "/api/v1/api?t=anime&apikey=tokenalice"
+ },
+ {
+  "name": "v1_get_empty_g",
+  "path": "/api/v1/api?t=get&apikey=tokenalice&g="
+ },
+ {
+  "name": "v1_details_missing_id",
+  "path": "/api/v1/api?t=details&apikey=tokenalice"
+ },
+ {
+  "name": "v1_nfo_missing_id",
+  "path": "/api/v1/api?t=nfo&apikey=tokenalice"
+ },
+ {
+  "name": "v1_nzbadd_denied",
+  "method": "POST",
+  "path": "/api/v1/api?t=nzbadd&apikey=tokenalice"
+ },
+ {
+  "name": "v2_caps",
+  "path": "/api/v2/capabilities"
+ },
+ {
+  "name": "v2_missing_token",
+  "path": "/api/v2/search"
+ },
+ {
+  "name": "v2_empty_token",
+  "path": "/api/v2/search?api_token="
+ },
+ {
+  "name": "v2_wrong_token",
+  "path": "/api/v2/search?api_token=nope"
+ },
+ {
+  "name": "v2_unverified_token",
+  "path": "/api/v2/search?api_token=tokenunverified"
+ },
+ {
+  "name": "v2_disabled_token",
+  "path": "/api/v2/search?api_token=tokendisabled"
+ },
+ {
+  "name": "v2_deleted_token",
+  "path": "/api/v2/search?api_token=tokendeleted"
+ },
+ {
+  "name": "v2_quota_exhausted",
+  "path": "/api/v2/search?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_requests (users_id, request, timestamp) SELECT 1, 'x', NOW() FROM seq_1_to_10;"
+  ]
+ },
+ {
+  "name": "v2_url_array",
+  "path": "/api/v2/search?api_token=tokenalice&id[]=x"
+ },
+ {
+  "name": "v2_url_array_weird_key",
+  "path": "/api/v2/search?api_token=tokenalice&bad-key[]=x"
+ },
+ {
+  "name": "v2_query_wrong_type",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "text/plain"
+  },
+  "body": "{}"
+ },
+ {
+  "name": "v2_query_charset_ok_then_auth",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "application/json; charset=\"UTF-8\""
+  },
+  "body": "{}"
+ },
+ {
+  "name": "v2_query_bad_charset",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "application/json; charset=latin1"
+  },
+  "body": "{}"
+ },
+ {
+  "name": "v2_query_bad_json",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{nope"
+ },
+ {
+  "name": "v2_query_nested",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"a\":{\"b\":{\"c\":1}}}"
+ },
+ {
+  "name": "v2_query_scalar",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "[1]"
+ },
+ {
+  "name": "v2_query_bad_key",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"bad-key\":1}"
+ },
+ {
+  "name": "v2_query_duplicate",
+  "method": "QUERY",
+  "path": "/api/v2/search?id=a",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"id\":\"b\"}"
+ },
+ {
+  "name": "v2_query_object_value",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"id\":{\"a\":1}}"
+ },
+ {
+  "name": "v2_query_bool_value",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"id\":true}"
+ },
+ {
+  "name": "v2_query_null_value",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"id\":null}"
+ },
+ {
+  "name": "v2_query_too_big",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"id\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}"
+ },
+ {
+  "name": "v2_query_too_many",
+  "method": "QUERY",
+  "path": "/api/v2/search",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"k0\": 1, \"k1\": 1, \"k2\": 1, \"k3\": 1, \"k4\": 1, \"k5\": 1, \"k6\": 1, \"k7\": 1, \"k8\": 1, \"k9\": 1, \"k10\": 1, \"k11\": 1, \"k12\": 1, \"k13\": 1, \"k14\": 1, \"k15\": 1, \"k16\": 1, \"k17\": 1, \"k18\": 1, \"k19\": 1, \"k20\": 1, \"k21\": 1, \"k22\": 1, \"k23\": 1, \"k24\": 1, \"k25\": 1, \"k26\": 1, \"k27\": 1, \"k28\": 1, \"k29\": 1, \"k30\": 1, \"k31\": 1, \"k32\": 1, \"k33\": 1, \"k34\": 1, \"k35\": 1, \"k36\": 1, \"k37\": 1, \"k38\": 1, \"k39\": 1, \"k40\": 1, \"k41\": 1, \"k42\": 1, \"k43\": 1, \"k44\": 1, \"k45\": 1, \"k46\": 1, \"k47\": 1, \"k48\": 1, \"k49\": 1, \"k50\": 1, \"k51\": 1, \"k52\": 1, \"k53\": 1, \"k54\": 1, \"k55\": 1, \"k56\": 1, \"k57\": 1, \"k58\": 1, \"k59\": 1, \"k60\": 1, \"k61\": 1, \"k62\": 1, \"k63\": 1, \"k64\": 1}"
+ },
+ {
+  "name": "v2_movies_missing_id",
+  "path": "/api/v2/movies?api_token=tokenalice"
+ },
+ {
+  "name": "v2_audio_empty_id",
+  "path": "/api/v2/audio?api_token=tokenalice&id="
+ },
+ {
+  "name": "v2_books_empty_id",
+  "path": "/api/v2/books?api_token=tokenalice&id="
+ },
+ {
+  "name": "v2_anime_missing",
+  "path": "/api/v2/anime?api_token=tokenalice"
+ },
+ {
+  "name": "v2_tv_missing",
+  "path": "/api/v2/tv?api_token=tokenalice"
+ },
+ {
+  "name": "v2_details_missing_id",
+  "path": "/api/v2/details?api_token=tokenalice"
+ },
+ {
+  "name": "v2_getnzb_missing_id",
+  "path": "/api/v2/getnzb?api_token=tokenalice"
+ },
+ {
+  "name": "v2_nzbadd_denied",
+  "method": "POST",
+  "path": "/api/v2/nzbadd?api_token=tokenalice"
+ },
+ {
+  "name": "v2_nzbadd_no_file",
+  "method": "POST",
+  "path": "/api/v2/nzbadd?api_token=tokenposter"
+ },
+ {
+  "name": "v2_search_bad_maxage",
+  "path": "/api/v2/search?api_token=tokenalice&maxage=abc"
+ },
+ {
+  "name": "v2_search_bad_sort",
+  "path": "/api/v2/search?api_token=tokenalice&sort=abc"
+ },
+ {
+  "name": "v2_search_bad_limit",
+  "path": "/api/v2/search?api_token=tokenalice&limit=0"
+ },
+ {
+  "name": "v2_search_bad_offset",
+  "path": "/api/v2/search?api_token=tokenalice&offset=-1"
+ },
+ {
+  "name": "v2_search_cursor_offset",
+  "path": "/api/v2/search?api_token=tokenalice&cursor=x&offset=5"
+ },
+ {
+  "name": "v2_search_bad_cursor",
+  "path": "/api/v2/search?api_token=tokenalice&cursor=x"
+ },
+ {
+  "name": "mediainfo_empty",
+  "path": "/api/release/1/mediainfo"
+ },
+ {
+  "name": "inform_no_token",
+  "path": "/api/inform/release"
+ },
+ {
+  "name": "inform_wrong_token",
+  "path": "/api/inform/release?api_token=nope"
+ },
+ {
+  "name": "inform_disabled",
+  "path": "/api/inform/release?api_token=tokendisabled"
+ },
+ {
+  "name": "inform_bad_data",
+  "path": "/api/inform/release?api_token=tokenalice&relo=a"
+ },
+ {
+  "name": "inform_add",
+  "path": "/api/inform/release?api_token=tokenalice&relo=a&relp=b"
+ },
+ {
+  "name": "implicit_options_caps",
+  "method": "OPTIONS",
+  "path": "/api/v2/capabilities"
+ },
+ {
+  "name": "implicit_options_inform",
+  "method": "OPTIONS",
+  "path": "/api/inform/release"
+ },
+ {
+  "name": "implicit_options_getnzb",
+  "method": "OPTIONS",
+  "path": "/api/v2/getnzb"
+ },
+ {
+  "name": "implicit_options_nzbadd",
+  "method": "OPTIONS",
+  "path": "/api/v2/nzbadd"
+ },
+ {
+  "name": "implicit_options_fallback",
+  "method": "OPTIONS",
+  "path": "/api/nope"
+ },
+ {
+  "name": "implicit_options_rss_health",
+  "method": "OPTIONS",
+  "path": "/rss/health"
+ },
+ {
+  "name": "head_caps",
+  "method": "HEAD",
+  "path": "/api/v2/capabilities"
+ },
+ {
+  "name": "caps_etag_match",
+  "path": "/api/v2/capabilities",
+  "headers": {
+   "If-None-Match": "\"f40cf4baca9717d467aad15114218307c7a7e99cf720d1ec1d13d31c19e6d178\""
+  }
+ },
+ {
+  "name": "nzbadd_get_not_allowed",
+  "path": "/api/v2/nzbadd"
+ },
+ {
+  "name": "caps_del_method_not_allowed",
+  "method": "PUT",
+  "path": "/api/v2/capabilities"
+ },
+ {
+  "name": "caps_host_header",
+  "path": "/api/v1/api?t=caps&o=json",
+  "headers": {
+   "Host": "indexer.example.test"
+  }
+ },
+ {
+  "name": "caps_forwarded",
+  "path": "/api/v1/api?t=caps&o=json",
+  "headers": {
+   "X-Forwarded-Proto": "https",
+   "X-Forwarded-Host": "fwd.example.test"
+  }
+ },
+ {
+  "name": "mediainfo_data",
+  "path": "/api/release/7/mediainfo",
+  "setup": [
+   "INSERT INTO video_data (releases_id, containerformat, overallbitrate, videoduration, videoformat, videocodec, videowidth, videoheight, videoaspect, videoframerate, videolibrary) VALUES (7, 'MPEG-4', '5000', '60/1', 'AVC', 'h264', 1920, 1080, '16:9', 23.976, 'x264/lib');",
+   "INSERT INTO audio_data (id, releases_id, audioid, audioformat, audiomode, audiobitratemode, audiobitrate, audiochannels, audiosamplerate, audiolibrary, audiolanguage, audiotitle) VALUES (11, 7, 2, 'AC-3', 'CBR', 'CBR', '640', '6', '48000', 'lib', 'Français', NULL), (12, 7, 1, 'DTS', NULL, NULL, NULL, NULL, NULL, NULL, 'en', 'x');",
+   "INSERT INTO release_subtitles (releases_id, subsid, subslanguage) VALUES (7, 2, 'de'), (7, 1, 'en');"
+  ]
+ },
+ {
+  "name": "mediainfo_nonnumeric",
+  "path": "/api/release/abc/mediainfo"
+ },
+ {
+  "name": "mediainfo_post",
+  "method": "POST",
+  "path": "/api/release/1/mediainfo"
+ },
+ {
+  "name": "v2_token_limit_headers",
+  "path": "/api/v2/movies?api_token=tokenposter"
+ }
+]

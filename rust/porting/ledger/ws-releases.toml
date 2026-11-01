@@ -100,7 +100,7 @@ status = "todo"
 kind = "command"
 id = "releases:verification-barrier"
 source = "app/Console/Commands/ReleaseVerificationBarrier.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -118,10 +118,17 @@ status = "todo"
 kind = "command"
 id = "verification:import-manifests"
 source = "app/Console/Commands/ImportVerificationManifests.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "job"
 id = "CollectReleaseFingerprintMetadata"
 source = "app/Jobs/CollectReleaseFingerprintMetadata.php"
 status = "todo"
+
+[[entry]]
+kind = "service"
+id = "CollectionDowntimeCompensator"
+source = "app/Services/Tmux/CollectionDowntimeCompensator.php"
+status = "ported"
+note = "nntmux_runtime::downtime. ws-ingest and ws-ops call note_ingestion and record_activity, and ws-releases calls the barrier. The PHP marker file isn't imported, so the first Rust start only records and an outage across the cutover isn't compensated."

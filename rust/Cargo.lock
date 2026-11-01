@@ -309,6 +309,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -612,6 +627,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "deunicode"
+version = "1.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abd57806937c9cc163efc8ea3910e00a62e2aeb0b8119f1793a978088f8f6b04"
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -728,6 +749,17 @@ dependencies = [
  "hashbag",
  "left-right",
  "smallvec",
+]
+
+[[package]]
+name = "fancy-regex"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -1353,6 +1385,16 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "md-5"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
@@ -1482,9 +1524,29 @@ dependencies = [
 name = "nntmux-api"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "hex",
+ "md-5 0.10.6",
+ "nntmux-core",
  "nntmux-runtime",
+ "nntmux-testkit",
  "nntmux-webkit",
+ "rand 0.9.5",
+ "redis",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1494,6 +1556,9 @@ dependencies = [
  "anyhow",
  "clap",
  "nntmux-runtime",
+ "regex",
+ "serde_json",
+ "sqlx",
 ]
 
 [[package]]
@@ -1501,6 +1566,10 @@ name = "nntmux-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fancy-regex",
+ "hex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1641,6 +1710,7 @@ name = "nntmux-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "futures-util",
  "metrics",
@@ -1711,8 +1781,24 @@ name = "nntmux-verify"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "crc32fast",
+ "deunicode",
+ "flate2",
+ "hex",
+ "nntmux-core",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "rand 0.9.5",
+ "redis",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1789,7 +1875,13 @@ dependencies = [
 name = "nntmux-yenc"
 version = "0.1.0"
 dependencies = [
- "anyhow",
+ "crc32fast",
+ "hex",
+ "md-5 0.10.6",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
 ]
 
 [[package]]
@@ -2057,6 +2149,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2259,6 +2363,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -2486,7 +2601,7 @@ dependencies = [
  "log",
  "percent-encoding",
  "serde",
- "sha1",
+ "sha1 0.11.0",
  "sha2 0.11.1",
  "sqlx-core",
  "thiserror",
@@ -2515,7 +2630,7 @@ dependencies = [
  "hmac 0.13.0",
  "itoa",
  "log",
- "md-5",
+ "md-5 0.11.0",
  "memchr",
  "rand 0.10.3",
  "serde",
