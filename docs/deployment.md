@@ -127,7 +127,7 @@ The data volume has `prevent_destroy`. Destroying the whole root therefore requi
 
 ### Publish an image and configure secrets
 
-Build on an x86_64 host, or use Buildx with `--platform linux/amd64`. This image bundles production Composer dependencies and Vite assets; it does not bundle `.env`, database files, installation locks, or host storage. The build requires access to public Composer/npm registries and the forum repository.
+Build on an x86_64 host, or use Buildx with `--platform linux/amd64`. This image bundles production Composer dependencies and Vite assets; it does not bundle `.env`, database files, installation locks, or host storage. The build requires access to public Composer/npm registries.
 
 ```bash
 repository=$(terraform -chdir=infra/terraform/aws output -raw repository_url)
