@@ -201,18 +201,6 @@ source = "app/Console/Commands/TmuxStop.php"
 status = "ported"
 
 [[entry]]
-kind = "route"
-id = "POST /internal/release-verification/publish"
-source = "App\\Http\\Controllers\\ReleaseVerificationPublicationController"
-status = "todo"
-
-[[entry]]
-kind = "route"
-id = "POST /internal/release-verification/publish-batch"
-source = "App\\Http\\Controllers\\ReleaseVerificationPublicationBatchController"
-status = "todo"
-
-[[entry]]
 kind = "schedule"
 id = "call: function () {"
 source = "routes/console.php"

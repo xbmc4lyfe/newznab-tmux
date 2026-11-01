@@ -3,18 +3,17 @@
 //! manifest is rebuilt from the stored copy, and the sender's lease must still own the candidate.
 
 use std::net::IpAddr;
-use std::sync::OnceLock;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use axum::Json;
-use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use axum::{Extension, Json, Router};
 use ipnet::IpNet;
 use nntmux_categorize::Categorizer;
 use nntmux_core::{parsed_or, var_or};
@@ -427,59 +426,84 @@ impl Publication {
     }
 }
 
-static PUBLICATION: OnceCell<Publication> = OnceCell::const_new();
-
-async fn publication(ctx: &Ctx) -> Result<&'static Publication> {
-    PUBLICATION
-        .get_or_try_init(|| async {
-            Ok(Publication {
-                verify: Releases::new(ctx)?.verify,
-                cleaner: ReleaseCleaner::new(),
-                predb: PredbIndex::new(&ctx.config.manticore),
-                categorizer: Categorizer::load(&ctx.db).await?,
-            })
-        })
-        .await
+/// Read once when the router is built.
+#[derive(Clone, Debug)]
+pub struct Settings {
+    pub enabled: bool,
+    pub networks: Vec<IpNet>,
+    pub batch_items: usize,
+    pub batch_bytes: usize,
+    pub batch_seconds: f64,
 }
 
-fn flag(key: &str) -> bool {
-    matches!(
-        var_or(key, "false").to_ascii_lowercase().as_str(),
-        "true" | "1" | "(true)"
-    )
+fn network(entry: &str) -> Option<IpNet> {
+    let entry = entry.trim();
+    entry
+        .parse()
+        .ok()
+        .or_else(|| entry.parse::<IpAddr>().ok().map(IpNet::from))
 }
 
-static NETWORKS: OnceLock<Vec<IpNet>> = OnceLock::new();
-
-fn allowed(ip: IpAddr) -> bool {
-    NETWORKS
-        .get_or_init(|| {
-            var_or(
+impl Settings {
+    pub fn from_env() -> Self {
+        let enabled = var_or("RELEASE_VERIFICATION_PUBLISH_ENDPOINT", "false");
+        let items: usize =
+            parsed_or("RELEASE_VERIFICATION_PUBLISH_BATCH_MAX_ITEMS", 16).unwrap_or(16);
+        let bytes: usize = parsed_or("RELEASE_VERIFICATION_PUBLISH_BATCH_MAX_BYTES", 1_048_576)
+            .unwrap_or(1_048_576);
+        let seconds: f64 =
+            parsed_or("RELEASE_VERIFICATION_PUBLISH_BATCH_SECONDS", 15.0).unwrap_or(15.0);
+        Self {
+            enabled: matches!(
+                enabled.to_ascii_lowercase().as_str(),
+                "true" | "1" | "(true)"
+            ),
+            networks: var_or(
                 "RELEASE_VERIFICATION_PUBLISH_ALLOWED_NETWORKS",
                 "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8",
             )
             .split(',')
-            .filter_map(|network| {
-                let network = network.trim();
-                network
-                    .parse::<IpNet>()
-                    .ok()
-                    .or_else(|| network.parse::<IpAddr>().ok().map(IpNet::from))
+            .filter_map(network)
+            .collect(),
+            batch_items: items.clamp(1, BATCH_HARD_MAX_ITEMS),
+            batch_bytes: bytes.max(1),
+            batch_seconds: seconds.max(0.0),
+        }
+    }
+}
+
+struct Shared {
+    settings: Settings,
+    publication: OnceCell<Publication>,
+}
+
+impl Shared {
+    async fn publication(&self, ctx: &Ctx) -> Result<&Publication> {
+        self.publication
+            .get_or_try_init(|| async {
+                Ok(Publication {
+                    verify: Releases::new(ctx)?.verify,
+                    cleaner: ReleaseCleaner::new(),
+                    predb: PredbIndex::new(&ctx.config.manticore),
+                    categorizer: Categorizer::load(&ctx.db).await?,
+                })
             })
-            .collect()
-        })
-        .iter()
-        .any(|network| network.contains(&ip))
+            .await
+    }
 }
 
 /// Off unless configured, and then for private-network clients only. It has no authentication.
-async fn endpoint_gate(request: Request, next: Next) -> Response {
-    if !flag("RELEASE_VERIFICATION_PUBLISH_ENDPOINT") {
+async fn endpoint_gate(
+    Extension(shared): Extension<Arc<Shared>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !shared.settings.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
     let (parts, body) = request.into_parts();
-    let ip = client_ip::from_parts(&parts);
-    if !allowed(ip.0) {
+    let ip = client_ip::from_parts(&parts).0;
+    if !shared.settings.networks.iter().any(|net| net.contains(&ip)) {
         return StatusCode::FORBIDDEN.into_response();
     }
     next.run(Request::from_parts(parts, body)).await
@@ -497,7 +521,11 @@ fn internal_error(failure: &anyhow::Error) -> Response {
         .into_response()
 }
 
-async fn publish_single(State(ctx): State<Ctx>, body: Bytes) -> Response {
+async fn publish_single(
+    State(ctx): State<Ctx>,
+    Extension(shared): Extension<Arc<Shared>>,
+    body: Bytes,
+) -> Response {
     let data: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let item = match validate(&data) {
         Ok(item) => item,
@@ -509,7 +537,7 @@ async fn publish_single(State(ctx): State<Ctx>, body: Bytes) -> Response {
                 .into_response();
         }
     };
-    let service = match publication(&ctx).await {
+    let service = match shared.publication(&ctx).await {
         Ok(service) => service,
         Err(failure) => return internal_error(&failure),
     };
@@ -526,32 +554,17 @@ async fn publish_single(State(ctx): State<Ctx>, body: Bytes) -> Response {
     }
 }
 
-struct BatchLimits {
-    items: usize,
-    bytes: usize,
-    seconds: f64,
-}
-
-fn batch_limits() -> BatchLimits {
-    let items: usize = parsed_or("RELEASE_VERIFICATION_PUBLISH_BATCH_MAX_ITEMS", 16).unwrap_or(16);
-    let bytes: usize =
-        parsed_or("RELEASE_VERIFICATION_PUBLISH_BATCH_MAX_BYTES", 1_048_576).unwrap_or(1_048_576);
-    let seconds: f64 =
-        parsed_or("RELEASE_VERIFICATION_PUBLISH_BATCH_SECONDS", 15.0).unwrap_or(15.0);
-    BatchLimits {
-        items: items.clamp(1, BATCH_HARD_MAX_ITEMS),
-        bytes: bytes.max(1),
-        seconds: seconds.max(0.0),
-    }
-}
-
-async fn publish_batch(State(ctx): State<Ctx>, body: Bytes) -> Response {
-    let limits = batch_limits();
-    if body.len() > limits.bytes {
-        let error = format!("Batch body exceeds {} bytes.", limits.bytes);
+async fn publish_batch(
+    State(ctx): State<Ctx>,
+    Extension(shared): Extension<Arc<Shared>>,
+    body: Bytes,
+) -> Response {
+    let limits = &shared.settings;
+    if body.len() > limits.batch_bytes {
+        let error = format!("Batch body exceeds {} bytes.", limits.batch_bytes);
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({"error": error, "max_bytes": limits.bytes})),
+            Json(json!({"error": error, "max_bytes": limits.batch_bytes})),
         )
             .into_response();
     }
@@ -566,27 +579,39 @@ async fn publish_batch(State(ctx): State<Ctx>, body: Bytes) -> Response {
     let Some(items) = data["items"].as_array().filter(|items| !items.is_empty()) else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error": "items must be a non-empty list.", "max_items": limits.items})),
+            Json(json!({"error": "items must be a non-empty list.", "max_items": limits.batch_items})),
         )
             .into_response();
     };
-    if items.len() > limits.items {
-        let error = format!("A batch holds at most {} items.", limits.items);
+    if items.len() > limits.batch_items {
+        let error = format!("A batch holds at most {} items.", limits.batch_items);
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error": error, "max_items": limits.items})),
+            Json(json!({"error": error, "max_items": limits.batch_items})),
         )
             .into_response();
     }
-    let service = match publication(&ctx).await {
+    let service = match shared.publication(&ctx).await {
         Ok(service) => service,
         Err(failure) => return internal_error(&failure),
     };
-    let results = service.publish_batch(items, limits.seconds).await;
+    let results = service.publish_batch(items, limits.batch_seconds).await;
     Json(json!({"protocol": BATCH_PROTOCOL, "results": results})).into_response()
 }
 
 pub fn router() -> Router<Ctx> {
+    routes(Settings::from_env(), None)
+}
+
+/// `publication` replaces the one built from the context on the first request.
+pub fn routes(settings: Settings, publication: Option<Publication>) -> Router<Ctx> {
+    // The batch handler answers an oversized body itself, with its limit.
+    let body_limit = settings.batch_bytes.max(16 * 1024 * 1024);
+    let shared = Arc::new(Shared {
+        settings,
+        publication: publication
+            .map_or_else(OnceCell::new, |found| OnceCell::new_with(Some(found))),
+    });
     Router::new()
         .route(
             "/internal/release-verification/publish",
@@ -596,7 +621,7 @@ pub fn router() -> Router<Ctx> {
             "/internal/release-verification/publish-batch",
             post(publish_batch),
         )
-        // The batch handler answers an oversized body itself, with its limit.
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(body_limit))
         .layer(from_fn(endpoint_gate))
+        .layer(Extension(shared))
 }
