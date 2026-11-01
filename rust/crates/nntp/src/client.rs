@@ -156,19 +156,24 @@ impl NntpClient {
 
     async fn connect(&mut self, provider: &Provider) -> Result<bool, NntpError> {
         let scheme = if provider.tls { "tls" } else { "tcp" };
-        let transport = Transport::connect(provider, &self.config.tls, CONNECT_TIMEOUT)
-            .await
-            .map_err(|failure| {
-                let hint = if provider.tls {
-                    " Try disabling SSL/TLS, and/or try a different port."
-                } else {
-                    ""
-                };
-                NntpError::Transport(format!(
-                    "Connection to {scheme}://{}:{} failed.{hint} [{failure}]",
-                    provider.host, provider.port
-                ))
-            })?;
+        let transport = Transport::connect(
+            provider,
+            &self.config.tls,
+            CONNECT_TIMEOUT,
+            self.using_alternate,
+        )
+        .await
+        .map_err(|failure| {
+            let hint = if provider.tls {
+                " Try disabling SSL/TLS, and/or try a different port."
+            } else {
+                ""
+            };
+            NntpError::Transport(format!(
+                "Connection to {scheme}://{}:{} failed.{hint} [{failure}]",
+                provider.host, provider.port
+            ))
+        })?;
         self.transport = Some(transport);
         match self.read_status().await {
             Ok(200) => Ok(true),
