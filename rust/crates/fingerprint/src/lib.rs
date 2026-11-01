@@ -7,13 +7,14 @@ pub mod breaker;
 pub mod collect;
 pub mod database;
 pub mod manifest;
+pub mod role;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Subcommand;
 use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
 
-pub async fn run(_ctx: Ctx, _args: RoleArgs, _stop: Shutdown) -> Result<()> {
-    bail!("the fingerprint role isn't ported yet")
+pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
+    role::run(ctx, args, stop).await
 }
 
 /// `nntmux-ctl fingerprint ...`
