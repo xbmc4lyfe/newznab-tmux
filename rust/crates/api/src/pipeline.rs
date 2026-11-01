@@ -15,6 +15,7 @@ use tracing::error;
 
 use crate::auth::{self, User};
 use crate::cache;
+use crate::release_cache::Unavailable;
 use crate::reply::{Reply, json_error, xml_error};
 use crate::request::ApiRequest;
 use crate::rss::{self, Feed};
@@ -251,7 +252,7 @@ async fn respond(
         let session = request_auth
             .as_ref()
             .map(|auth| auth.user.api_token.as_str());
-        return getnzb::web(ctx, &api, session, route_id.as_deref()).await;
+        return getnzb::web(ctx, settings, &api, session, route_id.as_deref()).await;
     }
     let group = match hit_group(ctx, settings, &api).await {
         Ok(group) => group,
@@ -291,7 +292,19 @@ async fn respond(
                 token_headers = Some((max, (max - attempt.attempts).max(0)));
             }
         }
-        handle(endpoint, ctx, settings, &api, resolved, route_id).await?
+        match handle(endpoint, ctx, settings, &api, resolved, route_id).await {
+            Err(failure) if failure.is::<Unavailable>() => {
+                let text = "Search is temporarily unavailable, retry shortly";
+                let mut reply = if api.path.starts_with("/api/v2/") {
+                    json_error(900, text)
+                } else {
+                    xml_error(900, text)
+                };
+                reply.status = 503;
+                reply.header("retry-after", "30")
+            }
+            other => other?,
+        }
     };
 
     let mut reply = handled;
@@ -334,7 +347,7 @@ async fn handle(
         Endpoint::V2Tv => v2::tv(ctx, settings, api, resolved).await,
         Endpoint::V2Details => v2::details(ctx, settings, api, resolved).await,
         Endpoint::V2GetNzb => v2::get_nzb(ctx, settings, api, resolved).await,
-        Endpoint::Inform => misc::inform(ctx, api).await,
+        Endpoint::Inform => misc::inform(ctx, settings, api).await,
         Endpoint::MediaInfo => misc::media_info(ctx, route_id.as_deref().unwrap_or_default()).await,
         Endpoint::Fallback => Ok(misc::fallback()),
         Endpoint::RssHealth => Ok(misc::rss_health()),

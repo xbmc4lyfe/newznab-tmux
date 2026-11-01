@@ -14,6 +14,8 @@ use base64::Engine;
 use nntmux_api::{Settings, router_with};
 use nntmux_core::{Config, DatabaseConfig, ManticoreConfig};
 use nntmux_runtime::Ctx;
+use nntmux_search::config::IndexNames;
+use nntmux_search::{CursorCodec, SearchClient, SearchConfig, create_table_sql};
 use nntmux_testkit::TestDb;
 use rand::Rng;
 use redis::aio::ConnectionManager;
@@ -97,7 +99,11 @@ fn app(ctx: &Ctx) -> Router {
 fn mask(value: &str) -> String {
     let date = regex::Regex::new(r#"("(?:apiOldestTime|grabOldestTime|apioldesttime|graboldesttime)":|(?:apioldesttime|graboldesttime)=)"[^"]+""#)
         .expect("static regex");
-    date.replace_all(value, "$1\"<now>\"").into_owned()
+    let masked = date.replace_all(value, "$1\"<now>\"");
+    let cursor = regex::Regex::new(r#""next_cursor":"[^"]+""#).expect("static regex");
+    cursor
+        .replace_all(&masked, "\"next_cursor\":\"<cursor>\"")
+        .into_owned()
 }
 
 fn headers_of(value: &Value) -> Vec<(String, String)> {
@@ -118,6 +124,10 @@ fn headers_of(value: &Value) -> Vec<(String, String)> {
 }
 
 async fn replay(file: &str, skip: &[&str]) -> Result<()> {
+    replay_with(file, skip, None).await
+}
+
+async fn replay_with(file: &str, skip: &[&str], search: Option<SearchConfig>) -> Result<()> {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
     else {
@@ -164,7 +174,13 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
             }
             _ => Body::empty(),
         };
-        let response = app(&ctx).oneshot(builder.body(body)?).await?;
+        let mut settings = settings();
+        settings.search_config = search.clone();
+        settings.cursor_codec = Some(CursorCodec::new("test-key", "1", 15));
+        let app = router_with(settings)
+            .layer(axum::Extension(ctx.clone()))
+            .with_state(ctx.clone());
+        let response = app.oneshot(builder.body(body)?).await?;
         let status = response.status().as_u16();
         let mut got_headers: Vec<(String, String)> = response
             .headers()
@@ -681,5 +697,93 @@ async fn help_pages_render_for_a_signed_in_user() -> Result<()> {
         .oneshot(Request::get("/apihelp").body(Body::empty())?)
         .await?;
     assert_eq!(guest.status(), 303);
+    db.drop_database().await
+}
+
+/// Loads the documents PHP's populate wrote into tables only this test uses, then replays.
+#[tokio::test]
+async fn search_matches_php() -> Result<()> {
+    let Ok(endpoint) = std::env::var("TEST_MANTICORE_HTTP") else {
+        eprintln!("TEST_MANTICORE_HTTP is unset, skipping");
+        return Ok(());
+    };
+    let prefix = format!("t{:012x}_", rand::rng().random::<u64>() >> 16);
+    let mut config = SearchConfig::new(format!("http://{endpoint}"));
+    config.indexes = IndexNames::prefixed(&prefix);
+    let client = SearchClient::new(config.clone(), None)?;
+    let documents: Value = serde_json::from_str(&fs::read_to_string(
+        fixtures().join("index_documents.json"),
+    )?)?;
+    let logical = [
+        "releases", "predb", "movies", "tvshows", "music", "books", "games", "console", "steam",
+        "anime",
+    ];
+    for name in logical {
+        let table = config.indexes.table(name).to_owned();
+        client.sql(&create_table_sql(&table, name)).await?;
+        let docs: Vec<(i64, Value)> = documents[name]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                (
+                    entry["id"].as_i64().unwrap_or_default(),
+                    entry["doc"].clone(),
+                )
+            })
+            .collect();
+        client.replace_documents(&table, &docs).await?;
+    }
+    let result = replay_with("golden_search.json", &[], Some(config.clone())).await;
+    for name in logical {
+        client
+            .sql(&format!(
+                "DROP TABLE IF EXISTS {}",
+                config.indexes.table(name)
+            ))
+            .await?;
+    }
+    result
+}
+
+/// With Manticore unreachable a search can't claim "no matches": it answers a retryable 503, and
+/// v1 and v2 each use their own error format.
+#[tokio::test]
+async fn unreachable_search_answers_503() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    for (uri, kind) in [
+        (
+            "/api/v1/api?t=search&q=Movie&apikey=tokenposter",
+            "text/xml; charset=utf-8",
+        ),
+        (
+            "/api/v2/search?id=Movie&api_token=tokenposter",
+            "application/json",
+        ),
+    ] {
+        let mut settings = settings();
+        settings.search_config = Some(SearchConfig::new("http://127.0.0.1:9"));
+        let app = router_with(settings)
+            .layer(axum::Extension(ctx.clone()))
+            .with_state(ctx.clone());
+        let request = Request::builder()
+            .uri(uri)
+            .header("host", "x.test")
+            .body(Body::empty())?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), 503, "{uri}");
+        assert_eq!(response.headers()["retry-after"], "30");
+        assert_eq!(response.headers()["content-type"], kind);
+    }
     db.drop_database().await
 }

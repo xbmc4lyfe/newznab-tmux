@@ -98,7 +98,7 @@ pub async fn password_limit(db: &MySqlPool) -> Result<i32> {
     Ok(i32::from(show == Some(1)))
 }
 
-fn id_list(ids: &[i64]) -> String {
+pub fn id_list(ids: &[i64]) -> String {
     ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
 }
 
@@ -108,6 +108,9 @@ pub struct BrowseFilter<'a> {
     pub excluded: &'a [i64],
     /// A group name, escaped by binding.
     pub group: Option<&'a str>,
+    /// More conditions, written only from literals, with `?` for each of `extra_binds`.
+    pub extra: &'a str,
+    pub extra_binds: &'a [String],
 }
 
 /// The inner WHERE. Numbers are written in; the group name is bound by the caller.
@@ -125,6 +128,7 @@ async fn where_clause(db: &MySqlPool, filter: &BrowseFilter<'_>) -> Result<Strin
     if filter.group.is_some() {
         clause.push_str(" AND g.name = ?");
     }
+    clause.push_str(filter.extra);
     Ok(clause)
 }
 
@@ -140,6 +144,9 @@ pub async fn browse_count(db: &MySqlPool, filter: &BrowseFilter<'_>) -> Result<u
     let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
     if let Some(group) = filter.group {
         query = query.bind(group);
+    }
+    for bind in filter.extra_binds {
+        query = query.bind(bind);
     }
     let count = query.fetch_one(db).await?.max(0) as u64;
     let cap = max_results();
@@ -395,6 +402,9 @@ pub async fn browse_rows(
     let mut query = sqlx::query_as::<_, RawRow>(sqlx::AssertSqlSafe(sql));
     if let Some(group) = filter.group {
         query = query.bind(group);
+    }
+    for bind in filter.extra_binds {
+        query = query.bind(bind);
     }
     let raw = query.fetch_all(db).await?;
     let date_is_added = true;

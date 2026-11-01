@@ -148,7 +148,6 @@ async fn user_check(
     }
 
     let params = Params {
-        uid: user.id,
         token: user.api_token.clone(),
         extended: true,
         delete_from_cart: input.str("del") == Some("1"),
@@ -509,7 +508,7 @@ fn human_filesize(bytes: i64) -> String {
 }
 
 /// `resolveImageAssetFilename`.
-fn resolve_cover(roots: &[std::path::PathBuf], dir: &str, basename: &str) -> Option<String> {
+pub fn resolve_cover(roots: &[std::path::PathBuf], dir: &str, basename: &str) -> Option<String> {
     let safe = |name: &str| {
         name.chars()
             .next()

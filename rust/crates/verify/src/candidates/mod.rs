@@ -8,7 +8,7 @@ mod archive;
 mod deferrals;
 mod expiry;
 mod hot;
-mod queue;
+pub(crate) mod queue;
 
 use anyhow::Result;
 use chrono::{NaiveDateTime, TimeDelta, Utc};

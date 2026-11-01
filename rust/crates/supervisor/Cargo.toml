@@ -7,7 +7,20 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+metrics.workspace = true
+nntmux-core.workspace = true
+nntmux-ops.workspace = true
 nntmux-runtime.workspace = true
+redis.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+nntmux-testkit.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
