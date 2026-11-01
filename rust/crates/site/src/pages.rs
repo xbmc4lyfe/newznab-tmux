@@ -604,9 +604,11 @@ async fn load_incidents(ctx: &Ctx, condition: &str, order: &str) -> Result<Vec<I
         .collect())
 }
 
+type ServiceRow = (String, String, String, Option<u32>, Option<DateTime<Utc>>);
+
 async fn status(State(ctx): State<Ctx>, layout: Layout) -> WebResult {
     let now = Utc::now();
-    let rows: Vec<(String, String, String, Option<u32>, Option<DateTime<Utc>>)> = sqlx::query_as(
+    let rows: Vec<ServiceRow> = sqlx::query_as(
         "SELECT name, status, CAST(uptime_percentage AS CHAR), response_time_ms, last_checked_at
          FROM service_statuses WHERE is_enabled = 1 AND check_type = 'http' ORDER BY sort_order, id",
     )
