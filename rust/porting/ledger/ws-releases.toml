@@ -10,7 +10,8 @@ status = "ported"
 kind = "command"
 id = "nntmux:delete-releases"
 source = "app/Console/Commands/DeleteReleases.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases delete. Unknown criteria now fail, an unknown group matches nothing, and --rage is gone because releases has no rageid column."
 
 [[entry]]
 kind = "command"
@@ -22,7 +23,8 @@ status = "todo"
 kind = "command"
 id = "nntmux:nzbclean"
 source = "app/Console/Commands/CleanNZB.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases nzb-clean. --notondisk stays refused and orphans stay reported only, as in PHP's database mode. Staged filesystem generations are kept."
 
 [[entry]]
 kind = "command"
@@ -34,7 +36,8 @@ status = "todo"
 kind = "command"
 id = "nzbs:import-database"
 source = "app/Console/Commands/ImportDatabaseNzbs.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases import-database."
 
 [[entry]]
 kind = "command"
@@ -88,13 +91,15 @@ status = "ported"
 kind = "command"
 id = "releases:remove-crap"
 source = "app/Console/Commands/RemoveCrapReleases.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases remove-crap."
 
 [[entry]]
 kind = "command"
 id = "releases:retry-archive-inspection"
 source = "app/Console/Commands/RetryArchiveInspection.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases retry-archive-inspection."
 
 [[entry]]
 kind = "command"
