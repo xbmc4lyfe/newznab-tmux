@@ -471,3 +471,49 @@ async fn a_listed_scene_filename_names_the_release_and_keeps_ownership() -> Resu
     assert_eq!(held.release.searchname, SCENE);
     db.drop_database().await
 }
+
+#[tokio::test]
+async fn an_episode_name_held_for_the_inventory_names_the_release_after_finalizing() -> Result<()> {
+    let Some(db) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let episode = "Show.Name.S01E01.1080p.WEB-DL-GROUP";
+    let predb = NewPredb {
+        title: episode.to_owned(),
+        source: "t".to_owned(),
+        ..NewPredb::default()
+    };
+    let InsertOutcome::Inserted(predb_id) = identity::insert_feed(pool, &predb).await? else {
+        panic!("predb row rejected");
+    };
+    certify(pool).await?;
+    let covers = tempfile::tempdir()?;
+    let (claimed, digest) = release(pool, "a1").await?;
+    let id = claimed.id;
+    let (mut manager, _) = manager(pool, covers.path()).await?;
+    let mut context = context(claimed, &digest);
+    // While the release might be a pack, a listed episode isn't tried for naming yet.
+    context.season_pack_probable = true;
+    assert!(
+        manager
+            .add_file_info(&file(&format!("{episode}.mkv"), 100, 0), &mut context)
+            .await?
+    );
+    let before: String = sqlx::query_scalar("SELECT searchname FROM releases WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(before, "s");
+
+    // The complete inventory shows a single episode, so finalizing names the release.
+    manager.finalize_release(&mut context, true).await?;
+    assert_eq!(evidence_scope(pool, id).await?, "complete_single");
+    let (searchname, linked): (String, i64) =
+        sqlx::query_as("SELECT searchname, CAST(predb_id AS SIGNED) FROM releases WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+    assert_eq!((searchname.as_str(), linked), (episode, predb_id as i64));
+    db.drop_database().await
+}

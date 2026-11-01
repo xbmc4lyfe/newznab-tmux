@@ -623,7 +623,10 @@ impl ReleaseFiles {
                 .cloned()
                 .collect();
             if !candidates.is_empty() {
-                let row = sqlx::query("SELECT * FROM releases WHERE id = ? FOR UPDATE")
+                // Name fixing reads the release as PHP's consumers selected it.
+                let row = sqlx::query(
+                    "SELECT *, id AS releases_id, size AS relsize FROM releases WHERE id = ? FOR UPDATE",
+                )
                     .bind(context.release.id)
                     .fetch_optional(&mut *conn)
                     .await?;
