@@ -367,3 +367,132 @@ async fn browser_failure_reports_need_a_session_and_token() {
     assert_eq!(failures, 1);
     db.drop_database().await.unwrap();
 }
+
+#[tokio::test]
+async fn cover_pages_group_releases_and_filter() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let name = unique("cora");
+    let id = add_user(&db.pool, &name, true, 1).await;
+    for permission in [
+        "view movies",
+        "view audio",
+        "view console",
+        "view pc",
+        "view books",
+        "view adult",
+    ] {
+        grant(&db.pool, id, permission).await;
+    }
+    let group = add_group(&db.pool, &unique("alt.binaries.covers")).await;
+    let (movie_release, movie_guid) = add_release(&db.pool, "Cover.Movie.2024", 2040, group).await;
+    sqlx::query("INSERT INTO movieinfo (imdbid, title, year, genre, actors, plot, tagline, rating, type, director, language, cover, backdrop, trailer) VALUES ('7654321', 'Cover Movie', '2024', 'Drama', 'Ann Lee', 'A plot.', '', '7.5', '', 'Bob Ray', '', 1, 0, 'javascript:alert(1)')")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE releases SET imdbid = '7654321' WHERE id = ?")
+        .bind(movie_release)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (music_release, _) = add_release(&db.pool, "Cover.Album.FLAC", 3040, group).await;
+    let music = sqlx::query("INSERT INTO musicinfo (title, artist, publisher, year, cover, asin, url, salesrank, review, tracks) VALUES ('An Album', 'An Artist', 'Label', '2020', 1, '', '', 0, '', '')")
+        .execute(&db.pool)
+        .await
+        .unwrap()
+        .last_insert_id();
+    sqlx::query("UPDATE releases SET musicinfo_id = ? WHERE id = ?")
+        .bind(music)
+        .bind(music_release)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO user_downloads (users_id, timestamp, releases_id) VALUES (?, NOW(), ?)",
+    )
+    .bind(id)
+    .bind(movie_release)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let mut browser = Browser::new(&ctx);
+    browser
+        .post("/login", &[("username", &name), ("password", PASSWORD)])
+        .await;
+
+    let (response, html) = browser.get("/Movies").await;
+    assert_eq!(response.status(), StatusCode::OK, "{html}");
+    assert!(html.contains("Cover Movie") && html.contains(&movie_guid));
+    assert!(html.contains("/Movies?actors=Ann+Lee"));
+    let (_, html) = browser.get("/Movies?title=nothing-like-this").await;
+    assert!(!html.contains("Cover Movie"));
+    assert!(html.contains("No results found"));
+    let (_, html) = browser.get("/Movies?ob=rating_desc&year=1;DROP").await;
+    assert!(html.contains("Cover Movie"), "a bad year is ignored");
+
+    let (response, html) = browser.get("/movie/7654321").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(html.contains(&movie_guid));
+    assert!(
+        !html.contains("javascript:alert"),
+        "only web trailers reach an iframe"
+    );
+    let (response, _) = browser.get("/movie/0000000").await;
+    assert_eq!(location(&response), "/Movies");
+
+    let (_, html) = browser.get("/Audio").await;
+    assert!(html.contains("An Album") && html.contains("An Artist"));
+    for path in ["/Console", "/Games", "/Books", "/XXX"] {
+        let (response, html) = browser.get(path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}: {html}");
+    }
+    let (_, html) = browser.get("/trending-movies").await;
+    assert!(html.contains("Cover Movie"));
+    assert!(html.contains("1 downloads"));
+
+    let (response, _) = browser.get("/movietrailers?id=abc").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let (response, _) = browser
+        .post_authed("/movies/update-layout", &[("layout", "9")])
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let (response, _) = browser
+        .post_authed("/movies/update-layout", &[("layout", "1")])
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn cover_pages_need_the_category_permission() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let name = unique("dora");
+    let id = add_user(&db.pool, &name, true, 1).await;
+    sqlx::query("DELETE FROM model_has_permissions WHERE model_id = ?")
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut browser = Browser::new(&ctx);
+    browser
+        .post("/login", &[("username", &name), ("password", PASSWORD)])
+        .await;
+    for path in [
+        "/Movies",
+        "/movie/1",
+        "/trending-movies",
+        "/Audio",
+        "/Console",
+        "/Games",
+        "/Books",
+        "/XXX",
+    ] {
+        let (response, _) = browser.get(path).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    db.drop_database().await.unwrap();
+}

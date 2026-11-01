@@ -1,0 +1,337 @@
+[
+ {
+  "name": "v1_search_text",
+  "path": "/api/v1/api?t=search&q=Movie&apikey=tokenposter"
+ },
+ {
+  "name": "v1_search_text_json",
+  "path": "/api/v1/api?t=search&q=Movie&o=json&extended=1&apikey=tokenposter"
+ },
+ {
+  "name": "v1_search_text_ext_xml",
+  "path": "/api/v1/api?t=search&q=Show&extended=1&apikey=tokenposter"
+ },
+ {
+  "name": "v1_search_none",
+  "path": "/api/v1/api?t=search&q=zzzznothing&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse",
+  "path": "/api/v1/api?t=search&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_json_ext",
+  "path": "/api/v1/api?t=search&o=json&extended=1&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_limit_offset",
+  "path": "/api/v1/api?t=search&limit=2&offset=1&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_cat",
+  "path": "/api/v1/api?t=search&cat=2000&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_cats",
+  "path": "/api/v1/api?t=search&cat=2040,5040&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_group",
+  "path": "/api/v1/api?t=search&group=a.b.moovee&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_bad_group",
+  "path": "/api/v1/api?t=search&group=no_dots&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_minsize",
+  "path": "/api/v1/api?t=search&minsize=2000000000&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_maxage",
+  "path": "/api/v1/api?t=search&maxage=1&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_sort_size",
+  "path": "/api/v1/api?t=search&sort=size_asc&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_sort_name",
+  "path": "/api/v1/api?t=search&sort=name_asc&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_sort_name_desc_ext",
+  "path": "/api/v1/api?t=search&sort=name_desc&limit=3&offset=1&extended=1&apikey=tokenposter"
+ },
+ {
+  "name": "v1_search_sort_name",
+  "path": "/api/v1/api?t=search&q=GRP&sort=name_asc&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_cat_sort",
+  "path": "/api/v1/api?t=search&sort=cat_asc&limit=3&apikey=tokenposter"
+ },
+ {
+  "name": "v1_browse_excluded",
+  "path": "/api/v1/api?t=search&apikey=tokenalice&apikey=tokenposter"
+ },
+ {
+  "name": "v1_tv_browse",
+  "path": "/api/v1/api?t=tvsearch&apikey=tokenposter"
+ },
+ {
+  "name": "v1_tv_text",
+  "path": "/api/v1/api?t=tvsearch&q=Show&apikey=tokenposter"
+ },
+ {
+  "name": "v1_tv_text_season",
+  "path": "/api/v1/api?t=tvsearch&q=Show&season=2&ep=3&apikey=tokenposter"
+ },
+ {
+  "name": "v1_tv_tvdb",
+  "path": "/api/v1/api?t=tvsearch&tvdbid=73&extended=1&apikey=tokenposter"
+ },
+ {
+  "name": "v1_tv_tvdb_episode",
+  "path": "/api/v1/api?t=tvsearch&tvdbid=73&season=2&ep=3&extended=1&apikey=tokenposter"
+ },
+ {
+  "name": "v1_tv_tvdb_wrong_episode",
+  "path": "/api/v1/api?t=tvsearch&tvdbid=73&season=9&apikey=tokenposter"
+ },
+ {
+  "name": "v1_tv_vid",
+  "path": "/api/v1/api?t=tvsearch&vid=70&apikey=tokenposter"
+ },
+ {
+  "name": "v1_tv_missing",
+  "path": "/api/v1/api?t=tvsearch&tvdbid=999&apikey=tokenposter"
+ },
+ {
+  "name": "v1_tv_imdb",
+  "path": "/api/v1/api?t=tvsearch&imdbid=tt0123456&apikey=tokenposter"
+ },
+ {
+  "name": "v1_tv_airdate",
+  "path": "/api/v1/api?t=tvsearch&tvdbid=73&season=2026&ep=03/04&apikey=tokenposter"
+ },
+ {
+  "name": "v1_movie_browse",
+  "path": "/api/v1/api?t=movie&apikey=tokenposter"
+ },
+ {
+  "name": "v1_movie_text",
+  "path": "/api/v1/api?t=movie&q=Movie&apikey=tokenposter"
+ },
+ {
+  "name": "v1_movie_imdb",
+  "path": "/api/v1/api?t=movie&imdbid=tt1234567&extended=1&apikey=tokenposter"
+ },
+ {
+  "name": "v1_movie_tmdb",
+  "path": "/api/v1/api?t=movie&tmdbid=81&apikey=tokenposter"
+ },
+ {
+  "name": "v1_movie_trakt_json",
+  "path": "/api/v1/api?t=movie&traktid=82&o=json&apikey=tokenposter"
+ },
+ {
+  "name": "v1_movie_missing",
+  "path": "/api/v1/api?t=movie&imdbid=9999999&apikey=tokenposter"
+ },
+ {
+  "name": "v1_music_browse",
+  "path": "/api/v1/api?t=music&apikey=tokenposter"
+ },
+ {
+  "name": "v1_music_text",
+  "path": "/api/v1/api?t=music&q=Album&apikey=tokenposter"
+ },
+ {
+  "name": "v1_music_none",
+  "path": "/api/v1/api?t=music&q=nothinghere&apikey=tokenposter"
+ },
+ {
+  "name": "v1_book_browse",
+  "path": "/api/v1/api?t=book&apikey=tokenposter"
+ },
+ {
+  "name": "v1_book_text",
+  "path": "/api/v1/api?t=book&q=Book&apikey=tokenposter"
+ },
+ {
+  "name": "v1_anime_id",
+  "path": "/api/v1/api?t=anime&anidbid=93&apikey=tokenposter"
+ },
+ {
+  "name": "v1_anime_anilist",
+  "path": "/api/v1/api?t=anime&anilistid=94&apikey=tokenposter"
+ },
+ {
+  "name": "v1_anime_anilist_unknown",
+  "path": "/api/v1/api?t=anime&anilistid=7&apikey=tokenposter"
+ },
+ {
+  "name": "v1_anime_text",
+  "path": "/api/v1/api?t=anime&q=Anime&apikey=tokenposter"
+ },
+ {
+  "name": "v1_anime_text_none",
+  "path": "/api/v1/api?t=anime&q=zzzzz&apikey=tokenposter"
+ },
+ {
+  "name": "v1_query_search",
+  "path": "/api/v1/api?t=search&apikey=tokenposter",
+  "method": "QUERY",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"q\": \"Movie\", \"cat\": [2000]}"
+ },
+ {
+  "name": "v1_bad_syntax",
+  "path": "/api/v1/api?t=search&q=%21only&apikey=tokenposter"
+ },
+ {
+  "name": "v1_rejected_brackets",
+  "path": "/api/v1/api?t=search&q=%28%28&apikey=tokenposter"
+ },
+ {
+  "name": "v2_search_text",
+  "path": "/api/v2/search?api_token=tokenposter&id=Movie"
+ },
+ {
+  "name": "v2_search_browse",
+  "path": "/api/v2/search?api_token=tokenposter"
+ },
+ {
+  "name": "v2_search_empty_id",
+  "path": "/api/v2/search?api_token=tokenposter&id="
+ },
+ {
+  "name": "v2_search_cursor_start",
+  "path": "/api/v2/search?api_token=tokenposter&id=GRP&cursor=&limit=2"
+ },
+ {
+  "name": "v2_search_browse_cursor",
+  "path": "/api/v2/search?api_token=tokenposter&cursor=&limit=2"
+ },
+ {
+  "name": "v2_search_sort_name",
+  "path": "/api/v2/search?api_token=tokenposter&id=GRP&sort=name_desc&limit=3"
+ },
+ {
+  "name": "v2_search_minsize",
+  "path": "/api/v2/search?api_token=tokenposter&minsize=2000000000"
+ },
+ {
+  "name": "v2_search_query",
+  "path": "/api/v2/search?api_token=tokenposter",
+  "method": "QUERY",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"id\": \"Movie\"}"
+ },
+ {
+  "name": "v2_movies_text",
+  "path": "/api/v2/movies?api_token=tokenposter&id=Movie"
+ },
+ {
+  "name": "v2_movies_imdb",
+  "path": "/api/v2/movies?api_token=tokenposter&imdbid=tt1234567"
+ },
+ {
+  "name": "v2_movies_tmdb",
+  "path": "/api/v2/movies?api_token=tokenposter&tmdbid=81"
+ },
+ {
+  "name": "v2_movies_cursor",
+  "path": "/api/v2/movies?api_token=tokenposter&id=Movie&cursor="
+ },
+ {
+  "name": "v2_audio_browse",
+  "path": "/api/v2/audio?api_token=tokenposter"
+ },
+ {
+  "name": "v2_audio_text",
+  "path": "/api/v2/audio?api_token=tokenposter&id=Album"
+ },
+ {
+  "name": "v2_books_browse",
+  "path": "/api/v2/books?api_token=tokenposter"
+ },
+ {
+  "name": "v2_books_text",
+  "path": "/api/v2/books?api_token=tokenposter&id=Book"
+ },
+ {
+  "name": "v2_anime_id",
+  "path": "/api/v2/anime?api_token=tokenposter&anidbid=93"
+ },
+ {
+  "name": "v2_anime_text",
+  "path": "/api/v2/anime?api_token=tokenposter&id=Anime"
+ },
+ {
+  "name": "v2_anime_minsize",
+  "path": "/api/v2/anime?api_token=tokenposter&anidbid=93&minsize=99999999999"
+ },
+ {
+  "name": "v2_tv_text",
+  "path": "/api/v2/tv?api_token=tokenposter&id=Show"
+ },
+ {
+  "name": "v2_tv_text_season",
+  "path": "/api/v2/tv?api_token=tokenposter&id=Show&season=2"
+ },
+ {
+  "name": "v2_tv_tvdb",
+  "path": "/api/v2/tv?api_token=tokenposter&tvdbid=73"
+ },
+ {
+  "name": "v2_tv_tvdb_episode",
+  "path": "/api/v2/tv?api_token=tokenposter&tvdbid=73&season=2&ep=3"
+ },
+ {
+  "name": "v2_tv_vid",
+  "path": "/api/v2/tv?api_token=tokenposter&vid=70"
+ },
+ {
+  "name": "v2_tv_missing",
+  "path": "/api/v2/tv?api_token=tokenposter&tvdbid=999"
+ },
+ {
+  "name": "v2_offset_past_window",
+  "path": "/api/v2/search?api_token=tokenposter&offset=20000"
+ },
+ {
+  "name": "suggest_autocomplete",
+  "path": "/api/search/autocomplete?q=Mov",
+  "status_only": false
+ },
+ {
+  "name": "suggest_autocomplete_short",
+  "path": "/api/search/autocomplete?q=M"
+ },
+ {
+  "name": "suggest_suggest",
+  "path": "/api/search/suggest?q=Movi"
+ },
+ {
+  "name": "suggest_suggest_empty",
+  "path": "/api/search/suggest"
+ },
+ {
+  "name": "suggest_assist",
+  "path": "/api/search/assist?q=Mov"
+ },
+ {
+  "name": "v1_tv_tmdb",
+  "path": "/api/v1/api?t=tvsearch&tmdbid=71&apikey=tokenposter"
+ },
+ {
+  "name": "v2_tv_trakt",
+  "path": "/api/v2/tv?api_token=tokenposter&traktid=72"
+ }
+]

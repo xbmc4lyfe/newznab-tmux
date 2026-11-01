@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use nntmux_core::var_or;
 use sqlx::{MySqlConnection, MySqlPool};
+use tracing::warn;
 
 use crate::context::Verify;
 use crate::nzb;
@@ -81,9 +82,21 @@ pub async fn delete_single(verify: &Verify, id: i64, guid: &str) -> Result<()> {
 
 pub async fn delete_single_on(pool: &MySqlPool, id: i64, guid: &str) -> Result<()> {
     nzb::delete(pool, guid).await?;
-    delete_release_files(guid)?;
+    // A preview that can't be removed mustn't strand a release whose NZB is already gone.
+    if let Err(failure) = delete_release_files(guid) {
+        warn!(
+            release = id,
+            error = format!("{failure:#}"),
+            "release file cleanup failed"
+        );
+    }
     let mut conn = pool.acquire().await?;
     request_search_delete(&mut conn, id).await?;
+    // No foreign key takes these.
+    sqlx::query("DELETE FROM user_downloads WHERE releases_id = ?")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("DELETE FROM releases WHERE guid = ?")
         .bind(guid)
         .execute(&mut *conn)
