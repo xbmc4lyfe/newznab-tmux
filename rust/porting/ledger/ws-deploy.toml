@@ -4,34 +4,19 @@
 kind = "command"
 id = "monitoring:install"
 source = "app/Console/Commands/InstallMonitoring.php"
-status = "todo"
+status = "dropped"
+note = "Ubuntu host installer and Sail .env editing; Prometheus and Grafana run as Compose services that scrape each role's /metrics"
 
 [[entry]]
 kind = "command"
 id = "nntmux:deploy-init"
 source = "app/Console/Commands/DeployInitialize.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl init"
 
 [[entry]]
 kind = "command"
 id = "nntmux:install"
 source = "app/Console/Commands/InstallNntmux.php"
-status = "todo"
-
-[[entry]]
-kind = "command"
-id = "update:backfill"
-source = "app/Console/Commands/UpdateBackfill.php"
-status = "todo"
-
-[[entry]]
-kind = "command"
-id = "update:binaries"
-source = "app/Console/Commands/UpdateBinaries.php"
-status = "todo"
-
-[[entry]]
-kind = "command"
-id = "update:postprocess"
-source = "app/Console/Commands/UpdatePostProcess.php"
-status = "todo"
+status = "dropped"
+note = "it wiped the database with migrate:fresh; nntmux-ctl init sets up an empty database and refuses one with tables"

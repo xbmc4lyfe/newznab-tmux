@@ -31,3 +31,9 @@ kind = "command"
 id = "postprocess:tv-pipeline"
 source = "app/Console/Commands/PostProcessTvPipeline.php"
 status = "todo"
+
+[[entry]]
+kind = "command"
+id = "update:postprocess"
+source = "app/Console/Commands/UpdatePostProcess.php"
+status = "todo"

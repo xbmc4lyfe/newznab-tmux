@@ -2301,6 +2301,9 @@ name = "nntmux-ctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "bcrypt",
+ "chrono",
  "clap",
  "nntmux-categorize",
  "nntmux-core",
@@ -2317,7 +2320,12 @@ dependencies = [
  "nntmux-runtime",
  "nntmux-search",
  "nntmux-telemetry",
+ "nntmux-testkit",
  "nntmux-verify",
+ "nntmux-webkit",
+ "rand 0.9.5",
+ "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -2821,6 +2829,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "ipnet",
+ "md-5 0.10.6",
  "nntmux-core",
  "nntmux-runtime",
  "nntmux-testkit",
