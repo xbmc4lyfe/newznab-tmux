@@ -346,15 +346,13 @@ fn too_many_for_token(retry_after: i64, limit: i64) -> Reply {
         .header("x-nntmux", "API ERROR [500] Request limit reached")
 }
 
-/// `throttle:60,1` on the `api` group, keyed by host and client address.
+/// `throttle:60,1` on the `api` group, keyed by client address.
 async fn hit_group(ctx: &Ctx, settings: &Settings, api: &ApiRequest) -> Result<(i64, i64), Reply> {
     const LIMIT: i64 = 60;
-    let host = api.header("host").unwrap_or_default();
+    // The routes declare no domain, so Laravel's signature is the address alone. Keying on the Host
+    // header would let a client mint a fresh bucket per request.
     let ip = api.client_ip().unwrap_or_default();
-    let name = format!(
-        "throttle:{}",
-        hex::encode(Sha1::digest(format!("{host}|{ip}")))
-    );
+    let name = format!("throttle:{}", hex::encode(Sha1::digest(format!("|{ip}"))));
     let attempt = cache::hit(ctx, settings, &name, LIMIT, 60).await;
     if !attempt.allowed {
         let reset = chrono::Utc::now().timestamp() + attempt.retry_after;

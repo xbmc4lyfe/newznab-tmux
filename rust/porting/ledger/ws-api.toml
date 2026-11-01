@@ -1,6 +1,12 @@
 # Entry points owned by ws-api. Status: todo, ported or dropped (with a note).
 
 [[entry]]
+kind = "middleware"
+id = "BlockAbusiveServices"
+source = "app/Http/Middleware/BlockAbusiveServices.php"
+status = "todo"
+
+[[entry]]
 kind = "job"
 id = "RecordApiUsage"
 source = "app/Jobs/RecordApiUsage.php"

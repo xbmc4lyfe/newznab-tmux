@@ -303,6 +303,12 @@ pub async fn nzb_add(
             "Insufficient privileges/not authorized",
         ));
     }
+    let multipart = request
+        .header("content-type")
+        .is_some_and(|value| value.starts_with("multipart/"));
+    if multipart {
+        return Ok(not_ported());
+    }
     Ok(Reply::v2_error(
         400,
         "Missing parameter (nzb file is required)",

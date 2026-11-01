@@ -88,6 +88,16 @@ pub async fn inform(ctx: &Ctx, request: &ApiRequest) -> Result<Reply> {
             "Indexer inform error, wrong data supplied!",
         ));
     }
+    // A known release must be renamed too, which needs the name fixer. Until that's ported, say so
+    // rather than report a rename that never happens.
+    let known: Option<u32> =
+        sqlx::query_scalar("SELECT id FROM releases WHERE searchname = ? LIMIT 1")
+            .bind(&original)
+            .fetch_optional(&ctx.db)
+            .await?;
+    if known.is_some() {
+        return Ok(Reply::message(501, "Not ported yet"));
+    }
     let now = crate::usage::now_string();
     sqlx::query(
         "INSERT IGNORE INTO release_informs (relOName, relPName, api_token, created_at, updated_at)

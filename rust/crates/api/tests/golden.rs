@@ -290,6 +290,31 @@ async fn token_rate_limit_answers_429() -> Result<()> {
     db.drop_database().await
 }
 
+/// Sending a new Host per request must not mint a new bucket for the per-IP throttle.
+#[tokio::test]
+async fn group_throttle_ignores_host() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    let app = app(&ctx);
+    for (host, remaining) in [("a.test", "59"), ("b.test", "58")] {
+        let request = Request::builder()
+            .uri("/api/nope")
+            .header("host", host)
+            .body(Body::empty())?;
+        let response = app.clone().oneshot(request).await?;
+        assert_eq!(response.headers()["x-ratelimit-remaining"], remaining);
+    }
+    db.drop_database().await
+}
+
 /// The `UpdateUserApiAccess` job writes at most once per interval.
 #[tokio::test]
 async fn access_update_runs_once_per_interval() -> Result<()> {
