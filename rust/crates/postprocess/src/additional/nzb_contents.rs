@@ -2,7 +2,7 @@
 //! count-stripped form of `NzbParserService::parseNzbFileList` it uses.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use anyhow::Result;
@@ -42,8 +42,8 @@ pattern!(CLOSED, r"/<\/nzb>\s*$/i");
 /// Video containers a release can be posted as directly. Port of `VideoContainer::fromFileName`'s
 /// extension list.
 const VIDEO_EXTENSIONS: &[&str] = &[
-    "mkv", "mp4", "m4v", "avi", "mov", "wmv", "mpg", "mpeg", "ts", "m2ts", "mts", "webm", "flv",
-    "ogv", "vob", "divx", "xvid", "3gp", "asf",
+    "mkv", "mk3d", "webm", "avi", "divx", "xvid", "mpg", "mpeg", "vob", "m2v", "mpv", "ts", "m2ts",
+    "mts", "mp4", "m4v", "mov", "qt", "wmv", "asf", "ogv", "ogm",
 ];
 
 /// A posted file: its name and its first article.
@@ -258,7 +258,8 @@ fn read_document(xml: &[u8]) -> Option<RawDocument> {
                 depth = depth.saturating_sub(1);
             }
             Event::DocType(_) => {}
-            Event::Eof => return root_seen.then_some(document),
+            // An unclosed element is a truncated document, which libxml refuses.
+            Event::Eof => return (root_seen && depth == 0).then_some(document),
             _ => {}
         }
         buffer.clear();
@@ -378,12 +379,14 @@ pub fn strnatcmp(a: &[u8], b: &[u8]) -> Ordering {
 /// by its decimal form, the same text.
 fn file_list(document: &RawDocument) -> Vec<NzbFile> {
     let mut keys: Vec<String> = Vec::new();
+    let mut positions: HashMap<String, usize> = HashMap::new();
     let mut entries: Vec<NzbFile> = Vec::new();
     for file in &document.files {
         let key = strip_count_key(&file.subject);
-        let index = match keys.iter().position(|existing| *existing == key) {
-            Some(index) => index,
+        let index = match positions.get(&key) {
+            Some(index) => *index,
             None => {
+                positions.insert(key.clone(), entries.len());
                 keys.push(key);
                 entries.push(NzbFile::default());
                 entries.len() - 1
@@ -499,12 +502,16 @@ pub fn source_file_inventory(decoded: &[u8], parsed: &[NzbFile]) -> Option<Vec<S
                 return None;
             }
             let number: u64 = number.parse().ok()?;
-            if number < 1 || segments.iter().any(|(seen, _)| *seen == number) {
+            if number < 1 {
                 return None;
             }
             segments.push((number, id));
         }
         segments.sort_by_key(|(number, _)| *number);
+        // A repeated number is refused, found next to its twin once sorted.
+        if segments.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return None;
+        }
         let contiguous = segments
             .iter()
             .enumerate()
@@ -569,7 +576,8 @@ async fn snapshot(pool: &MySqlPool, guid: &str) -> Result<Option<(ReleaseRef, Ve
             id,
             guid: guid.to_owned(),
         };
-        let Some(contents) = nzb::read(&mut *tx, guid).await.ok().flatten() else {
+        // A read failure is an error, as PHP's integrity check throws; a lock wait retries.
+        let Some(contents) = nzb::read(&mut *tx, guid).await? else {
             return Ok(None);
         };
         let digest = nzb::digest(&contents);

@@ -65,6 +65,9 @@ $documents = [
     'other control byte' => "<nzb>\x01".'<file subject="&quot;C.mkv&quot; yEnc (1/1)"><segments><segment number="1" bytes="5">c@x</segment></segments></file></nzb>',
     'wrong root' => '<notnzb><file subject="x"/></notnzb>',
     'broken' => '<nzb><file subject="x">',
+    'cut after a file' => '<nzb><file subject="&quot;A.mkv&quot; yEnc (1/1)"><segments><segment number="1" bytes="5">a@x</segment></segments></file>',
+    'cut inside a later file' => '<nzb><file subject="&quot;A.mkv&quot; yEnc (1/1)"><segments><segment number="1" bytes="5">a@x</segment></segments></file><file subject="&quot;B.mkv&quot; yEnc (1/1)"><segments>',
+    'repeated segment number' => $nzb([$file('"Twice.mkv" yEnc (1/2)', [$segment('t1@x'), $segment('t2@x', 1)])]),
     'empty nzb' => '<nzb/>',
     'uppercase root' => '<NZB><file subject="&quot;U.mkv&quot; yEnc (1/1)"><segments><segment number="1" bytes="9">u@x</segment></segments></file></NZB>',
 ];
