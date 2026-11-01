@@ -100,10 +100,10 @@ pub async fn layer(request: Request, next: Next) -> Response {
         input = input.with_form(&bytes);
     } else if content_type.contains("json") {
         input = input.with_json(&bytes);
-    } else if content_type.starts_with("multipart/form-data") {
-        if let Some(value) = multipart_field(&bytes, "_token") {
-            input = input.with_field("_token", value);
-        }
+    } else if content_type.starts_with("multipart/form-data")
+        && let Some(value) = multipart_field(&bytes, "_token")
+    {
+        input = input.with_field("_token", value);
     }
 
     if !EXEMPT.contains(&parts.uri.path()) {
