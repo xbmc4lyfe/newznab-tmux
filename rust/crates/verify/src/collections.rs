@@ -5,6 +5,7 @@
 //! large backlog can't stall a cycle.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -152,7 +153,7 @@ pub async fn delete_collections_and_descendants(
 ) -> Result<u64> {
     let mut deleted = 0;
     for chunk in ids.chunks(cleanup.sql_chunk_size) {
-        deleted += retry_on_lock_error(label, async || {
+        deleted += retry_on_lock_error(label, move || async move {
             in_tx!(pool, 1, |tx| {
                 let deletable = deletable_verification_ids(tx, chunk).await?;
                 delete_rows(tx, &deletable).await
@@ -165,9 +166,10 @@ pub async fn delete_collections_and_descendants(
 
 /// Runs a write in a bounded retry loop that only swallows transient InnoDB lock errors. Anything
 /// else is returned so real failures aren't silently retried. Exhausted retries report 0 rows.
-async fn retry_on_lock_error<F>(label: &str, mut op: F) -> Result<u64>
+async fn retry_on_lock_error<F, Fut>(label: &str, mut op: F) -> Result<u64>
 where
-    F: AsyncFnMut() -> Result<u64>,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<u64>>,
 {
     let mut attempt = 0;
     loop {
@@ -465,18 +467,19 @@ async fn delete_expired_on_archival(
         let mut sorted = chunk.to_vec();
         sorted.sort_unstable();
         let unlocked = candidates::unlocked_ids(verify, &sorted).await;
-        deleted += retry_on_lock_error("Expired stale cleanup", async || {
+        let (sorted, unlocked) = (&sorted, &unlocked);
+        deleted += retry_on_lock_error("Expired stale cleanup", move || async move {
             in_tx!(verify.db, 1, |tx| {
                 let mut query = QueryBuilder::<MySql>::new(format!(
                     "SELECT {EXPIRY_COLUMNS} FROM collections FORCE INDEX (PRIMARY) WHERE id IN ("
                 ));
                 let mut separated = query.separated(",");
-                for id in &sorted {
+                for id in sorted {
                     separated.push_bind(*id);
                 }
                 query.push(") ORDER BY id FOR UPDATE");
                 let rows: Vec<ExpiryRow> = query.build_query_as().fetch_all(&mut *tx).await?;
-                let sources = expiry_sources(verify, rows, &unlocked);
+                let sources = expiry_sources(verify, rows, unlocked);
                 let known = known_sources(&mut *tx, &sources).await?;
                 let expired: Vec<i64> = sources
                     .into_iter()

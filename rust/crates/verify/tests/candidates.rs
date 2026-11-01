@@ -459,3 +459,22 @@ async fn preparation_classifies_inventories_without_a_network() -> Result<()> {
     assert_eq!(statuses, ["ready", "waiting_upload"]);
     harness.finish().await
 }
+
+/// Workers spawn these, so their futures must stay `Send`.
+#[test]
+fn the_work_futures_are_send() {
+    fn assert_send<T: Send>(_: T) {}
+    fn check(
+        verify: &nntmux_verify::context::Verify,
+        cleanup: &nntmux_verify::collections::Cleanup,
+    ) {
+        assert_send(candidates::archive(verify, 1));
+        assert_send(candidates::archive_each(verify, &[]));
+        assert_send(candidates::expire(verify, None));
+        assert_send(nntmux_verify::collections::delete_finished_and_orphans(
+            verify, cleanup,
+        ));
+        assert_send(prepare::settle_dirty(verify, 1, 1));
+    }
+    let _ = check;
+}
