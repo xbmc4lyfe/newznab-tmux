@@ -12,8 +12,8 @@ use App\Models\ServiceIncident;
 use App\Models\ServiceStatus;
 use App\Services\StatusProbes\ProbeResult;
 use App\Services\StatusProbes\ServiceProbeRegistry;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Carbon;
-use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -39,9 +39,9 @@ class SiteStatusService
     ) {}
 
     /**
-     * @return \Illuminate\Database\Eloquent\Collection<int, ServiceStatus>
+     * @return Collection<int, ServiceStatus>
      */
-    public function getEnabledServices(): \Illuminate\Database\Eloquent\Collection
+    public function getEnabledServices(): Collection
     {
         return Cache::flexible(self::CACHE_KEY_ENABLED_SERVICES, self::CACHE_TTL, fn () => ServiceStatus::query()
             ->where('is_enabled', true)
@@ -51,9 +51,9 @@ class SiteStatusService
     }
 
     /**
-     * @return \Illuminate\Database\Eloquent\Collection<int, ServiceStatus>
+     * @return Collection<int, ServiceStatus>
      */
-    public function getAllServicesForAdmin(): \Illuminate\Database\Eloquent\Collection
+    public function getAllServicesForAdmin(): Collection
     {
         return ServiceStatus::query()
             ->orderBy('sort_order')
@@ -64,9 +64,9 @@ class SiteStatusService
     /**
      * Enabled HTTP endpoint rows only (excludes internal infrastructure probes from the public status page).
      *
-     * @return \Illuminate\Database\Eloquent\Collection<int, ServiceStatus>
+     * @return Collection<int, ServiceStatus>
      */
-    public function getPublicEnabledServices(): \Illuminate\Database\Eloquent\Collection
+    public function getPublicEnabledServices(): Collection
     {
         return ServiceStatus::query()
             ->where('is_enabled', true)
@@ -82,9 +82,9 @@ class SiteStatusService
     }
 
     /**
-     * @param  \Illuminate\Database\Eloquent\Collection<int, ServiceStatus>  $services
+     * @param  Collection<int, ServiceStatus>  $services
      */
-    private function aggregateWorstStatus(\Illuminate\Database\Eloquent\Collection $services): ServiceStatusEnum
+    private function aggregateWorstStatus(Collection $services): ServiceStatusEnum
     {
         if ($services->isEmpty()) {
             return ServiceStatusEnum::Operational;
@@ -103,9 +103,9 @@ class SiteStatusService
     }
 
     /**
-     * @return \Illuminate\Database\Eloquent\Collection<int, ServiceIncident>
+     * @return Collection<int, ServiceIncident>
      */
-    public function getActiveIncidents(): \Illuminate\Database\Eloquent\Collection
+    public function getActiveIncidents(): Collection
     {
         return Cache::flexible(self::CACHE_KEY_ACTIVE_INCIDENTS, self::CACHE_TTL, fn () => ServiceIncident::query()
             ->with(['services:id,name,slug,check_type'])
@@ -128,9 +128,9 @@ class SiteStatusService
     /**
      * Active incidents that affect at least one public (HTTP) service — hides internal probe-only outages.
      *
-     * @return \Illuminate\Database\Eloquent\Collection<int, ServiceIncident>
+     * @return Collection<int, ServiceIncident>
      */
-    public function getActiveIncidentsForPublic(): \Illuminate\Database\Eloquent\Collection
+    public function getActiveIncidentsForPublic(): Collection
     {
         return $this->getActiveIncidents()
             ->filter(fn (ServiceIncident $incident): bool => $this->incidentTouchesPublicService($incident))
@@ -138,9 +138,9 @@ class SiteStatusService
     }
 
     /**
-     * @return \Illuminate\Database\Eloquent\Collection<int, ServiceIncident>
+     * @return Collection<int, ServiceIncident>
      */
-    public function getRecentResolvedIncidents(int $days = 30): \Illuminate\Database\Eloquent\Collection
+    public function getRecentResolvedIncidents(int $days = 30): Collection
     {
         $since = Carbon::now()->subDays($days);
 
@@ -154,9 +154,9 @@ class SiteStatusService
     }
 
     /**
-     * @return \Illuminate\Database\Eloquent\Collection<int, ServiceIncident>
+     * @return Collection<int, ServiceIncident>
      */
-    public function getRecentResolvedIncidentsForPublic(int $days = 30): \Illuminate\Database\Eloquent\Collection
+    public function getRecentResolvedIncidentsForPublic(int $days = 30): Collection
     {
         return $this->getRecentResolvedIncidents($days)
             ->filter(fn (ServiceIncident $incident): bool => $this->incidentTouchesPublicService($incident))
