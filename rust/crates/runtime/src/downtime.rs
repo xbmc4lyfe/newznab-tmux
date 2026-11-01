@@ -18,6 +18,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::{ConnectOptions, Connection, MySqlConnection, MySqlPool};
+use tracing::warn;
 
 use crate::Ctx;
 
@@ -29,6 +30,7 @@ const NOTE_INTERVAL_SECONDS: i64 = 30;
 const MAX_WINDOWS: usize = 100_000;
 const WINDOW_ATTEMPTS: u32 = 5;
 const LOCK_WAIT_SECONDS: u32 = 30;
+const NOTE_WAIT_SECONDS: u32 = 1;
 /// Statuses whose reconciliation is gated by the collection delay; 10 is legacy.
 const WAITING: &str = "0, 1, 15, 16, 10";
 
@@ -96,7 +98,15 @@ pub async fn note_ingestion_on(pool: &MySqlPool) -> Result<()> {
     {
         return Ok(());
     }
-    record_activity_on(pool).await
+    // Ingestion doesn't wait out a held lock: a holder lost with its host can keep it for hours, and
+    // the next note tries again.
+    let Some(barrier) = Barrier::try_lock(pool, NOTE_WAIT_SECONDS).await? else {
+        warn!("ingestion activity is locked; skipping this note");
+        return Ok(());
+    };
+    let result = record_locked(pool).await;
+    barrier.release().await;
+    result
 }
 
 /// When ingestion was last recorded active, in Unix seconds.
@@ -116,26 +126,38 @@ pub struct Barrier {
 }
 
 impl Barrier {
-    /// Waits for the lock.
+    /// Waits for the lock, warning each time a wait ends without it.
     async fn lock(pool: &MySqlPool) -> Result<Self> {
         let mut conn = pool.connect_options().connect().await?;
-        loop {
-            let got: Option<i64> =
-                sqlx::query_scalar("SELECT GET_LOCK(CONCAT('nnd:', MD5(DATABASE())), ?)")
-                    .bind(LOCK_WAIT_SECONDS)
-                    .fetch_one(&mut conn)
-                    .await?;
-            match got {
-                Some(1) => return Ok(Self { conn }),
-                Some(_) => {}
-                None => bail!("the ingestion activity lock failed"),
-            }
+        while !acquire(&mut conn, LOCK_WAIT_SECONDS).await? {
+            warn!(
+                waited_seconds = LOCK_WAIT_SECONDS,
+                "still waiting for the ingestion activity lock"
+            );
         }
+        Ok(Self { conn })
+    }
+
+    async fn try_lock(pool: &MySqlPool, seconds: u32) -> Result<Option<Self>> {
+        let mut conn = pool.connect_options().connect().await?;
+        Ok(acquire(&mut conn, seconds).await?.then_some(Self { conn }))
     }
 
     /// Closing the session releases the lock.
     pub async fn release(self) {
         let _ = self.conn.close().await;
+    }
+}
+
+async fn acquire(conn: &mut MySqlConnection, seconds: u32) -> Result<bool> {
+    let got: Option<i64> =
+        sqlx::query_scalar("SELECT GET_LOCK(CONCAT('nnd:', MD5(DATABASE())), ?)")
+            .bind(seconds)
+            .fetch_one(&mut *conn)
+            .await?;
+    match got {
+        Some(result) => Ok(result == 1),
+        None => bail!("the ingestion activity lock failed"),
     }
 }
 
@@ -329,6 +351,23 @@ async fn try_shift_window(
 ) -> Result<u64, sqlx::Error> {
     let downtime = (shift.now - shift.last_active).max(0);
     let mut tx = pool.begin().await?;
+    // The position is claimed first, so a holder that lost the lock without noticing, working from a
+    // stale position, can't shift rows another holder already moved.
+    let claimed = sqlx::query(
+        "UPDATE ingestion_activity SET shift_window_end = ?, shift_inclusive = 0 \
+         WHERE id = 1 AND shift_window_end = ? AND shift_inclusive = ?",
+    )
+    .bind(start)
+    .bind(shift.window_end)
+    .bind(shift.inclusive)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if claimed != 1 {
+        return Err(sqlx::Error::Protocol(
+            "the downtime shift moved on under this holder".to_owned(),
+        ));
+    }
     let sql = format!(
         "UPDATE collections SET dateadded = dateadded + INTERVAL (CASE WHEN dateadded <= ? THEN ? \
          ELSE GREATEST(0, LEAST(TIMESTAMPDIFF(SECOND, dateadded, ?), ?)) END) SECOND \
@@ -511,6 +550,52 @@ mod tests {
         assert!(!waiter.is_finished());
         barrier.release().await;
         waiter.await??;
+        db.drop_database().await
+    }
+
+    #[tokio::test]
+    async fn a_holder_working_from_a_stale_position_moves_nothing() -> Result<()> {
+        let Some(db) = TestDb::create().await? else {
+            return Ok(());
+        };
+        let now = Utc::now().timestamp();
+        let last = now - 3600;
+        let id = add_collection(&db.pool, 1, 0, at(last - 100)).await?;
+        sqlx::query(
+            "INSERT INTO ingestion_activity (id, last_active_at, shift_last_active, shift_now, shift_delay_seconds, \
+             shift_upper_id, shift_window_end, shift_inclusive) VALUES (1, ?, ?, ?, 7200, ?, ?, 0)",
+        )
+        .bind(now)
+        .bind(last)
+        .bind(now)
+        .bind(id)
+        .bind(at(now))
+        .execute(&db.pool)
+        .await?;
+        let stale = Shift {
+            last_active: last,
+            now,
+            delay_seconds: 7200,
+            upper_id: id,
+            window_end: at(now + 60),
+            inclusive: true,
+        };
+        assert!(run_shift(&db.pool, stale, usize::MAX).await.is_err());
+        assert_eq!(added(&db.pool, id).await?, at(last - 100));
+        db.drop_database().await
+    }
+
+    #[tokio::test]
+    async fn a_note_skips_a_held_lock_rather_than_wait() -> Result<()> {
+        let Some(db) = TestDb::create().await? else {
+            return Ok(());
+        };
+        let barrier = Barrier::lock(&db.pool).await?;
+        note_ingestion_on(&db.pool).await?;
+        assert_eq!(last_activity(&db.pool).await?, None);
+        barrier.release().await;
+        note_ingestion_on(&db.pool).await?;
+        assert!(last_activity(&db.pool).await?.is_some());
         db.drop_database().await
     }
 }
