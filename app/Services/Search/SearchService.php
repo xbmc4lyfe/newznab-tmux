@@ -536,16 +536,6 @@ class SearchService extends Manager implements SearchServiceInterface
     }
 
     /**
-     * Delete a predb record from the index.
-     *
-     * @param  int  $id  Predb ID
-     */
-    public function deletePreDb(int $id): void
-    {
-        $this->driver()->deletePreDb($id);
-    }
-
-    /**
      * Get the movies index name.
      */
     public function getMoviesIndex(): string
@@ -610,16 +600,6 @@ class SearchService extends Manager implements SearchServiceInterface
     }
 
     /**
-     * Search movies by external ID (IMDB, TMDB, Trakt).
-     *
-     * @return array<string, mixed>
-     */
-    public function searchMovieByExternalId(string $field, int|string $value): ?array
-    {
-        return $this->driver()->searchMovieByExternalId($field, $value);
-    }
-
-    /**
      * @param  array<string, mixed>  $externalIds
      * @return array<string, mixed>|null
      */
@@ -645,14 +625,6 @@ class SearchService extends Manager implements SearchServiceInterface
     public function insertTvShow(array $parameters): void
     {
         $this->driver()->insertTvShow($parameters);
-    }
-
-    /**
-     * Update a TV show in the search index.
-     */
-    public function updateTvShow(int $videoId): void
-    {
-        $this->driver()->updateTvShow($videoId);
     }
 
     /**
@@ -686,25 +658,6 @@ class SearchService extends Manager implements SearchServiceInterface
     }
 
     /**
-     * Search TV shows by external ID (TVDB, Trakt, TVMaze, TVRage, IMDB, TMDB).
-     *
-     * @return array<string, mixed>
-     */
-    public function searchTvShowByExternalId(string $field, int|string $value): ?array
-    {
-        return $this->driver()->searchTvShowByExternalId($field, $value);
-    }
-
-    /**
-     * @param  array<string, mixed>  $externalIds
-     * @return array<string, mixed>|null
-     */
-    public function searchTvShowByExternalIds(array $externalIds): ?array
-    {
-        return $this->driver()->searchTvShowByExternalIds($externalIds);
-    }
-
-    /**
      * Search releases by external media IDs.
      * Used to find releases associated with a specific movie or TV show.
      *
@@ -726,30 +679,6 @@ class SearchService extends Manager implements SearchServiceInterface
     }
 
     /**
-     * Search releases by category ID using the search index.
-     * This provides a fast way to get release IDs for a specific category without hitting the database.
-     *
-     * @param  array<string, mixed>  $categoryIds
-     * @return array<string, mixed>
-     */
-    public function searchReleasesByCategory(array $categoryIds, int $limit = 1000): array
-    {
-        return $this->driver()->searchReleasesByCategory($categoryIds, $limit);
-    }
-
-    /**
-     * Combined search: text search with category filtering.
-     * First searches by text, then filters by category IDs using the search index.
-     *
-     * @param  array<string, mixed>  $categoryIds
-     * @return array<string, mixed>
-     */
-    public function searchReleasesWithCategoryFilter(string $searchTerm, array $categoryIds = [], int $limit = 1000): array
-    {
-        return $this->driver()->searchReleasesWithCategoryFilter($searchTerm, $categoryIds, $limit);
-    }
-
-    /**
      * @param  array<string, mixed>  $criteria
      * @return array{ids: list<int>, total: int, fuzzy: bool}
      */
@@ -766,11 +695,6 @@ class SearchService extends Manager implements SearchServiceInterface
     public function insertSecondary(SecondarySearchIndex $index, int $id, array $document): void
     {
         $this->driver()->insertSecondary($index, $id, $document);
-    }
-
-    public function updateSecondary(SecondarySearchIndex $index, int $id): void
-    {
-        $this->driver()->updateSecondary($index, $id);
     }
 
     public function deleteSecondary(SecondarySearchIndex $index, int $id): void

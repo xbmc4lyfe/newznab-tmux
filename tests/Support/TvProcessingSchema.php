@@ -86,7 +86,6 @@ trait TvProcessingSchema
 
         Search::shouldReceive('updateRelease')->zeroOrMoreTimes();
         Search::shouldReceive('insertTvShow')->zeroOrMoreTimes();
-        Search::shouldReceive('updateTvShow')->zeroOrMoreTimes();
     }
 
     protected function tvLookupStateMigration(): Migration

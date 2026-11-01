@@ -190,13 +190,6 @@ interface SearchServiceInterface
     public function bulkInsertPredb(array $predbRecords): array;
 
     /**
-     * Delete a predb record from the index.
-     *
-     * @param  int  $id  Predb ID
-     */
-    public function deletePreDb(int $id): void;
-
-    /**
      * Insert a movie into the movies search index.
      *
      * @param  array<string, mixed>  $parameters  Movie data with id, imdbid, tmdbid, traktid, title, year, genre, actors, director, rating
@@ -235,15 +228,6 @@ interface SearchServiceInterface
     public function searchMovies(array|string $searchTerm, int $limit = 1000): array;
 
     /**
-     * Search movies by external ID (IMDB, TMDB, Trakt).
-     *
-     * @param  string  $field  Field name (imdbid, tmdbid, traktid)
-     * @param  int|string  $value  The external ID value
-     * @return array<string, mixed>|null Movie data or null if not found
-     */
-    public function searchMovieByExternalId(string $field, int|string $value): ?array;
-
-    /**
      * Search movies by any provided external IDs in one call.
      *
      * @param  array<string, mixed>  $externalIds  Keys: imdbid, tmdbid, traktid
@@ -265,13 +249,6 @@ interface SearchServiceInterface
      * @param  array<string, mixed>  $parameters  TV show data with id, title, tvdb, trakt, tvmaze, tvrage, imdb, tmdb, started, type
      */
     public function insertTvShow(array $parameters): void;
-
-    /**
-     * Update a TV show in the search index.
-     *
-     * @param  int  $videoId  Video/TV show ID
-     */
-    public function updateTvShow(int $videoId): void;
 
     /**
      * Delete a TV show from the search index.
@@ -298,23 +275,6 @@ interface SearchServiceInterface
     public function searchTvShows(array|string $searchTerm, int $limit = 1000): array;
 
     /**
-     * Search TV shows by external ID (TVDB, Trakt, TVMaze, TVRage, IMDB, TMDB).
-     *
-     * @param  string  $field  Field name (tvdb, trakt, tvmaze, tvrage, imdb, tmdb)
-     * @param  int|string  $value  The external ID value
-     * @return array<string, mixed>|null TV show data or null if not found
-     */
-    public function searchTvShowByExternalId(string $field, int|string $value): ?array;
-
-    /**
-     * Search TV shows by any provided external IDs in one call.
-     *
-     * @param  array<string, mixed>  $externalIds  Keys: tvdb, trakt, tvmaze, tvrage, imdb, tmdb
-     * @return array<string, mixed>|null TV show data or null if not found
-     */
-    public function searchTvShowByExternalIds(array $externalIds): ?array;
-
-    /**
      * Search releases by external media IDs.
      * Used to find releases associated with a specific movie or TV show.
      *
@@ -331,27 +291,6 @@ interface SearchServiceInterface
      * @return array<string, mixed> Array of release IDs
      */
     public function searchReleasesByMultipleExternalIds(array $externalIdSets, int $limit = 1000): array;
-
-    /**
-     * Search releases by category ID using the search index.
-     * This provides a fast way to get release IDs for a specific category without hitting the database.
-     *
-     * @param  array<string, mixed>  $categoryIds  Array of category IDs to filter by
-     * @param  int  $limit  Maximum number of results
-     * @return array<string, mixed> Array of release IDs
-     */
-    public function searchReleasesByCategory(array $categoryIds, int $limit = 1000): array;
-
-    /**
-     * Combined search: text search with category filtering.
-     * First searches by text, then filters by category IDs using the search index.
-     *
-     * @param  string  $searchTerm  Search text
-     * @param  array<string, mixed>  $categoryIds  Array of category IDs to filter by (empty for all categories)
-     * @param  int  $limit  Maximum number of results
-     * @return array<string, mixed> Array of release IDs
-     */
-    public function searchReleasesWithCategoryFilter(string $searchTerm, array $categoryIds = [], int $limit = 1000): array;
 
     /**
      * Filter/sort releases in the search index (category, age, size, group, password) with optional full-text.
@@ -375,8 +314,6 @@ interface SearchServiceInterface
      * @param  array<string, mixed>  $document  Fields for the index (no id key required)
      */
     public function insertSecondary(SecondarySearchIndex $index, int $id, array $document): void;
-
-    public function updateSecondary(SecondarySearchIndex $index, int $id): void;
 
     public function deleteSecondary(SecondarySearchIndex $index, int $id): void;
 
