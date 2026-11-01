@@ -123,7 +123,8 @@ note = "The verify role, and nntmux-ctl verify candidates by hand. Prefetching a
 kind = "command"
 id = "releases:verify-repairable"
 source = "app/Console/Commands/VerifyExistingReleases.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl verify repairable. The search document removal is queued in the deletion transaction, and the candidate worker's scratch cleanup removes the preview files. Receipts for NZB files from a disk-based PHP store are kept for review, since this stack only stores NZBs in the database. PHP's scratch budget bootstrap is skipped: Rust spot checks don't write scratch files."
 
 [[entry]]
 kind = "command"

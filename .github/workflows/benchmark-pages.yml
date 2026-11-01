@@ -1,0 +1,246 @@
+name: Benchmark Pages
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    paths:
+      - '.github/workflows/benchmark-pages.yml'
+      - 'scripts/*benchmark*'
+      - 'docker/app/nzb-yenc-ffi/**'
+      - 'tests/Unit/test_benchmark*.py'
+      - 'tests/Unit/test_verify_benchmark_pages.py'
+      - 'github-pages/docs/**'
+      - 'scripts/build-docs.py'
+      - 'scripts/rewrite-metrics/**'
+      - 'rust/porting/ledger/**'
+      - 'tests/Unit/test_rewrite_progress.py'
+      - 'tests/Unit/test_docs_site.py'
+      - 'scripts/check-docs.py'
+      - 'tests/Unit/test_docs_links.py'
+      - 'scripts/benchmark_callers_summary.py'
+      - 'scripts/benchmark-resource-limits.py'
+      - 'tests/Unit/test_benchmark_callers_export.py'
+      - 'tests/Unit/test_benchmark_utility_extended.py'
+      - 'tests/Unit/test_benchmark_resource_limits.py'
+      - '.gitattributes'
+  workflow_run:
+    workflows: ['Rust', 'Rust indexer', 'rust-clippy analyze']
+    types: [in_progress, completed]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: 1
+
+# Serialize collection as well as deployment. Old completion events refresh the
+# current master, and cannot publish an older rendered snapshot after a new one.
+concurrency:
+  group: benchmark-pages-${{ github.event_name == 'pull_request' && github.ref || 'master' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    # Needs the Node.js that GitHub-hosted images provide.
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Resolve the source once before testing
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == 'pull_request' ]]; then
+            sha="$EVENT_SHA"
+          else
+            sha=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/master --jq .object.sha)
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          persist-credentials: false
+      - run: |
+          export PYTHONDONTWRITEBYTECODE=1
+          python3 -B tests/Unit/test_benchmark_pages.py
+          python3 -B tests/Unit/test_benchmark_pages_completeness.py
+          python3 -B tests/Unit/test_verify_benchmark_pages.py
+          python3 -B tests/Unit/test_benchmark_toolchain.py
+          python3 -B scripts/benchmark_rust_inventory.py --check --root .
+          python3 -B tests/Unit/test_benchmark_summary_export.py
+          python3 -B tests/Unit/test_benchmark_callers_export.py
+          python3 -B tests/Unit/test_benchmark_utility_extended.py
+          python3 -B tests/Unit/test_benchmark_resource_limits.py
+          python3 -B tests/Unit/test_docs_site.py
+          python3 -B tests/Unit/test_rewrite_progress.py
+          python3 -B tests/Unit/test_docs_links.py
+      - name: Check Google style with pinned Vale
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/vale.tar.gz" https://github.com/vale-cli/vale/releases/download/v3.24.0/vale_3.24.0_Linux_64-bit.tar.gz
+          echo "867534ddb678abca7f214bc4706ead0922bd5252ffe8035fc227013f66c8b214  $RUNNER_TEMP/vale.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/vale"
+          tar -xzf "$RUNNER_TEMP/vale.tar.gz" -C "$RUNNER_TEMP/vale" vale
+          "$RUNNER_TEMP/vale/vale" --config=github-pages/docs/.vale.ini github-pages/docs/content
+      - name: Build and check documentation preview
+        run: |
+          node --check github-pages/docs/assets/site.js
+          bash github-pages/deployment/prepare-benchmarks.sh docs-preview
+          echo '{"status":"unavailable","reason":"Preview has no current-build collection"}' > docs-preview/results.json
+          python3 -B scripts/build-docs.py --output=docs-preview
+          python3 -B scripts/check-docs.py --site=docs-preview
+
+  build:
+    needs: test
+    if: >-
+      github.repository == 'xbmc4lyfe/newznab-tmux' &&
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_run' ||
+       ((github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        github.event.workflow_run.head_branch == 'master')) &&
+      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha: ${{ steps.identity.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.test.outputs.sha }}
+          persist-credentials: false
+      - id: identity
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Preserve the reviewed historical reports
+        run: |
+          if [[ -f github-pages/deployment/prepare-benchmarks.sh ]]; then
+            bash github-pages/deployment/prepare-benchmarks.sh benchmark-site
+          fi
+      - name: Collect current commit and attempt summaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_SHA: ${{ steps.identity.outputs.sha }}
+        run: python3 -B scripts/benchmark-pages.py --sha="$BUILD_SHA" --output=benchmark-site
+      # Before the cutover master still holds the PHP and the rewrite sits on rust-native, which
+      # dispatches this workflow on each push; measure that branch too. After the cutover the
+      # checkout is the rewrite (no app/), so neither step runs. The denominator is the committed
+      # baseline in scripts/rewrite-metrics/subsystems.toml, which needs no PHP.
+      - name: Check out rust-native for the rewrite ledgers
+        if: hashFiles('app/**/*.php') != ''
+        continue-on-error: true
+        uses: actions/checkout@v5
+        with:
+          ref: rust-native
+          path: rewrite-rust-native
+          persist-credentials: false
+      - name: Set up the PHP that app/ is written for
+        if: hashFiles('app/**/*.php') != ''
+        continue-on-error: true
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          coverage: none
+      - name: Measure rewrite progress
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          progress=(python3 -B scripts/rewrite-metrics/progress.py --master=. --output=benchmark-site/rewrite-progress.json)
+          if [[ -d rewrite-rust-native/.git ]]; then
+            progress+=(--rust-native=rewrite-rust-native)
+          fi
+          "${progress[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Build documentation around current and historical evidence
+        run: |
+          python3 -B scripts/build-docs.py --output=benchmark-site
+          python3 -B scripts/check-docs.py --site=benchmark-site
+      - name: Bind the complete site to the tested source
+        env:
+          BUILD_SHA: ${{ needs.test.outputs.sha }}
+        run: python3 -B scripts/verify-benchmark-pages.py create --site=benchmark-site --sha="$BUILD_SHA"
+      - name: Retain the trusted expected publication separately
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: benchmark-site/publication.json
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: benchmark-site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check that master still matches the rendered build
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          current=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/master --jq .object.sha)
+          [[ "$current" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          if [[ "$current" == "$BUILD_SHA" ]]; then
+            echo 'matches=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Master advanced; its queued refresh will publish the new build.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/configure-pages@v5
+        if: steps.current.outputs.matches == 'true'
+      - uses: actions/deploy-pages@v4
+        if: steps.current.outputs.matches == 'true'
+        id: deployment
+      - uses: actions/checkout@v5
+        if: steps.current.outputs.matches == 'true'
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+          persist-credentials: false
+      - name: Download the trusted build manifest
+        if: steps.current.outputs.matches == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: expected-publication
+      - name: Verify the published source and every public file
+        if: steps.current.outputs.matches == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_SHA: ${{ needs.build.outputs.sha }}
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          current=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/master --jq .object.sha)
+          [[ "$current" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          if [[ "$current" != "$BUILD_SHA" ]]; then
+            echo 'Master advanced; publication verification is superseded by its queued refresh.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if python3 -B scripts/verify-benchmark-pages.py verify --manifest=expected-publication/publication.json --sha="$BUILD_SHA" --url="$PAGE_URL"; then
+            echo "Verified every published file against tested source $BUILD_SHA." >> "$GITHUB_STEP_SUMMARY"
+          else
+            current=$(gh api repos/xbmc4lyfe/newznab-tmux/git/ref/heads/master --jq .object.sha)
+            [[ "$current" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            if [[ "$current" != "$BUILD_SHA" ]]; then
+              echo 'Master advanced; publication verification is superseded by its queued refresh.' >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo 'Current-source publication verification failed.' >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          fi

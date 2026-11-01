@@ -133,12 +133,62 @@ impl Tmdb {
         Ok(None)
     }
 
+    /// The full-size image at a path.
+    pub fn original_image_url(path: &str) -> String {
+        format!("{IMAGE_BASE_URL}/original{path}")
+    }
+
     pub fn image_url(path: &str) -> String {
         if path.is_empty() {
             String::new()
         } else {
             format!("{IMAGE_BASE_URL}/w500{path}")
         }
+    }
+
+    pub async fn search_movies(&self, query: &str, year: Option<&str>) -> Result<Option<Value>> {
+        let mut params = vec![
+            ("query", query.to_owned()),
+            ("page", "1".to_owned()),
+            ("include_adult", "false".to_owned()),
+        ];
+        if let Some(year) = year {
+            params.push(("year", year.to_owned()));
+        }
+        self.get("/search/movie", &params).await
+    }
+
+    /// A movie by TMDB id, or by IMDb id with its `tt` prefix.
+    pub async fn movie(&self, id: &str, append: &[&str]) -> Result<Option<Value>> {
+        let mut id = id.to_owned();
+        if id.starts_with("tt") {
+            let found = self
+                .get(
+                    &format!("/find/{id}"),
+                    &[("external_source", "imdb_id".to_owned())],
+                )
+                .await?;
+            let tmdb = found
+                .as_ref()
+                .and_then(|found| found.get("movie_results"))
+                .and_then(|results| results.get(0))
+                .map_or(0, |movie| php::int(movie.get("id")));
+            if tmdb <= 0 {
+                return Ok(None);
+            }
+            id = tmdb.to_string();
+        }
+        let params = if append.is_empty() {
+            Vec::new()
+        } else {
+            vec![("append_to_response", append.join(","))]
+        };
+        self.get(&format!("/movie/{id}"), &params).await
+    }
+
+    pub async fn movie_alternative_titles(&self, id: i64) -> Result<Option<Value>> {
+        self.get(&format!("/movie/{id}/alternative_titles"), &[])
+            .await
     }
 
     pub async fn search_tv(&self, query: &str, year: Option<i32>) -> Result<Option<Value>> {

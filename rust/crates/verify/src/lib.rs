@@ -3,6 +3,7 @@
 //! Owner: ws-releases. See `rust/WORKSTREAMS.md`.
 
 pub mod article;
+pub mod audit;
 pub mod barrier;
 pub mod cache;
 pub mod candidates;
@@ -97,6 +98,24 @@ pub enum Command {
         #[arg(long)]
         delete_files: bool,
     },
+    /// Spot check published NZBs with bounded article reads. Inconclusive results are retained.
+    Repairable {
+        /// Report without deleting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete only releases proven unrepairable.
+        #[arg(long)]
+        delete: bool,
+        /// Maximum releases.
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+        /// Start after this release ID.
+        #[arg(long, default_value_t = 0)]
+        since_id: i64,
+        /// Use the persisted audit cursor, and take due retries in turn.
+        #[arg(long)]
+        resume: bool,
+    },
     /// Hold verification workers on every host out until this command is stopped.
     Barrier {
         /// Seconds to wait for every host's workers to finish.
@@ -185,6 +204,34 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 counts.unreferenced,
                 report.last_candidate_id,
             );
+            Ok(())
+        }
+        Command::Repairable {
+            dry_run,
+            delete,
+            limit,
+            since_id,
+            resume,
+        } => {
+            let nntp = std::sync::Arc::new(nntmux_nntp::NntpConfig::from_env());
+            let source = worker::NntpSource::new(nntp, &verify);
+            let options = audit::AuditOptions {
+                dry_run,
+                delete,
+                limit,
+                since_id,
+                resume,
+            };
+            let report = audit::run(&verify, &source, options, |line| println!("{line}")).await?;
+            match report.deferred {
+                Some(audit::Deferred::WorkerPriority) => {
+                    eprintln!("The new-release verifier has priority; retry the audit later.");
+                }
+                Some(audit::Deferred::CandidatesDue) => {
+                    eprintln!("New candidates are due; audit deferred.");
+                }
+                None => {}
+            }
             Ok(())
         }
         Command::Barrier {

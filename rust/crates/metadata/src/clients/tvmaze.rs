@@ -129,6 +129,13 @@ impl TvMaze {
         Ok(show.as_ref().map(MazeShow::parse))
     }
 
+    pub async fn show_by_id(&self, id: i64) -> Result<Option<MazeShow>> {
+        let show = self
+            .get(&format!("/shows/{id}"), &[("embed", "akas".to_owned())])
+            .await?;
+        Ok(show.as_ref().map(MazeShow::parse))
+    }
+
     pub async fn lookup(&self, site: &str, id: &str) -> Result<Option<MazeShow>> {
         let show = self.get("/lookup/shows", &[(site, id.to_owned())]).await?;
         Ok(show.as_ref().map(MazeShow::parse))

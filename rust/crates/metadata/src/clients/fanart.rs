@@ -12,6 +12,14 @@ use crate::php;
 
 const CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
 
+/// What Fanart.tv has for a movie.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovieArt {
+    pub cover: String,
+    pub backdrop: String,
+    pub banner: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Fanart {
     http: Client,
@@ -96,6 +104,29 @@ impl Fanart {
     pub async fn tv_fan_art(&self, tvdb_id: i64) -> Option<Value> {
         self.cached(&format!("fanarttv_tv_{tvdb_id}"), &format!("tv/{tvdb_id}"))
             .await
+    }
+
+    /// A movie's art by IMDb id. Only when it has both a cover and a backdrop.
+    pub async fn movie_properties(&self, imdb: &str) -> Option<MovieArt> {
+        let id = if imdb.to_ascii_lowercase().starts_with("tt") {
+            imdb.to_owned()
+        } else {
+            format!("tt{imdb}")
+        };
+        let art = self
+            .cached(&format!("fanarttv_movie_{id}"), &format!("movies/{id}"))
+            .await?;
+        let first_url = |key: &str| {
+            art.get(key)
+                .and_then(|list| list.get(0))
+                .map(|first| php::text(first.get("url")))
+                .filter(|url| !url.is_empty() && url != "0")
+        };
+        Some(MovieArt {
+            cover: first_url("movieposter")?,
+            backdrop: first_url("moviebackground").or_else(|| first_url("moviethumb"))?,
+            banner: first_url("moviebanner"),
+        })
     }
 
     /// The most liked poster of a show.

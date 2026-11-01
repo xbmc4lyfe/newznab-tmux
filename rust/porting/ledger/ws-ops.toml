@@ -72,18 +72,6 @@ status = "ported"
 
 [[entry]]
 kind = "command"
-id = "nntmux:fetch-movie"
-source = "app/Console/Commands/FetchMovieByImdb.php"
-status = "todo"
-
-[[entry]]
-kind = "command"
-id = "nntmux:find-size-mismatches"
-source = "app/Console/Commands/FindSizeMismatchedReleases.php"
-status = "todo"
-
-[[entry]]
-kind = "command"
 id = "nntmux:git"
 source = "app/Console/Commands/UpdateNNTmuxGit.php"
 status = "dropped"
@@ -114,12 +102,6 @@ kind = "command"
 id = "nntmux:populate"
 source = "app/Console/Commands/NntmuxPopulateSearchIndexes.php"
 status = "ported"
-
-[[entry]]
-kind = "command"
-id = "nntmux:populate-steam-apps"
-source = "app/Console/Commands/NntmuxPopulateSteamApps.php"
-status = "todo"
 
 [[entry]]
 kind = "command"
@@ -155,7 +137,7 @@ status = "ported"
 kind = "command"
 id = "nntmux:update-expired-roles"
 source = "app/Console/Commands/NntmuxUpdateExpiredRoles.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -168,7 +150,8 @@ note = "Checked the yEnc FFI library, which is gone. The yenc crate is plain Rus
 kind = "command"
 id = "redis:monitor"
 source = "app/Console/Commands/RedisMonitor.php"
-status = "todo"
+status = "dropped"
+note = "A terminal dashboard. `redis-cli --stat` and the redis-exporter panels in Grafana show the same figures."
 
 [[entry]]
 kind = "command"
@@ -256,7 +239,7 @@ note = "Laravel's cache-tag index. No Rust code uses Laravel cache tags."
 kind = "schedule"
 id = "command: 'clean:directories')->hourly()->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -274,7 +257,7 @@ status = "ported"
 kind = "schedule"
 id = "command: 'gdpr:purge-expired-exports')->dailyAt('03:30')->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -323,7 +306,7 @@ status = "ported"
 kind = "schedule"
 id = "command: 'nntmux:delete-unverified-users')->twiceDaily(1, 13);"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -341,7 +324,7 @@ status = "ported"
 kind = "schedule"
 id = "command: 'nntmux:index-logs')->everyMinute()->withoutOverlapping()->runInBackground()->when(static "
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -366,7 +349,7 @@ note = "The search-sync role retries failed index updates continuously."
 kind = "schedule"
 id = "command: 'nntmux:update-expired-roles')->daily();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -400,13 +383,13 @@ note = "Compose restarts the supervisor; nothing runs in tmux."
 kind = "schedule"
 id = "command: 'tv:repair-links --legacy --stuck --orphans --limit=50000')->dailyAt('05:15')->withoutOver"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
 id = "command: 'tv:reprocess-missing-episodes --scheduled --limit=500')->everyThirtyMinutes()->withoutOve"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -433,17 +416,17 @@ note = "The verify role runs this on its own loop."
 kind = "schedule"
 id = "job: new PurgeDeletedAccounts)->daily();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
 id = "job: new RemoveInactiveAccounts)->daily();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:index-logs"
 source = "app/Console/Commands/IndexLogs.php"
-status = "todo"
+status = "ported"
 note = "Moved from ws-search: this tails log files for the admin log viewer, which ws-ops owns."

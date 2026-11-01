@@ -7,12 +7,21 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true
+crc32fast.workspace = true
 hex.workspace = true
+md-5.workspace = true
 nntmux-core.workspace = true
+nntmux-nntp.workspace = true
+nntmux-namefix.workspace = true
+nntmux-nntp.workspace = true
+nntmux-metadata.workspace = true
 nntmux-runtime.workspace = true
 nntmux-verify.workspace = true
+nntmux-yenc.workspace = true
+quick-xml.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
