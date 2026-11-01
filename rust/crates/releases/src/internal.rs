@@ -18,7 +18,7 @@ use ipnet::IpNet;
 use nntmux_categorize::Categorizer;
 use nntmux_core::{parsed_or, var_or};
 use nntmux_predb::PredbIndex;
-use nntmux_runtime::Ctx;
+use nntmux_runtime::{Ctx, busy};
 use nntmux_verify::candidates::{self, Candidate, Claim};
 use nntmux_verify::cleaning::ReleaseCleaner;
 use nntmux_verify::context::Verify;
@@ -410,16 +410,7 @@ impl Publication {
                     }
                 }
             };
-            let claim_id = integer(&raw["claim"]["id"], i64::MIN, i64::MAX, "").ok();
-            let claim_version = integer(&raw["claim"]["version"], i64::MIN, i64::MAX, "").ok();
-            results.push(json!({
-                "index": index,
-                "claim_id": claim_id,
-                "claim_version": claim_version,
-                "status": done.status,
-                "release_id": done.release_id,
-                "error": done.error,
-            }));
+            results.push(result_row(index, raw, &done));
         }
         gate.close().await;
         results
@@ -521,6 +512,21 @@ fn internal_error(failure: &anyhow::Error) -> Response {
         .into_response()
 }
 
+fn result_row(index: usize, raw: &Value, done: &PublicationOutcome) -> Value {
+    json!({
+        "index": index,
+        "claim_id": integer(&raw["claim"]["id"], i64::MIN, i64::MAX, "").ok(),
+        "claim_version": integer(&raw["claim"]["version"], i64::MIN, i64::MAX, "").ok(),
+        "status": done.status,
+        "release_id": done.release_id,
+        "error": done.error,
+    })
+}
+
+fn not_started((index, raw): (usize, &Value)) -> Value {
+    result_row(index, raw, &failed("paused", PAUSED))
+}
+
 /// A client that gives up mustn't roll back a publication under way, nor stop the work after its
 /// commit: dropping a handler would do both. Its retry finds the release.
 async fn detached<T: Send + 'static>(
@@ -546,10 +552,15 @@ async fn publish_single(
         }
     };
     let done = detached(async move {
+        // Held until the work ends, so an operator's drain waits for a client that already left.
+        let Some(busy) = busy::enter(&ctx, "publication").await? else {
+            return Ok(failed("paused", PAUSED));
+        };
         let service = shared.publication(&ctx).await?;
         let mut gate = Gate::new(false);
         let done = service.publish_item(&item, &mut gate, false).await;
         gate.close().await;
+        drop(busy);
         Ok(done)
     })
     .await;
@@ -606,10 +617,15 @@ async fn publish_batch(
     }
     let items = items.clone();
     let results = detached(async move {
+        let Some(busy) = busy::enter(&ctx, "publication").await? else {
+            return Ok(items.iter().enumerate().map(not_started).collect());
+        };
         let service = shared.publication(&ctx).await?;
-        Ok(service
+        let results = service
             .publish_batch(&items, shared.settings.batch_seconds)
-            .await)
+            .await;
+        drop(busy);
+        Ok(results)
     })
     .await;
     let results = match results {

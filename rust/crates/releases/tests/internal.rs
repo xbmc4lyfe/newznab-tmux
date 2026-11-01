@@ -402,3 +402,35 @@ async fn a_partial_below_its_policy_is_deferred() -> Result<()> {
     assert_eq!(harness.count("releases").await?, 0);
     harness.finish().await
 }
+
+#[tokio::test]
+async fn an_operator_pause_holds_publication_back() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let app = app(&harness, settings()).await?;
+    let claim = claimed(&harness, "f0").await?;
+    let db = harness.db();
+    sqlx::query(
+        "INSERT INTO processing_runtime_states (id, stop_requested) VALUES (1, 1) \
+         ON DUPLICATE KEY UPDATE stop_requested = 1",
+    )
+    .execute(&db)
+    .await?;
+    let (status, answer) = post(&app, SINGLE, &item(&claim)).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert!(answer["error"].as_str().unwrap().contains("paused"));
+    let batch = json!({"protocol": 1, "items": [item(&claim)]});
+    let (status, answer) = post(&app, BATCH, &batch).await?;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["results"][0]["status"], "paused");
+    assert_eq!(answer["results"][0]["claim_id"], claim.candidate.id);
+    assert_eq!(harness.count("releases").await?, 0);
+
+    sqlx::query("UPDATE processing_runtime_states SET stop_requested = 0 WHERE id = 1")
+        .execute(&db)
+        .await?;
+    let (status, answer) = post(&app, SINGLE, &item(&claim)).await?;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    harness.finish().await
+}
