@@ -1326,7 +1326,7 @@
     ],
     [
      "content-disposition",
-     "attachment; filename*=UTF-8''20261101012151.zip"
+     "attachment; filename*=UTF-8''20261101014850.zip"
     ],
     [
      "content-length",
@@ -1361,7 +1361,7 @@
      "SAMEORIGIN"
     ]
    ],
-   "body_b64": "UEsDBC0ACAgAALlqYV0AAAAA//////////8hABgAQS5Nb3ZpZS4yMDI0LjEwODBwLkJsdVJheS1HUlAubnpiAQAQAAAAAAAAAAAAAAAAAAAAAABTVgAAPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPG56Yj48ZmlsZSBwb3N0ZXI9ImFAYiIgZGF0ZT0iMSIgc3ViamVjdD0icyI+PGdyb3Vwcz48Z3JvdXA+ZzwvZ3JvdXA+PC9ncm91cHM+PHNlZ21lbnRzPjxzZWdtZW50IGJ5dGVzPSIxIiBudW1iZXI9IjEiPm1AeDwvc2VnbWVudD48L3NlZ21lbnRzPjwvZmlsZT48ZmlsZSBwb3N0ZXI9ImNAZCI+PC9maWxlPjwvbnpiPgpQSwcIhlej2N0AAAAAAAAA3QAAAAAAAABQSwECAwYtAAgIAAC5amFdhlej2N0AAADdAAAAIQAAAAAAAAAAACAAAAAAAAAAQS5Nb3ZpZS4yMDI0LjEwODBwLkJsdVJheS1HUlAubnpiUEsFBgAAAAABAAEATwAAAEwBAAAAAA==",
+   "body_b64": "UEsDBC0ACAgAABluYV0AAAAA//////////8hABgAQS5Nb3ZpZS4yMDI0LjEwODBwLkJsdVJheS1HUlAubnpiAQAQAAAAAAAAAAAAAAAAAAAAAABTVgAAPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPG56Yj48ZmlsZSBwb3N0ZXI9ImFAYiIgZGF0ZT0iMSIgc3ViamVjdD0icyI+PGdyb3Vwcz48Z3JvdXA+ZzwvZ3JvdXA+PC9ncm91cHM+PHNlZ21lbnRzPjxzZWdtZW50IGJ5dGVzPSIxIiBudW1iZXI9IjEiPm1AeDwvc2VnbWVudD48L3NlZ21lbnRzPjwvZmlsZT48ZmlsZSBwb3N0ZXI9ImNAZCI+PC9maWxlPjwvbnpiPgpQSwcIhlej2N0AAAAAAAAA3QAAAAAAAABQSwECAwYtAAgIAAAZbmFdhlej2N0AAADdAAAAIQAAAAAAAAAAACAAAAAAAAAAQS5Nb3ZpZS4yMDI0LjEwODBwLkJsdVJheS1HUlAubnpiUEsFBgAAAAABAAEATwAAAEwBAAAAAA==",
    "audit": [],
    "after": [
     "4",
@@ -1370,6 +1370,63 @@
     "2",
     "0"
    ]
+  }
+ },
+ {
+  "name": "getnzb_zip_same_name",
+  "path": "/getnzb?id=aaaa000000000000000000000000000000000001,bbbb000000000000000000000000000000000002&r=tokenalice&zip=1",
+  "status_only": true,
+  "setup": [
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('aaaa000000000000000000000000000000000001', 1, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('bbbb000000000000000000000000000000000002', 2, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());",
+   "UPDATE releases SET searchname='same' WHERE id IN (1,2);"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "public, must-revalidate"
+    ],
+    [
+     "content-disposition",
+     "attachment; filename*=UTF-8''20261101014850.zip"
+    ],
+    [
+     "content-length",
+     "383"
+    ],
+    [
+     "content-transfer-encoding",
+     "binary"
+    ],
+    [
+     "content-type",
+     "application/x-zip"
+    ],
+    [
+     "pragma",
+     "public"
+    ],
+    [
+     "referrer-policy",
+     "strict-origin-when-cross-origin"
+    ],
+    [
+     "x-accel-buffering",
+     "no"
+    ],
+    [
+     "x-content-type-options",
+     "nosniff"
+    ],
+    [
+     "x-frame-options",
+     "SAMEORIGIN"
+    ]
+   ],
+   "body_b64": "UEsDBC0ACAgAABluYV0AAAAA//////////8IABgAc2FtZS5uemIBABAAAAAAAAAAAAAAAAAAAAAAAFNWAAA8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCI/Pgo8bnpiPjxmaWxlIHBvc3Rlcj0iYUBiIiBkYXRlPSIxIiBzdWJqZWN0PSJzIj48Z3JvdXBzPjxncm91cD5nPC9ncm91cD48L2dyb3Vwcz48c2VnbWVudHM+PHNlZ21lbnQgYnl0ZXM9IjEiIG51bWJlcj0iMSI+bUB4PC9zZWdtZW50Pjwvc2VnbWVudHM+PC9maWxlPjxmaWxlIHBvc3Rlcj0iY0BkIj48L2ZpbGU+PC9uemI+ClBLBwiGV6PY3QAAAAAAAADdAAAAAAAAAFBLAQIDBi0ACAgAABluYV2GV6PY3QAAAN0AAAAIAAAAAAAAAAAAIAAAAAAAAABzYW1lLm56YlBLBQYAAAAAAQABADYAAAAzAQAAAAA=",
+   "audit": []
   }
  }
 ]

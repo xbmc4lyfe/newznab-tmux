@@ -16,8 +16,8 @@ use crate::auth::{self, User};
 use crate::cache;
 use crate::reply::{Reply, json_error, xml_error};
 use crate::request::ApiRequest;
-use crate::settings::Settings;
 use crate::rss::{self, Feed};
+use crate::settings::Settings;
 use crate::{abuse, caps, getnzb, misc, v1, v2};
 
 const DEFAULT_RATE_LIMIT: i64 = 60;

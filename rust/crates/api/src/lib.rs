@@ -23,8 +23,8 @@ mod present_v1;
 mod present_v2;
 mod reply;
 mod request;
-mod rss;
 mod rows;
+mod rss;
 mod settings;
 pub mod usage;
 mod v1;
@@ -37,9 +37,9 @@ use axum::routing::any;
 use axum::{Extension, Router};
 use nntmux_runtime::Ctx;
 
+pub use crate::abuse::AbuseConfig;
 use crate::pipeline::{Endpoint, dispatch};
 use crate::rss::Feed;
-pub use crate::abuse::AbuseConfig;
 pub use crate::settings::Settings;
 
 pub fn router() -> Router<Ctx> {
@@ -72,8 +72,14 @@ pub fn router_with(settings: Settings) -> Router<Ctx> {
         .route("/rss/full-feed", route(Endpoint::Rss(Feed::Full)))
         .route("/rss/cart", route(Endpoint::Rss(Feed::Cart)))
         .route("/rss/category", route(Endpoint::Rss(Feed::Category)))
-        .route("/rss/trending-movies", route(Endpoint::Rss(Feed::TrendingMovies)))
-        .route("/rss/trending-shows", route(Endpoint::Rss(Feed::TrendingShows)))
+        .route(
+            "/rss/trending-movies",
+            route(Endpoint::Rss(Feed::TrendingMovies)),
+        )
+        .route(
+            "/rss/trending-shows",
+            route(Endpoint::Rss(Feed::TrendingShows)),
+        )
         .route("/getnzb", route(Endpoint::GetNzb))
         .route("/getnzb/{guid}", route(Endpoint::GetNzb))
         .layer(Extension(Arc::new(settings)))

@@ -17,10 +17,11 @@ pub async fn expand(ctx: &Ctx, categories: &[String]) -> Result<Vec<i64>> {
         if id == -1 {
             continue;
         }
-        let is_root: Option<u64> = sqlx::query_scalar("SELECT id FROM root_categories WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&ctx.db)
-            .await?;
+        let is_root: Option<u64> =
+            sqlx::query_scalar("SELECT id FROM root_categories WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&ctx.db)
+                .await?;
         if is_root.is_some() {
             let rows = sqlx::query("SELECT id FROM categories WHERE root_categories_id = ?")
                 .bind(id)

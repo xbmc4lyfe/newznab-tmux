@@ -5,6 +5,7 @@ Start it first, on a scratch copy of the php-ref-setup.sh database:
   docker exec nntmux-rust-test-mariadb-1 sh -c "mariadb -uroot -proot -e 'CREATE DATABASE nntmux_api_ref'; \
     mariadb-dump -uroot -proot --no-tablespaces nntmux | mariadb -uroot -proot nntmux_api_ref"
   export every QUERY_ENV value below, then php artisan manticore:create-indexes
+  apply seed.sql, then php artisan nntmux:populate --manticore --releases --music --books
   cd newznab-tmux-php-ref/public && php -S 127.0.0.1:8765 ../vendor/laravel/framework/src/Illuminate/Foundation/resources/server.php
 
 Every case runs from a fresh seed.sql plus its own `setup` statements, so the array cache and

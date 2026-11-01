@@ -19,7 +19,7 @@ use crate::json::{J, Style};
 use crate::present_v1::{Namespace, Params, rss_json_refused, write_feed};
 use crate::reply::{Reply, json_error};
 use crate::request::ApiRequest;
-use crate::rows::{Row, is_empty};
+use crate::rows::{Row, attach_partial_counts, is_empty};
 use crate::settings::Settings;
 use crate::usage::{now_string, rfc2822};
 use crate::xml::XmlWriter;
@@ -44,7 +44,8 @@ pub enum Feed {
     TrendingShows,
 }
 
-const FEED_COLUMNS: &str = "r.searchname, r.guid, r.postdate, r.categories_id, r.size, r.totalpart, r.fromname,
+const FEED_COLUMNS: &str =
+    "r.searchname, r.guid, r.postdate, r.categories_id, r.size, r.totalpart, r.fromname,
     r.passwordstatus, r.grabs, r.comments, r.adddate, r.videos_id, r.tv_episodes_id,
     m.cover, m.imdbid, m.rating, m.plot, m.year, m.genre, m.director, m.actors,
     g.name AS group_name,
@@ -58,7 +59,10 @@ const FEED_COLUMNS: &str = "r.searchname, r.guid, r.postdate, r.categories_id, r
     bo.cover AS bo_cover";
 
 fn cart_no_cache(mut reply: Reply) -> Reply {
-    reply.set_header("cache-control", "max-age=0, must-revalidate, no-cache, no-store, private, s-maxage=0");
+    reply.set_header(
+        "cache-control",
+        "max-age=0, must-revalidate, no-cache, no-store, private, s-maxage=0",
+    );
     reply.set_header("pragma", "no-cache");
     reply.set_header("expires", "Thu, 01 Jan 1970 00:00:00 GMT");
     reply.set_header("cdn-cache-control", "no-store");
@@ -68,7 +72,10 @@ fn cart_no_cache(mut reply: Reply) -> Reply {
 
 /// `userCheck`: the token, the limit and the accounting. RSS counts its own way: strictly over the
 /// limit, oldest times across all history, and the raw request URI in the audit row.
-async fn user_check(ctx: &Ctx, request: &ApiRequest) -> Result<std::result::Result<(User, Params), Reply>> {
+async fn user_check(
+    ctx: &Ctx,
+    request: &ApiRequest,
+) -> Result<std::result::Result<(User, Params), Reply>> {
     let input = &request.input;
     if !input.has("api_token") {
         return Ok(Err(json_error(200, "Missing parameter (api_token)")));
@@ -76,8 +83,15 @@ async fn user_check(ctx: &Ctx, request: &ApiRequest) -> Result<std::result::Resu
     let Some(user) = auth::find_verified(ctx, &input.string("api_token")).await? else {
         return Ok(Err(json_error(100, "")));
     };
-    let since = (Utc::now() - Duration::days(1)).format("%Y-%m-%d %H:%M:%S").to_string();
-    let (used, grabs, oldest_api, oldest_grab): (i64, i64, Option<NaiveDateTime>, Option<NaiveDateTime>) = sqlx::query_as(
+    let since = (Utc::now() - Duration::days(1))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let (used, grabs, oldest_api, oldest_grab): (
+        i64,
+        i64,
+        Option<NaiveDateTime>,
+        Option<NaiveDateTime>,
+    ) = sqlx::query_as(
         "SELECT
             (SELECT COUNT(*) FROM user_requests WHERE users_id = ? AND timestamp > ?),
             (SELECT COUNT(*) FROM user_downloads WHERE users_id = ? AND timestamp > ?),
@@ -97,11 +111,18 @@ async fn user_check(ctx: &Ctx, request: &ApiRequest) -> Result<std::result::Resu
     }
     if used > user.api_requests {
         let max = user.api_requests;
-        return Ok(Err(json_error(500, &format!("Request limit reached ({used}/{max})"))));
+        return Ok(Err(json_error(
+            500,
+            &format!("Request limit reached ({used}/{max})"),
+        )));
     }
 
     let now = now_string();
-    let uri: String = request.request_uri().chars().take(AUDIT_MAX_LENGTH).collect();
+    let uri: String = request
+        .request_uri()
+        .chars()
+        .take(AUDIT_MAX_LENGTH)
+        .collect();
     sqlx::query("INSERT INTO user_requests (users_id, request, timestamp) VALUES (?, ?, ?)")
         .bind(user.id)
         .bind(uri)
@@ -151,15 +172,22 @@ fn abs_numeric(input: &Input, key: &str, default: i64) -> i64 {
 }
 
 async fn show_passwords_for_rss(ctx: &Ctx) -> Result<&'static str> {
-    let allow: Option<bool> = sqlx::query_scalar("SELECT show_passworded_releases FROM ingestion_configurations LIMIT 1")
-        .fetch_optional(&ctx.db)
-        .await?;
-    Ok(if allow.unwrap_or(false) { "BETWEEN 0 AND 1" } else { "= 0" })
+    let allow: Option<bool> =
+        sqlx::query_scalar("SELECT show_passworded_releases FROM ingestion_configurations LIMIT 1")
+            .fetch_optional(&ctx.db)
+            .await?;
+    Ok(if allow.unwrap_or(false) {
+        "BETWEEN 0 AND 1"
+    } else {
+        "= 0"
+    })
 }
 
 async fn run(ctx: &Ctx, sql: String) -> Result<Vec<Row>> {
     let rows = sqlx::query(AssertSqlSafe(sql)).fetch_all(&ctx.db).await?;
-    rows.iter().map(|row| row_json(row).map(Row::from_json)).collect()
+    rows.iter()
+        .map(|row| row_json(row).map(Row::from_json))
+        .collect()
 }
 
 /// `Cache::get` then `Cache::put` around a query, keyed by its text.
@@ -209,11 +237,18 @@ fn common_filters(input: &Input, categories: Vec<String>) -> FeedQuery {
 
 /// `getRss`. Laravel served uncategorized feeds through the search index when it could; the rows are
 /// the same, in the same `postdate DESC` order.
-async fn general_rows(ctx: &Ctx, settings: &Settings, user_id: i64, query: &FeedQuery) -> Result<Vec<Row>> {
+async fn general_rows(
+    ctx: &Ctx,
+    settings: &Settings,
+    user_id: i64,
+    query: &FeedQuery,
+) -> Result<Vec<Row>> {
     let first = query.categories.first().map_or(0, |id| php_int(id));
     let is_cart = first == -2;
     let cart_join = if is_cart {
-        format!("INNER JOIN users_releases ON users_releases.users_id = {user_id} AND users_releases.releases_id = r.id")
+        format!(
+            "INNER JOIN users_releases ON users_releases.users_id = {user_id} AND users_releases.releases_id = r.id"
+        )
     } else {
         String::new()
     };
@@ -235,7 +270,10 @@ async fn general_rows(ctx: &Ctx, settings: &Settings, user_id: i64, query: &Feed
         }
     };
     let air = if query.air_date > -1 {
-        format!("AND tve.firstaired >= DATE_SUB(CURDATE(), INTERVAL {} DAY)", query.air_date)
+        format!(
+            "AND tve.firstaired >= DATE_SUB(CURDATE(), INTERVAL {} DAY)",
+            query.air_date
+        )
     } else {
         String::new()
     };
@@ -287,7 +325,13 @@ fn capped_limit(limit: i64) -> String {
     }
 }
 
-async fn my_shows(ctx: &Ctx, settings: &Settings, user_id: i64, limit: i64, air_date: i64) -> Result<Vec<Row>> {
+async fn my_shows(
+    ctx: &Ctx,
+    settings: &Settings,
+    user_id: i64,
+    limit: i64,
+    air_date: i64,
+) -> Result<Vec<Row>> {
     let excluded = auth::category_exclusions(ctx, settings, user_id).await?;
     let air = if air_date > -1 {
         format!(" AND tve.firstaired >= DATE_SUB(CURDATE(), INTERVAL {air_date} DAY)")
@@ -341,7 +385,9 @@ async fn my_movies(ctx: &Ctx, settings: &Settings, user_id: i64, limit: i64) -> 
 }
 
 fn hours_ago_48() -> String {
-    (Utc::now() - Duration::hours(48)).format("%Y-%m-%d %H:%M:%S").to_string()
+    (Utc::now() - Duration::hours(48))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 /// The top 15 movies by downloads in 48 hours, each with its latest five releases.
@@ -467,8 +513,12 @@ fn human_filesize(bytes: i64) -> String {
 /// `resolveImageAssetFilename`.
 fn resolve_cover(roots: &[std::path::PathBuf], dir: &str, basename: &str) -> Option<String> {
     let safe = |name: &str| {
-        name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        name.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     };
     if !safe(basename) {
         return None;
@@ -492,14 +542,20 @@ fn is_file(path: &Path) -> bool {
 /// columns these queries don't select or a strict comparison they fail, so no feed reaches them.
 fn write_description(xml: &mut XmlWriter, row: &Row, url: &str, roots: &[std::path::PathBuf]) {
     let mut html = String::from("\n\t<div>\n");
-    let cover = [("cover", "movies", "imdbid"), ("mu_cover", "music", "musicinfo_id"), ("co_cover", "console", "consoleinfo_id"), ("bo_cover", "book", "bookinfo_id")]
-        .into_iter()
-        .find(|(column, _, _)| !is_empty(row.get(column)));
+    let cover = [
+        ("cover", "movies", "imdbid"),
+        ("mu_cover", "music", "musicinfo_id"),
+        ("co_cover", "console", "consoleinfo_id"),
+        ("bo_cover", "book", "bookinfo_id"),
+    ]
+    .into_iter()
+    .find(|(column, _, _)| !is_empty(row.get(column)));
     let name = row.text("searchname");
     if let Some((_, dir, id_column)) = cover {
         let suffix = if dir == "movies" { "-cover" } else { "" };
         let basename = format!("{}{suffix}", row.text(id_column));
-        let file = resolve_cover(roots, dir, &basename).unwrap_or_else(|| "no-cover.jpg".to_owned());
+        let file =
+            resolve_cover(roots, dir, &basename).unwrap_or_else(|| "no-cover.jpg".to_owned());
         html.push_str(&format!(
             "\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" src=\"{url}/covers/{dir}/{file}\" width=\"120\" alt=\"{name}\" />\n"
         ));
@@ -532,7 +588,12 @@ fn write_description(xml: &mut XmlWriter, row: &Row, url: &str, roots: &[std::pa
     xml.end();
 }
 
-pub async fn feed(ctx: &Ctx, settings: &Arc<Settings>, request: &ApiRequest, feed: Feed) -> Result<Reply> {
+pub async fn feed(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
+    feed: Feed,
+) -> Result<Reply> {
     let input = &request.input;
     let category_input = crate::getnzb::scalar_id(input);
     if feed == Feed::Category && category_input.is_empty() {
@@ -547,13 +608,36 @@ pub async fn feed(ctx: &Ctx, settings: &Arc<Settings>, request: &ApiRequest, fee
         Err(reply) if feed == Feed::Cart => return Ok(cart_no_cache(reply)),
         Err(reply) => return Ok(reply),
     };
-    let rows = match feed {
+    let mut rows = match feed {
         Feed::MyMovies => my_movies(ctx, settings, user.id, abs_numeric(input, "num", 0)).await?,
         Feed::MyShows => {
-            my_shows(ctx, settings, user.id, abs_numeric(input, "num", 0), abs_numeric(input, "airdate", -1)).await?
+            my_shows(
+                ctx,
+                settings,
+                user.id,
+                abs_numeric(input, "num", 0),
+                abs_numeric(input, "airdate", -1),
+            )
+            .await?
         }
-        Feed::Full => general_rows(ctx, settings, user.id, &common_filters(input, vec!["0".to_owned()])).await?,
-        Feed::Cart => general_rows(ctx, settings, user.id, &common_filters(input, vec!["-2".to_owned()])).await?,
+        Feed::Full => {
+            general_rows(
+                ctx,
+                settings,
+                user.id,
+                &common_filters(input, vec!["0".to_owned()]),
+            )
+            .await?
+        }
+        Feed::Cart => {
+            general_rows(
+                ctx,
+                settings,
+                user.id,
+                &common_filters(input, vec!["-2".to_owned()]),
+            )
+            .await?
+        }
         Feed::Category => {
             let ids: Vec<String> = category_input
                 .split(',')
@@ -575,17 +659,33 @@ pub async fn feed(ctx: &Ctx, settings: &Arc<Settings>, request: &ApiRequest, fee
         Feed::TrendingMovies => trending_movies(ctx, settings).await?,
         Feed::TrendingShows => trending_shows(ctx, settings).await?,
     };
+    attach_partial_counts(ctx, &mut rows).await;
     if input.str("o") == Some("json") {
         let reply = rss_json_refused();
-        return Ok(if feed == Feed::Cart { cart_no_cache(reply) } else { reply });
+        return Ok(if feed == Feed::Cart {
+            cart_no_cache(reply)
+        } else {
+            reply
+        });
     }
     let server = Server::load(ctx, settings, request.base_url()).await?;
     let roots = settings.cover_roots.clone();
-    let body = write_feed(&rows, &params, &server, 0, Namespace::Nntmux, &|xml, row, url| {
-        write_description(xml, row, url, &roots);
-    });
+    let body = write_feed(
+        &rows,
+        &params,
+        &server,
+        0,
+        Namespace::Nntmux,
+        &|xml, row, url| {
+            write_description(xml, row, url, &roots);
+        },
+    );
     let reply = Reply::new(200, "text/xml; charset=utf-8", body);
-    Ok(if feed == Feed::Cart { cart_no_cache(reply) } else { reply })
+    Ok(if feed == Feed::Cart {
+        cart_no_cache(reply)
+    } else {
+        reply
+    })
 }
 
 #[cfg(test)]
@@ -594,7 +694,14 @@ mod tests {
 
     #[test]
     fn sizes_format_like_php() {
-        for (bytes, expected) in [(5_368_709_120, "5GB"), (734_003_200, "700MB"), (1000, "1kB"), (999, "999B"), (0, "0B"), (1_048_576, "1MB")] {
+        for (bytes, expected) in [
+            (5_368_709_120, "5GB"),
+            (734_003_200, "700MB"),
+            (1000, "1kB"),
+            (999, "999B"),
+            (0, "0B"),
+            (1_048_576, "1MB"),
+        ] {
             assert_eq!(human_filesize(bytes), expected);
         }
     }

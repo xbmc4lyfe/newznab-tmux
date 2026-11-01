@@ -1562,7 +1562,7 @@
     ],
     [
      "content-length",
-     "836"
+     "835"
     ],
     [
      "content-type",
@@ -1577,7 +1577,7 @@
      "59"
     ]
    ],
-   "body": "{\"offset\":0,\"total\":1,\"apilimits\":{\"apicurrent\":0,\"apimax\":1000,\"grabcurrent\":0,\"grabmax\":1000},\"item\":[{\"title\":\"Passworded.Release-GRP\",\"guid\":\"http://127.0.0.1:8765/details/9999000000000000000000000000000000000009\",\"link\":\"http://127.0.0.1:8765/getnzb?id=9999000000000000000000000000000000000009.nzb&r=tokenposter\",\"comments\":\"http://127.0.0.1:8765/details/9999000000000000000000000000000000000009#comments\",\"pubDate\":\"Sat, 09 May 2026 12:00:00 +0000\",\"category\":\"Other > Misc\",\"description\":\"Passworded.Release-GRP\",\"enclosure\":{\"url\":\"http://127.0.0.1:8765/getnzb?id=9999000000000000000000000000000000000009.nzb&r=tokenposter\",\"length\":1000,\"type\":\"application/x-nzb\"},\"attr\":{\"category\":10,\"size\":1000,\"files\":10,\"grabs\":0,\"comments\":0,\"password\":10,\"usenetdate\":\"Sat, 09 May 2026 10:00:00 +0000\",\"group\":\"alt.binaries.teevee\"}}]}",
+   "body": "{\"offset\":0,\"total\":1,\"apilimits\":{\"apicurrent\":0,\"apimax\":1000,\"grabcurrent\":0,\"grabmax\":1000},\"item\":[{\"title\":\"Passworded.Release-GRP\",\"guid\":\"http://127.0.0.1:8765/details/9999000000000000000000000000000000000009\",\"link\":\"http://127.0.0.1:8765/getnzb?id=9999000000000000000000000000000000000009.nzb&r=tokenposter\",\"comments\":\"http://127.0.0.1:8765/details/9999000000000000000000000000000000000009#comments\",\"pubDate\":\"Sat, 09 May 2026 12:00:00 +0000\",\"category\":\"Other > Misc\",\"description\":\"Passworded.Release-GRP\",\"enclosure\":{\"url\":\"http://127.0.0.1:8765/getnzb?id=9999000000000000000000000000000000000009.nzb&r=tokenposter\",\"length\":1000,\"type\":\"application/x-nzb\"},\"attr\":{\"category\":10,\"size\":1000,\"files\":10,\"grabs\":0,\"comments\":0,\"password\":1,\"usenetdate\":\"Sat, 09 May 2026 10:00:00 +0000\",\"group\":\"alt.binaries.teevee\"}}]}",
    "audit": [
     "/api/v1/api?extended=1&id=9999000000000000000000000000000000000009&o=json&t=d"
    ]
@@ -1607,7 +1607,7 @@
     ],
     [
      "content-length",
-     "1830"
+     "1829"
     ],
     [
      "content-type",
@@ -1622,7 +1622,7 @@
      "59"
     ]
    ],
-   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:newznab=\"http://www.newznab.com/DTD/2010/feeds/attributes/\" encoding=\"utf-8\"><channel><title>NNTmux</title><description>NNTmux API Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/apihelp/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><newznab:response offset=\"0\" total=\"1\"/><newznab:apilimits apicurrent=\"0\" apimax=\"1000\" grabcurrent=\"0\" grabmax=\"1000\"/><item><title>Passworded.Release-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/9999000000000000000000000000000000000009</guid><link>http://127.0.0.1:8765/getnzb?id=9999000000000000000000000000000000000009.nzb&amp;r=tokenposter&amp;del=1</link><comments>http://127.0.0.1:8765/details/9999000000000000000000000000000000000009#comments</comments><pubDate>Sat, 09 May 2026 12:00:00 +0000</pubDate><category>Other &gt; Misc</category><description>Passworded.Release-GRP</description><enclosure url=\"http://127.0.0.1:8765/getnzb?id=9999000000000000000000000000000000000009.nzb&amp;r=tokenposter&amp;del=1\" length=\"1000\" type=\"application/x-nzb\"/><newznab:attr name=\"category\" value=\"10\"/><newznab:attr name=\"size\" value=\"1000\"/><newznab:attr name=\"files\" value=\"10\"/><newznab:attr name=\"grabs\" value=\"0\"/><newznab:attr name=\"comments\" value=\"0\"/><newznab:attr name=\"password\" value=\"10\"/><newznab:attr name=\"usenetdate\" value=\"Sat, 09 May 2026 10:00:00 +0000\"/><newznab:attr name=\"group\" value=\"alt.binaries.teevee\"/></item></channel></rss>\n",
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:newznab=\"http://www.newznab.com/DTD/2010/feeds/attributes/\" encoding=\"utf-8\"><channel><title>NNTmux</title><description>NNTmux API Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/apihelp/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><newznab:response offset=\"0\" total=\"1\"/><newznab:apilimits apicurrent=\"0\" apimax=\"1000\" grabcurrent=\"0\" grabmax=\"1000\"/><item><title>Passworded.Release-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/9999000000000000000000000000000000000009</guid><link>http://127.0.0.1:8765/getnzb?id=9999000000000000000000000000000000000009.nzb&amp;r=tokenposter&amp;del=1</link><comments>http://127.0.0.1:8765/details/9999000000000000000000000000000000000009#comments</comments><pubDate>Sat, 09 May 2026 12:00:00 +0000</pubDate><category>Other &gt; Misc</category><description>Passworded.Release-GRP</description><enclosure url=\"http://127.0.0.1:8765/getnzb?id=9999000000000000000000000000000000000009.nzb&amp;r=tokenposter&amp;del=1\" length=\"1000\" type=\"application/x-nzb\"/><newznab:attr name=\"category\" value=\"10\"/><newznab:attr name=\"size\" value=\"1000\"/><newznab:attr name=\"files\" value=\"10\"/><newznab:attr name=\"grabs\" value=\"0\"/><newznab:attr name=\"comments\" value=\"0\"/><newznab:attr name=\"password\" value=\"1\"/><newznab:attr name=\"usenetdate\" value=\"Sat, 09 May 2026 10:00:00 +0000\"/><newznab:attr name=\"group\" value=\"alt.binaries.teevee\"/></item></channel></rss>\n",
    "audit": [
     "/api/v1/api?del=1&extended=1&id=9999000000000000000000000000000000000009&t=d"
    ]
@@ -1663,7 +1663,7 @@
      "59"
     ]
    ],
-   "body": "{\"title\":\"Passworded.Release-GRP\",\"details\":\"http://127.0.0.1:8765/details/9999000000000000000000000000000000000009\",\"link\":\"http://127.0.0.1:8765/getnzb?id=9999000000000000000000000000000000000009.nzb&r=tokenalice\",\"category\":10,\"category_name\":\"Other > Misc\",\"added\":\"Sat, 09 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":0,\"comments\":0,\"password\":10,\"usenetdate\":\"Sat, 09 May 2026 10:00:00 +0000\"}",
+   "body": "{\"title\":\"Passworded.Release-GRP\",\"details\":\"http://127.0.0.1:8765/details/9999000000000000000000000000000000000009\",\"link\":\"http://127.0.0.1:8765/getnzb?id=9999000000000000000000000000000000000009.nzb&r=tokenalice\",\"category\":10,\"category_name\":\"Other > Misc\",\"added\":\"Sat, 09 May 2026 12:00:00 +0000\",\"size\":1000,\"files\":10,\"grabs\":0,\"comments\":0,\"password\":1,\"usenetdate\":\"Sat, 09 May 2026 10:00:00 +0000\"}",
    "audit": [
     "/api/v2/details?id=9999000000000000000000000000000000000009"
    ]
@@ -1758,7 +1758,7 @@
      "59"
     ]
    ],
-   "body": "{\"offset\":0,\"total\":1,\"apilimits\":{\"apicurrent\":2,\"apimax\":10,\"grabcurrent\":1,\"grabmax\":10,\"apioldesttime\":\"Sun, 01 Nov 2026 11:22:32 +0000\",\"graboldesttime\":\"Sun, 01 Nov 2026 10:22:32 +0000\"},\"item\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"link\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenalice\",\"comments\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments\",\"pubDate\":\"Fri, 01 May 2026 12:00:00 +0000\",\"category\":\"Movies > HD\",\"description\":\"A.Movie.2024.1080p.BluRay-GRP\",\"enclosure\":{\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenalice\",\"length\":5368709120,\"type\":\"application/x-nzb\"},\"attr\":{\"category\":2040,\"size\":5368709120}}]}",
+   "body": "{\"offset\":0,\"total\":1,\"apilimits\":{\"apicurrent\":2,\"apimax\":10,\"grabcurrent\":1,\"grabmax\":10,\"apioldesttime\":\"Sun, 01 Nov 2026 11:49:09 +0000\",\"graboldesttime\":\"Sun, 01 Nov 2026 10:49:09 +0000\"},\"item\":[{\"title\":\"A.Movie.2024.1080p.BluRay-GRP\",\"guid\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\",\"link\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenalice\",\"comments\":\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments\",\"pubDate\":\"Fri, 01 May 2026 12:00:00 +0000\",\"category\":\"Movies > HD\",\"description\":\"A.Movie.2024.1080p.BluRay-GRP\",\"enclosure\":{\"url\":\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&r=tokenalice\",\"length\":5368709120,\"type\":\"application/x-nzb\"},\"attr\":{\"category\":2040,\"size\":5368709120}}]}",
    "audit": [
     "/api/v1/api?id=aaaa000000000000000000000000000000000001&o=json&t=details"
    ]

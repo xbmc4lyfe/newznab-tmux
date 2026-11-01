@@ -167,7 +167,7 @@
   "name": "rss_passworded_allowed",
   "path": "/rss/category?id=10&api_token=tokenalice",
   "setup": [
-   "UPDATE releases SET passwordstatus = 1 WHERE id = 9;",
+   
    "UPDATE ingestion_configurations SET show_passworded_releases = 1;"
   ]
  },

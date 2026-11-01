@@ -129,8 +129,10 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
         let mut builder = Request::builder()
             .method(case["method"].as_str().unwrap_or("GET"))
             .uri(case["path"].as_str().context("path")?)
-            .header("accept", "*/*")
-            .header("user-agent", "golden");
+            .header("accept", "*/*");
+        if case["headers"]["User-Agent"].is_null() {
+            builder = builder.header("user-agent", "golden");
+        }
         if case["headers"]["Host"].is_null() {
             builder = builder.header("host", "127.0.0.1:8765");
         }
@@ -448,7 +450,8 @@ async fn rss_matches_php() -> Result<()> {
 /// PHP crashes on a numeric `limit`; the feed should simply honor it.
 #[tokio::test]
 async fn rss_limit_is_honored() -> Result<()> {
-    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL")) else {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
         return Ok(());
     };
     let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
@@ -473,7 +476,8 @@ async fn rss_limit_is_honored() -> Result<()> {
 /// default threshold of 50, and the indexer Referer (30) tips it over.
 #[tokio::test]
 async fn proxy_detection_scores_like_php() -> Result<()> {
-    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL")) else {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
         return Ok(());
     };
     let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
@@ -495,7 +499,8 @@ async fn proxy_detection_scores_like_php() -> Result<()> {
         if let Some(referer) = referer {
             builder = builder.header("referer", referer);
         }
-        app.clone().oneshot(builder.body(Body::empty()).expect("static request"))
+        app.clone()
+            .oneshot(builder.body(Body::empty()).expect("static request"))
     };
     let response = call("/api/v1/api?t=caps&apikey=tokenalice", None).await?;
     assert_eq!(response.status(), 200);

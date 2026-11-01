@@ -63,6 +63,6 @@ INSERT INTO releases (id, name, searchname, totalpart, groups_id, size, postdate
   (6, 'anime.raw', 'An.Anime.E01.1080p-GRP', 8, 9001, 1073741824, '2026-05-06 10:00:00', '2026-05-06 12:00:00', 'ffff000000000000000000000000000000000006', 'f', 'anime@example.test', 100, 5070, 0, 0, NULL, NULL, NULL, 0, NULL, 93, NULL, 0, 0, 0, 0, 0, 1, NULL, NULL, NULL, NULL),
   (7, 'adult.raw', 'Adult.Release.XXX-GRP', 8, 9001, 1073741824, '2026-05-07 10:00:00', '2026-05-07 12:00:00', '7777000000000000000000000000000000000007', '7', 'x@example.test', 100, 6040, 0, 0, NULL, NULL, NULL, 0, NULL, NULL, NULL, 0, 0, 0, 0, 0, 1, NULL, NULL, NULL, NULL),
   (8, 'partial.raw', 'Partial.Release.2026-GRP', 10, 9001, 1000, '2026-05-08 10:00:00', '2026-05-08 12:00:00', '8888000000000000000000000000000000000008', '8', 'p@example.test', 80, 2040, 0, 0, NULL, NULL, NULL, 0, NULL, NULL, NULL, 0, 0, 0, 0, 0, 1, 80, 100, 8, 10),
-  (9, 'pw.raw', 'Passworded.Release-GRP', 10, 9001, 1000, '2026-05-09 10:00:00', '2026-05-09 12:00:00', '9999000000000000000000000000000000000009', '9', 'p@example.test', 100, 10, 0, 0, NULL, NULL, NULL, 0, NULL, NULL, NULL, 0, 0, 0, 10, 0, 1, NULL, NULL, NULL, NULL);
+  (9, 'pw.raw', 'Passworded.Release-GRP', 10, 9001, 1000, '2026-05-09 10:00:00', '2026-05-09 12:00:00', '9999000000000000000000000000000000000009', '9', 'p@example.test', 100, 10, 0, 0, NULL, NULL, NULL, 0, NULL, NULL, NULL, 0, 0, 0, 1, 0, 1, NULL, NULL, NULL, NULL);
 DELETE FROM registration_periods;
 UPDATE registration_configurations SET status = 0;

@@ -4484,5 +4484,155 @@
     "/api/v2/movies"
    ]
   }
+ },
+ {
+  "name": "block_ua_api",
+  "path": "/api/v1/api?t=caps",
+  "headers": {
+   "User-Agent": "Stremio/1.0"
+  },
+  "expect": {
+   "status": 403,
+   "headers": [
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ]
+   ],
+   "body": "{\"error\":true,\"message\":\"Access denied: Streaming services are not allowed.\"}",
+   "audit": []
+  }
+ },
+ {
+  "name": "block_ua_rss",
+  "path": "/rss/health",
+  "headers": {
+   "User-Agent": "AIOStreams"
+  },
+  "expect": {
+   "status": 403,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ]
+   ],
+   "body": "{\"error\":true,\"message\":\"Access denied: Streaming services are not allowed.\"}",
+   "audit": []
+  }
+ },
+ {
+  "name": "block_ua_getnzb",
+  "path": "/getnzb",
+  "headers": {
+   "User-Agent": "usenetstreamer"
+  },
+  "expect": {
+   "status": 403,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ]
+   ],
+   "body": "{\"error\":true,\"message\":\"Access denied: Streaming services are not allowed.\"}",
+   "audit": []
+  }
+ },
+ {
+  "name": "block_ua_before_method",
+  "method": "DELETE",
+  "path": "/api/v1/api",
+  "headers": {
+   "User-Agent": "stremio"
+  },
+  "expect": {
+   "status": 403,
+   "headers": [
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ]
+   ],
+   "body": "{\"error\":true,\"message\":\"Access denied: Streaming services are not allowed.\"}",
+   "audit": []
+  }
+ },
+ {
+  "name": "block_ua_not_preflight",
+  "method": "OPTIONS",
+  "path": "/api/v2/tv",
+  "headers": {
+   "User-Agent": "stremio",
+   "Origin": "https://x.test",
+   "Access-Control-Request-Method": "GET"
+  },
+  "expect": {
+   "status": 204,
+   "headers": [
+    [
+     "access-control-allow-headers",
+     ""
+    ],
+    [
+     "access-control-allow-methods",
+     "GET"
+    ],
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-max-age",
+     "0"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "text/html; charset=UTF-8"
+    ],
+    [
+     "vary",
+     "Access-Control-Request-Method, Access-Control-Request-Headers"
+    ]
+   ],
+   "body": "",
+   "audit": []
+  }
  }
 ]

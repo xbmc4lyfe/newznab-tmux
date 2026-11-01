@@ -17,7 +17,10 @@ use crate::request::ApiRequest;
 use crate::settings::Settings;
 
 const BLOCKED_USER_AGENTS: [&str; 3] = ["aiostreams", "usenetstreamer", "stremio"];
-const BLOCKED_ASNS: [(u32, &str); 2] = [(31898, "Oracle Cloud Infrastructure"), (13335, "Cloudflare WARP")];
+const BLOCKED_ASNS: [(u32, &str); 2] = [
+    (31898, "Oracle Cloud Infrastructure"),
+    (13335, "Cloudflare WARP"),
+];
 const ASN_CACHE_SECONDS: u64 = 86_400;
 /// Failed lookups retry sooner, and not on every request: ip-api.com allows 45 a minute.
 const ASN_MISS_CACHE_SECONDS: u64 = 300;
@@ -71,17 +74,25 @@ impl Default for AbuseConfig {
 
 impl AbuseConfig {
     pub fn from_env() -> anyhow::Result<Self> {
-        let flag = |key: &str| optional(key).is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on" | "yes"));
+        let flag = |key: &str| {
+            optional(key).is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on" | "yes"))
+        };
         let defaults = Self::default();
         Ok(Self {
             block_proxy_apps: flag("BLOCK_PROXY_INDEXER_APPS"),
-            proxy_app_user_agents: patterns(&var_or("BLOCK_PROXY_INDEXER_APP_USER_AGENTS", "Prowlarr/,NZBHydra2")),
+            proxy_app_user_agents: patterns(&var_or(
+                "BLOCK_PROXY_INDEXER_APP_USER_AGENTS",
+                "Prowlarr/,NZBHydra2",
+            )),
             detection_enabled: flag("PROXY_DETECTION_ENABLED"),
             threshold: parsed_or("PROXY_DETECTION_THRESHOLD", defaults.threshold)?,
             window_seconds: parsed_or("PROXY_DETECTION_WINDOW_SECONDS", defaults.window_seconds)?,
             ratio_min: parsed_or("PROXY_DETECTION_RATIO_MIN", defaults.ratio_min)?,
             min_searches: parsed_or("PROXY_DETECTION_MIN_SEARCHES", defaults.min_searches)?,
-            referer_patterns: patterns(&var_or("PROXY_DETECTION_INDEXER_REFERER_PATTERNS", "hydra,prowlarr")),
+            referer_patterns: patterns(&var_or(
+                "PROXY_DETECTION_INDEXER_REFERER_PATTERNS",
+                "hydra,prowlarr",
+            )),
             asn_lookup: true,
         })
     }
@@ -108,12 +119,17 @@ fn is_search(request: &ApiRequest) -> bool {
     request.path.starts_with("/rss/")
         || V2_SEARCH_PATHS.contains(&request.path.as_str())
         || (request.path == "/api/v1/api"
-            && matches!(operation(request).as_str(), "search" | "tvsearch" | "movie" | "music" | "book" | "caps"))
+            && matches!(
+                operation(request).as_str(),
+                "search" | "tvsearch" | "movie" | "music" | "book" | "caps"
+            ))
 }
 
 fn matches_any(haystack: &str, patterns: &[String]) -> bool {
     let lower = haystack.to_lowercase();
-    patterns.iter().any(|pattern| lower.contains(pattern.as_str()))
+    patterns
+        .iter()
+        .any(|pattern| lower.contains(pattern.as_str()))
 }
 
 fn key(parts: &[&str]) -> String {
@@ -139,20 +155,37 @@ fn token(request: &ApiRequest) -> Option<&str> {
 
 /// Scores a download from four weak signals, so no single one can block a real user. Redirected
 /// grabs score zero: the download client's own User-Agent matches none of them.
-async fn analyze(ctx: &Ctx, settings: &Settings, request: &ApiRequest, user_agent: &str, ip: &str) -> (bool, i64) {
+async fn analyze(
+    ctx: &Ctx,
+    settings: &Settings,
+    request: &ApiRequest,
+    user_agent: &str,
+    ip: &str,
+) -> (bool, i64) {
     let config = &settings.abuse;
     let mut score = 0;
-    if request.header("referer").is_some_and(|referer| matches_any(referer, &config.referer_patterns)) {
+    if request
+        .header("referer")
+        .is_some_and(|referer| matches_any(referer, &config.referer_patterns))
+    {
         score += 30;
     }
     if let Some(token) = token(request) {
-        let recent: Vec<String> = cache::get(ctx, settings, &key(&["ua", token])).await.unwrap_or_default();
+        let recent: Vec<String> = cache::get(ctx, settings, &key(&["ua", token]))
+            .await
+            .unwrap_or_default();
         if recent.iter().any(|agent| agent == user_agent) {
             score += 25;
         }
-        let searches: i64 = cache::get(ctx, settings, &key(&["count", token, "searches"])).await.unwrap_or(0);
-        let downloads: i64 = cache::get(ctx, settings, &key(&["count", token, "downloads"])).await.unwrap_or(0);
-        if searches >= config.min_searches && (downloads as f64 / searches.max(1) as f64) >= config.ratio_min {
+        let searches: i64 = cache::get(ctx, settings, &key(&["count", token, "searches"]))
+            .await
+            .unwrap_or(0);
+        let downloads: i64 = cache::get(ctx, settings, &key(&["count", token, "downloads"]))
+            .await
+            .unwrap_or(0);
+        if searches >= config.min_searches
+            && (downloads as f64 / searches.max(1) as f64) >= config.ratio_min
+        {
             score += 25;
         }
     }
@@ -163,19 +196,32 @@ async fn analyze(ctx: &Ctx, settings: &Settings, request: &ApiRequest, user_agen
         }
     }
     if let Some(token) = token(request) {
-        cache::increment(ctx, settings, &key(&["count", token, "downloads"]), config.window_seconds).await;
+        cache::increment(
+            ctx,
+            settings,
+            &key(&["count", token, "downloads"]),
+            config.window_seconds,
+        )
+        .await;
     }
     (score >= config.threshold, score)
 }
 
 /// Feeds the sliding windows, so a later download from this token or address can be correlated.
-async fn record_search(ctx: &Ctx, settings: &Settings, request: &ApiRequest, user_agent: &str, ip: &str) {
+async fn record_search(
+    ctx: &Ctx,
+    settings: &Settings,
+    request: &ApiRequest,
+    user_agent: &str,
+    ip: &str,
+) {
     let ttl = settings.abuse.window_seconds;
     if let Some(token) = token(request) {
         cache::increment(ctx, settings, &key(&["count", token, "searches"]), ttl).await;
         if !user_agent.is_empty() {
             let name = key(&["ua", token]);
-            let mut agents: Vec<String> = cache::get(ctx, settings, &name).await.unwrap_or_default();
+            let mut agents: Vec<String> =
+                cache::get(ctx, settings, &name).await.unwrap_or_default();
             agents.retain(|agent| agent != user_agent);
             agents.insert(0, user_agent.to_owned());
             agents.truncate(MAX_TRACKED_USER_AGENTS);
@@ -183,7 +229,14 @@ async fn record_search(ctx: &Ctx, settings: &Settings, request: &ApiRequest, use
         }
     }
     if !user_agent.is_empty() {
-        cache::put(ctx, settings, &key(&["ip", ip, "indexer_ua"]), ttl, &user_agent).await;
+        cache::put(
+            ctx,
+            settings,
+            &key(&["ip", ip, "indexer_ua"]),
+            ttl,
+            &user_agent,
+        )
+        .await;
     }
 }
 
@@ -198,13 +251,20 @@ async fn asn_of(ctx: &Ctx, settings: &Settings, ip: &str) -> Option<u32> {
         return entry.asn;
     }
     let asn = fetch_asn(ip).await;
-    let ttl = if asn.is_some() { ASN_CACHE_SECONDS } else { ASN_MISS_CACHE_SECONDS };
+    let ttl = if asn.is_some() {
+        ASN_CACHE_SECONDS
+    } else {
+        ASN_MISS_CACHE_SECONDS
+    };
     cache::put(ctx, settings, &name, ttl, &AsnEntry { asn }).await;
     asn
 }
 
 async fn fetch_asn(ip: &str) -> Option<u32> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build().ok()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()?;
     let url = format!("http://ip-api.com/json/{ip}?fields=status,as,org");
     let response = match client.get(url).send().await {
         Ok(response) if response.status().is_success() => response,
@@ -221,7 +281,12 @@ async fn fetch_asn(ip: &str) -> Option<u32> {
     if body["status"] != "success" {
         return None;
     }
-    let digits: String = body["as"].as_str()?.strip_prefix("AS")?.chars().take_while(char::is_ascii_digit).collect();
+    let digits: String = body["as"]
+        .as_str()?
+        .strip_prefix("AS")?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
     digits.parse().ok()
 }
 
@@ -230,9 +295,19 @@ pub async fn check(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Opti
     let user_agent = request.header("user-agent").unwrap_or_default();
     let ip = request.client_ip();
     let lower = user_agent.to_lowercase();
-    if BLOCKED_USER_AGENTS.iter().any(|pattern| lower.contains(pattern)) {
-        warn!(ip, user_agent, path = request.path, "blocked abusive User-Agent");
-        return Some(blocked("Access denied: Streaming services are not allowed."));
+    if BLOCKED_USER_AGENTS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        warn!(
+            ip,
+            user_agent,
+            path = request.path,
+            "blocked abusive User-Agent"
+        );
+        return Some(blocked(
+            "Access denied: Streaming services are not allowed.",
+        ));
     }
 
     let download = is_download(request);
@@ -242,22 +317,40 @@ pub async fn check(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Opti
         if download {
             let (block, score) = analyze(ctx, settings, request, user_agent, address).await;
             if block {
-                warn!(ip, user_agent, score, path = request.path, "blocked proxied NZB download");
-                return Some(blocked("Access denied: Proxying NZB downloads through indexer apps is not allowed."));
+                warn!(
+                    ip,
+                    user_agent,
+                    score,
+                    path = request.path,
+                    "blocked proxied NZB download"
+                );
+                return Some(blocked(
+                    "Access denied: Proxying NZB downloads through indexer apps is not allowed.",
+                ));
             }
         } else if is_search(request) {
             record_search(ctx, settings, request, user_agent, address).await;
         }
     }
-    if config.block_proxy_apps && download && matches_any(user_agent, &config.proxy_app_user_agents) {
-        warn!(ip, user_agent, path = request.path, "blocked proxied NZB download from indexer app");
-        return Some(blocked("Access denied: Proxying NZB downloads through indexer apps is not allowed."));
+    if config.block_proxy_apps && download && matches_any(user_agent, &config.proxy_app_user_agents)
+    {
+        warn!(
+            ip,
+            user_agent,
+            path = request.path,
+            "blocked proxied NZB download from indexer app"
+        );
+        return Some(blocked(
+            "Access denied: Proxying NZB downloads through indexer apps is not allowed.",
+        ));
     }
 
     if config.asn_lookup
         && let Some(address) = &ip
         && let Some(asn) = asn_of(ctx, settings, address).await
-        && let Some((_, name)) = BLOCKED_ASNS.iter().find(|(blocked_asn, _)| *blocked_asn == asn)
+        && let Some((_, name)) = BLOCKED_ASNS
+            .iter()
+            .find(|(blocked_asn, _)| *blocked_asn == asn)
     {
         warn!(ip, asn, user_agent, path = request.path, "blocked ASN");
         return Some(blocked(&format!("Access denied: {name} is not allowed.")));
