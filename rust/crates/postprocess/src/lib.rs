@@ -5,6 +5,7 @@
 pub mod additional;
 pub mod archive_info;
 pub mod config;
+pub mod tv_pipeline;
 pub mod workspace;
 
 use anyhow::{Result, bail};
@@ -26,6 +27,17 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// `postprocess:tv-pipeline`: post process TV releases of one GUID bucket through the TV
+    /// provider pipeline.
+    TvPipeline {
+        /// First character of the release GUID (a-f, 0-9).
+        guid: String,
+        /// 1 takes every release, 2 renamed releases only; empty uses the configured mode.
+        renamed: Option<String>,
+        /// Deprecated and ignored; every run uses the provider pipeline.
+        #[arg(long)]
+        mode: Option<String>,
+    },
 }
 
 pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
@@ -39,6 +51,22 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 print!("{}", additional::diagnose::render(&report));
             }
             Ok(())
+        }
+        Command::TvPipeline {
+            guid,
+            renamed,
+            mode,
+        } => {
+            tv_pipeline::check_guid_char(&guid)?;
+            if mode.is_some() {
+                eprintln!(
+                    "The --mode option is deprecated and ignored; every run uses the provider pipeline."
+                );
+            }
+            let Some(renamed) = tv_pipeline::renamed_argument(renamed.as_deref()) else {
+                return Ok(());
+            };
+            nntmux_metadata::process_tv_pipeline(&ctx, 0, &guid, renamed).await
         }
     }
 }
