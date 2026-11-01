@@ -7,9 +7,9 @@ use nntmux_search::query::{
     prepare_poster_query, prepare_user_search_query, scope_release_search_query,
 };
 use nntmux_search::{
-    Bounds, ExternalId, MovieExternalIds, Phrases, ReleaseDocument, ReleaseRow, ReleaseSearchQuery,
-    SearchClient, SearchConfig, SearchError, SecondaryIndex, SortDirection, SortField,
-    config::IndexNames, create_table_sql,
+    Bounds, CursorCodec, ExternalId, MovieExternalIds, Phrases, ReleaseDocument, ReleaseRow,
+    ReleaseSearchQuery, SearchClient, SearchConfig, SearchError, SecondaryIndex, SortDirection,
+    SortField, config::IndexNames, create_table_sql,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -363,6 +363,116 @@ async fn a_failed_search_is_an_error_not_an_empty_page() {
     );
 }
 
+async fn server_answering_search_with(response: ResponseTemplate) -> SearchClient {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/sql"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"data": [{"Counter": "x"}], "error": ""}])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/search"))
+        .respond_with(response)
+        .mount(&server)
+        .await;
+    let client = SearchClient::new(SearchConfig::new(server.uri()), None).unwrap();
+    // Keeps the server alive for the rest of the test.
+    std::mem::forget(server);
+    client
+}
+
+fn deep_query(offset: u64) -> ReleaseSearchQuery {
+    ReleaseSearchQuery {
+        phrases: Some(Phrases::Text("x".to_owned())),
+        offset,
+        ..ReleaseSearchQuery::default()
+    }
+}
+
+#[tokio::test]
+async fn a_missing_table_is_not_a_rejected_query() {
+    let client =
+        server_answering_search_with(ResponseTemplate::new(500).set_body_json(
+            json!({"error": "unknown local table(s) 'releases_rt' in search request"}),
+        ))
+        .await;
+    assert!(matches!(
+        client.search_releases(&deep_query(0)).await,
+        Err(SearchError::Query(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_proxy_failure_is_unavailable() {
+    let client = server_answering_search_with(
+        ResponseTemplate::new(503).set_body_string("<html>Bad gateway</html>"),
+    )
+    .await;
+    assert!(matches!(
+        client.search_releases(&deep_query(0)).await,
+        Err(SearchError::Unavailable(_))
+    ));
+}
+
+fn empty_hits(total: u64) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "timed_out": false,
+        "hits": {"total": total, "total_relation": "eq", "hits": []}
+    }))
+}
+
+#[tokio::test]
+async fn paging_past_the_window_is_an_error_and_ends_the_cursor() {
+    let client = server_answering_search_with(empty_hits(50_000)).await;
+    assert!(matches!(
+        client.search_releases(&deep_query(10_000)).await,
+        Err(SearchError::BeyondWindow {
+            offset: 10_000,
+            max_matches: 10_000
+        })
+    ));
+
+    // The last page inside the window has no next page, however many documents match.
+    let hits: Vec<Value> = (1..=100)
+        .map(|id| json!({"_id": id, "_source": {}}))
+        .collect();
+    let client = server_answering_search_with(ResponseTemplate::new(200).set_body_json(json!({
+        "timed_out": false,
+        "hits": {"total": 50_000, "total_relation": "eq", "hits": hits}
+    })))
+    .await;
+    let page = client.search_releases(&deep_query(9_900)).await.unwrap();
+    assert!(!page.has_more);
+    let codec = CursorCodec::new("key", "1", 15);
+    assert_eq!(codec.next(&page, 9_900, "q"), None);
+}
+
+#[tokio::test]
+async fn a_page_past_the_last_match_is_empty_without_a_fuzzy_retry() {
+    let server = recording_server().await;
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/sql"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"data": [{"Counter": "x"}], "error": ""}])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/search"))
+        .respond_with(empty_hits(4))
+        .mount(&server)
+        .await;
+    let client = SearchClient::new(SearchConfig::new(server.uri()), None).unwrap();
+    let page = client.search_releases(&deep_query(500)).await.unwrap();
+    assert!(page.ids.is_empty() && !page.has_more && !page.fuzzy);
+    assert_eq!(search_bodies(&server).await.len(), 1);
+}
+
 #[tokio::test]
 async fn an_unreachable_server_is_an_error_and_is_remembered() {
     let client = SearchClient::new(SearchConfig::new("http://127.0.0.1:9"), None).unwrap();
@@ -550,7 +660,7 @@ async fn live_results_match_php() {
         // Manticore refuses a query that is only a negation. PHP swallowed that as no results.
         if case[0] == json!("!circus") {
             assert!(
-                matches!(&outcome, Err(error) if error.is_rejected_query()),
+                matches!(&outcome, Err(SearchError::RejectedQuery(_))),
                 "{outcome:?}"
             );
             assert_eq!(expected["ids"], json!([]));

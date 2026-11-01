@@ -194,16 +194,28 @@ async fn read_response(response: reqwest::Response) -> Result<Value, SearchError
         .map_err(|error| SearchError::Unavailable(error.without_url().to_string()))?;
     let value: Value = match serde_json::from_str(&text) {
         Ok(value) => value,
-        Err(_) if !status.is_success() => return Err(SearchError::Query(text)),
+        // Manticore always answers in JSON, so this came from a proxy or a sign-in check.
+        Err(_) if !status.is_success() => {
+            return Err(SearchError::Unavailable(format!("HTTP {status}")));
+        }
         Err(error) => return Err(SearchError::Malformed(error.to_string())),
     };
     if let Some(error) = response_error(&value) {
-        return Err(SearchError::Query(error));
+        return Err(if is_query_text_error(&error) {
+            SearchError::RejectedQuery(error)
+        } else {
+            SearchError::Query(error)
+        });
     }
     if !status.is_success() {
         return Err(SearchError::Query(text));
     }
     Ok(value)
+}
+
+/// Whether the query text itself is at fault. HTTP status can't tell: every error here is a 500.
+fn is_query_text_error(error: &str) -> bool {
+    error.contains("query is non-computable") || error.contains("syntax error")
 }
 
 /// An `error` that isn't empty at the top or in any `/sql` result, or `errors` that isn't false.
@@ -230,7 +242,24 @@ fn response_error(value: &Value) -> Option<String> {
 mod tests {
     use serde_json::json;
 
-    use super::response_error;
+    use super::{is_query_text_error, response_error};
+
+    #[test]
+    fn only_query_text_errors_count_as_rejected() {
+        assert!(is_query_text_error(
+            "table t: query error: query is non-computable (single NOT operator)"
+        ));
+        assert!(is_query_text_error(
+            "query error: P08: syntax error, unexpected $end"
+        ));
+        assert!(!is_query_text_error(
+            "unknown local table(s) 'x' in search request"
+        ));
+        assert!(!is_query_text_error("unknown column: nosuch"));
+        assert!(!is_query_text_error(
+            "query error: no field 'nosuch' found in schema"
+        ));
+    }
 
     #[test]
     fn errors_are_found_in_every_response_shape() {

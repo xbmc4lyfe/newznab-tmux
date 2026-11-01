@@ -5,20 +5,22 @@ pub enum SearchError {
     NotPorted(&'static str),
     #[error("Manticore is unreachable: {0}")]
     Unavailable(String),
-    #[error("Manticore rejected the request: {0}")]
+    /// Manticore couldn't parse or run this query text, as with a lone `!word` or unbalanced
+    /// brackets. Nothing is wrong with the service, so a site can show this as no results, as
+    /// PHP always did.
+    #[error("Manticore can't run this query: {0}")]
+    RejectedQuery(String),
+    /// Manticore refused the request for another reason, such as a missing table or column.
+    #[error("Manticore refused the request: {0}")]
     Query(String),
+    /// The page starts past `max_matches`, the most Manticore will page through. Matches exist
+    /// there, but it won't return them.
+    #[error("offset {offset} is past the {max_matches} results Manticore pages through")]
+    BeyondWindow { offset: u64, max_matches: u64 },
     #[error("Manticore sent a malformed response: {0}")]
     Malformed(String),
     #[error("the search cursor is invalid or expired")]
     InvalidCursor,
     #[error("the search cursor doesn't match this query or index generation")]
     CursorMismatch,
-}
-
-impl SearchError {
-    /// True when Manticore refused this query, as with a lone `!word` or unbalanced brackets,
-    /// and is otherwise fine. A site can show that as no results; PHP always did.
-    pub fn is_rejected_query(&self) -> bool {
-        matches!(self, Self::Query(_))
-    }
 }

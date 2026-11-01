@@ -177,7 +177,9 @@ impl SearchClient {
         } else if has_text {
             let first = self.release_attempt(query, false).await?;
             let negated = query.phrases.as_ref().is_some_and(Phrases::has_negation);
+            // Matches past the end of the page aren't a reason to go looking for typos.
             if !first.ids.is_empty()
+                || first.total > 0
                 || !query.fuzzy_allowed()
                 || !self.config.fuzzy_enabled
                 || negated
@@ -222,7 +224,16 @@ impl SearchClient {
         } else {
             Vec::new()
         };
-        let has_more = query.effective_offset() + (hits.ids.len() as u64) < hits.total;
+        let offset = query.effective_offset();
+        let max_matches = self.config.max_matches;
+        if hits.ids.is_empty() && offset < hits.total && offset >= max_matches {
+            return Err(SearchError::BeyondWindow {
+                offset,
+                max_matches,
+            });
+        }
+        let next = offset + hits.ids.len() as u64;
+        let has_more = !hits.ids.is_empty() && next < hits.total.min(max_matches);
         Ok(SearchPage {
             ids: hits.ids,
             total: hits.total,

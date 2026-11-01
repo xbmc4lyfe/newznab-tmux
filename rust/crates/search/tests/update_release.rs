@@ -108,14 +108,14 @@ async fn update_release_writes_the_projection_and_removes_gone_rows() {
         .await
         .unwrap();
     assert!(live.client.update_release(&live.db.pool, 501).await);
-    let resolved: (Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>) = sqlx::query_as(
-        "SELECT resolved_at, next_attempt_at FROM search_index_failures WHERE release_id = 501",
+    let resolved: bool = sqlx::query_scalar(
+        "SELECT resolved_at IS NOT NULL AND next_attempt_at IS NULL \
+         FROM search_index_failures WHERE release_id = 501",
     )
     .fetch_one(&live.db.pool)
     .await
     .unwrap();
-    assert!(resolved.0.is_some());
-    assert!(resolved.1.is_none());
+    assert!(resolved);
 
     sqlx::query("DELETE FROM releases WHERE id = 501")
         .execute(&live.db.pool)
