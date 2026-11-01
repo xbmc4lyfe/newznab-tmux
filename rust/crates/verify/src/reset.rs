@@ -42,8 +42,18 @@ where
     }
     let token = format!("reset-{:016x}", rand::rng().random::<u64>());
     locks::pause(&verify.db, &token, "reset").await?;
+    // The work below runs on the pool, so losing the session wouldn't stop it. The durable pause
+    // stays in that case, because the gates can no longer say what else is running.
+    if !session.holds_all(&[&admission, &workers]).await {
+        bail!(
+            "Verification locks were lost; clear the reset's pause once nothing else is running."
+        );
+    }
     let outcome = match clear(verify).await {
-        Ok(()) => reset().await,
+        Ok(()) if session.holds_all(&[&admission, &workers]).await => reset().await,
+        Ok(()) => bail!(
+            "Verification locks were lost; clear the reset's pause once nothing else is running."
+        ),
         Err(failure) => Err(failure),
     };
     let released = locks::unpause(&verify.db, Some(&token), None).await;
