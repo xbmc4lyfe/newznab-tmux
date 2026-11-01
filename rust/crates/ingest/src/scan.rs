@@ -645,7 +645,7 @@ impl<'a> Ingest<'a> {
             if let Ok(Some(date)) = local {
                 return date.unwrap_or_else(|| Utc::now().timestamp());
             }
-            if let Ok(headers) = self.nntp.xover(current, current).await
+            if let Ok(headers) = self.nntp.xover_article(current).await
                 && let Some(header) = headers.first()
                 && !header.date.is_empty()
             {
@@ -812,7 +812,7 @@ impl<'a> Ingest<'a> {
     /// Admission needs the requested article's own date. Stored part numbers and neighbouring
     /// probes can't establish that. None only when the server confirms no such article.
     async fn target_postdate(&mut self, post: u64) -> Result<Option<i64>> {
-        let rows = match self.nntp.xover(post, post).await {
+        let rows = match self.nntp.xover_article(post).await {
             Ok(rows) => rows,
             Err(failure) if failure.no_article() => return Ok(None),
             Err(_) => bail!(DATE_UNAVAILABLE),

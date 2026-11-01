@@ -61,12 +61,12 @@ impl Nntp for Client {
     }
 
     async fn xover(&mut self, first: u64, last: u64) -> Result<Vec<Overview>, NntpFailure> {
-        let range = if first == last {
-            first.to_string()
-        } else {
-            format!("{first}-{last}")
-        };
-        let rows = self.0.get_xover(&range).await?;
+        let rows = self.0.get_xover(&format!("{first}-{last}")).await?;
+        Ok(rows.iter().filter_map(overview).collect())
+    }
+
+    async fn xover_article(&mut self, number: u64) -> Result<Vec<Overview>, NntpFailure> {
+        let rows = self.0.get_xover(&number.to_string()).await?;
         Ok(rows.iter().filter_map(overview).collect())
     }
 

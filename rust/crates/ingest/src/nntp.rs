@@ -41,6 +41,9 @@ pub trait Nntp: Send + Sync {
     async fn select_group(&mut self, group: &str) -> Result<SelectedGroup, NntpFailure>;
     /// The overview of articles `first..=last` in the selected group.
     async fn xover(&mut self, first: u64, last: u64) -> Result<Vec<Overview>, NntpFailure>;
+    /// The overview of one article, asked for by its number alone. Servers can answer a missing
+    /// article differently here than for a range, so a window of one still uses [`Nntp::xover`].
+    async fn xover_article(&mut self, number: u64) -> Result<Vec<Overview>, NntpFailure>;
     /// Reconnects. The group must be selected again afterwards.
     async fn reconnect(&mut self, compression: bool) -> Result<(), NntpFailure>;
     /// Turns header compression back on after a retry without it.

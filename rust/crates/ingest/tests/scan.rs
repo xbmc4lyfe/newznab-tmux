@@ -77,6 +77,10 @@ impl Nntp for FakeServer {
             .collect())
     }
 
+    async fn xover_article(&mut self, number: u64) -> Result<Vec<Overview>, NntpFailure> {
+        self.xover(number, number).await
+    }
+
     async fn reconnect(&mut self, compression: bool) -> Result<(), NntpFailure> {
         self.reconnects.push(compression);
         Ok(())
