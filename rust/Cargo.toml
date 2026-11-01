@@ -64,6 +64,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 quick-xml = { version = "0.42", features = ["serialize"] }
 rand = "0.9"
+rcgen = "0.14"
 roxmltree = "0.21"
 redis = { version = "1", default-features = false, features = ["aio", "connection-manager", "tokio-rustls-comp", "script"] }
 regex = "1"
@@ -90,6 +91,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
 webauthn-rs = "0.6"
+webpki-roots = "1"
 wiremock = "0.6"
 
 [workspace.lints.rust]
