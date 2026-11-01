@@ -3,6 +3,7 @@
 //! Owner: ws-postprocess. See `rust/WORKSTREAMS.md`.
 
 pub mod additional;
+pub mod archive_info;
 pub mod config;
 pub mod workspace;
 

@@ -1,0 +1,312 @@
+//! What every reader shares: a byte source with PHP's bounds semantics, the integer codecs and
+//! the file record. Port of `ArchiveReader`.
+
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+use std::sync::Arc;
+
+/// `ArchiveReader::$maxReadBytes`. In-memory data past this isn't seen at all.
+pub const MAX_READ_BYTES: i64 = 1_048_576;
+/// `ArchiveReader::$maxFilenameLength`.
+pub const MAX_FILENAME_LENGTH: usize = 256;
+
+/// A read or seek out of bounds, or a PHP warning Laravel would have turned into an exception.
+/// Every parser loop treats it as the end of readable data unless `error` was set too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Thrown;
+
+pub type Parse<T> = Result<T, Thrown>;
+
+#[derive(Clone, Debug)]
+pub enum Source {
+    Memory(Arc<Vec<u8>>),
+    File(Arc<File>, i64),
+}
+
+impl Source {
+    fn size(&self) -> i64 {
+        match self {
+            Self::Memory(data) => i64::try_from(data.len())
+                .unwrap_or(i64::MAX)
+                .min(MAX_READ_BYTES),
+            Self::File(_, size) => *size,
+        }
+    }
+
+    /// The whole of this source, as a reader would have stored it.
+    pub fn stored_data(&self) -> Option<&[u8]> {
+        match self {
+            Self::Memory(data) => {
+                let size = usize::try_from(self.size()).ok()?;
+                data.get(..size)
+            }
+            Self::File(..) => None,
+        }
+    }
+}
+
+/// A window of a [`Source`]. Offsets are relative to `start`.
+#[derive(Clone, Debug)]
+pub struct Cursor {
+    source: Source,
+    pub start: i64,
+    pub end: i64,
+    pub length: i64,
+    pub offset: i64,
+}
+
+impl Cursor {
+    /// `setData` or `open`. An `Err` is the reader's error message.
+    pub fn open(source: Source, range: Option<(i64, i64)>) -> Result<Self, String> {
+        let (start, mut end) = range.unwrap_or((0, 0));
+        if start < 0 || end < 0 {
+            return Err(format!(
+                "Start ({start}) and end ({end}) points must be positive integers"
+            ));
+        }
+        if end < start {
+            return Err(format!(
+                "End point ({end}) must be higher than start point ({start})"
+            ));
+        }
+        let size = source.size();
+        // setRange checks before the size is known to the file path, and with it for data.
+        if matches!(source, Source::Memory(_)) && size == 0 {
+            return Err("No data was passed, nothing to analyze".to_owned());
+        }
+        if end == 0 {
+            end = size - 1;
+        }
+        let length = end - start + 1;
+        if size != 0 && (end >= size || start >= size || length < 1) {
+            return Err(format!("Byte range ({start}-{end}) is invalid"));
+        }
+        Ok(Self {
+            source,
+            start,
+            end,
+            length,
+            offset: 0,
+        })
+    }
+
+    pub fn source(&self) -> &Source {
+        &self.source
+    }
+
+    pub fn read(&mut self, count: i64) -> Parse<Vec<u8>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let new_position = self.offset.checked_add(count).ok_or(Thrown)?;
+        if count < 1 || new_position > self.length {
+            return Err(Thrown);
+        }
+        let bytes = self.bytes_at(self.start + self.offset, count)?;
+        self.offset = new_position;
+        Ok(bytes)
+    }
+
+    fn bytes_at(&self, position: i64, count: i64) -> Parse<Vec<u8>> {
+        let from = usize::try_from(position).map_err(|_| Thrown)?;
+        let count = usize::try_from(count).map_err(|_| Thrown)?;
+        match &self.source {
+            Source::Memory(data) => data
+                .get(from..from.checked_add(count).ok_or(Thrown)?)
+                .map(<[u8]>::to_vec)
+                .ok_or(Thrown),
+            Source::File(file, _) => {
+                let mut buffer = vec![0; count];
+                file.read_exact_at(&mut buffer, u64::try_from(from).map_err(|_| Thrown)?)
+                    .map_err(|_| Thrown)?;
+                Ok(buffer)
+            }
+        }
+    }
+
+    pub fn seek(&mut self, position: i64) -> Parse<()> {
+        if position > self.length || position < 0 {
+            return Err(Thrown);
+        }
+        self.offset = position;
+        Ok(())
+    }
+
+    pub fn byte(&mut self) -> Parse<i64> {
+        Ok(i64::from(self.read(1)?[0]))
+    }
+
+    pub fn u16(&mut self) -> Parse<i64> {
+        let bytes = self.read(2)?;
+        Ok(i64::from(u16::from_le_bytes([bytes[0], bytes[1]])))
+    }
+
+    pub fn u32(&mut self) -> Parse<i64> {
+        let bytes = self.read(4)?;
+        Ok(i64::from(u32::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ])))
+    }
+
+    pub fn u64_pair(&mut self) -> Parse<i64> {
+        let low = self.u32()?;
+        let high = self.u32()?;
+        Ok(int64(low, high))
+    }
+
+    /// The buffer marker searches run over.
+    pub fn marker_buffer(&mut self) -> Parse<Vec<u8>> {
+        let buffer = self.read(self.length.min(MAX_READ_BYTES))?;
+        self.seek(0)?;
+        Ok(buffer)
+    }
+
+    /// `getRange`, for an absolute range of the source.
+    pub fn absolute_range(&self, start: i64, end: i64) -> Option<Vec<u8>> {
+        let mut window = Self::open(self.source.clone(), Some((start, end))).ok()?;
+        let length = window.length;
+        window.read(length).ok()
+    }
+}
+
+/// `int64()`. The PHP goes to a float past `PHP_INT_MAX`, and such a value fails every later
+/// bounds check, as the saturated integer does.
+pub fn int64(low: i64, high: i64) -> i64 {
+    let value = i128::from(low) + i128::from(high) * 0x1_0000_0000;
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// `dos2unixtime`, in UTC, which is the app's timezone. Out-of-range fields roll over as
+/// `mktime` rolls them.
+pub fn dos_to_unix(dos: i64) -> i64 {
+    let second = 2 * (dos & 0x1f);
+    let minute = (dos >> 5) & 0x3f;
+    let hour = (dos >> 11) & 0x1f;
+    let day = (dos >> 16) & 0x1f;
+    let month = (dos >> 21) & 0x0f;
+    let year = ((dos >> 25) & 0x7f) + 1980;
+    let months = year * 12 + (month - 1);
+    let days = days_from_civil(months.div_euclid(12), months.rem_euclid(12) + 1) + (day - 1);
+    days * 86_400 + hour * 3600 + minute * 60 + second
+}
+
+/// Days from 1970-01-01 to the first of a month.
+fn days_from_civil(year: i64, month: i64) -> i64 {
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let year_of_era = shifted.rem_euclid(400);
+    let month_index = (month + 9) % 12;
+    let day_of_year = (153 * month_index + 2) / 5;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// `win2unixtime`.
+pub fn windows_to_unix(low: i64, high: i64) -> i64 {
+    let filetime = i128::from(low) + i128::from(high) * 0x1_0000_0000;
+    let seconds = (filetime - 116_444_736_000_000_000).div_euclid(10_000_000);
+    i64::try_from(seconds).unwrap_or(i64::MAX)
+}
+
+/// PHP's `empty()` on a string, which counts `"0"` as empty.
+pub fn php_empty(bytes: &[u8]) -> bool {
+    bytes.is_empty() || bytes == b"0"
+}
+
+/// Position of `needle` in `haystack`.
+pub fn find(haystack: &[u8], needle: &[u8]) -> Option<i64> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .and_then(|position| i64::try_from(position).ok())
+}
+
+pub fn truncated_name(name: &[u8]) -> Vec<u8> {
+    name[..name.len().min(MAX_FILENAME_LENGTH)].to_vec()
+}
+
+/// `iconv('UTF-16LE', 'UTF-8//IGNORE//TRANSLIT', ...)`.
+pub fn utf16le_to_utf8(bytes: &[u8]) -> Vec<u8> {
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair));
+    let mut out = String::new();
+    for unit in char::decode_utf16(units).flatten() {
+        out.push(unit);
+    }
+    out.into_bytes()
+}
+
+/// One row of a reader's file list. Fields a format doesn't have stay at their default, and the
+/// consumers check them the way the PHP's `empty()` and `??` did.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FileRecord {
+    pub name: Vec<u8>,
+    pub size: i64,
+    pub date: i64,
+    pub pass: i64,
+    /// `None` where the format has no such field, or RAR's empty string for a method-less block.
+    pub compressed: Option<i64>,
+    pub next_offset: Option<i64>,
+    pub is_dir: bool,
+    /// Absolute and inclusive. The end can precede the start for a zero-length file.
+    pub range: Option<(i64, i64)>,
+    pub crc32: Option<String>,
+    pub split: bool,
+    pub split_after: bool,
+    pub source: String,
+    pub hash: Option<String>,
+    pub hash_16k: Option<String>,
+    pub blocks: Option<i64>,
+    pub checksum: Option<String>,
+}
+
+/// One element of `getArchiveFileList`, which mixes rows, errors and whole nested lists.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum ListEntry {
+    File(FileRecord),
+    Error { error: String, source: String },
+    Nested(Vec<ListEntry>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dos_times_match_mktime() {
+        // 2013-05-27 14:32:10.
+        let dos = ((2013 - 1980) << 25) | (5 << 21) | (27 << 16) | (14 << 11) | (32 << 5) | 5;
+        assert_eq!(dos_to_unix(dos), 1_369_665_130);
+        // Month and day zero roll back, to 1979-11-30.
+        assert_eq!(dos_to_unix(0), 312_768_000);
+    }
+
+    #[test]
+    fn windows_times_floor() {
+        assert_eq!(windows_to_unix(0xd53e_8000, 0x019d_b1de), 0);
+        assert_eq!(windows_to_unix(0xd53e_7fff, 0x019d_b1de), -1);
+    }
+
+    #[test]
+    fn memory_sources_stop_at_the_read_limit() -> Result<(), String> {
+        let data = Arc::new(vec![0_u8; 2_000_000]);
+        let cursor = Cursor::open(Source::Memory(data), None)?;
+        assert_eq!(cursor.length, MAX_READ_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn ranges_are_checked() {
+        let source = || Source::Memory(Arc::new(vec![0_u8; 10]));
+        assert_eq!(
+            Cursor::open(source(), Some((5, 20))).unwrap_err(),
+            "Byte range (5-20) is invalid"
+        );
+        assert!(Cursor::open(source(), Some((5, 3))).is_err());
+        let window = Cursor::open(source(), Some((2, 4))).expect("valid");
+        assert_eq!(window.length, 3);
+    }
+}
