@@ -34,13 +34,13 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /2fa/verify"
 source = "App\\Http\\Controllers\\PasswordSecurityController@getVerify2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /confirm-password"
 source = "App\\Http\\Controllers\\Auth\\ConfirmPasswordController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -58,19 +58,19 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /email/verify"
 source = "App\\Http\\Controllers\\Auth\\EmailVerificationController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /email/verify/{id}/{hash}"
 source = "App\\Http\\Controllers\\Auth\\EmailVerificationController@verify"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /forgottenpassword"
 source = "App\\Http\\Controllers\\Auth\\ForgotPasswordController@showLinkRequestForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -100,7 +100,7 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /login"
 source = "App\\Http\\Controllers\\Auth\\LoginController@showLoginForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -112,13 +112,13 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /password/reset"
 source = "App\\Http\\Controllers\\Auth\\ForgotPasswordController@showLinkRequestForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /password/reset/{token}"
 source = "App\\Http\\Controllers\\Auth\\ResetPasswordController@showResetForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -142,7 +142,7 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /register"
 source = "App\\Http\\Controllers\\Auth\\RegisterController@showRegistrationForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -160,7 +160,7 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /resetpassword"
 source = "App\\Http\\Controllers\\Auth\\ResetPasswordController@showLegacyResetForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -172,7 +172,7 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /up"
 source = "Closure"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -370,13 +370,13 @@ status = "todo"
 kind = "route"
 id = "POST /2fa/verify"
 source = "App\\Http\\Controllers\\PasswordSecurityController@verify2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /2faVerify"
 source = "App\\Http\\Controllers\\PasswordSecurityController@verify2fa"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -400,7 +400,7 @@ status = "todo"
 kind = "route"
 id = "POST /confirm-password"
 source = "App\\Http\\Controllers\\Auth\\ConfirmPasswordController@store"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -418,13 +418,13 @@ status = "todo"
 kind = "route"
 id = "POST /email/verification-notification"
 source = "App\\Http\\Controllers\\Auth\\EmailVerificationController@resend"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /forgottenpassword"
 source = "App\\Http\\Controllers\\Auth\\ForgotPasswordController@showLinkRequestForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -448,13 +448,13 @@ status = "todo"
 kind = "route"
 id = "POST /login"
 source = "App\\Http\\Controllers\\Auth\\LoginController@login"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /logout"
 source = "App\\Http\\Controllers\\Auth\\LoginController@logout"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -484,13 +484,13 @@ status = "todo"
 kind = "route"
 id = "POST /password/reset"
 source = "App\\Http\\Controllers\\Auth\\ForgotPasswordController@showLinkRequestForm"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /password/update"
 source = "App\\Http\\Controllers\\Auth\\ResetPasswordController@reset"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -550,7 +550,7 @@ status = "todo"
 kind = "route"
 id = "POST /register"
 source = "App\\Http\\Controllers\\Auth\\RegisterController@register"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
