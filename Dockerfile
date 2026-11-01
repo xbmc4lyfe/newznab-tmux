@@ -82,7 +82,6 @@ COPY vite.config.js /app/
 COPY app/Support/AdminReleaseNames.php /app/app/Support/AdminReleaseNames.php
 COPY resources/css /app/resources/css
 COPY resources/js /app/resources/js
-COPY resources/forum /app/resources/forum
 COPY resources/views /app/resources/views
 COPY public /app/public
 RUN ./node_modules/.bin/vite build
@@ -97,7 +96,6 @@ COPY public /app/public
 COPY database /app/database
 COPY config /app/config
 COPY routes /app/routes
-COPY resources/forum /app/resources/forum
 COPY resources/views /app/resources/views
 COPY app /app/app
 RUN composer dump-autoload --no-dev --no-scripts --optimize \
