@@ -1,5 +1,6 @@
 //! Turning sampled articles into a release's compact fingerprint record.
 
+use crate::backfill::{FORMAT, SCHEMA_VERSION};
 use crate::manifest::{self, File, Sample};
 use chrono::{DateTime, Utc};
 use md5::{Digest, Md5};
@@ -231,7 +232,7 @@ pub fn analyze(files: &[File], evidence: &[ProviderEvidence]) -> Collected {
             .and_then(|p| p["file_count"].as_u64())
             .is_some_and(|n| n > 200);
     let error_rows:Vec<_>=errors.into_iter().map(|((account,error_type),count)|json!({"account":account,"error_type":error_type,"count":count})).collect();
-    let mut data = json!({"schema_version":1,"format":"compact-v1","collector":{"engine":"rust","version":1},"nzb":{"file_count":files.len(),"segment_count":files.iter().map(|f|f.segments.len()).sum::<usize>(),"total_bytes":total_bytes(files),"groups":groups,"poster":posters.first().map(|p|manifest::bounded(&p.0)),"kinds":kinds},"samples":{"limit":12,"selected":samples.len(),"omitted":omitted},"providers":providers,"articles":articles,"files":rows,"par2":par,"posting":posting,"uploader_software_candidates":software.into_iter().collect::<Vec<_>>(),"errors":error_rows,"truncated":truncated});
+    let mut data = json!({"schema_version":SCHEMA_VERSION,"format":FORMAT,"collector":{"engine":"rust","version":1},"nzb":{"file_count":files.len(),"segment_count":files.iter().map(|f|f.segments.len()).sum::<usize>(),"total_bytes":total_bytes(files),"groups":groups,"poster":posters.first().map(|p|manifest::bounded(&p.0)),"kinds":kinds},"samples":{"limit":12,"selected":samples.len(),"omitted":omitted},"providers":providers,"articles":articles,"files":rows,"par2":par,"posting":posting,"uploader_software_candidates":software.into_iter().collect::<Vec<_>>(),"errors":error_rows,"truncated":truncated});
     budget(&mut data);
     Collected {
         status: if complete { "complete" } else { "partial" }.into(),
