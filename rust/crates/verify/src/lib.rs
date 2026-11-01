@@ -17,6 +17,7 @@ pub mod nzb;
 pub mod prepare;
 pub mod reader;
 pub mod releases;
+pub mod reset;
 pub mod txn;
 
 use anyhow::{Result, bail};
