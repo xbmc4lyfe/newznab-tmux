@@ -35,6 +35,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "seed_baseline",
         sql: include_str!("../../../migrations/0002_seed_baseline.sql"),
     },
+    Migration {
+        version: 3,
+        name: "ingestion_activity",
+        sql: include_str!("../../../migrations/0003_ingestion_activity.sql"),
+    },
 ];
 
 /// Returns the versions that ran.

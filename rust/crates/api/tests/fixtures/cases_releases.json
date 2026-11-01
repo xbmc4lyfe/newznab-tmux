@@ -1,0 +1,10 @@
+[
+ {
+  "name": "audit_q_v1",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=&q=hello%20w%C3%B6rld&cat=2000,%205030&secret=no&extended=1&o=json"
+ },
+ {
+  "name": "audit_v2_long",
+  "path": "/api/v2/details?api_token=tokenalice&id=nope&q=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ }
+]
