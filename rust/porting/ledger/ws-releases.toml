@@ -76,7 +76,7 @@ status = "todo"
 kind = "command"
 id = "releases:prepare-candidates"
 source = "app/Console/Commands/PrepareReleaseCandidates.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
