@@ -19,9 +19,11 @@ macro_rules! frx {
     }};
 }
 
+pub mod feeds;
 pub mod filename;
 pub mod identity;
 pub mod index;
+pub mod irc;
 pub mod season;
 pub mod selector;
 
@@ -35,8 +37,80 @@ use crate::filename::exact_value;
 
 pub use crate::index::{PredbIndex, PredbMatch, match_pre};
 
-pub async fn run(_ctx: Ctx, _args: RoleArgs, _stop: Shutdown) -> Result<()> {
-    bail!("the predb role isn't ported yet")
+/// The `predb` role: the IRC and WebSocket scrapers, plus the feed import and title check
+/// that the Laravel scheduler ran every five and ten minutes.
+pub async fn run(ctx: Ctx, _args: RoleArgs, stop: Shutdown) -> Result<()> {
+    let mut networks = irc::networks::enabled();
+    let scrapers = if networks.is_empty() {
+        tracing::info!("no IRC networks are enabled");
+        None
+    } else {
+        networks.sort();
+        Some(tokio::spawn(irc::supervise(
+            ctx.clone(),
+            networks,
+            stop.clone(),
+        )))
+    };
+
+    let config = feeds::FeedConfig::from_env();
+    // Separate loops, so a feed backing off for minutes can't starve the title check, and either
+    // can stop partway when a shutdown arrives.
+    let feeds = async {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(300));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = stop.token().cancelled_owned() => return,
+                _ = timer.tick() => {}
+            }
+            if !config.enabled || ctx.paused().await.unwrap_or(true) {
+                continue;
+            }
+            let args = feeds::command::ImportArgs {
+                source: Vec::new(),
+                pages: 1,
+                since: None,
+                max_pages: None,
+                dry_run: false,
+                quiet: true,
+            };
+            tokio::select! {
+                () = stop.token().cancelled_owned() => return,
+                result = feeds::command::run(&ctx, args) => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "PreDB feed import failed");
+                    }
+                }
+            }
+        }
+    };
+    let checks = async {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(600));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = stop.token().cancelled_owned() => return,
+                _ = timer.tick() => {}
+            }
+            if ctx.paused().await.unwrap_or(true) {
+                continue;
+            }
+            tokio::select! {
+                () = stop.token().cancelled_owned() => return,
+                result = check_pre(&ctx.db, Some(3)) => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "PreDB title check failed");
+                    }
+                }
+            }
+        }
+    };
+    tokio::join!(feeds, checks);
+    if let Some(scrapers) = scrapers {
+        scrapers.await.ok();
+    }
+    Ok(())
 }
 
 /// `nntmux-ctl predb ...`
@@ -46,6 +120,14 @@ pub enum Command {
     Check {
         /// Only releases added in the last this many days.
         limit: Option<u32>,
+    },
+    /// Imports release-title metadata from public feeds (`predb:import-feed`).
+    ImportFeed(feeds::command::ImportArgs),
+    /// Scrapes IRC and WebSocket pre announcements (`irc:scrape`).
+    Scrape {
+        /// One network, without restarts. Defaults to supervising every enabled one.
+        #[arg(long)]
+        network: Option<String>,
     },
     /// One finite identity rebuild operation (`predb:identity-rebuild`).
     IdentityRebuild {
@@ -75,6 +157,13 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
             let (matched, total) = check_pre(&ctx.db, limit).await?;
             println!("Matched {matched} of {total} PreDB titles to release search names.");
         }
+        Command::ImportFeed(args) => {
+            let succeeded = feeds::command::run(&ctx, args).await?;
+            if !succeeded {
+                bail!("no PreDB feed source succeeded");
+            }
+        }
+        Command::Scrape { network } => irc::scrape_command(ctx, network).await?,
         Command::IdentityRebuild { action } => {
             let result = match action {
                 RebuildAction::Start => {
