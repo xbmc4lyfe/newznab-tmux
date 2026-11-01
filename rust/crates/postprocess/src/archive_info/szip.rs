@@ -4,6 +4,7 @@
 //! all-defined flag returns no flags and reads no bytes, so empty-stream markers and undefined
 //! digests derail the parse, and the caller falls back to the 7-Zip client.
 
+use std::collections::HashSet;
 use std::mem::size_of;
 
 use super::reader::{
@@ -322,6 +323,7 @@ impl SzipReader {
         if id == PROPERTY_SIZE {
             let mut sizes = Vec::new();
             for _ in 0..streams {
+                self.cursor.budget.retain(size_of::<i64>())?;
                 sizes.push(self.read_number()?);
             }
             header.pack_sizes = Some(sizes);
@@ -364,6 +366,7 @@ impl SzipReader {
         }
         for folder in &mut folders {
             for _ in 0..folder.total_out_streams {
+                self.cursor.budget.retain(size_of::<i64>())?;
                 folder.unpack_sizes.push(self.read_number()?);
             }
         }
@@ -412,6 +415,7 @@ impl SzipReader {
             for _ in 0..bind_pair_count.max(0) {
                 let input = self.read_number()?;
                 let output = self.read_number()?;
+                self.cursor.budget.retain(size_of::<(i64, i64)>())?;
                 folder.bind_pairs.push((input, output));
             }
             let packed = total_in.saturating_sub(bind_pair_count);
@@ -437,6 +441,7 @@ impl SzipReader {
         let mut subs = Substreams::default();
         if id == PROPERTY_NUM_UNPACK_STREAM {
             for _ in 0..count {
+                self.cursor.budget.retain(size_of::<i64>())?;
                 subs.num_unpack_streams.push(self.read_number()?);
             }
             id = self.cursor.byte()?;
@@ -452,6 +457,7 @@ impl SzipReader {
                 let mut sum = 0_i64;
                 for _ in 1..streams {
                     let size = self.read_number()?;
+                    self.cursor.budget.retain(size_of::<i64>())?;
                     subs.unpack_sizes.push(size);
                     sum = sum.saturating_add(size);
                 }
@@ -819,9 +825,14 @@ impl SzipReader {
 }
 
 fn folder_unpack_size(folder: &Folder) -> i64 {
+    let bound: HashSet<i64> = folder
+        .bind_pairs
+        .iter()
+        .map(|(_, output)| *output)
+        .collect();
     for (index, size) in folder.unpack_sizes.iter().enumerate().rev() {
         let index = i64::try_from(index).unwrap_or(i64::MAX);
-        if !folder.bind_pairs.iter().any(|(_, output)| *output == index) {
+        if !bound.contains(&index) {
             return *size;
         }
     }
