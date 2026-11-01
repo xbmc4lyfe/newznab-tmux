@@ -113,6 +113,9 @@ fn populate(catalog: &mut Catalog, releases: u64) -> Result<()> {
     Ok(())
 }
 
+/// Makes one request's query string.
+type MakeQuery = Box<dyn FnMut(&mut Rng) -> String>;
+
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     let rank = ((sorted.len() as f64 - 1.0) * p).round() as usize;
     sorted[rank]
@@ -143,7 +146,7 @@ fn main() -> Result<()> {
     let api = Api::new(&config, &paths, Arc::new(index))?;
 
     let mut rng = Rng(42);
-    let kinds: [(&str, Box<dyn FnMut(&mut Rng) -> String>); 6] = [
+    let kinds: [(&str, MakeQuery); 6] = [
         (
             "search q=two words",
             Box::new(|r| format!("t=search&q={}+{}", r.pick(&WORDS), r.pick(&WORDS))),
