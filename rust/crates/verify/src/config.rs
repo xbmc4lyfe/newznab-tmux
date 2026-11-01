@@ -42,6 +42,13 @@ impl VerificationConfig {
             )?,
             partial_after_hours: parsed_or("RELEASE_VERIFICATION_PARTIAL_AFTER_HOURS", 4)?,
             partial_ready_limit: parsed_or("RELEASE_VERIFICATION_PARTIAL_READY_LIMIT", 500)?,
+            article_bytes: parsed_or("RELEASE_VERIFICATION_ARTICLE_BYTES", 16_777_216)?,
+            stat_all_articles: matches!(
+                var_or("RELEASE_VERIFICATION_STAT_ALL_ARTICLES", "false")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "1" | "true" | "(true)"
+            ),
             candidate_workers: parsed_or("RELEASE_VERIFICATION_CANDIDATE_WORKERS", 2)?,
             slot_offset: parsed_or("RELEASE_VERIFICATION_SLOT_OFFSET", 0)?,
             host: var_or("RELEASE_VERIFICATION_HOST", ""),
