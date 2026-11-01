@@ -1,51 +1,62 @@
 # Remote release-verification worker host. It runs only this host's verification slots against
 # the primary's shared MariaDB, and publishes spot-checked candidates through the primary's
-# internal endpoint (INTERNAL_BIND/INTERNAL_PORT there), so it needs no NZB storage, Redis or
-# Manticore of its own.
+# internal endpoint (INTERNAL_BIND/INTERNAL_PORT there), so it needs no NZB storage or Manticore.
+# Every Rust role connects to a Redis at start, so it runs a small private one.
 #
 # Setup on the worker host, from this directory:
 #   1. Copy config/app.env.example to config/app.env and fill in the database login, this host's
 #      NNTP account, RELEASE_VERIFICATION_HOST and a slot range no other host uses.
-#   2. Copy the database CA to config/ca.pem (the primary mounts the same file), and
-#      `touch config/install.lock`: the shared database is already initialized by the primary.
-#   3. Load the primary's exact scheduler role image (the verifier runs the scheduler), for example
-#        ssh <primary> 'docker save nntmux/scheduler:local' | docker load
+#   2. Copy the database CA to config/ca.pem (the primary mounts the same file).
+#   3. Load the primary's exact image, for example
+#        ssh <primary> 'docker save nntmux/rust:local' | docker load
 #      Run the image the primary runs; a worker on older code must not run after a migration.
 #   4. docker compose up -d
 #
 # Before the primary migrates verification tables, stop these workers (docker compose stop lets the
-# scheduler finish its active candidates) and start them again on the new image afterwards.
+# verify role finish its active candidates) and start them again on the new image afterwards.
 name: ${COMPOSE_PROJECT_NAME:-nntmux-worker}
 
 services:
   verifier:
-    image: ${APP_IMAGE:-nntmux/scheduler:local}
+    image: ${APP_IMAGE:-nntmux/rust:local}
     init: true
     user: "33:33"
     restart: unless-stopped
     stop_signal: SIGTERM
-    # Detached verification runs remain owned by the subreaper until they finish (at most
+    # The verify role finishes its active candidates on SIGTERM (at most
     # RELEASE_VERIFICATION_WORKER_SECONDS plus the active candidate).
     stop_grace_period: 900s
-    command: ["python3", "/app/docker/app/bin/scheduler.py"]
+    command: ["nntmux-worker", "verify"]
+    env_file: ./config/app.env
     environment:
       TZ: ${TZ:-UTC}
-      SHELL: /bin/bash
-      PULSE_ENABLED: "false"
+      REDIS_HOST: redis
     volumes:
-      - ./config/app.env:/app/.env:ro
       - ./config/ca.pem:/etc/mysql/ssl/ca.pem:ro
-      - ./config/install.lock:/app/_install/install.lock:ro
       - storage:/app/storage
     tmpfs:
       - /var/tmp/nntmux:uid=33,gid=33,mode=0770,size=256m
     healthcheck:
-      test: ["CMD", "python3", "/app/docker/app/bin/scheduler.py", "status"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9187/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 60s
     mem_limit: ${VERIFIER_MEMORY:-16g}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4.2-alpine}
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 128m
 
 volumes:
   storage:
