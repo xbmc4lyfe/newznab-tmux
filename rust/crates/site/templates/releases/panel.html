@@ -1,0 +1,32 @@
+<form
+    id="nzb_multi_operations_form"
+    method="get"
+    x-data="releaseMultiOps"
+    data-show-thumbs="{% if list.show_thumbs %}1{% else %}0{% endif %}"
+>
+    <div class="release-results-toolbar surface-panel-alt border-b px-4 py-4 sm:px-6">
+        <div class="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+            <div class="min-w-0 text-sm text-gray-600 dark:text-gray-400">
+                Showing <span class="font-semibold tabular-nums text-gray-900 dark:text-gray-100">{{ list.pager.first_item }}–{{ list.pager.last_item }}</span> of <span class="font-semibold tabular-nums text-gray-900 dark:text-gray-100">{{ list.pager.total }}</span> releases
+            </div>
+
+            {% include "releases/before_actions.html" %}
+        </div>
+
+        <div class="mt-4 flex flex-wrap items-center justify-between gap-4">
+            {% include "releases/bulk_actions.html" %}
+
+            <div class="release-results-toolbar__filters flex min-w-0 flex-wrap items-center gap-3">
+                {% include "releases/inline_search.html" %}
+
+                {% include "releases/sort_dropdown.html" %}
+            </div>
+        </div>
+    </div>
+
+    <div class="hidden md:block px-4 py-3 sm:px-6 surface-panel-alt border-b">{% include "releases/pager_top.html" %}</div>
+
+    {% include "releases/results.html" %}
+
+    <div class="px-4 py-3 sm:px-6 surface-panel-alt border-t">{% include "releases/pager_top.html" %}</div>
+</form>

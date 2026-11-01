@@ -94,6 +94,34 @@ pub async fn send_contact(ctx: &Ctx, to: &str, reply_to: &str, body: &str) -> Re
     .await
 }
 
+pub async fn send_invitation(
+    ctx: &Ctx,
+    to: &str,
+    inviter: &str,
+    url: &str,
+    expires: &str,
+) -> Result<()> {
+    let site = config::app_name();
+    Letter {
+        to,
+        subject: &format!("You're invited to join {site}"),
+        heading: &format!("You're invited to {site}"),
+        paragraphs: vec![
+            "Hello!".to_owned(),
+            format!("Great news! {inviter} has invited you to join {site}."),
+        ],
+        button: Some(("Accept invitation", url)),
+        panel: Some(format!("Heads up: This invitation expires on {expires}. Please complete your registration before then.")),
+        after: vec![
+            format!("If the button above doesn't work, copy and paste this link into your browser: {url}"),
+            "If you have any questions, feel free to contact us once you've registered.".to_owned(),
+        ],
+        reply_to: None,
+    }
+    .send(ctx)
+    .await
+}
+
 pub async fn send_verification(ctx: &Ctx, to: &str, username: &str, url: &str) -> Result<()> {
     let site = config::app_name();
     let greeting = if username.is_empty() {
