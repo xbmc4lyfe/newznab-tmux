@@ -5,6 +5,7 @@
 pub mod archive_retry;
 pub mod crap;
 pub mod delete;
+pub mod import;
 pub mod import_database;
 pub mod internal;
 pub mod maintenance;
@@ -14,6 +15,7 @@ pub mod reconcile;
 pub mod remove;
 pub mod runner;
 pub mod settings;
+pub mod upload_manifest;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -68,6 +70,12 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
             }
         };
         let round = runner::run_round(&releases, &stop).await;
+        // Staged uploads would otherwise wait for someone to run the import by hand, as they did.
+        if let Some(folder) = upload_folder(None).ok().filter(|folder| folder.is_dir())
+            && let Err(failure) = import_uploads(&releases, folder, &stop).await
+        {
+            error!(error = format!("{failure:#}"), "upload import failed");
+        }
         drop(busy);
         if let Err(failure) = &round {
             error!(error = format!("{failure:#}"), "release round failed");
@@ -124,6 +132,33 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Import NZB files for indexing, and move staged uploads forward.
+    ImportNzbs {
+        /// Import folder path. Defaults to NZB_UPLOAD_FOLDER.
+        #[arg(long)]
+        folder: Option<PathBuf>,
+        /// Use the file name as the release name.
+        #[arg(long)]
+        filename: bool,
+        /// Delete files after import.
+        #[arg(long)]
+        delete: bool,
+        /// Delete files after failed import.
+        #[arg(long)]
+        delete_failed: bool,
+    },
+    /// Store the NFOs paired with uploads whose NZB has a release.
+    ImportNfos {
+        /// Import folder path. Defaults to NZB_UPLOAD_FOLDER.
+        #[arg(long)]
+        folder: Option<PathBuf>,
+        /// Delete the inputs once stored.
+        #[arg(long)]
+        delete: bool,
+        /// Delete the NFO of an upload whose NZB ended without a release.
+        #[arg(long)]
+        delete_failed: bool,
+    },
     /// Copy retained NZBs into the database, preserving originals.
     ImportDatabase {
         /// Legacy NZB roots, searched in this order.
@@ -160,6 +195,33 @@ pub enum Command {
         #[arg(long)]
         delete: bool,
     },
+}
+
+/// One pass over the staged uploads, as `import-nzbs --delete` and `import-nfos --delete --delete-failed`
+/// would run. A blacklisted, duplicate or groupless upload is deleted as `--delete` deletes it. An
+/// upload with nothing left to do loses its directory, so passes don't grow with every upload.
+async fn import_uploads(releases: &Releases, folder: PathBuf, stop: &Shutdown) -> Result<()> {
+    let options = import::Options {
+        folder: folder.clone(),
+        use_filename: false,
+        delete: true,
+        delete_failed: false,
+        unattended: true,
+        stop: Some(stop.clone()),
+    };
+    import::import_folder(releases, &options).await?;
+    import::import_companions(releases, &folder, true, true, Some(stop)).await?;
+    upload_manifest::remove_finished(&folder, Some(stop));
+    Ok(())
+}
+
+fn upload_folder(folder: Option<PathBuf>) -> Result<PathBuf> {
+    folder
+        .or_else(|| {
+            let configured = nntmux_core::var_or("NZB_UPLOAD_FOLDER", "");
+            (!configured.is_empty()).then(|| PathBuf::from(configured))
+        })
+        .ok_or_else(|| anyhow::anyhow!("Folder path must not be empty"))
 }
 
 pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
@@ -212,6 +274,41 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
         }
         Command::RetryArchiveInspection { limit, dry_run } => {
             archive_retry::run(&ctx.db, limit, dry_run).await
+        }
+        Command::ImportNzbs {
+            folder,
+            filename,
+            delete,
+            delete_failed,
+        } => {
+            let options = import::Options {
+                folder: upload_folder(folder)?,
+                use_filename: filename,
+                delete,
+                delete_failed,
+                unattended: false,
+                stop: None,
+            };
+            let report = import::import_folder(&releases, &options).await?;
+            println!(
+                "Processed {} NZBs, {} skipped, {} duplicates.",
+                report.imported, report.skipped, report.duplicates
+            );
+            Ok(())
+        }
+        Command::ImportNfos {
+            folder,
+            delete,
+            delete_failed,
+        } => {
+            let folder = upload_folder(folder)?;
+            let (imported, skipped, failed) =
+                import::import_companions(&releases, &folder, delete, delete_failed, None).await?;
+            println!("Processed {imported} NFOs, skipped {skipped}, failed {failed}.");
+            if failed > 0 {
+                bail!("{failed} NFOs failed.");
+            }
+            Ok(())
         }
         Command::ImportDatabase {
             roots,
