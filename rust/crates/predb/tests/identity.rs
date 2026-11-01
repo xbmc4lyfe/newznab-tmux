@@ -197,3 +197,215 @@ async fn check_links_only_exact_titles() {
     );
     db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn a_lookup_after_an_earlier_read_sees_current_rows() {
+    let Some(db) = TestDb::create().await.expect("db") else {
+        return;
+    };
+    let pool = &db.pool;
+    sqlx::query("INSERT INTO predb (title, source, filename) VALUES ('First.Alias.2020-GRP', 't', 'shared-stem-name.mkv')")
+        .execute(pool)
+        .await
+        .expect("insert");
+    rebuild(pool).await;
+
+    let mut caller = pool.begin().await.expect("begin");
+    let _: Option<u64> = sqlx::query_scalar("SELECT id FROM predb LIMIT 1")
+        .fetch_optional(&mut *caller)
+        .await
+        .expect("read");
+    let row = IrcRow {
+        title: "Second.Alias.2020-GRP".to_owned(),
+        filename: Some("shared-stem-name.mkv".to_owned()),
+        ..IrcRow::default()
+    };
+    assert!(matches!(
+        insert_irc(pool, &row).await.expect("insert"),
+        LegacyOutcome::Inserted(_)
+    ));
+    let found = lookup_many_in(
+        &mut caller,
+        &[OriginalFilenameEvidence::new("shared-stem-name.mkv")],
+    )
+    .await;
+    assert_eq!(found, vec![Lookup::Ambiguous]);
+    caller.rollback().await.expect("rollback");
+
+    // Any other isolation level answers Unknown rather than risk a stale answer.
+    let mut other = pool.acquire().await.expect("acquire");
+    sqlx::query("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *other)
+        .await
+        .expect("set");
+    let found = lookup_many_in(
+        &mut other,
+        &[OriginalFilenameEvidence::new("shared-stem-name.mkv")],
+    )
+    .await;
+    assert_eq!(found, vec![Lookup::Unknown]);
+    sqlx::query("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *other)
+        .await
+        .expect("reset");
+    drop(other);
+    db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn irc_rows_fill_only_what_php_filled() {
+    let Some(db) = TestDb::create().await.expect("db") else {
+        return;
+    };
+    let pool = &db.pool;
+    let row = IrcRow {
+        title: "Irc.Rel-GRP".to_owned(),
+        source: Some("#pre".to_owned()),
+        category: Some(String::new()),
+        filename: Some("0".to_owned()),
+        size: Some(String::new()),
+        ..IrcRow::default()
+    };
+    let LegacyOutcome::Inserted(id) = insert_irc(pool, &row).await.expect("insert") else {
+        panic!("not inserted");
+    };
+    let stored: (Option<String>, String, Option<String>) =
+        sqlx::query_as("SELECT category, filename, size FROM predb WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("row");
+    assert_eq!(
+        stored,
+        (None, String::new(), None),
+        "PHP's empty() values are not stored"
+    );
+
+    let update = IrcRow {
+        title: "IRC.rel-grp".to_owned(),
+        source: Some("#other".to_owned()),
+        category: Some("TV".to_owned()),
+        ..IrcRow::default()
+    };
+    assert_eq!(
+        update_irc(pool, id, "Irc.Rel-GRP", &update)
+            .await
+            .expect("update"),
+        LegacyOutcome::Updated
+    );
+    let stored: (String, String, Option<String>) =
+        sqlx::query_as("SELECT title, source, category FROM predb WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("row");
+    assert_eq!(
+        stored,
+        (
+            "IRC.rel-grp".to_owned(),
+            "#pre".to_owned(),
+            Some("TV".to_owned())
+        )
+    );
+    assert_eq!(
+        update_irc(pool, id, "Irc.Rel-GRP", &update)
+            .await
+            .expect("update"),
+        LegacyOutcome::Stale
+    );
+    db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn match_pre_needs_the_current_row_to_agree() {
+    let (Some(db), Ok(http)) = (
+        TestDb::create().await.expect("db"),
+        std::env::var("TEST_MANTICORE_HTTP"),
+    ) else {
+        return;
+    };
+    let base = format!("http://{http}");
+    let table = db.name.clone();
+    let client = reqwest::Client::new();
+    let sql = |statement: String| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .post(format!("{base}/cli"))
+                .body(statement)
+                .send()
+                .await
+                .expect("sql")
+                .error_for_status()
+                .expect("sql status");
+        }
+    };
+    sql(format!(
+        "CREATE TABLE {table} (title text, filename text, source text)"
+    ))
+    .await;
+    let index = nntmux_predb::PredbIndex::at(base.clone(), table.clone());
+    let pool = &db.pool;
+
+    let InsertOutcome::Inserted(id) = insert_feed(pool, &row("Some.Rel-2020-GRP"))
+        .await
+        .expect("insert")
+    else {
+        panic!("rejected");
+    };
+    index
+        .replace(id, "Some.Rel-2020-GRP", "alias.name-grp", "t")
+        .await;
+    sqlx::query("UPDATE predb SET filename = 'alias.name-grp' WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("update");
+
+    let found = nntmux_predb::match_pre(pool, &index, "some.rel-2020-grp")
+        .await
+        .expect("match");
+    assert_eq!(
+        found.map(|m| (m.predb_id, m.title)),
+        Some((id, "Some.Rel-2020-GRP".to_owned()))
+    );
+    let found = nntmux_predb::match_pre(pool, &index, "ALIAS.name-grp")
+        .await
+        .expect("match");
+    assert_eq!(found.map(|m| m.predb_id), Some(id));
+    assert_eq!(
+        nntmux_predb::match_pre(pool, &index, "Some.Rel-2020")
+            .await
+            .expect("match"),
+        None
+    );
+    assert_eq!(
+        nntmux_predb::match_pre(pool, &index, "  ")
+            .await
+            .expect("match"),
+        None
+    );
+    assert_eq!(
+        nntmux_predb::match_pre(pool, &index, "(!)")
+            .await
+            .expect("match"),
+        None
+    );
+
+    // A stale document never overrides the database.
+    sqlx::query("UPDATE predb SET title = 'Renamed.Rel-2020-GRP', filename = '' WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("update");
+    assert_eq!(
+        nntmux_predb::match_pre(pool, &index, "Some.Rel-2020-GRP")
+            .await
+            .expect("match"),
+        None
+    );
+
+    sql(format!("DROP TABLE {table}")).await;
+    db.drop_database().await.expect("drop");
+}
