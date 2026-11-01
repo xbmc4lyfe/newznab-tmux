@@ -352,6 +352,10 @@ async fn asn_refusal(
     Some(blocked(&format!("Access denied: {name} is not allowed.")))
 }
 
+/// What `site::statics` serves from disk, which the web server answered before PHP.
+const STATIC_PREFIXES: [&str; 4] = ["/build/", "/assets/", "/svg/", "/storage/"];
+const STATIC_FILES: [&str; 2] = ["/favicon.ico", "/robots.txt"];
+
 static PAGE_SETTINGS: LazyLock<Option<Settings>> = LazyLock::new(|| match Settings::from_env() {
     Ok(settings) => Some(settings),
     Err(failure) => {
@@ -365,10 +369,11 @@ static PAGE_SETTINGS: LazyLock<Option<Settings>> = LazyLock::new(|| match Settin
 /// answered in PHP's setup are left alone.
 pub async fn block_pages(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_owned();
-    let Some(ctx) = request.extensions().get::<Ctx>().cloned() else {
-        return next.run(request).await;
-    };
-    if path.starts_with("/build/") || path.starts_with("/assets/") {
+    if STATIC_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+        || STATIC_FILES.contains(&path.as_str())
+    {
         return next.run(request).await;
     }
     let (parts, body) = request.into_parts();
@@ -381,9 +386,9 @@ pub async fn block_pages(request: Request, next: Next) -> Response {
         .to_owned();
     let mut refusal = agent_refusal(&user_agent, Some(&ip), &path);
     if refusal.is_none()
-        && let Some(settings) = PAGE_SETTINGS.as_ref()
+        && let (Some(ctx), Some(settings)) = (parts.extensions.get::<Ctx>(), PAGE_SETTINGS.as_ref())
     {
-        refusal = asn_refusal(&ctx, settings, &user_agent, Some(&ip), &path).await;
+        refusal = asn_refusal(ctx, settings, &user_agent, Some(&ip), &path).await;
     }
     match refusal {
         Some(reply) => reply.into_response(),

@@ -41,6 +41,7 @@ async fn streaming_services_are_refused_on_pages_but_not_on_static_files() {
     let app = Router::new()
         .route("/login", get(|| async { "page" }))
         .route("/build/app.js", get(|| async { "file" }))
+        .route("/robots.txt", get(|| async { "file" }))
         .layer(from_fn(nntmux_api::block_pages))
         .layer(Extension(ctx));
 
@@ -55,6 +56,10 @@ async fn streaming_services_are_refused_on_pages_but_not_on_static_files() {
     );
     assert_eq!(
         status(&app, "/build/app.js", "AIOStreams/2.0").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&app, "/robots.txt", "AIOStreams/2.0").await,
         StatusCode::OK
     );
 }
