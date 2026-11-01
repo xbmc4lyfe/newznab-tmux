@@ -63,11 +63,9 @@ impl Lists {
                 matched.insert(rule.id);
             }
         }
-        if !blacklisted {
-            if let Some(rule) = self.black.iter().find(|rule| rule.matches(header)) {
-                blacklisted = true;
-                matched.insert(rule.id);
-            }
+        if !blacklisted && let Some(rule) = self.black.iter().find(|rule| rule.matches(header)) {
+            blacklisted = true;
+            matched.insert(rule.id);
         }
         blacklisted
     }
