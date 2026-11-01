@@ -61,6 +61,9 @@ pub async fn serve(articles: Vec<(&'static str, Vec<u8>)>) -> Server {
                             }
                             None => io.write_all(b"430 no such article\r\n").await.unwrap(),
                         }
+                    } else if let Some(group) = line.strip_prefix("GROUP ") {
+                        let reply = format!("211 1 1 1 {group}\r\n");
+                        io.write_all(reply.as_bytes()).await.unwrap();
                     } else {
                         io.write_all(b"500 what\r\n").await.unwrap();
                     }
@@ -72,6 +75,11 @@ pub async fn serve(articles: Vec<(&'static str, Vec<u8>)>) -> Server {
 }
 
 pub fn service(port: u16) -> DownloadService {
+    DownloadService::new(client(port), false, MappingPolicy::default())
+}
+
+/// A client for the scripted server.
+pub fn client(port: u16) -> NntpClient {
     let config = NntpConfig {
         primary: Provider {
             host: "127.0.0.1".into(),
@@ -91,11 +99,7 @@ pub fn service(port: u16) -> DownloadService {
         fingerprint_breaker_seconds: 900,
         retries: 1,
     };
-    DownloadService::new(
-        NntpClient::new(Arc::new(config)),
-        false,
-        MappingPolicy::default(),
-    )
+    NntpClient::new(Arc::new(config))
 }
 
 pub fn article(name: &str, payload: &[u8]) -> Vec<u8> {

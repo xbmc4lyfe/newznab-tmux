@@ -5,6 +5,7 @@
 pub mod additional;
 pub mod archive_info;
 pub mod config;
+pub mod nfo;
 pub mod tv_pipeline;
 pub mod workspace;
 
@@ -38,6 +39,16 @@ pub enum Command {
         #[arg(long)]
         mode: Option<String>,
     },
+    /// `update:postprocess nfo`: one pass of NFO processing, then the archive pass for releases
+    /// out of retries.
+    Nfo {
+        /// Only releases whose GUID starts with this character.
+        #[arg(long, default_value = "")]
+        guid: String,
+        /// Only releases in this group.
+        #[arg(long)]
+        group: Option<i64>,
+    },
 }
 
 pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
@@ -67,6 +78,22 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 return Ok(());
             };
             nntmux_metadata::process_tv_pipeline(&ctx, 0, &guid, renamed).await
+        }
+        Command::Nfo { guid, group } => {
+            if !guid.is_empty() {
+                tv_pipeline::check_guid_char(&guid)?;
+            }
+            let config = Config::load(&ctx.db).await?;
+            if !config.settings.lookup_nfo {
+                println!("NFO lookup is turned off.");
+                return Ok(());
+            }
+            let nntp = nntmux_nntp::NntpConfig::from_env();
+            let settings = nfo::Settings::from_config(&config, nntp.alternate_article_fallback);
+            let client = nntmux_nntp::NntpClient::new(std::sync::Arc::new(nntp));
+            let mut service = nfo::NfoService::new(ctx.db.clone(), settings, client);
+            service.process_nfo_files(group, &guid).await?;
+            Ok(())
         }
     }
 }
