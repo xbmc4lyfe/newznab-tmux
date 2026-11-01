@@ -1,23 +1,24 @@
 name: Native utility performance
 
 on:
-  push:
-    branches: [master]
-  pull_request:
-    branches: [master]
-    paths:
-      - '**/*.md'
-      - 'github-pages/**'
-      - 'docker/app/nzb-yenc-ffi/**'
-      - 'app/Services/Nzb/NzbArticleFingerprint.php'
-      - 'app/Services/Nzb/RustArticleFingerprintWorker.php'
-      - 'tests/Fixtures/nzb-article-fingerprint/**'
-      - 'scripts/*benchmark*'
-      - 'scripts/build-docs.py'
-      - 'tests/Unit/test_docs_site.py'
-      - 'tests/Unit/test_benchmark*'
-      - 'composer.lock'
-      - '.github/workflows/native-utilities-performance.yml'
+  # TODO: turn back on
+  # push:
+  #   branches: [master]
+  # pull_request:
+  #   branches: [master]
+  #   paths:
+  #     - '**/*.md'
+  #     - 'github-pages/**'
+  #     - 'docker/app/nzb-yenc-ffi/**'
+  #     - 'app/Services/Nzb/NzbArticleFingerprint.php'
+  #     - 'app/Services/Nzb/RustArticleFingerprintWorker.php'
+  #     - 'tests/Fixtures/nzb-article-fingerprint/**'
+  #     - 'scripts/*benchmark*'
+  #     - 'scripts/build-docs.py'
+  #     - 'tests/Unit/test_docs_site.py'
+  #     - 'tests/Unit/test_benchmark*'
+  #     - 'composer.lock'
+  #     - '.github/workflows/native-utilities-performance.yml'
   workflow_dispatch:
     inputs:
       pairs:
