@@ -20,3 +20,10 @@ id = "nntmux:install"
 source = "app/Console/Commands/InstallNntmux.php"
 status = "dropped"
 note = "it wiped the database with migrate:fresh; nntmux-ctl init sets up an empty database and refuses one with tables"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "update:postprocess"
+source = "app/Console/Commands/UpdatePostProcess.php"
+status = "todo"

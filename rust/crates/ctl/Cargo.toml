@@ -17,6 +17,7 @@ anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
+nntmux-admin.workspace = true
 nntmux-categorize.workspace = true
 nntmux-core.workspace = true
 nntmux-db.workspace = true

@@ -15,5 +15,8 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+tower.workspace = true
+
 [lints]
 workspace = true

@@ -35,6 +35,8 @@ async fn main() -> Result<()> {
                 .merge(nntmux_admin::router())
                 .layer(from_fn(nntmux_api::block_pages)),
         )
+        // After every route, so each request is labelled with the pattern it matched.
+        .route_layer(from_fn(nntmux_telemetry::http::track))
         .layer(TraceLayer::new_for_http())
         // The web stack's layers run before the state exists, so they read it from here.
         .layer(Extension(ctx.clone()))
