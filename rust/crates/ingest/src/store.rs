@@ -316,6 +316,9 @@ async fn store_attempt(
             .context("invalidating verification candidates")?
     };
     transaction.commit().await?;
+    // Clean-up takes its own connection, so hand this one back first: chunks all cleaning up at
+    // once mustn't wait on each other for the pool.
+    drop(connection);
     // The headers are safe by now, so a manifest left behind must not fail the chunk.
     if let Err(failure) = hooks.after_commit(&unreferenced).await {
         warn!(
