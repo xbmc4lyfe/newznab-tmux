@@ -652,7 +652,13 @@ pub async fn feed(
                     Style::Plain,
                 ));
             }
-            general_rows(ctx, settings, user.id, &common_filters(input, settings, ids)).await?
+            general_rows(
+                ctx,
+                settings,
+                user.id,
+                &common_filters(input, settings, ids),
+            )
+            .await?
         }
         Feed::TrendingMovies => trending_movies(ctx, settings).await?,
         Feed::TrendingShows => trending_shows(ctx, settings).await?,

@@ -471,9 +471,16 @@ async fn rss_limit_is_honored() -> Result<()> {
     for (uri, app, items) in [
         ("/rss/full-feed?limit=2&api_token=tokenalice", app(&ctx), 2),
         ("/rss/full-feed?limit=-1&api_token=tokenalice", app(&ctx), 1),
-        ("/rss/full-feed?limit=1e30&api_token=tokenalice", router_with(settings_with_cap()).with_state(ctx.clone()), 1),
+        (
+            "/rss/full-feed?limit=1e30&api_token=tokenalice",
+            router_with(settings_with_cap()).with_state(ctx.clone()),
+            1,
+        ),
     ] {
-        let request = Request::builder().uri(uri).header("host", "x.test").body(Body::empty())?;
+        let request = Request::builder()
+            .uri(uri)
+            .header("host", "x.test")
+            .body(Body::empty())?;
         let response = app.oneshot(request).await?;
         assert_eq!(response.status(), 200);
         let body = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
