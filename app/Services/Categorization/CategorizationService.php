@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Services\Categorization;
 
 use App\Models\Category;
-use App\Services\Categorization\Pipes\AbstractCategorizationPipe;
 use Blacklight\Categorize;
 
 /**
@@ -39,50 +38,6 @@ class CategorizationService
         bool $debug = false
     ): array {
         return $this->pipeline->categorize($groupId, $releaseName, $poster, $debug);
-    }
-
-    /**
-     * Batch categorize multiple releases.
-     *
-     * @param  array<string, mixed>  $releases  Array of ['group_id' => x, 'name' => y, 'poster' => z]
-     * @return array<string, mixed> Array of categorization results
-     */
-    public function batchCategorize(array $releases): array
-    {
-        $results = [];
-
-        foreach ($releases as $release) {
-            $groupId = $release['group_id'] ?? $release['groupId'] ?? 0;
-            $name = $release['name'] ?? $release['releaseName'] ?? '';
-            $poster = $release['poster'] ?? '';
-
-            $results[] = [
-                'release' => $release,
-                'result' => $this->determineCategory($groupId, $name, $poster),
-            ];
-        }
-
-        return $results;
-    }
-
-    /**
-     * Get the underlying pipeline.
-     *
-     * @return list<array<string, mixed>>
-     */
-    public function getPipeline(): CategorizationPipeline
-    {
-        return $this->pipeline;
-    }
-
-    /**
-     * Add a custom categorizer pipe to the pipeline.
-     */
-    public function addCategorizer(AbstractCategorizationPipe $pipe): self
-    {
-        $this->pipeline->addCategorizer($pipe);
-
-        return $this;
     }
 
     /**

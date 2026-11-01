@@ -13,8 +13,6 @@ use App\Services\ReleaseImageService;
 use App\Services\TmdbClient;
 use App\Services\TraktService;
 use Illuminate\Contracts\Cache\LockTimeoutException;
-use Illuminate\Database\Eloquent\Builder;
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -529,23 +527,6 @@ abstract class AbstractTvProvider extends BaseVideoProvider
     public function setCoverFound(int $videoId): void
     {
         TvInfo::query()->where('videos_id', $videoId)->update(['image' => 1]);
-    }
-
-    /**
-     * @return Video|false|Builder|Model
-     */
-    public function getSiteByID(string $column, int $id): Model|bool|Builder|Video|int|string // @phpstan-ignore missingType.generics
-    {
-        $return = false;
-        $video = Video::query()->where('id', $id)->first([$column]);
-        if ($column === '*') {
-            $return = $video;
-        } elseif ($video !== null) {
-            $value = $video[$column];
-            $return = ($value !== null && $value !== '') ? $value : false;
-        }
-
-        return $return;
     }
 
     /**

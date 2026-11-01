@@ -95,19 +95,4 @@ class CategorizationResult
     {
         return new self(Category::OTHER_MISC, 0.0, 'no_match');
     }
-
-    /**
-     * Create a result with debug info merged.
-     *
-     * @param  array<string, mixed>  $additionalDebug
-     */
-    public function withDebug(array $additionalDebug): self
-    {
-        return new self(
-            $this->categoryId,
-            $this->confidence,
-            $this->matchedBy,
-            array_merge($this->debug, $additionalDebug)
-        );
-    }
 }

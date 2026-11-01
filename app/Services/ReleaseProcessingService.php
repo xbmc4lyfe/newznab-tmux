@@ -674,26 +674,6 @@ final class ReleaseProcessingService
     }
 
     /**
-     * Reset all releases to other->misc category.
-     */
-    public function resetCategorize(string $where = ''): void
-    {
-        if ($where !== '') {
-            DB::update(
-                'UPDATE releases SET categories_id = ?, iscategorized = 0 '.$where,
-                [Category::OTHER_MISC]
-            );
-        } else {
-            Release::query()->update([
-                'categories_id' => Category::OTHER_MISC,
-                'iscategorized' => 0,
-            ]);
-        }
-
-        ReleaseSearchIndexSync::reindexMatchingWhere($where);
-    }
-
-    /**
      * Categorize a release using the specified type.
      *
      * @throws \Exception

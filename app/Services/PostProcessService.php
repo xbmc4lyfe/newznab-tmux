@@ -267,15 +267,6 @@ final class PostProcessService
 
     /**
      * @param  null|callable(): bool  $canPersist
-     * @param  null|callable(): bool  $onRead
-     */
-    public function parsePAR2ForRename(string $messageID, int $relID, int $groupID, NNTPService $nntp, int $show, ?callable $canPersist = null, bool $expectedPar2 = false, ?callable $onRead = null): Par2RenameOutcome
-    {
-        return $this->par2Processor->parseForRename($messageID, $relID, $groupID, $nntp, $show, $canPersist, $expectedPar2, $onRead);
-    }
-
-    /**
-     * @param  null|callable(): bool  $canPersist
      * @param  array{id: int, guid: string, name: ?string, searchname: ?string, max_payload_bytes?: int}|null  $expectedSnapshot
      */
     public function applyPAR2InventoryForRename(Par2PacketAccumulator $inventory, int $relID, int $groupID, int $show, ?callable $canPersist = null, bool $allowTerminalMetadata = true, ?array $expectedSnapshot = null): Par2RenameOutcome

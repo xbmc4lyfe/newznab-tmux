@@ -919,35 +919,4 @@ class GamesService
     {
         return md5(mb_strtolower(trim($title)));
     }
-
-    /**
-     * Get processing statistics from the last run.
-     *
-     * @return array<string, mixed>
-     */
-    public function getProcessingStats(): array
-    {
-        return [
-            'processed' => $this->processedCount,
-            'matched' => $this->matchedCount,
-            'cached' => $this->cachedCount,
-            'failed' => $this->failedCount,
-        ];
-    }
-
-    /**
-     * Clear game lookup caches.
-     */
-    public function clearLookupCaches(): void
-    {
-        Log::info('GamesService: Lookup caches cleared');
-    }
-
-    /**
-     * Match genre name to known genres.
-     */
-    public function matchGenreName(string $gameGenre): bool|string
-    {
-        return $this->igdbService->isKnownGenre($gameGenre) ? $gameGenre : false;
-    }
 }

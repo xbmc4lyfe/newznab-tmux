@@ -53,17 +53,6 @@ class CategorizationPipeline
     }
 
     /**
-     * Register a categorizer pipe in the pipeline.
-     */
-    public function addCategorizer(AbstractCategorizationPipe $pipe): self
-    {
-        $this->pipes->push($pipe);
-        $this->pipes = $this->pipes->sortBy(fn (AbstractCategorizationPipe $p) => $p->getPriority());
-
-        return $this;
-    }
-
-    /**
      * Determine the category for a release using Laravel Pipeline.
      *
      * @param  int|string  $groupId  The usenet group ID
