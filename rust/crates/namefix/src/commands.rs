@@ -13,7 +13,7 @@ use nntmux_search::SearchClient;
 use redis::AsyncCommands;
 
 use crate::fixnames_chain;
-use crate::par2_check::{Par2Checker, Par2Settings};
+use crate::par2_check::{Par2Checker, Par2Settings, env_bool};
 use crate::par2_nntp::NntpArticles;
 use crate::par2_probe::{BatchProbe, fix_names_with_par2};
 use crate::queries::{self, FixNamesConfig, PredbTitle};
@@ -692,6 +692,20 @@ fn slot_partitions(total: usize, slot: usize, slots: usize) -> impl Iterator<Ite
     (0..total).filter(move |partition| partition % slots.max(1) == slot)
 }
 
+/// `TMUX_FIX_NAMES_PREDBFT` and `TMUX_FIX_NAMES_PREDBFT_SCHEDULED`, with PHP's defaults.
+fn predbft_flags() -> (bool, bool) {
+    (
+        env_bool("TMUX_FIX_NAMES_PREDBFT").unwrap_or(true),
+        env_bool("TMUX_FIX_NAMES_PREDBFT_SCHEDULED").unwrap_or(true),
+    )
+}
+
+/// Whether the scheduler owns the PreDB fulltext pass. The pass has one launcher: the scheduler
+/// when this is true, otherwise the `fixnames` role while `TMUX_FIX_NAMES_PREDBFT` is on.
+pub fn predbft_scheduled() -> bool {
+    predbft_flags() == (true, true)
+}
+
 /// One cycle of what the tmux monitor's fix-names pane ran: the numbered levels, when the
 /// pane would run them. Returns whether it ran.
 async fn run_chain(ctx: &Ctx, backends: &Backends, stop: &Shutdown) -> Result<bool> {
@@ -760,9 +774,7 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
             if slot == 0 {
                 moved |= run_chain(&ctx, &backends, &shutdown).await?;
             }
-            // One launcher: the scheduler owns the pass while this is set.
-            let predbft = crate::par2_check::env_bool("TMUX_FIX_NAMES_PREDBFT").unwrap_or(true)
-                && !crate::par2_check::env_bool("TMUX_FIX_NAMES_PREDBFT_SCHEDULED").unwrap_or(true);
+            let predbft = predbft_flags() == (true, false);
             let (per_run, threads) = post_processing_settings(&ctx).await?;
             if predbft && per_run > 0 {
                 let workers = threads.clamp(1, 16);
