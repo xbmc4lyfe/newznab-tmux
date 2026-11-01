@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::manifest::{Manifest, ManifestFile, Segment};
 use crate::nzb::fingerprint::php_trim;
-use crate::nzb::parse::parse;
+use crate::nzb::parse::{ParsedNzb, parse};
 
 static QUOTED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""[^"\r\n]*"|'[^'\r\n]*'"#).expect("valid"));
@@ -106,7 +106,11 @@ pub fn read_manifest(xml: &[u8], facts: &ReleaseFacts) -> Result<Manifest> {
     if xml.len() > MAX_DOCUMENT_BYTES {
         bail!("NZB exceeds audit metadata budget.");
     }
-    let document = parse(xml)?;
+    read_parsed(&parse(xml)?, facts)
+}
+
+/// [`read_manifest`] of a document already parsed.
+pub fn read_parsed(document: &ParsedNzb, facts: &ReleaseFacts) -> Result<Manifest> {
     // PHP rejected an entity reference where metadata lives, and read one elsewhere. A declared
     // entity has no honest use in an NZB, so any declaration is held for review.
     if document.declares_entities || (document.password_in_head && document.heads > 1) {
