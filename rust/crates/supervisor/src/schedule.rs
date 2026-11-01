@@ -34,8 +34,8 @@ const HEALTH_LIMIT: Duration = Duration::from_secs(300);
 
 pub fn tasks() -> Vec<Task<Ctx>> {
     use nntmux_ops::{
-        accounts, activity, clean_directories, disposable, expired_roles, metrics_export,
-        processing_stats, resets, site_status, stats, system_metrics,
+        accounts, activity, clean_directories, disposable, expired_roles, log_index,
+        metrics_export, processing_stats, resets, site_status, stats, system_metrics,
     };
     vec![
         Task {
@@ -56,6 +56,18 @@ pub fn tasks() -> Vec<Task<Ctx>> {
             enabled: metrics_export::enabled,
             ..task("processing-stats", EveryMinutes(1), |ctx| {
                 Box::pin(async move { processing_stats::publish(&ctx).await })
+            })
+        },
+        Task {
+            enabled: log_index::enabled,
+            ..task("nntmux:index-logs", EveryMinutes(1), |ctx| {
+                Box::pin(async move {
+                    let client = nntmux_search::SearchClient::from_ctx(&ctx)?;
+                    log_index::LogIndexer::from_env(&client, &ctx.db)?
+                        .run(&[])
+                        .await?;
+                    Ok(())
+                })
             })
         },
         task("nntmux:update-expired-roles", Cadence::MIDNIGHT, |ctx| {

@@ -88,6 +88,7 @@ totp-rs = "6"
 tower = "0.5"
 tower-http = { version = "0.7", features = ["compression-gzip", "fs", "request-id", "trace"] }
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
 webauthn-rs = "0.6"

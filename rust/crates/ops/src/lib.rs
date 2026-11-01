@@ -7,6 +7,7 @@ pub mod activity;
 pub mod clean_directories;
 pub mod disposable;
 pub mod expired_roles;
+pub mod log_index;
 pub mod metrics_export;
 pub mod populate;
 pub mod processing_stats;
@@ -36,6 +37,15 @@ pub enum Command {
     DisableExpiredPromotions,
     /// Complete registration periods past their end (`nntmux:disable-expired-registration-periods`).
     DisableExpiredRegistrationPeriods,
+    /// Tail the log directory into the log viewer's index (`nntmux:index-logs`).
+    IndexLogs {
+        /// Only these files, relative to the log directory. Repeatable.
+        #[arg(long = "file")]
+        files: Vec<String>,
+        /// Drop the index and start every file again.
+        #[arg(long)]
+        reset: bool,
+    },
     /// Warn about expiring roles and move expired users (`nntmux:update-expired-roles`).
     UpdateExpiredRoles,
     /// Clear old files from the extraction temp directories (`clean:directories`).
@@ -165,6 +175,25 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 println!("Marked registration period as done: {name}");
             }
             println!("Completed {} expired registration period(s).", names.len());
+        }
+        Command::IndexLogs { files, reset } => {
+            if !log_index::enabled() {
+                println!("The log index is off, or NNTMUX_LOG_DIR is unset.");
+                return Ok(());
+            }
+            let client = nntmux_search::SearchClient::from_ctx(&ctx)?;
+            if !client.is_available().await {
+                bail!("Manticore is not reachable, so logs weren't indexed.");
+            }
+            let indexer = log_index::LogIndexer::from_env(&client, &ctx.db)?;
+            if reset {
+                indexer.reset().await?;
+            }
+            let stats = indexer.run(&files).await?;
+            println!(
+                "Indexed {} entries ({} bytes) from {} file(s); {} file(s) purged.",
+                stats.entries, stats.bytes, stats.files, stats.purged
+            );
         }
         Command::UpdateExpiredRoles => {
             let report = expired_roles::update_expired_roles(&ctx).await?;
