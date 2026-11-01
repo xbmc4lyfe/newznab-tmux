@@ -10,7 +10,7 @@ status = "ported"
 kind = "route"
 id = "DELETE /passkeys/{passkey}"
 source = "App\\Http\\Controllers\\Auth\\PasskeyManagementController@destroy"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -100,7 +100,7 @@ status = "ported"
 kind = "route"
 id = "GET|HEAD /passkeys/authentication-options"
 source = "Spatie\\LaravelPasskeys\\Http\\Controllers\\GeneratePasskeyAuthenticationOptionsController"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -449,19 +449,19 @@ status = "ported"
 kind = "route"
 id = "POST /passkeys"
 source = "App\\Http\\Controllers\\Auth\\PasskeyManagementController@store"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /passkeys/authenticate"
 source = "App\\Http\\Controllers\\Auth\\PasskeyLoginController"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /passkeys/register-options"
 source = "App\\Http\\Controllers\\Auth\\PasskeyManagementController@options"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"

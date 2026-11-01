@@ -613,5 +613,26 @@
    "Origin": "https://x.test",
    "Access-Control-Request-Method": "GET"
   }
+ },
+ {
+  "name": "inform_rename",
+  "path": "/api/inform/release?api_token=tokenalice&relo=A.Game.PS4-GRP&relp=Better.Game.Name.PS4-GROUP",
+  "after": "SELECT CONCAT_WS('|', searchname, categories_id, isrenamed, iscategorized, proc_files) FROM releases WHERE id = 4 UNION ALL SELECT CONCAT_WS('|', relOName, relPName) FROM release_informs"
+ },
+ {
+  "name": "inform_rename_same",
+  "path": "/api/inform/release?api_token=tokenalice&relo=A.Game.PS4-GRP&relp=A.Game.PS4-GRP",
+  "after": "SELECT CONCAT_WS('|', searchname, categories_id, isrenamed, iscategorized, proc_files) FROM releases WHERE id = 4 UNION ALL SELECT CONCAT_WS('|', relOName, relPName) FROM release_informs"
+ },
+ {
+  "name": "inform_rename_movie",
+  "path": "/api/inform/release?api_token=tokenalice&relo=An.Author-A.Book.EPUB&relp=Some.Movie.2024.1080p.BluRay.x264-GROUP",
+  "after": "SELECT CONCAT_WS('|', searchname, categories_id, isrenamed, iscategorized, proc_files) FROM releases WHERE id = 5 UNION ALL SELECT CONCAT_WS('|', relOName, relPName) FROM release_informs",
+  "status_only": true
+ },
+ {
+  "name": "inform_unknown",
+  "path": "/api/inform/release?api_token=tokenalice&relo=nothing&relp=b",
+  "after": "SELECT CONCAT_WS('|', relOName, relPName) FROM release_informs"
  }
 ]
