@@ -133,7 +133,11 @@ async fn the_ledger_refuses_growth_past_capacity() -> Result<()> {
     assert!(!ledger::fits(&mut *conn, &config, 101).await?);
     assert!(ledger::adjust(&mut conn, &config, 90).await?);
     assert!(!ledger::adjust(&mut conn, &config, 11).await?);
-    assert!(ledger::adjust(&mut conn, &config, -200).await?);
+    assert!(
+        ledger::adjust(&mut conn, &config, -200).await.is_err(),
+        "releasing more than is held is accounting drift"
+    );
+    assert!(ledger::adjust(&mut conn, &config, -90).await?);
     let pending: u64 =
         sqlx::query_scalar("SELECT pending_bytes FROM release_verification_state WHERE id = 1")
             .fetch_one(&mut *conn)
@@ -340,5 +344,51 @@ async fn barriers_and_pauses_exclude_workers() -> Result<()> {
     locks::unpause(&db.pool, None, Some("deployment")).await?;
     assert!(worker.admitting().await?);
     worker.close().await;
+    db.drop_database().await
+}
+
+#[tokio::test]
+async fn an_admission_gives_its_lock_back_and_refuses_while_a_reset_runs() -> Result<()> {
+    use nntmux_verify::locks::{self, Admission, LockSession};
+    let Some(db) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let mut resets = LockSession::open(&db.pool).await?;
+    let admission = Admission::enter(&db.pool).await?;
+    assert!(
+        resets.exclusive_group("reset").await?.is_none(),
+        "a running admission holds a reset out"
+    );
+    admission.leave().await?;
+    let gate = resets
+        .exclusive_group("reset")
+        .await?
+        .expect("nothing holds it now");
+    assert!(
+        Admission::enter(&db.pool).await.is_err(),
+        "a reset holds admissions out"
+    );
+    resets.release(gate).await;
+
+    // A task dropped mid-admission doesn't leave its stripe held by a pooled connection.
+    drop(Admission::enter(&db.pool).await?);
+    let mut freed = false;
+    for _ in 0..100 {
+        if let Some(gate) = resets.exclusive_group("reset").await? {
+            resets.release(gate).await;
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(freed);
+
+    locks::pause(&db.pool, "t", "reset").await?;
+    assert!(
+        Admission::enter(&db.pool).await.is_err(),
+        "a lost reset's pause holds admissions out"
+    );
+    locks::unpause(&db.pool, Some("t"), None).await?;
+    assert!(resets.exclusive_group("reset").await?.is_some());
     db.drop_database().await
 }

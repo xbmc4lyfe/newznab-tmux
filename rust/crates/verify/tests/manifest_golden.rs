@@ -128,3 +128,10 @@ fn stored_bodies_refuse_trailing_members_and_bombs() {
     assert_eq!(nzb::decode(&body[..body.len() - 1], 100), None);
     assert_eq!(nzb::decode(b"not gzip", 100), None);
 }
+
+#[test]
+fn a_manifest_with_no_post_date_has_no_document() {
+    let mut manifest = case(&golden()["manifests"]["ready"]);
+    manifest.date = None;
+    assert!(nzb::document(&manifest, 0).is_err());
+}

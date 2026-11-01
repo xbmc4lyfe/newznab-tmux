@@ -89,13 +89,15 @@ async fn take_shared(
     conn: &mut MySqlConnection,
     database: &str,
     group: &str,
+    held: &HashSet<String>,
 ) -> Result<Option<String>> {
     let count = members(group)?;
     let start = rand::rng().random_range(0..count);
     let gate = key(database, group)?;
     for offset in 0..count {
         let member = key(database, &format!("{group}.{}", (start + offset) % count))?;
-        if !take(conn, &member).await? {
+        // GET_LOCK is re-entrant, so a stripe this session holds would count as a second holder's.
+        if held.contains(&member) || !take(conn, &member).await? {
             continue;
         }
         return match is_free(conn, &gate).await {
@@ -173,7 +175,7 @@ impl LockSession {
     /// A shared holder of a group, refused while the group is held exclusively.
     pub async fn shared(&mut self, group: &str) -> Result<Option<Held>> {
         let database = self.database.clone();
-        let Some(member) = take_shared(&mut self.conn, &database, group).await? else {
+        let Some(member) = take_shared(&mut self.conn, &database, group, &self.held).await? else {
             return Ok(None);
         };
         self.held.insert(member.clone());
@@ -286,8 +288,8 @@ impl LockSession {
 }
 
 /// Protects an admission from a concurrent reset, on the pooled connection its transaction uses.
-/// Dropped with the lock still held (a cancelled or failed task), it closes the connection rather
-/// than return a session holding a lock to the pool.
+/// Dropped before the lock is given back (a cancelled or failed task), it closes the connection
+/// rather than return a session holding a lock to the pool.
 pub struct Admission {
     conn: Option<PoolConnection<MySql>>,
     member: String,
@@ -297,15 +299,18 @@ impl Admission {
     /// Fails when a reset is running, or left its durable pause behind while its cleanup may still run.
     pub async fn enter(pool: &MySqlPool) -> Result<Self> {
         const BUSY: &str = "Verification worker, admission or reset is active; retry reset later.";
-        let mut conn = pool.acquire().await?;
-        let database = database_name(&mut conn).await?;
-        let Some(member) = take_shared(&mut conn, &database, "reset").await? else {
+        // Built before the lock is taken, so cancellation at any later point closes the connection.
+        let mut admission = Self {
+            conn: Some(pool.acquire().await?),
+            member: String::new(),
+        };
+        let database = database_name(admission.conn()).await?;
+        let member = take_shared(admission.conn(), &database, "reset", &HashSet::new()).await?;
+        let Some(member) = member else {
+            admission.conn = None;
             bail!(BUSY);
         };
-        let mut admission = Self {
-            conn: Some(conn),
-            member,
-        };
+        admission.member = member;
         let paused: Option<i32> = sqlx::query_scalar(
             "SELECT 1 FROM release_verification_pauses WHERE reason = 'reset' LIMIT 1 LOCK IN SHARE MODE",
         )
@@ -324,13 +329,12 @@ impl Admission {
             .expect("an admission keeps its connection until it leaves")
     }
 
-    /// Gives the lock back and returns the connection to the pool.
+    /// Gives the lock back and returns the connection to the pool. If the release fails or is
+    /// cancelled, the connection stays here and `Drop` closes it.
     pub async fn leave(mut self) -> Result<()> {
-        let mut conn = self.conn.take().expect("an admission leaves once");
-        if let Err(error) = drop_lock(&mut conn, &self.member).await {
-            conn.close_on_drop();
-            return Err(error);
-        }
+        let member = std::mem::take(&mut self.member);
+        drop_lock(self.conn(), &member).await?;
+        self.conn = None;
         Ok(())
     }
 }

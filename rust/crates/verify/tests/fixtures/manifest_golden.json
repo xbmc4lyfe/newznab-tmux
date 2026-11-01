@@ -651,6 +651,349 @@
             "bytes": 700011,
             "document": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head><meta type=\"nntmux:declared-file-count\">2</meta><meta type=\"nntmux:verification-mode\">spot-check</meta></head><file poster=\"poster &lt;poster@example.com&gt;\" date=\"1793449845\" subject=\"file &amp; one.rar &quot;q&quot; (1/2)\"><groups><group>alt.binaries.a</group><group>alt.binaries.b</group></groups><segments><segment number=\"1\" bytes=\"700000\">one@example.com</segment><segment number=\"2\" bytes=\"11\">two@example.com</segment></segments></file></nzb>\n",
             "digest": "e27664967e2c94fa4df97ce7e0365e350b03858b28c90cd78124869af94d9007"
+        },
+        "quotes_in_text": {
+            "manifest": {
+                "legacy_release_id": null,
+                "identity": "abababababababababababababababababababab",
+                "subject": "Some/Release \"name\" é € 😀 [01/02]",
+                "fromname": "poster <poster@example.com>",
+                "date": "2026-10-31 12:30:45",
+                "groups_id": 7,
+                "regex_id": 3,
+                "expected_files": 2,
+                "groups": [
+                    "alt.binaries.a",
+                    ""
+                ],
+                "files": [
+                    {
+                        "key": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+                        "subject": "file & one.rar \"q\"",
+                        "totalparts": 2,
+                        "segments": [
+                            {
+                                "number": 1,
+                                "messageid": "quo\"te@example.com",
+                                "bytes": 700000
+                            },
+                            {
+                                "number": 2,
+                                "messageid": "two@example.com",
+                                "bytes": 11
+                            }
+                        ]
+                    },
+                    {
+                        "key": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                        "subject": "tab\tline\nfile.par2",
+                        "totalparts": 1,
+                        "segments": [
+                            {
+                                "number": 1,
+                                "messageid": "<three@example.com>",
+                                "bytes": 42
+                            }
+                        ]
+                    }
+                ],
+                "conflict": false,
+                "passwords": [
+                    "pa\"ss",
+                    ""
+                ]
+            },
+            "json": "{\"legacy_release_id\":null,\"identity\":\"abababababababababababababababababababab\",\"subject\":\"Some\\/Release \\\"name\\\" \\u00e9 \\u20ac \\ud83d\\ude00 [01\\/02]\",\"fromname\":\"poster <poster@example.com>\",\"date\":\"2026-10-31 12:30:45\",\"groups_id\":7,\"regex_id\":3,\"expected_files\":2,\"groups\":[\"alt.binaries.a\",\"\"],\"files\":[{\"key\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\",\"subject\":\"file & one.rar \\\"q\\\"\",\"totalparts\":2,\"segments\":[{\"number\":1,\"messageid\":\"quo\\\"te@example.com\",\"bytes\":700000},{\"number\":2,\"messageid\":\"two@example.com\",\"bytes\":11}]},{\"key\":\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",\"subject\":\"tab\\tline\\nfile.par2\",\"totalparts\":1,\"segments\":[{\"number\":1,\"messageid\":\"<three@example.com>\",\"bytes\":42}]}],\"conflict\":false,\"passwords\":[\"pa\\\"ss\",\"\"]}",
+            "name": "417cb883db5b44d8b0ae04bc02444452e7d05fdbaaa66423ed101d8c70581c80.json.gz",
+            "status": "ready",
+            "reason": null,
+            "partial_rejection": null,
+            "completeness": {
+                "articles_found": 3,
+                "articles_expected": 3,
+                "files_found": 2,
+                "files_expected": 2
+            },
+            "bytes": 700053,
+            "document": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head><meta type=\"nntmux:verified-file-count\">2</meta><meta type=\"password\">pa&quot;ss</meta><meta type=\"password\"></meta></head><file poster=\"poster &lt;poster@example.com&gt;\" date=\"1793449845\" subject=\"file &amp; one.rar &quot;q&quot; (1/2)\"><groups><group>alt.binaries.a</group><group></group></groups><segments><segment number=\"1\" bytes=\"700000\">quo&quot;te@example.com</segment><segment number=\"2\" bytes=\"11\">two@example.com</segment></segments></file><file poster=\"poster &lt;poster@example.com&gt;\" date=\"1793449845\" subject=\"tab&#9;line&#10;file.par2 (1/1)\"><groups><group>alt.binaries.a</group><group></group></groups><segments><segment number=\"1\" bytes=\"42\">three@example.com</segment></segments></file></nzb>\n",
+            "digest": "cb36c71717ed9b32fc534fc84186b827e44ffbfa1a6ff94159af04b04ab00607"
+        },
+        "no_groups": {
+            "manifest": {
+                "legacy_release_id": null,
+                "identity": "abababababababababababababababababababab",
+                "subject": "Some/Release \"name\" é € 😀 [01/02]",
+                "fromname": "poster <poster@example.com>",
+                "date": "2026-10-31 12:30:45",
+                "groups_id": 7,
+                "regex_id": 3,
+                "expected_files": 2,
+                "groups": [],
+                "files": [
+                    {
+                        "key": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+                        "subject": "file & one.rar \"q\"",
+                        "totalparts": 2,
+                        "segments": [
+                            {
+                                "number": 1,
+                                "messageid": "one@example.com",
+                                "bytes": 700000
+                            },
+                            {
+                                "number": 2,
+                                "messageid": "two@example.com",
+                                "bytes": 11
+                            }
+                        ]
+                    },
+                    {
+                        "key": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                        "subject": "tab\tline\nfile.par2",
+                        "totalparts": 1,
+                        "segments": [
+                            {
+                                "number": 1,
+                                "messageid": "<three@example.com>",
+                                "bytes": 42
+                            }
+                        ]
+                    }
+                ],
+                "conflict": false
+            },
+            "json": "{\"legacy_release_id\":null,\"identity\":\"abababababababababababababababababababab\",\"subject\":\"Some\\/Release \\\"name\\\" \\u00e9 \\u20ac \\ud83d\\ude00 [01\\/02]\",\"fromname\":\"poster <poster@example.com>\",\"date\":\"2026-10-31 12:30:45\",\"groups_id\":7,\"regex_id\":3,\"expected_files\":2,\"groups\":[],\"files\":[{\"key\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\",\"subject\":\"file & one.rar \\\"q\\\"\",\"totalparts\":2,\"segments\":[{\"number\":1,\"messageid\":\"one@example.com\",\"bytes\":700000},{\"number\":2,\"messageid\":\"two@example.com\",\"bytes\":11}]},{\"key\":\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",\"subject\":\"tab\\tline\\nfile.par2\",\"totalparts\":1,\"segments\":[{\"number\":1,\"messageid\":\"<three@example.com>\",\"bytes\":42}]}],\"conflict\":false}",
+            "name": "4a4bfbcdb9ff470d6b977e8bcc0fa01719490287e12e1f53944fca91a9df8d85.json.gz",
+            "status": "ready",
+            "reason": null,
+            "partial_rejection": null,
+            "completeness": {
+                "articles_found": 3,
+                "articles_expected": 3,
+                "files_found": 2,
+                "files_expected": 2
+            },
+            "bytes": 700053,
+            "document": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head><meta type=\"nntmux:verified-file-count\">2</meta></head><file poster=\"poster &lt;poster@example.com&gt;\" date=\"1793449845\" subject=\"file &amp; one.rar &quot;q&quot; (1/2)\"><groups/><segments><segment number=\"1\" bytes=\"700000\">one@example.com</segment><segment number=\"2\" bytes=\"11\">two@example.com</segment></segments></file><file poster=\"poster &lt;poster@example.com&gt;\" date=\"1793449845\" subject=\"tab&#9;line&#10;file.par2 (1/1)\"><groups/><segments><segment number=\"1\" bytes=\"42\">three@example.com</segment></segments></file></nzb>\n",
+            "digest": "4fc5aa9b8ad07fe30f65a04aa829518b99f148f9fbe9add12055ef4e484384cd"
+        },
+        "empty_document": {
+            "manifest": {
+                "legacy_release_id": null,
+                "identity": "abababababababababababababababababababab",
+                "subject": "Some/Release \"name\" é € 😀 [01/02]",
+                "fromname": "poster <poster@example.com>",
+                "date": "2026-10-31 12:30:45",
+                "groups_id": 7,
+                "regex_id": 3,
+                "expected_files": 0,
+                "groups": [
+                    "alt.binaries.a",
+                    "alt.binaries.b"
+                ],
+                "files": [],
+                "conflict": false
+            },
+            "json": "{\"legacy_release_id\":null,\"identity\":\"abababababababababababababababababababab\",\"subject\":\"Some\\/Release \\\"name\\\" \\u00e9 \\u20ac \\ud83d\\ude00 [01\\/02]\",\"fromname\":\"poster <poster@example.com>\",\"date\":\"2026-10-31 12:30:45\",\"groups_id\":7,\"regex_id\":3,\"expected_files\":0,\"groups\":[\"alt.binaries.a\",\"alt.binaries.b\"],\"files\":[],\"conflict\":false}",
+            "name": "57e97ee545b5ec63a9f457b83c027bfaa9c3a95ad162bbb2ccd6561f458f8106.json.gz",
+            "status": "header_rejected",
+            "reason": "Candidate has no file inventory to spot check.",
+            "partial_rejection": "Candidate has no file inventory to spot check.",
+            "completeness": {
+                "articles_found": 0,
+                "articles_expected": 0,
+                "files_found": 0,
+                "files_expected": 0
+            },
+            "bytes": 0,
+            "document": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"/>\n",
+            "digest": "cf105fac992928d78ea7f10778ba2c2cd5caa643361ff5bf284796f685fc91f1"
+        },
+        "fractional_date": {
+            "manifest": {
+                "legacy_release_id": null,
+                "identity": "abababababababababababababababababababab",
+                "subject": "Some/Release \"name\" é € 😀 [01/02]",
+                "fromname": "poster <poster@example.com>",
+                "date": "2026-10-31 12:30:45.250",
+                "groups_id": 7,
+                "regex_id": 3,
+                "expected_files": 2,
+                "groups": [
+                    "alt.binaries.a",
+                    "alt.binaries.b"
+                ],
+                "files": [
+                    {
+                        "key": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+                        "subject": "file & one.rar \"q\"",
+                        "totalparts": 2,
+                        "segments": [
+                            {
+                                "number": 1,
+                                "messageid": "one@example.com",
+                                "bytes": 700000
+                            },
+                            {
+                                "number": 2,
+                                "messageid": "two@example.com",
+                                "bytes": 11
+                            }
+                        ]
+                    },
+                    {
+                        "key": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                        "subject": "tab\tline\nfile.par2",
+                        "totalparts": 1,
+                        "segments": [
+                            {
+                                "number": 1,
+                                "messageid": "<three@example.com>",
+                                "bytes": 42
+                            }
+                        ]
+                    }
+                ],
+                "conflict": false
+            },
+            "json": "{\"legacy_release_id\":null,\"identity\":\"abababababababababababababababababababab\",\"subject\":\"Some\\/Release \\\"name\\\" \\u00e9 \\u20ac \\ud83d\\ude00 [01\\/02]\",\"fromname\":\"poster <poster@example.com>\",\"date\":\"2026-10-31 12:30:45.250\",\"groups_id\":7,\"regex_id\":3,\"expected_files\":2,\"groups\":[\"alt.binaries.a\",\"alt.binaries.b\"],\"files\":[{\"key\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\",\"subject\":\"file & one.rar \\\"q\\\"\",\"totalparts\":2,\"segments\":[{\"number\":1,\"messageid\":\"one@example.com\",\"bytes\":700000},{\"number\":2,\"messageid\":\"two@example.com\",\"bytes\":11}]},{\"key\":\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",\"subject\":\"tab\\tline\\nfile.par2\",\"totalparts\":1,\"segments\":[{\"number\":1,\"messageid\":\"<three@example.com>\",\"bytes\":42}]}],\"conflict\":false}",
+            "name": "dc83eb7bbb71e73df8d0a4a06cdb8fac849e92a7344bbadddc0a79d59a34ffc5.json.gz",
+            "status": "ready",
+            "reason": null,
+            "partial_rejection": null,
+            "completeness": {
+                "articles_found": 3,
+                "articles_expected": 3,
+                "files_found": 2,
+                "files_expected": 2
+            },
+            "bytes": 700053,
+            "document": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head><meta type=\"nntmux:verified-file-count\">2</meta></head><file poster=\"poster &lt;poster@example.com&gt;\" date=\"1793449845\" subject=\"file &amp; one.rar &quot;q&quot; (1/2)\"><groups><group>alt.binaries.a</group><group>alt.binaries.b</group></groups><segments><segment number=\"1\" bytes=\"700000\">one@example.com</segment><segment number=\"2\" bytes=\"11\">two@example.com</segment></segments></file><file poster=\"poster &lt;poster@example.com&gt;\" date=\"1793449845\" subject=\"tab&#9;line&#10;file.par2 (1/1)\"><groups><group>alt.binaries.a</group><group>alt.binaries.b</group></groups><segments><segment number=\"1\" bytes=\"42\">three@example.com</segment></segments></file></nzb>\n",
+            "digest": "92fcdaa8e24d53eed982d5d172762983fc0466887737c6e7c73c3deeb16e2908"
+        },
+        "iso_date": {
+            "manifest": {
+                "legacy_release_id": null,
+                "identity": "abababababababababababababababababababab",
+                "subject": "Some/Release \"name\" é € 😀 [01/02]",
+                "fromname": "poster <poster@example.com>",
+                "date": "2026-10-31T12:30:45+02:00",
+                "groups_id": 7,
+                "regex_id": 3,
+                "expected_files": 2,
+                "groups": [
+                    "alt.binaries.a",
+                    "alt.binaries.b"
+                ],
+                "files": [
+                    {
+                        "key": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+                        "subject": "file & one.rar \"q\"",
+                        "totalparts": 2,
+                        "segments": [
+                            {
+                                "number": 1,
+                                "messageid": "one@example.com",
+                                "bytes": 700000
+                            },
+                            {
+                                "number": 2,
+                                "messageid": "two@example.com",
+                                "bytes": 11
+                            }
+                        ]
+                    },
+                    {
+                        "key": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                        "subject": "tab\tline\nfile.par2",
+                        "totalparts": 1,
+                        "segments": [
+                            {
+                                "number": 1,
+                                "messageid": "<three@example.com>",
+                                "bytes": 42
+                            }
+                        ]
+                    }
+                ],
+                "conflict": false
+            },
+            "json": "{\"legacy_release_id\":null,\"identity\":\"abababababababababababababababababababab\",\"subject\":\"Some\\/Release \\\"name\\\" \\u00e9 \\u20ac \\ud83d\\ude00 [01\\/02]\",\"fromname\":\"poster <poster@example.com>\",\"date\":\"2026-10-31T12:30:45+02:00\",\"groups_id\":7,\"regex_id\":3,\"expected_files\":2,\"groups\":[\"alt.binaries.a\",\"alt.binaries.b\"],\"files\":[{\"key\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\",\"subject\":\"file & one.rar \\\"q\\\"\",\"totalparts\":2,\"segments\":[{\"number\":1,\"messageid\":\"one@example.com\",\"bytes\":700000},{\"number\":2,\"messageid\":\"two@example.com\",\"bytes\":11}]},{\"key\":\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",\"subject\":\"tab\\tline\\nfile.par2\",\"totalparts\":1,\"segments\":[{\"number\":1,\"messageid\":\"<three@example.com>\",\"bytes\":42}]}],\"conflict\":false}",
+            "name": "28940ad18ea34076e0d6042fa6482ff81d3cf35dca2a028579fcf2a989a84076.json.gz",
+            "status": "ready",
+            "reason": null,
+            "partial_rejection": null,
+            "completeness": {
+                "articles_found": 3,
+                "articles_expected": 3,
+                "files_found": 2,
+                "files_expected": 2
+            },
+            "bytes": 700053,
+            "document": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head><meta type=\"nntmux:verified-file-count\">2</meta></head><file poster=\"poster &lt;poster@example.com&gt;\" date=\"1793442645\" subject=\"file &amp; one.rar &quot;q&quot; (1/2)\"><groups><group>alt.binaries.a</group><group>alt.binaries.b</group></groups><segments><segment number=\"1\" bytes=\"700000\">one@example.com</segment><segment number=\"2\" bytes=\"11\">two@example.com</segment></segments></file><file poster=\"poster &lt;poster@example.com&gt;\" date=\"1793442645\" subject=\"tab&#9;line&#10;file.par2 (1/1)\"><groups><group>alt.binaries.a</group><group>alt.binaries.b</group></groups><segments><segment number=\"1\" bytes=\"42\">three@example.com</segment></segments></file></nzb>\n",
+            "digest": "3797b24c89eef4dbc07df6642e1b7e90f2c54c63b75354751419e327fe856f81"
+        },
+        "date_only": {
+            "manifest": {
+                "legacy_release_id": null,
+                "identity": "abababababababababababababababababababab",
+                "subject": "Some/Release \"name\" é € 😀 [01/02]",
+                "fromname": "poster <poster@example.com>",
+                "date": "2026-10-31",
+                "groups_id": 7,
+                "regex_id": 3,
+                "expected_files": 2,
+                "groups": [
+                    "alt.binaries.a",
+                    "alt.binaries.b"
+                ],
+                "files": [
+                    {
+                        "key": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+                        "subject": "file & one.rar \"q\"",
+                        "totalparts": 2,
+                        "segments": [
+                            {
+                                "number": 1,
+                                "messageid": "one@example.com",
+                                "bytes": 700000
+                            },
+                            {
+                                "number": 2,
+                                "messageid": "two@example.com",
+                                "bytes": 11
+                            }
+                        ]
+                    },
+                    {
+                        "key": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                        "subject": "tab\tline\nfile.par2",
+                        "totalparts": 1,
+                        "segments": [
+                            {
+                                "number": 1,
+                                "messageid": "<three@example.com>",
+                                "bytes": 42
+                            }
+                        ]
+                    }
+                ],
+                "conflict": false
+            },
+            "json": "{\"legacy_release_id\":null,\"identity\":\"abababababababababababababababababababab\",\"subject\":\"Some\\/Release \\\"name\\\" \\u00e9 \\u20ac \\ud83d\\ude00 [01\\/02]\",\"fromname\":\"poster <poster@example.com>\",\"date\":\"2026-10-31\",\"groups_id\":7,\"regex_id\":3,\"expected_files\":2,\"groups\":[\"alt.binaries.a\",\"alt.binaries.b\"],\"files\":[{\"key\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\",\"subject\":\"file & one.rar \\\"q\\\"\",\"totalparts\":2,\"segments\":[{\"number\":1,\"messageid\":\"one@example.com\",\"bytes\":700000},{\"number\":2,\"messageid\":\"two@example.com\",\"bytes\":11}]},{\"key\":\"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b\",\"subject\":\"tab\\tline\\nfile.par2\",\"totalparts\":1,\"segments\":[{\"number\":1,\"messageid\":\"<three@example.com>\",\"bytes\":42}]}],\"conflict\":false}",
+            "name": "ea5bafc4c7d20d05aef5af8b3b84c258beded326243296c959722205fb945f10.json.gz",
+            "status": "ready",
+            "reason": null,
+            "partial_rejection": null,
+            "completeness": {
+                "articles_found": 3,
+                "articles_expected": 3,
+                "files_found": 2,
+                "files_expected": 2
+            },
+            "bytes": 700053,
+            "document": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"><head><meta type=\"nntmux:verified-file-count\">2</meta></head><file poster=\"poster &lt;poster@example.com&gt;\" date=\"1793404800\" subject=\"file &amp; one.rar &quot;q&quot; (1/2)\"><groups><group>alt.binaries.a</group><group>alt.binaries.b</group></groups><segments><segment number=\"1\" bytes=\"700000\">one@example.com</segment><segment number=\"2\" bytes=\"11\">two@example.com</segment></segments></file><file poster=\"poster &lt;poster@example.com&gt;\" date=\"1793404800\" subject=\"tab&#9;line&#10;file.par2 (1/1)\"><groups><group>alt.binaries.a</group><group>alt.binaries.b</group></groups><segments><segment number=\"1\" bytes=\"42\">three@example.com</segment></segments></file></nzb>\n",
+            "digest": "9a53415707d2356d87af7e334d4e0ea888f8ff01d0ec3000c663aa4ebc0ef363"
         }
     },
     "fingerprints": [

@@ -144,12 +144,10 @@ pub async fn adjust(
         .await?
         .rows_affected()
     } else {
-        // A release never drives the unsigned column below zero.
+        // An unsigned underflow is an error, so accounting drift aborts the transaction visibly.
         sqlx::query(
-            "UPDATE release_verification_state \
-             SET pending_bytes = IF(pending_bytes < ?, 0, pending_bytes - ?) WHERE id = 1",
+            "UPDATE release_verification_state SET pending_bytes = pending_bytes - ? WHERE id = 1",
         )
-        .bind(-delta)
         .bind(-delta)
         .execute(&mut *conn)
         .await?

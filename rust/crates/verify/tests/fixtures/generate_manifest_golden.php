@@ -73,6 +73,17 @@ $cases = [
 
         return $m;
     })(),
+    'quotes_in_text' => (static function () {
+        $m = collection(['passwords' => ['pa"ss', ''], 'groups' => ['alt.binaries.a', '']]);
+        $m['files'][0]['segments'][0]['messageid'] = 'quo"te@example.com';
+
+        return $m;
+    })(),
+    'no_groups' => collection(['groups' => []]),
+    'empty_document' => collection(['files' => [], 'expected_files' => 0]),
+    'fractional_date' => collection(['date' => '2026-10-31 12:30:45.250']),
+    'iso_date' => collection(['date' => '2026-10-31T12:30:45+02:00']),
+    'date_only' => collection(['date' => '2026-10-31']),
 ];
 
 $writer = (new ReflectionClass(VerifiedNzbWriter::class))->newInstanceWithoutConstructor();

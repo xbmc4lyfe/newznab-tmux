@@ -3,7 +3,7 @@
 use std::fmt::Write;
 
 use anyhow::{Result, bail};
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 
 use crate::manifest::{Manifest, valid_passwords};
 
@@ -35,6 +35,7 @@ fn text(value: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
             '\r' => out.push_str("&#13;"),
             c => out.push(c),
         }
@@ -44,9 +45,17 @@ fn text(value: &str) -> String {
 
 /// The Unix time a stored post date names; the app runs in UTC. An unparsable date writes an empty
 /// attribute, as `(string) strtotime()` did.
-fn post_time(date: Option<&str>) -> String {
-    date.and_then(|value| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").ok())
-        .map(|parsed| parsed.and_utc().timestamp().to_string())
+fn post_time(value: &str) -> String {
+    let parsed = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+        .map(|naive| naive.and_utc().timestamp())
+        .or_else(|_| DateTime::parse_from_rfc3339(value).map(|at| at.timestamp()))
+        .or_else(|_| DateTime::parse_from_rfc2822(value).map(|at| at.timestamp()))
+        .or_else(|_| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map(|day| day.and_time(NaiveTime::MIN).and_utc().timestamp())
+        });
+    parsed
+        .map(|seconds| seconds.to_string())
         .unwrap_or_default()
 }
 
@@ -73,7 +82,15 @@ pub fn document(manifest: &Manifest, verified_file_count: i64) -> Result<String>
     let inventory = head_inventory(manifest, verified_file_count);
     let mut xml = String::with_capacity(4096);
     xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    write!(xml, "<nzb xmlns=\"{NZB_NAMESPACE}\">")?;
+    write!(xml, "<nzb xmlns=\"{NZB_NAMESPACE}\"")?;
+    let has_files = manifest.files.iter().any(|file| !file.segments.is_empty());
+    let has_head = inventory > 0 || spot_check || !passwords.is_empty();
+    // libxml self-closes an element that got no content.
+    if !has_head && !has_files {
+        xml.push_str("/>\n");
+        return Ok(xml);
+    }
+    xml.push('>');
     if inventory > 0 || spot_check || !passwords.is_empty() {
         xml.push_str("<head>");
         if spot_check {
@@ -96,11 +113,20 @@ pub fn document(manifest: &Manifest, verified_file_count: i64) -> Result<String>
         xml.push_str("</head>");
     }
     let poster = attribute(&manifest.fromname);
-    let date = post_time(manifest.date.as_deref());
+    // A collection with no post date can't publish; it retries until it expires.
+    let Some(date) = manifest.date.as_deref() else {
+        bail!("Verified NZB has no post date.");
+    };
+    let date = post_time(date);
     let mut groups = String::new();
     for group in &manifest.groups {
         write!(groups, "<group>{}</group>", text(group))?;
     }
+    let groups = if groups.is_empty() {
+        "<groups/>".to_owned()
+    } else {
+        format!("<groups>{groups}</groups>")
+    };
     for file in &manifest.files {
         if file.segments.is_empty() {
             continue;
@@ -108,7 +134,7 @@ pub fn document(manifest: &Manifest, verified_file_count: i64) -> Result<String>
         let subject = attribute(&format!("{} (1/{})", file.subject, file.totalparts));
         write!(
             xml,
-            "<file poster=\"{poster}\" date=\"{date}\" subject=\"{subject}\"><groups>{groups}</groups><segments>"
+            "<file poster=\"{poster}\" date=\"{date}\" subject=\"{subject}\">{groups}<segments>"
         )?;
         for segment in &file.segments {
             write!(

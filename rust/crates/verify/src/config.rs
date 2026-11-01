@@ -47,7 +47,7 @@ impl VerificationConfig {
             host: var_or("RELEASE_VERIFICATION_HOST", ""),
             storage_path: PathBuf::from(var_or(
                 "RELEASE_VERIFICATION_STORAGE_PATH",
-                "storage/app/release-verification",
+                "/app/storage/app/release-verification",
             )),
         })
     }
