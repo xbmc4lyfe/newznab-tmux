@@ -37,6 +37,17 @@ use crate::filename::exact_value;
 
 pub use crate::index::{PredbIndex, PredbMatch, match_pre};
 
+/// The gate for one timed pass. The next tick retries after a pause or a failure.
+async fn admit(ctx: &Ctx) -> Option<nntmux_runtime::busy::Busy> {
+    match nntmux_runtime::busy::enter(ctx, "predb").await {
+        Ok(busy) => busy,
+        Err(error) => {
+            tracing::warn!(error = format!("{error:#}"), "PreDB pass not admitted");
+            None
+        }
+    }
+}
+
 /// The `predb` role: the IRC and WebSocket scrapers, plus the feed import and title check
 /// that the Laravel scheduler ran every five and ten minutes.
 pub async fn run(ctx: Ctx, _args: RoleArgs, stop: Shutdown) -> Result<()> {
@@ -64,9 +75,12 @@ pub async fn run(ctx: Ctx, _args: RoleArgs, stop: Shutdown) -> Result<()> {
                 () = stop.token().cancelled_owned() => return,
                 _ = timer.tick() => {}
             }
-            if !config.enabled || ctx.paused().await.unwrap_or(true) {
+            if !config.enabled {
                 continue;
             }
+            let Some(_busy) = admit(&ctx).await else {
+                continue;
+            };
             let args = feeds::command::ImportArgs {
                 source: Vec::new(),
                 pages: 1,
@@ -93,9 +107,9 @@ pub async fn run(ctx: Ctx, _args: RoleArgs, stop: Shutdown) -> Result<()> {
                 () = stop.token().cancelled_owned() => return,
                 _ = timer.tick() => {}
             }
-            if ctx.paused().await.unwrap_or(true) {
+            let Some(_busy) = admit(&ctx).await else {
                 continue;
-            }
+            };
             tokio::select! {
                 () = stop.token().cancelled_owned() => return,
                 result = check_pre(&ctx.db, Some(3)) => {

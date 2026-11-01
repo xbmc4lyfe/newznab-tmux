@@ -1,26 +1,23 @@
 //! Turning sampled articles into a release's compact fingerprint record.
 
 use crate::backfill::{FORMAT, SCHEMA_VERSION};
+use crate::breaker;
+use crate::database::{self, Claim};
 use crate::manifest::{self, File, Sample};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use md5::{Digest, Md5};
+use nntmux_nntp::fingerprint::{Article, Client, Provider};
 use nntmux_yenc as yenc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::MySqlPool;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Collected {
     pub status: String,
     pub data: Value,
-}
-/// One article a provider returned.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Article {
-    pub headers: Vec<String>,
-    pub body: Vec<u8>,
-    pub response: String,
-    pub ms: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderEvidence {
@@ -82,6 +79,114 @@ fn article_identity(
         return Some("ArticleIdentityMismatch");
     }
     None
+}
+pub async fn run(
+    pool: &MySqlPool,
+    claim: &Claim,
+    worker: &str,
+    providers: &[Provider],
+    alternate_percent: u32,
+    timeout: u64,
+) -> Result<Collected> {
+    let xml = database::decode_nzb(claim)?;
+    let files = manifest::parse(&xml)?;
+    let (samples, _) = manifest::samples(&files);
+    let mut evidence = vec![];
+    for p in providers {
+        if p.account == "alternate"
+            && crc32fast::hash(claim.release_id.to_string().as_bytes()) % 100
+                >= alternate_percent.min(100)
+        {
+            continue;
+        }
+        let decision = if p.account == "alternate" {
+            Some(breaker::begin(pool, &p.account).await?)
+        } else {
+            None
+        };
+        if let Some(skipped_reason) = decision.as_ref().and_then(|d| d.skipped_reason.clone()) {
+            evidence.push(ProviderEvidence {
+                account: p.account.clone(),
+                host: p.host.clone(),
+                port: p.port.to_string(),
+                tls: p.tls,
+                implementation: None,
+                profile: "NntpProviderUnavailableException".into(),
+                skipped_reason: Some(skipped_reason),
+                articles: samples
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.messageid.clone(),
+                            Err("NntpProviderUnavailableException".into()),
+                        )
+                    })
+                    .collect(),
+            });
+            continue;
+        }
+        database::slot(pool, claim, &p.account, worker).await?;
+        let mut client = Client::connect(p, timeout).await.ok();
+        let mut entries = BTreeMap::new();
+        let mut implementation = None;
+        let mut profile = "ok".to_string();
+        let mut unavailable = false;
+        if let Some(connection) = client.as_mut() {
+            if connection.profile().await.is_err() {
+                profile = "ProfileResponseInvalid".into();
+                if let Some(decision) = decision.as_ref() {
+                    breaker::release_probe(pool, &p.account, decision).await?;
+                }
+            } else if let Some(decision) = decision.as_ref() {
+                breaker::reachable(pool, &p.account, decision).await?;
+            }
+            implementation = connection.implementation.clone();
+        } else {
+            profile = "NntpProviderUnavailableException".into();
+            if decision.is_some() {
+                breaker::unavailable(pool, &p.account).await?;
+                unavailable = true;
+            }
+        }
+        for sample in &samples {
+            if !unavailable && client.as_ref().is_none_or(Client::poisoned) {
+                drop(client.take());
+                client = Client::connect(p, timeout).await.ok();
+                if client.is_none() && decision.is_some() {
+                    breaker::unavailable(pool, &p.account).await?;
+                    unavailable = true;
+                }
+            }
+            let article = if unavailable {
+                Err("NntpProviderUnavailableException".into())
+            } else if let Some(connection) = client.as_mut() {
+                connection
+                    .article(&sample.messageid)
+                    .await
+                    .map_err(|error| {
+                        if error.to_string().contains("NntpArticleMissingException") {
+                            "NntpArticleMissingException".to_string()
+                        } else {
+                            "RuntimeException".to_string()
+                        }
+                    })
+            } else {
+                Err("NntpProviderUnavailableException".into())
+            };
+            entries.insert(sample.messageid.clone(), article);
+        }
+        evidence.push(ProviderEvidence {
+            account: p.account.clone(),
+            host: p.host.clone(),
+            port: p.port.to_string(),
+            tls: p.tls,
+            implementation,
+            profile,
+            skipped_reason: None,
+            articles: entries,
+        });
+    }
+    Ok(analyze(&files, &evidence))
 }
 pub fn analyze(files: &[File], evidence: &[ProviderEvidence]) -> Collected {
     let (samples, omitted) = manifest::samples(files);

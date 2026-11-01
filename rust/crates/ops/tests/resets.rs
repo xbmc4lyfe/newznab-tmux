@@ -230,6 +230,21 @@ async fn truncate_keeps_releases_with_nzbs_and_clear_empties_everything() -> Res
     .await?;
     assert_eq!(dirty, 0);
 
+    // Nothing that points at a release may survive, or a reused release id collides with it.
+    let referencing: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE \
+         WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME = 'releases'",
+    )
+    .fetch_all(db)
+    .await?;
+    assert!(!referencing.is_empty());
+    for table in referencing {
+        assert!(
+            resets::RESET_TABLES.contains(&table.as_str()),
+            "{table} isn't reset"
+        );
+    }
+
     // Every listed table exists, or the truncate fails here.
     resets::clear_database(db).await?;
     let releases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM releases")
