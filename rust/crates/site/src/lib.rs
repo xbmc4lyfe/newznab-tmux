@@ -5,6 +5,7 @@
 mod auth;
 mod guest;
 mod mailer;
+mod pages;
 mod statics;
 pub mod validate;
 
@@ -12,6 +13,8 @@ use axum::Router;
 use nntmux_runtime::Ctx;
 
 pub fn router() -> Router<Ctx> {
-    let pages = Router::new().merge(auth::router());
-    nntmux_webkit::stack(pages).merge(statics::router())
+    let pages = Router::new().merge(auth::router()).merge(pages::router());
+    nntmux_webkit::stack(pages)
+        .merge(statics::router())
+        .merge(pages::cover_router())
 }

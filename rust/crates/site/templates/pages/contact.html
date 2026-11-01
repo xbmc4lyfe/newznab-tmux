@@ -1,0 +1,117 @@
+{% extends "layout.html" %}
+{% import "components.html" as c %}
+
+
+{% block head %}{% if let Some(captcha) = captcha %}<script src="{{ captcha.script() }}" nonce="{{ layout.nonce }}" async defer></script>{% endif %}{% endblock %}
+{% block content %}
+<div class="w-full contact-page-container mx-auto">
+    <div class="surface-panel rounded-xl shadow-sm mb-6">
+        {% call c::page_header("Contact us", "We are here to help", "Send a message to the site team and we will get back to you as soon as possible.", "fas fa-message") %}{% endcall %}
+
+        <div class="px-6 py-8 lg:px-12 lg:py-10">
+            {% if sent %}
+                <div class="mb-6 p-4 bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-700 text-green-800 dark:text-green-200 rounded-lg">
+                    <i class="fa fa-check-circle mr-2"></i><h2 style="text-align:center;">Thank you for getting in touch with {{ layout.app_name }}.</h2>
+                </div>
+            {% endif %}
+
+            {% if let Some(success) = layout.flash_success %}
+                <div class="mb-6 p-4 bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-700 text-green-800 dark:text-green-200 rounded-lg">
+                    <i class="fa fa-check-circle mr-2"></i>{{ success }}
+                </div>
+            {% endif %}
+
+            {% if !errors.is_empty() %}
+                <div class="mb-6 p-4 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-700 text-red-800 dark:text-red-200 rounded-lg">
+                    <i class="fa fa-exclamation-circle mr-2"></i>
+                    <ul class="mb-0 list-disc list-inside">
+                        {% for error in errors %}
+                            <li>{{ error }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            {% endif %}
+
+            <div class="mb-6">
+                <h3 class="text-2xl font-semibold text-gray-800 dark:text-gray-200 mb-3">Have a question?</h3>
+                <p class="text-gray-600 dark:text-gray-400">Don't hesitate to send us a message. Our team will be happy to help you.</p>
+            </div>
+
+            <form method="POST" action="/contact-us">
+                <input type="hidden" name="_token" value="{{ layout.csrf }}">
+                <div class="mb-6">
+                    <label for="username" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                        Name <span class="text-red-500">*</span>
+                    </label>
+                    <div class="flex">
+                        <span class="inline-flex items-center px-3 bg-gray-50 dark:bg-gray-900 border border-r-0 border-gray-300 dark:border-gray-600 rounded-l-md">
+                            <i class="fas fa-user text-gray-500 dark:text-gray-400"></i>
+                        </span>
+                        <input id="username" type="text" name="username" value="{{ old_username }}"
+                               placeholder="Your name"
+                               class="flex-1 block w-full px-4 py-3 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-r-md focus:ring-2 focus:ring-primary-500 focus:border-primary-500 placeholder-gray-400 dark:placeholder-gray-500 {% if let Some(message) = error_username %} border-red-500 {% endif %}"
+                               required>
+                    </div>
+                    {% if let Some(message) = error_username %}
+                        <div class="text-red-500 dark:text-red-400 text-sm mt-1">{{ message }}</div>
+                    {% endif %}
+                </div>
+
+                <div class="mb-6">
+                    <label for="useremail" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                        Email <span class="text-red-500">*</span>
+                    </label>
+                    <div class="flex">
+                        <span class="inline-flex items-center px-3 bg-gray-50 dark:bg-gray-900 border border-r-0 border-gray-300 dark:border-gray-600 rounded-l-md">
+                            <i class="fas fa-envelope text-gray-500 dark:text-gray-400"></i>
+                        </span>
+                        <input type="email" id="useremail" name="useremail" value="{{ old_useremail }}"
+                               placeholder="Your email address"
+                               class="flex-1 block w-full px-4 py-3 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-r-md focus:ring-2 focus:ring-primary-500 focus:border-primary-500 placeholder-gray-400 dark:placeholder-gray-500 {% if let Some(message) = error_useremail %} border-red-500 {% endif %}"
+                               required>
+                    </div>
+                    {% if let Some(message) = error_useremail %}
+                        <div class="text-red-500 dark:text-red-400 text-sm mt-1">{{ message }}</div>
+                    {% endif %}
+                </div>
+
+                <div class="mb-6">
+                    <label for="comment" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                        Message <span class="text-red-500">*</span>
+                    </label>
+                    <div class="flex">
+                        <span class="inline-flex items-start px-3 pt-3 bg-gray-50 dark:bg-gray-900 border border-r-0 border-gray-300 dark:border-gray-600 rounded-tl-md rounded-bl-md">
+                            <i class="fas fa-comment text-gray-500 dark:text-gray-400"></i>
+                        </span>
+                        <textarea rows="7" name="comment" id="comment"
+                                  placeholder="Your message"
+                                  class="flex-1 block w-full px-4 py-3 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded-r-md focus:ring-2 focus:ring-primary-500 focus:border-primary-500 placeholder-gray-400 dark:placeholder-gray-500 {% if let Some(message) = error_comment %} border-red-500 {% endif %}"
+                                  required>{{ old_comment }}</textarea>
+                    </div>
+                    {% if let Some(message) = error_comment %}
+                        <div class="text-red-500 dark:text-red-400 text-sm mt-1">{{ message }}</div>
+                    {% endif %}
+                </div>
+
+                {% if let Some(captcha) = captcha %}<div class="mb-6"><div class="{{ captcha.class() }}" data-sitekey="{{ captcha.sitekey }}"></div></div>{% if let Some(message) = error_captcha %}<p class="mt-2 text-sm text-red-600 dark:text-red-400">{{ message }}</p>{% endif %}{% endif %}
+                <div class="w-full">
+                    <button type="submit" class="w-full bg-green-600 dark:bg-green-700 hover:bg-green-700 dark:hover:bg-green-800 text-white font-semibold py-3 px-6 rounded-lg transition duration-150 ease-in-out flex items-center justify-center text-lg">
+                        <i class="fas fa-paper-plane mr-2"></i>Send Message
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <div class="surface-panel-alt px-6 py-4 border-t rounded-b-lg text-center">
+            <p class="mb-0 text-gray-600 dark:text-gray-400">
+                <i class="fas fa-info-circle mr-1"></i>
+                We typically respond to messages within 1-2 business days.
+            </p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+    {% if let Some(captcha) = captcha %}<div class="mb-6"><div class="{{ captcha.class() }}" data-sitekey="{{ captcha.sitekey }}"></div></div>{% if let Some(message) = error_captcha %}<p class="mt-2 text-sm text-red-600 dark:text-red-400">{{ message }}</p>{% endif %}{% endif %}
+{% endblock %}

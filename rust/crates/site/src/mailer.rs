@@ -79,6 +79,21 @@ impl Letter<'_> {
     }
 }
 
+pub async fn send_contact(ctx: &Ctx, to: &str, reply_to: &str, body: &str) -> Result<()> {
+    Letter {
+        to,
+        subject: "Contact form submitted",
+        heading: "Contact form submitted",
+        paragraphs: body.lines().map(str::to_owned).collect(),
+        button: None,
+        panel: None,
+        after: Vec::new(),
+        reply_to: Some(reply_to.to_owned()),
+    }
+    .send(ctx)
+    .await
+}
+
 pub async fn send_verification(ctx: &Ctx, to: &str, username: &str, url: &str) -> Result<()> {
     let site = config::app_name();
     let greeting = if username.is_empty() {
