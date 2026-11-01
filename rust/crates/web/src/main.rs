@@ -17,7 +17,8 @@ use tracing::info;
 async fn main() -> Result<()> {
     nntmux_webkit::config::require_app_key()?;
     let config = Config::from_env()?;
-    let metrics = nntmux_telemetry::init(&config.log_filter, config.log_json)?;
+    let metrics =
+        nntmux_telemetry::init_for_role(&config.log_filter, config.log_json, Some("web"))?;
     let stop = Shutdown::on_signals()?;
     let health = tokio::spawn(nntmux_telemetry::serve(
         config.health_addr,
