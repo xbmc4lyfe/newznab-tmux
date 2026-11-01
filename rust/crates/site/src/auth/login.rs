@@ -132,6 +132,7 @@ pub async fn submit(
     let remember = input.boolean("rememberme") || input.boolean("remember");
     let breached = validate::is_breached(&password, 1).await;
 
+    let mut passed = false;
     if two_factor::required(&ctx, user.id).await? {
         let trusted = match config::cookie_value(&headers, auth::TRUSTED_DEVICE_COOKIE) {
             Some(cookie) => {
@@ -148,11 +149,15 @@ pub async fn submit(
             auth::clear_two_factor(&session);
             return Ok(Redirect::to("/2fa/verify").into_response());
         }
-        auth::mark_two_factor_passed(&session);
         session.put("2fa:trusted_device", true);
+        passed = true;
     }
 
     auth::login(&session, &user);
+    // `login` clears this, so it follows.
+    if passed {
+        auth::mark_two_factor_passed(&session);
+    }
     auth::rotate_session_token(&ctx, &session, user.id).await?;
     throttle::clear(&ctx, &key).await;
     session.flash("info", "You have been logged in");

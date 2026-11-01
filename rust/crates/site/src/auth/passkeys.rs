@@ -31,6 +31,8 @@ const INVALID: &str = "Could not login using the given passkey";
 const REGISTER_FAILED: &str = "Something went wrong generating the passkey.";
 /// `password.confirm:…,900`
 const CONFIRM_SECONDS: i64 = 900;
+/// The largest browser response worth parsing as JSON.
+const MAX_RESPONSE: usize = 64 * 1024;
 
 pub fn router() -> Router<Ctx> {
     let sign_in = Router::new()
@@ -47,6 +49,9 @@ pub fn router() -> Router<Ctx> {
         .route("/passkeys", post(store))
         .route("/passkeys/{passkey}", delete(destroy))
         .route_layer(from_fn(password_confirmed))
+        .route_layer(from_fn(|request, next| {
+            throttle::limit(request, next, "passkeys-manage", 20, 60)
+        }))
         .route_layer(from_fn(guard::two_factor))
         .route_layer(from_fn(guard::verified))
         .route_layer(from_fn(guard::authenticated));
@@ -92,6 +97,27 @@ fn rp_id() -> String {
     }
 }
 
+/// `scheme://host[:port]` of `APP_URL`.
+fn app_origin() -> String {
+    let url = config::app_url();
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url.as_str()));
+    format!("{scheme}://{}", rest.split('/').next().unwrap_or_default())
+}
+
+fn party<'a>(rp_id: &'a str, app_origin: &'a str) -> webauthn::Party<'a> {
+    webauthn::Party { rp_id, app_origin }
+}
+
+/// One of the values the WebAuthn spec allows, or `preferred`.
+fn requirement(key: &str) -> String {
+    let value = var_or(key, "preferred");
+    if matches!(value.as_str(), "required" | "preferred" | "discouraged") {
+        value
+    } else {
+        "preferred".to_owned()
+    }
+}
+
 fn challenge() -> String {
     webauthn::encode(&rand::random::<[u8; 32]>())
 }
@@ -110,16 +136,20 @@ fn refused(session: &Session, message: &str, reason: &str) -> Response {
 
 /// Finds and checks the passkey, then saves its new counter. `None` is a failed sign-in.
 async fn check_passkey(ctx: &Ctx, raw: &str, challenge: &str) -> Result<Option<i64>> {
+    if raw.len() > MAX_RESPONSE {
+        return Ok(None);
+    }
     let Ok(credential) = serde_json::from_str::<Value>(raw) else {
         return Ok(None);
     };
+    let (rp_id, app_origin) = (rp_id(), app_origin());
     let Ok(id) = webauthn::credential_id(&credential) else {
         return Ok(None);
     };
     // PHP's `credential_id` column mangled binary ids, so the stored JSON is what identifies one.
     let row: Option<(i64, i64, String)> = sqlx::query_as(
         "SELECT CAST(id AS SIGNED), CAST(authenticatable_id AS SIGNED), CAST(data AS CHAR) FROM passkeys
-         WHERE JSON_VALUE(data, '$.publicKeyCredentialId') = ? LIMIT 1",
+         WHERE JSON_VALUE(data, '$.publicKeyCredentialId') = ? ORDER BY id LIMIT 1",
     )
     .bind(&id)
     .fetch_optional(&ctx.db)
@@ -128,7 +158,12 @@ async fn check_passkey(ctx: &Ctx, raw: &str, challenge: &str) -> Result<Option<i
         return Ok(None);
     };
     let stored: Value = serde_json::from_str(&data)?;
-    let updated = match webauthn::verify_assertion(&credential, &stored, challenge, &rp_id()) {
+    let updated = match webauthn::verify_assertion(
+        &credential,
+        &stored,
+        challenge,
+        &party(&rp_id, &app_origin),
+    ) {
         Ok(updated) => updated,
         Err(error) => {
             tracing::warn!(passkey, %error, "passkey sign-in refused");
@@ -191,10 +226,13 @@ async fn authenticate(
         auth::record_login(&ctx, user.id, &ip).await,
         "recording the login",
     );
-    // A passkey is enough on its own, so no code is asked for.
+    // Anything confirmed for an account signed in on this session doesn't carry over.
+    session.forget(CONFIRMED_AT);
+    session.forget(REGISTER_CHALLENGE);
     session.forget("2fa:trusted_device");
-    auth::mark_two_factor_passed(&session);
     auth::login(&session, &user);
+    // A passkey is enough on its own, so no code is asked for. `login` clears this, so it follows.
+    auth::mark_two_factor_passed(&session);
     auth::rotate_session_token(&ctx, &session, user.id).await?;
     session.flash("info", "You have been logged in");
     let mut response = Redirect::to(&guard::pull_intended(&session, "/")).into_response();
@@ -243,9 +281,9 @@ async fn register_options(
         user.email.clone()
     };
     let mut selection = json!({
-        "residentKey": var_or("PASSKEY_RESIDENT_KEY", "preferred"),
-        "requireResidentKey": var_or("PASSKEY_RESIDENT_KEY", "preferred") == "required",
-        "userVerification": var_or("PASSKEY_USER_VERIFICATION", "preferred"),
+            "residentKey": requirement("PASSKEY_RESIDENT_KEY"),
+    "requireResidentKey": requirement("PASSKEY_RESIDENT_KEY") == "required",
+    "userVerification": requirement("PASSKEY_USER_VERIFICATION"),
     });
     let attachment = var_or("PASSKEY_AUTHENTICATOR_ATTACHMENT", "");
     if matches!(attachment.as_str(), "platform" | "cross-platform") {
@@ -279,8 +317,17 @@ async fn register(
     raw: &str,
     challenge: &str,
 ) -> Result<Value> {
+    anyhow::ensure!(raw.len() <= MAX_RESPONSE, "the response is too large");
     let credential: Value = serde_json::from_str(raw)?;
-    let (id, data) = webauthn::verify_registration(&credential, challenge, &rp_id(), user_id)?;
+    let (rp_id, app_origin) = (rp_id(), app_origin());
+    let require_verified = requirement("PASSKEY_USER_VERIFICATION") == "required";
+    let (id, data) = webauthn::verify_registration(
+        &credential,
+        challenge,
+        &party(&rp_id, &app_origin),
+        require_verified,
+        user_id,
+    )?;
     let taken: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM passkeys WHERE JSON_VALUE(data, '$.publicKeyCredentialId') = ?",
     )

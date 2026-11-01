@@ -250,6 +250,29 @@ async fn register_then_sign_in_then_delete() {
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["ok"], true);
 }
 
+async fn insert_passkey(db: &sqlx::MySqlPool, user: i64, authenticator: &Authenticator) {
+    let data = json!({
+        "publicKeyCredentialId": encode(&authenticator.id),
+        "type": "public-key",
+        "transports": ["internal", "hybrid"],
+        "attestationType": "none",
+        "trustPath": [],
+        "aaguid": "00000000-0000-0000-0000-000000000000",
+        "credentialPublicKey": encode(&authenticator.cose()),
+        "userHandle": encode(user.to_string().as_bytes()),
+        "counter": 0,
+        "backupEligible": true,
+        "backupStatus": true,
+        "uvInitialized": true,
+    });
+    sqlx::query("INSERT INTO passkeys (authenticatable_id, name, credential_id, data, created_at, updated_at) VALUES (?, 'Old', '??mangled??', ?, NOW(), NOW())")
+        .bind(user)
+        .bind(data.to_string())
+        .execute(db)
+        .await
+        .unwrap();
+}
+
 /// The row shape PHP's webauthn-lib wrote, with the mangled `credential_id` it stored.
 #[tokio::test]
 async fn a_passkey_registered_under_php_still_signs_in() {
@@ -259,26 +282,7 @@ async fn a_passkey_registered_under_php_still_signs_in() {
     let name = unique("phil");
     let id = add_user(&db.pool, &name, true, 1).await;
     let mut authenticator = Authenticator::new();
-    let data = json!({
-        "publicKeyCredentialId": encode(&authenticator.id),
-        "type": "public-key",
-        "transports": ["internal", "hybrid"],
-        "attestationType": "none",
-        "trustPath": {"type": "Webauthn\\TrustPath\\EmptyTrustPath"},
-        "aaguid": "00000000-0000-0000-0000-000000000000",
-        "credentialPublicKey": encode(&authenticator.cose()),
-        "userHandle": encode(id.to_string().as_bytes()),
-        "counter": 0,
-        "backupEligible": true,
-        "backupStatus": true,
-        "uvInitialized": true,
-    });
-    sqlx::query("INSERT INTO passkeys (authenticatable_id, name, credential_id, data, created_at, updated_at) VALUES (?, 'Old', '??mangled??', ?, NOW(), NOW())")
-        .bind(id)
-        .bind(data.to_string())
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    insert_passkey(&db.pool, id, &authenticator).await;
 
     let mut browser = Browser::new(&ctx);
     let sign_in_challenge = challenge(&mut browser).await;
@@ -331,4 +335,69 @@ async fn a_passkey_registered_under_php_still_signs_in() {
         )
         .await;
     assert_eq!(location(&response), "/login");
+}
+
+#[tokio::test]
+async fn a_passkey_counts_as_the_second_factor_and_drops_old_confirmations() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let name = unique("tia");
+    let id = add_user(&db.pool, &name, true, 1).await;
+    sqlx::query("INSERT INTO password_securities (user_id, google2fa_enable, google2fa_secret) VALUES (?, 1, 'JBSWY3DPEHPK3PXP')")
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut authenticator = Authenticator::new();
+    insert_passkey(&db.pool, id, &authenticator).await;
+
+    let mut browser = Browser::new(&ctx);
+    let sign_in_challenge = challenge(&mut browser).await;
+    let signed = authenticator.sign_in(&sign_in_challenge, id);
+    let (response, _) = browser
+        .post(
+            "/passkeys/authenticate",
+            &[("start_authentication_response", &signed)],
+        )
+        .await;
+    assert_eq!(location(&response), "/");
+    let (response, _) = browser.get("/confirm-password").await;
+    assert_eq!(response.status(), StatusCode::OK, "no code is asked for");
+    let (response, _) = browser
+        .post_authed("/passkeys/register-options", &[("name", "Next")])
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::LOCKED,
+        "the password wasn't confirmed by this sign-in"
+    );
+}
+
+#[tokio::test]
+async fn the_pages_ajax_request_shape_is_accepted() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let name = unique("axl");
+    add_user(&db.pool, &name, true, 1).await;
+    let mut browser = Browser::new(&ctx);
+    browser
+        .post("/login", &[("username", &name), ("password", PASSWORD)])
+        .await;
+    browser
+        .post_authed("/confirm-password", &[("password", PASSWORD)])
+        .await;
+    let page = browser.get("/confirm-password").await.1;
+    // What axios sends once bootstrap.js has set the token header.
+    let request = axum::http::Request::post("/passkeys/register-options")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/plain, */*")
+        .header("x-requested-with", "XMLHttpRequest")
+        .header("x-csrf-token", extract_token(&page));
+    let (response, body) = browser
+        .send(request, json!({"name": "Laptop"}).to_string())
+        .await;
+    assert_eq!(response.status(), StatusCode::OK, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["ok"], true);
 }

@@ -16,11 +16,27 @@ const USER_VERIFIED: u8 = 0x04;
 const BACKUP_ELIGIBLE: u8 = 0x08;
 const BACKUP_STATE: u8 = 0x10;
 const ATTESTED: u8 = 0x40;
+const EXTENSIONS: u8 = 0x80;
 
 const ES256: i64 = -7;
 const EDDSA: i64 = -8;
 const RS256: i64 = -257;
 
+/// Far above anything an authenticator sends. Decoding allocates, so hostile input stops here.
+const MAX_CLIENT_DATA: usize = 8 * 1024;
+const MAX_ATTESTATION: usize = 16 * 1024;
+const MAX_AUTH_DATA: usize = 4 * 1024;
+const MAX_SIGNATURE: usize = 2 * 1024;
+const MAX_KEY: usize = 2 * 1024;
+const TRANSPORTS: [&str; 7] = [
+    "ble",
+    "cable",
+    "hybrid",
+    "internal",
+    "nfc",
+    "smart-card",
+    "usb",
+];
 pub fn encode(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -120,6 +136,10 @@ fn cbor(input: &[u8], depth: usize) -> Result<(Cbor, usize)> {
                 let (value, size) =
                     cbor(input.get(used..).context("CBOR ended early")?, depth + 1)?;
                 used += size;
+                ensure!(
+                    entries.iter().all(|(seen, _)| *seen != key),
+                    "CBOR repeats a map key"
+                );
                 entries.push((key, value));
             }
             Cbor::Map(entries)
@@ -128,6 +148,22 @@ fn cbor(input: &[u8], depth: usize) -> Result<(Cbor, usize)> {
         _ => bail!("unsupported CBOR type"),
     };
     Ok((item, used))
+}
+
+/// Without leading zeros, which `ring` refuses and COSE encoders sometimes write.
+fn unpadded(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
+    &bytes[start..]
+}
+
+/// The whole of `input` as one item, so nothing can hide after it.
+fn cbor_exact(input: &[u8]) -> Result<Cbor> {
+    let (item, size) = cbor(input, 0)?;
+    ensure!(size == input.len(), "CBOR has trailing bytes");
+    Ok(item)
 }
 
 /// Refuses a key this site can't verify with, whatever the authenticator offered.
@@ -147,10 +183,13 @@ fn check_key(key: &Cbor) -> Result<i64> {
         }
         RS256 => {
             ensure!(key.int(1)? == 3, "not an RSA key");
+            let modulus = unpadded(key.bytes(-1)?);
+            let exponent = unpadded(key.bytes(-2)?);
             ensure!(
-                key.bytes(-1)?.len() >= 256 && !key.bytes(-2)?.is_empty(),
-                "bad RSA key"
+                (256..=1024).contains(&modulus.len()) && modulus[0] & 0x80 != 0,
+                "RSA modulus size"
             );
+            ensure!((1..=4).contains(&exponent.len()), "RSA exponent size");
         }
         other => bail!("unsupported algorithm {other}"),
     }
@@ -158,7 +197,8 @@ fn check_key(key: &Cbor) -> Result<i64> {
 }
 
 fn verify_signature(cose: &[u8], message: &[u8], signature: &[u8]) -> Result<()> {
-    let (key, _) = cbor(cose, 0)?;
+    ensure!(cose.len() <= MAX_KEY, "the key is too large");
+    let key = cbor_exact(cose)?;
     let refused = |_| anyhow!("the signature does not verify");
     match check_key(&key)? {
         ES256 => {
@@ -173,30 +213,43 @@ fn verify_signature(cose: &[u8], message: &[u8], signature: &[u8]) -> Result<()>
             .verify(message, signature)
             .map_err(refused),
         _ => RsaPublicKeyComponents {
-            n: key.bytes(-1)?,
-            e: key.bytes(-2)?,
+            n: unpadded(key.bytes(-1)?),
+            e: unpadded(key.bytes(-2)?),
         }
         .verify(&RSA_PKCS1_2048_8192_SHA256, message, signature)
         .map_err(refused),
     }
 }
 
-/// The request's origin must be this relying party, over HTTPS unless it is localhost.
-fn origin_allowed(origin: &str, rp_id: &str) -> bool {
+/// An origin may be `https://{rp_id}`, the site's own `APP_URL` origin when that is on the
+/// relying party's domain, or anything on localhost. Another port on the same host is a
+/// different origin, so it doesn't pass.
+fn origin_allowed(origin: &str, rp_id: &str, app_origin: &str) -> bool {
     let Some((scheme, authority)) = origin.split_once("://") else {
         return false;
     };
-    let host = authority.split_once(':').map_or(authority, |(host, port)| {
-        if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) {
-            host
-        } else {
-            ""
-        }
-    });
-    host == rp_id && (scheme == "https" || (scheme == "http" && rp_id == "localhost"))
+    let (host, port) = authority.split_once(':').unwrap_or((authority, ""));
+    let plain =
+        !host.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) && !host.contains('/');
+    if rp_id == "localhost" {
+        return plain && host == "localhost" && matches!(scheme, "http" | "https");
+    }
+    if origin == format!("https://{rp_id}") {
+        return true;
+    }
+    plain
+        && scheme == "https"
+        && origin == app_origin.trim_end_matches('/')
+        && (host == rp_id || host.ends_with(&format!(".{rp_id}")))
 }
 
-fn check_client_data(raw: &[u8], kind: &str, challenge: &str, rp_id: &str) -> Result<()> {
+/// Who is asking: the relying party, and the origin the site is served from.
+pub struct Party<'a> {
+    pub rp_id: &'a str,
+    pub app_origin: &'a str,
+}
+
+fn check_client_data(raw: &[u8], kind: &str, challenge: &str, party: &Party) -> Result<()> {
     let data: Value = serde_json::from_slice(raw).context("clientDataJSON is not JSON")?;
     ensure!(data["type"] == kind, "wrong ceremony type");
     let sent = data["challenge"].as_str().context("no challenge")?;
@@ -207,8 +260,8 @@ fn check_client_data(raw: &[u8], kind: &str, challenge: &str, rp_id: &str) -> Re
     ensure!(data["crossOrigin"] != json!(true), "cross-origin ceremony");
     let origin = data["origin"].as_str().context("no origin")?;
     ensure!(
-        origin_allowed(origin, rp_id),
-        "origin {origin} is not allowed"
+        origin_allowed(origin, party.rp_id, party.app_origin),
+        "the origin is not allowed"
     );
     Ok(())
 }
@@ -227,6 +280,10 @@ fn auth_data<'a>(raw: &'a [u8], rp_id: &str) -> Result<AuthData<'a>> {
     );
     let flags = raw[32];
     ensure!(flags & USER_PRESENT != 0, "the user was not present");
+    ensure!(
+        flags & BACKUP_STATE == 0 || flags & BACKUP_ELIGIBLE != 0,
+        "backed up but not backup eligible"
+    );
     let counter = u32::from_be_bytes([raw[33], raw[34], raw[35], raw[36]]);
     Ok(AuthData {
         flags,
@@ -235,12 +292,17 @@ fn auth_data<'a>(raw: &'a [u8], rp_id: &str) -> Result<AuthData<'a>> {
     })
 }
 
-fn part(response: &Value, name: &str) -> Result<Vec<u8>> {
-    decode(
-        response[name]
-            .as_str()
-            .with_context(|| format!("{name} is missing"))?,
-    )
+fn part(response: &Value, name: &str, limit: usize) -> Result<Vec<u8>> {
+    let text = response[name]
+        .as_str()
+        .with_context(|| format!("{name} is missing"))?;
+    ensure!(
+        text.len() <= limit.div_ceil(3) * 4 + 4,
+        "{name} is too large"
+    );
+    let bytes = decode(text)?;
+    ensure!(bytes.len() <= limit, "{name} is too large");
+    Ok(bytes)
 }
 
 /// The credential id a browser's response names, in the form stored JSON holds it.
@@ -257,26 +319,26 @@ pub fn verify_assertion(
     credential: &Value,
     stored: &Value,
     challenge: &str,
-    rp_id: &str,
+    party: &Party,
 ) -> Result<Value> {
     ensure!(
         credential["type"] == "public-key",
         "not a public key credential"
     );
     let response = &credential["response"];
-    let client_data = part(response, "clientDataJSON")?;
-    check_client_data(&client_data, "webauthn.get", challenge, rp_id)?;
-    let raw = part(response, "authenticatorData")?;
-    let data = auth_data(&raw, rp_id)?;
-    if let Some(handle) = response["userHandle"]
+    let client_data = part(response, "clientDataJSON", MAX_CLIENT_DATA)?;
+    check_client_data(&client_data, "webauthn.get", challenge, party)?;
+    let raw = part(response, "authenticatorData", MAX_AUTH_DATA)?;
+    let data = auth_data(&raw, party.rp_id)?;
+    // Sign-in names no account up front, so the spec requires the handle.
+    let handle = response["userHandle"]
         .as_str()
         .filter(|handle| !handle.is_empty())
-    {
-        let expected = stored["userHandle"]
-            .as_str()
-            .context("stored credential has no user")?;
-        ensure!(decode(handle)? == decode(expected)?, "wrong user handle");
-    }
+        .context("no user handle")?;
+    let expected = stored["userHandle"]
+        .as_str()
+        .context("stored credential has no user")?;
+    ensure!(decode(handle)? == decode(expected)?, "wrong user handle");
     let key = decode(
         stored["credentialPublicKey"]
             .as_str()
@@ -284,7 +346,7 @@ pub fn verify_assertion(
     )?;
     let mut message = raw.clone();
     message.extend_from_slice(&Sha256::digest(&client_data));
-    verify_signature(&key, &message, &part(response, "signature")?)?;
+    verify_signature(&key, &message, &part(response, "signature", MAX_SIGNATURE)?)?;
     let previous = stored["counter"].as_u64().unwrap_or(0);
     let counter = u64::from(data.counter);
     ensure!(
@@ -293,6 +355,7 @@ pub fn verify_assertion(
     );
     let mut updated = stored.clone();
     updated["counter"] = json!(counter);
+    updated["backupEligible"] = json!(data.flags & BACKUP_ELIGIBLE != 0);
     updated["backupStatus"] = json!(data.flags & BACKUP_STATE != 0);
     if data.flags & USER_VERIFIED != 0 {
         updated["uvInitialized"] = json!(true);
@@ -304,7 +367,8 @@ pub fn verify_assertion(
 pub fn verify_registration(
     credential: &Value,
     challenge: &str,
-    rp_id: &str,
+    party: &Party,
+    require_verified: bool,
     user_id: i64,
 ) -> Result<(String, Value)> {
     ensure!(
@@ -312,13 +376,9 @@ pub fn verify_registration(
         "not a public key credential"
     );
     let response = &credential["response"];
-    check_client_data(
-        &part(response, "clientDataJSON")?,
-        "webauthn.create",
-        challenge,
-        rp_id,
-    )?;
-    let (attestation, _) = cbor(&part(response, "attestationObject")?, 0)?;
+    let client_data = part(response, "clientDataJSON", MAX_CLIENT_DATA)?;
+    check_client_data(&client_data, "webauthn.create", challenge, party)?;
+    let attestation = cbor_exact(&part(response, "attestationObject", MAX_ATTESTATION)?)?;
     let text = |name: &str| Cbor::Text(name.to_owned());
     ensure!(
         attestation.field(&text("fmt")) == Some(&text("none")),
@@ -331,8 +391,12 @@ pub fn verify_registration(
     let Some(Cbor::Bytes(raw)) = attestation.field(&text("authData")) else {
         bail!("no authenticator data");
     };
-    let data = auth_data(raw, rp_id)?;
+    let data = auth_data(raw, party.rp_id)?;
     ensure!(data.flags & ATTESTED != 0, "no attested credential");
+    ensure!(
+        !require_verified || data.flags & USER_VERIFIED != 0,
+        "the user was not verified"
+    );
     ensure!(data.rest.len() >= 18, "attested credential is too short");
     let (aaguid, rest) = data.rest.split_at(16);
     let (length, rest) = rest.split_at(2);
@@ -343,16 +407,35 @@ pub fn verify_registration(
     );
     let (id, rest) = rest.split_at(length);
     let (key, size) = cbor(rest, 0)?;
+    ensure!(size <= MAX_KEY, "the key is too large");
     check_key(&key)?;
+    // Only extension data may follow the key, and only when the flag says so.
+    if data.flags & EXTENSIONS == 0 {
+        ensure!(size == rest.len(), "authenticator data has trailing bytes");
+    } else {
+        ensure!(
+            matches!(cbor_exact(&rest[size..])?, Cbor::Map(_)),
+            "bad extension data"
+        );
+    }
+    let transports: Vec<&str> = response["transports"]
+        .as_array()
+        .map(|sent| {
+            sent.iter()
+                .filter_map(Value::as_str)
+                .filter(|name| TRANSPORTS.contains(name))
+                .collect()
+        })
+        .unwrap_or_default();
     let id = encode(id);
     let aaguid = hex::encode(aaguid);
     let stored = json!({
         "publicKeyCredentialId": id,
         "type": "public-key",
-        "transports": response["transports"].as_array().cloned().unwrap_or_default(),
-        "attestationType": "none",
-        "trustPath": {"type": "Webauthn\\TrustPath\\EmptyTrustPath"},
-        "aaguid": format!("{}-{}-{}-{}-{}", &aaguid[..8], &aaguid[8..12], &aaguid[12..16], &aaguid[16..20], &aaguid[20..]),
+        "transports": transports,
+    "attestationType": "none",
+        "trustPath": [],
+    "aaguid": format!("{}-{}-{}-{}-{}", &aaguid[..8], &aaguid[8..12], &aaguid[12..16], &aaguid[16..20], &aaguid[20..]),
         "credentialPublicKey": encode(&rest[..size]),
         "userHandle": encode(user_id.to_string().as_bytes()),
         "counter": data.counter,
@@ -370,6 +453,10 @@ mod tests {
     use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, Ed25519KeyPair, KeyPair};
 
     const RP: &str = "example.com";
+    const PARTY: Party = Party {
+        rp_id: RP,
+        app_origin: "https://www.example.com",
+    };
     const ORIGIN: &str = "https://example.com";
 
     /// RS256 made with `openssl dgst -sha256 -sign` over the message below.
@@ -428,7 +515,7 @@ mod tests {
             &client("webauthn.get", "abc", ORIGIN),
             &data(0x05, 9),
         );
-        let updated = verify_assertion(&credential, &stored(&cose, 8), "abc", RP).unwrap();
+        let updated = verify_assertion(&credential, &stored(&cose, 8), "abc", &PARTY).unwrap();
         assert_eq!(updated["counter"], 9);
         assert_eq!(updated["uvInitialized"], true);
     }
@@ -438,7 +525,7 @@ mod tests {
         let (pair, cose) = p256();
         let good = client("webauthn.get", "abc", ORIGIN);
         let check = |credential: &Value, counter: u64| {
-            verify_assertion(credential, &stored(&cose, counter), "abc", RP)
+            verify_assertion(credential, &stored(&cose, counter), "abc", &PARTY)
         };
         let present = data(0x01, 9);
         assert!(
@@ -493,7 +580,7 @@ mod tests {
                 &assertion(&pair, &good, &present),
                 &stored(&cose, 0),
                 "",
-                RP
+                &PARTY
             )
             .is_err()
         );
@@ -507,7 +594,7 @@ mod tests {
             &client("webauthn.get", "abc", ORIGIN),
             &data(0x01, 0),
         );
-        assert!(verify_assertion(&credential, &stored(&cose, 0), "abc", RP).is_ok());
+        assert!(verify_assertion(&credential, &stored(&cose, 0), "abc", &PARTY).is_ok());
     }
 
     #[test]
@@ -560,7 +647,7 @@ mod tests {
     fn registration_stores_what_webauthn_lib_reads() {
         let (_, cose) = p256();
         let credential = registration(&attestation("none", 0x4d, &cose), "webauthn.create");
-        let (id, data) = verify_registration(&credential, "abc", RP, 7).unwrap();
+        let (id, data) = verify_registration(&credential, "abc", &PARTY, false, 7).unwrap();
         assert_eq!(id, "AQID");
         assert_eq!(data["publicKeyCredentialId"], "AQID");
         assert_eq!(data["credentialPublicKey"], encode(&cose));
@@ -574,7 +661,7 @@ mod tests {
     #[test]
     fn bad_registrations_fail() {
         let (_, cose) = p256();
-        let check = |credential: &Value| verify_registration(credential, "abc", RP, 7);
+        let check = |credential: &Value| verify_registration(credential, "abc", &PARTY, false, 7);
         assert!(
             check(&registration(
                 &attestation("packed", 0x45, &cose),
@@ -609,14 +696,100 @@ mod tests {
 
     #[test]
     fn origins_match_the_relying_party_exactly() {
-        assert!(origin_allowed("https://example.com", RP));
-        assert!(origin_allowed("https://example.com:8443", RP));
-        assert!(origin_allowed("http://localhost:8080", "localhost"));
-        assert!(!origin_allowed("http://example.com", RP));
-        assert!(!origin_allowed("https://example.com.evil.net", RP));
-        assert!(!origin_allowed("https://sub.example.com", RP));
-        assert!(!origin_allowed("https://example.com:x", RP));
-        assert!(!origin_allowed("https://example.com/path", RP));
+        let allowed = |origin| origin_allowed(origin, RP, "https://www.example.com");
+        assert!(allowed("https://example.com"));
+        assert!(allowed("https://www.example.com"));
+        assert!(origin_allowed("http://localhost:8080", "localhost", ""));
+        assert!(!allowed("http://example.com"));
+        assert!(
+            !allowed("https://example.com:8443"),
+            "another port is another origin"
+        );
+        assert!(!allowed("https://example.com.evil.net"));
+        assert!(!allowed("https://sub.example.com"));
+        assert!(!allowed("https://example.com/path"));
+        assert!(
+            !origin_allowed("https://evil.net", RP, "https://evil.net"),
+            "APP_URL off the domain"
+        );
+        assert!(!origin_allowed("http://evil.net", "localhost", ""));
+    }
+
+    #[test]
+    fn hostile_sizes_and_shapes_are_refused() {
+        let (pair, cose) = p256();
+        let huge = vec![0u8; MAX_ATTESTATION + 1];
+        assert!(
+            verify_registration(
+                &registration(&huge, "webauthn.create"),
+                "abc",
+                &PARTY,
+                false,
+                7
+            )
+            .is_err()
+        );
+
+        let mut padded = cose.clone();
+        padded.push(0);
+        let credential = assertion(
+            &pair,
+            &client("webauthn.get", "abc", ORIGIN),
+            &data(0x01, 1),
+        );
+        assert!(
+            verify_assertion(&credential, &stored(&padded, 0), "abc", &PARTY).is_err(),
+            "bytes after the key"
+        );
+
+        let backed_up_only = assertion(
+            &pair,
+            &client("webauthn.get", "abc", ORIGIN),
+            &data(0x11, 1),
+        );
+        assert!(verify_assertion(&backed_up_only, &stored(&cose, 0), "abc", &PARTY).is_err());
+
+        let mut no_handle = credential.clone();
+        no_handle["response"]
+            .as_object_mut()
+            .unwrap()
+            .remove("userHandle");
+        assert!(verify_assertion(&no_handle, &stored(&cose, 0), "abc", &PARTY).is_err());
+
+        assert!(
+            cbor(&[0xa2, 0x01, 0x01, 0x01, 0x02], 0).is_err(),
+            "a repeated map key"
+        );
+    }
+
+    #[test]
+    fn registration_can_require_user_verification_and_filters_transports() {
+        let (_, cose) = p256();
+        let present_only = registration(&attestation("none", 0x41, &cose), "webauthn.create");
+        assert!(verify_registration(&present_only, "abc", &PARTY, true, 7).is_err());
+        assert!(verify_registration(&present_only, "abc", &PARTY, false, 7).is_ok());
+        let mut odd = registration(&attestation("none", 0x45, &cose), "webauthn.create");
+        odd["response"]["transports"] = json!(["usb", {"x": 1}, "nonsense"]);
+        let (_, data) = verify_registration(&odd, "abc", &PARTY, false, 7).unwrap();
+        assert_eq!(data["transports"], json!(["usb"]));
+    }
+
+    #[test]
+    fn rsa_keys_with_padding_verify_and_small_ones_are_refused() {
+        let modulus = hex::decode(RSA_N).unwrap();
+        let mut cose = vec![
+            0xa4, 0x01, 0x03, 0x03, 0x39, 0x01, 0x00, 0x20, 0x59, 0x01, 0x01, 0x00,
+        ];
+        cose.extend_from_slice(&modulus);
+        cose.extend_from_slice(&[0x21, 0x44, 0x00, 0x01, 0x00, 0x01]);
+        assert!(verify_signature(&cose, RSA_MESSAGE, &hex::decode(RSA_SIGNATURE).unwrap()).is_ok());
+
+        let mut small = vec![
+            0xa4, 0x01, 0x03, 0x03, 0x39, 0x01, 0x00, 0x20, 0x59, 0x01, 0x00, 0x7f,
+        ];
+        small.extend_from_slice(&modulus[1..]);
+        small.extend_from_slice(&[0x21, 0x43, 0x01, 0x00, 0x01]);
+        assert!(check_key(&cbor_exact(&small).unwrap()).is_err());
     }
 
     #[test]
