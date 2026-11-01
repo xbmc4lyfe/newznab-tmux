@@ -3,10 +3,13 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use axum::Router;
+use axum::extract::Request;
+use axum::middleware::map_request;
+use axum::{Extension, Router, ServiceExt};
 use nntmux_core::{Config, var_or};
 use nntmux_runtime::{Ctx, Shutdown};
 use tokio::net::TcpListener;
+use tower::Layer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -27,6 +30,8 @@ async fn main() -> Result<()> {
         .merge(nntmux_site::router())
         .merge(nntmux_admin::router())
         .layer(TraceLayer::new_for_http())
+        // The web stack's layers run before the state exists, so they read it from here.
+        .layer(Extension(ctx.clone()))
         .with_state(ctx);
 
     let addr: SocketAddr = var_or("NNTMUX_WEB_ADDR", "0.0.0.0:8080")
@@ -36,7 +41,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {addr}"))?;
     info!(%addr, "serving");
-    axum::serve(listener, app)
+    // Outside the router, because routing already depends on the method.
+    let app = map_request(nntmux_webkit::csrf::override_method).layer(app);
+    axum::serve(
+        listener,
+        ServiceExt::<Request>::into_make_service_with_connect_info::<SocketAddr>(app),
+    )
         .with_graceful_shutdown(stop.token().cancelled_owned())
         .await
         .context("serving")?;
