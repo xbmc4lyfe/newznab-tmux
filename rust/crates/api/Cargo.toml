@@ -10,13 +10,18 @@ anyhow.workspace = true
 axum.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 md-5.workspace = true
+multer = "3"
 nntmux-core.workspace = true
 nntmux-runtime.workspace = true
 nntmux-webkit.workspace = true
+quick-xml.workspace = true
 rand.workspace = true
 redis.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1 = "0.10"
@@ -24,8 +29,11 @@ sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+unicode-normalization = "0.1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 base64.workspace = true
 regex.workspace = true
 nntmux-testkit.workspace = true

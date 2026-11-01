@@ -145,7 +145,7 @@ async fn load_exclusions(ctx: &Ctx, user_id: i64) -> Result<Vec<i64>> {
     let mut exclusions: Vec<i64> = Vec::new();
     if !excluded_roots.is_empty() {
         let roots = join_ids(&excluded_roots);
-        let ids: Vec<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
+        let ids: Vec<u32> = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT id FROM categories WHERE root_categories_id IN ({roots})"
         )))
         .fetch_all(&ctx.db)
@@ -161,7 +161,7 @@ async fn load_exclusions(ctx: &Ctx, user_id: i64) -> Result<Vec<i64>> {
             join_ids(&excluded_roots)
         )
     };
-    let own: Vec<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
+    let own: Vec<u32> = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT c.id FROM categories c
          INNER JOIN user_excluded_categories e ON e.categories_id = c.id
          WHERE e.users_id = ?{not_in_excluded_root}"
