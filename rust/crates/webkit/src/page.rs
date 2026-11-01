@@ -301,15 +301,18 @@ fn looks_like_domain(url: &str) -> bool {
         && rest.chars().take_while(char::is_ascii_alphabetic).count() >= 2
 }
 
-/// PHP's `html_entity_decode` for what useful-link bodies hold, after trimming wrapping quotes.
-fn useful_link_body(body: &str) -> String {
-    body.trim_matches(|c| c == '\'' || c == '"')
-        .replace("&lt;", "<")
+/// PHP's `html_entity_decode` for what admin-entered content holds.
+pub fn resolve_entities(body: &str) -> String {
+    body.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#039;", "'")
         .replace("&#39;", "'")
         .replace("&amp;", "&")
+}
+
+fn useful_link_body(body: &str) -> String {
+    resolve_entities(body.trim_matches(|c| c == '\'' || c == '"'))
 }
 
 async fn load_useful_links(db: &MySqlPool) -> anyhow::Result<Vec<UsefulLink>> {
