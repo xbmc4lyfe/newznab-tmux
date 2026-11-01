@@ -1,15 +1,57 @@
 //! The feed sources, built by key.
 
+mod crowdnfo;
+mod dats_pciso;
+mod dom;
+mod g4u;
+mod gabber;
 mod json;
+mod knaben;
+mod literal;
+mod nima4k;
+mod nzedb_archive;
 mod rss;
+mod scene_archive_sql;
+mod seriousaboutsound;
+mod xml_catalogue;
+mod xml_tree;
 
 use anyhow::{Result, bail};
 
 use super::http::FeedHttp;
 use super::{FeedConfig, FeedSource};
 
+pub use crowdnfo::CrowdnfoSource;
+pub use dats_pciso::DatsPcIsoSource;
+pub use g4u::G4uSource;
+pub use gabber::GabberSource;
 pub use json::*;
+pub use knaben::KnabenSource;
+pub use nima4k::Nima4kSource;
+pub use nzedb_archive::NzedbArchiveSource;
 pub use rss::{RssFeedSource, RssOptions};
+pub use scene_archive_sql::SceneArchiveSqlSource;
+pub use seriousaboutsound::SeriousAboutSoundSource;
+pub use xml_catalogue::XmlCatalogueSource;
+
+/// The pure parse functions, for tests and one-off tools.
+pub mod parse {
+    pub use super::crowdnfo::parse_html as crowdnfo;
+    pub use super::dats_pciso::{DatsCatalogue, parse_xml as dats_pciso};
+    pub use super::g4u::parse_html as g4u;
+    pub use super::gabber::parse_html as gabber;
+    pub use super::knaben::{KnabenPage, parse_json as knaben};
+    pub use super::nima4k::parse_html as nima4k;
+    pub use super::nzedb_archive::{
+        ArchiveCatalogue, Limits as NzedbLimits, decode_archive, parse_csv as nzedb_csv,
+        parse_gzip as nzedb_gzip,
+    };
+    pub use super::scene_archive_sql::{
+        Limits as SceneArchiveLimits, parse_file as scene_archive_sql,
+    };
+    pub use super::seriousaboutsound::parse_html as seriousaboutsound;
+    pub use super::xml_catalogue::{Catalogue, parse_xml as xml_catalogue};
+}
 
 const AVAILABLE: [&str; 34] = [
     "predb_club",
@@ -163,9 +205,20 @@ pub fn make(key: &str, config: &FeedConfig, http: &FeedHttp) -> Result<Box<dyn F
         "movieblog" => rss("movieblog.to", catalogue),
         "hdworld" => rss("hd-world.cc", catalogue),
         "hdencode" | "hdencode_tv" => rss("hdencode.org", hdencode),
-        other if AVAILABLE.contains(&other) => {
-            bail!("PreDB feed source [{other}] isn't ported yet")
-        }
+        "knaben" => Box::new(KnabenSource::new(&url, size, h)),
+        "crowdnfo" => Box::new(CrowdnfoSource::new(url, size, h)),
+        "seriousaboutsound" => Box::new(SeriousAboutSoundSource::new(url, size, h)),
+        "g4u" => Box::new(G4uSource::new(url, size, h)),
+        "gabber" => Box::new(GabberSource::new(url, config)?),
+        "nima4k" => Box::new(Nima4kSource::new(url, size, h)),
+        "nzedb_archive" => Box::new(NzedbArchiveSource::new(url, size, h)),
+        "dats_pciso_1998" => Box::new(DatsPcIsoSource::new(url, size, h)),
+        "scene_archive_sql" => Box::new(SceneArchiveSqlSource::new(
+            config.scene_archive_sql_file.as_str(),
+            size,
+        )?),
+        "nswdb" => Box::new(XmlCatalogueSource::nswdb(url, size, h)),
+        "3dsdb" => Box::new(XmlCatalogueSource::three_ds_db(url, size, h)),
         other => bail!(
             "Unknown PreDB feed source [{other}]. Available: {}",
             AVAILABLE.join(", ")

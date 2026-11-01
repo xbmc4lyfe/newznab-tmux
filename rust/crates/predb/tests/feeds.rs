@@ -210,7 +210,7 @@ async fn importer_inserts_and_only_fills_gaps() {
     };
     assert_eq!(
         importer
-            .import(&[first.clone()], false)
+            .import(std::slice::from_ref(&first), false)
             .await
             .expect("import"),
         Totals {
