@@ -25,7 +25,7 @@ fn task(
 }
 
 pub fn tasks() -> Vec<Task<Ctx>> {
-    use nntmux_ops::{accounts, activity, stats, system_metrics};
+    use nntmux_ops::{accounts, activity, disposable, stats, system_metrics};
     vec![
         task("nntmux:collect-stats", EveryMinutes(15), |ctx| {
             Box::pin(async move { stats::collect(&ctx.db).await })
@@ -96,11 +96,20 @@ pub fn tasks() -> Vec<Task<Ctx>> {
                 Ok(())
             })
         }),
-        task("predb:check 3 --quiet", EveryMinutes(10), |ctx| {
-            Box::pin(async move {
-                nntmux_predb::check_pre(&ctx.db, Some(3)).await?;
-                Ok(())
-            })
-        }),
+        task(
+            "disposable:update",
+            Weekly {
+                day: Weekday::Sun,
+                hour: 0,
+                minute: 0,
+            },
+            |_| {
+                Box::pin(async move {
+                    let path = disposable::list_path();
+                    disposable::refresh(disposable::SOURCE, &path).await?;
+                    Ok(())
+                })
+            },
+        ),
     ]
 }

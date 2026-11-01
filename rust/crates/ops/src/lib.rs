@@ -4,12 +4,14 @@
 
 pub mod accounts;
 pub mod activity;
+pub mod disposable;
+pub mod runtime_state;
 pub mod stats;
 pub mod system_metrics;
 
 use anyhow::Result;
 use clap::Subcommand;
-use nntmux_runtime::Ctx;
+use nntmux_runtime::{Ctx, Shutdown};
 
 /// `nntmux-ctl ops ...`
 #[derive(Debug, Subcommand)]
@@ -26,6 +28,33 @@ pub enum Command {
     DisableExpiredPromotions,
     /// Complete registration periods past their end (`nntmux:disable-expired-registration-periods`).
     DisableExpiredRegistrationPeriods,
+    /// Refresh the disposable-domain list the site reads (`disposable:update`).
+    DisposableUpdate,
+    /// Let workers claim work again and clear any drain (`tmux:start`).
+    Start,
+    /// Pause processing until the next start (`tmux:stop`). Workers finish what they hold.
+    Stop {
+        /// Wait as long as it takes for active work to finish.
+        #[arg(long)]
+        wait: bool,
+        /// Seconds to wait for active work to finish.
+        #[arg(long, default_value_t = 5)]
+        timeout: u64,
+    },
+    /// Pause new work and wait for active workers to finish (`tmux:drain`).
+    Drain {
+        /// Seconds to wait for active workers.
+        #[arg(long, default_value_t = 90)]
+        timeout: u64,
+        /// Restore the state from before the drain.
+        #[arg(long)]
+        resume: bool,
+        /// Restore only the drain this operation owns.
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Check that the supervisor is alive when processing should be running (`tmux:health-check`).
+    HealthCheck,
 }
 
 pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
@@ -56,6 +85,41 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
             }
             println!("Completed {} expired registration period(s).", names.len());
         }
+        Command::DisposableUpdate => {
+            let path = disposable::list_path();
+            let count = disposable::refresh(disposable::SOURCE, &path).await?;
+            println!("Saved {count} domains to {}.", path.display());
+        }
+        Command::Start => {
+            runtime_state::start(&ctx).await?;
+            println!("Processing started.");
+        }
+        Command::Stop { wait, timeout } => {
+            let remaining =
+                runtime_state::stop(&ctx, wait, timeout, &Shutdown::on_signals()?).await?;
+            if remaining.is_empty() {
+                println!("Processing stopped.");
+            } else {
+                println!(
+                    "Processing stopped; these roles are still finishing: {}.",
+                    remaining.join(", ")
+                );
+            }
+        }
+        Command::Drain {
+            timeout,
+            resume,
+            token,
+        } => {
+            if resume {
+                println!("{}", runtime_state::resume(&ctx, token.as_deref()).await?);
+            } else {
+                runtime_state::drain(&ctx, timeout, token.as_deref(), &Shutdown::on_signals()?)
+                    .await?;
+                println!("Active processing workers finished; scheduling remains paused.");
+            }
+        }
+        Command::HealthCheck => println!("{}", runtime_state::health_check(&ctx).await?),
     }
     Ok(())
 }

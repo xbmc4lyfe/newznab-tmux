@@ -9,6 +9,11 @@ publish.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 nntmux-runtime.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+nntmux-testkit.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

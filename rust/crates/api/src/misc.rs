@@ -1,13 +1,22 @@
 //! The small endpoints: health, media info and the release inform hook.
 
+use std::sync::Arc;
+
 use anyhow::Result;
+use async_trait::async_trait;
+use nntmux_categorize::Categorizer;
+use nntmux_namefix::release::Release;
+use nntmux_namefix::update::{ReleaseSearch, ReleaseUpdater};
+use nntmux_predb::filename::fixer_cleaner;
 use nntmux_runtime::Ctx;
+use tracing::warn;
 
 use crate::auth;
 use crate::db::row_json;
 use crate::json::{J, Style};
 use crate::reply::{Reply, json_error};
 use crate::request::ApiRequest;
+use crate::settings::Settings;
 
 pub fn rss_health() -> Reply {
     Reply::json(
@@ -59,8 +68,29 @@ pub async fn media_info(ctx: &Ctx, id: &str) -> Result<Reply> {
     ))
 }
 
+/// Refreshes a renamed release's search document. Failures record their own retry.
+struct IndexRefresh {
+    ctx: Ctx,
+    settings: Arc<Settings>,
+}
+
+#[async_trait]
+impl ReleaseSearch for IndexRefresh {
+    async fn update_release(&self, release_id: i64) {
+        match self.settings.search(&self.ctx) {
+            Ok(client) => {
+                client.update_release(&self.ctx.db, release_id).await;
+            }
+            Err(failure) => warn!(
+                error = format!("{failure:#}"),
+                "no search client for a rename"
+            ),
+        }
+    }
+}
+
 /// `GET /api/inform/release`: a client reports the proper name for an obfuscated one.
-pub async fn inform(ctx: &Ctx, request: &ApiRequest) -> Result<Reply> {
+pub async fn inform(ctx: &Ctx, settings: &Arc<Settings>, request: &ApiRequest) -> Result<Reply> {
     let input = &request.input;
     let token = input.string("api_token");
     let Some(user) = auth::find_verified(ctx, &token).await? else {
@@ -88,16 +118,6 @@ pub async fn inform(ctx: &Ctx, request: &ApiRequest) -> Result<Reply> {
             "Indexer inform error, wrong data supplied!",
         ));
     }
-    // A known release must be renamed too, which needs the name fixer. Until that's ported, say so
-    // rather than report a rename that never happens.
-    let known: Option<u32> =
-        sqlx::query_scalar("SELECT id FROM releases WHERE searchname = ? LIMIT 1")
-            .bind(&original)
-            .fetch_optional(&ctx.db)
-            .await?;
-    if known.is_some() {
-        return Ok(Reply::message(501, "Not ported yet"));
-    }
     let now = crate::usage::now_string();
     sqlx::query(
         "INSERT IGNORE INTO release_informs (relOName, relPName, api_token, created_at, updated_at)
@@ -110,6 +130,43 @@ pub async fn inform(ctx: &Ctx, request: &ApiRequest) -> Result<Reply> {
     .bind(&now)
     .execute(&ctx.db)
     .await?;
+    // `whereSearchname()->first()`. Cast, since the updater's reader takes signed integers.
+    let found = sqlx::query(
+        "SELECT CAST(id AS SIGNED) AS releases_id, guid, name, searchname, fromname,
+                CAST(groups_id AS SIGNED) AS groups_id, CAST(categories_id AS SIGNED) AS categories_id,
+                CAST(size AS SIGNED) AS relsize, CAST(predb_id AS SIGNED) AS predb_id,
+                CAST(isrenamed AS SIGNED) AS isrenamed, CAST(nfostatus AS SIGNED) AS nfostatus,
+                CAST(proc_nfo AS SIGNED) AS proc_nfo, CAST(proc_files AS SIGNED) AS proc_files,
+                CAST(proc_par2 AS SIGNED) AS proc_par2, CAST(proc_uid AS SIGNED) AS proc_uid,
+                CAST(proc_srr AS SIGNED) AS proc_srr, CAST(proc_hash16k AS SIGNED) AS proc_hash16k,
+                CAST(proc_crc32 AS SIGNED) AS proc_crc32
+         FROM releases WHERE searchname = ? LIMIT 1",
+    )
+    .bind(&original)
+    .fetch_optional(&ctx.db)
+    .await?;
+    if let Some(found) = found {
+        let found = Release::from_row(&found)?;
+        let categorizer = Categorizer::load(&ctx.db).await?;
+        let search = Arc::new(IndexRefresh {
+            ctx: ctx.clone(),
+            settings: settings.clone(),
+        });
+        let mut updater = ReleaseUpdater::new(ctx.db.clone(), categorizer, search, fixer_cleaner);
+        updater
+            .update_release(
+                &found,
+                &proper,
+                "Release Inform API",
+                true,
+                "Filenames, ",
+                true,
+                0,
+                None,
+                None,
+            )
+            .await?;
+    }
     Ok(Reply::message(200, "Release Information Added!"))
 }
 

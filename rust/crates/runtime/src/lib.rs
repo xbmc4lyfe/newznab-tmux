@@ -1,6 +1,7 @@
 //! What every worker role shares: the connections, a clean stop on SIGTERM, and the
 //! claim-work-commit loop.
 
+pub mod busy;
 pub mod downtime;
 
 use std::future::Future;
@@ -163,7 +164,13 @@ where
                 }
                 let outcome = AssertUnwindSafe({
                     let (work, ctx) = (work.clone(), ctx.clone());
-                    async move { work(ctx, slot).await }
+                    async move {
+                        // A pause that lands here reads as nothing to claim this time.
+                        let Some(_busy) = busy::enter(&ctx, role).await? else {
+                            return Ok(false);
+                        };
+                        work(ctx, slot).await
+                    }
                 })
                 .catch_unwind()
                 .await
