@@ -66,19 +66,19 @@ status = "todo"
 kind = "library"
 id = "formats:article-identity"
 source = "docker/app/nzb-yenc-ffi/src/article_identity.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:article-xref"
 source = "docker/app/nzb-yenc-ffi/src/article_xref.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:article-dates"
 source = "docker/app/nzb-yenc-ffi/src/article_dates.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
@@ -90,19 +90,19 @@ status = "todo"
 kind = "library"
 id = "formats:nntp-headers"
 source = "docker/app/nzb-yenc-ffi/src/nntp_headers.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:nntp-body"
 source = "docker/app/nzb-yenc-ffi/src/nntp_body.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:header-filename-identity"
 source = "docker/app/nzb-yenc-ffi/src/header_filename_identity.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
