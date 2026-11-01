@@ -4,13 +4,14 @@
 kind = "command"
 id = "multiprocessing:releases"
 source = "app/Console/Commands/ProcessReleasesMulti.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:delete-releases"
 source = "app/Console/Commands/DeleteReleases.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases delete. Unknown criteria now fail, an unknown group matches nothing, and --rage is gone because releases has no rageid column."
 
 [[entry]]
 kind = "command"
@@ -22,19 +23,22 @@ status = "todo"
 kind = "command"
 id = "nntmux:nzbclean"
 source = "app/Console/Commands/CleanNZB.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases nzb-clean. --notondisk stays refused and orphans stay reported only, as in PHP's database mode. Staged filesystem generations are kept."
 
 [[entry]]
 kind = "command"
 id = "nntmux:update-releases-index"
 source = "app/Console/Commands/UpdateReleasesIndexSchema.php"
-status = "todo"
+status = "dropped"
+note = "A one-time migration for indexes older than the media fields. The Rust registry defines the full schema, and search documents already carry those fields, so the rebuild ws-search is porting replaces it. See the cutover requirements in WORKSTREAMS.md."
 
 [[entry]]
 kind = "command"
 id = "nzbs:import-database"
 source = "app/Console/Commands/ImportDatabaseNzbs.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases import-database."
 
 [[entry]]
 kind = "command"
@@ -52,13 +56,15 @@ status = "todo"
 kind = "command"
 id = "releases:fingerprint-backfill"
 source = "app/Console/Commands/BackfillReleaseFingerprintMetadata.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl fingerprint backfill."
 
 [[entry]]
 kind = "command"
 id = "releases:fingerprint-transfer"
 source = "app/Console/Commands/TransferFingerprintQueue.php"
-status = "todo"
+status = "dropped"
+note = "Moves Redis Horizon jobs to the database queue. Run once on PHP before cutover: Rust has no Horizon queue to transfer from. See the cutover requirements in WORKSTREAMS.md."
 
 [[entry]]
 kind = "command"
@@ -82,19 +88,21 @@ status = "ported"
 kind = "command"
 id = "releases:process"
 source = "app/Console/Commands/ProcessReleasesCommand.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "releases:remove-crap"
 source = "app/Console/Commands/RemoveCrapReleases.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases remove-crap. Timed codec and wmv_all runs now delete every match in the window: PHP appended the time filter to GROUP BY, so it returned one row per page and could delete old releases."
 
 [[entry]]
 kind = "command"
 id = "releases:retry-archive-inspection"
 source = "app/Console/Commands/RetryArchiveInspection.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases retry-archive-inspection."
 
 [[entry]]
 kind = "command"

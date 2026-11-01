@@ -1,0 +1,878 @@
+{
+    "club": {
+        "in": [
+            {
+                "name": " Some.Rel-GRP ",
+                "cat": "TV",
+                "size": 1500.5,
+                "files": "12",
+                "preAt": 1700000000,
+                "nuke": null
+            },
+            {
+                "name": "Nuked.Rel-GRP",
+                "cat": "",
+                "size": 0.5,
+                "files": 0,
+                "preAt": "1700000001",
+                "nuke": {
+                    "type": "modnuke",
+                    "reason": "bad"
+                }
+            },
+            {
+                "name": "Un.Rel-GRP",
+                "nuke": {
+                    "type": "undelpre",
+                    "reason": ""
+                }
+            },
+            {
+                "name": "Old.Rel-GRP",
+                "nuke": {
+                    "type": "oldnuke"
+                }
+            },
+            {
+                "name": "Re.Rel-GRP",
+                "size": "x",
+                "nuke": {
+                    "type": "renuke",
+                    "reason": "r"
+                }
+            },
+            {
+                "name": "Plain-GRP",
+                "nuke": {
+                    "reason": "x"
+                }
+            },
+            {
+                "name": "  "
+            },
+            {
+                "nope": 1
+            },
+            "scalar"
+        ],
+        "out": [
+            {
+                "title": "Some.Rel-GRP",
+                "source": "predb.club",
+                "category": "TV",
+                "size": "1500.5MB",
+                "files": "12",
+                "predate": "2023-11-14 22:13:20",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Nuked.Rel-GRP",
+                "source": "predb.club",
+                "category": null,
+                "size": "512KB",
+                "files": null,
+                "predate": "2023-11-14 22:13:21",
+                "nuked": 3,
+                "reason": "bad",
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Un.Rel-GRP",
+                "source": "predb.club",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 1,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Old.Rel-GRP",
+                "source": "predb.club",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 5,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Re.Rel-GRP",
+                "source": "predb.club",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 4,
+                "reason": "r",
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Plain-GRP",
+                "source": "predb.club",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 2,
+                "reason": "x",
+                "listed": null,
+                "enrich": false
+            }
+        ]
+    },
+    "net": {
+        "in": [
+            {
+                "release": "A.Rel-GRP",
+                "section": "MP3",
+                "size": 12.345,
+                "files": 3,
+                "pretime": 1700000000,
+                "status": 0,
+                "reason": "ignored"
+            },
+            {
+                "release": "B.Rel-GRP",
+                "status": 1,
+                "reason": "dupe"
+            },
+            {
+                "release": "C.Rel-GRP",
+                "status": 2
+            },
+            {
+                "release": "D.Rel-GRP",
+                "status": 3,
+                "reason": "x"
+            },
+            {
+                "release": "E.Rel-GRP",
+                "status": "4"
+            }
+        ],
+        "out": [
+            {
+                "title": "A.Rel-GRP",
+                "source": "predb.net",
+                "category": "MP3",
+                "size": "12.35MB",
+                "files": "3",
+                "predate": "2023-11-14 22:13:20",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "B.Rel-GRP",
+                "source": "predb.net",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 2,
+                "reason": "dupe",
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "C.Rel-GRP",
+                "source": "predb.net",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 1,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "D.Rel-GRP",
+                "source": "predb.net",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 2,
+                "reason": "x",
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "E.Rel-GRP",
+                "source": "predb.net",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 1,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        ]
+    },
+    "org": {
+        "in": [
+            {
+                "rlsname": "A-GRP",
+                "section": "X",
+                "ctime": 1600000000,
+                "size": "700",
+                "files": 2,
+                "status": 0,
+                "nukereason": ""
+            },
+            {
+                "rlsname": "B-GRP",
+                "status": "1"
+            },
+            {
+                "rlsname": "C-GRP",
+                "status": 0,
+                "nukereason": "why"
+            }
+        ],
+        "out": [
+            {
+                "title": "A-GRP",
+                "source": "predb.org",
+                "category": "X",
+                "size": "700MB",
+                "files": "2",
+                "predate": "2020-09-13 12:26:40",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "B-GRP",
+                "source": "predb.org",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 2,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "C-GRP",
+                "source": "predb.org",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 2,
+                "reason": "why",
+                "listed": null,
+                "enrich": false
+            }
+        ]
+    },
+    "ovh": {
+        "in": [
+            {
+                "id": 5,
+                "name": "A-GRP",
+                "cat": "TV",
+                "size": 2048,
+                "files": 3,
+                "preAt": 1600000000,
+                "nuke": {
+                    "typeId": 1,
+                    "preId": 5,
+                    "reason": "r"
+                }
+            },
+            {
+                "id": 6,
+                "name": "B-GRP",
+                "nuke": {
+                    "typeId": 1,
+                    "preId": 7,
+                    "reason": "other row"
+                }
+            },
+            {
+                "id": "8",
+                "name": "C-GRP",
+                "nuke": {
+                    "typeId": 5,
+                    "preId": "008"
+                }
+            },
+            {
+                "name": "D-GRP",
+                "nuke": {
+                    "typeId": 3,
+                    "reason": "mod"
+                }
+            },
+            {
+                "name": "E-GRP",
+                "nuke": {
+                    "typeId": 4
+                }
+            }
+        ],
+        "out": [
+            {
+                "title": "A-GRP",
+                "source": "predb.ovh",
+                "category": "TV",
+                "size": "2MB",
+                "files": "3",
+                "predate": "2020-09-13 12:26:40",
+                "nuked": 2,
+                "reason": "r",
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "B-GRP",
+                "source": "predb.ovh",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "C-GRP",
+                "source": "predb.ovh",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 1,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "D-GRP",
+                "source": "predb.ovh",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 3,
+                "reason": "mod",
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "E-GRP",
+                "source": "predb.ovh",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 2,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        ]
+    },
+    "srrdb": {
+        "in": [
+            {
+                "release": "A-GRP",
+                "date": "2026-07-01 12:00:00"
+            },
+            {
+                "release": "B-GRP",
+                "date": "2026-01-01 12:00:00"
+            },
+            {
+                "release": "C-GRP",
+                "date": "junk"
+            },
+            {
+                "release": "D-GRP"
+            }
+        ],
+        "out": [
+            {
+                "title": "A-GRP",
+                "source": "srrdb",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": "2026-07-01 10:00:00",
+                "enrich": false
+            },
+            {
+                "title": "B-GRP",
+                "source": "srrdb",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": "2026-01-01 11:00:00",
+                "enrich": false
+            },
+            {
+                "title": "C-GRP",
+                "source": "srrdb",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "D-GRP",
+                "source": "srrdb",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        ]
+    },
+    "xrel": {
+        "in": [
+            {
+                "dirname": "A-GRP",
+                "time": 1600000000,
+                "size": {
+                    "number": 700,
+                    "unit": "MB"
+                },
+                "ext_info": {
+                    "type": "movie"
+                },
+                "flags": {
+                    "nuke_rls": true
+                }
+            },
+            {
+                "dirname": "B-GRP",
+                "size": {
+                    "number": 2,
+                    "unit": "gb"
+                }
+            },
+            {
+                "dirname": "C-GRP",
+                "size": {
+                    "number": 5,
+                    "unit": "RAR"
+                },
+                "flags": {
+                    "nuke_rls": false
+                }
+            },
+            {
+                "dirname": "D-GRP",
+                "size": {
+                    "number": 512,
+                    "unit": "KB"
+                }
+            },
+            {
+                "dirname": "E-GRP",
+                "size": {
+                    "number": 1,
+                    "unit": "TB"
+                }
+            }
+        ],
+        "out": [
+            {
+                "title": "A-GRP",
+                "source": "xrel",
+                "category": "MOVIE",
+                "size": "700MB",
+                "files": null,
+                "predate": "2020-09-13 12:26:40",
+                "nuked": 2,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "B-GRP",
+                "source": "xrel",
+                "category": null,
+                "size": "2048MB",
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "C-GRP",
+                "source": "xrel",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "D-GRP",
+                "source": "xrel",
+                "category": null,
+                "size": "512KB",
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "E-GRP",
+                "source": "xrel",
+                "category": null,
+                "size": "1048576MB",
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        ]
+    },
+    "xrel_p2p": {
+        "in": [
+            {
+                "dirname": "A-GRP",
+                "pub_time": 1600000000,
+                "size_mb": 1234,
+                "category": {
+                    "meta_cat": "movies",
+                    "sub_cat": "hd"
+                }
+            },
+            {
+                "dirname": "B-GRP",
+                "category": {
+                    "meta_cat": "tv"
+                }
+            },
+            {
+                "dirname": "C-GRP",
+                "category": {
+                    "sub_cat": "x"
+                }
+            }
+        ],
+        "out": [
+            {
+                "title": "A-GRP",
+                "source": "xrel-p2p",
+                "category": "MOVIES-hd",
+                "size": "1234MB",
+                "files": null,
+                "predate": "2020-09-13 12:26:40",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "B-GRP",
+                "source": "xrel-p2p",
+                "category": "TV",
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "C-GRP",
+                "source": "xrel-p2p",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        ]
+    },
+    "apibay": {
+        "in": [
+            {
+                "name": "A-GRP",
+                "category": "207",
+                "size": "1073741824",
+                "num_files": "3",
+                "added": "1600000000"
+            },
+            {
+                "name": "Adult",
+                "category": 501
+            },
+            {
+                "name": "B-GRP",
+                "category": 205,
+                "size": 1024
+            }
+        ],
+        "out": [
+            {
+                "title": "A-GRP",
+                "source": "apibay",
+                "category": "MOVIE-HD",
+                "size": "1024MB",
+                "files": "3",
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": "2020-09-13 12:26:40",
+                "enrich": false
+            },
+            {
+                "title": "B-GRP",
+                "source": "apibay",
+                "category": "TV",
+                "size": "1KB",
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        ]
+    },
+    "predatabase": {
+        "in": [
+            {
+                "rlsname": "A-GRP",
+                "section": "X",
+                "size": 3,
+                "files": 1,
+                "ctime": 1600000000
+            },
+            {
+                "rlsname": "B-GRP",
+                "ctime": 0
+            },
+            {
+                "rlsname": ""
+            }
+        ],
+        "out": [
+            {
+                "title": "A-GRP",
+                "source": "predataba.se",
+                "category": "X",
+                "size": "3MB",
+                "files": "1",
+                "predate": "2020-09-13 12:26:40",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "B-GRP",
+                "source": "predataba.se",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        ]
+    },
+    "rss": {
+        "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\"><channel><title>Feed</title>\n<item><title>Some.Rel-GRP</title><category>TV</category><category>Second</category><pubDate>Sat, 01 Aug 2026 10:00:00 +0200</pubDate></item>\n<item><title><![CDATA[Cdata.Rel-GRP]]></title><pubDate>not a date</pubDate></item>\n<item><title>Amp&amp;Rel-GRP &#8211; 1.5 GB</title><pubDate>2026-08-01 10:00:00</pubDate></item>\n<item><title>Spaced Rel 720p  EZTV</title></item>\n<item><title>Size.Rel-GRP – 700 MB</title><category> Mapped </category></item>\n<item><category>no title</category></item>\n</channel></rss>",
+        "plain": [
+            {
+                "title": "Some.Rel-GRP",
+                "source": "label",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 08:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Cdata.Rel-GRP",
+                "source": "label",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        ],
+        "spaced": [
+            {
+                "title": "Some.Rel-GRP",
+                "source": "label",
+                "category": "TV",
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 08:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Cdata.Rel-GRP",
+                "source": "label",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Amp&Rel-GRP.–.1.5.GB",
+                "source": "label",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": "2026-08-01 10:00:00",
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Spaced.Rel.720p",
+                "source": "label",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Size.Rel-GRP.–.700.MB",
+                "source": "label",
+                "category": "Mapped",
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        ],
+        "catalogue": [
+            {
+                "title": "Some.Rel-GRP",
+                "source": "label",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": "2026-08-01 08:00:00",
+                "enrich": false
+            },
+            {
+                "title": "Cdata.Rel-GRP",
+                "source": "label",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Amp&Rel-GRP",
+                "source": "label",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            },
+            {
+                "title": "Size.Rel-GRP",
+                "source": "label",
+                "category": null,
+                "size": null,
+                "files": null,
+                "predate": null,
+                "nuked": 0,
+                "reason": null,
+                "listed": null,
+                "enrich": false
+            }
+        ]
+    },
+    "sizes": {
+        "0.5": "512KB",
+        "1": "1MB",
+        "1.5": "1.5MB",
+        "1500.123": "1500.12MB",
+        "0.0009": "0.92KB",
+        "0": null,
+        "100": "100MB"
+    }
+}

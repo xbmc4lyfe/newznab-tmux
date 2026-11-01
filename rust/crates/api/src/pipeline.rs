@@ -9,11 +9,13 @@ use axum::extract::Request;
 use axum::handler::Handler;
 use axum::response::Response;
 use nntmux_runtime::Ctx;
+use nntmux_webkit::auth::Auth;
 use sha1::{Digest, Sha1};
 use tracing::error;
 
 use crate::auth::{self, User};
 use crate::cache;
+use crate::release_cache::Unavailable;
 use crate::reply::{Reply, json_error, xml_error};
 use crate::request::ApiRequest;
 use crate::rss::{self, Feed};
@@ -205,6 +207,7 @@ async fn respond(
         return Ok(preflight(&request));
     }
 
+    let request_auth = request.extensions().get::<Auth>().cloned();
     let mut api = ApiRequest::read(request).await?;
     // Global middleware runs before routing, so it also sees requests that end in a 405.
     if let Some(reply) = abuse::check(ctx, settings, &api).await {
@@ -246,7 +249,10 @@ async fn respond(
 
     // Only the web group's /getnzb runs outside the API throttle.
     if endpoint == Endpoint::GetNzb {
-        return getnzb::web(ctx, &api, route_id.as_deref()).await;
+        let session = request_auth
+            .as_ref()
+            .map(|auth| auth.user.api_token.as_str());
+        return getnzb::web(ctx, settings, &api, session, route_id.as_deref()).await;
     }
     let group = match hit_group(ctx, settings, &api).await {
         Ok(group) => group,
@@ -286,7 +292,19 @@ async fn respond(
                 token_headers = Some((max, (max - attempt.attempts).max(0)));
             }
         }
-        handle(endpoint, ctx, settings, &api, resolved, route_id).await?
+        match handle(endpoint, ctx, settings, &api, resolved, route_id).await {
+            Err(failure) if failure.is::<Unavailable>() => {
+                let text = "Search is temporarily unavailable, retry shortly";
+                let mut reply = if api.path.starts_with("/api/v2/") {
+                    json_error(900, text)
+                } else {
+                    xml_error(900, text)
+                };
+                reply.status = 503;
+                reply.header("retry-after", "30")
+            }
+            other => other?,
+        }
     };
 
     let mut reply = handled;

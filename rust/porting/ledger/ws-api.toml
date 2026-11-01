@@ -29,7 +29,7 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /api/release/{guid}/filelist"
 source = "App\\Http\\Controllers\\Api\\FileListApiController@getFileList"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -41,19 +41,19 @@ status = "ported"
 kind = "route"
 id = "GET|HEAD /api/search/assist"
 source = "App\\Http\\Controllers\\SearchSuggestController@searchAssist"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /api/search/autocomplete"
 source = "App\\Http\\Controllers\\SearchSuggestController@autocomplete"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /api/search/suggest"
 source = "App\\Http\\Controllers\\SearchSuggestController@suggest"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -125,49 +125,49 @@ status = "ported"
 kind = "route"
 id = "GET|POST|HEAD /apihelp"
 source = "App\\Http\\Controllers\\ApiHelpController@index"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /apiv2help"
 source = "App\\Http\\Controllers\\ApiHelpController@apiv2"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /getnzb"
 source = "App\\Http\\Controllers\\GetNzbController@getNzb"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /getnzb/{guid}"
 source = "App\\Http\\Controllers\\GetNzbController@getNzb"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /rsshelp"
 source = "App\\Http\\Controllers\\RssController@showRssDesc"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|QUERY|HEAD /api/v2/anime"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@anime"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|QUERY|HEAD /api/v2/audio"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@audio"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|QUERY|HEAD /api/v2/books"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@books"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -179,19 +179,19 @@ status = "ported"
 kind = "route"
 id = "GET|QUERY|HEAD /api/v2/movies"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@movie"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|QUERY|HEAD /api/v2/search"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@apiSearch"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|QUERY|HEAD /api/v2/tv"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@tv"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -245,7 +245,7 @@ status = "ported"
 kind = "route"
 id = "POST /api/v2/nzbadd"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@nzbAdd"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -293,4 +293,4 @@ status = "ported"
 kind = "route"
 id = "POST|GET|QUERY|HEAD /api/v1/api"
 source = "App\\Http\\Controllers\\Api\\ApiController@api"
-status = "todo"
+status = "ported"

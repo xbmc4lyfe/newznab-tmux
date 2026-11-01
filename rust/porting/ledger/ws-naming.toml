@@ -10,7 +10,7 @@ status = "todo"
 kind = "command"
 id = "irc:scrape"
 source = "app/Console/Commands/IrcScraperCommand.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -40,19 +40,19 @@ status = "ported"
 kind = "command"
 id = "predb:check"
 source = "app/Console/Commands/PredbCheck.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "predb:identity-rebuild"
 source = "app/Console/Commands/PredbIdentityRebuildCommand.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "predb:import-feed"
 source = "app/Console/Commands/PredbImportFeed.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"

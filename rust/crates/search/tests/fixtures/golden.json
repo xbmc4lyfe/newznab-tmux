@@ -1,0 +1,5548 @@
+{
+    "pure": {
+        "prepare": [
+            [
+                "dead circus",
+                "dead circus"
+            ],
+            [
+                "!circus",
+                "!circus"
+            ],
+            [
+                "-circus",
+                "-circus"
+            ],
+            [
+                "dead !circus",
+                "dead !circus"
+            ],
+            [
+                "dead -circus",
+                "dead -circus"
+            ],
+            [
+                "!foo !bar",
+                "!foo !bar"
+            ],
+            [
+                "\"exact phrase\"",
+                "\"exact phrase\""
+            ],
+            [
+                "!\"exact phrase\"",
+                "!\"exact phrase\""
+            ],
+            [
+                "-\"exact phrase\"",
+                "-\"exact phrase\""
+            ],
+            [
+                "a | b",
+                "a | b"
+            ],
+            [
+                "word*",
+                "word*"
+            ],
+            [
+                "*word",
+                "*word"
+            ],
+            [
+                "*word*",
+                "*word*"
+            ],
+            [
+                "(a | b) -c",
+                "(a | b) -c"
+            ],
+            [
+                "((a))",
+                "((a))"
+            ],
+            [
+                "()",
+                "()"
+            ],
+            [
+                "(",
+                "("
+            ],
+            [
+                ")",
+                ")"
+            ],
+            [
+                "spider-man",
+                "spider\\-man"
+            ],
+            [
+                "WEB-DL.x265",
+                "WEB\\-DL.x265"
+            ],
+            [
+                "S01E02.1080p.WEB-DL",
+                "S01E02.1080p.WEB\\-DL"
+            ],
+            [
+                "foo_bar.baz-qux",
+                "foo_bar.baz\\-qux"
+            ],
+            [
+                "it's",
+                "it\\'s"
+            ],
+            [
+                "a@b",
+                "a\\@b"
+            ],
+            [
+                "a~b",
+                "a\\~b"
+            ],
+            [
+                "a&b",
+                "a\\&b"
+            ],
+            [
+                "a/b",
+                "a\\/b"
+            ],
+            [
+                "a$b",
+                "a\\$b"
+            ],
+            [
+                "a=b",
+                "a\\=b"
+            ],
+            [
+                "a[b]",
+                "a\\[b\\]"
+            ],
+            [
+                "back\\slash",
+                "back\\\\slash"
+            ],
+            [
+                "unmatched\"quote",
+                "unmatched\\\"quote"
+            ],
+            [
+                "*",
+                ""
+            ],
+            [
+                "",
+                ""
+            ],
+            [
+                "   ",
+                ""
+            ],
+            [
+                "0",
+                "0"
+            ],
+            [
+                "-",
+                "\\-"
+            ],
+            [
+                "!",
+                "\\!"
+            ],
+            [
+                "--",
+                "-\\-"
+            ],
+            [
+                "-!",
+                "-\\!"
+            ],
+            [
+                "abc-",
+                "abc\\-"
+            ],
+            [
+                "abc!",
+                "abc\\!"
+            ],
+            [
+                "a--b",
+                "a\\-\\-b"
+            ],
+            [
+                "**",
+                "*"
+            ],
+            [
+                "*-*",
+                "*\\-*"
+            ],
+            [
+                "Amélie 2001",
+                "Amélie 2001"
+            ],
+            [
+                "Amélie.2001",
+                "Amélie.2001"
+            ],
+            [
+                "non breaking",
+                "non breaking"
+            ],
+            [
+                "tab\tsep",
+                "tab sep"
+            ],
+            [
+                "ctrl\u000bv",
+                "ctrl v"
+            ],
+            [
+                "form\ffeed",
+                "form feed"
+            ],
+            [
+                "Ünï-çødé",
+                "Ünï\\-çødé"
+            ],
+            [
+                "東京 2020",
+                "東京 2020"
+            ],
+            [
+                "-1",
+                "-1"
+            ],
+            [
+                "foo@bar.baz",
+                "foo\\@bar.baz"
+            ],
+            [
+                "poster <a@b.c> (x)",
+                "poster <a\\@b.c> (x)"
+            ],
+            [
+                "x|y",
+                "x|y"
+            ],
+            [
+                "x^y",
+                "x^y"
+            ],
+            [
+                "x?y",
+                "x?y"
+            ],
+            [
+                "x%y",
+                "x%y"
+            ],
+            [
+                "x<y>z",
+                "x<y>z"
+            ],
+            [
+                "a.b_c-d e",
+                "a.b_c\\-d e"
+            ],
+            [
+                "...",
+                "..."
+            ],
+            [
+                "._-",
+                "._\\-"
+            ]
+        ],
+        "escape": [
+            [
+                "dead circus",
+                "dead circus"
+            ],
+            [
+                "!circus",
+                "\\!circus"
+            ],
+            [
+                "-circus",
+                "\\-circus"
+            ],
+            [
+                "dead !circus",
+                "dead \\!circus"
+            ],
+            [
+                "dead -circus",
+                "dead \\-circus"
+            ],
+            [
+                "!foo !bar",
+                "\\!foo \\!bar"
+            ],
+            [
+                "\"exact phrase\"",
+                "\\\"exact phrase\\\""
+            ],
+            [
+                "!\"exact phrase\"",
+                "\\!\\\"exact phrase\\\""
+            ],
+            [
+                "-\"exact phrase\"",
+                "\\-\\\"exact phrase\\\""
+            ],
+            [
+                "a | b",
+                "a | b"
+            ],
+            [
+                "word*",
+                "word*"
+            ],
+            [
+                "*word",
+                "*word"
+            ],
+            [
+                "*word*",
+                "*word*"
+            ],
+            [
+                "(a | b) -c",
+                "\\(a | b\\) \\-c"
+            ],
+            [
+                "((a))",
+                "\\(\\(a\\)\\)"
+            ],
+            [
+                "()",
+                "\\(\\)"
+            ],
+            [
+                "(",
+                "\\("
+            ],
+            [
+                ")",
+                "\\)"
+            ],
+            [
+                "spider-man",
+                "spider\\-man"
+            ],
+            [
+                "WEB-DL.x265",
+                "WEB\\-DL.x265"
+            ],
+            [
+                "S01E02.1080p.WEB-DL",
+                "S01E02.1080p.WEB\\-DL"
+            ],
+            [
+                "foo_bar.baz-qux",
+                "foo_bar.baz\\-qux"
+            ],
+            [
+                "it's",
+                "it\\'s"
+            ],
+            [
+                "a@b",
+                "a\\@b"
+            ],
+            [
+                "a~b",
+                "a\\~b"
+            ],
+            [
+                "a&b",
+                "a\\&b"
+            ],
+            [
+                "a/b",
+                "a\\/b"
+            ],
+            [
+                "a$b",
+                "a\\$b"
+            ],
+            [
+                "a=b",
+                "a\\=b"
+            ],
+            [
+                "a[b]",
+                "a\\[b\\]"
+            ],
+            [
+                "back\\slash",
+                "back\\\\slash"
+            ],
+            [
+                "unmatched\"quote",
+                "unmatched\\\"quote"
+            ],
+            [
+                "*",
+                ""
+            ],
+            [
+                "",
+                ""
+            ],
+            [
+                "   ",
+                ""
+            ],
+            [
+                "0",
+                ""
+            ],
+            [
+                "-",
+                "\\"
+            ],
+            [
+                "!",
+                "\\"
+            ],
+            [
+                "--",
+                "\\\\-\\"
+            ],
+            [
+                "-!",
+                "\\-\\"
+            ],
+            [
+                "abc-",
+                "abc\\"
+            ],
+            [
+                "abc!",
+                "abc\\"
+            ],
+            [
+                "a--b",
+                "a\\\\-\\-b"
+            ],
+            [
+                "**",
+                "**"
+            ],
+            [
+                "*-*",
+                "*\\-*"
+            ],
+            [
+                "Amélie 2001",
+                "Amélie 2001"
+            ],
+            [
+                "Amélie.2001",
+                "Amélie.2001"
+            ],
+            [
+                "non breaking",
+                "non breaking"
+            ],
+            [
+                "tab\tsep",
+                "tab\tsep"
+            ],
+            [
+                "ctrl\u000bv",
+                "ctrl\u000bv"
+            ],
+            [
+                "form\ffeed",
+                "form\ffeed"
+            ],
+            [
+                "Ünï-çødé",
+                "Ünï\\-çødé"
+            ],
+            [
+                "東京 2020",
+                "東京 2020"
+            ],
+            [
+                "-1",
+                "\\-1"
+            ],
+            [
+                "foo@bar.baz",
+                "foo\\@bar.baz"
+            ],
+            [
+                "poster <a@b.c> (x)",
+                "poster <a\\@b.c> \\(x\\)"
+            ],
+            [
+                "x|y",
+                "x|y"
+            ],
+            [
+                "x^y",
+                "x^y"
+            ],
+            [
+                "x?y",
+                "x?y"
+            ],
+            [
+                "x%y",
+                "x%y"
+            ],
+            [
+                "x<y>z",
+                "x<y>z"
+            ],
+            [
+                "a.b_c-d e",
+                "a.b_c\\-d e"
+            ],
+            [
+                "...",
+                "..."
+            ],
+            [
+                "._-",
+                "._\\"
+            ]
+        ],
+        "negation": [
+            [
+                "dead circus",
+                false
+            ],
+            [
+                "!circus",
+                true
+            ],
+            [
+                "-circus",
+                true
+            ],
+            [
+                "dead !circus",
+                true
+            ],
+            [
+                "dead -circus",
+                true
+            ],
+            [
+                "!foo !bar",
+                true
+            ],
+            [
+                "\"exact phrase\"",
+                false
+            ],
+            [
+                "!\"exact phrase\"",
+                true
+            ],
+            [
+                "-\"exact phrase\"",
+                true
+            ],
+            [
+                "a | b",
+                false
+            ],
+            [
+                "word*",
+                false
+            ],
+            [
+                "*word",
+                false
+            ],
+            [
+                "*word*",
+                false
+            ],
+            [
+                "(a | b) -c",
+                true
+            ],
+            [
+                "((a))",
+                false
+            ],
+            [
+                "()",
+                false
+            ],
+            [
+                "(",
+                false
+            ],
+            [
+                ")",
+                false
+            ],
+            [
+                "spider-man",
+                false
+            ],
+            [
+                "WEB-DL.x265",
+                false
+            ],
+            [
+                "S01E02.1080p.WEB-DL",
+                false
+            ],
+            [
+                "foo_bar.baz-qux",
+                false
+            ],
+            [
+                "it's",
+                false
+            ],
+            [
+                "a@b",
+                false
+            ],
+            [
+                "a~b",
+                false
+            ],
+            [
+                "a&b",
+                false
+            ],
+            [
+                "a/b",
+                false
+            ],
+            [
+                "a$b",
+                false
+            ],
+            [
+                "a=b",
+                false
+            ],
+            [
+                "a[b]",
+                false
+            ],
+            [
+                "back\\slash",
+                false
+            ],
+            [
+                "unmatched\"quote",
+                false
+            ],
+            [
+                "*",
+                false
+            ],
+            [
+                "",
+                false
+            ],
+            [
+                "   ",
+                false
+            ],
+            [
+                "0",
+                false
+            ],
+            [
+                "-",
+                false
+            ],
+            [
+                "!",
+                false
+            ],
+            [
+                "--",
+                true
+            ],
+            [
+                "-!",
+                true
+            ],
+            [
+                "abc-",
+                false
+            ],
+            [
+                "abc!",
+                false
+            ],
+            [
+                "a--b",
+                false
+            ],
+            [
+                "**",
+                false
+            ],
+            [
+                "*-*",
+                false
+            ],
+            [
+                "Amélie 2001",
+                false
+            ],
+            [
+                "Amélie.2001",
+                false
+            ],
+            [
+                "non breaking",
+                false
+            ],
+            [
+                "tab\tsep",
+                false
+            ],
+            [
+                "ctrl\u000bv",
+                false
+            ],
+            [
+                "form\ffeed",
+                false
+            ],
+            [
+                "Ünï-çødé",
+                false
+            ],
+            [
+                "東京 2020",
+                false
+            ],
+            [
+                "-1",
+                true
+            ],
+            [
+                "foo@bar.baz",
+                false
+            ],
+            [
+                "poster <a@b.c> (x)",
+                false
+            ],
+            [
+                "x|y",
+                false
+            ],
+            [
+                "x^y",
+                false
+            ],
+            [
+                "x?y",
+                false
+            ],
+            [
+                "x%y",
+                false
+            ],
+            [
+                "x<y>z",
+                false
+            ],
+            [
+                "a.b_c-d e",
+                false
+            ],
+            [
+                "...",
+                false
+            ],
+            [
+                "._-",
+                false
+            ]
+        ],
+        "fromname": [
+            [
+                "dead circus",
+                "dead circus"
+            ],
+            [
+                "!circus",
+                "\\!circus"
+            ],
+            [
+                "-circus",
+                "\\-circus"
+            ],
+            [
+                "dead !circus",
+                "dead \\!circus"
+            ],
+            [
+                "dead -circus",
+                "dead \\-circus"
+            ],
+            [
+                "!foo !bar",
+                "\\!foo \\!bar"
+            ],
+            [
+                "\"exact phrase\"",
+                "\\\"exact phrase\\\""
+            ],
+            [
+                "!\"exact phrase\"",
+                "\\!\\\"exact phrase\\\""
+            ],
+            [
+                "-\"exact phrase\"",
+                "\\-\\\"exact phrase\\\""
+            ],
+            [
+                "a | b",
+                "a \\| b"
+            ],
+            [
+                "word*",
+                "word\\*"
+            ],
+            [
+                "*word",
+                "\\*word"
+            ],
+            [
+                "*word*",
+                "\\*word\\*"
+            ],
+            [
+                "(a | b) -c",
+                "\\(a \\| b\\) \\-c"
+            ],
+            [
+                "((a))",
+                "\\(\\(a\\)\\)"
+            ],
+            [
+                "()",
+                "\\(\\)"
+            ],
+            [
+                "(",
+                "\\("
+            ],
+            [
+                ")",
+                "\\)"
+            ],
+            [
+                "spider-man",
+                "spider\\-man"
+            ],
+            [
+                "WEB-DL.x265",
+                "WEB\\-DL.x265"
+            ],
+            [
+                "S01E02.1080p.WEB-DL",
+                "S01E02.1080p.WEB\\-DL"
+            ],
+            [
+                "foo_bar.baz-qux",
+                "foo_bar.baz\\-qux"
+            ],
+            [
+                "it's",
+                "it\\'s"
+            ],
+            [
+                "a@b",
+                "a\\@b"
+            ],
+            [
+                "a~b",
+                "a\\~b"
+            ],
+            [
+                "a&b",
+                "a\\&b"
+            ],
+            [
+                "a/b",
+                "a\\/b"
+            ],
+            [
+                "a$b",
+                "a\\$b"
+            ],
+            [
+                "a=b",
+                "a\\=b"
+            ],
+            [
+                "a[b]",
+                "a\\[b\\]"
+            ],
+            [
+                "back\\slash",
+                "back\\\\slash"
+            ],
+            [
+                "unmatched\"quote",
+                "unmatched\\\"quote"
+            ],
+            [
+                "*",
+                "\\*"
+            ],
+            [
+                "",
+                ""
+            ],
+            [
+                "   ",
+                ""
+            ],
+            [
+                "0",
+                "0"
+            ],
+            [
+                "-",
+                "\\-"
+            ],
+            [
+                "!",
+                "\\!"
+            ],
+            [
+                "--",
+                "\\-\\-"
+            ],
+            [
+                "-!",
+                "\\-\\!"
+            ],
+            [
+                "abc-",
+                "abc\\-"
+            ],
+            [
+                "abc!",
+                "abc\\!"
+            ],
+            [
+                "a--b",
+                "a\\-\\-b"
+            ],
+            [
+                "**",
+                "\\*\\*"
+            ],
+            [
+                "*-*",
+                "\\*\\-\\*"
+            ],
+            [
+                "Amélie 2001",
+                "Amélie 2001"
+            ],
+            [
+                "Amélie.2001",
+                "Amélie.2001"
+            ],
+            [
+                "non breaking",
+                "non breaking"
+            ],
+            [
+                "tab\tsep",
+                "tab\tsep"
+            ],
+            [
+                "ctrl\u000bv",
+                "ctrl\u000bv"
+            ],
+            [
+                "form\ffeed",
+                "form\ffeed"
+            ],
+            [
+                "Ünï-çødé",
+                "Ünï\\-çødé"
+            ],
+            [
+                "東京 2020",
+                "東京 2020"
+            ],
+            [
+                "-1",
+                "\\-1"
+            ],
+            [
+                "foo@bar.baz",
+                "foo\\@bar.baz"
+            ],
+            [
+                "poster <a@b.c> (x)",
+                "poster \\<a\\@b.c\\> \\(x\\)"
+            ],
+            [
+                "x|y",
+                "x\\|y"
+            ],
+            [
+                "x^y",
+                "x\\^y"
+            ],
+            [
+                "x?y",
+                "x\\?y"
+            ],
+            [
+                "x%y",
+                "x\\%y"
+            ],
+            [
+                "x<y>z",
+                "x\\<y\\>z"
+            ],
+            [
+                "a.b_c-d e",
+                "a.b_c\\-d e"
+            ],
+            [
+                "...",
+                "..."
+            ],
+            [
+                "._-",
+                "._\\-"
+            ]
+        ],
+        "scope": [
+            [
+                "dead circus",
+                "",
+                "(dead circus)"
+            ],
+            [
+                "dead circus",
+                "@searchname",
+                "@searchname (dead circus)"
+            ],
+            [
+                "dead circus",
+                "@name",
+                "@name (dead circus)"
+            ],
+            [
+                "dead circus",
+                "@(name,searchname)",
+                "@(name,searchname) (dead circus)"
+            ],
+            [
+                "dead circus",
+                "@(title,filename)",
+                "@(title,filename) (dead circus)"
+            ],
+            [
+                "!circus",
+                "",
+                "(!circus)"
+            ],
+            [
+                "!circus",
+                "@searchname",
+                "@searchname (!circus)"
+            ],
+            [
+                "!circus",
+                "@name",
+                "@name (!circus)"
+            ],
+            [
+                "!circus",
+                "@(name,searchname)",
+                "@(name,searchname) (!circus)"
+            ],
+            [
+                "!circus",
+                "@(title,filename)",
+                "@(title,filename) (!circus)"
+            ],
+            [
+                "-circus",
+                "",
+                "(-circus)"
+            ],
+            [
+                "-circus",
+                "@searchname",
+                "@searchname (-circus)"
+            ],
+            [
+                "-circus",
+                "@name",
+                "@name (-circus)"
+            ],
+            [
+                "-circus",
+                "@(name,searchname)",
+                "@(name,searchname) (-circus)"
+            ],
+            [
+                "-circus",
+                "@(title,filename)",
+                "@(title,filename) (-circus)"
+            ],
+            [
+                "dead !circus",
+                "",
+                "(dead !circus)"
+            ],
+            [
+                "dead !circus",
+                "@searchname",
+                "@searchname (dead !circus)"
+            ],
+            [
+                "dead !circus",
+                "@name",
+                "@name (dead !circus)"
+            ],
+            [
+                "dead !circus",
+                "@(name,searchname)",
+                "@(name,searchname) (dead !circus)"
+            ],
+            [
+                "dead !circus",
+                "@(title,filename)",
+                "@(title,filename) (dead !circus)"
+            ],
+            [
+                "dead -circus",
+                "",
+                "(dead -circus)"
+            ],
+            [
+                "dead -circus",
+                "@searchname",
+                "@searchname (dead -circus)"
+            ],
+            [
+                "dead -circus",
+                "@name",
+                "@name (dead -circus)"
+            ],
+            [
+                "dead -circus",
+                "@(name,searchname)",
+                "@(name,searchname) (dead -circus)"
+            ],
+            [
+                "dead -circus",
+                "@(title,filename)",
+                "@(title,filename) (dead -circus)"
+            ],
+            [
+                "!foo !bar",
+                "",
+                "(!foo !bar)"
+            ],
+            [
+                "!foo !bar",
+                "@searchname",
+                "@searchname (!foo !bar)"
+            ],
+            [
+                "!foo !bar",
+                "@name",
+                "@name (!foo !bar)"
+            ],
+            [
+                "!foo !bar",
+                "@(name,searchname)",
+                "@(name,searchname) (!foo !bar)"
+            ],
+            [
+                "!foo !bar",
+                "@(title,filename)",
+                "@(title,filename) (!foo !bar)"
+            ],
+            [
+                "\"exact phrase\"",
+                "",
+                "(\"exact phrase\")"
+            ],
+            [
+                "\"exact phrase\"",
+                "@searchname",
+                "@searchname (\"exact phrase\")"
+            ],
+            [
+                "\"exact phrase\"",
+                "@name",
+                "@name (\"exact phrase\")"
+            ],
+            [
+                "\"exact phrase\"",
+                "@(name,searchname)",
+                "@(name,searchname) (\"exact phrase\")"
+            ],
+            [
+                "\"exact phrase\"",
+                "@(title,filename)",
+                "@(title,filename) (\"exact phrase\")"
+            ],
+            [
+                "!\"exact phrase\"",
+                "",
+                "(!\"exact phrase\")"
+            ],
+            [
+                "!\"exact phrase\"",
+                "@searchname",
+                "@searchname (!\"exact phrase\")"
+            ],
+            [
+                "!\"exact phrase\"",
+                "@name",
+                "@name (!\"exact phrase\")"
+            ],
+            [
+                "!\"exact phrase\"",
+                "@(name,searchname)",
+                "@(name,searchname) (!\"exact phrase\")"
+            ],
+            [
+                "!\"exact phrase\"",
+                "@(title,filename)",
+                "@(title,filename) (!\"exact phrase\")"
+            ],
+            [
+                "-\"exact phrase\"",
+                "",
+                "(-\"exact phrase\")"
+            ],
+            [
+                "-\"exact phrase\"",
+                "@searchname",
+                "@searchname (-\"exact phrase\")"
+            ],
+            [
+                "-\"exact phrase\"",
+                "@name",
+                "@name (-\"exact phrase\")"
+            ],
+            [
+                "-\"exact phrase\"",
+                "@(name,searchname)",
+                "@(name,searchname) (-\"exact phrase\")"
+            ],
+            [
+                "-\"exact phrase\"",
+                "@(title,filename)",
+                "@(title,filename) (-\"exact phrase\")"
+            ],
+            [
+                "a | b",
+                "",
+                "(a | b)"
+            ],
+            [
+                "a | b",
+                "@searchname",
+                "@searchname (a | b)"
+            ],
+            [
+                "a | b",
+                "@name",
+                "@name (a | b)"
+            ],
+            [
+                "a | b",
+                "@(name,searchname)",
+                "@(name,searchname) (a | b)"
+            ],
+            [
+                "a | b",
+                "@(title,filename)",
+                "@(title,filename) (a | b)"
+            ],
+            [
+                "word*",
+                "",
+                "(word*)"
+            ],
+            [
+                "word*",
+                "@searchname",
+                "@searchname (word*)"
+            ],
+            [
+                "word*",
+                "@name",
+                "@name (word*)"
+            ],
+            [
+                "word*",
+                "@(name,searchname)",
+                "@(name,searchname) (word*)"
+            ],
+            [
+                "word*",
+                "@(title,filename)",
+                "@(title,filename) (word*)"
+            ],
+            [
+                "*word",
+                "",
+                "(*word)"
+            ],
+            [
+                "*word",
+                "@searchname",
+                "@searchname (*word)"
+            ],
+            [
+                "*word",
+                "@name",
+                "@name (*word)"
+            ],
+            [
+                "*word",
+                "@(name,searchname)",
+                "@(name,searchname) (*word)"
+            ],
+            [
+                "*word",
+                "@(title,filename)",
+                "@(title,filename) (*word)"
+            ],
+            [
+                "*word*",
+                "",
+                "(*word*)"
+            ],
+            [
+                "*word*",
+                "@searchname",
+                "@searchname (*word*)"
+            ],
+            [
+                "*word*",
+                "@name",
+                "@name (*word*)"
+            ],
+            [
+                "*word*",
+                "@(name,searchname)",
+                "@(name,searchname) (*word*)"
+            ],
+            [
+                "*word*",
+                "@(title,filename)",
+                "@(title,filename) (*word*)"
+            ],
+            [
+                "(a | b) -c",
+                "",
+                "((a | b) -c)"
+            ],
+            [
+                "(a | b) -c",
+                "@searchname",
+                "@searchname ((a | b) -c)"
+            ],
+            [
+                "(a | b) -c",
+                "@name",
+                "@name ((a | b) -c)"
+            ],
+            [
+                "(a | b) -c",
+                "@(name,searchname)",
+                "@(name,searchname) ((a | b) -c)"
+            ],
+            [
+                "(a | b) -c",
+                "@(title,filename)",
+                "@(title,filename) ((a | b) -c)"
+            ],
+            [
+                "((a))",
+                "",
+                "(((a)))"
+            ],
+            [
+                "((a))",
+                "@searchname",
+                "@searchname (((a)))"
+            ],
+            [
+                "((a))",
+                "@name",
+                "@name (((a)))"
+            ],
+            [
+                "((a))",
+                "@(name,searchname)",
+                "@(name,searchname) (((a)))"
+            ],
+            [
+                "((a))",
+                "@(title,filename)",
+                "@(title,filename) (((a)))"
+            ],
+            [
+                "()",
+                "",
+                "(())"
+            ],
+            [
+                "()",
+                "@searchname",
+                "@searchname (())"
+            ],
+            [
+                "()",
+                "@name",
+                "@name (())"
+            ],
+            [
+                "()",
+                "@(name,searchname)",
+                "@(name,searchname) (())"
+            ],
+            [
+                "()",
+                "@(title,filename)",
+                "@(title,filename) (())"
+            ],
+            [
+                "(",
+                "",
+                "(()"
+            ],
+            [
+                "(",
+                "@searchname",
+                "@searchname (()"
+            ],
+            [
+                "(",
+                "@name",
+                "@name (()"
+            ],
+            [
+                "(",
+                "@(name,searchname)",
+                "@(name,searchname) (()"
+            ],
+            [
+                "(",
+                "@(title,filename)",
+                "@(title,filename) (()"
+            ],
+            [
+                ")",
+                "",
+                "())"
+            ],
+            [
+                ")",
+                "@searchname",
+                "@searchname ())"
+            ],
+            [
+                ")",
+                "@name",
+                "@name ())"
+            ],
+            [
+                ")",
+                "@(name,searchname)",
+                "@(name,searchname) ())"
+            ],
+            [
+                ")",
+                "@(title,filename)",
+                "@(title,filename) ())"
+            ],
+            [
+                "spider-man",
+                "",
+                "(spider\\-man)"
+            ],
+            [
+                "spider-man",
+                "@searchname",
+                "(@searchname (spider\\-man) | @searchname (spider man))"
+            ],
+            [
+                "spider-man",
+                "@name",
+                "@name (spider\\-man)"
+            ],
+            [
+                "spider-man",
+                "@(name,searchname)",
+                "(@(name,searchname) (spider\\-man) | @(name,searchname) (spider man))"
+            ],
+            [
+                "spider-man",
+                "@(title,filename)",
+                "@(title,filename) (spider\\-man)"
+            ],
+            [
+                "WEB-DL.x265",
+                "",
+                "(WEB\\-DL.x265)"
+            ],
+            [
+                "WEB-DL.x265",
+                "@searchname",
+                "(@searchname (WEB\\-DL.x265) | @searchname (WEB DL x265))"
+            ],
+            [
+                "WEB-DL.x265",
+                "@name",
+                "@name (WEB\\-DL.x265)"
+            ],
+            [
+                "WEB-DL.x265",
+                "@(name,searchname)",
+                "(@(name,searchname) (WEB\\-DL.x265) | @(name,searchname) (WEB DL x265))"
+            ],
+            [
+                "WEB-DL.x265",
+                "@(title,filename)",
+                "@(title,filename) (WEB\\-DL.x265)"
+            ],
+            [
+                "S01E02.1080p.WEB-DL",
+                "",
+                "(S01E02.1080p.WEB\\-DL)"
+            ],
+            [
+                "S01E02.1080p.WEB-DL",
+                "@searchname",
+                "(@searchname (S01E02.1080p.WEB\\-DL) | @searchname (S01E02 1080p WEB DL))"
+            ],
+            [
+                "S01E02.1080p.WEB-DL",
+                "@name",
+                "@name (S01E02.1080p.WEB\\-DL)"
+            ],
+            [
+                "S01E02.1080p.WEB-DL",
+                "@(name,searchname)",
+                "(@(name,searchname) (S01E02.1080p.WEB\\-DL) | @(name,searchname) (S01E02 1080p WEB DL))"
+            ],
+            [
+                "S01E02.1080p.WEB-DL",
+                "@(title,filename)",
+                "@(title,filename) (S01E02.1080p.WEB\\-DL)"
+            ],
+            [
+                "foo_bar.baz-qux",
+                "",
+                "(foo_bar.baz\\-qux)"
+            ],
+            [
+                "foo_bar.baz-qux",
+                "@searchname",
+                "(@searchname (foo_bar.baz\\-qux) | @searchname (foo bar baz qux))"
+            ],
+            [
+                "foo_bar.baz-qux",
+                "@name",
+                "@name (foo_bar.baz\\-qux)"
+            ],
+            [
+                "foo_bar.baz-qux",
+                "@(name,searchname)",
+                "(@(name,searchname) (foo_bar.baz\\-qux) | @(name,searchname) (foo bar baz qux))"
+            ],
+            [
+                "foo_bar.baz-qux",
+                "@(title,filename)",
+                "@(title,filename) (foo_bar.baz\\-qux)"
+            ],
+            [
+                "it's",
+                "",
+                "(it\\'s)"
+            ],
+            [
+                "it's",
+                "@searchname",
+                "@searchname (it\\'s)"
+            ],
+            [
+                "it's",
+                "@name",
+                "@name (it\\'s)"
+            ],
+            [
+                "it's",
+                "@(name,searchname)",
+                "@(name,searchname) (it\\'s)"
+            ],
+            [
+                "it's",
+                "@(title,filename)",
+                "@(title,filename) (it\\'s)"
+            ],
+            [
+                "a@b",
+                "",
+                "(a\\@b)"
+            ],
+            [
+                "a@b",
+                "@searchname",
+                "@searchname (a\\@b)"
+            ],
+            [
+                "a@b",
+                "@name",
+                "@name (a\\@b)"
+            ],
+            [
+                "a@b",
+                "@(name,searchname)",
+                "@(name,searchname) (a\\@b)"
+            ],
+            [
+                "a@b",
+                "@(title,filename)",
+                "@(title,filename) (a\\@b)"
+            ],
+            [
+                "a~b",
+                "",
+                "(a\\~b)"
+            ],
+            [
+                "a~b",
+                "@searchname",
+                "@searchname (a\\~b)"
+            ],
+            [
+                "a~b",
+                "@name",
+                "@name (a\\~b)"
+            ],
+            [
+                "a~b",
+                "@(name,searchname)",
+                "@(name,searchname) (a\\~b)"
+            ],
+            [
+                "a~b",
+                "@(title,filename)",
+                "@(title,filename) (a\\~b)"
+            ],
+            [
+                "a&b",
+                "",
+                "(a\\&b)"
+            ],
+            [
+                "a&b",
+                "@searchname",
+                "@searchname (a\\&b)"
+            ],
+            [
+                "a&b",
+                "@name",
+                "@name (a\\&b)"
+            ],
+            [
+                "a&b",
+                "@(name,searchname)",
+                "@(name,searchname) (a\\&b)"
+            ],
+            [
+                "a&b",
+                "@(title,filename)",
+                "@(title,filename) (a\\&b)"
+            ],
+            [
+                "a/b",
+                "",
+                "(a\\/b)"
+            ],
+            [
+                "a/b",
+                "@searchname",
+                "@searchname (a\\/b)"
+            ],
+            [
+                "a/b",
+                "@name",
+                "@name (a\\/b)"
+            ],
+            [
+                "a/b",
+                "@(name,searchname)",
+                "@(name,searchname) (a\\/b)"
+            ],
+            [
+                "a/b",
+                "@(title,filename)",
+                "@(title,filename) (a\\/b)"
+            ],
+            [
+                "a$b",
+                "",
+                "(a\\$b)"
+            ],
+            [
+                "a$b",
+                "@searchname",
+                "@searchname (a\\$b)"
+            ],
+            [
+                "a$b",
+                "@name",
+                "@name (a\\$b)"
+            ],
+            [
+                "a$b",
+                "@(name,searchname)",
+                "@(name,searchname) (a\\$b)"
+            ],
+            [
+                "a$b",
+                "@(title,filename)",
+                "@(title,filename) (a\\$b)"
+            ],
+            [
+                "a=b",
+                "",
+                "(a\\=b)"
+            ],
+            [
+                "a=b",
+                "@searchname",
+                "@searchname (a\\=b)"
+            ],
+            [
+                "a=b",
+                "@name",
+                "@name (a\\=b)"
+            ],
+            [
+                "a=b",
+                "@(name,searchname)",
+                "@(name,searchname) (a\\=b)"
+            ],
+            [
+                "a=b",
+                "@(title,filename)",
+                "@(title,filename) (a\\=b)"
+            ],
+            [
+                "a[b]",
+                "",
+                "(a\\[b\\])"
+            ],
+            [
+                "a[b]",
+                "@searchname",
+                "@searchname (a\\[b\\])"
+            ],
+            [
+                "a[b]",
+                "@name",
+                "@name (a\\[b\\])"
+            ],
+            [
+                "a[b]",
+                "@(name,searchname)",
+                "@(name,searchname) (a\\[b\\])"
+            ],
+            [
+                "a[b]",
+                "@(title,filename)",
+                "@(title,filename) (a\\[b\\])"
+            ],
+            [
+                "back\\slash",
+                "",
+                "(back\\\\slash)"
+            ],
+            [
+                "back\\slash",
+                "@searchname",
+                "@searchname (back\\\\slash)"
+            ],
+            [
+                "back\\slash",
+                "@name",
+                "@name (back\\\\slash)"
+            ],
+            [
+                "back\\slash",
+                "@(name,searchname)",
+                "@(name,searchname) (back\\\\slash)"
+            ],
+            [
+                "back\\slash",
+                "@(title,filename)",
+                "@(title,filename) (back\\\\slash)"
+            ],
+            [
+                "unmatched\"quote",
+                "",
+                "(unmatched\\\"quote)"
+            ],
+            [
+                "unmatched\"quote",
+                "@searchname",
+                "@searchname (unmatched\\\"quote)"
+            ],
+            [
+                "unmatched\"quote",
+                "@name",
+                "@name (unmatched\\\"quote)"
+            ],
+            [
+                "unmatched\"quote",
+                "@(name,searchname)",
+                "@(name,searchname) (unmatched\\\"quote)"
+            ],
+            [
+                "unmatched\"quote",
+                "@(title,filename)",
+                "@(title,filename) (unmatched\\\"quote)"
+            ],
+            [
+                "*",
+                "",
+                ""
+            ],
+            [
+                "*",
+                "@searchname",
+                ""
+            ],
+            [
+                "*",
+                "@name",
+                ""
+            ],
+            [
+                "*",
+                "@(name,searchname)",
+                ""
+            ],
+            [
+                "*",
+                "@(title,filename)",
+                ""
+            ],
+            [
+                "",
+                "",
+                ""
+            ],
+            [
+                "",
+                "@searchname",
+                ""
+            ],
+            [
+                "",
+                "@name",
+                ""
+            ],
+            [
+                "",
+                "@(name,searchname)",
+                ""
+            ],
+            [
+                "",
+                "@(title,filename)",
+                ""
+            ],
+            [
+                "   ",
+                "",
+                ""
+            ],
+            [
+                "   ",
+                "@searchname",
+                ""
+            ],
+            [
+                "   ",
+                "@name",
+                ""
+            ],
+            [
+                "   ",
+                "@(name,searchname)",
+                ""
+            ],
+            [
+                "   ",
+                "@(title,filename)",
+                ""
+            ],
+            [
+                "0",
+                "",
+                "(0)"
+            ],
+            [
+                "0",
+                "@searchname",
+                "@searchname (0)"
+            ],
+            [
+                "0",
+                "@name",
+                "@name (0)"
+            ],
+            [
+                "0",
+                "@(name,searchname)",
+                "@(name,searchname) (0)"
+            ],
+            [
+                "0",
+                "@(title,filename)",
+                "@(title,filename) (0)"
+            ],
+            [
+                "-",
+                "",
+                "(\\-)"
+            ],
+            [
+                "-",
+                "@searchname",
+                "@searchname (\\-)"
+            ],
+            [
+                "-",
+                "@name",
+                "@name (\\-)"
+            ],
+            [
+                "-",
+                "@(name,searchname)",
+                "@(name,searchname) (\\-)"
+            ],
+            [
+                "-",
+                "@(title,filename)",
+                "@(title,filename) (\\-)"
+            ],
+            [
+                "!",
+                "",
+                "(\\!)"
+            ],
+            [
+                "!",
+                "@searchname",
+                "@searchname (\\!)"
+            ],
+            [
+                "!",
+                "@name",
+                "@name (\\!)"
+            ],
+            [
+                "!",
+                "@(name,searchname)",
+                "@(name,searchname) (\\!)"
+            ],
+            [
+                "!",
+                "@(title,filename)",
+                "@(title,filename) (\\!)"
+            ],
+            [
+                "--",
+                "",
+                "(-\\-)"
+            ],
+            [
+                "--",
+                "@searchname",
+                "@searchname (-\\-)"
+            ],
+            [
+                "--",
+                "@name",
+                "@name (-\\-)"
+            ],
+            [
+                "--",
+                "@(name,searchname)",
+                "@(name,searchname) (-\\-)"
+            ],
+            [
+                "--",
+                "@(title,filename)",
+                "@(title,filename) (-\\-)"
+            ],
+            [
+                "-!",
+                "",
+                "(-\\!)"
+            ],
+            [
+                "-!",
+                "@searchname",
+                "@searchname (-\\!)"
+            ],
+            [
+                "-!",
+                "@name",
+                "@name (-\\!)"
+            ],
+            [
+                "-!",
+                "@(name,searchname)",
+                "@(name,searchname) (-\\!)"
+            ],
+            [
+                "-!",
+                "@(title,filename)",
+                "@(title,filename) (-\\!)"
+            ],
+            [
+                "abc-",
+                "",
+                "(abc\\-)"
+            ],
+            [
+                "abc-",
+                "@searchname",
+                "(@searchname (abc\\-) | @searchname (abc))"
+            ],
+            [
+                "abc-",
+                "@name",
+                "@name (abc\\-)"
+            ],
+            [
+                "abc-",
+                "@(name,searchname)",
+                "(@(name,searchname) (abc\\-) | @(name,searchname) (abc))"
+            ],
+            [
+                "abc-",
+                "@(title,filename)",
+                "@(title,filename) (abc\\-)"
+            ],
+            [
+                "abc!",
+                "",
+                "(abc\\!)"
+            ],
+            [
+                "abc!",
+                "@searchname",
+                "@searchname (abc\\!)"
+            ],
+            [
+                "abc!",
+                "@name",
+                "@name (abc\\!)"
+            ],
+            [
+                "abc!",
+                "@(name,searchname)",
+                "@(name,searchname) (abc\\!)"
+            ],
+            [
+                "abc!",
+                "@(title,filename)",
+                "@(title,filename) (abc\\!)"
+            ],
+            [
+                "a--b",
+                "",
+                "(a\\-\\-b)"
+            ],
+            [
+                "a--b",
+                "@searchname",
+                "(@searchname (a\\-\\-b) | @searchname (a b))"
+            ],
+            [
+                "a--b",
+                "@name",
+                "@name (a\\-\\-b)"
+            ],
+            [
+                "a--b",
+                "@(name,searchname)",
+                "(@(name,searchname) (a\\-\\-b) | @(name,searchname) (a b))"
+            ],
+            [
+                "a--b",
+                "@(title,filename)",
+                "@(title,filename) (a\\-\\-b)"
+            ],
+            [
+                "**",
+                "",
+                "(*)"
+            ],
+            [
+                "**",
+                "@searchname",
+                "@searchname (*)"
+            ],
+            [
+                "**",
+                "@name",
+                "@name (*)"
+            ],
+            [
+                "**",
+                "@(name,searchname)",
+                "@(name,searchname) (*)"
+            ],
+            [
+                "**",
+                "@(title,filename)",
+                "@(title,filename) (*)"
+            ],
+            [
+                "*-*",
+                "",
+                "(*\\-*)"
+            ],
+            [
+                "*-*",
+                "@searchname",
+                "@searchname (*\\-*)"
+            ],
+            [
+                "*-*",
+                "@name",
+                "@name (*\\-*)"
+            ],
+            [
+                "*-*",
+                "@(name,searchname)",
+                "@(name,searchname) (*\\-*)"
+            ],
+            [
+                "*-*",
+                "@(title,filename)",
+                "@(title,filename) (*\\-*)"
+            ],
+            [
+                "Amélie 2001",
+                "",
+                "(Amélie 2001)"
+            ],
+            [
+                "Amélie 2001",
+                "@searchname",
+                "@searchname (Amélie 2001)"
+            ],
+            [
+                "Amélie 2001",
+                "@name",
+                "@name (Amélie 2001)"
+            ],
+            [
+                "Amélie 2001",
+                "@(name,searchname)",
+                "@(name,searchname) (Amélie 2001)"
+            ],
+            [
+                "Amélie 2001",
+                "@(title,filename)",
+                "@(title,filename) (Amélie 2001)"
+            ],
+            [
+                "Amélie.2001",
+                "",
+                "(Amélie.2001)"
+            ],
+            [
+                "Amélie.2001",
+                "@searchname",
+                "(@searchname (Amélie.2001) | @searchname (Amélie 2001))"
+            ],
+            [
+                "Amélie.2001",
+                "@name",
+                "@name (Amélie.2001)"
+            ],
+            [
+                "Amélie.2001",
+                "@(name,searchname)",
+                "(@(name,searchname) (Amélie.2001) | @(name,searchname) (Amélie 2001))"
+            ],
+            [
+                "Amélie.2001",
+                "@(title,filename)",
+                "@(title,filename) (Amélie.2001)"
+            ],
+            [
+                "non breaking",
+                "",
+                "(non breaking)"
+            ],
+            [
+                "non breaking",
+                "@searchname",
+                "@searchname (non breaking)"
+            ],
+            [
+                "non breaking",
+                "@name",
+                "@name (non breaking)"
+            ],
+            [
+                "non breaking",
+                "@(name,searchname)",
+                "@(name,searchname) (non breaking)"
+            ],
+            [
+                "non breaking",
+                "@(title,filename)",
+                "@(title,filename) (non breaking)"
+            ],
+            [
+                "tab\tsep",
+                "",
+                "(tab sep)"
+            ],
+            [
+                "tab\tsep",
+                "@searchname",
+                "@searchname (tab sep)"
+            ],
+            [
+                "tab\tsep",
+                "@name",
+                "@name (tab sep)"
+            ],
+            [
+                "tab\tsep",
+                "@(name,searchname)",
+                "@(name,searchname) (tab sep)"
+            ],
+            [
+                "tab\tsep",
+                "@(title,filename)",
+                "@(title,filename) (tab sep)"
+            ],
+            [
+                "ctrl\u000bv",
+                "",
+                "(ctrl v)"
+            ],
+            [
+                "ctrl\u000bv",
+                "@searchname",
+                "@searchname (ctrl v)"
+            ],
+            [
+                "ctrl\u000bv",
+                "@name",
+                "@name (ctrl v)"
+            ],
+            [
+                "ctrl\u000bv",
+                "@(name,searchname)",
+                "@(name,searchname) (ctrl v)"
+            ],
+            [
+                "ctrl\u000bv",
+                "@(title,filename)",
+                "@(title,filename) (ctrl v)"
+            ],
+            [
+                "form\ffeed",
+                "",
+                "(form feed)"
+            ],
+            [
+                "form\ffeed",
+                "@searchname",
+                "@searchname (form feed)"
+            ],
+            [
+                "form\ffeed",
+                "@name",
+                "@name (form feed)"
+            ],
+            [
+                "form\ffeed",
+                "@(name,searchname)",
+                "@(name,searchname) (form feed)"
+            ],
+            [
+                "form\ffeed",
+                "@(title,filename)",
+                "@(title,filename) (form feed)"
+            ],
+            [
+                "Ünï-çødé",
+                "",
+                "(Ünï\\-çødé)"
+            ],
+            [
+                "Ünï-çødé",
+                "@searchname",
+                "(@searchname (Ünï\\-çødé) | @searchname (Ünï çødé))"
+            ],
+            [
+                "Ünï-çødé",
+                "@name",
+                "@name (Ünï\\-çødé)"
+            ],
+            [
+                "Ünï-çødé",
+                "@(name,searchname)",
+                "(@(name,searchname) (Ünï\\-çødé) | @(name,searchname) (Ünï çødé))"
+            ],
+            [
+                "Ünï-çødé",
+                "@(title,filename)",
+                "@(title,filename) (Ünï\\-çødé)"
+            ],
+            [
+                "東京 2020",
+                "",
+                "(東京 2020)"
+            ],
+            [
+                "東京 2020",
+                "@searchname",
+                "@searchname (東京 2020)"
+            ],
+            [
+                "東京 2020",
+                "@name",
+                "@name (東京 2020)"
+            ],
+            [
+                "東京 2020",
+                "@(name,searchname)",
+                "@(name,searchname) (東京 2020)"
+            ],
+            [
+                "東京 2020",
+                "@(title,filename)",
+                "@(title,filename) (東京 2020)"
+            ],
+            [
+                "-1",
+                "",
+                "(-1)"
+            ],
+            [
+                "-1",
+                "@searchname",
+                "@searchname (-1)"
+            ],
+            [
+                "-1",
+                "@name",
+                "@name (-1)"
+            ],
+            [
+                "-1",
+                "@(name,searchname)",
+                "@(name,searchname) (-1)"
+            ],
+            [
+                "-1",
+                "@(title,filename)",
+                "@(title,filename) (-1)"
+            ],
+            [
+                "foo@bar.baz",
+                "",
+                "(foo\\@bar.baz)"
+            ],
+            [
+                "foo@bar.baz",
+                "@searchname",
+                "@searchname (foo\\@bar.baz)"
+            ],
+            [
+                "foo@bar.baz",
+                "@name",
+                "@name (foo\\@bar.baz)"
+            ],
+            [
+                "foo@bar.baz",
+                "@(name,searchname)",
+                "@(name,searchname) (foo\\@bar.baz)"
+            ],
+            [
+                "foo@bar.baz",
+                "@(title,filename)",
+                "@(title,filename) (foo\\@bar.baz)"
+            ],
+            [
+                "poster <a@b.c> (x)",
+                "",
+                "(poster <a\\@b.c> (x))"
+            ],
+            [
+                "poster <a@b.c> (x)",
+                "@searchname",
+                "@searchname (poster <a\\@b.c> (x))"
+            ],
+            [
+                "poster <a@b.c> (x)",
+                "@name",
+                "@name (poster <a\\@b.c> (x))"
+            ],
+            [
+                "poster <a@b.c> (x)",
+                "@(name,searchname)",
+                "@(name,searchname) (poster <a\\@b.c> (x))"
+            ],
+            [
+                "poster <a@b.c> (x)",
+                "@(title,filename)",
+                "@(title,filename) (poster <a\\@b.c> (x))"
+            ],
+            [
+                "x|y",
+                "",
+                "(x|y)"
+            ],
+            [
+                "x|y",
+                "@searchname",
+                "@searchname (x|y)"
+            ],
+            [
+                "x|y",
+                "@name",
+                "@name (x|y)"
+            ],
+            [
+                "x|y",
+                "@(name,searchname)",
+                "@(name,searchname) (x|y)"
+            ],
+            [
+                "x|y",
+                "@(title,filename)",
+                "@(title,filename) (x|y)"
+            ],
+            [
+                "x^y",
+                "",
+                "(x^y)"
+            ],
+            [
+                "x^y",
+                "@searchname",
+                "@searchname (x^y)"
+            ],
+            [
+                "x^y",
+                "@name",
+                "@name (x^y)"
+            ],
+            [
+                "x^y",
+                "@(name,searchname)",
+                "@(name,searchname) (x^y)"
+            ],
+            [
+                "x^y",
+                "@(title,filename)",
+                "@(title,filename) (x^y)"
+            ],
+            [
+                "x?y",
+                "",
+                "(x?y)"
+            ],
+            [
+                "x?y",
+                "@searchname",
+                "@searchname (x?y)"
+            ],
+            [
+                "x?y",
+                "@name",
+                "@name (x?y)"
+            ],
+            [
+                "x?y",
+                "@(name,searchname)",
+                "@(name,searchname) (x?y)"
+            ],
+            [
+                "x?y",
+                "@(title,filename)",
+                "@(title,filename) (x?y)"
+            ],
+            [
+                "x%y",
+                "",
+                "(x%y)"
+            ],
+            [
+                "x%y",
+                "@searchname",
+                "@searchname (x%y)"
+            ],
+            [
+                "x%y",
+                "@name",
+                "@name (x%y)"
+            ],
+            [
+                "x%y",
+                "@(name,searchname)",
+                "@(name,searchname) (x%y)"
+            ],
+            [
+                "x%y",
+                "@(title,filename)",
+                "@(title,filename) (x%y)"
+            ],
+            [
+                "x<y>z",
+                "",
+                "(x<y>z)"
+            ],
+            [
+                "x<y>z",
+                "@searchname",
+                "@searchname (x<y>z)"
+            ],
+            [
+                "x<y>z",
+                "@name",
+                "@name (x<y>z)"
+            ],
+            [
+                "x<y>z",
+                "@(name,searchname)",
+                "@(name,searchname) (x<y>z)"
+            ],
+            [
+                "x<y>z",
+                "@(title,filename)",
+                "@(title,filename) (x<y>z)"
+            ],
+            [
+                "a.b_c-d e",
+                "",
+                "(a.b_c\\-d e)"
+            ],
+            [
+                "a.b_c-d e",
+                "@searchname",
+                "(@searchname (a.b_c\\-d e) | @searchname (a b c d e))"
+            ],
+            [
+                "a.b_c-d e",
+                "@name",
+                "@name (a.b_c\\-d e)"
+            ],
+            [
+                "a.b_c-d e",
+                "@(name,searchname)",
+                "(@(name,searchname) (a.b_c\\-d e) | @(name,searchname) (a b c d e))"
+            ],
+            [
+                "a.b_c-d e",
+                "@(title,filename)",
+                "@(title,filename) (a.b_c\\-d e)"
+            ],
+            [
+                "...",
+                "",
+                "(...)"
+            ],
+            [
+                "...",
+                "@searchname",
+                "@searchname (...)"
+            ],
+            [
+                "...",
+                "@name",
+                "@name (...)"
+            ],
+            [
+                "...",
+                "@(name,searchname)",
+                "@(name,searchname) (...)"
+            ],
+            [
+                "...",
+                "@(title,filename)",
+                "@(title,filename) (...)"
+            ],
+            [
+                "._-",
+                "",
+                "(._\\-)"
+            ],
+            [
+                "._-",
+                "@searchname",
+                "@searchname (._\\-)"
+            ],
+            [
+                "._-",
+                "@name",
+                "@name (._\\-)"
+            ],
+            [
+                "._-",
+                "@(name,searchname)",
+                "@(name,searchname) (._\\-)"
+            ],
+            [
+                "._-",
+                "@(title,filename)",
+                "@(title,filename) (._\\-)"
+            ]
+        ],
+        "fuzzy": [
+            [
+                "dead circus",
+                "dead circus"
+            ],
+            [
+                "!circus",
+                "circus"
+            ],
+            [
+                "-circus",
+                "circus"
+            ],
+            [
+                "dead !circus",
+                "dead circus"
+            ],
+            [
+                "dead -circus",
+                "dead circus"
+            ],
+            [
+                "!foo !bar",
+                "foo bar"
+            ],
+            [
+                "\"exact phrase\"",
+                "exact phrase"
+            ],
+            [
+                "!\"exact phrase\"",
+                "exact phrase"
+            ],
+            [
+                "-\"exact phrase\"",
+                "exact phrase"
+            ],
+            [
+                "a | b",
+                "a b"
+            ],
+            [
+                "word*",
+                "word"
+            ],
+            [
+                "*word",
+                "word"
+            ],
+            [
+                "*word*",
+                "word"
+            ],
+            [
+                "(a | b) -c",
+                "a b c"
+            ],
+            [
+                "((a))",
+                "a"
+            ],
+            [
+                "()",
+                ""
+            ],
+            [
+                "(",
+                ""
+            ],
+            [
+                ")",
+                ""
+            ],
+            [
+                "spider-man",
+                "spider man"
+            ],
+            [
+                "WEB-DL.x265",
+                "WEB DL x265"
+            ],
+            [
+                "S01E02.1080p.WEB-DL",
+                "S01E02 1080p WEB DL"
+            ],
+            [
+                "foo_bar.baz-qux",
+                "foo_bar baz qux"
+            ],
+            [
+                "it's",
+                "it s"
+            ],
+            [
+                "a@b",
+                "a b"
+            ],
+            [
+                "a~b",
+                "a b"
+            ],
+            [
+                "a&b",
+                "a b"
+            ],
+            [
+                "a/b",
+                "a b"
+            ],
+            [
+                "a$b",
+                "a b"
+            ],
+            [
+                "a=b",
+                "a b"
+            ],
+            [
+                "a[b]",
+                "a b"
+            ],
+            [
+                "back\\slash",
+                "back slash"
+            ],
+            [
+                "unmatched\"quote",
+                "unmatched quote"
+            ],
+            [
+                "*",
+                ""
+            ],
+            [
+                "",
+                ""
+            ],
+            [
+                "   ",
+                ""
+            ],
+            [
+                "0",
+                ""
+            ],
+            [
+                "-",
+                ""
+            ],
+            [
+                "!",
+                ""
+            ],
+            [
+                "--",
+                ""
+            ],
+            [
+                "-!",
+                ""
+            ],
+            [
+                "abc-",
+                "abc"
+            ],
+            [
+                "abc!",
+                "abc"
+            ],
+            [
+                "a--b",
+                "a b"
+            ],
+            [
+                "**",
+                ""
+            ],
+            [
+                "*-*",
+                ""
+            ],
+            [
+                "Amélie 2001",
+                "Am lie 2001"
+            ],
+            [
+                "Amélie.2001",
+                "Am lie 2001"
+            ],
+            [
+                "non breaking",
+                "non breaking"
+            ],
+            [
+                "tab\tsep",
+                "tab sep"
+            ],
+            [
+                "ctrl\u000bv",
+                "ctrl v"
+            ],
+            [
+                "form\ffeed",
+                "form feed"
+            ],
+            [
+                "Ünï-çødé",
+                "n d"
+            ],
+            [
+                "東京 2020",
+                "2020"
+            ],
+            [
+                "-1",
+                "1"
+            ],
+            [
+                "foo@bar.baz",
+                "foo bar baz"
+            ],
+            [
+                "poster <a@b.c> (x)",
+                "poster a b c x"
+            ],
+            [
+                "x|y",
+                "x y"
+            ],
+            [
+                "x^y",
+                "x y"
+            ],
+            [
+                "x?y",
+                "x y"
+            ],
+            [
+                "x%y",
+                "x y"
+            ],
+            [
+                "x<y>z",
+                "x y z"
+            ],
+            [
+                "a.b_c-d e",
+                "a b_c d e"
+            ],
+            [
+                "...",
+                ""
+            ],
+            [
+                "._-",
+                "_"
+            ]
+        ],
+        "field_expressions": [
+            [
+                {
+                    "__fields": [
+                        [
+                            "searchname",
+                            "foo bar"
+                        ]
+                    ]
+                },
+                null,
+                "@@relaxed @searchname (foo bar)"
+            ],
+            [
+                {
+                    "__fields": [
+                        [
+                            "name",
+                            "a-b"
+                        ],
+                        [
+                            "searchname",
+                            "a-b"
+                        ]
+                    ]
+                },
+                null,
+                "@@relaxed @name (a\\-b) (@searchname (a\\-b) | @searchname (a b))"
+            ],
+            [
+                {
+                    "__fields": [
+                        [
+                            "title",
+                            "x"
+                        ],
+                        [
+                            "director",
+                            "y z"
+                        ]
+                    ]
+                },
+                null,
+                "@@relaxed @title (x) @director (y z)"
+            ],
+            [
+                {
+                    "__fields": [
+                        [
+                            "title",
+                            "0"
+                        ]
+                    ]
+                },
+                null,
+                "@@relaxed @title (0)"
+            ],
+            [
+                {
+                    "__fields": [
+                        [
+                            "title",
+                            ""
+                        ],
+                        [
+                            "actors",
+                            "*"
+                        ]
+                    ]
+                },
+                null,
+                null
+            ],
+            [
+                {
+                    "__fields": [
+                        [
+                            "searchname",
+                            "a"
+                        ],
+                        [
+                            "bad",
+                            "b"
+                        ]
+                    ]
+                },
+                [
+                    "searchname"
+                ],
+                "@@relaxed @searchname (a)"
+            ]
+        ],
+        "suggestions": [
+            [
+                "Show.Name.S01E01.mkv",
+                "show",
+                "Show Name S01E01"
+            ],
+            [
+                "file_with_under.scores.NFO",
+                "file",
+                "file with under scores"
+            ],
+            [
+                "a.r01",
+                "a",
+                "a"
+            ],
+            [
+                "0",
+                "0",
+                null
+            ],
+            [
+                "...",
+                "x",
+                null
+            ],
+            [
+                "The.Quite.Extraordinarily.Long.Release.Name.Of.A.Show.That.Keeps.Going.And.Going.Needle.S01E01.1080p.WEB-DL.DDP5.1.H264-GROUP.mkv",
+                "needle",
+                "Going Needle S01E01 1080p WEB-DL DDP5 1"
+            ],
+            [
+                "The.Quite.Extraordinarily.Long.Release.Name.Of.A.Show.That.Keeps.Going.And.Going.Needle.S01E01.1080p.WEB-DL.DDP5.1.H264-GROUP.mkv",
+                "zzz",
+                "The Quite Extraordinarily Long Release Name Of A Show That Keeps Going And Going"
+            ],
+            [
+                "The.Quite.Extraordinarily.Long.Release.Name.Of.A.Show.That.Keeps.Going.And.Going.Needle.S01E01.1080p.WEB-DL.DDP5.1.H264-GROUP.mkv",
+                "the",
+                "The Quite Extraordinarily Long Release Name Of A Show That Keeps Going And"
+            ]
+        ]
+    },
+    "requests": {
+        "browse_defaults": {
+            "criteria": [],
+            "limit": 50,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 50,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "text": {
+            "criteria": {
+                "phrases": "Dead Circus"
+            },
+            "limit": 25,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "ranker": "sph04",
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 25,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "@@relaxed @searchname (Dead Circus)"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "fuzzy": true,
+                        "distance": 2,
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 25,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "Dead Circus"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "text_offset": {
+            "criteria": {
+                "phrases": "foo",
+                "try_fuzzy": false
+            },
+            "limit": 100,
+            "offset": 9000,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "ranker": "sph04",
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 9200,
+                    "limit": 100,
+                    "offset": 9000,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "@@relaxed @searchname (foo)"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "punctuated": {
+            "criteria": {
+                "phrases": "WEB-DL.x265"
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "ranker": "sph04",
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "@@relaxed (@searchname (WEB\\-DL.x265) | @searchname (WEB DL x265))"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "fuzzy": true,
+                        "distance": 2,
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "WEB DL x265"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "negated": {
+            "criteria": {
+                "phrases": "!harry"
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "ranker": "sph04",
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "@@relaxed @searchname (!harry)"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "terms": {
+            "criteria": {
+                "phrases": [
+                    "foo",
+                    "bar"
+                ]
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "ranker": "sph04",
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "@@relaxed @searchname (foo bar)"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "fuzzy": true,
+                        "distance": 2,
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "foo bar"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "empty_terms": {
+            "criteria": {
+                "phrases": []
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": []
+        },
+        "fields": {
+            "criteria": {
+                "phrases": {
+                    "__fields": [
+                        [
+                            "searchname",
+                            "a"
+                        ],
+                        [
+                            "name",
+                            "b-c"
+                        ],
+                        [
+                            "bogus",
+                            "x"
+                        ],
+                        [
+                            "filename",
+                            ""
+                        ]
+                    ]
+                }
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "ranker": "sph04",
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "@@relaxed @searchname (a) @name (b\\-c)"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "fuzzy": true,
+                        "distance": 2,
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "a b c x"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "poster": {
+            "criteria": {
+                "phrases": {
+                    "__fields": [
+                        [
+                            "fromname",
+                            "x@y.z (Name)"
+                        ]
+                    ]
+                }
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "ranker": "sph04",
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "@@relaxed @fromname (x\\@y.z \\(Name\\))"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "poster_fuzzy_only": {
+            "criteria": {
+                "phrases": {
+                    "__fields": [
+                        [
+                            "fromname",
+                            "abc"
+                        ]
+                    ]
+                },
+                "fuzzy_only": true
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "ranker": "sph04",
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "@@relaxed @fromname (abc)"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "media_field": {
+            "criteria": {
+                "phrases": {
+                    "__fields": [
+                        [
+                            "media_video_codec",
+                            "h264"
+                        ]
+                    ]
+                }
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "ranker": "sph04",
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "@@relaxed @media_video_codec (h264)"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "fuzzy_only": {
+            "criteria": {
+                "phrases": "harry poter",
+                "fuzzy_only": true
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "fuzzy": true,
+                        "distance": 2,
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "harry poter"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "fuzzy_punctuation": {
+            "criteria": {
+                "phrases": "Amélie.2001-x",
+                "fuzzy_only": true
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "options": {
+                        "fuzzy": true,
+                        "distance": 2,
+                        "field_weights": {
+                            "searchname": 12,
+                            "plainsearchname": 10,
+                            "name": 8,
+                            "filename": 5,
+                            "fromname": 1
+                        }
+                    },
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "query_string": "Am lie 2001 x"
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "filters": {
+            "criteria": {
+                "category_ids": [
+                    2000,
+                    0,
+                    2040
+                ],
+                "excluded_category_ids": [
+                    5000,
+                    5040
+                ],
+                "release_ids": [
+                    7
+                ],
+                "min_size": 10,
+                "max_size": 20,
+                "min_date": 1000,
+                "max_date": 2000,
+                "groups_id": 3,
+                "password_allow_rar": true,
+                "password_status_min": -1,
+                "has_media_info": true,
+                "media_unique_id": " abc ",
+                "min_video_width": 1,
+                "max_video_width": 2,
+                "min_video_height": 3,
+                "max_video_height": 4,
+                "sort_field": "size",
+                "sort_dir": "ASC"
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "sort": [
+                        {
+                            "size": "asc"
+                        },
+                        {
+                            "id": "asc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "equals": {
+                                        "id": 7
+                                    }
+                                },
+                                {
+                                    "in": {
+                                        "categories_id": [
+                                            2000,
+                                            2040
+                                        ]
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "size": {
+                                            "gte": 10
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "size": {
+                                            "lte": 20
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "postdate_ts": {
+                                            "gte": 1000
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "postdate_ts": {
+                                            "lte": 2000
+                                        }
+                                    }
+                                },
+                                {
+                                    "equals": {
+                                        "groups_id": 3
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 1
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "gte": -1
+                                        }
+                                    }
+                                },
+                                {
+                                    "equals": {
+                                        "has_media_info": 1
+                                    }
+                                },
+                                {
+                                    "equals": {
+                                        "media_unique_id": "abc"
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "media_video_width": {
+                                            "gte": 1
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "media_video_width": {
+                                            "lte": 2
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "media_video_height": {
+                                            "gte": 3
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "media_video_height": {
+                                            "lte": 4
+                                        }
+                                    }
+                                }
+                            ],
+                            "must_not": [
+                                {
+                                    "in": {
+                                        "categories_id": [
+                                            5000,
+                                            5040
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "filters_more": {
+            "criteria": {
+                "category_ids": [
+                    2000
+                ],
+                "release_ids": [
+                    1,
+                    -1,
+                    2
+                ],
+                "has_media_info": false,
+                "media_unique_id": "-1",
+                "groups_id": 0,
+                "sort_field": "bogus",
+                "sort_dir": "sideways",
+                "ranges": {
+                    "size": {
+                        "min": 1,
+                        "max": 2
+                    },
+                    "grabs": {
+                        "min": -1
+                    },
+                    "bogus": {
+                        "min": 1
+                    },
+                    "adddate_ts": {
+                        "max": "9"
+                    }
+                },
+                "min_id": 5,
+                "max_id": "6"
+            },
+            "limit": 10,
+            "offset": 0,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "sort": [
+                        {
+                            "postdate_ts": "desc"
+                        },
+                        {
+                            "id": "desc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 10,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "range": {
+                                        "size": {
+                                            "gte": 1
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "size": {
+                                            "lte": 2
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "adddate_ts": {
+                                            "lte": 9
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "id": {
+                                            "gte": 5
+                                        }
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "id": {
+                                            "lte": 6
+                                        }
+                                    }
+                                },
+                                {
+                                    "in": {
+                                        "id": [
+                                            1,
+                                            2
+                                        ]
+                                    }
+                                },
+                                {
+                                    "equals": {
+                                        "categories_id": 2000
+                                    }
+                                },
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                },
+                                {
+                                    "equals": {
+                                        "has_media_info": 0
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "sort_id": {
+            "criteria": {
+                "sort_field": "id",
+                "sort_dir": "asc"
+            },
+            "limit": 0,
+            "offset": -5,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "strip_bad_utf8": true,
+                    "sort": [
+                        {
+                            "id": "asc"
+                        }
+                    ],
+                    "max_matches": 1000,
+                    "limit": 1,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "range": {
+                                        "passwordstatus": {
+                                            "lte": 0
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        }
+    },
+    "external_requests": {
+        "one": {
+            "sets": [
+                {
+                    "imdbid": "0133093",
+                    "tmdbid": 603,
+                    "tvdb": 0,
+                    "bogus": 1
+                }
+            ],
+            "limit": 1000,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "limit": 1000,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "equals": {
+                                        "imdbid": "0133093"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "table": "releases_rt",
+                    "limit": 1000,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "equals": {
+                                        "tmdbid": 603
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        "sets": {
+            "sets": [
+                {
+                    "imdbid": "1"
+                },
+                {
+                    "imdbid": "1",
+                    "tvmaze": "5"
+                },
+                {
+                    "tvrage": 6,
+                    "traktid": 7
+                }
+            ],
+            "limit": 20000,
+            "bodies": [
+                {
+                    "table": "releases_rt",
+                    "limit": 10000,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "equals": {
+                                        "imdbid": "1"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "table": "releases_rt",
+                    "limit": 10000,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "equals": {
+                                        "tvmaze": 5
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "table": "releases_rt",
+                    "limit": 10000,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "equals": {
+                                        "tvrage": 6
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "table": "releases_rt",
+                    "limit": 10000,
+                    "query": {
+                        "bool": {
+                            "must": [
+                                {
+                                    "equals": {
+                                        "traktid": 7
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        }
+    },
+    "lookups": {
+        "candidates": [
+            {
+                "table": "releases_rt",
+                "strip_bad_utf8": true,
+                "sort": [
+                    {
+                        "id": "asc"
+                    }
+                ],
+                "options": {
+                    "ranker": "sph04",
+                    "field_weights": {
+                        "searchname": 12,
+                        "plainsearchname": 10,
+                        "name": 8,
+                        "filename": 5,
+                        "fromname": 1
+                    }
+                },
+                "max_matches": 22,
+                "limit": 22,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "query_string": "@@relaxed (@name (Dead Circus 2019) | @searchname (Dead Circus 2019))"
+                            },
+                            {
+                                "range": {
+                                    "id": {
+                                        "gt": 5
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        ],
+        "exact": [
+            {
+                "table": "predb_rt",
+                "limit": 5,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "query_string": "@title \"^Some.Release\\-GRP \\[x\\]$\""
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "table": "predb_rt",
+                "limit": 5,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "query_string": "@filename \"^Some.Release\\-GRP \\[x\\]$\""
+                            }
+                        ]
+                    }
+                }
+            }
+        ],
+        "filename": [
+            {
+                "table": "predb_rt",
+                "max_matches": 1000,
+                "limit": 1000,
+                "strip_bad_utf8": false,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "query_string": "@@relaxed @(title,filename) (some.release.nfo)"
+                            }
+                        ]
+                    }
+                }
+            }
+        ]
+    },
+    "results": {
+        "pages": {
+            "browse": {
+                "criteria": {
+                    "password_allow_rar": true
+                },
+                "limit": 50,
+                "offset": 0,
+                "ids": [
+                    5,
+                    2,
+                    1,
+                    3,
+                    4
+                ],
+                "total": 5,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "browse_no_passworded": {
+                "criteria": [],
+                "limit": 50,
+                "offset": 0,
+                "ids": [
+                    5,
+                    1,
+                    3,
+                    4
+                ],
+                "total": 4,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "text": {
+                "criteria": {
+                    "phrases": "dead circus"
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    1
+                ],
+                "total": 1,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "text_documents": {
+                "criteria": {
+                    "phrases": "dead circus",
+                    "include_documents": true
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    1
+                ],
+                "total": 1,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": [
+                    {
+                        "name": "dead.circus.2019.1080p",
+                        "searchname": "Dead.Circus.2019.1080p.WEB-DL.x265-GRP",
+                        "plainsearchname": "Dead Circus 2019 1080p WEB DL x265 GRP",
+                        "fromname": "poster@example.com (Poster)",
+                        "filename": "dead.circus.mkv",
+                        "episode_title": "",
+                        "media_movie_name": "",
+                        "media_file_name": "",
+                        "media_container_format": "",
+                        "media_video_format": "",
+                        "media_video_codec": "h264",
+                        "media_audio_format": "",
+                        "media_audio_channels": "",
+                        "media_audio_language": "",
+                        "media_subtitle_language": "",
+                        "guid": "g1",
+                        "category_name": "Movies > HD",
+                        "parent_category": "Movies",
+                        "sub_category": "HD",
+                        "group_name": "alt.binaries.movies",
+                        "categories_id": 2040,
+                        "imdbid": "0133093",
+                        "tmdbid": 603,
+                        "traktid": 481,
+                        "tvdb": 0,
+                        "tvmaze": 0,
+                        "tvrage": 0,
+                        "trakt": 0,
+                        "imdb": "",
+                        "tmdb": 0,
+                        "videos_id": 0,
+                        "tv_episodes_id": 0,
+                        "movieinfo_id": 0,
+                        "anidbid": 0,
+                        "parentid": 0,
+                        "series": 0,
+                        "episode": 0,
+                        "firstaired_ts": 0,
+                        "size": 5000000000,
+                        "postdate_ts": 1709287200,
+                        "adddate_ts": 1709290800,
+                        "totalpart": 100,
+                        "grabs": 7,
+                        "comments": 1,
+                        "nfostatus": 0,
+                        "jpgstatus": 0,
+                        "nfoid": 0,
+                        "reid": 0,
+                        "passwordstatus": 0,
+                        "groups_id": 11,
+                        "nzbstatus": 1,
+                        "haspreview": 0,
+                        "media_unique_id": "uid-1",
+                        "media_video_width": 1920,
+                        "media_video_height": 1080,
+                        "has_media_info": 1,
+                        "name_len": 4,
+                        "searchname_len": 8,
+                        "plainsearchname_len": 8,
+                        "fromname_len": 4,
+                        "filename_len": 3,
+                        "episode_title_len": 0,
+                        "media_movie_name_len": 0,
+                        "media_file_name_len": 0,
+                        "media_container_format_len": 0,
+                        "media_video_format_len": 0,
+                        "media_video_codec_len": 1,
+                        "media_audio_format_len": 0,
+                        "media_audio_channels_len": 0,
+                        "media_audio_language_len": 0,
+                        "media_subtitle_language_len": 0,
+                        "id": 1
+                    }
+                ]
+            },
+            "punctuated": {
+                "criteria": {
+                    "phrases": "WEB-DL.x265"
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    1
+                ],
+                "total": 1,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "hyphen": {
+                "criteria": {
+                    "phrases": "spider-man"
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    3
+                ],
+                "total": 1,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "negated": {
+                "criteria": {
+                    "phrases": "circus !locked",
+                    "password_allow_rar": true
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    2,
+                    1
+                ],
+                "total": 2,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "negated_no_fuzzy": {
+                "criteria": {
+                    "phrases": "!nosuchword"
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [],
+                "total": 0,
+                "fuzzy": false,
+                "available": false,
+                "has_more": false,
+                "documents": []
+            },
+            "typo_fuzzy_fallback": {
+                "criteria": {
+                    "phrases": "ciircus"
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    1
+                ],
+                "total": 1,
+                "fuzzy": true,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "typo_no_fuzzy": {
+                "criteria": {
+                    "phrases": "ciircus",
+                    "try_fuzzy": false
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [],
+                "total": 0,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "fuzzy_only": {
+                "criteria": {
+                    "phrases": "circus",
+                    "fuzzy_only": true
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    1
+                ],
+                "total": 1,
+                "fuzzy": true,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "poster": {
+                "criteria": {
+                    "phrases": {
+                        "__fields": [
+                            [
+                                "fromname",
+                                "poster@example.com"
+                            ]
+                        ]
+                    }
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    5,
+                    1,
+                    3
+                ],
+                "total": 3,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "poster_no_fuzzy": {
+                "criteria": {
+                    "phrases": {
+                        "__fields": [
+                            [
+                                "fromname",
+                                "nosuchposter"
+                            ]
+                        ]
+                    }
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [],
+                "total": 0,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "fields": {
+                "criteria": {
+                    "phrases": {
+                        "__fields": [
+                            [
+                                "searchname",
+                                "dead"
+                            ],
+                            [
+                                "name",
+                                "720p"
+                            ]
+                        ]
+                    }
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [],
+                "total": 0,
+                "fuzzy": true,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "media_field": {
+                "criteria": {
+                    "phrases": {
+                        "__fields": [
+                            [
+                                "media_video_codec",
+                                "h264"
+                            ]
+                        ]
+                    }
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    1
+                ],
+                "total": 1,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "paged": {
+                "criteria": {
+                    "sort_field": "size",
+                    "sort_dir": "asc"
+                },
+                "limit": 2,
+                "offset": 1,
+                "ids": [
+                    5,
+                    1
+                ],
+                "total": 4,
+                "fuzzy": false,
+                "available": true,
+                "has_more": true,
+                "documents": []
+            },
+            "category": {
+                "criteria": {
+                    "category_ids": [
+                        2040
+                    ]
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    1,
+                    3
+                ],
+                "total": 2,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "excluded": {
+                "criteria": {
+                    "excluded_category_ids": [
+                        2040
+                    ]
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    5,
+                    4
+                ],
+                "total": 2,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "ids": {
+                "criteria": {
+                    "release_ids": [
+                        1,
+                        3
+                    ]
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    1,
+                    3
+                ],
+                "total": 2,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "ranges": {
+                "criteria": {
+                    "ranges": {
+                        "grabs": {
+                            "min": 5
+                        }
+                    },
+                    "min_id": 2
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    3,
+                    4
+                ],
+                "total": 2,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "media": {
+                "criteria": {
+                    "has_media_info": true,
+                    "min_video_width": 1000,
+                    "media_unique_id": "uid-1"
+                },
+                "limit": 10,
+                "offset": 0,
+                "ids": [
+                    1
+                ],
+                "total": 1,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            },
+            "too_deep": {
+                "criteria": [],
+                "limit": 10,
+                "offset": 20000,
+                "ids": [],
+                "total": 4,
+                "fuzzy": false,
+                "available": true,
+                "has_more": false,
+                "documents": []
+            }
+        },
+        "autocomplete": [
+            [
+                "dead",
+                [
+                    {
+                        "suggest": "Dead Circus 2019 720p HDTV x264-GRP",
+                        "distance": 0,
+                        "docs": 1
+                    },
+                    {
+                        "suggest": "Dead Circus 2019 1080p WEB-DL x265-GRP",
+                        "distance": 0,
+                        "docs": 1
+                    }
+                ]
+            ],
+            [
+                "Dead Ci",
+                [
+                    {
+                        "suggest": "Dead Circus 2019 720p HDTV x264-GRP",
+                        "distance": 0,
+                        "docs": 1
+                    },
+                    {
+                        "suggest": "Dead Circus 2019 1080p WEB-DL x265-GRP",
+                        "distance": 0,
+                        "docs": 1
+                    }
+                ]
+            ],
+            [
+                "spider-m",
+                [
+                    {
+                        "suggest": "Spider-Man 2002 1080p BluRay",
+                        "distance": 0,
+                        "docs": 1
+                    }
+                ]
+            ],
+            [
+                "zz",
+                []
+            ],
+            [
+                "d",
+                []
+            ],
+            [
+                "nosuchthing",
+                []
+            ]
+        ],
+        "suggest": [
+            [
+                "circos",
+                []
+            ],
+            [
+                "spidr",
+                []
+            ],
+            [
+                "dead",
+                [
+                    {
+                        "suggest": "web",
+                        "distance": 3,
+                        "docs": 1
+                    }
+                ]
+            ],
+            [
+                "!circus",
+                []
+            ],
+            [
+                "",
+                []
+            ],
+            [
+                "nosuchthing",
+                []
+            ],
+            [
+                "circus",
+                []
+            ]
+        ],
+        "external": [
+            [
+                [
+                    {
+                        "imdbid": "0133093"
+                    }
+                ],
+                [
+                    1
+                ]
+            ],
+            [
+                [
+                    {
+                        "tvdb": 77
+                    }
+                ],
+                [
+                    3,
+                    4
+                ]
+            ],
+            [
+                [
+                    {
+                        "tmdbid": 603
+                    },
+                    {
+                        "tvdb": 77
+                    }
+                ],
+                [
+                    1,
+                    3,
+                    4
+                ]
+            ],
+            [
+                [
+                    {
+                        "imdbid": "404"
+                    }
+                ],
+                []
+            ]
+        ],
+        "secondary": [
+            [
+                "music",
+                "beatles",
+                {
+                    "id": [
+                        2,
+                        1
+                    ],
+                    "data": [
+                        {
+                            "title": "Let It Be",
+                            "artist": "The Beatles",
+                            "year": "1970",
+                            "genres_id": 3,
+                            "cover": 0,
+                            "title_len": 3,
+                            "artist_len": 2
+                        },
+                        {
+                            "title": "Abbey Road",
+                            "artist": "The Beatles",
+                            "year": "1969",
+                            "genres_id": 3,
+                            "cover": 1,
+                            "title_len": 2,
+                            "artist_len": 2
+                        }
+                    ]
+                }
+            ],
+            [
+                "music",
+                "abbey",
+                {
+                    "id": [
+                        1
+                    ],
+                    "data": [
+                        {
+                            "title": "Abbey Road",
+                            "artist": "The Beatles",
+                            "year": "1969",
+                            "genres_id": 3,
+                            "cover": 1,
+                            "title_len": 2,
+                            "artist_len": 2
+                        }
+                    ]
+                }
+            ],
+            [
+                "anime",
+                "cowboy",
+                {
+                    "id": [
+                        103,
+                        102,
+                        101
+                    ],
+                    "data": [
+                        {
+                            "title": "Cowboy Bebop TV",
+                            "anidbid": 23,
+                            "anilist_id": 1,
+                            "mal_id": 1,
+                            "lang": "en",
+                            "title_type": "synonym",
+                            "media_type": "tv",
+                            "status": "done",
+                            "title_len": 3
+                        },
+                        {
+                            "title": "Cowboy Bebop: Tengoku no Tobira",
+                            "anidbid": 24,
+                            "anilist_id": 5,
+                            "mal_id": 5,
+                            "lang": "en",
+                            "title_type": "official",
+                            "media_type": "movie",
+                            "status": "done",
+                            "title_len": 5
+                        },
+                        {
+                            "title": "Cowboy Bebop",
+                            "anidbid": 23,
+                            "anilist_id": 1,
+                            "mal_id": 1,
+                            "lang": "en",
+                            "title_type": "official",
+                            "media_type": "tv",
+                            "status": "done",
+                            "title_len": 2
+                        }
+                    ]
+                }
+            ],
+            [
+                "music",
+                "  ",
+                {
+                    "id": [],
+                    "data": []
+                }
+            ]
+        ],
+        "anime": [
+            [
+                "cowboy",
+                [
+                    23,
+                    24
+                ]
+            ],
+            [
+                "bebop",
+                [
+                    23,
+                    24
+                ]
+            ],
+            [
+                "nosuch",
+                []
+            ]
+        ],
+        "ids": [
+            [
+                "dead circus",
+                100,
+                [
+                    2,
+                    1
+                ]
+            ],
+            [
+                {
+                    "__fields": [
+                        [
+                            "name",
+                            "dead"
+                        ],
+                        [
+                            "searchname",
+                            "dead"
+                        ]
+                    ]
+                },
+                100,
+                [
+                    2,
+                    1
+                ]
+            ],
+            [
+                {
+                    "__fields": [
+                        [
+                            "searchname",
+                            "dead"
+                        ],
+                        [
+                            "fromname",
+                            "poster"
+                        ]
+                    ]
+                },
+                100,
+                [
+                    1
+                ]
+            ],
+            [
+                "0",
+                100,
+                []
+            ]
+        ],
+        "fuzzy_ids": [
+            [
+                "dead circus",
+                100,
+                {
+                    "ids": [
+                        2,
+                        1
+                    ],
+                    "fuzzy": false
+                }
+            ],
+            [
+                {
+                    "__fields": [
+                        [
+                            "name",
+                            "dead"
+                        ],
+                        [
+                            "searchname",
+                            "dead"
+                        ]
+                    ]
+                },
+                100,
+                {
+                    "ids": [
+                        2,
+                        1
+                    ],
+                    "fuzzy": false
+                }
+            ],
+            [
+                {
+                    "__fields": [
+                        [
+                            "searchname",
+                            "dead"
+                        ],
+                        [
+                            "fromname",
+                            "poster"
+                        ]
+                    ]
+                },
+                100,
+                {
+                    "ids": [
+                        1
+                    ],
+                    "fuzzy": false
+                }
+            ],
+            [
+                "0",
+                100,
+                {
+                    "ids": [],
+                    "fuzzy": false
+                }
+            ],
+            [
+                "ciircus",
+                100,
+                {
+                    "ids": [
+                        1,
+                        2,
+                        6
+                    ],
+                    "fuzzy": true
+                }
+            ],
+            [
+                "!circus",
+                100,
+                {
+                    "ids": [],
+                    "fuzzy": false
+                }
+            ]
+        ],
+        "predb": [
+            [
+                "some release",
+                [
+                    {
+                        "id": 1,
+                        "title": "Some.Release-GRP",
+                        "filename": "some.release.nfo",
+                        "source": "srrdb"
+                    }
+                ]
+            ],
+            [
+                "some.release.nfo",
+                [
+                    {
+                        "id": 1,
+                        "title": "Some.Release-GRP",
+                        "filename": "some.release.nfo",
+                        "source": "srrdb"
+                    }
+                ]
+            ],
+            [
+                "nosuch",
+                []
+            ]
+        ],
+        "tv": [
+            [
+                "lost",
+                {
+                    "id": [
+                        1
+                    ],
+                    "data": [
+                        {
+                            "title": "Lost",
+                            "started": "2004-09-22",
+                            "tvdb": 73739,
+                            "trakt": 511,
+                            "tvmaze": 123,
+                            "tvrage": 4,
+                            "imdb": "0411008",
+                            "tmdb": 4607,
+                            "type": 0,
+                            "title_len": 1,
+                            "started_len": 3
+                        }
+                    ]
+                }
+            ],
+            [
+                "nosuch",
+                {
+                    "id": [],
+                    "data": []
+                }
+            ]
+        ],
+        "movies": [
+            [
+                "matrix",
+                {
+                    "id": [
+                        1
+                    ],
+                    "data": [
+                        {
+                            "title": "The Matrix",
+                            "year": "1999",
+                            "genre": "Action",
+                            "actors": "Keanu Reeves",
+                            "director": "Lana Wachowski",
+                            "rating": "8.7",
+                            "plot": "Simulated reality.",
+                            "imdbid": "0133093",
+                            "tmdbid": 603,
+                            "traktid": 481,
+                            "title_len": 2,
+                            "year_len": 1,
+                            "genre_len": 1,
+                            "actors_len": 2,
+                            "director_len": 2,
+                            "rating_len": 2,
+                            "plot_len": 2
+                        }
+                    ]
+                }
+            ],
+            [
+                "keanu",
+                {
+                    "id": [
+                        1
+                    ],
+                    "data": [
+                        {
+                            "title": "The Matrix",
+                            "year": "1999",
+                            "genre": "Action",
+                            "actors": "Keanu Reeves",
+                            "director": "Lana Wachowski",
+                            "rating": "8.7",
+                            "plot": "Simulated reality.",
+                            "imdbid": "0133093",
+                            "tmdbid": 603,
+                            "traktid": 481,
+                            "title_len": 2,
+                            "year_len": 1,
+                            "genre_len": 1,
+                            "actors_len": 2,
+                            "director_len": 2,
+                            "rating_len": 2,
+                            "plot_len": 2
+                        }
+                    ]
+                }
+            ]
+        ],
+        "movie_external": [
+            [
+                {
+                    "imdbid": "0133093"
+                },
+                {
+                    "title": "The Matrix",
+                    "year": "1999",
+                    "genre": "Action",
+                    "actors": "Keanu Reeves",
+                    "director": "Lana Wachowski",
+                    "rating": "8.7",
+                    "plot": "Simulated reality.",
+                    "imdbid": "0133093",
+                    "tmdbid": 603,
+                    "traktid": 481,
+                    "title_len": 2,
+                    "year_len": 1,
+                    "genre_len": 1,
+                    "actors_len": 2,
+                    "director_len": 2,
+                    "rating_len": 2,
+                    "plot_len": 2,
+                    "id": 1
+                }
+            ],
+            [
+                {
+                    "tmdbid": 404
+                },
+                null
+            ]
+        ],
+        "movies_by_fields": [
+            [
+                {
+                    "__fields": [
+                        [
+                            "title",
+                            "matrix"
+                        ],
+                        [
+                            "director",
+                            "wachowski"
+                        ],
+                        [
+                            "bogus",
+                            "x"
+                        ]
+                    ]
+                },
+                {
+                    "imdbids": [
+                        "0133093"
+                    ],
+                    "movieinfo_ids": [
+                        1
+                    ],
+                    "data": [
+                        {
+                            "title": "The Matrix",
+                            "year": "1999",
+                            "genre": "Action",
+                            "actors": "Keanu Reeves",
+                            "director": "Lana Wachowski",
+                            "rating": "8.7",
+                            "plot": "Simulated reality.",
+                            "imdbid": "0133093",
+                            "tmdbid": 603,
+                            "traktid": 481,
+                            "title_len": 2,
+                            "year_len": 1,
+                            "genre_len": 1,
+                            "actors_len": 2,
+                            "director_len": 2,
+                            "rating_len": 2,
+                            "plot_len": 2
+                        }
+                    ]
+                }
+            ]
+        ],
+        "candidates": [
+            [
+                "dead circus",
+                1,
+                0,
+                {
+                    "ids": [
+                        1
+                    ],
+                    "available": true,
+                    "has_more": true
+                }
+            ],
+            [
+                "dead circus",
+                21,
+                0,
+                {
+                    "ids": [
+                        1,
+                        2
+                    ],
+                    "available": true,
+                    "has_more": false
+                }
+            ],
+            [
+                "dead circus",
+                21,
+                1,
+                {
+                    "ids": [
+                        2
+                    ],
+                    "available": true,
+                    "has_more": false
+                }
+            ],
+            [
+                "...",
+                21,
+                0,
+                {
+                    "ids": [],
+                    "available": false,
+                    "has_more": false
+                }
+            ],
+            [
+                "nosuch",
+                21,
+                0,
+                {
+                    "ids": [],
+                    "available": true,
+                    "has_more": false
+                }
+            ]
+        ],
+        "predb_exact": [
+            [
+                "Some.Release-GRP",
+                {
+                    "id": 1,
+                    "title": "Some.Release-GRP",
+                    "filename": "some.release.nfo",
+                    "source": "srrdb"
+                }
+            ],
+            [
+                "some.release-grp",
+                {
+                    "id": 1,
+                    "title": "Some.Release-GRP",
+                    "filename": "some.release.nfo",
+                    "source": "srrdb"
+                }
+            ],
+            [
+                "some.release.nfo",
+                {
+                    "id": 1,
+                    "title": "Some.Release-GRP",
+                    "filename": "some.release.nfo",
+                    "source": "srrdb"
+                }
+            ],
+            [
+                "Some.Release",
+                null
+            ],
+            [
+                "...",
+                null
+            ],
+            [
+                "nosuch",
+                null
+            ]
+        ],
+        "predb_filename": [
+            [
+                "some.release.nfo",
+                [
+                    {
+                        "id": 1,
+                        "title": "Some.Release-GRP",
+                        "filename": "some.release.nfo",
+                        "source": "srrdb"
+                    }
+                ]
+            ],
+            [
+                "some",
+                [
+                    {
+                        "id": 1,
+                        "title": "Some.Release-GRP",
+                        "filename": "some.release.nfo",
+                        "source": "srrdb"
+                    }
+                ]
+            ],
+            [
+                "nosuch",
+                []
+            ],
+            [
+                "*",
+                null
+            ],
+            [
+                "0",
+                null
+            ]
+        ]
+    }
+}

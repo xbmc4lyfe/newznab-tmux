@@ -4,19 +4,26 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use nntmux_runtime::Ctx;
+use nntmux_search::SecondaryIndex;
+use serde_json::json;
 
 use crate::auth::{self, User};
 use crate::caps::{self, Server};
 use crate::filename;
-use crate::getnzb::{self, Errors};
+use crate::getnzb::{self, Errors, html_escape};
 use crate::input::{Input, php_int};
+use crate::json::J;
 use crate::misc::{cp437_to_utf8, nl2br};
 use crate::params;
 use crate::present_v1::{Params, api_output};
+use crate::release_cache::remember;
 use crate::reply::{Reply, xml_error};
 use crate::request::ApiRequest;
 use crate::rows;
+use crate::rss;
+use crate::search::{Categories, Filters, Found, MOVIES_GROUP, Searcher, TV_GROUP, TvIds};
 use crate::settings::Settings;
+use crate::upload;
 use crate::usage::{self, Statistics, rfc2822};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,7 +136,7 @@ pub async fn api(ctx: &Ctx, settings: &Arc<Settings>, request: &ApiRequest) -> R
         Function::Search => search(ctx, settings, request, &account).await,
         Function::Tv => tv(ctx, settings, request, &account).await,
         Function::Movie => movie(ctx, settings, request, &account).await,
-        Function::Music | Function::Book => media(ctx, settings, request, &account).await,
+        Function::Music | Function::Book => media(ctx, settings, request, &account, function).await,
         Function::Anime => anime(ctx, settings, request, &account).await,
         Function::Get => get(ctx, settings, request, &account).await,
         Function::Details => details(ctx, settings, request, &account).await,
@@ -163,8 +170,64 @@ fn sort_and_age(input: &Input) -> Result<(i64, String), Reply> {
     Ok((age, sort))
 }
 
-fn not_ported() -> Reply {
-    Reply::message(501, "Not ported yet")
+/// v1's minsize: any positive cast, where v2 wants a number.
+fn minimum_size(input: &Input) -> i64 {
+    input
+        .str("minsize")
+        .map_or(0, |value| php_int(value).max(0))
+}
+
+async fn filters(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    input: &Input,
+    account: &Account,
+    age: i64,
+    sort: String,
+    group: Option<String>,
+) -> Result<Filters> {
+    Ok(Filters {
+        categories: params::categories(ctx, input).await?,
+        excluded: auth::category_exclusions(ctx, settings, account.user.id).await?,
+        max_age: age,
+        min_size: minimum_size(input),
+        group,
+        offset: params::offset(input),
+        limit: params::limit(input, settings),
+        sort,
+    })
+}
+
+fn describe(filters: &Filters) -> serde_json::Value {
+    let mut categories = filters.categories.0.clone();
+    categories.sort();
+    categories.dedup();
+    let mut excluded = filters.excluded.clone();
+    excluded.sort_unstable();
+    serde_json::json!({
+        "categories": categories, "excluded": excluded, "max_age": filters.max_age, "min_size": filters.min_size,
+        "group": filters.group, "offset": filters.offset, "limit": filters.limit, "sort": filters.sort,
+    })
+}
+
+async fn respond(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
+    account: &Account,
+    mut rows: Vec<rows::Row>,
+) -> Result<Reply> {
+    rows::attach_partial_counts(ctx, &mut rows).await;
+    let input = &request.input;
+    let server = Server::load(ctx, settings, request.base_url()).await?;
+    let xml = input.str("o") != Some("json");
+    Ok(api_output(
+        &rows,
+        &output_params(input, account),
+        &server,
+        params::offset(input),
+        xml,
+    ))
 }
 
 async fn search(
@@ -177,11 +240,41 @@ async fn search(
     if let Some(error) = require_filled(input, "q") {
         return Ok(error);
     }
-    if let Err(error) = sort_and_age(input) {
-        return Ok(error);
-    }
+    let (age, sort) = match sort_and_age(input) {
+        Ok(found) => found,
+        Err(error) => return Ok(error),
+    };
+    let group = params::group(input);
     audit(ctx, settings, request, account).await?;
-    Ok(not_ported())
+    let filters = filters(ctx, settings, input, account, age, sort, group).await?;
+    let client = settings.search(ctx)?;
+    let searcher = Searcher::new(ctx, client).await?;
+    let text = input.str("q").map(str::to_owned);
+    let key = json!({"q": text, "filters": describe(&filters)}).to_string();
+    let rows = remember(ctx, settings, "v1", "search", &key, || async {
+        if input.has("q") {
+            searcher.api_search(text.as_deref(), &filters, None).await
+        } else {
+            searcher.browse(&filters).await
+        }
+    })
+    .await?;
+    respond(ctx, settings, request, account, rows).await
+}
+
+fn optional_string(input: &Input, key: &str) -> String {
+    input.string(key)
+}
+
+fn air_date(series: &str, episode: &str) -> String {
+    let year = series.len() == 4
+        && (series.starts_with("19") || series.starts_with("20"))
+        && series.bytes().all(|byte| byte.is_ascii_digit());
+    if year && episode.contains('/') {
+        format!("{series}-{episode}").replace('/', "-")
+    } else {
+        String::new()
+    }
 }
 
 async fn tv(
@@ -198,11 +291,56 @@ async fn tv(
             return Ok(error);
         }
     }
-    if let Err(error) = sort_and_age(input) {
-        return Ok(error);
-    }
+    let (age, sort) = match sort_and_age(input) {
+        Ok(found) => found,
+        Err(error) => return Ok(error),
+    };
     audit(ctx, settings, request, account).await?;
-    Ok(not_ported())
+    let mut filters = filters(ctx, settings, input, account, age, sort, None).await?;
+    let client = settings.search(ctx)?;
+    let searcher = Searcher::new(ctx, client).await?;
+    let wanted = [
+        "q", "vid", "tvdbid", "traktid", "rid", "tvmazeid", "imdbid", "tmdbid",
+    ];
+    if !wanted.iter().any(|key| input.filled(key)) {
+        if filters.categories.is_unfiltered() {
+            filters.categories = Categories::ids(&TV_GROUP);
+        }
+        let key = json!({"has_search": false, "filters": describe(&filters)}).to_string();
+        let rows = remember(ctx, settings, "v1", "tv", &key, || {
+            searcher.browse(&filters)
+        })
+        .await?;
+        return respond(ctx, settings, request, account, rows).await;
+    }
+    let or_zero = |name: &str| {
+        input
+            .str(name)
+            .map_or_else(|| "0".to_owned(), str::to_owned)
+    };
+    let ids = TvIds {
+        id: or_zero("vid"),
+        tvdb: or_zero("tvdbid"),
+        trakt: or_zero("traktid"),
+        tvrage: or_zero("rid"),
+        tvmaze: or_zero("tvmazeid"),
+        imdb: input.string("imdbid").replace("tt", ""),
+        tmdb: or_zero("tmdbid"),
+    };
+    let series = optional_string(input, "season");
+    let episode = optional_string(input, "ep");
+    let air = air_date(&series, &episode);
+    let name = optional_string(input, "q");
+    let key = json!({
+        "has_search": true, "ids": [ids.id, ids.tvdb, ids.trakt, ids.tvrage, ids.tvmaze, ids.imdb, ids.tmdb],
+        "season": series, "episode": episode, "air": air, "q": name, "filters": describe(&filters),
+    })
+    .to_string();
+    let rows = remember(ctx, settings, "v1", "tv", &key, || {
+        searcher.tv(&ids, &series, &episode, &air, &name, &filters)
+    })
+    .await?;
+    respond(ctx, settings, request, account, rows).await
 }
 
 async fn movie(
@@ -217,11 +355,58 @@ async fn movie(
             return Ok(error);
         }
     }
-    if let Err(error) = sort_and_age(input) {
-        return Ok(error);
-    }
+    let (age, sort) = match sort_and_age(input) {
+        Ok(found) => found,
+        Err(error) => return Ok(error),
+    };
     audit(ctx, settings, request, account).await?;
-    Ok(not_ported())
+    let mut filters = filters(ctx, settings, input, account, age, sort, None).await?;
+    let client = settings.search(ctx)?;
+    let searcher = Searcher::new(ctx, client).await?;
+    if !["q", "imdbid", "tmdbid", "traktid"]
+        .iter()
+        .any(|key| input.filled(key))
+    {
+        if filters.categories.is_unfiltered() {
+            filters.categories = Categories::ids(&MOVIES_GROUP);
+        }
+        let key = json!({"has_search": false, "filters": describe(&filters)}).to_string();
+        let rows = remember(ctx, settings, "v1", "movie", &key, || {
+            searcher.browse(&filters)
+        })
+        .await?;
+        return respond(ctx, settings, request, account, rows).await;
+    }
+    let imdb = input.string("imdbid").replace("tt", "");
+    let number = |name: &str| {
+        if input.filled(name) {
+            php_int(&input.string(name))
+        } else {
+            -1
+        }
+    };
+    let (tmdb, trakt) = (number("tmdbid"), number("traktid"));
+    let name = optional_string(input, "q");
+    let key = json!({
+        "has_search": true, "imdb": imdb, "tmdb": tmdb, "trakt": trakt, "q": name, "filters": describe(&filters),
+    })
+    .to_string();
+    let mut rows = remember(ctx, settings, "v1", "movie", &key, || {
+        searcher.movies(&imdb, tmdb, trakt, &name, &filters)
+    })
+    .await?;
+    for row in &mut rows {
+        if row.get("id").is_some() {
+            let id = row.text("imdbid");
+            if !id.is_empty() && id != "0" {
+                let file =
+                    rss::resolve_cover(&settings.cover_roots, "movies", &format!("{id}-cover"))
+                        .unwrap_or_else(|| "no-cover.jpg".to_owned());
+                row.set("coverurl", J::Str(format!("movies/{file}")));
+            }
+        }
+    }
+    respond(ctx, settings, request, account, rows).await
 }
 
 async fn media(
@@ -229,16 +414,40 @@ async fn media(
     settings: &Arc<Settings>,
     request: &ApiRequest,
     account: &Account,
+    function: Function,
 ) -> Result<Reply> {
     let input = &request.input;
-    if let Some(error) = require_filled(input, "q") {
-        return Ok(error);
+    if input.has("q") && !input.filled("q") {
+        return Ok(empty_error("q"));
     }
-    if let Err(error) = sort_and_age(input) {
-        return Ok(error);
-    }
+    let (age, sort) = match sort_and_age(input) {
+        Ok(found) => found,
+        Err(error) => return Ok(error),
+    };
+    let group = params::group(input);
     audit(ctx, settings, request, account).await?;
-    Ok(not_ported())
+    let mut filters = filters(ctx, settings, input, account, age, sort, group).await?;
+    let client = settings.search(ctx)?;
+    let searcher = Searcher::new(ctx, client).await?;
+    let text = input.string("q");
+    let (scope, root, index, column) = if function == Function::Music {
+        ("music", 3000, SecondaryIndex::Music, "musicinfo_id")
+    } else {
+        ("book", 7000, SecondaryIndex::Books, "bookinfo_id")
+    };
+    if text.is_empty() && filters.categories.is_unfiltered() {
+        filters.categories = Categories::ids(&[root]);
+    }
+    let key = json!({"q": text, "filters": describe(&filters)}).to_string();
+    let rows = remember(ctx, settings, "v1", scope, &key, || async {
+        if text.is_empty() {
+            searcher.browse(&filters).await
+        } else {
+            searcher.by_metadata(index, column, &text, &filters).await
+        }
+    })
+    .await?;
+    respond(ctx, settings, request, account, rows).await
 }
 
 async fn anime(
@@ -255,17 +464,31 @@ async fn anime(
             -1
         }
     };
-    if input.string("q").is_empty() && filled_int("anidbid") <= 0 && filled_int("anilistid") <= 0 {
+    let (anidb, anilist) = (filled_int("anidbid"), filled_int("anilistid"));
+    let name = input.string("q");
+    if name.is_empty() && anidb <= 0 && anilist <= 0 {
         return Ok(xml_error(
             200,
             "Missing parameter (specify q, anidbid, or anilistid)",
         ));
     }
-    if let Err(error) = sort_and_age(input) {
-        return Ok(error);
-    }
+    let (age, sort) = match sort_and_age(input) {
+        Ok(found) => found,
+        Err(error) => return Ok(error),
+    };
     audit(ctx, settings, request, account).await?;
-    Ok(not_ported())
+    let mut filters = filters(ctx, settings, input, account, age, sort, None).await?;
+    // v1 never passed its minsize here.
+    filters.min_size = 0;
+    let client = settings.search(ctx)?;
+    let searcher = Searcher::new(ctx, client).await?;
+    let key = json!({"q": name, "anidb": anidb, "anilist": anilist, "filters": describe(&filters)})
+        .to_string();
+    let rows = remember(ctx, settings, "v1", "anime", &key, || {
+        searcher.anime(anidb, anilist, &name, &filters)
+    })
+    .await?;
+    respond(ctx, settings, request, account, rows).await
 }
 
 async fn get(
@@ -286,14 +509,22 @@ async fn get(
             "No such item (the guid you provided has no release in our database)",
         ));
     }
-    getnzb::download(ctx, request, &account.user, &id, Errors::Xml, false).await
+    getnzb::download(
+        ctx,
+        settings,
+        request,
+        &account.user,
+        &id,
+        Errors::Xml,
+        false,
+    )
+    .await
 }
 
 /// `$params` for the release output.
 fn output_params(input: &Input, account: &Account) -> Params {
     let flag = |key: &str| input.str(key).is_some_and(|value| php_int(value) == 1);
     Params {
-        uid: account.user.id,
         token: account.token.clone(),
         extended: flag("extended"),
         delete_from_cart: flag("del"),
@@ -321,17 +552,18 @@ async fn details(
         ));
     }
     audit(ctx, settings, request, account).await?;
-    let found = rows::by_guid_for_api(ctx, &input.string("id"), true).await?;
-    let rows: Vec<rows::Row> = found.into_iter().collect();
-    let server = Server::load(ctx, settings, request.base_url()).await?;
-    let xml = input.str("o") != Some("json");
-    Ok(api_output(
-        &rows,
-        &output_params(input, account),
-        &server,
-        params::offset(input),
-        xml,
-    ))
+    let guid = input.string("id");
+    let key = json!({"guid": guid}).to_string();
+    let rows = remember(ctx, settings, "v1", "details", &key, || async {
+        Ok(Found::from_rows(
+            rows::by_guid_for_api(ctx, &guid, true)
+                .await?
+                .into_iter()
+                .collect(),
+        ))
+    })
+    .await?;
+    respond(ctx, settings, request, account, rows).await
 }
 
 async fn nfo(
@@ -384,13 +616,53 @@ async fn nfo(
 }
 
 async fn nzb_add(
-    _ctx: &Ctx,
-    _settings: &Settings,
-    _request: &ApiRequest,
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
     account: &Account,
 ) -> Result<Reply> {
     if !account.user.can_post {
         return Ok(xml_error(102, "Insufficient privileges/not authorized"));
     }
-    Ok(not_ported())
+    let legacy = request.has_field("file");
+    let modern = request.has_field("nzb") || request.has_field("nfo");
+    if legacy && modern {
+        return Ok(xml_error(
+            201,
+            "Use either file or nzb/nfo upload fields, not both",
+        ));
+    }
+    if !legacy && !modern {
+        return Ok(xml_error(200, "Missing parameter (nzb file is required)"));
+    }
+    audit(ctx, settings, request, account).await?;
+
+    let folder = settings.upload_folder.clone();
+    let name = if modern {
+        let Some(nzb) = request.file("nzb").cloned() else {
+            return Ok(xml_error(200, "Missing parameter (nzb file is required)"));
+        };
+        let nfo = request.file("nfo").cloned();
+        tokio::task::spawn_blocking(move || {
+            upload::stage(folder.as_deref(), &nzb, nfo.as_ref()).map(|staged| staged.name)
+        })
+        .await?
+    } else {
+        let Some(file) = request.file("file").cloned() else {
+            return Ok(xml_error(600, "Failed to load upload (no file)"));
+        };
+        tokio::task::spawn_blocking(move || upload::stage_legacy(folder.as_deref(), &file)).await?
+    };
+    match name {
+        Err(failure) => Ok(xml_error(600, &failure.message)),
+        Ok(name) => Ok(Reply::new(
+            200,
+            "text/xml; charset=utf-8",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<success id=\"0\" guid=\"\" categoryid=\"{}\" name=\"{}\" />\n",
+                request.input.string("cat"),
+                html_escape(&name),
+            ),
+        )),
+    }
 }

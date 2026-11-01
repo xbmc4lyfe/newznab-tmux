@@ -2,15 +2,13 @@
 //!
 //! Owner: ws-api. See `rust/WORKSTREAMS.md`.
 
-// Helpers the release, RSS and download endpoints use arrive in the next PRs of this workstream.
-#![allow(dead_code)]
-
 mod abuse;
 mod auth;
 mod cache;
 mod caps;
 mod category;
 mod db;
+mod filelist;
 mod filename;
 mod getnzb;
 mod input;
@@ -21,19 +19,24 @@ mod params;
 mod pipeline;
 mod present_v1;
 mod present_v2;
+mod release_cache;
 mod reply;
 mod request;
 mod rows;
 mod rss;
+mod search;
 mod settings;
+mod suggest;
+mod upload;
 pub mod usage;
 mod v1;
 mod v2;
+mod web;
 mod xml;
 
 use std::sync::Arc;
 
-use axum::routing::any;
+use axum::routing::{MethodFilter, any, on};
 use axum::{Extension, Router};
 use nntmux_runtime::Ctx;
 
@@ -80,7 +83,11 @@ pub fn router_with(settings: Settings) -> Router<Ctx> {
             "/rss/trending-shows",
             route(Endpoint::Rss(Feed::TrendingShows)),
         )
-        .route("/getnzb", route(Endpoint::GetNzb))
-        .route("/getnzb/{guid}", route(Endpoint::GetNzb))
+        .merge(web::router(on(
+            MethodFilter::GET
+                .or(MethodFilter::POST)
+                .or(MethodFilter::OPTIONS),
+            dispatch(Endpoint::GetNzb),
+        )))
         .layer(Extension(Arc::new(settings)))
 }

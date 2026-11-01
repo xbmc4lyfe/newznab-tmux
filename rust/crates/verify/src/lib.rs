@@ -2,6 +2,7 @@
 //!
 //! Owner: ws-releases. See `rust/WORKSTREAMS.md`.
 
+pub mod article;
 pub mod barrier;
 pub mod cache;
 pub mod candidates;
@@ -9,6 +10,7 @@ pub mod collections;
 pub mod config;
 pub mod context;
 pub mod groups;
+pub mod identity;
 pub mod inventory;
 pub mod ledger;
 pub mod locks;
@@ -17,6 +19,8 @@ pub mod nzb;
 pub mod prepare;
 pub mod reader;
 pub mod releases;
+pub mod reset;
+pub mod spot_check;
 pub mod txn;
 
 use anyhow::{Result, bail};

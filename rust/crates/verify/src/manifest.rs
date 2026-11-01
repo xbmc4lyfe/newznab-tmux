@@ -81,6 +81,56 @@ pub struct Manifest {
     pub original_subject: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrades_release_id: Option<i64>,
+    /// What a spot check adds on top of the archived inventory. None of this is stored with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_check: Option<SpotCheck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_file_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_file_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_file_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_hints: Option<Vec<IdentityHint>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<crate::inventory::Completeness>,
+}
+
+/// The spot check a sampled result records.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct SpotCheck {
+    pub articles: i64,
+    pub bytes: i64,
+    pub sampled_files: i64,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parity_file_keys: Vec<String>,
+}
+
+/// A filename read from a sampled article.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct IdentityHint {
+    pub name: String,
+    #[serde(default)]
+    pub source: String,
+}
+
+/// The sampled evidence a remote worker sends instead of a whole manifest.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct Evidence {
+    pub articles: i64,
+    pub bytes: i64,
+    pub sampled_files: i64,
+    pub verified_file_names: Vec<String>,
+    pub identity_hints: Vec<String>,
+    #[serde(default)]
+    pub partial: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parity_file_keys: Vec<String>,
 }
 
 fn null_as_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {

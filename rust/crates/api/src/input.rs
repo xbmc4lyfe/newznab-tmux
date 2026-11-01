@@ -98,7 +98,7 @@ pub fn parse_urlencoded(raw: &str) -> Bag {
         }
         let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
         let name = decode(name);
-        let value = clean(&decode(value));
+        let value = clean_value(&decode(value));
         let (base, sub) = match name.find('[') {
             Some(open) if open > 0 => {
                 let rest = &name[open + 1..];
@@ -127,7 +127,7 @@ pub fn parse_urlencoded(raw: &str) -> Bag {
     bag
 }
 
-fn decode(raw: &str) -> String {
+pub fn decode(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -163,7 +163,7 @@ pub fn trim(value: &str) -> &str {
     })
 }
 
-fn clean(value: &str) -> Value {
+pub fn clean_value(value: &str) -> Value {
     let trimmed = trim(value);
     if trimmed.is_empty() {
         Value::Null
@@ -179,7 +179,7 @@ pub fn from_json(json: &Json) -> Value {
         Json::Bool(true) => Value::Str("1".to_owned()),
         Json::Bool(false) => Value::Null,
         Json::Number(number) => Value::Str(number.to_string()),
-        Json::String(text) => clean(text),
+        Json::String(text) => clean_value(text),
         Json::Array(items) => Value::List(items.iter().map(from_json).collect()),
         Json::Object(entries) => Value::Map(
             entries

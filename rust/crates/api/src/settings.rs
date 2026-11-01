@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use nntmux_core::{parsed_or, var_or};
+use nntmux_core::{optional, parsed_or, var_or};
+use nntmux_runtime::Ctx;
+use nntmux_search::{CursorCodec, SearchClient, SearchConfig};
 
 use crate::abuse::AbuseConfig;
 use crate::json::J;
@@ -23,6 +25,12 @@ pub struct Settings {
     /// Where cover images live, checked in order.
     pub cover_roots: Vec<PathBuf>,
     pub abuse: AbuseConfig,
+    pub upload_folder: Option<PathBuf>,
+    /// Replaces the Manticore settings from the environment, for tests.
+    pub search_config: Option<SearchConfig>,
+    /// Replaces the `APP_KEY` cursor signing, for tests.
+    pub cursor_codec: Option<CursorCodec>,
+    search_client: OnceLock<SearchClient>,
     /// Small read-mostly values such as the v1 server menu, which every XML response needs.
     local: Mutex<HashMap<String, (Instant, J)>>,
 }
@@ -65,7 +73,30 @@ impl Settings {
                 PathBuf::from("/app/public/covers"),
             ],
             abuse: AbuseConfig::default(),
+            upload_folder: optional("NZB_UPLOAD_FOLDER").map(PathBuf::from),
+            search_config: None,
+            cursor_codec: None,
+            search_client: OnceLock::new(),
             local: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The Manticore client, built on first use.
+    pub fn search(&self, ctx: &Ctx) -> Result<&SearchClient> {
+        if let Some(client) = self.search_client.get() {
+            return Ok(client);
+        }
+        let client = match &self.search_config {
+            Some(config) => SearchClient::new(config.clone(), Some(ctx.redis.clone()))?,
+            None => SearchClient::from_ctx(ctx)?,
+        };
+        Ok(self.search_client.get_or_init(|| client))
+    }
+
+    pub fn cursors(&self, client: &SearchClient) -> Result<CursorCodec> {
+        match &self.cursor_codec {
+            Some(codec) => Ok(codec.clone()),
+            None => CursorCodec::from_env(&client.config().index_generation),
         }
     }
 
