@@ -60,6 +60,16 @@ async fn repairs_only_of_releases_in_xxx_categories() {
         return;
     };
     let pool = &db.pool;
+    // Laravel's migration adds this category, then its seeder deletes it, so a fresh install
+    // has none and the repair refuses to run.
+    let refused = repair_onlyfans(pool, false, |_| async { true }).await;
+    assert!(refused.is_err());
+    sqlx::query(
+        "INSERT INTO categories (id, title, root_categories_id) VALUES (6047, 'OnlyFans', 6000)",
+    )
+    .execute(pool)
+    .await
+    .expect("category");
     insert(pool, 1, "OF.Creator.Video.1080p.mp4", cat::XXX_X264).await;
     insert(pool, 2, "OF.Creator_Photosets.1080p", cat::XXX_X264).await;
     insert(pool, 3, "OF.Creator.Video.2.mp4", cat::OTHER_MISC).await;

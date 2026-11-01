@@ -40,11 +40,6 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "ingestion_activity",
         sql: include_str!("../../../migrations/0003_ingestion_activity.sql"),
     },
-    Migration {
-        version: 4,
-        name: "xxx_vr_onlyfans_categories",
-        sql: include_str!("../../../migrations/0004_xxx_vr_onlyfans_categories.sql"),
-    },
 ];
 
 /// Returns the versions that ran.

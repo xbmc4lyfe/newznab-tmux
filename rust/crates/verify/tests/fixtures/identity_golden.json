@@ -1,0 +1,470 @@
+{
+    "pairs": [
+        {
+            "subject": "Release name anything.bin yEnc (1/2)",
+            "actual": "anything.bin",
+            "packet": false,
+            "matches": true
+        },
+        {
+            "subject": "Release name yEnc (1/2)",
+            "actual": "anything.bin",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/9] - \"Readable.Release.Name.mkv\" yEnc",
+            "actual": "Readable.Release.Name.mkv",
+            "packet": false,
+            "matches": true
+        },
+        {
+            "subject": "[1/9] - \"Readable.Release.Name.mkv\" yEnc",
+            "actual": "Different.Release.mkv",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/9] - \"Xk29dPq8LmZ0Yt5R.mkv\" yEnc",
+            "actual": "setup.exe",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/9] - \"Xk29dPq8LmZ0Yt5R.mkv\" yEnc",
+            "actual": "b7Qe1ZrT9wXy.mkv",
+            "packet": false,
+            "matches": true
+        },
+        {
+            "subject": "[1/1] - 'movie.mkv' yEnc",
+            "actual": "other.mkv",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/9] - \"Final.Fantasy.VI.iso\" yEnc",
+            "actual": "Final.Fantasy.VII.iso",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/9] - \"Final Fantasy VI.iso\" yEnc",
+            "actual": "final.fantasy.vi.iso",
+            "packet": false,
+            "matches": true
+        },
+        {
+            "subject": "[1/2] - 'O'Brien's Show.mkv' yEnc",
+            "actual": "O'Brien's Show.mkv",
+            "packet": false,
+            "matches": true
+        },
+        {
+            "subject": "[1/2] - \"Caf\\u{00e9}.mkv\" yEnc",
+            "actual": "Café.mkv",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/2] - \"File.part01.rar\" yEnc",
+            "actual": "File.part02.rar",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/2] - \"Show 1 10.mkv\" yEnc",
+            "actual": "Show 11 0.mkv",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/2] - \"C++ Guide.pdf\" yEnc",
+            "actual": "C Guide.pdf",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "\"one.rar\" yEnc \"two.rar\" yEnc",
+            "actual": "one.rar",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/2] - \"a.par2\" yEnc",
+            "actual": "a.mkv",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/2] - \"movie.mkv\" yEnc",
+            "actual": "movie.par2",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/2] - \"movie.mkv\" yEnc",
+            "actual": "movie.mkv",
+            "packet": true,
+            "matches": false
+        },
+        {
+            "subject": "[1/2] - \"movie\" yEnc",
+            "actual": "random",
+            "packet": true,
+            "matches": false
+        },
+        {
+            "subject": "[1/2] - \"body.mkv\" yEnc",
+            "actual": "body.exe",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/2] - \"body.exe\" yEnc",
+            "actual": "body.exe",
+            "packet": false,
+            "matches": true
+        },
+        {
+            "subject": "[1/2] - \"BBC2Documentary.mkv\" yEnc",
+            "actual": "b7Qe1ZrT9wXy.mkv",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/2] - \"0123456789abcdef01.mkv\" yEnc",
+            "actual": "anything.mkv",
+            "packet": false,
+            "matches": true
+        },
+        {
+            "subject": "anything.bin.mkv yEnc",
+            "actual": "anything.bin",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "the yEnc file",
+            "actual": "file",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "\"yEnc in name.rar\" yEnc",
+            "actual": "yEnc in name.rar",
+            "packet": false,
+            "matches": true
+        },
+        {
+            "subject": "[1/3] \"a.rar\" [2/3] \"b.rar\" (1/3) yEnc",
+            "actual": "b.rar",
+            "packet": false,
+            "matches": true
+        },
+        {
+            "subject": "\"a b.rar\" - \"c.rar\"",
+            "actual": "c.rar",
+            "packet": false,
+            "matches": true
+        },
+        {
+            "subject": "[1/2] - \"x.mkv\" yEnc",
+            "actual": "x.mkv:stream",
+            "packet": false,
+            "matches": false
+        },
+        {
+            "subject": "[1/2] - \"x.mkv\" yEnc",
+            "actual": "x.mkv. ",
+            "packet": false,
+            "matches": false
+        }
+    ],
+    "names": [
+        {
+            "name": "file.par2",
+            "par2": true,
+            "payload": false
+        },
+        {
+            "name": "file.PAR2.",
+            "par2": true,
+            "payload": false
+        },
+        {
+            "name": "README",
+            "par2": false,
+            "payload": true
+        },
+        {
+            "name": "b7Qe1ZrT9wXy",
+            "par2": false,
+            "payload": false
+        },
+        {
+            "name": "file.mkv",
+            "par2": false,
+            "payload": true
+        },
+        {
+            "name": "a:b.par2",
+            "par2": true,
+            "payload": false
+        },
+        {
+            "name": "Show.S01E01",
+            "par2": false,
+            "payload": true
+        },
+        {
+            "name": "0123456789abcdef01",
+            "par2": false,
+            "payload": false
+        }
+    ],
+    "manifest": {
+        "identity": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "files": [
+            {
+                "key": "k1",
+                "totalparts": 3,
+                "segments": [
+                    {
+                        "number": 1,
+                        "messageid": "a1",
+                        "bytes": 100
+                    },
+                    {
+                        "number": 2,
+                        "messageid": "a2",
+                        "bytes": 200
+                    },
+                    {
+                        "number": 3,
+                        "messageid": "a3",
+                        "bytes": 300
+                    }
+                ]
+            },
+            {
+                "key": "k2",
+                "totalparts": 2,
+                "totalparts_inferred": true,
+                "segments": [
+                    {
+                        "number": 1,
+                        "messageid": "b1",
+                        "bytes": 100
+                    },
+                    {
+                        "number": 2,
+                        "messageid": "b2",
+                        "bytes": 100
+                    }
+                ]
+            },
+            {
+                "key": "k3",
+                "totalparts": 1,
+                "segments": [
+                    {
+                        "number": 1,
+                        "messageid": "c1",
+                        "bytes": 5000
+                    }
+                ]
+            },
+            {
+                "key": "k4",
+                "totalparts": 1,
+                "segments": [
+                    {
+                        "number": 1,
+                        "messageid": "a1",
+                        "bytes": 50
+                    }
+                ]
+            }
+        ]
+    },
+    "plans": [
+        {
+            "articles": 1,
+            "bytes": 1048576,
+            "article_bytes": 1048576,
+            "plan": [
+                {
+                    "file_key": "k2",
+                    "totalparts": 2,
+                    "totalparts_inferred": true,
+                    "number": 2,
+                    "messageid": "b2",
+                    "bytes": 100
+                }
+            ]
+        },
+        {
+            "articles": 3,
+            "bytes": 1048576,
+            "article_bytes": 1048576,
+            "plan": [
+                {
+                    "file_key": "k2",
+                    "totalparts": 2,
+                    "totalparts_inferred": true,
+                    "number": 2,
+                    "messageid": "b2",
+                    "bytes": 100
+                },
+                {
+                    "file_key": "k4",
+                    "totalparts": 1,
+                    "totalparts_inferred": false,
+                    "number": 1,
+                    "messageid": "a1",
+                    "bytes": 50
+                },
+                {
+                    "file_key": "k3",
+                    "totalparts": 1,
+                    "totalparts_inferred": false,
+                    "number": 1,
+                    "messageid": "c1",
+                    "bytes": 5000
+                }
+            ]
+        },
+        {
+            "articles": 16,
+            "bytes": 1048576,
+            "article_bytes": 1048576,
+            "plan": [
+                {
+                    "file_key": "k2",
+                    "totalparts": 2,
+                    "totalparts_inferred": true,
+                    "number": 2,
+                    "messageid": "b2",
+                    "bytes": 100
+                },
+                {
+                    "file_key": "k4",
+                    "totalparts": 1,
+                    "totalparts_inferred": false,
+                    "number": 1,
+                    "messageid": "a1",
+                    "bytes": 50
+                },
+                {
+                    "file_key": "k3",
+                    "totalparts": 1,
+                    "totalparts_inferred": false,
+                    "number": 1,
+                    "messageid": "c1",
+                    "bytes": 5000
+                },
+                {
+                    "file_key": "k1",
+                    "totalparts": 3,
+                    "totalparts_inferred": false,
+                    "number": 3,
+                    "messageid": "a3",
+                    "bytes": 300
+                },
+                {
+                    "file_key": "k2",
+                    "totalparts": 2,
+                    "totalparts_inferred": true,
+                    "number": 1,
+                    "messageid": "b1",
+                    "bytes": 100
+                },
+                {
+                    "file_key": "k1",
+                    "totalparts": 3,
+                    "totalparts_inferred": false,
+                    "number": 2,
+                    "messageid": "a2",
+                    "bytes": 200
+                }
+            ]
+        },
+        {
+            "articles": 16,
+            "bytes": 1000,
+            "article_bytes": 1000,
+            "plan": [
+                {
+                    "file_key": "k2",
+                    "totalparts": 2,
+                    "totalparts_inferred": true,
+                    "number": 2,
+                    "messageid": "b2",
+                    "bytes": 100
+                },
+                {
+                    "file_key": "k4",
+                    "totalparts": 1,
+                    "totalparts_inferred": false,
+                    "number": 1,
+                    "messageid": "a1",
+                    "bytes": 50
+                },
+                {
+                    "file_key": "k1",
+                    "totalparts": 3,
+                    "totalparts_inferred": false,
+                    "number": 3,
+                    "messageid": "a3",
+                    "bytes": 300
+                },
+                {
+                    "file_key": "k2",
+                    "totalparts": 2,
+                    "totalparts_inferred": true,
+                    "number": 1,
+                    "messageid": "b1",
+                    "bytes": 100
+                },
+                {
+                    "file_key": "k1",
+                    "totalparts": 3,
+                    "totalparts_inferred": false,
+                    "number": 2,
+                    "messageid": "a2",
+                    "bytes": 200
+                }
+            ]
+        },
+        {
+            "articles": 2,
+            "bytes": 250,
+            "article_bytes": 150,
+            "plan": [
+                {
+                    "file_key": "k2",
+                    "totalparts": 2,
+                    "totalparts_inferred": true,
+                    "number": 2,
+                    "messageid": "b2",
+                    "bytes": 100
+                },
+                {
+                    "file_key": "k4",
+                    "totalparts": 1,
+                    "totalparts_inferred": false,
+                    "number": 1,
+                    "messageid": "a1",
+                    "bytes": 50
+                }
+            ]
+        },
+        {
+            "articles": 0,
+            "bytes": 1000,
+            "article_bytes": 1000,
+            "plan": []
+        }
+    ]
+}

@@ -4,6 +4,7 @@
 
 mod auth;
 mod browse;
+mod covers;
 mod details;
 mod guest;
 mod invitations;
@@ -24,6 +25,7 @@ pub fn router() -> Router<Ctx> {
         .merge(invitations::router())
         .merge(profile::router())
         .merge(browse::router())
+        .merge(covers::router())
         .merge(details::router())
         .merge(details::failed_router());
     nntmux_webkit::stack(pages)

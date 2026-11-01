@@ -1,0 +1,24 @@
+<article class="surface-panel rounded-xl shadow-sm border p-4 flex gap-4">
+    <img src="{{ card.cover }}" alt="{{ card.title }}" loading="lazy" class="w-28 h-40 object-cover rounded-lg shrink-0 bg-gray-100 dark:bg-gray-700">
+    <div class="min-w-0 flex-1">
+        <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-1">{% if let Some(href) = card.href %}<a href="{{ href }}" class="hover:text-primary-600">{{ card.title }}</a>{% else %}{{ card.title }}{% endif %}</h3>
+        <dl class="text-sm text-gray-600 dark:text-gray-400 space-y-0.5 mb-2">
+            {% for meta in card.meta %}
+            <div><dt class="inline font-medium">{{ meta.label }}:</dt> <dd class="inline">{% if !meta.value.is_empty() %}{{ meta.value }}{% endif %}{% for link in meta.links %}{% if !loop.first %}, {% endif %}<a href="{{ link.1 }}" class="text-primary-600 dark:text-primary-400 hover:underline">{{ link.0 }}</a>{% endfor %}</dd></div>
+            {% endfor %}
+        </dl>
+        <ul class="divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+            {% for release in card.releases %}
+            <li class="py-1.5 flex flex-wrap items-center justify-between gap-2">
+                <a href="/details/{{ release.guid }}" class="min-w-0 truncate text-primary-600 dark:text-primary-400 hover:underline" title="{{ release.searchname }}">{{ release.searchname }}</a>
+                <span class="flex items-center gap-2 shrink-0 text-xs text-gray-500 dark:text-gray-400">
+                    <span>{{ release.size_label }}</span><span>{{ release.posted }}</span>
+                    <a href="/getnzb/{{ release.guid }}" class="download-nzb text-green-600 dark:text-green-400" title="Download NZB"><i class="fa fa-download" aria-hidden="true"></i><span class="sr-only">Download</span></a>
+                    <button type="button" class="add-to-cart text-primary-600 dark:text-primary-400" data-guid="{{ release.guid }}" title="Add to basket"><i class="icon_cart fa fa-shopping-basket" aria-hidden="true"></i><span class="sr-only">Add to basket</span></button>
+                </span>
+            </li>
+            {% endfor %}
+        </ul>
+        {% if card.more > 0 %}<p class="mt-1 text-xs text-gray-500 dark:text-gray-400">and {{ card.more }} more</p>{% endif %}
+    </div>
+</article>

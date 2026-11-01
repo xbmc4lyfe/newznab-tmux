@@ -10,7 +10,8 @@ status = "todo"
 kind = "command"
 id = "nntmux:additional-diagnose"
 source = "app/Console/Commands/AdditionalProcessingDiagnose.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl postprocess additional-diagnose. The claim-queue index check accepts the required columns as a prefix; the PHP's exact match reported the shipped index as missing."
 
 [[entry]]
 kind = "command"

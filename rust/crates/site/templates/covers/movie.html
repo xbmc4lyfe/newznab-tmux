@@ -1,0 +1,9 @@
+{% extends "layout.html" %}
+{% import "components.html" as c %}
+{% block modals %}{% include "releases/modals.html" %}{% endblock %}
+{% block content %}
+{% call c::page_header_open(card.title, "Movie", "All releases for this movie.", "fas fa-film") %}{% endcall %}
+{% call c::page_header_close() %}{% endcall %}
+{% include "covers/card.html" %}
+{% if let Some(trailer) = trailer %}<div class="mt-4"><iframe width="{{ layout.site.trailers_size_x }}" height="{{ layout.site.trailers_size_y }}" src="{{ trailer }}" title="Trailer"></iframe></div>{% endif %}
+{% endblock %}
