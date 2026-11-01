@@ -42,6 +42,7 @@ const MAX_ARTICLE_BYTES: i64 = 1_048_576;
 const MAX_STAT_REQUESTS: usize = 16;
 const MAINTENANCE_BUDGET: Duration = Duration::from_secs(5);
 const PREPARE_EVERY: Duration = Duration::from_secs(60);
+const LOCK_CHECK_EVERY: Duration = Duration::from_secs(30);
 
 /// Spot checks read from the primary provider only, over one connection per worker.
 pub struct NntpSource {
@@ -261,7 +262,7 @@ impl Worker {
             let Some(claim) = candidates::claim(&self.verify, locks, prefer_ready).await? else {
                 break;
             };
-            self.process(source, &claim).await;
+            self.process(source, &claim, locks).await;
             locks.release_candidate(Some(claim.id())).await;
             report.processed += 1;
         }
@@ -294,10 +295,10 @@ impl Worker {
 
     /// Verifies and publishes one claim. A failure is recorded on the candidate, not returned, so
     /// one bad candidate doesn't end the run.
-    async fn process(&self, source: &dyn ArticleSource, claim: &Claim) {
+    async fn process(&self, source: &dyn ArticleSource, claim: &Claim, locks: &mut WorkerLocks) {
         let started = Instant::now();
         let id = claim.id();
-        let outcome = self.verify_and_publish(source, claim).await;
+        let outcome = self.verify_and_publish(source, claim, locks).await;
         match outcome {
             Ok((result, bytes)) => {
                 self.write_status(bytes, started);
@@ -365,6 +366,7 @@ impl Worker {
         &self,
         source: &dyn ArticleSource,
         claim: &Claim,
+        locks: &mut WorkerLocks,
     ) -> Result<(VerificationResult, i64)> {
         let verify = &self.verify;
         let mut conn = verify.db.acquire().await?;
@@ -377,7 +379,7 @@ impl Worker {
         .await?;
         drop(conn);
         let renewal = LeaseRenewal::start(verify.clone(), claim);
-        let outcome = self.verify_renewed(source, claim, &renewal).await;
+        let outcome = self.verify_renewed(source, claim, &renewal, locks).await;
         renewal.stop();
         outcome
     }
@@ -387,6 +389,7 @@ impl Worker {
         source: &dyn ArticleSource,
         claim: &Claim,
         renewal: &LeaseRenewal,
+        locks: &mut WorkerLocks,
     ) -> Result<(VerificationResult, i64)> {
         let verify = &self.verify;
         let manifest =
@@ -394,9 +397,30 @@ impl Worker {
         let options = self.spot_check_options();
         let allow_partial = candidates::partial_allowed(verify, &claim.candidate);
         let mut lost = renewal.lost.clone();
-        let result = tokio::select! {
-            result = spot_check::verify(source, &options, &manifest, allow_partial) => result,
-            _ = lost.wait_for(|lost| *lost) => bail!("Verification lease was lost."),
+        let verification = spot_check::verify(source, &options, &manifest, allow_partial);
+        tokio::pin!(verification);
+        // The locks end with their session, which also keeps that session from idling out. A barrier
+        // can hold the worker group once they're gone, so this worker must not go on to publish.
+        let mut checks = tokio::time::interval(LOCK_CHECK_EVERY);
+        checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let lost_lease = async {
+            while !*lost.borrow_and_update() {
+                if lost.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        tokio::pin!(lost_lease);
+        let result = loop {
+            tokio::select! {
+                result = &mut verification => break result,
+                () = &mut lost_lease => bail!("Verification lease was lost."),
+                _ = checks.tick() => {
+                    if !locks.held().await || !locks.protects(claim.id()).await {
+                        bail!("Verification worker locks were lost.");
+                    }
+                }
+            }
         };
         if !result.passed() {
             let attempt = FinishedAttempt {
@@ -414,6 +438,9 @@ impl Worker {
             .as_ref()
             .and_then(|manifest| manifest.spot_check.as_ref())
             .map_or(0, |sample| sample.bytes);
+        if !locks.held().await || !locks.protects(claim.id()).await || !locks.admitting().await? {
+            bail!("Verification worker locks were lost.");
+        }
         let resolver = Resolver {
             db: &verify.db,
             cleaner: &self.cleaner,
@@ -801,13 +828,24 @@ pub async fn run_role(ctx: Ctx, args: RoleArgs, stop: Shutdown, verify: Verify) 
         let once = args.once;
         tasks.spawn(async move {
             while !stop.requested() {
-                if !ctx.paused().await.unwrap_or(true)
-                    && let Err(failure) = prepare_pass(&verify).await
-                {
-                    error!(
-                        error = format!("{failure:#}"),
-                        "candidate preparation failed"
-                    );
+                match busy::enter(&ctx, "verify").await {
+                    // Held across the pass, so a drain waits for its writes.
+                    Ok(Some(busy)) => {
+                        if let Err(failure) = prepare_pass(&verify).await {
+                            error!(
+                                error = format!("{failure:#}"),
+                                "candidate preparation failed"
+                            );
+                        }
+                        drop(busy);
+                    }
+                    Ok(None) => {}
+                    Err(failure) => {
+                        error!(
+                            error = format!("{failure:#}"),
+                            "can't mark this worker busy"
+                        );
+                    }
                 }
                 if once {
                     return;
