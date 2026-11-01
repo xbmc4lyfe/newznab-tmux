@@ -274,7 +274,7 @@ status = "ported"
 kind = "schedule"
 id = "command: 'gdpr:purge-expired-exports')->dailyAt('03:30')->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -323,7 +323,7 @@ status = "ported"
 kind = "schedule"
 id = "command: 'nntmux:delete-unverified-users')->twiceDaily(1, 13);"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -433,13 +433,13 @@ note = "The verify role runs this on its own loop."
 kind = "schedule"
 id = "job: new PurgeDeletedAccounts)->daily();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
 id = "job: new RemoveInactiveAccounts)->daily();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"

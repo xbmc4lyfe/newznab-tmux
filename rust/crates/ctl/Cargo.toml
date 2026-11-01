@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+nntmux-admin.workspace = true
 nntmux-categorize.workspace = true
 nntmux-core.workspace = true
 nntmux-db.workspace = true
