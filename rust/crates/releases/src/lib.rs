@@ -56,7 +56,11 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
             stop.sleep(Duration::from_secs(5)).await;
             continue;
         }
+        let Some(busy) = nntmux_runtime::busy::enter(&ctx, "releases").await? else {
+            continue;
+        };
         let round = runner::run_round(&releases, &stop).await;
+        drop(busy);
         if let Err(failure) = &round {
             error!(error = format!("{failure:#}"), "release round failed");
         }

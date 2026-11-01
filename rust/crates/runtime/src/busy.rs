@@ -30,8 +30,16 @@ pub struct Busy {
     refresh: JoinHandle<()>,
 }
 
-/// Marks `role` busy until the result is dropped. Roles that don't run through
-/// [`crate::run_slots`] call this around each unit of work.
+/// The gate every unit of work passes. Marks `role` busy, then reads the pause flag, and returns
+/// `None` if processing is paused. A drain sets the flag before it scans the marks, so either the
+/// drain sees this mark or this read sees the flag: work can't slip past a finished drain. Roles
+/// that don't run through [`crate::run_slots`] hold the result for each unit of work.
+pub async fn enter(ctx: &Ctx, role: &str) -> Result<Option<Busy>> {
+    let busy = mark(ctx, role).await;
+    Ok((!ctx.paused().await?).then_some(busy))
+}
+
+/// Marks `role` busy until the result is dropped, without checking the pause flag.
 pub async fn mark(ctx: &Ctx, role: &str) -> Busy {
     let key = format!(
         "{}{role}:{}:{}",

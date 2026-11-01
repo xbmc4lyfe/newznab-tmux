@@ -139,7 +139,8 @@ async fn drain_locked(
     signals: &Shutdown,
 ) -> Result<()> {
     let (running, stopped) = flags(ctx).await?;
-    let earlier = saved_drain(ctx).await?;
+    // State saved by a drain whose pause has since ended is stale: nothing is draining any more.
+    let earlier = saved_drain(ctx).await?.filter(|_| stopped);
     match &earlier {
         None => {
             let state =
@@ -153,8 +154,11 @@ async fn drain_locked(
         }
         Some(_) => {}
     }
-    set_flags(ctx, false, true).await?;
-    let waited = wait_for_workers(ctx, timeout, signals).await;
+    let waited = async {
+        set_flags(ctx, false, true).await?;
+        wait_for_workers(ctx, timeout, signals).await
+    }
+    .await;
     if waited.is_err() {
         let restored = async {
             set_flags(ctx, running, stopped).await?;
@@ -207,6 +211,10 @@ pub async fn resume(ctx: &Ctx, token: Option<&str>) -> Result<&'static str> {
         };
         if token.is_some_and(|token| state["token"] != token) {
             return Ok(NOT_OWNED);
+        }
+        if !flags(ctx).await?.1 {
+            clear_drain(ctx).await?;
+            return Ok("Processing isn't paused; cleared the stale drain state.");
         }
         let (Some(running), Some(stopped)) =
             (state["running"].as_bool(), state["stopped"].as_bool())

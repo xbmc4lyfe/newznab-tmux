@@ -17,7 +17,7 @@ kind = "command"
 id = "multiprocessing:binaries"
 source = "app/Console/Commands/ProcessBinaries.php"
 status = "dropped"
-note = "The ingest role downloads headers for all active groups."
+note = "The ingest role replaces this. ws-ingest owns that role, which is not merged yet."
 
 [[entry]]
 kind = "command"
