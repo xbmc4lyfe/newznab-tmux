@@ -365,13 +365,6 @@ class Tmux
         ];
     }
 
-    public function microtime_float(): float
-    {
-        [$usec, $sec] = explode(' ', microtime());
-
-        return (float) $usec + (float) $sec;
-    }
-
     public function decodeSize(int|float $bytes): string
     {
         // Handle zero case
@@ -395,43 +388,6 @@ class Tmux
         }
 
         return round($bytes, 2).' '.$types[$index];
-    }
-
-    public function writelog(mixed $pane): ?string
-    {
-        $path = storage_path('logs');
-        $getDate = now()->format('Y_m_d');
-        $logs = app(ConfigurationProvider::class)->tmux()->writeLogs;
-        if ($logs) {
-            return "2>&1 | tee -a $path/$pane-$getDate.log";
-        }
-
-        return '';
-    }
-
-    /**
-     * @throws \Exception
-     */
-    public function get_color(mixed $colors_start, mixed $colors_end, mixed $colors_exc): int
-    {
-        // Handle null values with sensible defaults
-        $colors_start = $colors_start ?? 0;
-        $colors_end = $colors_end ?? 255;
-        $colors_exc = $colors_exc ?? '';
-
-        $exception = str_replace('.', '.', $colors_exc);
-        $exceptions = explode(',', $exception);
-        sort($exceptions);
-        $number = random_int($colors_start, $colors_end - \count($exceptions));
-        foreach ($exceptions as $exception) {
-            if ($number >= $exception) {
-                $number++;
-            } else {
-                break;
-            }
-        }
-
-        return $number;
     }
 
     public function relativeTime(mixed $_time): string
@@ -558,36 +514,6 @@ class Tmux
     public function isRunning(): bool
     {
         return $this->runtimeState->isTmuxRunning();
-    }
-
-    /**
-     * @throws \Exception
-     */
-    public function stopIfRunning(): bool
-    {
-        if ($this->isRunning()) {
-            $this->runtimeState->requestStop();
-            $this->runtimeState->setTmuxRunning(false);
-            $sleep = app(ConfigurationProvider::class)->tmux()->monitorDelay;
-            cli()->header('Stopping tmux scripts and waiting '.$sleep.' seconds for all panes to shutdown');
-            sleep($sleep);
-
-            return true;
-        }
-        cli()->info('Tmux scripts are not running!');
-
-        return false;
-    }
-
-    /**
-     * @throws \RuntimeException
-     */
-    public function startRunning(): void
-    {
-        if (! $this->isRunning()) {
-            $this->runtimeState->requestStop(false);
-            $this->runtimeState->setTmuxRunning(true);
-        }
     }
 
     /**
