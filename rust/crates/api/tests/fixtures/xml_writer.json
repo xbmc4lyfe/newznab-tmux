@@ -1,0 +1,30 @@
+[
+    {
+        "input": "plain",
+        "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root a=\"plain\"><e>plain<\/e><empty\/><t b=\"plain\">plain<\/t><c><![CDATA[plain]]><\/c><\/root>\n"
+    },
+    {
+        "input": "a&b<c>d\"e'f",
+        "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root a=\"a&amp;b&lt;c&gt;d&quot;e'f\"><e>a&amp;b&lt;c&gt;d&quot;e'f<\/e><empty\/><t b=\"a&amp;b&lt;c&gt;d&quot;e'f\">a&amp;b&lt;c&gt;d&quot;e'f<\/t><c><![CDATA[a&b<c>d\"e'f]]><\/c><\/root>\n"
+    },
+    {
+        "input": "tab\tnl\ncr\r",
+        "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root a=\"tab&#9;nl&#10;cr&#13;\"><e>tab\tnl\ncr&#13;<\/e><empty\/><t b=\"tab&#9;nl&#10;cr&#13;\">tab\tnl\ncr&#13;<\/t><c><![CDATA[tab\tnl\ncr\r]]><\/c><\/root>\n"
+    },
+    {
+        "input": "ünï→𝄞",
+        "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root a=\"ünï→𝄞\"><e>ünï→𝄞<\/e><empty\/><t b=\"ünï→𝄞\">ünï→𝄞<\/t><c><![CDATA[ünï→𝄞]]><\/c><\/root>\n"
+    },
+    {
+        "input": "",
+        "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root a=\"\"><e><\/e><empty\/><t b=\"\"><\/t><c><![CDATA[]]><\/c><\/root>\n"
+    },
+    {
+        "input": "\u0001bad",
+        "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root a=\"bad\"><e>bad<\/e><empty\/><t b=\"bad\">bad<\/t><c><![CDATA[bad]]><\/c><\/root>\n"
+    },
+    {
+        "input": "]]>",
+        "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root a=\"]]&gt;\"><e>]]&gt;<\/e><empty\/><t b=\"]]&gt;\">]]&gt;<\/t><c><![CDATA[]]>]]><\/c><\/root>\n"
+    }
+]
