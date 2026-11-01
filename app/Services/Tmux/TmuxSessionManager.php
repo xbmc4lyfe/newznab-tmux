@@ -179,28 +179,6 @@ class TmuxSessionManager
         return $panes;
     }
 
-    /**
-     * Get pane status
-     */
-    public function getPaneStatus(string $window, string $pane): ?string
-    {
-        $result = Process::timeout(5)->run(
-            TmuxCommand::arguments(['display-message', '-p', '-t', $this->target().":{$window}.{$pane}", '#{pane_current_command}'])
-        );
-
-        return $result->successful() ? trim($result->output()) : null;
-    }
-
-    /**
-     * Check if a pane is running a command
-     */
-    public function isPaneActive(string $window, string $pane): bool
-    {
-        $status = $this->getPaneStatus($window, $pane);
-
-        return $status !== null && $status !== 'bash' && $status !== 'sh';
-    }
-
     public function lastError(): ?string
     {
         return $this->lastError;

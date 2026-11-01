@@ -849,18 +849,6 @@ class TmuxTaskRunner
     }
 
     /**
-     * Legacy method for backward compatibility - now just calls runTvTask
-     *
-     * @deprecated Use runTvTask() instead
-     *
-     * @param  array<string, mixed>  $runVar
-     */
-    protected function runNonAmazonTask(array $runVar): bool
-    {
-        return $this->runTvTask($runVar);
-    }
-
-    /**
      * Run metadata post-processing (Books, Music, Games, Console)
      *
      * @param  array<string, mixed>  $runVar
