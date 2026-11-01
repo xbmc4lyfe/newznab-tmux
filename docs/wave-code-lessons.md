@@ -17,6 +17,8 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 9. **Speed up where the time goes.** Wave 67.4 sped up in-memory plans by 1.73x to 4.18x. `IsbnDbService`'s real work is an HTTP request through `$this->client->get`, which the plans never touch. The indexer's speed work should target I/O: NNTP, the database and metadata APIs.
 10. **Check scope before porting.** Wave 67.4 covers IGDB games, ISBNdb books and invitations. The indexer covers TV and movies, so none of this is worth porting.
 11. **Layers pile up when nothing gets removed.** `IsbnDbService` already had Wave 39.4 toggles when Wave 67.4 added a second set. Delete the old route when adding a new one, so each behavior has one path.
+12. **Share a helper once it repeats.** Each wave class carries its own state helper for routing and the library handle. After this slice, `app` still has 493 copies across 400 files. Put repeated plumbing in one place, so a fix lands once.
+13. **Keep one access decision.** `LogFileRepository`'s listing is its access whitelist, yet the Wave 67.6 plan computed its own `accepted` flag that nothing read. A second answer to "may this be read?" can only drift from the real one.
 
 ## Slices
 
@@ -25,3 +27,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 1 | Wave 68.3 monitoring plans: 5 PHP classes, `monitoring_horizon_verification_status_tmux_grafana_w683` and its parity test | `436c89705` | 1 to 6 |
 | 1 | Wave 44.2 parity test only. Its PHP and Rust code goes with Wave 44 | `719bd8f9e` | 7, 8 |
 | 2 | Wave 67.4 metadata plans: `Company`, `Game`, `Platform`, `InvitationService`, `IsbnDbService`, their Rust module and parity test | `2fac89eed` | 9 to 11 |
+| 3 | Wave 67.6 plans: `LogFileRepository`, `LogReader`, `LogSearcher`, `SearchQuery`, `Mcp/ProcessRunner`, their Rust module and parity test | `382db8a64` | 12, 13 |
