@@ -2387,6 +2387,7 @@ dependencies = [
  "md-5 0.10.6",
  "nntmux-core",
  "nntmux-nntp",
+ "nntmux-ops",
  "nntmux-runtime",
  "nntmux-testkit",
  "nntmux-verify",

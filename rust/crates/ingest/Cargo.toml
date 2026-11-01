@@ -14,6 +14,7 @@ hex.workspace = true
 md-5.workspace = true
 nntmux-core.workspace = true
 nntmux-nntp.workspace = true
+nntmux-ops.workspace = true
 nntmux-runtime.workspace = true
 nntmux-verify.workspace = true
 rand.workspace = true

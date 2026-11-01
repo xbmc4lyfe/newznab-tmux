@@ -458,16 +458,24 @@ pub struct RoleSettings {
     pub backfill_timer: u32,
     pub progressive_backfill: bool,
     pub collections_kill_threshold: u32,
+    pub post_process_kill_threshold: u32,
 }
 
 pub async fn role_settings(pool: &MySqlPool) -> Result<RoleSettings> {
     Ok(sqlx::query_as(
         "SELECT binaries_enabled, binaries_timer, backfill_mode, backfill_timer,
-                progressive_backfill, collections_kill_threshold
+                progressive_backfill, collections_kill_threshold, post_process_kill_threshold
          FROM tmux_configurations WHERE id = 1",
     )
     .fetch_one(pool)
     .await?)
+}
+
+/// Whether the post-processing backlog is over its kill threshold, which holds both header roles.
+/// A failed count fails the pass, so a role doesn't admit work it can't check.
+pub async fn post_process_held(pool: &MySqlPool, settings: &RoleSettings) -> Result<bool> {
+    let limit = i64::from(settings.post_process_kill_threshold);
+    Ok(limit > 0 && limit < nntmux_ops::processing_stats::total_work(pool).await?)
 }
 
 /// How long backfill rests. With progressive backfill, a large collections table slows it down.
@@ -518,7 +526,7 @@ async fn update_pass(ctx: &Ctx, stop: &Shutdown) -> Result<Duration> {
         return Ok(PAUSED_REST);
     };
     let settings = role_settings(&ctx.db).await?;
-    if settings.binaries_enabled {
+    if settings.binaries_enabled && !post_process_held(&ctx.db, &settings).await? {
         let runner = runner(ctx, Some(stop.clone())).await?;
         let result = runner.safe_binaries(Some(ctx.redis.clone())).await?;
         info!(
@@ -532,8 +540,9 @@ async fn update_pass(ctx: &Ctx, stop: &Shutdown) -> Result<Duration> {
     ))
 }
 
-/// `nntmux-worker backfill`: the configured backfill mode, held while collections are over the
-/// kill threshold, as they back up when releases can't keep up.
+/// `nntmux-worker backfill`: the configured backfill mode, held while collections or the
+/// post-processing backlog are over their kill thresholds, as they back up when releases can't
+/// keep up.
 pub async fn run_backfill_role(ctx: Ctx, once: bool, stop: Shutdown) -> Result<()> {
     while !stop.requested() {
         let outcome = backfill_pass(&ctx, &stop).await;
@@ -555,7 +564,7 @@ async fn backfill_pass(ctx: &Ctx, stop: &Shutdown) -> Result<Duration> {
         .fetch_one(&ctx.db)
         .await?;
     let limit = i64::from(settings.collections_kill_threshold);
-    let held = limit > 0 && limit < collections;
+    let held = (limit > 0 && limit < collections) || post_process_held(&ctx.db, &settings).await?;
     if !held && matches!(settings.backfill_mode, 1 | 4) {
         let runner = runner(ctx, Some(stop.clone())).await?;
         let result = if settings.backfill_mode == 1 {
@@ -693,6 +702,7 @@ mod tests {
             backfill_timer: 600,
             progressive_backfill: true,
             collections_kill_threshold: 0,
+            post_process_kill_threshold: 0,
         };
         assert_eq!(backfill_sleep(&settings, 1000), 600);
         assert_eq!(backfill_sleep(&settings, 500_000), 1000);
