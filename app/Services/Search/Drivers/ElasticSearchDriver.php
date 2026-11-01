@@ -17,18 +17,15 @@ use App\Services\Search\Contracts\ReleaseCandidatePager;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
-use App\Services\Search\SearchService;
 use App\Services\Search\Support\ElasticsearchClientFactory;
 use App\Services\Search\Support\ElasticsearchResponseHelper;
 use App\Services\Search\Support\ReleaseIndexProjection;
 use App\Services\Search\Support\SearchFailureTracker;
 use App\Support\PredbSearchDocument;
 use App\Support\ReleaseSearchIndexDocument;
-use App\Support\RustPipelineLibrary;
 use App\Support\SecondaryIndexDocuments;
 use Elastic\Elasticsearch\Client;
 use Elastic\Elasticsearch\Exception\ElasticsearchException;
-use FFI\CData;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -43,37 +40,6 @@ use RuntimeException;
 class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandidatePager, SearchDriverInterface
 {
     private const CACHE_TTL_MINUTES = 5;
-
-    private const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_elastic_escape_string(const char *input_ptr, size_t input_len, uint8_t *out_buf, size_t out_cap);
-        C;
-
-    private static ?bool $useRustFfi = null;
-
-    private static \FFI|false|null $ffi = null;
-
-    private static ?CData $escapeBuf = null;
-
-    private static int $escapeCap = 0;
-
-    public static function setUseRustFfi(?bool $useRust): void
-    {
-        self::$useRustFfi = $useRust;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? false;
-    }
-
-    public static function ffi(): ?\FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('elastic_escape_string', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
 
     private const SCROLL_TIMEOUT = '30s';
 
@@ -336,64 +302,6 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
      */
     public static function escapeString(string $string): string
     {
-        if (self::$useRustFfi === true) {
-            $native = self::escapeStringNative($string);
-            if ($native !== null) {
-                return $native;
-            }
-        }
-
-        return self::escapeStringPhp($string);
-    }
-
-    public static function escapeStringNative(string $string): ?string
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        if ($string === '' || $string === '0' || $string === '*') {
-            return '';
-        }
-
-        $len = strlen($string);
-        $needed = max(256, $len + 16);
-        if (self::$escapeBuf === null || self::$escapeCap < $needed) {
-            self::$escapeCap = $needed;
-            self::$escapeBuf = $ffi->new("uint8_t[{$needed}]");
-        }
-
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_elastic_escape_string(
-            $string,
-            $len,
-            self::$escapeBuf,
-            self::$escapeCap,
-        );
-        if ($written < -1) {
-            $req = -$written;
-            self::$escapeCap = max($req + 16, 256);
-            self::$escapeBuf = $ffi->new('uint8_t['.self::$escapeCap.']');
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_elastic_escape_string(
-                $string,
-                $len,
-                self::$escapeBuf,
-                self::$escapeCap,
-            );
-        }
-        if ($written < 0) {
-            return null;
-        }
-        if ($written === 0) {
-            return '';
-        }
-
-        return \FFI::string(self::$escapeBuf, $written);
-    }
-
-    public static function escapeStringPhp(string $string): string
-    {
         if (empty($string) || $string === '*') {
             return '';
         }
@@ -643,34 +551,22 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
 
             $response = $client->search($searchParams);
 
-            $searchnames = [];
-            if (isset($response['hits']['hits'])) {
-                foreach ($response['hits']['hits'] as $hit) {
-                    $sn = $hit['_source']['searchname'] ?? '';
-                    if (is_string($sn) && $sn !== '') {
-                        $searchnames[] = $sn;
-                    }
-                }
-            }
-
-            $rust = RustPipelineLibrary::searchSuggestFallbackBatch($searchnames, $query, 5);
-            if ($rust !== null) {
-                return $rust;
-            }
-
             // Extract common terms from results that differ from the query
             $termCounts = [];
-            foreach ($searchnames as $searchname) {
-                $words = preg_split('/[\s.\-_]+/', strtolower($searchname)) ?: [];
+            if (isset($response['hits']['hits'])) {
+                foreach ($response['hits']['hits'] as $hit) {
+                    $searchname = $hit['_source']['searchname'] ?? '';
+                    $words = preg_split('/[\s.\-_]+/', strtolower($searchname));
 
-                foreach ($words as $word) {
-                    if (strlen($word) >= 3 && $word !== strtolower($query)) {
-                        $distance = levenshtein(strtolower($query), $word);
-                        if ($distance > 0 && $distance <= 3) {
-                            if (! isset($termCounts[$word])) {
-                                $termCounts[$word] = ['count' => 0, 'distance' => $distance];
+                    foreach ($words as $word) {
+                        if (strlen($word) >= 3 && $word !== strtolower($query)) {
+                            $distance = levenshtein(strtolower($query), $word);
+                            if ($distance > 0 && $distance <= 3) {
+                                if (! isset($termCounts[$word])) {
+                                    $termCounts[$word] = ['count' => 0, 'distance' => $distance];
+                                }
+                                $termCounts[$word]['count']++;
                             }
-                            $termCounts[$word]['count']++;
                         }
                     }
                 }
@@ -682,7 +578,7 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
             $suggestions = [];
             foreach (array_slice($termCounts, 0, 5, true) as $term => $data) {
                 $suggestions[] = [
-                    'suggest' => (string) $term,
+                    'suggest' => $term,
                     'distance' => $data['distance'],
                     'docs' => $data['count'],
                 ];
@@ -707,12 +603,6 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
      */
     private function extractSuggestion(string $searchname, string $query): ?string
     {
-        $supported = false;
-        $rust = RustPipelineLibrary::searchExtractSuggestion($searchname, $query, null, $supported);
-        if ($supported) {
-            return $rust;
-        }
-
         // Clean up the searchname - remove file extensions
         $clean = preg_replace('/\.(mkv|avi|mp4|wmv|nfo|nzb|par2|rar|zip|r\d+)$/i', '', $searchname);
 
@@ -1897,11 +1787,6 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
         $terms = trim($terms);
         if (empty($terms)) {
             return '';
-        }
-
-        $native = RustPipelineLibrary::searchSanitizeLucene($terms);
-        if ($native !== null) {
-            return $native;
         }
 
         // Use the original sanitize() helper function that properly handles
@@ -3704,283 +3589,5 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
         }
 
         return array_keys($seen);
-    }
-
-    /**
-     * Rust stays opt-in for the Wave 40.5 summary: the FFI round trip misses the 1.5x gate; see
-     * tests/Unit/RustManticoreElasticSearchServiceCircuitW40ParityTest.php.
-     */
-    public const bool W405_RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useW405RustFfi = null;
-
-    public static function useW405RustFfi(?bool $use = true): void
-    {
-        self::$useW405RustFfi = $use;
-    }
-
-    public static function usesW405RustFfi(): bool
-    {
-        return self::$useW405RustFfi ?? self::W405_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW405RustFfi(): void
-    {
-        self::$useW405RustFfi = null;
-    }
-
-    /**
-     * Summarizes Elasticsearch `_bulk` response items. Each item is keyed by its action
-     * (`index`, `create`, `update`, `delete`); the first entry's integer `status` is used. Items
-     * without one are malformed and count as failures. All items succeeded when every status is
-     * 2xx (vacuously true for an empty response).
-     *
-     * @param  array<array-key, mixed>  $items
-     * @return array{total_items: int, created_count: int, updated_count: int, conflict_count: int, throttled_count: int, server_error_count: int, all_succeeded: bool}
-     */
-    public static function summarizeElasticBulkResponseItems(array $items): array
-    {
-        return self::usesW405RustFfi()
-            ? self::summarizeElasticBulkResponseItemsNative($items)
-            : self::summarizeElasticBulkResponseItemsPhp($items);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $items
-     * @return array{total_items: int, created_count: int, updated_count: int, conflict_count: int, throttled_count: int, server_error_count: int, all_succeeded: bool}
-     */
-    private static function summarizeElasticBulkResponseItemsNative(array $items): array
-    {
-        $parts = [];
-        foreach ($items as $item) {
-            $status = self::itemStatus($item);
-            $parts[] = $status === null ? '' : (string) $status;
-        }
-        $fields = SearchService::evaluateW405Native(2, $parts);
-        if ($fields === null || \count($fields) !== 7) {
-            return self::summarizeElasticBulkResponseItemsPhp($items);
-        }
-
-        return [
-            'total_items' => (int) $fields[0],
-            'created_count' => (int) $fields[1],
-            'updated_count' => (int) $fields[2],
-            'conflict_count' => (int) $fields[3],
-            'throttled_count' => (int) $fields[4],
-            'server_error_count' => (int) $fields[5],
-            'all_succeeded' => $fields[6] === '1',
-        ];
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $items
-     * @return array{total_items: int, created_count: int, updated_count: int, conflict_count: int, throttled_count: int, server_error_count: int, all_succeeded: bool}
-     */
-    private static function summarizeElasticBulkResponseItemsPhp(array $items): array
-    {
-        $created = $updated = $conflict = $throttled = $server = 0;
-        $allOk = true;
-        foreach ($items as $item) {
-            $status = self::itemStatus($item);
-            if ($status === null) {
-                $allOk = false;
-
-                continue;
-            }
-            match (true) {
-                $status === 201 => $created++,
-                $status === 200 => $updated++,
-                $status === 409 => $conflict++,
-                $status === 429 => $throttled++,
-                $status >= 500 && $status <= 599 => $server++,
-                default => null,
-            };
-            $allOk = $allOk && $status >= 200 && $status <= 299;
-        }
-
-        return [
-            'total_items' => \count($items),
-            'created_count' => $created,
-            'updated_count' => $updated,
-            'conflict_count' => $conflict,
-            'throttled_count' => $throttled,
-            'server_error_count' => $server,
-            'all_succeeded' => $allOk,
-        ];
-    }
-
-    private static function itemStatus(mixed $item): ?int
-    {
-        if (! \is_array($item)) {
-            return null;
-        }
-        $result = reset($item);
-
-        return \is_array($result) && \is_int($result['status'] ?? null) ? $result['status'] : null;
-    }
-
-    public const string W56_FFI_CDEF = 'int64_t nntmux_w565_elastic_query_string_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
-
-    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W56.5 parity test's QUALIFICATION). */
-    private const bool W56_RUST_FFI_DEFAULT = true;
-
-    /** Lucene query string reserved characters, counted by {@see self::queryStringPlanBatch()}. */
-    private const array W56_LUCENE_RESERVED = ['+', '-', '=', '&', '|', '>', '<', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '\\', '/'];
-
-    /**
-     * Wave 56.5 routing and FFI cache, kept in function-local statics. Without $op it reports
-     * the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
-     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[],
-     * capacity]` with room for at least $val words, or null without the library.
-     */
-    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'reset':
-                $ffi = $val;
-                $out = null;
-                $outCap = 0;
-
-                return null;
-            case 'buffer':
-                if ($ffi === null) {
-                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
-                    $ffi = RustPipelineLibrary::resolveDomain('w56_5', self::W56_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
-                }
-                if (! $ffi instanceof \FFI || ! \is_int($val)) {
-                    return null;
-                }
-                if ($out === null || $outCap < $val) {
-                    $outCap = max(1024, $val);
-                    $out = $ffi->new('int64_t['.$outCap.']');
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled ?? self::W56_RUST_FFI_DEFAULT;
-        }
-    }
-
-    public static function usesW56RustFfi(): bool
-    {
-        return self::w56RustFfiState() === true;
-    }
-
-    /**
-     * Runs $callback with queryStringPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w56RustFfiState('set', $enabled);
-
-        try {
-            return $callback();
-        } finally {
-            self::w56RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Exactly $words output words from the Wave 56.5 Rust helper over $count NUL-joined records, or null
-     * to fall back to PHP.
-     *
-     * @return list<int>|null
-     */
-    private static function w56Words(int $count, string $data, int $words): ?array
-    {
-        try {
-            $handle = self::w56RustFfiState('buffer', $words);
-            if (! \is_array($handle)) {
-                return null;
-            }
-            [$ffi, $out, $cap] = $handle;
-            $written = $ffi->nntmux_w565_elastic_query_string_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
-            if ($written !== $words) {
-                return null;
-            }
-            /** @var array<int, int>|false $values */
-            $values = unpack('P*', \FFI::string($out, $written * 8));
-
-            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
-        } catch (\Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Batch plan of {@see self::escapeStringPhp()}-style normalization: dots become spaces, the text is
-     * trimmed and whitespace runs collapse to one space. Four words per query: `[normalized length,
-     * terms, reserved, flags]`; `''`, `'0'` and `'*'` report `[0, 0, 0, 1]`. Terms are runs of non-space
-     * bytes and reserved counts Lucene reserved bytes. Flags: 2 non-ASCII, 4 had a dot, 8 collapsing
-     * changed the text.
-     *
-     * @param  list<string>  $queries
-     * @return list<int>
-     */
-    public static function queryStringPlanBatch(array $queries): array
-    {
-        return self::usesW56RustFfi() ? self::queryStringPlanBatchNative($queries) : self::queryStringPlanBatchPhp($queries);
-    }
-
-    /**
-     * @param  list<string>  $queries
-     * @return list<int>
-     */
-    public static function queryStringPlanBatchPhp(array $queries): array
-    {
-        $out = [];
-        foreach ($queries as $query) {
-            if ($query === '' || $query === '0' || $query === '*') {
-                array_push($out, 0, 0, 0, 1);
-
-                continue;
-            }
-            $trimmed = trim(str_replace('.', ' ', $query));
-            $normalized = preg_replace('/\s+/', ' ', $trimmed) ?? $trimmed;
-            $flags = (preg_match('/[\x80-\xff]/', $normalized) === 1 ? 2 : 0)
-                | (str_contains($query, '.') ? 4 : 0)
-                | ($normalized !== $trimmed ? 8 : 0);
-            array_push(
-                $out,
-                \strlen($normalized),
-                (int) preg_match_all('/[^ ]+/', $normalized),
-                \strlen($normalized) - \strlen(str_replace(self::W56_LUCENE_RESERVED, '', $normalized)),
-                $flags,
-            );
-        }
-
-        return $out;
-    }
-
-    /**
-     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds
-     * a NUL.
-     *
-     * @param  list<string>  $queries
-     * @return list<int>
-     */
-    public static function queryStringPlanBatchNative(array $queries): array
-    {
-        $count = \count($queries);
-        if ($count === 0) {
-            return [];
-        }
-
-        return self::w56Words($count, implode("\0", $queries), 4 * $count) ?? self::queryStringPlanBatchPhp($queries);
     }
 }

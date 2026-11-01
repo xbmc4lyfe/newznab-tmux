@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Throwable;
@@ -18,170 +16,6 @@ use Throwable;
  */
 final class RemotePublicationService
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_w16_publication(uint32_t operation, const char *input, size_t length, char *output, size_t capacity);
-        C;
-
-    // Candidate helpers retain PHP defaults until every paired mean/p99 gate passes.
-    private static bool $useRustFfi = false;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    /** Reject objects before serialize() can invoke user code; bound cycles and nesting. */
-    private static function nativeValueSupported(mixed $value, int &$remaining, int $depth): bool
-    {
-        if (--$remaining < 0 || $depth > 24) {
-            return false;
-        }
-        if (is_array($value)) {
-            foreach ($value as $item) {
-                if (! self::nativeValueSupported($item, $remaining, $depth + 1)) {
-                    return false;
-                }
-            }
-
-            return true;
-        }
-
-        return $value === null || is_scalar($value);
-    }
-
-    /** @param list<mixed> $arguments */
-    private static function computeNative(int $operation, array $arguments): mixed
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        try {
-            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
-            if ($ffi === null) {
-                return null;
-            }
-            $remaining = 100000;
-            if (! self::nativeValueSupported($arguments, $remaining, 0)) {
-                return null;
-            }
-            $input = serialize($arguments);
-            $capacity = 0;
-            $output = RustPipelineLibrary::obtainScratch($ffi, max(4096, strlen($input) + 512), $capacity);
-            if ($output === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w16_publication($operation, $input, strlen($input), $output, $capacity);
-            if (! is_int($written) || $written < 0 || $written > $capacity) {
-                return null;
-            }
-
-            return unserialize(FFI::string($output, $written), ['allowed_classes' => false]);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * @param  array<int, int>  $singleSizes
-     * @return list<array{batch: bool, positions: list<int>}>
-     */
-    public static function batchPartition(array $singleSizes, int $emptySize, int $limit): array
-    {
-        return self::batchPartitionNative($singleSizes, $emptySize, $limit) ?? self::batchPartitionPhp($singleSizes, $emptySize, $limit);
-    }
-
-    /**
-     * @param  array<int, int>  $singleSizes
-     * @return list<array{batch: bool, positions: list<int>}>
-     */
-    public static function batchPartitionPhp(array $singleSizes, int $emptySize, int $limit): array
-    {
-        $groups = [];
-        $current = [];
-        $bytes = $emptySize;
-        foreach ($singleSizes as $position => $size) {
-            if ($size > $limit) {
-                if ($current !== []) {
-                    $groups[] = ['batch' => true, 'positions' => $current];
-                    $current = [];
-                    $bytes = $emptySize;
-                }
-                $groups[] = ['batch' => false, 'positions' => [$position]];
-
-                continue;
-            }
-            $extra = $size - $emptySize + ($current === [] ? 0 : 1);
-            if ($current !== [] && $bytes + $extra > $limit) {
-                $groups[] = ['batch' => true, 'positions' => $current];
-                $current = [];
-                $bytes = $emptySize;
-                $extra = $size - $emptySize;
-            }
-            $current[] = $position;
-            $bytes += $extra;
-        }
-        if ($current !== []) {
-            $groups[] = ['batch' => true, 'positions' => $current];
-        }
-
-        return $groups;
-    }
-
-    /**
-     * @param  array<int, int>  $singleSizes
-     * @return list<array{batch: bool, positions: list<int>}>|null
-     */
-    public static function batchPartitionNative(array $singleSizes, int $emptySize, int $limit): ?array
-    {
-        $result = self::computeNative(0, [$singleSizes, $emptySize, $limit]);
-
-        return is_array($result) ? $result : null;
-    }
-
-    /**
-     * @return array{status: ?string, release_id: ?int}
-     */
-    public static function settledOutcome(?int $releaseId, ?string $resolved, bool $replay): array
-    {
-        return self::settledOutcomeNative($releaseId, $resolved, $replay) ?? self::settledOutcomePhp($releaseId, $resolved, $replay);
-    }
-
-    /**
-     * @return array{status: ?string, release_id: ?int}
-     */
-    public static function settledOutcomePhp(?int $releaseId, ?string $resolved, bool $replay): array
-    {
-        return ['status' => $releaseId !== null ? PublicationOutcome::PUBLISHED : ($replay ? $resolved : null), 'release_id' => $releaseId];
-    }
-
-    /**
-     * @return array{status: ?string, release_id: ?int}|null
-     */
-    public static function settledOutcomeNative(?int $releaseId, ?string $resolved, bool $replay): ?array
-    {
-        $result = self::computeNative(1, [$releaseId, $resolved, $replay]);
-
-        return is_array($result) ? $result : null;
-    }
-
-    public static function ledgerAdjustment(int $bytes, bool $retain): int
-    {
-        return self::ledgerAdjustmentNative($bytes, $retain) ?? self::ledgerAdjustmentPhp($bytes, $retain);
-    }
-
-    public static function ledgerAdjustmentPhp(int $bytes, bool $retain): int
-    {
-        return $retain ? 0 : -$bytes;
-    }
-
-    public static function ledgerAdjustmentNative(int $bytes, bool $retain): ?int
-    {
-        $result = self::computeNative(2, [$bytes, $retain]);
-
-        return is_int($result) ? $result : null;
-    }
-
     public const string STALE_MESSAGE = 'Stale verification result cannot publish.';
 
     /** Version of the batch request and response; a mismatch makes the worker fall back to single requests. */
@@ -293,7 +127,7 @@ final class RemotePublicationService
                 ? new PublicationOutcome(PublicationOutcome::ERROR, null, $outcome->error ?? 'Publication produced no release.') : $outcome;
         } catch (Throwable $error) {
             // Even the recovery lookup failed; the item may or may not have published, and a resend decides.
-            return new PublicationOutcome(PublicationOutcome::ERROR, null, RemoteReleasePublisher::errorMessage($error->getMessage()));
+            return new PublicationOutcome(PublicationOutcome::ERROR, null, mb_strcut($error->getMessage(), 0, 500, 'UTF-8'));
         }
     }
 
@@ -392,7 +226,7 @@ final class RemotePublicationService
             if ($settled !== null) {
                 return $settled;
             }
-            $message = RemoteReleasePublisher::errorMessage($error->getMessage());
+            $message = mb_strcut($error->getMessage(), 0, 500, 'UTF-8');
 
             return new PublicationOutcome(str_starts_with($message, 'Stale verification result cannot')
                 ? PublicationOutcome::STALE : PublicationOutcome::ERROR, null, $message);
@@ -403,10 +237,12 @@ final class RemotePublicationService
     private function settled(object $claim, bool $replayResolved): ?PublicationOutcome
     {
         $published = $this->publishedRelease($claim);
-        $status = $published === null && $replayResolved ? $this->resolvedStatus($claim) : null;
-        $settled = self::settledOutcome($published, $status, $replayResolved);
+        if ($published !== null) {
+            return new PublicationOutcome(PublicationOutcome::PUBLISHED, $published);
+        }
+        $status = $replayResolved ? $this->resolvedStatus($claim) : null;
 
-        return $settled['status'] === null ? null : new PublicationOutcome($settled['status'], $settled['release_id']);
+        return $status === null ? null : new PublicationOutcome($status);
     }
 
     /** The release already published for this exact candidate generation. */
@@ -426,194 +262,5 @@ final class RemotePublicationService
             ->whereIn('status', [PublicationOutcome::FILTERED, PublicationOutcome::METADATA_REVIEW])->value('status');
 
         return is_string($status) ? $status : null;
-    }
-
-    public const string W58_FFI_CDEF = 'int64_t nntmux_w585_publication_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
-
-    /** Wave 58.5 `[outcome, class]` codes per item status label. */
-    private const array W58_OUTCOMES = [
-        PublicationOutcome::PUBLISHED => [1, 3], PublicationOutcome::FILTERED => [2, 3], PublicationOutcome::METADATA_REVIEW => [3, 3],
-        PublicationOutcome::DEFERRED => [4, 1], PublicationOutcome::PAUSED => [5, 1], PublicationOutcome::RETRY => [6, 1],
-        PublicationOutcome::STALE => [7, 0], PublicationOutcome::ERROR => [8, 0], PublicationOutcome::TRANSPORT => [9, 1],
-        PublicationOutcome::INVALID => [10, 0], PublicationOutcome::NO_RELEASE => [11, 3],
-    ];
-
-    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W58.5 parity test's QUALIFICATION). */
-    private const bool W58_RUST_FFI_DEFAULT = true;
-
-    /**
-     * Wave 58.5 routing and FFI cache, kept in function-local statics (readonly verification classes cannot declare
-     * static properties, so every W58 class follows the same shape). Without $op it reports the routing; 'set' swaps
-     * the override for $val and returns the previous one; 'reset' replaces the cached handle with $val (null
-     * re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]` with room for at least $val words,
-     * or null without the library.
-     */
-    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'reset':
-                $ffi = $val;
-                $out = null;
-                $outCap = 0;
-
-                return null;
-            case 'buffer':
-                if ($ffi === null) {
-                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
-                    $ffi = RustPipelineLibrary::resolveDomain('w58_5', self::W58_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
-                }
-                if (! $ffi instanceof FFI || ! \is_int($val)) {
-                    return null;
-                }
-                if ($out === null || $outCap < $val) {
-                    $outCap = max(1024, $val);
-                    $out = $ffi->new('int64_t['.$outCap.']');
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled ?? self::W58_RUST_FFI_DEFAULT;
-        }
-    }
-
-    public static function usesW58RustFfi(): bool
-    {
-        return self::w58RustFfiState() === true;
-    }
-
-    /**
-     * Runs $callback with publicationPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w58RustFfiState('set', $enabled);
-
-        try {
-            return $callback();
-        } finally {
-            self::w58RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Exactly $words output words from the Wave 58.5 Rust helper over $count NUL-joined records, or null
-     * to fall back to PHP.
-     *
-     * @return list<int>|null
-     */
-    private static function w58Words(int $count, string $data, int $words): ?array
-    {
-        try {
-            $handle = self::w58RustFfiState('buffer', $words);
-            if (! \is_array($handle)) {
-                return null;
-            }
-            [$ffi, $out, $cap] = $handle;
-            $written = $ffi->nntmux_w585_publication_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
-            if ($written !== $words) {
-                return null;
-            }
-            /** @var array<int, int>|false $values */
-            $values = unpack('q*', FFI::string($out, $written * 8));
-
-            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Batch plan over tab-separated `id, version, manifest_hash, lease_token, status` publication items. Five words per
-     * record: `[id, version, flags, outcome, class]`. Id and version are 1-18 digits (0 when invalid). Flags: 1 id
-     * invalid or zero, 2 version invalid, 4 hash not 64 lowercase hex, 8 lease token empty or over 64 bytes, 16 not
-     * exactly five fields. Outcome: a three-digit status is its code; labels map through W58_OUTCOMES; anything else
-     * 0. Class: 3 settled (published, filtered, metadata_review, no_release, 2xx), 1 retry (deferred, paused, retry,
-     * transport, 408, 429, 503, 504), 2 batch fallback (404, 405, 413), 0 final.
-     *
-     * @param  list<string>  $records
-     * @return list<int>
-     */
-    public static function publicationPlanBatch(array $records): array
-    {
-        return self::usesW58RustFfi() ? self::publicationPlanBatchNative($records) : self::publicationPlanBatchPhp($records);
-    }
-
-    /**
-     * @param  list<string>  $records
-     * @return list<int>
-     */
-    public static function publicationPlanBatchPhp(array $records): array
-    {
-        $out = [];
-        foreach ($records as $record) {
-            $fields = explode("\t", $record);
-            $flags = \count($fields) === 5 ? 0 : 16;
-            $id = \strlen($fields[0]) <= 18 && ctype_digit($fields[0]) ? (int) $fields[0] : 0;
-            if ($id === 0) {
-                $flags |= 1;
-            }
-            $version = $fields[1] ?? '';
-            if (\strlen($version) <= 18 && ctype_digit($version)) {
-                $version = (int) $version;
-            } else {
-                $flags |= 2;
-                $version = 0;
-            }
-            $hash = $fields[2] ?? '';
-            if (\strlen($hash) !== 64 || strspn($hash, '0123456789abcdef') !== 64) {
-                $flags |= 4;
-            }
-            $lease = $fields[3] ?? '';
-            if ($lease === '' || \strlen($lease) > 64) {
-                $flags |= 8;
-            }
-            $status = $fields[4] ?? '';
-            if (\strlen($status) === 3 && ctype_digit($status)) {
-                $outcome = (int) $status;
-                $class = match (true) {
-                    $outcome >= 200 && $outcome <= 299 => 3,
-                    $outcome === 408 || $outcome === 429 || $outcome === 503 || $outcome === 504 => 1,
-                    $outcome === 404 || $outcome === 405 || $outcome === 413 => 2,
-                    default => 0,
-                };
-            } else {
-                [$outcome, $class] = self::W58_OUTCOMES[$status] ?? [0, 0];
-            }
-            array_push($out, $id, $version, $flags, $outcome, $class);
-        }
-
-        return $out;
-    }
-
-    /**
-     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
-     * a NUL.
-     *
-     * @param  list<string>  $records
-     * @return list<int>
-     */
-    public static function publicationPlanBatchNative(array $records): array
-    {
-        $count = \count($records);
-        if ($count === 0) {
-            return [];
-        }
-
-        return self::w58Words($count, implode("\0", $records), 5 * $count) ?? self::publicationPlanBatchPhp($records);
     }
 }

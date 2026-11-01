@@ -8,84 +8,13 @@ use App\Http\Controllers\BasePageController;
 use App\Models\Release;
 use App\Models\Video;
 use App\Services\TvProcessing\TvShowAdder;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\View\View;
-use Throwable;
 
 class AdminShowsController extends BasePageController
 {
-    private const FFI_CDEF = <<<'CDEF'
-    ssize_t nntmux_admin_shows_normalize_preview_ids(
-        uint32_t has_tvdb,
-        int64_t tvdb,
-        uint32_t has_tvmaze,
-        int64_t tvmaze,
-        uint32_t has_tmdb,
-        int64_t tmdb,
-        uint32_t has_trakt,
-        int64_t trakt,
-        uint32_t has_tvrage,
-        int64_t tvrage,
-        uint32_t has_imdb,
-        const char *imdb_ptr,
-        size_t imdb_len,
-        int64_t *out_ids,
-        char *out_buf,
-        size_t out_cap
-    );
-    ssize_t nntmux_admin_shows_format_create_flash(
-        uint32_t existed,
-        const char *title_ptr,
-        size_t title_len,
-        size_t *out_lens,
-        char *out_buf,
-        size_t out_cap
-    );
-    CDEF;
-
-    /**
-     * Production default stays false until benchmark/parity sign-off; see
-     * tests/Unit/RustAdminMediaCatalogControllersParityTest.php.
-     */
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useRustFfi = (bool) $useRustFfi;
-    }
-
-    public static function enableRustFfi(): void
-    {
-        self::$useRustFfi = true;
-    }
-
-    public static function disableRustFfi(): void
-    {
-        self::$useRustFfi = false;
-    }
-
-    public static function resetRustFfi(): void
-    {
-        self::$useRustFfi = false;
-        self::$ffi = null;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $ffi): void
-    {
-        self::$ffi = $ffi;
-    }
-
     /**
      * Display a listing of TV shows
      */
@@ -162,7 +91,7 @@ class AdminShowsController extends BasePageController
                 );
             } catch (\InvalidArgumentException $e) {
                 return back()->with('error', $e->getMessage())->withInput();
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 return back()->with('error', 'Lookup failed: '.$e->getMessage())->withInput();
             }
 
@@ -170,12 +99,12 @@ class AdminShowsController extends BasePageController
                 return back()->with('error', 'No show could be added for that ID.')->withInput();
             }
 
-            $flash = self::formatCreateFlash(
-                (bool) $result['existed'],
-                isset($result['title']) ? (string) $result['title'] : null,
-            );
+            $flashKey = $result['existed'] ? 'warning' : 'success';
+            $flashMsg = $result['existed']
+                ? sprintf('Show "%s" already exists — opened existing record.', $result['title'] ?? '')
+                : sprintf('TV show "%s" added successfully.', $result['title'] ?? '');
 
-            return redirect()->to('/admin/show-edit?id='.$result['videoId'])->with($flash['key'], $flash['message']);
+            return redirect()->to('/admin/show-edit?id='.$result['videoId'])->with($flashKey, $flashMsg);
         }
 
         return view('admin.shows.add', compact('title', 'meta_title', 'sources'));
@@ -197,7 +126,7 @@ class AdminShowsController extends BasePageController
             $preview = $adder->preview($data['source'], (string) $data['external_id']);
         } catch (\InvalidArgumentException $e) {
             return response()->json(['ok' => false, 'error' => $e->getMessage()], 422);
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             return response()->json(['ok' => false, 'error' => 'Lookup failed: '.$e->getMessage()], 500);
         }
 
@@ -207,7 +136,21 @@ class AdminShowsController extends BasePageController
 
         return response()->json([
             'ok' => true,
-            'show' => self::normalizeLookupPreviewPayload($preview),
+            'show' => [
+                'title' => $preview['title'] ?? null,
+                'summary' => $preview['summary'] ?? null,
+                'started' => $preview['started'] ?? null,
+                'publisher' => $preview['publisher'] ?? null,
+                'poster' => $preview['poster'] ?? null,
+                'ids' => [
+                    'tvdb' => $preview['tvdb'] ?? 0,
+                    'tvmaze' => $preview['tvmaze'] ?? 0,
+                    'tmdb' => $preview['tmdb'] ?? 0,
+                    'trakt' => $preview['trakt'] ?? 0,
+                    'imdb' => $preview['imdb'] ?? '',
+                    'tvrage' => $preview['tvrage'] ?? 0,
+                ],
+            ],
         ]);
     }
 
@@ -230,282 +173,5 @@ class AdminShowsController extends BasePageController
         $meta_title = $title = 'Remove Video and Episode IDs from Releases';
 
         return view('admin.shows.remove', compact('success', 'videoid', 'title', 'meta_title'));
-    }
-
-    /**
-     * @param  array<string, mixed>  $preview
-     * @return array{
-     *     title: mixed,
-     *     summary: mixed,
-     *     started: mixed,
-     *     publisher: mixed,
-     *     poster: mixed,
-     *     ids: array{tvdb: mixed, tvmaze: mixed, tmdb: mixed, trakt: mixed, imdb: mixed, tvrage: mixed}
-     * }
-     */
-    public static function normalizeLookupPreviewPayload(array $preview): array
-    {
-        if (self::$useRustFfi) {
-            return self::normalizeLookupPreviewPayloadNative($preview);
-        }
-
-        return self::normalizeLookupPreviewPayloadPhp($preview);
-    }
-
-    /**
-     * @param  array<string, mixed>  $preview
-     * @return array{
-     *     title: mixed,
-     *     summary: mixed,
-     *     started: mixed,
-     *     publisher: mixed,
-     *     poster: mixed,
-     *     ids: array{tvdb: mixed, tvmaze: mixed, tmdb: mixed, trakt: mixed, imdb: mixed, tvrage: mixed}
-     * }
-     */
-    public static function normalizeLookupPreviewPayloadPhp(array $preview): array
-    {
-        return [
-            'title' => $preview['title'] ?? null,
-            'summary' => $preview['summary'] ?? null,
-            'started' => $preview['started'] ?? null,
-            'publisher' => $preview['publisher'] ?? null,
-            'poster' => $preview['poster'] ?? null,
-            'ids' => [
-                'tvdb' => $preview['tvdb'] ?? 0,
-                'tvmaze' => $preview['tvmaze'] ?? 0,
-                'tmdb' => $preview['tmdb'] ?? 0,
-                'trakt' => $preview['trakt'] ?? 0,
-                'imdb' => $preview['imdb'] ?? '',
-                'tvrage' => $preview['tvrage'] ?? 0,
-            ],
-        ];
-    }
-
-    /**
-     * @param  array<string, mixed>  $preview
-     * @return array{
-     *     title: mixed,
-     *     summary: mixed,
-     *     started: mixed,
-     *     publisher: mixed,
-     *     poster: mixed,
-     *     ids: array{tvdb: mixed, tvmaze: mixed, tmdb: mixed, trakt: mixed, imdb: mixed, tvrage: mixed}
-     * }
-     */
-    public static function normalizeLookupPreviewPayloadNative(array $preview): array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::normalizeLookupPreviewPayloadPhp($preview);
-        }
-
-        foreach (['tvdb', 'tvmaze', 'tmdb', 'trakt', 'tvrage'] as $intKey) {
-            if (isset($preview[$intKey]) && ! is_int($preview[$intKey])) {
-                return self::normalizeLookupPreviewPayloadPhp($preview);
-            }
-        }
-        if (isset($preview['imdb']) && ! is_string($preview['imdb'])) {
-            return self::normalizeLookupPreviewPayloadPhp($preview);
-        }
-
-        $imdb = isset($preview['imdb']) ? $preview['imdb'] : '';
-
-        try {
-            $outIds = $ffi->new('int64_t[5]');
-            $cap = 0;
-            $buf = RustPipelineLibrary::obtainScratch($ffi, max(32, strlen($imdb) + 8), $cap);
-            if ($buf === null) {
-                return self::normalizeLookupPreviewPayloadPhp($preview);
-            }
-
-            $rc = (int) self::callFfi(
-                $ffi,
-                'nntmux_admin_shows_normalize_preview_ids',
-                isset($preview['tvdb']) ? 1 : 0,
-                isset($preview['tvdb']) ? $preview['tvdb'] : 0,
-                isset($preview['tvmaze']) ? 1 : 0,
-                isset($preview['tvmaze']) ? $preview['tvmaze'] : 0,
-                isset($preview['tmdb']) ? 1 : 0,
-                isset($preview['tmdb']) ? $preview['tmdb'] : 0,
-                isset($preview['trakt']) ? 1 : 0,
-                isset($preview['trakt']) ? $preview['trakt'] : 0,
-                isset($preview['tvrage']) ? 1 : 0,
-                isset($preview['tvrage']) ? $preview['tvrage'] : 0,
-                isset($preview['imdb']) ? 1 : 0,
-                $imdb,
-                strlen($imdb),
-                $outIds,
-                $buf,
-                $cap
-            );
-            if ($rc < -1) {
-                $buf = RustPipelineLibrary::obtainScratch($ffi, -$rc, $cap);
-                if ($buf === null) {
-                    return self::normalizeLookupPreviewPayloadPhp($preview);
-                }
-                $rc = (int) self::callFfi(
-                    $ffi,
-                    'nntmux_admin_shows_normalize_preview_ids',
-                    isset($preview['tvdb']) ? 1 : 0,
-                    isset($preview['tvdb']) ? $preview['tvdb'] : 0,
-                    isset($preview['tvmaze']) ? 1 : 0,
-                    isset($preview['tvmaze']) ? $preview['tvmaze'] : 0,
-                    isset($preview['tmdb']) ? 1 : 0,
-                    isset($preview['tmdb']) ? $preview['tmdb'] : 0,
-                    isset($preview['trakt']) ? 1 : 0,
-                    isset($preview['trakt']) ? $preview['trakt'] : 0,
-                    isset($preview['tvrage']) ? 1 : 0,
-                    isset($preview['tvrage']) ? $preview['tvrage'] : 0,
-                    isset($preview['imdb']) ? 1 : 0,
-                    $imdb,
-                    strlen($imdb),
-                    $outIds,
-                    $buf,
-                    $cap
-                );
-            }
-            if ($rc < 0) {
-                return self::normalizeLookupPreviewPayloadPhp($preview);
-            }
-
-            return [
-                'title' => $preview['title'] ?? null,
-                'summary' => $preview['summary'] ?? null,
-                'started' => $preview['started'] ?? null,
-                'publisher' => $preview['publisher'] ?? null,
-                'poster' => $preview['poster'] ?? null,
-                'ids' => [
-                    'tvdb' => (int) $outIds[0],
-                    'tvmaze' => (int) $outIds[1],
-                    'tmdb' => (int) $outIds[2],
-                    'trakt' => (int) $outIds[3],
-                    'imdb' => $rc > 0 ? FFI::string($buf, $rc) : '',
-                    'tvrage' => (int) $outIds[4],
-                ],
-            ];
-        } catch (Throwable) {
-            return self::normalizeLookupPreviewPayloadPhp($preview);
-        }
-    }
-
-    /**
-     * @return array{key: string, message: string}
-     */
-    public static function formatCreateFlash(bool $existed, ?string $title): array
-    {
-        if (self::$useRustFfi) {
-            return self::formatCreateFlashNative($existed, $title);
-        }
-
-        return self::formatCreateFlashPhp($existed, $title);
-    }
-
-    /**
-     * @return array{key: string, message: string}
-     */
-    public static function formatCreateFlashPhp(bool $existed, ?string $title): array
-    {
-        $titleStr = $title ?? '';
-
-        return [
-            'key' => $existed ? 'warning' : 'success',
-            'message' => $existed
-                ? sprintf('Show "%s" already exists — opened existing record.', $titleStr)
-                : sprintf('TV show "%s" added successfully.', $titleStr),
-        ];
-    }
-
-    /**
-     * @return array{key: string, message: string}
-     */
-    public static function formatCreateFlashNative(bool $existed, ?string $title): array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::formatCreateFlashPhp($existed, $title);
-        }
-
-        $titleStr = $title ?? '';
-
-        try {
-            $lens = $ffi->new('size_t[2]');
-            $cap = 0;
-            $buf = RustPipelineLibrary::obtainScratch($ffi, max(128, strlen($titleStr) + 96), $cap);
-            if ($buf === null) {
-                return self::formatCreateFlashPhp($existed, $title);
-            }
-
-            $rc = (int) self::callFfi(
-                $ffi,
-                'nntmux_admin_shows_format_create_flash',
-                $existed ? 1 : 0,
-                $titleStr,
-                strlen($titleStr),
-                $lens,
-                $buf,
-                $cap
-            );
-            if ($rc < -1) {
-                $buf = RustPipelineLibrary::obtainScratch($ffi, -$rc, $cap);
-                if ($buf === null) {
-                    return self::formatCreateFlashPhp($existed, $title);
-                }
-                $rc = (int) self::callFfi(
-                    $ffi,
-                    'nntmux_admin_shows_format_create_flash',
-                    $existed ? 1 : 0,
-                    $titleStr,
-                    strlen($titleStr),
-                    $lens,
-                    $buf,
-                    $cap
-                );
-            }
-            if ($rc < 0) {
-                return self::formatCreateFlashPhp($existed, $title);
-            }
-
-            $keyLen = (int) $lens[0];
-            $msgLen = (int) $lens[1];
-            if ($keyLen + $msgLen !== $rc) {
-                return self::formatCreateFlashPhp($existed, $title);
-            }
-
-            $packed = FFI::string($buf, $rc);
-
-            return [
-                'key' => substr($packed, 0, $keyLen),
-                'message' => substr($packed, $keyLen, $msgLen),
-            ];
-        } catch (Throwable) {
-            return self::formatCreateFlashPhp($existed, $title);
-        }
-    }
-
-    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
-    {
-        return $ffi->$symbol(...$args);
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === false) {
-            return null;
-        }
-
-        if (self::$ffi instanceof FFI) {
-            return self::$ffi;
-        }
-
-        $envLib = getenv('NNTMUX_PIPELINE_FFI_LIB');
-        $ffi = RustPipelineLibrary::resolveDomain(
-            'metadata',
-            self::FFI_CDEF,
-            is_string($envLib) && $envLib !== '' ? $envLib : null,
-        );
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
     }
 }

@@ -17,9 +17,7 @@ use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Support\Par2RenameProgress;
 use App\Support\PredbSearchDocument;
 use App\Support\ReleaseArchiveNamingEvidence;
-use App\Support\RustPipelineLibrary;
 use App\Traits\OwnsPredbIdentityTransactions;
-use FFI;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
@@ -35,61 +33,9 @@ use Throwable;
  */
 class ReleaseUpdateService
 {
-    private const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_name_fixing_query_pass(uint32_t mode, const char *input, size_t len, int64_t first, int64_t second, char *out, size_t cap);
-        C;
-
-    // Retained PHP: the paired caller benchmark must pass all four 1.5x gates.
-    private static bool $useRustFfi = false;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    /** Negative ABI results retain the exact PHP implementation. */
-    private static function queryPassNative(int $mode, ?string $input, int $first = 0, int $second = 0, int $needed = 4096): ?string
-    {
-        if ($input === null || strlen($input) > intdiv(PHP_INT_MAX - 4096, 8)) {
-            return null;
-        }
-        try {
-            $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
-            if ($ffi === null) {
-                return null;
-            }
-            $capacity = 0;
-            $buffer = RustPipelineLibrary::obtainScratch($ffi, max($needed, strlen($input) * 8 + 4096), $capacity);
-            if ($buffer === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_name_fixing_query_pass($mode, $input, strlen($input), $first, $second, $buffer, $capacity);
-
-            return is_int($written) && $written >= 0 && $written <= $capacity
-                ? ($written === 0 ? '' : FFI::string($buffer, $written)) : null;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** @param list<string> $fields */
-    private static function queryPassFields(array $fields): ?string
-    {
-        $input = '';
-        foreach ($fields as $field) {
-            if (strlen($field) > 0xFFFFFFFF) {
-                return null;
-            }
-            $input .= pack('V', strlen($field)).$field;
-        }
-
-        return $input;
-    }
-
     use OwnsPredbIdentityTransactions;
 
-    public const PREDB_IDENTITY_POLICY = '8a825706e8b83c748ff15ec520a8401384082346ca3b0e3bad795e0a66eeec56';
+    public const PREDB_IDENTITY_POLICY = 'c148f4ef88867221970c15c036a93e8ef5d9d48a8d20cf6c6bf27d11bc4f009e';
 
     /**
      * @var list<string>
@@ -423,64 +369,7 @@ class ReleaseUpdateService
     }
 
     /** @return array{id: int, guid: string, name: ?string, searchname: ?string}|null */
-    /** @return array{id: int, guid: string, name: ?string, searchname: ?string}|null */
     private function completedReleaseSnapshot(object $release, ?string $newTitle = null): ?array
-    {
-        if (self::$useRustFfi) {
-            $supported = false;
-            $snapshot = $this->completedReleaseSnapshotNative($release, $newTitle, $supported);
-            if ($supported) {
-                return $snapshot;
-            }
-        }
-
-        return $this->completedReleaseSnapshotPhp($release, $newTitle);
-    }
-
-    /** @param-out bool $supported
-     * @return array{id: int, guid: string, name: ?string, searchname: ?string}|null
-     */
-    private function completedReleaseSnapshotNative(object $release, ?string $newTitle = null, ?bool &$supported = null): ?array
-    {
-        $supported = false;
-        $attributes = $release instanceof Release ? $release->getAttributes() : get_object_vars($release);
-        $present = (int) isset($release->guid) | (array_key_exists('name', $attributes) ? 2 : 0)
-            | (array_key_exists('searchname', $attributes) ? 4 : 0);
-        // Read model accessors exactly as the original helper, only when the shape is valid.
-        $fields = ['', '', '', '', ''];
-        $flags = 0;
-        if ($present === 7) {
-            $id = (string) (int) ($release->releases_id ?? $release->id ?? 0);
-            $guid = (string) $release->guid;
-            $nameNull = $release->name === null;
-            $name = $nameNull ? '' : (string) $release->name;
-            $searchNull = $newTitle === null && $release->searchname === null;
-            $search = $newTitle ?? ($searchNull ? '' : (string) $release->searchname);
-            $fields = [$id, $guid, $name, $search, $newTitle ?? ''];
-            $flags = ($nameNull ? 1 : 0) | ($searchNull ? 2 : 0) | ($newTitle !== null ? 4 : 0);
-        }
-        $raw = self::queryPassNative(8, self::queryPassFields($fields), $present, $flags);
-        if ($raw === null) {
-            return null;
-        }
-        $supported = true;
-        if ($raw === '') {
-            return null;
-        }
-        $fields = self::queryPassDecode($raw);
-        if ($fields === null || count($fields) !== 6) {
-            $supported = false;
-
-            return null;
-        }
-
-        return ['id' => (int) $fields[0], 'guid' => $fields[1],
-            'name' => $fields[2] === '1' ? null : $fields[3],
-            'searchname' => $fields[4] === '1' ? null : $fields[5]];
-    }
-
-    /** @return array{id: int, guid: string, name: ?string, searchname: ?string}|null */
-    private function completedReleaseSnapshotPhp(object $release, ?string $newTitle = null): ?array
     {
         $attributes = $release instanceof Release ? $release->getAttributes() : get_object_vars($release);
         if (! isset($release->guid) || ! array_key_exists('name', $attributes)
@@ -732,18 +621,6 @@ class ReleaseUpdateService
      */
     protected function isTrustedSource(string $type, string $method, int $preId): bool
     {
-        return (self::$useRustFfi ? $this->isTrustedSourceNative($type, $method, $preId) : null) ?? $this->isTrustedSourcePhp($type, $method, $preId);
-    }
-
-    private function isTrustedSourceNative(string $type, string $method, int $preId): ?bool
-    {
-        $raw = self::queryPassNative(5, self::queryPassFields([$type, $method]), $preId);
-
-        return $raw === null ? null : $raw === '1';
-    }
-
-    protected function isTrustedSourcePhp(string $type, string $method, int $preId): bool
-    {
         return
             (! empty($preId) && $preId > 0) ||
             str_starts_with($type, 'PreDB') ||
@@ -932,22 +809,7 @@ class ReleaseUpdateService
      *
      * @return array<string, mixed>
      */
-    /** @return array<string, mixed> */
     protected function getStatusColumnsForType(string $type): array
-    {
-        return (self::$useRustFfi ? $this->getStatusColumnsForTypeNative($type) : null) ?? $this->getStatusColumnsForTypePhp($type);
-    }
-
-    /** @return array<string, int>|null */
-    private function getStatusColumnsForTypeNative(string $type): ?array
-    {
-        $raw = self::queryPassNative(6, $type);
-
-        return $raw === null ? null : ($raw === '' ? [] : array_fill_keys(explode("\0", $raw), 1));
-    }
-
-    /** @return array<string, mixed> */
-    protected function getStatusColumnsForTypePhp(string $type): array
     {
         return match ($type) {
             'NFO, ' => ['isrenamed' => 1, 'iscategorized' => 1, 'proc_nfo' => 1],
@@ -1259,21 +1121,9 @@ class ReleaseUpdateService
      */
     private function renamesSeasonPackToEpisode(string $currentName, string $newName): bool
     {
-        return (self::$useRustFfi ? $this->renamesSeasonPackToEpisodeNative($currentName, $newName) : null) ?? $this->renamesSeasonPackToEpisodePhp($currentName, $newName);
-    }
-
-    private function renamesSeasonPackToEpisodeNative(string $currentName, string $newName): ?bool
-    {
-        $raw = self::queryPassNative(7, self::queryPassFields([$currentName, $newName]));
-
-        return $raw === null ? null : $raw === '1';
-    }
-
-    private function renamesSeasonPackToEpisodePhp(string $currentName, string $newName): bool
-    {
-        return SeasonPackDetector::isSeasonPackPhp($currentName)
-            && SeasonPackDetector::isEpisodeNamePhp($newName)
-            && ! SeasonPackDetector::isSeasonPackPhp($newName);
+        return SeasonPackDetector::isSeasonPack($currentName)
+            && SeasonPackDetector::isEpisodeName($newName)
+            && ! SeasonPackDetector::isSeasonPack($newName);
     }
 
     private function allowsArchiveNamingLocked(object $release, string $title, ?string $filenameEvidence = null): bool
@@ -1336,27 +1186,5 @@ class ReleaseUpdateService
             'matched' => $this->matched,
             'done' => $this->done,
         ];
-    }
-
-    /** @return list<string>|null */
-    private static function queryPassDecode(string $raw): ?array
-    {
-        $fields = [];
-        $offset = 0;
-        $length = strlen($raw);
-        while ($offset < $length) {
-            if ($length - $offset < 4) {
-                return null;
-            }
-            $size = unpack('Vsize', substr($raw, $offset, 4))['size'];
-            $offset += 4;
-            if ($size > $length - $offset) {
-                return null;
-            }
-            $fields[] = substr($raw, $offset, $size);
-            $offset += $size;
-        }
-
-        return $fields;
     }
 }

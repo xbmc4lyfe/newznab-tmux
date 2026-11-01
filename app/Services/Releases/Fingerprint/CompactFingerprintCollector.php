@@ -10,10 +10,6 @@ use App\Services\NNTP\NntpProviderUnavailableException;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
-use App\Services\Nzb\Par2CandidateRecoveryResult;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Throwable;
 
 /**
@@ -21,19 +17,6 @@ use Throwable;
  *
  * This is the reference implementation of the compact-v1 contract shared with the Rust workers, so
  * the output must stay deterministic apart from the documented timing and timestamp fields.
- *
- * Production NZB XML analysis and compact-v1 summarization (`analyzeNzbForCompact`) executes in a
- * single Rust FFI pass (`nntmux_compact_fp_analyze_nzb_xml` in `rust/pipeline-ffi/src/metadata.rs`),
- * computing `samples`, `omitted`, `segment_counts`, `manifest_invalid_files`, `nzbSummary`,
- * `fileRows`, `posting`, `group_count`, `file_count`, and `nzb_names` directly from the raw NZB XML
- * without materializing per-segment PHP arrays (2.74x-3.25x mean and 2.45x-3.69x p99 speedup over
- * `NzbFingerprintAnalyzer::analyzeManifest` + PHP array loops, and 8.09x-9.09x mean / 7.26x-9.64x p99
- * over pure PHP). NNTP/yEnc article decoding (`NzbFingerprintAnalyzer::analyzeArticleAndDecodedBytes`)
- * and PAR2 binary packet parsing (`Par2MetadataParser::parse`) also execute in Rust FFI. Per-article
- * post-analysis PHP array/string helpers (`yencIntegrityErrors`/`yencSummary`, `verifiedPartPrefixMd5`,
- * and `subjectFilename`/`bounded`) retain the native PHP path for the <= 12 sampled articles under the
- * < 1.5x FFI threshold rule when operating on pre-parsed PHP arrays; their output-identical Rust FFI
- * counterparts remain exposed via `*Native` methods for parity testing.
  */
 final class CompactFingerprintCollector
 {
@@ -60,42 +43,12 @@ final class CompactFingerprintCollector
     /** Serialized record budget; file lists are shortened until the record fits. */
     public const MAX_RECORD_BYTES = 20_480;
 
-    private const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_compact_fp_subject_filename_bounded(const char *input, size_t input_len, uint32_t mode, char *out_buf, size_t out_cap);
-        ssize_t nntmux_compact_fp_verified_part_prefix_md5(const char *decoded, size_t decoded_len, int64_t file_size, int64_t begin, char *out_buf, size_t out_cap);
-        ssize_t nntmux_compact_fp_select_samples(const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_compact_fp_summarize_files(const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_compact_fp_yenc_integrity(const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_compact_fp_analyze_nzb_xml(const char *xml, size_t xml_len, char *out_buf, size_t out_cap);
-        C;
-
-    private static bool $useRustFfi = true;
-
-    private static FFI|false|null $cachedFfi = null;
-
     private readonly FingerprintProviderBreaker $breaker;
 
     public function __construct(private readonly NzbService $nzb, private readonly NzbFingerprintAnalyzer $analyzer,
         private readonly Par2MetadataParser $par2, ?FingerprintProviderBreaker $breaker = null)
     {
         $this->breaker = $breaker ?? new FingerprintProviderBreaker;
-    }
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        if (self::$cachedFfi === null) {
-            self::$cachedFfi = RustPipelineLibrary::resolveDomain('compact_fingerprint', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$cachedFfi === false ? null : self::$cachedFfi;
     }
 
     /**
@@ -117,12 +70,10 @@ final class CompactFingerprintCollector
     /** @return array{status: string, data: array<string, mixed>} */
     public function collectFromNzb(string $xml, int $releaseId): array
     {
-        $compactNzb = $this->analyzeNzbForCompact($xml);
-        $samples = $compactNzb['samples'];
-        $omitted = $compactNzb['omitted'];
-        $segmentCounts = $compactNzb['segment_counts'];
-        $manifestInvalidFiles = $compactNzb['manifest_invalid_files'];
-        $nzbNames = $compactNzb['nzb_names'];
+        $manifest = $this->analyzer->analyzeManifest($xml);
+        $files = $manifest['files'];
+        $omitted = 0;
+        $samples = self::selectSamples($files, $omitted);
         $servers = $this->servers($releaseId);
         $nntp = app(NNTPService::class);
 
@@ -179,6 +130,11 @@ final class CompactFingerprintCollector
             }
         }
 
+        $segmentCounts = [];
+        foreach ($files as $file) {
+            $segmentCounts[(int) $file['index']] = is_array($file['segments'] ?? null) ? count($file['segments']) : 0;
+        }
+        $manifestInvalidFiles = self::manifestInvalidFileCount($manifest);
         if ($manifestInvalidFiles > 0) {
             $errors['nzb']['NzbManifestInvalid'] = $manifestInvalidFiles;
         }
@@ -253,7 +209,7 @@ final class CompactFingerprintCollector
                     // Every verified provider copy may supply PAR2 metadata until a usable summary is found.
                     if ($par2 === null && $sample['kind'] === 'par2' && $integrityErrors === []
                         && is_string($analysis['decoded_bytes'] ?? null)) {
-                        $summary = $this->par2Summary($analysis['decoded_bytes'], [], $nzbNames);
+                        $summary = $this->par2Summary($analysis['decoded_bytes'], $files);
                         // Only a summary with file descriptions ends the search; a set ID alone (e.g. a
                         // Creator-only volume) is kept as a fallback while later volumes are examined.
                         if ($summary !== null && $summary['files'] !== []) {
@@ -306,14 +262,6 @@ final class CompactFingerprintCollector
         $softwareCandidates = array_keys($softwareCandidates);
         sort($softwareCandidates);
 
-        $fileRows = $compactNzb['files'];
-        if ($firstPrefixMd5 !== []) {
-            foreach ($fileRows as &$fileRow) {
-                $fileRow['first16k_md5'] = $firstPrefixMd5[$fileRow['file_index']] ?? null;
-            }
-            unset($fileRow);
-        }
-
         $primary = $providerRows[0] ?? null;
         $status = $primary !== null && $samples !== []
             && $primary['articles']['found'] === count($samples)
@@ -323,69 +271,20 @@ final class CompactFingerprintCollector
             'schema_version' => self::SCHEMA_VERSION,
             'format' => self::FORMAT,
             'collector' => ['engine' => 'php', 'version' => self::SCHEMA_VERSION],
-            'nzb' => $compactNzb['nzb'],
+            'nzb' => self::nzbSummary($manifest),
             'samples' => ['limit' => self::SAMPLE_LIMIT, 'selected' => count($samples), 'omitted' => $omitted],
             'providers' => $providerRows,
             'articles' => $articles,
-            'files' => $fileRows,
+            'files' => self::fileRows($files, $firstPrefixMd5),
             'par2' => $par2 ?? $par2Fallback,
-            'posting' => $compactNzb['posting'],
+            'posting' => self::posting($files),
             'uploader_software_candidates' => $softwareCandidates,
             'errors' => $errorRows,
             // Also true when a list cap below omitted entries before the byte budget applied.
-            'truncated' => $compactNzb['file_count'] > self::MAX_LISTED_FILES
+            'truncated' => count($files) > self::MAX_LISTED_FILES
                 || (($par2 ?? $par2Fallback) !== null && ($par2 ?? $par2Fallback)['file_count'] > count(($par2 ?? $par2Fallback)['files']))
-                || $compactNzb['group_count'] > self::MAX_LISTED_GROUPS,
+                || count(self::nzbGroups($files)) > self::MAX_LISTED_GROUPS,
         ])];
-    }
-
-    /**
-     * Single-pass NZB XML analysis and compact-v1 summarization. Uses `nntmux_compact_fp_analyze_nzb_xml`
-     * when Rust FFI is enabled, avoiding materializing per-segment PHP arrays for the entire NZB.
-     *
-     * @return array{
-     *     samples: list<array{file_index: int, kind: string, segment_number: int, messageid: string, role: string}>,
-     *     omitted: int,
-     *     segment_counts: array<int, int>,
-     *     manifest_invalid_files: int,
-     *     nzb: array<string, mixed>,
-     *     files: list<array<string, mixed>>,
-     *     posting: array{first_utc: string, last_utc: string, span_s: int}|null,
-     *     group_count: int,
-     *     file_count: int,
-     *     nzb_names: array<string, true>
-     * }
-     */
-    public function analyzeNzbForCompact(string $xml): array
-    {
-        $native = self::analyzeNzbForCompactNative($xml);
-        if ($native !== null) {
-            return $native;
-        }
-
-        $manifest = $this->analyzer->analyzeManifest($xml);
-        $files = $manifest['files'];
-        $omitted = 0;
-        $samples = self::selectSamples($files, $omitted);
-        $segmentCounts = [];
-        $nzbNames = [];
-        foreach ($files as $file) {
-            $segmentCounts[(int) $file['index']] = is_array($file['segments'] ?? null) ? count($file['segments']) : 0;
-            $nzbNames[self::subjectFilename((string) ($file['subject'] ?? ''))] = true;
-        }
-
-        return [
-            'samples' => $samples,
-            'omitted' => $omitted,
-            'segment_counts' => $segmentCounts,
-            'manifest_invalid_files' => self::manifestInvalidFileCount($manifest),
-            'nzb' => self::nzbSummary($manifest),
-            'files' => self::fileRows($files, []),
-            'posting' => self::posting($files),
-            'group_count' => count(self::nzbGroups($files)),
-            'file_count' => count($files),
-            'nzb_names' => $nzbNames,
-        ];
     }
 
     /**
@@ -558,21 +457,18 @@ final class CompactFingerprintCollector
 
     /**
      * @param  list<array<string, mixed>>  $files
-     * @param  array<string, true>|null  $nzbNames
      * @return array<string, mixed>|null
      */
-    private function par2Summary(string $decoded, array $files, ?array $nzbNames = null): ?array
+    private function par2Summary(string $decoded, array $files): ?array
     {
         try {
             $parsed = $this->par2->parse($decoded);
         } catch (Throwable) {
             return null;
         }
-        if ($nzbNames === null) {
-            $nzbNames = [];
-            foreach ($files as $file) {
-                $nzbNames[self::subjectFilename((string) ($file['subject'] ?? ''))] = true;
-            }
+        $nzbNames = [];
+        foreach ($files as $file) {
+            $nzbNames[self::subjectFilename((string) ($file['subject'] ?? ''))] = true;
         }
         $sources = [];
         $matches = 0;
@@ -1003,675 +899,5 @@ final class CompactFingerprintCollector
     private static function isMissingArticle(Throwable $exception): bool
     {
         return $exception instanceof NntpArticleMissingException;
-    }
-
-    /**
-     * @param  list<array<string, mixed>>  $files
-     *
-     * @param-out int $omitted
-     *
-     * @return list<array{file_index: int, kind: string, segment_number: int, messageid: string, role: string}>|null
-     */
-    public static function selectSamplesNative(array $files, ?int &$omitted = null): ?array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $omitted = 0;
-        if ($files === []) {
-            return [];
-        }
-        $payload = serialize($files);
-        $payloadLen = strlen($payload);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(4096, $payloadLen), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_compact_fp_select_samples($payload, $payloadLen, $scratch, $cap);
-        if (! is_int($written) || $written === -1) {
-            return null;
-        }
-        if ($written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_compact_fp_select_samples($payload, $payloadLen, $scratch, $cap);
-            if (! is_int($written) || $written <= 0) {
-                return null;
-            }
-        }
-        if ($written <= 0) {
-            return null;
-        }
-        $decoded = unserialize(FFI::string($scratch, $written), ['allowed_classes' => false]);
-        if (! is_array($decoded) || count($decoded) !== 2 || ! is_array($decoded[0]) || ! is_int($decoded[1])) {
-            return null;
-        }
-        $omitted = $decoded[1];
-
-        /** @var list<array{file_index: int, kind: string, segment_number: int, messageid: string, role: string}> */
-        return $decoded[0];
-    }
-
-    /**
-     * @param  array<string, mixed>  $manifest
-     * @param  array<int, string>  $firstPrefixMd5
-     * @return array{nzb: array<string, mixed>, files: list<array<string, mixed>>, posting: array{first_utc: string, last_utc: string, span_s: int}|null, invalid_file_count: int, group_count: int}|null
-     */
-    public static function summarizeFilesNative(array $manifest, array $firstPrefixMd5 = []): ?array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $payload = serialize([$manifest, $firstPrefixMd5]);
-        $payloadLen = strlen($payload);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(8192, $payloadLen), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_compact_fp_summarize_files($payload, $payloadLen, $scratch, $cap);
-        if (! is_int($written) || $written === -1) {
-            return null;
-        }
-        if ($written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_compact_fp_summarize_files($payload, $payloadLen, $scratch, $cap);
-            if (! is_int($written) || $written <= 0) {
-                return null;
-            }
-        }
-        if ($written <= 0) {
-            return null;
-        }
-        $decoded = unserialize(FFI::string($scratch, $written), ['allowed_classes' => false]);
-        if (! is_array($decoded)) {
-            return null;
-        }
-
-        /** @var array{nzb: array<string, mixed>, files: list<array<string, mixed>>, posting: array{first_utc: string, last_utc: string, span_s: int}|null, invalid_file_count: int, group_count: int} */
-        return $decoded;
-    }
-
-    /**
-     * @return array{errors: list<string>, summary: array<string, mixed>|null, part_without_trailer_part: bool, declared_crcs_contradict: bool, empty_single_part: bool, sizes_agree: bool|null}|null
-     */
-    public static function yencIntegrityNative(mixed $yenc): ?array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        if (is_object($yenc)) {
-            return null;
-        }
-        $payload = serialize($yenc);
-        $payloadLen = strlen($payload);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(2048, $payloadLen * 2), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_compact_fp_yenc_integrity($payload, $payloadLen, $scratch, $cap);
-        if (! is_int($written) || $written === -1) {
-            return null;
-        }
-        if ($written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_compact_fp_yenc_integrity($payload, $payloadLen, $scratch, $cap);
-            if (! is_int($written) || $written <= 0) {
-                return null;
-            }
-        }
-        if ($written <= 0) {
-            return null;
-        }
-        $decoded = unserialize(FFI::string($scratch, $written), ['allowed_classes' => false]);
-        if (! is_array($decoded)) {
-            return null;
-        }
-
-        /** @var array{errors: list<string>, summary: array<string, mixed>|null, part_without_trailer_part: bool, declared_crcs_contradict: bool, empty_single_part: bool, sizes_agree: bool|null} */
-        return $decoded;
-    }
-
-    /**
-     * @param  array<string, mixed>  $yenc
-     *
-     * @param-out bool $supported
-     */
-    public static function verifiedPartPrefixMd5Native(array $yenc, mixed $decoded, bool &$supported = false): ?string
-    {
-        $supported = false;
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $fileSize = $yenc['file_size'] ?? null;
-        $begin = $yenc['begin'] ?? null;
-        if (! is_string($decoded) || ! is_int($fileSize) || ! is_int($begin)) {
-            $supported = true;
-
-            return null;
-        }
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_compact_fp_verified_part_prefix_md5($decoded, strlen($decoded), $fileSize, $begin, $scratch, $cap);
-        if (! is_int($written) || $written < 0) {
-            return null;
-        }
-        $supported = true;
-
-        return $written === 32 ? FFI::string($scratch, 32) : null;
-    }
-
-    public static function subjectFilenameNative(string $subject): ?string
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $len = strlen($subject);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 16), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_compact_fp_subject_filename_bounded($subject, $len, 0, $scratch, $cap);
-        if (! is_int($written) || $written < 0) {
-            return null;
-        }
-
-        return $written === 0 ? '' : FFI::string($scratch, $written);
-    }
-
-    /**
-     * @param-out bool $supported
-     */
-    public static function boundedNative(mixed $value, bool &$supported = false): ?string
-    {
-        $supported = false;
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        if (! is_string($value) && ! is_int($value)) {
-            $supported = true;
-
-            return null;
-        }
-        $str = (string) $value;
-        $len = strlen($str);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_compact_fp_subject_filename_bounded($str, $len, 1, $scratch, $cap);
-        if (! is_int($written) || $written < 0) {
-            return null;
-        }
-        $supported = true;
-
-        return $written === 0 ? '' : FFI::string($scratch, $written);
-    }
-
-    public static function subjectFilenameBoundedNative(string $subject): ?string
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $len = strlen($subject);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_compact_fp_subject_filename_bounded($subject, $len, 2, $scratch, $cap);
-        if (! is_int($written) || $written < 0) {
-            return null;
-        }
-
-        return $written === 0 ? '' : FFI::string($scratch, $written);
-    }
-
-    /**
-     * @param  list<string>  $subjects
-     * @return list<string>|null
-     */
-    public static function subjectFilenameBoundedBatchNative(array $subjects): ?array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $count = count($subjects);
-        if ($count === 0) {
-            return [];
-        }
-        $packed = implode("\0", $subjects);
-        if (substr_count($packed, "\0") !== $count - 1) {
-            return null;
-        }
-        $len = strlen($packed);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $count * (self::MAX_NAME_LENGTH + 1) + 64), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_compact_fp_subject_filename_bounded($packed, $len, 3, $scratch, $cap);
-        if (! is_int($written) || $written === -1) {
-            return null;
-        }
-        if ($written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_compact_fp_subject_filename_bounded($packed, $len, 3, $scratch, $cap);
-            if (! is_int($written) || $written < 0) {
-                return null;
-            }
-        }
-        if ($written === 0) {
-            return array_fill(0, $count, '');
-        }
-        $parts = explode("\0", FFI::string($scratch, $written));
-
-        return count($parts) === $count ? $parts : null;
-    }
-
-    /**
-     * @return array{
-     *     samples: list<array{file_index: int, kind: string, segment_number: int, messageid: string, role: string}>,
-     *     omitted: int,
-     *     segment_counts: array<int, int>,
-     *     manifest_invalid_files: int,
-     *     nzb: array<string, mixed>,
-     *     files: list<array<string, mixed>>,
-     *     posting: array{first_utc: string, last_utc: string, span_s: int}|null,
-     *     group_count: int,
-     *     file_count: int,
-     *     nzb_names: array<string, true>
-     * }|null
-     */
-    public static function analyzeNzbForCompactNative(string $xml): ?array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $xmlLen = strlen($xml);
-        if ($xmlLen === 0 || $xmlLen > 33_554_432) {
-            return null;
-        }
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(65_536, min($xmlLen, 131_072)), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_compact_fp_analyze_nzb_xml($xml, $xmlLen, $scratch, $cap);
-        if (! is_int($written) || $written === -1) {
-            return null;
-        }
-        if ($written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_compact_fp_analyze_nzb_xml($xml, $xmlLen, $scratch, $cap);
-            if (! is_int($written) || $written <= 0) {
-                return null;
-            }
-        }
-        if ($written <= 0) {
-            return null;
-        }
-        $decoded = unserialize(FFI::string($scratch, $written), ['allowed_classes' => false]);
-        if (! is_array($decoded)) {
-            return null;
-        }
-
-        /** @var array{samples: list<array{file_index: int, kind: string, segment_number: int, messageid: string, role: string}>, omitted: int, segment_counts: array<int, int>, manifest_invalid_files: int, nzb: array<string, mixed>, files: list<array<string, mixed>>, posting: array{first_utc: string, last_utc: string, span_s: int}|null, group_count: int, file_count: int, nzb_names: array<string, true>} */
-        return $decoded;
-    }
-
-    /**
-     * Default for the Wave 43.2 toggle only; it stays false because the paired benchmark in
-     * tests/Unit/RustNzbPar2ResultFingerprintStoreWorkerQueueW43ParityTest.php is below 1.5x.
-     */
-    public const bool W432_RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useW432RustFfi = null;
-
-    /** Force the Wave 43.2 helper onto Rust (true) or PHP (false); null restores W432_RUST_FFI_DEFAULT. */
-    public static function useW432RustFfi(?bool $enable = true): void
-    {
-        self::$useW432RustFfi = $enable;
-    }
-
-    public static function usesW432RustFfi(): bool
-    {
-        return self::$useW432RustFfi ?? self::W432_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW432RustFfi(): void
-    {
-        self::$useW432RustFfi = null;
-    }
-
-    /**
-     * Judge fetched copies with identityStatus(): each row is an array with a string `requested` Message-ID and the
-     * fetched `header` Message-ID and ARTICLE `response_text` (missing keys are null); other rows are invalid. A mismatch
-     * is counted against the header when the trimmed header differs, otherwise against the status line.
-     *
-     * @param  array<array-key, mixed>  $rows
-     * @return array{rows: int, invalid: int, confirmed: int, unconfirmed: int, header_mismatch: int, status_mismatch: int}
-     */
-    public static function summarizeIdentityStatuses(array $rows): array
-    {
-        return (self::usesW432RustFfi() ? self::summarizeIdentityStatusesNative($rows) : null)
-            ?? self::summarizeIdentityStatusesPhp($rows);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rows
-     * @return array{rows: int, invalid: int, confirmed: int, unconfirmed: int, header_mismatch: int, status_mismatch: int}
-     */
-    public static function summarizeIdentityStatusesPhp(array $rows): array
-    {
-        $summary = ['rows' => \count($rows), 'invalid' => 0, 'confirmed' => 0, 'unconfirmed' => 0, 'header_mismatch' => 0, 'status_mismatch' => 0];
-        foreach ($rows as $row) {
-            if (! \is_array($row) || ! \is_string($row['requested'] ?? null)) {
-                $summary['invalid']++;
-
-                continue;
-            }
-            $header = $row['header'] ?? null;
-            $status = self::identityStatus($row['requested'], $header, ['article_response' => ['response_text' => $row['response_text'] ?? null]]);
-            $key = match ($status) {
-                null => 'confirmed',
-                'ArticleIdentityUnconfirmed' => 'unconfirmed',
-                default => \is_string($header) && trim($header) === '<'.trim($row['requested'], '<>').'>' ? 'status_mismatch' : 'header_mismatch',
-            };
-            $summary[$key]++;
-        }
-
-        return $summary;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rows
-     * @return array{rows: int, invalid: int, confirmed: int, unconfirmed: int, header_mismatch: int, status_mismatch: int}|null
-     */
-    public static function summarizeIdentityStatusesNative(array $rows): ?array
-    {
-        $slots = [];
-        $tail = [];
-        foreach ($rows as $row) {
-            if (! \is_array($row) || ! \is_string($row['requested'] ?? null)) {
-                array_push($slots, -1, -1, -1);
-
-                continue;
-            }
-            foreach ([$row['requested'], $row['header'] ?? null, $row['response_text'] ?? null] as $text) {
-                if (\is_string($text)) {
-                    $slots[] = \strlen($text);
-                    $tail[] = $text;
-                } else {
-                    $slots[] = -1;
-                }
-            }
-        }
-        $values = Par2CandidateRecoveryResult::evaluateW432Native(3, \count($rows), $slots, implode('', $tail), 6);
-        if ($values === null) {
-            return null;
-        }
-        [$count, $invalid, $confirmed, $unconfirmed, $headerMismatch, $statusMismatch] = $values;
-        if ($count !== \count($rows) || min($values) < 0 || $invalid + $confirmed + $unconfirmed + $headerMismatch + $statusMismatch !== $count) {
-            return null;
-        }
-
-        return ['rows' => $count, 'invalid' => $invalid, 'confirmed' => $confirmed, 'unconfirmed' => $unconfirmed,
-            'header_mismatch' => $headerMismatch, 'status_mismatch' => $statusMismatch];
-    }
-
-    // ---------------------------------------------------------------------
-    // Wave 56.4 batch helper
-    // ---------------------------------------------------------------------
-
-    /** Disabled: three paired runs missed the 1.5x gates (min common mean 1.35x, p99 1.27x; uncommon mean 1.25x, p99 1.17x); see RustTmdbTvMazeTvdbPar2AccumulatorCompactFpW56ParityTest. */
-    public const bool W56_RUST_FFI_DEFAULT = false;
-
-    public const string W56_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w564_compact_fingerprint_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * Compact fingerprint rows: each value normalizes to a 16-byte fingerprint when it is raw
-     * binary (exactly 16 bytes, kind 1), or after trim() 32 hex digits (kind 2) or 0x/0X plus
-     * 32 hex digits (kind 3); anything else is invalid (kind 0). Each value yields four words:
-     * the kind, the fingerprint's high and low 64 bits (unpack('J2'), 0 when invalid) and the
-     * first row holding the same fingerprint, itself when first (-1 when invalid).
-     *
-     * @param  list<string>  $fingerprints
-     * @return list<int>
-     */
-    public static function fingerprintRowBatch(array $fingerprints): array
-    {
-        return self::usesW56RustFfi() ? self::fingerprintRowBatchNative($fingerprints) : self::fingerprintRowBatchPhp($fingerprints);
-    }
-
-    /**
-     * @param  list<string>  $fingerprints
-     * @return list<int>
-     */
-    public static function fingerprintRowBatchNative(array $fingerprints): array
-    {
-        self::w56FpColumns($fingerprints);
-        $count = \count($fingerprints);
-        if ($count === 0) {
-            return [];
-        }
-
-        return self::w56FpCall(implode('', $fingerprints), pack('P*', ...array_map(\strlen(...), $fingerprints)), $count, 4)
-            ?? self::fingerprintRowBatchPhp($fingerprints);
-    }
-
-    /**
-     * @param  list<string>  $fingerprints
-     * @return list<int>
-     */
-    public static function fingerprintRowBatchPhp(array $fingerprints): array
-    {
-        self::w56FpColumns($fingerprints);
-        $out = [];
-        $seen = [];
-        foreach ($fingerprints as $i => $value) {
-            $binary = null;
-            $kind = 0;
-            if (\strlen($value) === 16) {
-                [$kind, $binary] = [1, $value];
-            } else {
-                $hex = trim($value);
-                $length = \strlen($hex);
-                if ($length === 34 && $hex[0] === '0' && ($hex[1] === 'x' || $hex[1] === 'X')) {
-                    [$kind, $hex] = [3, substr($hex, 2)];
-                } elseif ($length === 32) {
-                    $kind = 2;
-                }
-                if ($kind !== 0 && ctype_xdigit($hex)) {
-                    $binary = (string) hex2bin($hex);
-                }
-            }
-            if ($binary === null) {
-                array_push($out, 0, 0, 0, -1);
-
-                continue;
-            }
-            /** @var array{1: int, 2: int} $words */
-            $words = unpack('J2', $binary);
-            array_push($out, $kind, $words[1], $words[2], $seen[$binary] ??= $i);
-        }
-
-        return $out;
-    }
-
-    /**
-     * Batch SQL parameters for fingerprint lookups: one `?` placeholder and 16-byte binary
-     * binding per distinct valid fingerprint in first-seen order, plus the invalid count.
-     *
-     * @param  list<string>  $fingerprints
-     * @return array{placeholders: string, bindings: list<string>, invalid: int}
-     */
-    public static function fingerprintSqlParameters(array $fingerprints): array
-    {
-        $rows = self::fingerprintRowBatch($fingerprints);
-        $bindings = [];
-        $invalid = 0;
-        foreach (array_keys($fingerprints) as $i) {
-            $base = $i * 4;
-            if ($rows[$base] === 0) {
-                $invalid++;
-            } elseif ($rows[$base + 3] === $i) {
-                $bindings[] = pack('J2', $rows[$base + 1], $rows[$base + 2]);
-            }
-        }
-
-        return ['placeholders' => implode(',', array_fill(0, \count($bindings), '?')), 'bindings' => $bindings, 'invalid' => $invalid];
-    }
-
-    public static function usesW56RustFfi(): bool
-    {
-        $enabled = self::w56RustFfiState('enabled');
-
-        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Run $callback with the W56 dispatch forced on or off, then restore the previous choice.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w56RustFfiState('enabled');
-        self::w56RustFfiState('enabled', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w56RustFfiState('enabled', $previous);
-        }
-    }
-
-    /**
-     * Equal-length list columns, or InvalidArgumentException.
-     *
-     * @param  array<array-key, mixed>  ...$columns
-     */
-    private static function w56FpColumns(array ...$columns): void
-    {
-        $count = \count($columns[0]);
-        foreach ($columns as $column) {
-            if (! array_is_list($column) || \count($column) !== $count) {
-                throw new \InvalidArgumentException('W56 batch columns must be lists of equal length.');
-            }
-        }
-    }
-
-    /**
-     * One FFI crossing for the batch: `$words` int64 words back per record. Null when the
-     * library is missing or declines a malformed frame, so the caller falls back to PHP.
-     *
-     * @return list<int>|null
-     */
-    private static function w56FpCall(string $text, string $ints, int $count, int $words): ?array
-    {
-        try {
-            /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
-            $state = self::w56RustFfiState();
-            $ffi = $state['ffi'];
-            if ($ffi === null) {
-                $ffi = RustPipelineLibrary::resolveDomain('metadata_w56', self::W56_FFI_CDEF) ?? false;
-                self::w56RustFfiState('ffi', $ffi);
-            }
-            if (! $ffi instanceof FFI) {
-                return null;
-            }
-            $need = $count * $words;
-            $out = $state['out'];
-            $cap = $state['cap'];
-            if (! $out instanceof CData || $cap < $need) {
-                $cap = max(1024, $need);
-                $out = $ffi->new('int64_t['.$cap.']');
-                self::w56RustFfiState('out', $out);
-                self::w56RustFfiState('cap', $cap);
-            }
-            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
-            $written = $ffi->nntmux_w564_compact_fingerprint_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
-            if ($written !== $need) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($out, $need * 8));
-
-            return $values === false ? null : array_values($values);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * W56 routing override and cached binding plus reusable output buffer, kept in a function
-     * static: no arguments returns the state, one argument reads a key ('reset' clears
-     * everything) and two arguments write a key.
-     */
-    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
-        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-        if ($op === null) {
-            return $state;
-        }
-        if ($op === 'reset') {
-            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-
-            return null;
-        }
-        if (\func_num_args() > 1) {
-            $state[$op] = $val;
-        }
-
-        return $state[$op] ?? null;
     }
 }

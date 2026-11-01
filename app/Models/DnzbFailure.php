@@ -5,11 +5,8 @@ declare(strict_types=1);
 namespace App\Models;
 
 use App\Models\Concerns\HasCompositePrimaryKey;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
-use Throwable;
 
 /**
  * App\Models\DnzbFailure.
@@ -33,90 +30,6 @@ use Throwable;
 class DnzbFailure extends Model
 {
     use HasCompositePrimaryKey;
-
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_wave21_dnzb_failed_count(uint32_t mode, const char *input, size_t len);
-        C;
-
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function enableRustFfi(): void
-    {
-        self::$useRustFfi = true;
-    }
-
-    public static function disableRustFfi(): void
-    {
-        self::$useRustFfi = false;
-    }
-
-    public static function resetRustFfi(): void
-    {
-        self::$useRustFfi = false;
-        self::$ffi = null;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi && self::ffi() !== null;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        try {
-            self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
-
-            return self::$ffi === false ? null : self::$ffi;
-        } catch (Throwable) {
-            self::$ffi = false;
-
-            return null;
-        }
-    }
-
-    public static function failedCountValue(mixed $value): mixed
-    {
-        $native = self::$useRustFfi ? self::failedCountValueNative($value) : null;
-
-        return $native !== null ? $native['value'] : self::failedCountValuePhp($value);
-    }
-
-    public static function failedCountValuePhp(mixed $value): mixed
-    {
-        return ! empty($value) ? $value : false;
-    }
-
-    /**
-     * @return array{value: mixed}|null
-     */
-    public static function failedCountValueNative(mixed $value): ?array
-    {
-        if (! is_int($value) && ! is_string($value)) {
-            return null;
-        }
-
-        try {
-            $ffi = self::ffi();
-            if ($ffi === null) {
-                return null;
-            }
-
-            $mode = is_int($value) ? 0 : 1;
-            $input = (string) $value;
-            // @phpstan-ignore method.notFound
-            $result = $ffi->nntmux_wave21_dnzb_failed_count($mode, $input, strlen($input));
-
-            return match ($result) {
-                0 => ['value' => false],
-                1 => ['value' => $value],
-                default => null,
-            };
-        } catch (Throwable) {
-            return null;
-        }
-    }
 
     /**
      * @var string
@@ -171,8 +84,11 @@ class DnzbFailure extends Model
     public static function getFailedCount(mixed $relId)
     {
         $result = self::query()->where('release_id', $relId)->value('failed');
+        if (! empty($result)) {
+            return $result;
+        }
 
-        return self::failedCountValue($result);
+        return false;
     }
 
     public static function getCount(): int

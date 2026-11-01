@@ -4,11 +4,6 @@ declare(strict_types=1);
 
 namespace App\Services\NameFixing;
 
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
-use Throwable;
-
 /**
  * Service for prioritizing files during name matching.
  *
@@ -16,32 +11,7 @@ use Throwable;
  */
 class FilePrioritizer
 {
-    public const PREDB_IDENTITY_POLICY = 'b087d1d37dd4f6d4ef63bed1e5ef0193ed48d1344e1b37cb92c9180275ba5151';
-
-    public const FFI_CDEF = <<<'CDEF'
-        intptr_t nntmux_file_prioritizer_categorize_batch_nul(const char *input, size_t input_len, size_t count, uint32_t mode, char *out_buf, size_t out_cap);
-        int32_t nntmux_file_prioritizer_crc_priority(const char *input, size_t input_len);
-        intptr_t nntmux_file_prioritizer_rar_release_name_nul(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
-        CDEF;
-
-    private const int MODE_MATCHING = 0;
-
-    private const int MODE_PREDB = 1;
-
-    private static bool $ffiResolved = false;
-
-    private static ?FFI $defaultFfi = null;
-
-    private static ?CData $defaultBuf = null;
-
-    private static int $defaultCap = 0;
-
-    private readonly bool $rustEligible;
-
-    public function __construct(private readonly ?string $libraryPath = null)
-    {
-        $this->rustEligible = static::class === self::class;
-    }
+    public const PREDB_IDENTITY_POLICY = 'f70a4604767f9914da3550b84b37bc432d2b165e28fd6b94c6c215f34ba8566a';
 
     /**
      * Video file extensions.
@@ -95,13 +65,6 @@ class FilePrioritizer
      */
     public function prioritizeForMatching(array $files): array
     {
-        if ($this->rustEligible) {
-            $result = $this->categorizeRust($files, self::MODE_MATCHING);
-            if ($result !== null) {
-                return $result;
-            }
-        }
-
         $categorized = $this->categorizeFiles($files);
 
         // Merge in priority order
@@ -126,13 +89,6 @@ class FilePrioritizer
      */
     public function prioritizeForPreDb(array $files): array
     {
-        if ($this->rustEligible) {
-            $result = $this->categorizeRust($files, self::MODE_PREDB);
-            if ($result !== null) {
-                return $result;
-            }
-        }
-
         $categorized = $this->categorizeFiles($files);
 
         // For PreDB, SRR files are most valuable, then main RARs
@@ -201,18 +157,6 @@ class FilePrioritizer
      */
     public function getCrcPriority(string $filename): int
     {
-        if ($this->rustEligible && ($ffi = $this->resolveFfi()) !== null) {
-            try {
-                // @phpstan-ignore method.notFound
-                $priority = $ffi->nntmux_file_prioritizer_crc_priority($filename, \strlen($filename));
-                if (\is_int($priority) && $priority >= 0) {
-                    return $priority;
-                }
-            } catch (Throwable) {
-                // Fall through to the PHP implementation.
-            }
-        }
-
         $lower = strtolower($filename);
 
         if ($this->isSampleOrProof($filename)) {
@@ -330,18 +274,11 @@ class FilePrioritizer
      * Analyzes multiple RAR files from a release to determine the most likely
      * release name by finding common patterns.
      *
-     * @param  array<array-key, mixed>  $rarFiles  Array of RAR filenames
+     * @param  array<string, mixed>  $rarFiles  Array of RAR filenames
      * @return string|null The most likely release name or null
      */
     public function findReleaseNameFromRarFiles(array $rarFiles): ?string
     {
-        if ($this->rustEligible) {
-            [$handled, $result] = $this->rarReleaseNameRust($rarFiles);
-            if ($handled) {
-                return $result;
-            }
-        }
-
         $candidates = [];
 
         foreach ($rarFiles as $file) {
@@ -401,134 +338,5 @@ class FilePrioritizer
         }
 
         return null;
-    }
-
-    private function resolveFfi(): ?FFI
-    {
-        if ($this->libraryPath !== null) {
-            return RustPipelineLibrary::resolveDomain('file_prioritizer', self::FFI_CDEF, $this->libraryPath);
-        }
-        if (! self::$ffiResolved) {
-            self::$defaultFfi = RustPipelineLibrary::resolveDomain('file_prioritizer', self::FFI_CDEF);
-            self::$ffiResolved = true;
-        }
-
-        return self::$defaultFfi;
-    }
-
-    private function scratch(FFI $ffi, int $minBytes, int &$cap): ?CData
-    {
-        if ($this->libraryPath === null && self::$defaultBuf !== null && $minBytes <= self::$defaultCap) {
-            $cap = self::$defaultCap;
-
-            return self::$defaultBuf;
-        }
-        $buf = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $cap);
-        if ($this->libraryPath === null && $buf !== null) {
-            self::$defaultBuf = $buf;
-            self::$defaultCap = $cap;
-        }
-
-        return $buf;
-    }
-
-    /**
-     * Joins string values with NUL; returns null when a value is not a NUL-free string
-     * so the PHP path keeps its exact (including TypeError) behaviour.
-     *
-     * @param  array<array-key, mixed>  $files
-     */
-    private static function joinNul(array $files): ?string
-    {
-        foreach ($files as $file) {
-            if (! \is_string($file)) {
-                return null;
-            }
-        }
-        $joined = implode("\0", $files);
-        if (substr_count($joined, "\0") !== \count($files) - 1) {
-            return null;
-        }
-
-        return $joined;
-    }
-
-    /**
-     * @param  list<string>  $files
-     * @return list<string>|null
-     */
-    private function categorizeRust(array $files, int $mode): ?array
-    {
-        $count = \count($files);
-        if ($count === 0) {
-            return [];
-        }
-        $ffi = $this->resolveFfi();
-        if ($ffi === null) {
-            return null;
-        }
-        $joined = self::joinNul($files);
-        if ($joined === null) {
-            return null;
-        }
-
-        try {
-            $len = \strlen($joined);
-            $cap = 0;
-            $buf = $this->scratch($ffi, $len + 64, $cap);
-            if ($buf === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_file_prioritizer_categorize_batch_nul($joined, $len, $count, $mode, $buf, $cap);
-            if (! \is_int($written) || $written < 0) {
-                return null;
-            }
-            if ($written === 0) {
-                return [];
-            }
-
-            return explode("\0", FFI::string($buf, $written - 1));
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rarFiles
-     * @return array{0: bool, 1: ?string}
-     */
-    private function rarReleaseNameRust(array $rarFiles): array
-    {
-        $count = \count($rarFiles);
-        if ($count === 0) {
-            return [true, null];
-        }
-        $ffi = $this->resolveFfi();
-        if ($ffi === null) {
-            return [false, null];
-        }
-        $joined = self::joinNul($rarFiles);
-        if ($joined === null) {
-            return [false, null];
-        }
-
-        try {
-            $len = \strlen($joined);
-            $cap = 0;
-            $buf = $this->scratch($ffi, $len + 64, $cap);
-            if ($buf === null) {
-                return [false, null];
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_file_prioritizer_rar_release_name_nul($joined, $len, $count, $buf, $cap);
-            if (! \is_int($written) || $written < 0) {
-                return [false, null];
-            }
-
-            return [true, $written === 0 ? null : FFI::string($buf, $written)];
-        } catch (Throwable) {
-            return [false, null];
-        }
     }
 }

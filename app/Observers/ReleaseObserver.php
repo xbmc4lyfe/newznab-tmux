@@ -8,11 +8,8 @@ use App\Facades\Search;
 use App\Models\Release;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseImageService;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Throwable;
 
 /**
  * Observer for Release model to keep search indexes in sync.
@@ -22,139 +19,6 @@ use Throwable;
  */
 class ReleaseObserver
 {
-    /** Release attributes copied into the search document. */
-    public const array INDEXED_FIELDS = [
-        'name',
-        'guid',
-        'searchname',
-        'fromname',
-        'categories_id',
-        'imdbid',
-        'anidbid',
-        'movieinfo_id',
-        'videos_id',
-        'tv_episodes_id',
-        'size',
-        'totalpart',
-        'grabs',
-        'passwordstatus',
-        'groups_id',
-        'nzbstatus',
-        'nfostatus',
-        'haspreview',
-        'jpgstatus',
-        'comments',
-        'postdate',
-        'adddate',
-    ];
-
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_release_observer_has_indexed_change(const char *keys, size_t keys_len, const size_t *lens, size_t count);
-        C;
-
-    /**
-     * The Rust helper stays opt-in: it did not beat PHP by 1.5x in the paired benchmark
-     * (tests/Unit/RustSearchUnavailableObserversFailedRelease2faParityTest.php).
-     */
-    private const bool DEFAULT_USE_RUST_FFI = false;
-
-    private static ?bool $useRustFfi = null;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function enableRustFfi(): void
-    {
-        self::$useRustFfi = true;
-    }
-
-    public static function disableRustFfi(): void
-    {
-        self::$useRustFfi = false;
-    }
-
-    public static function resetRustFfi(): void
-    {
-        self::$useRustFfi = null;
-        self::$ffi = null;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? self::DEFAULT_USE_RUST_FFI;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $override = null): void
-    {
-        self::$ffi = $override;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
-    /**
-     * Whether the dirty attributes (`Model::getDirty()`) touch an indexed field,
-     * matching `Model::isDirty($field)` for each of `INDEXED_FIELDS`.
-     *
-     * @param  array<array-key, mixed>  $dirty
-     */
-    public static function hasIndexedFieldChange(array $dirty): bool
-    {
-        return self::usesRustFfi()
-            ? self::hasIndexedFieldChangeNative($dirty)
-            : self::hasIndexedFieldChangePhp($dirty);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $dirty
-     */
-    public static function hasIndexedFieldChangePhp(array $dirty): bool
-    {
-        foreach (self::INDEXED_FIELDS as $field) {
-            if (array_key_exists($field, $dirty)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $dirty
-     */
-    public static function hasIndexedFieldChangeNative(array $dirty): bool
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::hasIndexedFieldChangePhp($dirty);
-        }
-
-        try {
-            $count = \count($dirty);
-            $lens = $ffi->new('size_t['.max(1, $count).']');
-            $packed = '';
-            $i = 0;
-            foreach ($dirty as $key => $_) {
-                $key = (string) $key;
-                $packed .= $key;
-                $lens[$i++] = \strlen($key);
-            }
-            // @phpstan-ignore method.notFound
-            $result = $ffi->nntmux_release_observer_has_indexed_change($packed, \strlen($packed), $lens, $count);
-        } catch (Throwable) {
-            return self::hasIndexedFieldChangePhp($dirty);
-        }
-
-        return $result === 0 || $result === 1
-            ? $result === 1
-            : self::hasIndexedFieldChangePhp($dirty);
-    }
-
     /**
      * Handle the Release "created" event.
      *
@@ -173,7 +37,40 @@ class ReleaseObserver
      */
     public function updated(Release $release): void
     {
-        if (self::hasIndexedFieldChange($release->getDirty())) {
+        $indexedFields = [
+            'name',
+            'guid',
+            'searchname',
+            'fromname',
+            'categories_id',
+            'imdbid',
+            'anidbid',
+            'movieinfo_id',
+            'videos_id',
+            'tv_episodes_id',
+            'size',
+            'totalpart',
+            'grabs',
+            'passwordstatus',
+            'groups_id',
+            'nzbstatus',
+            'nfostatus',
+            'haspreview',
+            'jpgstatus',
+            'comments',
+            'postdate',
+            'adddate',
+        ];
+
+        $changed = false;
+        foreach ($indexedFields as $field) {
+            if ($release->isDirty($field)) {
+                $changed = true;
+                break;
+            }
+        }
+
+        if ($changed) {
             $this->syncAfterCommit($release);
         }
     }
@@ -190,7 +87,7 @@ class ReleaseObserver
         try {
             $nzbService = app(NzbService::class);
             $nzbService->deleteNzb($release->guid);
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::error('ReleaseObserver: Failed to delete NZB file', [
                 'release_id' => $release->id,
                 'guid' => $release->guid,
@@ -202,7 +99,7 @@ class ReleaseObserver
         try {
             $releaseImageService = app(ReleaseImageService::class);
             $releaseImageService->delete($release->guid);
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::error('ReleaseObserver: Failed to delete release images', [
                 'release_id' => $release->id,
                 'guid' => $release->guid,
@@ -219,7 +116,7 @@ class ReleaseObserver
         DB::afterCommit(function () use ($release): void {
             try {
                 Search::deleteRelease($release->id);
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 Log::error('ReleaseObserver: Failed to delete release from search index', [
                     'release_id' => $release->id,
                     'error' => $e->getMessage(),
@@ -248,7 +145,7 @@ class ReleaseObserver
             }
 
             return true;
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::error('ReleaseObserver: Failed to sync release to search index', [
                 'release_id' => $release->id,
                 'error' => $e->getMessage(),

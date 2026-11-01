@@ -5,8 +5,6 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Exceptions\TvProviderException;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Client\Response;
@@ -14,7 +12,6 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
-use Throwable;
 
 /**
  * Trakt.tv Service
@@ -39,24 +36,6 @@ class TraktService
     protected const ID_TYPES = ['imdb', 'tmdb', 'trakt', 'tvdb'];
 
     protected const SEARCH_TYPES = ['movie', 'show', 'episode', 'person', 'list'];
-
-    private const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_trakt_image_url(const char *url, size_t url_len, char *out, size_t cap);
-        ssize_t nntmux_trakt_format_imdb_id(const char *id, size_t id_len, char *out, size_t cap);
-        ssize_t nntmux_trakt_format_media_id(const char *id, size_t id_len, char *out, size_t cap);
-        int32_t nntmux_trakt_usable_external_id(const char *id, size_t id_len, uint32_t imdb);
-        C;
-
-    private static ?FFI $traktFfi = null;
-
-    private static bool $traktFfiResolved = false;
-
-    /**
-     * Id helpers through Rust; null selects the benchmark-qualified production defaults: Rust for
-     * the formatMediaId() slug path only, PHP for the helpers that miss the 1.5x gate
-     * (see tests/Unit/RustTvProvidersTraktMatchingParityTest.php).
-     */
-    public ?bool $useRustFfi = null;
 
     /** Minimum seconds between requests to avoid rate limiting (Trakt/Cloudflare). */
     protected const THROTTLE_SECONDS = 1;
@@ -157,7 +136,7 @@ class TraktService
 
         try {
             $response = Http::timeout($this->timeout)
-                ->retry($this->retryTimes, $this->retryDelay, function (Throwable $exception, PendingRequest $request, ?string $key = null) {
+                ->retry($this->retryTimes, $this->retryDelay, function (\Throwable $exception, PendingRequest $request, ?string $key = null) {
                     // Don't retry on 404 - resource doesn't exist
                     if ($exception instanceof RequestException) {
                         $status = $exception->response->status();
@@ -227,7 +206,7 @@ class TraktService
             return null;
         } catch (TvProviderException $e) {
             throw $e;
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             // Check if this is a 404 wrapped in an exception
             if ($e instanceof RequestException && $e->response->status() === 404) {
                 Log::debug('Trakt: Resource not found', ['endpoint' => $endpoint]);
@@ -773,11 +752,6 @@ class TraktService
      */
     protected function formatImdbId(string $id): ?string
     {
-        return ($this->useRustFfi ?? false) ? $this->formatImdbIdNative($id) : $this->formatImdbIdPhp($id);
-    }
-
-    public function formatImdbIdPhp(string $id): ?string
-    {
         if (preg_match('/^tt\d{6,}$/i', $id) === 1) {
             return $id;
         }
@@ -787,36 +761,7 @@ class TraktService
         return $digits !== null && preg_match('/^\d{6,}$/', $digits) === 1 ? 'tt'.$digits : null;
     }
 
-    /**
-     * formatImdbIdPhp() through Rust `nntmux_trakt_format_imdb_id`.
-     */
-    public function formatImdbIdNative(string $id): ?string
-    {
-        $result = self::stringCall('nntmux_trakt_format_imdb_id', $id);
-
-        return $result === false ? $this->formatImdbIdPhp($id) : $result;
-    }
-
     protected function formatMediaId(int|string $id): ?string
-    {
-        $id = trim((string) $id);
-        if ($id === '') {
-            return null;
-        }
-        if (str_starts_with(strtolower($id), 'tt')) {
-            return $this->formatImdbId($id);
-        }
-
-        // Rust slugs printable ASCII (Trakt slugs and numeric ids); IMDb ids stay in PHP, where
-        // the regex is faster than the FFI round trip.
-        if (($this->useRustFfi ?? true) && \is_string($slug = self::stringCall('nntmux_trakt_format_media_id', $id))) {
-            return $slug;
-        }
-
-        return Str::slug($id);
-    }
-
-    public function formatMediaIdPhp(int|string $id): ?string
     {
         $id = trim((string) $id);
         if ($id === '') {
@@ -824,58 +769,6 @@ class TraktService
         }
 
         return str_starts_with(strtolower($id), 'tt') ? $this->formatImdbId($id) : Str::slug($id);
-    }
-
-    /**
-     * formatMediaIdPhp() through Rust `nntmux_trakt_format_media_id` (printable ASCII slugs and
-     * IMDb ids); falls back to PHP when Rust declines.
-     */
-    public function formatMediaIdNative(int|string $id): ?string
-    {
-        $result = self::stringCall('nntmux_trakt_format_media_id', (string) $id);
-
-        return $result === false ? $this->formatMediaIdPhp($id) : $result;
-    }
-
-    /**
-     * The shared Rust library with the Trakt helper exports, or null when unavailable.
-     */
-    public static function traktFfi(): ?FFI
-    {
-        if (! self::$traktFfiResolved) {
-            self::$traktFfi = RustPipelineLibrary::resolveDomain('trakt_matching', self::FFI_CDEF);
-            self::$traktFfiResolved = true;
-        }
-
-        return self::$traktFfi;
-    }
-
-    /**
-     * A string-returning Trakt export: its result, null for PHP `null`, or false to fall back.
-     */
-    private static function stringCall(string $function, string $input): string|false|null
-    {
-        $ffi = self::traktFfi();
-        if ($ffi === null) {
-            return false;
-        }
-        $len = \strlen($input);
-        $cap = 0;
-        // `@` expands to `-at-`: four output bytes per input byte at most.
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 4 * $len + 16, $cap);
-        if ($scratch === null) {
-            return false;
-        }
-        try {
-            $written = $ffi->{$function}($input, $len, $scratch, $cap);
-        } catch (Throwable) {
-            return false;
-        }
-        if ($written === -2) {
-            return null;
-        }
-
-        return \is_int($written) && $written >= 0 ? ($written === 0 ? '' : FFI::string($scratch, $written)) : false;
     }
 
     /**
@@ -893,457 +786,14 @@ class TraktService
 
     protected function isUsableExternalId(mixed $id, string $idType): bool
     {
-        return ($this->useRustFfi ?? false) ? $this->isUsableExternalIdNative($id, $idType) : $this->isUsableExternalIdPhp($id, $idType);
-    }
-
-    public function isUsableExternalIdPhp(mixed $id, string $idType): bool
-    {
         if ($id === null || $id === '') {
             return false;
         }
 
         if ($idType === 'imdb') {
-            return $this->formatImdbIdPhp((string) $id) !== null;
+            return $this->formatImdbId((string) $id) !== null;
         }
 
         return is_numeric($id) ? (int) $id > 0 : trim((string) $id) !== '';
-    }
-
-    /**
-     * isUsableExternalIdPhp() through Rust `nntmux_trakt_usable_external_id` for string ids.
-     */
-    public function isUsableExternalIdNative(mixed $id, string $idType): bool
-    {
-        if (\is_string($id) && ($ffi = self::traktFfi()) !== null) {
-            try {
-                // @phpstan-ignore method.notFound
-                $usable = $ffi->nntmux_trakt_usable_external_id($id, \strlen($id), $idType === 'imdb' ? 1 : 0);
-                if ($usable === 0 || $usable === 1) {
-                    return $usable === 1;
-                }
-            } catch (Throwable) {
-                // Older native libraries retain the PHP implementation.
-            }
-        }
-
-        return $this->isUsableExternalIdPhp($id, $idType);
-    }
-
-    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 4.29x, p99 3.47x; uncommon mean 4.08x, p99 3.83x; see the W46 parity test). */
-    public const bool W464_RUST_FFI_DEFAULT = true;
-
-    public const string W464_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w464_trakt_media_id_batch(const char *input, size_t len, char *out, size_t cap);
-        C;
-
-    private const array W464_SUMMARY_KEYS = ['total_entries', 'empty_count', 'imdb_prefixed_count', 'imdb_valid_count', 'numeric_count', 'positive_numeric_count', 'slug_ready_count', 'uppercase_count', 'whitespace_count', 'at_sign_count', 'non_ascii_count'];
-
-    /** unpack() format for the eleven little-endian int64 counters, in W464_SUMMARY_KEYS order. */
-    private const string W464_UNPACK = 'Ptotal_entries/Pempty_count/Pimdb_prefixed_count/Pimdb_valid_count/Pnumeric_count/Ppositive_numeric_count/Pslug_ready_count/Puppercase_count/Pwhitespace_count/Pat_sign_count/Pnon_ascii_count';
-
-    private static ?bool $w464UseRustFfi = null;
-
-    private static FFI|false|null $w464Ffi = null;
-
-    /** Null restores the benchmark-qualified default. */
-    public static function useW464RustFfi(?bool $enable = true): void
-    {
-        self::$w464UseRustFfi = $enable;
-    }
-
-    public static function usesW464RustFfi(): bool
-    {
-        return self::$w464UseRustFfi ?? self::W464_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW464RustFfi(): void
-    {
-        self::$w464UseRustFfi = null;
-        self::$w464Ffi = null;
-    }
-
-    /**
-     * Summarize show/movie ids as formatMediaId() routes them (trimmed):
-     * tt-prefixed ids and those formatImdbIdPhp() accepts, numeric and
-     * positive numeric ids, ids already in Str::slug() form, and uppercase,
-     * whitespace, @ and non-ASCII bytes the slugger rewrites. Entries come
-     * from strings, integers, or the slug, imdb, trakt, tmdb, tvdb or id
-     * field; other values count as empty. Byte classes are ASCII-only.
-     *
-     * @param  array<array-key, mixed>  $entries
-     * @return array<string, int>
-     */
-    public static function summarizeTraktMediaIdBatch(array $entries): array
-    {
-        return self::usesW464RustFfi()
-            ? self::summarizeTraktMediaIdBatchNative($entries)
-            : self::summarizeTraktMediaIdBatchPhp($entries);
-    }
-
-    /**
-     * Rust summary; falls back to PHP when the library or input frame is unusable.
-     *
-     * @param  array<array-key, mixed>  $entries
-     * @return array<string, int>
-     */
-    public static function summarizeTraktMediaIdBatchNative(array $entries): array
-    {
-        return self::w464Call(self::w464Entries($entries)) ?? self::summarizeTraktMediaIdBatchPhp($entries);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $entries
-     * @return array<string, int>
-     */
-    public static function summarizeTraktMediaIdBatchPhp(array $entries): array
-    {
-        $summary = array_fill_keys(self::W464_SUMMARY_KEYS, 0);
-        foreach (self::w464Entries($entries) as $entry) {
-            $summary['total_entries']++;
-            $id = trim($entry);
-            if ($id === '') {
-                $summary['empty_count']++;
-
-                continue;
-            }
-            $prefixed = strncasecmp($id, 'tt', 2) === 0;
-            $numeric = preg_match('/\A[0-9]+\z/', $id) === 1;
-            $summary['imdb_prefixed_count'] += (int) $prefixed;
-            $summary['imdb_valid_count'] += (int) ($prefixed && strlen(preg_replace('/[^0-9]/', '', $id) ?? '') >= 6);
-            $summary['numeric_count'] += (int) $numeric;
-            $summary['positive_numeric_count'] += (int) ($numeric && preg_match('/[1-9]/', $id) === 1);
-            $summary['slug_ready_count'] += (int) (preg_match('/\A[a-z0-9]+(?:-[a-z0-9]+)*\z/', $id) === 1);
-            $summary['uppercase_count'] += (int) (preg_match('/[A-Z]/', $id) === 1);
-            $summary['whitespace_count'] += (int) (preg_match('/[ \t\n\r\x0b\f]/', $id) === 1);
-            $summary['at_sign_count'] += (int) str_contains($id, '@');
-            $summary['non_ascii_count'] += (int) (preg_match('/[\x80-\xff]/', $id) === 1);
-        }
-
-        return $summary;
-    }
-
-    /** Only integer and string entries participate; objects are never cast or serialized.
-     *
-     * @param  array<array-key, mixed>  $input
-     * @return list<string>
-     */
-    private static function w464Entries(array $input): array
-    {
-        $entries = [];
-        foreach ($input as $item) {
-            if (is_array($item)) {
-                $item = $item['slug'] ?? $item['imdb'] ?? $item['trakt'] ?? $item['tmdb'] ?? $item['tvdb'] ?? $item['id'] ?? null;
-            }
-            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
-        }
-
-        return $entries;
-    }
-
-    /** @param list<string> $entries
-     * @return array<string, int>|null
-     */
-    private static function w464Call(array $entries): ?array
-    {
-        try {
-            $input = serialize($entries);
-            if (strlen($input) > 16777216) {
-                return null;
-            }
-            self::$w464Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w464', self::W464_FFI_CDEF) ?? false;
-            $ffi = self::$w464Ffi;
-            if ($ffi === false) {
-                return null;
-            }
-            // obtainScratch() returns at least the 88 bytes requested.
-            $out = RustPipelineLibrary::obtainScratch($ffi, 88);
-            // @phpstan-ignore method.notFound (Declared by W464_FFI_CDEF.)
-            if ($out === null || $ffi->nntmux_w464_trakt_media_id_batch($input, strlen($input), $out, 88) !== 88) {
-                return null;
-            }
-            /** @var array<string, int>|false $summary */
-            $summary = unpack(self::W464_UNPACK, FFI::string($out, 88));
-            $total = count($entries);
-            if ($summary === false || $summary['total_entries'] !== $total || min($summary) < 0 || max($summary) > $total) {
-                return null;
-            }
-
-            return $summary;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** C signature of the Wave 62.5 {@see self::lookupPlanBatch()} helper. */
-    private const string W62_TRAKT_PLAN_FFI_CDEF = 'int64_t nntmux_w625_trakt_lookup_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
-
-    /**
-     * The Wave 62.5 plan batch defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x
-     * (min 6.92/5.60/6.64/5.75x); see tests/Unit/RustSteamTmdbClientTraktTurnstileReleaseSearchW62ParityTest.php.
-     */
-    public const bool W62_RUST_FFI_DEFAULT = true;
-
-    /**
-     * Wave 62.5 routing and FFI cache, kept in function-local statics (no properties). Without $op it
-     * reports the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
-     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]`
-     * with room for at least $val words, or null without the library.
-     */
-    private static function w62RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'reset':
-                $ffi = $val;
-                $out = null;
-                $outCap = 0;
-
-                return null;
-            case 'buffer':
-                if ($ffi === null) {
-                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
-                    $ffi = RustPipelineLibrary::resolveDomain('w62_5', self::W62_TRAKT_PLAN_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
-                }
-                if (! $ffi instanceof FFI || ! \is_int($val)) {
-                    return null;
-                }
-                if ($out === null || $outCap < $val) {
-                    $outCap = max(1024, $val);
-                    $out = $ffi->new('int64_t['.$outCap.']');
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled ?? self::W62_RUST_FFI_DEFAULT;
-        }
-    }
-
-    public static function usesW62RustFfi(): bool
-    {
-        return self::w62RustFfiState() === true;
-    }
-
-    /**
-     * Runs $callback with lookupPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW62RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w62RustFfiState('set', $enabled);
-
-        try {
-            return $callback();
-        } finally {
-            self::w62RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Exactly $words output words from the Wave 62.5 Rust helper over $count NUL-joined records, or null
-     * to fall back to PHP.
-     *
-     * @return list<int>|null
-     */
-    private static function w62Words(int $count, string $data, int $words): ?array
-    {
-        try {
-            $handle = self::w62RustFfiState('buffer', $words);
-            if (! \is_array($handle)) {
-                return null;
-            }
-            [$ffi, $out, $cap] = $handle;
-            $written = $ffi->nntmux_w625_trakt_lookup_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
-            if ($written !== $words) {
-                return null;
-            }
-            /** @var array<int, int>|false $values */
-            $values = unpack('q*', FFI::string($out, $written * 8));
-
-            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Batch Trakt lookup plan over `media_type\tid\tid_type\tseason\tepisode\textended\tlimit`. Nine words per
-     * record: `[media_code, id_type_code, id_value, slug_len, season, episode, extended_code, limit, flags]`. Media
-     * follow SEARCH_TYPES (1 movie, 2 show, 3 episode, 4 person, 5 list) and id types ID_TYPES plus slug (1 imdb,
-     * 2 tmdb, 3 trakt, 4 tvdb, 5 slug), trimmed and ASCII case-insensitive (0 empty, -1 unknown). An empty id type
-     * is inferred from the trimmed id: imdb with an ASCII case-insensitive `tt` prefix, trakt for 1-18 digits,
-     * else slug. IMDb ids keep all their digits (formatImdbIdPhp()) when there are 6-18; tmdb, trakt and tvdb ids
-     * are 1-18 digits with a positive value; slugs join lowercased ASCII alphanumeric runs with `-` and report
-     * that length. Season and episode are trimmed 1-4 digits (empty -1); episode lookups need a season and a
-     * positive episode. Extended levels are 1 min, 2 full, 3 metadata, 4 episodes (empty or unknown min). The
-     * limit (empty 10) is 1-6 digits clamped to 1..100 (normalizeLimit()). Flags: 1 empty id, 2 unknown media, 4
-     * unknown id type, 8 invalid id, 16 invalid season or episode, 32 incomplete episode lookup, 64 unknown
-     * extended, 128 clamped limit, 256 invalid limit, 512 non-ASCII id, 1024 not exactly seven fields.
-     *
-     * @param  list<string>  $records
-     * @return list<int>
-     */
-    public static function lookupPlanBatch(array $records): array
-    {
-        return self::usesW62RustFfi() ? self::lookupPlanBatchNative($records) : self::lookupPlanBatchPhp($records);
-    }
-
-    /** Wave 62.5 extended levels in code order (1-based). */
-    private const array W62_EXTENDED = ['min', 'full', 'metadata', 'episodes'];
-
-    /**
-     * @param  list<string>  $records
-     * @return list<int>
-     */
-    public static function lookupPlanBatchPhp(array $records): array
-    {
-        $idTypes = [...self::ID_TYPES, 'slug'];
-        $out = [];
-        foreach ($records as $record) {
-            $fields = explode("\t", $record);
-            $flags = \count($fields) === 7 ? 0 : 1024;
-            $media = self::w62Code($fields[0], self::SEARCH_TYPES, 2, $flags);
-            $id = trim($fields[1] ?? '');
-            if (preg_match('/[\x80-\xff]/', $id) === 1) {
-                $flags |= 512;
-            }
-            $idType = self::w62Code($fields[2] ?? '', $idTypes, 4, $flags);
-            if ($idType === 0 && $id !== '') {
-                $idType = strncasecmp($id, 'tt', 2) === 0 ? 1 : (self::w62Digits($id, 18) !== null ? 3 : 5);
-            }
-            [$value, $slugLength] = [0, 0];
-            if ($id === '') {
-                $flags |= 1;
-            } elseif ($idType === 1) {
-                $digits = (string) preg_replace('/[^0-9]+/', '', $id);
-                if (\strlen($digits) >= 6 && \strlen($digits) <= 18) {
-                    $value = (int) $digits;
-                } else {
-                    $flags |= 8;
-                }
-            } elseif ($idType >= 2 && $idType <= 4) {
-                $number = self::w62Digits($id, 18);
-                if ($number !== null && $number > 0) {
-                    $value = $number;
-                } else {
-                    $flags |= 8;
-                }
-            } elseif ($idType === 5) {
-                $runs = preg_split('/[^A-Za-z0-9]+/', $id, -1, PREG_SPLIT_NO_EMPTY);
-                $slugLength = \is_array($runs) && $runs !== [] ? \strlen(implode('-', $runs)) : 0;
-                if ($slugLength === 0) {
-                    $flags |= 8;
-                }
-            }
-            $season = self::w62Number($fields[3] ?? '', 4, -1, 16, $flags);
-            $episode = self::w62Number($fields[4] ?? '', 4, -1, 16, $flags);
-            if ($media === 3 && ($season < 0 || $episode < 1)) {
-                $flags |= 32;
-            }
-            $extended = self::w62Code($fields[5] ?? '', self::W62_EXTENDED, 64, $flags);
-            $limit = self::w62Clamped($fields[6] ?? '', 6, 10, 1, 100, 128, 256, $flags);
-            array_push($out, $media, $idType, $value, $slugLength, $season, $episode, $extended > 0 ? $extended : 1, $limit, $flags);
-        }
-
-        return $out;
-    }
-
-    /** 1-$max ASCII digits as an integer, else null. */
-    private static function w62Digits(string $text, int $max): ?int
-    {
-        return $text !== '' && \strlen($text) <= $max && ctype_digit($text) ? (int) $text : null;
-    }
-
-    /**
-     * Trimmed, ASCII case-insensitive 1-based position of $field in the lowercase $names; 0 empty, -1 unknown
-     * (sets $flag).
-     *
-     * @param  list<string>  $names
-     */
-    private static function w62Code(string $field, array $names, int $flag, int &$flags): int
-    {
-        $field = trim($field);
-        if ($field === '') {
-            return 0;
-        }
-        $at = array_search(strtolower($field), $names, true);
-        if ($at === false) {
-            $flags |= $flag;
-
-            return -1;
-        }
-
-        return (int) $at + 1;
-    }
-
-    /** Trimmed 1-$max digits (empty $default); anything else sets $flag and yields $default. */
-    private static function w62Number(string $field, int $max, int $default, int $flag, int &$flags): int
-    {
-        $field = trim($field);
-        if ($field === '') {
-            return $default;
-        }
-        $value = self::w62Digits($field, $max);
-        if ($value === null) {
-            $flags |= $flag;
-
-            return $default;
-        }
-
-        return $value;
-    }
-
-    /**
-     * Trimmed 1-$max digits clamped to $low..$high (empty $default); clamping sets $clamped, other input sets
-     * $invalid and yields $default.
-     */
-    private static function w62Clamped(string $field, int $max, int $default, int $low, int $high, int $clamped, int $invalid, int &$flags): int
-    {
-        $field = trim($field);
-        if ($field === '') {
-            return $default;
-        }
-        $value = self::w62Digits($field, $max);
-        if ($value === null) {
-            $flags |= $invalid;
-
-            return $default;
-        }
-        if ($value < $low || $value > $high) {
-            $flags |= $clamped;
-
-            return max($low, min($high, $value));
-        }
-
-        return $value;
-    }
-
-    /**
-     * Rust batch over the NUL-joined records; falls back to PHP without the library or when a record holds
-     * a NUL.
-     *
-     * @param  list<string>  $records
-     * @return list<int>
-     */
-    public static function lookupPlanBatchNative(array $records): array
-    {
-        $count = \count($records);
-        if ($count === 0) {
-            return [];
-        }
-
-        return self::w62Words($count, implode("\0", $records), 9 * $count) ?? self::lookupPlanBatchPhp($records);
     }
 }

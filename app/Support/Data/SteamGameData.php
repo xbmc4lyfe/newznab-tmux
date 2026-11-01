@@ -5,11 +5,8 @@ declare(strict_types=1);
 namespace App\Support\Data;
 
 use App\Support\Data\Factories\SteamGameDataFactory;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Spatie\LaravelData\Data;
 use Spatie\TypeScriptTransformer\Attributes\TypeScript;
-use Throwable;
 
 /**
  * Data Transfer Object for Steam Game data.
@@ -20,41 +17,6 @@ use Throwable;
 #[TypeScript]
 final class SteamGameData extends Data
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_steam_game_data_transform_json(int32_t mode, const char *json, size_t len, char *out, size_t cap);
-        C;
-
-    private const int JSON_FLAGS = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR;
-
-    private const array MULTIPLAYER_CATEGORIES = ['Multi-player', 'Online Multi-Player', 'Online Co-op', 'Local Multi-Player', 'Local Co-op'];
-
-    /** Null selects the benchmark-qualified production default (PHP; see RustTvShowAdderAndMetadataParityTest). */
-    private static ?bool $useRustFfi = null;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function setUseRustFfi(?bool $use = true): void
-    {
-        self::$useRustFfi = $use;
-        if ($use === null) {
-            self::$ffi = null;
-        }
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? false;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
     /**
      * @param  array<int, array{thumbnail: ?string, full: ?string}>  $screenshots
      * @param  array<int, array{id: ?int, name: ?string, thumbnail: ?string, webm: ?string, mp4: ?string}>  $movies
@@ -115,42 +77,6 @@ final class SteamGameData extends Data
      */
     public function toGamesInfoArray(): array
     {
-        return self::usesRustFfi() ? $this->toGamesInfoArrayNative() : $this->toGamesInfoArrayPhp();
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    public function toGamesInfoArrayNative(): array
-    {
-        try {
-            $payload = json_encode([
-                'title' => $this->title,
-                'steamId' => $this->steamId,
-                'storeUrl' => $this->storeUrl,
-                'publisher' => $this->publisher,
-                'releaseDate' => $this->releaseDate,
-                'description' => $this->description,
-                'coverUrl' => $this->coverUrl,
-                'backdropUrl' => $this->backdropUrl,
-                'trailerUrl' => $this->trailerUrl,
-                'metacriticScore' => $this->metacriticScore,
-                'genres' => $this->genres,
-            ], self::JSON_FLAGS);
-            $json = self::callNative(0, $payload);
-            $decoded = $json !== null ? json_decode($json, true, 4, JSON_THROW_ON_ERROR) : null;
-        } catch (Throwable) {
-            $decoded = null;
-        }
-
-        return \is_array($decoded) ? $decoded : $this->toGamesInfoArrayPhp();
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    public function toGamesInfoArrayPhp(): array
-    {
         return [
             'title' => $this->title,
             'asin' => (string) $this->steamId,
@@ -206,32 +132,9 @@ final class SteamGameData extends Data
      */
     public function hasMultiplayer(): bool
     {
-        return self::usesRustFfi() ? $this->hasMultiplayerNative() : $this->hasMultiplayerPhp();
-    }
+        $multiplayerCategories = ['Multi-player', 'Online Multi-Player', 'Online Co-op', 'Local Multi-Player', 'Local Co-op'];
 
-    public function hasMultiplayerNative(): bool
-    {
-        if (($ffi = self::ffi()) === null) {
-            return $this->hasMultiplayerPhp();
-        }
-        try {
-            $payload = json_encode($this->categories, self::JSON_FLAGS);
-            // @phpstan-ignore method.notFound
-            $result = $ffi->nntmux_steam_game_data_transform_json(1, $payload, \strlen($payload), null, 0);
-        } catch (Throwable) {
-            return $this->hasMultiplayerPhp();
-        }
-
-        return match ($result) {
-            1 => true,
-            0 => false,
-            default => $this->hasMultiplayerPhp(),
-        };
-    }
-
-    public function hasMultiplayerPhp(): bool
-    {
-        return ! empty(array_intersect(self::MULTIPLAYER_CATEGORIES, $this->categories));
+        return ! empty(array_intersect($multiplayerCategories, $this->categories));
     }
 
     /**
@@ -247,54 +150,6 @@ final class SteamGameData extends Data
      */
     public function getGenresString(): string
     {
-        return self::usesRustFfi() ? $this->getGenresStringNative() : $this->getGenresStringPhp();
-    }
-
-    public function getGenresStringNative(): string
-    {
-        try {
-            $joined = self::callNative(2, json_encode($this->genres, self::JSON_FLAGS));
-        } catch (Throwable) {
-            $joined = null;
-        }
-
-        return $joined ?? $this->getGenresStringPhp();
-    }
-
-    public function getGenresStringPhp(): string
-    {
         return implode(', ', $this->genres);
-    }
-
-    private static function callNative(int $mode, string $payload): ?string
-    {
-        if (($ffi = self::ffi()) === null) {
-            return null;
-        }
-        $len = \strlen($payload);
-        $capacity = 0;
-        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 128), $capacity);
-        if ($buffer === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_steam_game_data_transform_json($mode, $payload, $len, $buffer, $capacity);
-            if (\is_int($written) && $written < -1) {
-                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($buffer === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_steam_game_data_transform_json($mode, $payload, $len, $buffer, $capacity);
-            }
-            if (! \is_int($written) || $written < 0 || $written > $capacity) {
-                return null;
-            }
-
-            return $written === 0 ? '' : FFI::string($buffer, $written);
-        } catch (Throwable) {
-            return null;
-        }
     }
 }

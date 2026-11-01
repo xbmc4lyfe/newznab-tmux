@@ -6,10 +6,7 @@ namespace App\Services;
 
 use App\Enums\ImageAssetProfile;
 use App\Support\Data\ImageProcessingResult;
-use App\Support\RustPipelineLibrary;
 use Closure;
-use FFI;
-use FFI\CData;
 use GuzzleHttp\Psr7\Uri;
 use GuzzleHttp\Psr7\UriResolver;
 use Illuminate\Http\UploadedFile;
@@ -28,25 +25,6 @@ use Throwable;
  */
 class ReleaseImageService
 {
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_release_image_is_valid_basename(const char *input, size_t input_len);
-        ssize_t nntmux_release_image_redact_url(const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        int64_t nntmux_release_image_scale_dimensions(int64_t width, int64_t height, int64_t max_width, int64_t max_height, const char *format, size_t format_len, int32_t *out_format);
-        int32_t nntmux_release_duplicate_resolve_reason(int64_t dup_predb_id, int64_t predb_id, const char *dup_search_name, size_t dup_search_name_len, const char *search_name, size_t search_name_len);
-        int32_t nntmux_release_duplicate_size_bounds(int64_t filesize, double tolerance, int64_t *out_low, int64_t *out_high);
-        ssize_t nntmux_release_management_export_date(const char *input, size_t input_len, uint32_t is_end_of_day, char *out_buf, size_t out_cap);
-        int32_t nntmux_categorization_result_is_successful(int64_t category_id, double confidence, const char *matched_by, size_t matched_by_len);
-        int32_t nntmux_categorization_result_is_protected_misc(int64_t category_id, const char *matched_by, size_t matched_by_len);
-        int32_t nntmux_categorization_result_should_override(int64_t self_category_id, double self_confidence, const char *self_matched_by, size_t self_matched_by_len, int64_t other_category_id, double other_confidence, const char *other_matched_by, size_t other_matched_by_len);
-        ssize_t nntmux_api_release_cache_normalize_json(const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        C;
-
-    public static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
-    private static ?CData $formatOut = null;
-
     /** Path to save ogg audio samples. */
     public string $audSavePath;
 
@@ -415,31 +393,8 @@ class ReleaseImageService
         ?int $maxWidth,
         ?int $maxHeight,
     ): LaravelImage {
-        $dimensions = $this->scaleDimensions($width, $height, $maxWidth, $maxHeight);
-        if ($dimensions !== null) {
-            return $image->resize($dimensions[0], $dimensions[1]);
-        }
-
-        return $image;
-    }
-
-    /**
-     * @return array{0: int, 1: int}|null
-     */
-    public function scaleDimensions(int $width, int $height, ?int $maxWidth, ?int $maxHeight): ?array
-    {
-        return self::$useRustFfi
-            ? $this->scaleDimensionsNative($width, $height, $maxWidth, $maxHeight)
-            : $this->scaleDimensionsPhp($width, $height, $maxWidth, $maxHeight);
-    }
-
-    /**
-     * @return array{0: int, 1: int}|null
-     */
-    public function scaleDimensionsPhp(int $width, int $height, ?int $maxWidth, ?int $maxHeight): ?array
-    {
-        if ($maxWidth === null || $maxHeight === null || $width <= 0 || $height <= 0 || $maxWidth <= 0 || $maxHeight <= 0) {
-            return null;
+        if ($maxWidth === null || $maxHeight === null) {
+            return $image;
         }
 
         $ratio = min($maxHeight / $height, $maxWidth / $width, 1);
@@ -447,36 +402,10 @@ class ReleaseImageService
         $newHeight = (int) floor($ratio * $height);
 
         if ($ratio < 1 && $newWidth > 10 && $newHeight > 10) {
-            return [$newWidth, $newHeight];
+            return $image->resize($newWidth, $newHeight);
         }
 
-        return null;
-    }
-
-    /**
-     * @return array{0: int, 1: int}|null
-     */
-    public function scaleDimensionsNative(int $width, int $height, ?int $maxWidth, ?int $maxHeight): ?array
-    {
-        if ($maxWidth === null || $maxHeight === null || $width <= 0 || $height <= 0 || $maxWidth <= 0 || $maxHeight <= 0) {
-            return null;
-        }
-
-        $ffi = self::mediaFfi();
-        if ($ffi === null) {
-            return $this->scaleDimensionsPhp($width, $height, $maxWidth, $maxHeight);
-        }
-
-        // @phpstan-ignore method.notFound
-        $packed = $ffi->nntmux_release_image_scale_dimensions($width, $height, $maxWidth, $maxHeight, null, 0, null);
-        if (! \is_int($packed) || $packed < 0) {
-            return $this->scaleDimensionsPhp($width, $height, $maxWidth, $maxHeight);
-        }
-        if ($packed === 0) {
-            return null;
-        }
-
-        return [$packed >> 32, $packed & 0xFFFFFFFF];
+        return $image;
     }
 
     private function encode(LaravelImage $image): string
@@ -491,40 +420,9 @@ class ReleaseImageService
 
     private function outputFormat(): string
     {
-        return $this->resolveOutputFormat((string) config('image.output_format', 'webp'));
-    }
+        $format = strtolower((string) config('image.output_format', 'webp'));
 
-    public function resolveOutputFormat(string $format): string
-    {
-        return self::$useRustFfi
-            ? $this->resolveOutputFormatNative($format)
-            : $this->resolveOutputFormatPhp($format);
-    }
-
-    public function resolveOutputFormatPhp(string $format): string
-    {
-        $normalized = strtolower($format);
-
-        return in_array($normalized, ['jpg', 'jpeg'], true) ? 'jpg' : 'webp';
-    }
-
-    public function resolveOutputFormatNative(string $format): string
-    {
-        $ffi = self::mediaFfi();
-        if ($ffi === null) {
-            return $this->resolveOutputFormatPhp($format);
-        }
-
-        $outBuf = self::$formatOut ??= $ffi->new('int32_t');
-
-        // @phpstan-ignore method.notFound
-        $res = $ffi->nntmux_release_image_scale_dimensions(0, 0, 0, 0, $format, \strlen($format), FFI::addr($outBuf));
-        if (! \is_int($res) || $res < 0) {
-            return $this->resolveOutputFormatPhp($format);
-        }
-
-        // @phpstan-ignore property.notFound
-        return $outBuf->cdata === 1 ? 'jpg' : 'webp';
+        return in_array($format, ['jpg', 'jpeg'], true) ? 'jpg' : 'webp';
     }
 
     private function maxSourceBytes(): int
@@ -537,36 +435,9 @@ class ReleaseImageService
         return max(1, (int) config('image.max_source_pixels', 40_000_000));
     }
 
-    public function isValidBasename(string $basename): bool
-    {
-        return self::$useRustFfi
-            ? $this->isValidBasenameNative($basename)
-            : $this->isValidBasenamePhp($basename);
-    }
-
-    public function isValidBasenamePhp(string $basename): bool
+    private function isValidBasename(string $basename): bool
     {
         return preg_match('/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/D', $basename) === 1;
-    }
-
-    public function isValidBasenameNative(string $basename): bool
-    {
-        if ($basename === '') {
-            return false;
-        }
-
-        $ffi = self::mediaFfi();
-        if ($ffi === null) {
-            return $this->isValidBasenamePhp($basename);
-        }
-
-        // @phpstan-ignore method.notFound
-        $res = $ffi->nntmux_release_image_is_valid_basename($basename, \strlen($basename));
-        if (! \is_int($res) || $res < 0) {
-            return $this->isValidBasenamePhp($basename);
-        }
-
-        return $res === 1;
     }
 
     private function assertSafeRemoteUrl(string $url): void
@@ -622,14 +493,7 @@ class ReleaseImageService
         return array_values(array_unique($addresses));
     }
 
-    public function redactedUrl(string $url): string
-    {
-        return self::$useRustFfi
-            ? $this->redactedUrlNative($url)
-            : $this->redactedUrlPhp($url);
-    }
-
-    public function redactedUrlPhp(string $url): string
+    private function redactedUrl(string $url): string
     {
         $parts = parse_url($url);
         if (! is_array($parts) || ! isset($parts['scheme'], $parts['host'])) {
@@ -639,337 +503,5 @@ class ReleaseImageService
         $port = isset($parts['port']) ? ':'.$parts['port'] : '';
 
         return strtolower($parts['scheme']).'://'.$parts['host'].$port.($parts['path'] ?? '/');
-    }
-
-    public function redactedUrlNative(string $url): string
-    {
-        if ($url === '') {
-            return '[invalid-url]';
-        }
-
-        $ffi = self::mediaFfi();
-        if ($ffi === null) {
-            return $this->redactedUrlPhp($url);
-        }
-
-        $len = \strlen($url);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 32), $cap);
-        if ($scratch === null) {
-            return $this->redactedUrlPhp($url);
-        }
-
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_release_image_redact_url($url, $len, $scratch, $cap);
-        if (! \is_int($written) || $written === -1) {
-            return $this->redactedUrlPhp($url);
-        }
-        if ($written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-            if ($scratch === null) {
-                return $this->redactedUrlPhp($url);
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_release_image_redact_url($url, $len, $scratch, $cap);
-            if (! \is_int($written) || $written <= 0) {
-                return $this->redactedUrlPhp($url);
-            }
-        }
-
-        return $written === 0 ? '[invalid-url]' : FFI::string($scratch, $written);
-    }
-
-    public static function setUseRustFfi(bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi;
-    }
-
-    public static function mediaFfi(): ?FFI
-    {
-        if (self::$ffi !== null) {
-            return self::$ffi === false ? null : self::$ffi;
-        }
-
-        self::$ffi = RustPipelineLibrary::resolveDomain('media', self::FFI_CDEF) ?? false;
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
-    /** Disabled: common p99 missed 1.5x in three of eight paired runs (1.41x, 1.49x, 1.49x; others 2.04x-2.88x; see the W43 parity test). */
-    public const bool W431_RUST_FFI_DEFAULT = false;
-
-    public const string W431_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w431_release_image_batch(const char *input, size_t len, char *out, size_t cap);
-        C;
-
-    private const array W431_SUMMARY_KEYS = ['total_refs', 'empty_ref_count', 'valid_basename_count', 'http_url_count', 'credential_url_count', 'image_extension_count', 'query_url_count'];
-
-    private static ?bool $w431UseRustFfi = null;
-
-    private static FFI|false|null $w431Ffi = null;
-
-    public static function useW431RustFfi(bool $enable = true): void
-    {
-        self::$w431UseRustFfi = $enable;
-    }
-
-    public static function usesW431RustFfi(): bool
-    {
-        return self::$w431UseRustFfi ?? self::W431_RUST_FFI_DEFAULT;
-    }
-
-    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
-    public static function resetW431RustFfi(): void
-    {
-        self::$w431UseRustFfi = null;
-        self::$w431Ffi = null;
-    }
-
-    /**
-     * Summarizes trimmed image references: basenames isValidBasenamePhp() accepts, http(s) URLs, URLs with
-     * an `@` in the authority, URLs with a query, and image extensions before a query, fragment or the end.
-     * Entries come from strings, integers, or the first non-null url, basename, name array field; other values
-     * (including objects) count as empty entries.
-     *
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>
-     */
-    public static function summarizeImageReferenceBatch(array $rows): array
-    {
-        return self::usesW431RustFfi() ? self::summarizeImageReferenceBatchNative($rows) : self::summarizeImageReferenceBatchPhp($rows);
-    }
-
-    /**
-     * Rust summary; falls back to PHP when the library or input frame is unusable.
-     *
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>
-     */
-    public static function summarizeImageReferenceBatchNative(array $rows): array
-    {
-        $values = CollectionsCleaningService::w431Invoke(self::$w431Ffi, self::W431_FFI_CDEF, 'nntmux_w431_release_image_batch', $rows, ['url', 'basename', 'name'], \count(self::W431_SUMMARY_KEYS));
-
-        return $values === null ? self::summarizeImageReferenceBatchPhp($rows) : array_combine(self::W431_SUMMARY_KEYS, $values);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>
-     */
-    public static function summarizeImageReferenceBatchPhp(array $rows): array
-    {
-        $summary = array_fill_keys(self::W431_SUMMARY_KEYS, 0);
-        foreach (CollectionsCleaningService::w431Entries($rows, ['url', 'basename', 'name']) as $entry) {
-            $summary['total_refs']++;
-            $entry = trim($entry);
-            if ($entry === '') {
-                $summary['empty_ref_count']++;
-
-                continue;
-            }
-            // Same pattern as isValidBasenamePhp().
-            $summary['valid_basename_count'] += (int) (preg_match('/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/D', $entry) === 1);
-            if (preg_match('#\Ahttps?://([^/?\#]*)#i', $entry, $match) === 1) {
-                $summary['http_url_count']++;
-                $summary['credential_url_count'] += (int) str_contains($match[1], '@');
-                $summary['query_url_count'] += (int) str_contains($entry, '?');
-            }
-            $summary['image_extension_count'] += (int) (preg_match('/\.(?:jpe?g|png|gif|webp|bmp)(?:[?#]|\z)/i', $entry) === 1);
-        }
-
-        return $summary;
-    }
-
-    /** Wave 55.3 paired benchmarks decide this default; see RustReleaseImageBrowseDuplicateGroupManagementW55ParityTest. */
-    private const bool W55_RUST_FFI_DEFAULT = true;
-
-    public const string W55_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w553_release_image_reference_flag_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    public static function usesW55RustFfi(): bool
-    {
-        $override = self::w55RustFfiState();
-
-        return \is_bool($override) ? $override : self::W55_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with the Wave 55 Rust path forced on or off, then restores the previous setting.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w55RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w55RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Wave 55.3 image reference flags. Per trimmed reference `flags | length << 16`, with flags 1 empty,
-     * 2 a basename isValidBasenamePhp() accepts, 4 http(s) URL, 8 `@` in its authority, 16 http(s) URL
-     * holding `?`, 32 image extension before a query, fragment or the end and 64 https, and `length` the
-     * trimmed byte length; then the seven flag counts.
-     *
-     * @param  array<array-key, string>  $refs
-     * @return list<int>
-     */
-    public static function w55ImageReferenceFlagBatch(array $refs): array
-    {
-        return self::usesW55RustFfi() ? self::w55ImageReferenceFlagBatchNative($refs) : self::w55ImageReferenceFlagBatchPhp($refs);
-    }
-
-    /**
-     * @param  array<array-key, string>  $refs
-     * @return list<int>
-     */
-    public static function w55ImageReferenceFlagBatchNative(array $refs): array
-    {
-        return self::w55Invoke($refs, \count($refs) + 7) ?? self::w55ImageReferenceFlagBatchPhp($refs);
-    }
-
-    /**
-     * @param  array<array-key, string>  $refs
-     * @return list<int>
-     */
-    public static function w55ImageReferenceFlagBatchPhp(array $refs): array
-    {
-        $out = [];
-        $totals = [0, 0, 0, 0, 0, 0, 0];
-        foreach ($refs as $ref) {
-            $entry = trim((string) $ref);
-            if ($entry === '') {
-                $word = 1;
-            } else {
-                $word = \strlen($entry) << 16;
-                // Same pattern as isValidBasenamePhp().
-                if (preg_match('/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/D', $entry) === 1) {
-                    $word |= 2;
-                }
-                if (preg_match('#\Ahttp(s?)://([^/?\#]*)#i', $entry, $match) === 1) {
-                    $word |= 4 | (str_contains($match[2], '@') ? 8 : 0) | (str_contains($entry, '?') ? 16 : 0) | ($match[1] !== '' ? 64 : 0);
-                }
-                if (preg_match('/\.(?:jpe?g|png|gif|webp|bmp)(?:[?#]|\z)/i', $entry) === 1) {
-                    $word |= 32;
-                }
-            }
-            for ($bit = 0; $bit < 7; $bit++) {
-                $totals[$bit] += ($word >> $bit) & 1;
-            }
-            $out[] = $word;
-        }
-        array_push($out, ...$totals);
-
-        return $out;
-    }
-
-    /**
-     * Wave 55 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
-     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
-     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
-     */
-    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        /** @var bool|null $override */
-        static $override = null;
-        /** @var FFI|false|null $ffi */
-        static $ffi = null;
-        /** @var CData|null $out */
-        static $out = null;
-        /** @var int $outCap */
-        static $outCap = 0;
-        /** @var CData|null $lens */
-        static $lens = null;
-        /** @var int $lensCap */
-        static $lensCap = 0;
-
-        if ($op === 'set') {
-            $previous = $override;
-            $override = \is_bool($val) ? $val : null;
-
-            return $previous;
-        }
-        if ($op === 'ffi') {
-            $ffi ??= RustPipelineLibrary::resolveDomain('release_w55', self::W55_FFI_CDEF) ?? false;
-
-            return $ffi === false ? null : $ffi;
-        }
-        if ($op === 'out') {
-            $words = \is_int($val) ? $val : 0;
-            if ($out === null || $outCap < $words) {
-                $handle = self::w55RustFfiState('ffi');
-                if (! $handle instanceof FFI) {
-                    return null;
-                }
-                $outCap = max(1024, $words * 2);
-                $out = $handle->new('int64_t['.$outCap.']');
-            }
-
-            return $out;
-        }
-        if ($op === 'lens') {
-            $words = \is_int($val) ? $val : 0;
-            if ($lens === null || $lensCap < $words) {
-                $handle = self::w55RustFfiState('ffi');
-                if (! $handle instanceof FFI) {
-                    return null;
-                }
-                $lensCap = max(256, $words * 2);
-                $lens = $handle->new('int64_t['.$lensCap.']');
-            }
-
-            return $lens;
-        }
-
-        return $override;
-    }
-
-    /**
-     * Calls the Wave 55.3 export with the NUL-joined $items, or with the items concatenated plus an
-     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
-     * declines or it writes other than $words words, so the caller falls back to PHP.
-     *
-     * @param  array<array-key, mixed>  $items
-     * @return list<int>|null
-     */
-    private static function w55Invoke(array $items, int $words): ?array
-    {
-        try {
-            $ffi = self::w55RustFfiState('ffi');
-            $out = self::w55RustFfiState('out', $words);
-            if (! $ffi instanceof FFI || ! $out instanceof CData) {
-                return null;
-            }
-            $count = \count($items);
-            $blob = implode("\0", $items);
-            $lens = null;
-            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
-                $blob = implode('', $items);
-                $column = self::w55RustFfiState('lens', $count);
-                if (! $column instanceof CData) {
-                    return null;
-                }
-                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
-                $lens = FFI::addr($column[0]);
-            }
-            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
-            $written = $ffi->nntmux_w553_release_image_reference_flag_batch($blob, \strlen($blob), $lens, $count, $out, $words);
-            if ($written !== $words) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($out, $words * 8));
-
-            /** @var list<int>|null */
-            return $values === false ? null : array_values($values);
-        } catch (Throwable) {
-            return null;
-        }
     }
 }

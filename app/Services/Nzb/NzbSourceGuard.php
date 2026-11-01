@@ -5,9 +5,6 @@ declare(strict_types=1);
 namespace App\Services\Nzb;
 
 use App\Support\ReleaseArchiveNamingEvidence;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
@@ -25,107 +22,18 @@ use Throwable;
  */
 final class NzbSourceGuard
 {
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_nzb_source_digest(const char *ptr, size_t len, char *out, size_t out_cap);
-        int32_t nntmux_nzb_source_validate_anchor(uint32_t absent, const char *guid_ptr, size_t guid_len, const char *path_ptr, size_t path_len, const char *anchor_ptr, size_t anchor_len, const char *dev_ptr, size_t dev_len, const char *ino_ptr, size_t ino_len);
-        int32_t nntmux_nzb_source_matches_anchor(int64_t mode, int64_t dev, int64_t ino, const char *receipt_dev_ptr, size_t receipt_dev_len, const char *receipt_ino_ptr, size_t receipt_ino_len);
-        int64_t nntmux_nzb_source_staged_guid_len(const char *ptr, size_t len);
-        C;
-
     /** @var array<string, true> */
     private static array $lockedPaths = [];
 
-    private static FFI|false|null $ffi = null;
-
-    private static bool $useRustFfi = true;
-
     public function __construct(private readonly NzbService $nzb) {}
 
-    public static function setUseRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    private static function resolveFfi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
-    /** Rust (hardware SHA-256) when the library is available: 7.8x mean / 6.5x p99 on 0.5 MB NZBs, 4x on tiny ones. */
     public static function digest(string $decoded): string
-    {
-        return self::digestNative($decoded) ?? self::digestPhp($decoded);
-    }
-
-    public static function digestPhp(string $decoded): string
     {
         return hash('sha256', "nntmux:nzb-archive-naming:1\0".$decoded);
     }
 
-    /** Rust implementation of {@see digestPhp()}; null when the library is unavailable or disabled. */
-    public static function digestNative(string $decoded): ?string
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return null;
-        }
-        $capacity = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $capacity);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_nzb_source_digest($decoded, \strlen($decoded), $scratch, $capacity);
-
-        return $written === 64 ? FFI::string($scratch, 64) : null;
-    }
-
     /** Partial upgrades stage their generation as `<canonical>.c<candidate>-<16 hex>.next` until they commit. */
     public const string STAGED_NAME = '/^(.+)\.nzb\.gz\.c\d+-[0-9a-f]{16}\.next$/D';
-
-    /** The GUID a staged generation's basename names, or null when it is not a staged generation. */
-    public static function stagedGuid(string $basename): ?string
-    {
-        return self::stagedGuidPhp($basename);
-    }
-
-    public static function stagedGuidPhp(string $basename): ?string
-    {
-        return preg_match(self::STAGED_NAME, $basename, $match) === 1 ? $match[1] : null;
-    }
-
-    /** Rust candidate for {@see stagedGuidPhp()}; `$supported` is false when the library is unavailable. */
-    public static function stagedGuidNative(string $basename, bool &$supported = false): ?string
-    {
-        $supported = false;
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $length = $ffi->nntmux_nzb_source_staged_guid_len($basename, \strlen($basename));
-        if (! \is_int($length) || $length === -1) {
-            return null;
-        }
-        $supported = true;
-
-        return $length < 1 ? null : substr($basename, 0, $length);
-    }
 
     /** @return SourceSnapshot|null */
     public function snapshot(string $guid, bool $beginNamingInspection = false): ?array
@@ -234,10 +142,10 @@ final class NzbSourceGuard
      */
     public function reconcileStaged(string $path, bool $apply = true): string
     {
-        $guid = self::stagedGuid(basename($path));
-        if ($guid === null) {
+        if (preg_match(self::STAGED_NAME, basename($path), $match) !== 1) {
             return 'kept';
         }
+        $guid = $match[1];
 
         return DB::transaction(function () use ($path, $guid, $apply): string {
             $release = DB::table('releases')->where('guid', $guid)->lockForUpdate()->first(['id', 'guid']);
@@ -393,7 +301,7 @@ final class NzbSourceGuard
         $paths = [];
         foreach ($directories as $directory) {
             foreach (glob($directory.DIRECTORY_SEPARATOR.$guid.'.nzb.gz.c*-*.next') ?: [] as $path) {
-                if (self::stagedGuid(basename($path)) === $guid) {
+                if (preg_match(self::STAGED_NAME, basename($path), $match) === 1 && $match[1] === $guid) {
                     $paths[] = $path;
                 }
             }
@@ -626,15 +534,6 @@ final class NzbSourceGuard
      */
     private function validateAnchor(array $receipt): array
     {
-        return self::validateAnchorPhp($receipt);
-    }
-
-    /**
-     * @param  array<string, mixed>  $receipt
-     * @return InodeDeletionAnchor|AbsentDeletionAnchor
-     */
-    public static function validateAnchorPhp(array $receipt): array
-    {
         if (($receipt['version'] ?? null) !== 1 || ! in_array($receipt['kind'] ?? null, ['inode', 'absent'], true)) {
             throw new RuntimeException('Unsupported NZB audit ownership receipt.');
         }
@@ -662,96 +561,13 @@ final class NzbSourceGuard
     }
 
     /**
-     * Rust candidate for {@see validateAnchorPhp()}; null (with `$supported` false) when the library is unavailable.
-     *
-     * @param  array<string, mixed>  $receipt
-     * @return InodeDeletionAnchor|AbsentDeletionAnchor|null
-     */
-    public static function validateAnchorNative(array $receipt, bool &$supported = false): ?array
-    {
-        $supported = false;
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return null;
-        }
-        $supported = true;
-        if (($receipt['version'] ?? null) !== 1 || ! in_array($receipt['kind'] ?? null, ['inode', 'absent'], true)) {
-            throw new RuntimeException('Unsupported NZB audit ownership receipt.');
-        }
-        $absent = $receipt['kind'] === 'absent';
-        foreach ($absent ? ['guid', 'path'] : ['guid', 'path', 'anchor', 'dev', 'ino'] as $key) {
-            if (! isset($receipt[$key]) || ! is_string($receipt[$key])) {
-                throw new RuntimeException('Malformed NZB audit ownership receipt.');
-            }
-        }
-        $anchor = $absent ? '' : $receipt['anchor'];
-        $dev = $absent ? '' : $receipt['dev'];
-        $ino = $absent ? '' : $receipt['ino'];
-        // @phpstan-ignore method.notFound
-        $code = $ffi->nntmux_nzb_source_validate_anchor($absent ? 1 : 0, $receipt['guid'], \strlen($receipt['guid']), $receipt['path'], \strlen($receipt['path']),
-            $anchor, \strlen($anchor), $dev, \strlen($dev), $ino, \strlen($ino));
-        if ($code === 1) {
-            throw new RuntimeException('Malformed NZB audit ownership receipt.');
-        }
-        if ($code === 2) {
-            throw new RuntimeException('NZB audit ownership receipt does not match its source.');
-        }
-        if ($code !== 0) {
-            $supported = false;
-
-            return null;
-        }
-
-        return $absent ? ['version' => 1, 'kind' => 'absent', 'guid' => $receipt['guid'], 'path' => $receipt['path']]
-            : ['version' => 1, 'kind' => 'inode', 'guid' => $receipt['guid'], 'path' => $receipt['path'], 'anchor' => $anchor,
-                'dev' => $dev, 'ino' => $ino];
-    }
-
-    /**
      * @param  array<string|int, int>|false  $stat
      * @param  InodeDeletionAnchor  $receipt
      */
     private function matchesAnchor(array|false $stat, array $receipt): bool
     {
-        return self::matchesAnchorPhp($stat, $receipt);
-    }
-
-    /**
-     * @param  array<string|int, int>|false  $stat
-     * @param  array{dev: string, ino: string}  $receipt
-     */
-    public static function matchesAnchorPhp(array|false $stat, array $receipt): bool
-    {
         return $stat !== false && ($stat['mode'] & 0170000) === 0100000
             && (string) $stat['dev'] === $receipt['dev'] && (string) $stat['ino'] === $receipt['ino'];
-    }
-
-    /**
-     * Rust candidate for {@see matchesAnchorPhp()}; null when the library is unavailable.
-     *
-     * @param  array<string|int, int>|false  $stat
-     * @param  array{dev: string, ino: string}  $receipt
-     */
-    public static function matchesAnchorNative(array|false $stat, array $receipt): ?bool
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return null;
-        }
-        if ($stat === false) {
-            return false;
-        }
-        // @phpstan-ignore method.notFound
-        $code = $ffi->nntmux_nzb_source_matches_anchor($stat['mode'], $stat['dev'], $stat['ino'],
-            $receipt['dev'], \strlen($receipt['dev']), $receipt['ino'], \strlen($receipt['ino']));
-
-        return $code < 0 ? null : $code === 1;
     }
 
     /** Ownership-aware cleanup, including when another writer installed identical bytes. */
@@ -920,435 +736,5 @@ final class NzbSourceGuard
             }
             throw $exception;
         }
-    }
-
-    /** The Wave 42.2 export shared by the staged name, path pair, upload filename, metadata type and part offset helpers. */
-    public const string W422_FFI_CDEF = <<<'C'
-        int32_t nntmux_w422_nzb_source_guard_install_staging_xml_par2(
-            uint32_t operation,
-            uint32_t flags,
-            const char *input,
-            size_t input_len,
-            char *out_buf,
-            size_t out_cap
-        );
-        C;
-
-    public const string W422_FFI_DOMAIN = 'nfo_w422';
-
-    /**
-     * Default for the Wave 42.2 toggle only; it stays false because the paired benchmark in
-     * tests/Unit/RustNzbSourceGuardInstallStagingXmlPar2W42ParityTest.php is below 1.5x.
-     */
-    public const bool W422_RUST_FFI_DEFAULT = false;
-
-    public const int W422_MAX_INPUT = 16777216;
-
-    /** The canonical basename of a retained source, as validateAnchorPhp() requires it. */
-    public const string W422_CANONICAL_NAME = '/^[a-zA-Z0-9_-]{1,40}\.nzb(\.gz)?$/D';
-
-    private static ?bool $useW422RustFfi = null;
-
-    public static function useW422RustFfi(bool $enable = true): void
-    {
-        self::$useW422RustFfi = $enable;
-    }
-
-    public static function usesW422RustFfi(): bool
-    {
-        return self::$useW422RustFfi ?? self::W422_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW422RustFfi(): void
-    {
-        self::$useW422RustFfi = null;
-    }
-
-    /**
-     * Run one Wave 42.2 operation; null whenever the library, input or answer is unusable, so callers fall back to PHP.
-     *
-     * @return list<int>|null
-     */
-    public static function evaluateW422Native(int $operation, string $input, int $slots): ?array
-    {
-        try {
-            if ($operation < 0 || $operation > 0xFFFFFFFF || $slots < 1 || $input === '' || \strlen($input) > self::W422_MAX_INPUT) {
-                return null;
-            }
-            $ffi = RustPipelineLibrary::resolveDomain(self::W422_FFI_DOMAIN, self::W422_FFI_CDEF, getenv('NNTMUX_PIPELINE_FFI_LIB') ?: null);
-            if (! $ffi instanceof FFI) {
-                return null;
-            }
-            $needed = $slots * 8;
-            for ($attempt = 0; $attempt < 2; $attempt++) {
-                $capacity = 0;
-                $output = RustPipelineLibrary::obtainScratch($ffi, $needed, $capacity);
-                if ($output === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_w422_nzb_source_guard_install_staging_xml_par2($operation, 0, $input, \strlen($input), $output, $capacity);
-                if (! \is_int($written) || $written === -1 || $written > $capacity) {
-                    return null;
-                }
-                if ($written < 0) {
-                    // Too small: retry once with the reported capacity.
-                    $needed = -$written;
-
-                    continue;
-                }
-                if ($written !== $slots * 8) {
-                    return null;
-                }
-                $values = array_values(unpack('q'.$slots, FFI::string($output, $written)) ?: []);
-
-                return \count($values) === $slots ? $values : null;
-            }
-        } catch (Throwable) {
-        }
-
-        return null;
-    }
-
-    /**
-     * Pack `[$lead, rows]`, one length slot per text (-1 for a non-string), `$width` texts per row, then the texts after
-     * `$prefix`; null when the packed input would exceed W422_MAX_INPUT.
-     *
-     * @param  list<string|null>  $texts
-     */
-    public static function packW422Texts(int $lead, array $texts, string $prefix = '', int $width = 1): ?string
-    {
-        $size = 16 + \count($texts) * 8 + \strlen($prefix);
-        if ($width < 1 || \count($texts) % $width !== 0 || $size > self::W422_MAX_INPUT) {
-            return null;
-        }
-        $words = [$lead, intdiv(\count($texts), $width)];
-        $tail = [$prefix];
-        foreach ($texts as $text) {
-            if ($text === null) {
-                $words[] = -1;
-
-                continue;
-            }
-            $words[] = \strlen($text);
-            $tail[] = $text;
-            $size += \strlen($text);
-            if ($size > self::W422_MAX_INPUT) {
-                return null;
-            }
-        }
-
-        return pack('q*', ...$words).implode('', $tail);
-    }
-
-    /**
-     * Classify NZB source basenames: invalid (not a string), staged (stagedGuidPhp() names a GUID, whose byte lengths are
-     * summed and maximized), canonical (`<guid>.nzb` or `<guid>.nzb.gz` with a 1-40 character `[a-zA-Z0-9_-]` GUID) or other.
-     *
-     * @param  array<array-key, mixed>  $basenames
-     * @return array{names: int, invalid: int, staged: int, canonical: int, other: int, guid_bytes: int, max_guid_bytes: int}
-     */
-    public static function summarizeStagedNameBatch(array $basenames): array
-    {
-        return (self::usesW422RustFfi() ? self::summarizeStagedNameBatchNative($basenames) : null)
-            ?? self::summarizeStagedNameBatchPhp($basenames);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $basenames
-     * @return array{names: int, invalid: int, staged: int, canonical: int, other: int, guid_bytes: int, max_guid_bytes: int}
-     */
-    public static function summarizeStagedNameBatchPhp(array $basenames): array
-    {
-        $invalid = $staged = $canonical = $other = $bytes = $max = 0;
-        foreach ($basenames as $name) {
-            if (! \is_string($name)) {
-                $invalid++;
-            } elseif (($guid = self::stagedGuidPhp($name)) !== null) {
-                $staged++;
-                $bytes += \strlen($guid);
-                $max = max($max, \strlen($guid));
-            } elseif (preg_match(self::W422_CANONICAL_NAME, $name) === 1) {
-                $canonical++;
-            } else {
-                $other++;
-            }
-        }
-
-        return ['names' => \count($basenames), 'invalid' => $invalid, 'staged' => $staged, 'canonical' => $canonical, 'other' => $other,
-            'guid_bytes' => $bytes, 'max_guid_bytes' => $max];
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $basenames
-     * @return array{names: int, invalid: int, staged: int, canonical: int, other: int, guid_bytes: int, max_guid_bytes: int}|null
-     */
-    public static function summarizeStagedNameBatchNative(array $basenames): ?array
-    {
-        $texts = [];
-        foreach ($basenames as $name) {
-            $texts[] = \is_string($name) ? $name : null;
-        }
-        $input = self::packW422Texts(0, $texts);
-        $slots = $input === null ? null : self::evaluateW422Native(0, $input, 7);
-        if ($slots === null) {
-            return null;
-        }
-        [$count, $invalid, $staged, $canonical, $other, $bytes, $max] = $slots;
-        if ($count !== \count($basenames) || min($slots) < 0 || $invalid + $staged + $canonical + $other !== $count || $max > $bytes) {
-            return null;
-        }
-
-        return ['names' => $count, 'invalid' => $invalid, 'staged' => $staged, 'canonical' => $canonical, 'other' => $other,
-            'guid_bytes' => $bytes, 'max_guid_bytes' => $max];
-    }
-
-    private const bool W56_RUST_FFI_DEFAULT = true;
-
-    public const string W56_FFI_CDEF = <<<'C'
-        int32_t nntmux_w566_anchor_receipt_batch(const char *versions, size_t versions_len, const char *fields, size_t fields_len, const char *field_twin, size_t field_twin_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    public const int W56_ANCHOR_HEADER = 9;
-
-    private const int W56_MAX_ITEMS = 1_048_576;
-
-    /**
-     * Check many deletion receipts as validateAnchorPhp() does, without throwing, from a version
-     * column and six string columns (kind, guid, path, anchor, dev, ino; missing values are 0 or
-     * empty). Status 0 valid inode, 1 valid absent, 2 unsupported (its version or kind), 3 malformed,
-     * 4 not matching its source.
-     *
-     * Layout: `[0]` count, `[1..5]` per status, `[6]` valid compressed (`.nzb.gz`) sources, `[7]`
-     * first rejected index (-1 when none), `[8]` FNV-1a digest; then per receipt `status |
-     * compressed << 3 | min(guid bytes, 255) << 4 | min(path bytes, 2^20-1) << 12`.
-     *
-     * @param  array<array-key, int>  $versions
-     * @param  array<array-key, string>  $kinds
-     * @param  array<array-key, string>  $guids
-     * @param  array<array-key, string>  $paths
-     * @param  array<array-key, string>  $anchors
-     * @param  array<array-key, string>  $devs
-     * @param  array<array-key, string>  $inos
-     * @return list<int>
-     */
-    public static function validateAnchorBatch(array $versions, array $kinds, array $guids, array $paths, array $anchors, array $devs, array $inos): array
-    {
-        return (self::usesW56RustFfi() ? self::validateAnchorBatchNative($versions, $kinds, $guids, $paths, $anchors, $devs, $inos) : null)
-            ?? self::validateAnchorBatchPhp($versions, $kinds, $guids, $paths, $anchors, $devs, $inos);
-    }
-
-    /**
-     * @param  array<array-key, int>  $versions
-     * @param  array<array-key, string>  $kinds
-     * @param  array<array-key, string>  $guids
-     * @param  array<array-key, string>  $paths
-     * @param  array<array-key, string>  $anchors
-     * @param  array<array-key, string>  $devs
-     * @param  array<array-key, string>  $inos
-     * @return list<int>
-     */
-    public static function validateAnchorBatchPhp(array $versions, array $kinds, array $guids, array $paths, array $anchors, array $devs, array $inos): array
-    {
-        $versions = array_values($versions);
-        $kinds = array_values($kinds);
-        $guids = array_values($guids);
-        $paths = array_values($paths);
-        $anchors = array_values($anchors);
-        $devs = array_values($devs);
-        $inos = array_values($inos);
-        $count = \count($versions);
-        $out = array_fill(0, self::W56_ANCHOR_HEADER, 0);
-        $out[0] = $count;
-        $out[7] = -1;
-        $digest = 2_166_136_261;
-        $rows = [];
-        for ($i = 0; $i < $count; $i++) {
-            $kind = $kinds[$i] ?? '';
-            $guid = $guids[$i] ?? '';
-            $path = $paths[$i] ?? '';
-            $base = '';
-            if ($versions[$i] !== 1 || ($kind !== 'inode' && $kind !== 'absent')) {
-                $status = 2;
-            } else {
-                $absent = $kind === 'absent';
-                $anchor = $anchors[$i] ?? '';
-                $dev = $devs[$i] ?? '';
-                $ino = $inos[$i] ?? '';
-                $base = basename($path);
-                $anchorBase = $absent ? '' : basename($anchor);
-                $status = match (true) {
-                    $guid === '' || $path === '' || str_contains($guid, "\0") || str_contains($path, "\0"),
-                    ! $absent && ($anchor === '' || $dev === '' || $ino === '' || str_contains($anchor, "\0") || str_contains($dev, "\0") || str_contains($ino, "\0")) => 3,
-                    preg_match('/^[a-zA-Z0-9_-]{1,40}$/D', $guid) !== 1 || ($base !== $guid.'.nzb.gz' && $base !== $guid.'.nzb') => 4,
-                    $absent => 1,
-                    dirname($path) !== dirname($anchor)
-                        || \strlen($anchorBase) !== \strlen($guid) + 55
-                        || ! str_starts_with($anchorBase, '.archive-audit-'.$guid.'-')
-                        || ! str_ends_with($anchorBase, '.anchor')
-                        || strspn($anchorBase, '0123456789abcdef', \strlen($guid) + 16, 32) !== 32
-                        || ! ctype_digit($dev) || ! ctype_digit($ino) => 4,
-                    default => 0,
-                };
-            }
-            $compressed = $status <= 1 && str_ends_with($base, '.gz') ? 1 : 0;
-            $out[1 + $status]++;
-            $out[6] += $compressed;
-            if ($status >= 2 && $out[7] < 0) {
-                $out[7] = $i;
-            }
-            $row = $status | $compressed << 3 | min(\strlen($guid), 255) << 4 | min(\strlen($path), 1_048_575) << 12;
-            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
-            $rows[] = $row;
-        }
-        $out[8] = $digest;
-
-        return [...$out, ...$rows];
-    }
-
-    /**
-     * Rust validation, or null when PHP must compute it (unavailable library or rejected input).
-     *
-     * @param  array<array-key, int>  $versions
-     * @param  array<array-key, string>  $kinds
-     * @param  array<array-key, string>  $guids
-     * @param  array<array-key, string>  $paths
-     * @param  array<array-key, string>  $anchors
-     * @param  array<array-key, string>  $devs
-     * @param  array<array-key, string>  $inos
-     * @return list<int>|null
-     */
-    public static function validateAnchorBatchNative(array $versions, array $kinds, array $guids, array $paths, array $anchors, array $devs, array $inos): ?array
-    {
-        $count = \count($versions);
-        if ($count > self::W56_MAX_ITEMS) {
-            return null;
-        }
-        $ints = pack('q*', ...array_values($versions));
-        [$joined, $twin] = self::w56Strings([...self::w56Fit($kinds, $count, ''), ...self::w56Fit($guids, $count, ''), ...self::w56Fit($paths, $count, ''),
-            ...self::w56Fit($anchors, $count, ''), ...self::w56Fit($devs, $count, ''), ...self::w56Fit($inos, $count, '')]);
-        $fields = self::W56_ANCHOR_HEADER + $count;
-
-        // @phpstan-ignore method.notFound
-        return self::w56Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w566_anchor_receipt_batch($ints, \strlen($ints), $joined, \strlen($joined), $twin, \strlen($twin), $count, $out, $fields));
-    }
-
-    /**
-     * Run `$callback` with the Wave 56.6 Rust batch path forced on or off, then restore the previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w56RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w56RustFfiState('set', $previous);
-        }
-    }
-
-    public static function usesW56RustFfi(): bool
-    {
-        $forced = self::w56RustFfiState();
-
-        return \is_bool($forced) ? $forced : self::W56_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Wave 56.6 routing and binding, kept in function statics so earlier waves' static state stays
-     * untouched. No `$op` returns the forced routing (null for the default); `'set'` replaces it with
-     * `$val` and returns the previous value; `'binding'` returns the cached `additional_w56` binding and
-     * an output buffer of at least `$val` values, or null.
-     */
-    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        /** @var bool|null $enabled */
-        static $enabled = null;
-        /** @var FFI|false|null $ffi */
-        static $ffi = null;
-        /** @var CData|null $buffer */
-        static $buffer = null;
-        static $capacity = 0;
-        if ($op === 'set') {
-            $previous = $enabled;
-            $enabled = \is_bool($val) ? $val : null;
-
-            return $previous;
-        }
-        if ($op !== 'binding') {
-            return $enabled;
-        }
-        $fields = \is_int($val) ? $val : 0;
-        try {
-            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w56', self::W56_FFI_CDEF) ?? false;
-            if ($ffi === false) {
-                return null;
-            }
-            if ($buffer === null || $capacity < $fields) {
-                $capacity = max(256, $fields);
-                $buffer = $ffi->new('int64_t['.$capacity.']');
-            }
-        } catch (Throwable) {
-            return null;
-        }
-
-        return $buffer === null ? null : [$ffi, $buffer];
-    }
-
-    /**
-     * The batch's `$fields` output words from one Wave 56.6 call, or null when PHP must compute it.
-     *
-     * @param  callable(FFI, CData): mixed  $call
-     * @return list<int>|null
-     */
-    private static function w56Call(int $fields, callable $call): ?array
-    {
-        /** @var array{0: FFI, 1: CData}|null $binding */
-        $binding = self::w56RustFfiState('binding', $fields);
-        if ($binding === null) {
-            return null;
-        }
-        try {
-            if ($call($binding[0], $binding[1]) !== 1) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
-        } catch (Throwable) {
-            return null;
-        }
-
-        return $values === false ? null : array_values($values);
-    }
-
-    /**
-     * NUL-joined values and, when one holds a NUL, the same list joined with 0x01 so Rust
-     * finds the separators where the two differ.
-     *
-     * @param  list<string>  $items
-     * @return array{0: string, 1: string}
-     */
-    private static function w56Strings(array $items): array
-    {
-        $joined = implode("\0", $items);
-
-        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
-    }
-
-    /**
-     * Exactly `$count` values: the list itself when it already fits, otherwise padded with `$pad`.
-     *
-     * @template TValue
-     *
-     * @param  array<array-key, TValue>  $values
-     * @param  TValue  $pad
-     * @return list<TValue>
-     */
-    private static function w56Fit(array $values, int $count, mixed $pad): array
-    {
-        return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, $pad);
     }
 }

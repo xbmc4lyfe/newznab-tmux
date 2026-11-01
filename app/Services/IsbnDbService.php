@@ -6,184 +6,16 @@ namespace App\Services;
 
 use App\Exceptions\BookProviderException;
 use App\Support\BookIsbn;
-use App\Support\BookMatchScorer;
-use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
-use FFI;
-use FFI\CData;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
-use InvalidArgumentException;
 use JsonException;
 use Psr\Http\Message\ResponseInterface;
-use Throwable;
 
 class IsbnDbService
 {
-    /** Disabled until correctness and the common-path and p99 benchmark gates qualify. */
-    public const bool W394_RUST_FFI_DEFAULT = false;
-
-    public const string W394_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w394_isbn_batch_candidates(const char *input, size_t len, char *out, size_t cap);
-        C;
-
-    private static ?bool $w394UseRustFfi = null;
-
-    private static FFI|false|null $w394Ffi = null;
-
-    public static function useW394RustFfi(?bool $use = true): void
-    {
-        self::$w394UseRustFfi = $use;
-        if ($use === null) {
-            self::$w394Ffi = null;
-        }
-    }
-
-    public static function usesW394RustFfi(): bool
-    {
-        return self::$w394UseRustFfi ?? self::W394_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW394RustFfi(): void
-    {
-        self::$w394UseRustFfi = null;
-        self::$w394Ffi = null;
-    }
-
-    /**
-     * Arguments contain only projected scalar fields, never caller-owned objects.
-     *
-     * @param  list<mixed>  $arguments
-     * @return array<string, int|string|bool>|null
-     */
-    private static function w394Call(array $arguments): ?array
-    {
-        try {
-            $input = serialize($arguments);
-            if (strlen($input) > 16777216) {
-                return null;
-            }
-            if (self::$w394Ffi === null) {
-                self::$w394Ffi = RustPipelineLibrary::resolveDomain('metadata_w394', self::W394_FFI_CDEF) ?? false;
-            }
-            $ffi = self::$w394Ffi;
-            if ($ffi === false) {
-                return null;
-            }
-            $capacity = 0;
-            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
-            if ($out === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
-            $written = $ffi->nntmux_w394_isbn_batch_candidates($input, strlen($input), $out, $capacity);
-            if (is_int($written) && $written < -1 && $written >= -16777216) {
-                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($out === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
-                $written = $ffi->nntmux_w394_isbn_batch_candidates($input, strlen($input), $out, $capacity);
-            }
-            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
-                return null;
-            }
-            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
-            $types = ['valid_isbn13_count' => 'int', 'valid_isbn10_count' => 'int', 'invalid_count' => 'int', 'deduplicated_count' => 'int', 'first_canonical_isbn13' => 'string'];
-            if (! is_array($result) || array_keys($result) !== array_keys($types)) {
-                return null;
-            }
-            foreach ($types as $key => $type) {
-                if (get_debug_type($result[$key]) !== $type) {
-                    return null;
-                }
-            }
-
-            return $result;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** @param array<array-key, mixed> $rawTokens
-     * @return array<string, int|string|bool>
-     */
-    public static function normalizeIsbnBatchCandidates(array $rawTokens): array
-    {
-        if (self::usesW394RustFfi()) {
-            $safe = [];
-            foreach ($rawTokens as $token) {
-                $safe[] = is_string($token) ? $token : null;
-            }
-            $native = self::w394Call([$safe]);
-            if ($native !== null) {
-                return $native;
-            }
-        }
-
-        return self::normalizeIsbnBatchCandidatesPhp($rawTokens);
-    }
-
-    /** @param array<array-key, mixed> $rawTokens
-     * @return array<string, int|string>
-     */
-    public static function normalizeIsbnBatchCandidatesPhp(array $rawTokens): array
-    {
-        $valid13 = $valid10 = $invalid = 0;
-        $canonical = [];
-        $first = '';
-        foreach ($rawTokens as $token) {
-            if (! is_string($token)) {
-                $invalid++;
-
-                continue;
-            }
-            $token = str_replace([' ', "\t", "\r", "\n", "\v", "\f", '-'], '', $token);
-            $token = str_replace('x', 'X', $token);
-            $isbn13 = '';
-            if (preg_match('/\A97[89][0-9]{10}\z/D', $token) === 1) {
-                $sum = 0;
-                for ($i = 0; $i < 13; $i++) {
-                    $sum += (ord($token[$i]) - 48) * ($i % 2 === 0 ? 1 : 3);
-                }
-                if ($sum % 10 === 0) {
-                    $valid13++;
-                    $isbn13 = $token;
-                }
-            } elseif (preg_match('/\A[0-9]{9}[0-9X]\z/D', $token) === 1) {
-                $sum = 0;
-                for ($i = 0; $i < 10; $i++) {
-                    $sum += ($token[$i] === 'X' ? 10 : ord($token[$i]) - 48) * (10 - $i);
-                }
-                if ($sum % 11 === 0) {
-                    $valid10++;
-                    $prefix = '978'.substr($token, 0, 9);
-                    $sum13 = 0;
-                    for ($i = 0; $i < 12; $i++) {
-                        $sum13 += (ord($prefix[$i]) - 48) * ($i % 2 === 0 ? 1 : 3);
-                    }
-                    $isbn13 = $prefix.(string) ((10 - $sum13 % 10) % 10);
-                }
-            }
-            if ($isbn13 === '') {
-                $invalid++;
-
-                continue;
-            }
-            $canonical[$isbn13] = true;
-            if ($first === '') {
-                $first = $isbn13;
-            }
-        }
-
-        return ['valid_isbn13_count' => $valid13, 'valid_isbn10_count' => $valid10, 'invalid_count' => $invalid, 'deduplicated_count' => count($canonical), 'first_canonical_isbn13' => $first];
-    }
-
-    /** Null selects the benchmark-qualified production default. */
-    public ?bool $useRustFfi = null;
-
     public const COOLDOWN_CACHE_KEY = 'isbndb_provider_cooldown';
 
     protected const API_URL = 'https://api2.isbndb.com';
@@ -410,54 +242,6 @@ class IsbnDbService
      */
     private function normalizeBookResult(array $book): array
     {
-        return ($this->useRustFfi ?? false) ? $this->normalizeBookResultNative($book) : $this->normalizeBookResultPhp($book);
-    }
-
-    /**
-     * @param  array<string, mixed>  $book
-     * @return array<string, mixed>
-     */
-    public function normalizeBookResultNative(array $book): array
-    {
-        $date = $book['date_published'] ?? null;
-        $authors = is_array($book['authors'] ?? null) ? $book['authors'] : [];
-        $subjects = is_array($book['subjects'] ?? null) ? $book['subjects'] : [];
-        foreach ([$authors, $subjects] as $items) {
-            foreach ($items as $value) {
-                if (! is_scalar($value) && $value !== null) {
-                    return $this->normalizeBookResultPhp($book);
-                }
-            }
-        }
-        $fields = [is_string($date) ? '1' : '0', is_string($date) ? $date : '', (string) count($authors), (string) count($subjects)];
-        foreach ([$authors, $subjects] as $items) {
-            foreach ($items as $value) {
-                $fields[] = (string) $value;
-            }
-        }
-        $input = implode("\0", $fields)."\0";
-        if (substr_count($input, "\0") !== count($fields)) {
-            return $this->normalizeBookResultPhp($book);
-        }
-        $result = BookMatchScorer::rankingString('nntmux_isbndb_fields_nul', $input);
-        $parts = $result === null ? [] : explode("\0", $result);
-        if (count($parts) !== 5 || $parts[4] !== '') {
-            return $this->normalizeBookResultPhp($book);
-        }
-
-        return $this->normalizeBookResultPhp($book, [
-            'author' => $parts[2], 'genre' => $parts[3],
-            'publishdate' => $parts[0] === '1' ? ($parts[1] === '' ? null : $parts[1]) : $this->normalizePublishDate($date),
-        ]);
-    }
-
-    /**
-     * @param  array<string, mixed>  $book
-     * @param  array{author: string, genre: string, publishdate: ?string}|null  $nativeFields
-     * @return array<string, mixed>
-     */
-    public function normalizeBookResultPhp(array $book, ?array $nativeFields = null): array
-    {
         $isbn13 = isset($book['isbn13']) ? BookIsbn::normalize((string) $book['isbn13']) : null;
         if ($isbn13 === null && isset($book['isbn'])) {
             $isbn13 = BookIsbn::normalize((string) $book['isbn']);
@@ -471,10 +255,10 @@ class IsbnDbService
             $isbn10 = BookIsbn::toIsbn10($isbn10);
         }
 
-        $authors = $nativeFields === null && is_array($book['authors'] ?? null)
+        $authors = is_array($book['authors'] ?? null)
             ? array_values(array_filter(array_map('strval', $book['authors'])))
             : [];
-        $subjects = $nativeFields === null && is_array($book['subjects'] ?? null)
+        $subjects = is_array($book['subjects'] ?? null)
             ? array_values(array_filter(array_map('strval', $book['subjects'])))
             : [];
 
@@ -484,17 +268,17 @@ class IsbnDbService
 
         return [
             'title' => (string) ($book['title'] ?? ''),
-            'author' => $nativeFields['author'] ?? implode(', ', $authors),
+            'author' => implode(', ', $authors),
             'asin' => 'isbndb:'.$identifier,
             'isbn' => $isbn13,
             'ean' => $isbn10,
             'url' => '',
             'salesrank' => '',
             'publisher' => (string) ($book['publisher'] ?? ''),
-            'publishdate' => $nativeFields !== null ? $nativeFields['publishdate'] : $this->normalizePublishDate($book['date_published'] ?? null),
+            'publishdate' => $this->normalizePublishDate($book['date_published'] ?? null),
             'pages' => isset($book['pages']) && is_numeric($book['pages']) ? (string) ((int) $book['pages']) : '',
             'overview' => strip_tags($overview),
-            'genre' => $nativeFields['genre'] ?? implode(', ', $subjects),
+            'genre' => implode(', ', $subjects),
             'coverurl' => $coverUrl,
             'cover' => $coverUrl !== '' ? 1 : 0,
         ];
@@ -553,169 +337,5 @@ class IsbnDbService
         $retryAt = strtotime($retryAfter);
 
         return $retryAt === false ? null : max(1, $retryAt - time());
-    }
-
-    // ---------------------------------------------------------------------
-    // Wave 51.4 batch helper
-    // ---------------------------------------------------------------------
-
-    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 10.57x, p99 9.73x; uncommon mean 8.08x, p99 6.30x); see RustIsbnOpenLibPar2ListProcessorNfoW51ParityTest. */
-    private const bool W51_RUST_FFI_DEFAULT = true;
-
-    public const string W51_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w514_isbn_token_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    private static ?bool $useW51RustFfi = null;
-
-    private static FFI|false|null $w51Ffi = null;
-
-    private static ?CData $w51Out = null;
-
-    private static int $w51OutCap = 0;
-
-    public static function usesW51RustFfi(): bool
-    {
-        return self::$useW51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Run $callback with the W51 batch dispatch forced on or off, then restore the previous choice.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::$useW51RustFfi;
-        self::$useW51RustFfi = $enabled;
-        try {
-            return $callback();
-        } finally {
-            self::$useW51RustFfi = $previous;
-        }
-    }
-
-    /**
-     * Classify raw ISBN tokens, three ints each: [13 or 10 for a valid ISBN-13 or ISBN-10, 0
-     * when invalid; canonical ISBN-13 as an integer or 0; index of the first earlier token with
-     * the same canonical ISBN-13 or -1]. Tokens are normalized as in
-     * normalizeIsbnBatchCandidatesPhp(): ASCII whitespace and hyphens removed, x uppercased.
-     *
-     * @param  list<string>  $tokens
-     * @return list<int>
-     */
-    public static function isbnTokenBatch(array $tokens): array
-    {
-        return self::usesW51RustFfi()
-            ? self::isbnTokenBatchNative($tokens)
-            : self::isbnTokenBatchPhp($tokens);
-    }
-
-    /**
-     * @param  list<string>  $tokens
-     * @return list<int>
-     */
-    public static function isbnTokenBatchNative(array $tokens): array
-    {
-        self::w51AssertList($tokens);
-        if ($tokens === []) {
-            return [];
-        }
-
-        return self::w51Call(implode("\0", $tokens), '', \count($tokens))
-            ?? self::isbnTokenBatchPhp($tokens);
-    }
-
-    /**
-     * @param  list<string>  $tokens
-     * @return list<int>
-     */
-    public static function isbnTokenBatchPhp(array $tokens): array
-    {
-        self::w51AssertList($tokens);
-        $out = [];
-        $seen = [];
-        foreach ($tokens as $i => $raw) {
-            $token = str_replace('x', 'X', str_replace([' ', "\t", "\r", "\n", "\v", "\f", '-'], '', $raw));
-            $kind = 0;
-            $isbn13 = '';
-            if (preg_match('/\A97[89][0-9]{10}\z/D', $token) === 1) {
-                $sum = 0;
-                for ($k = 0; $k < 13; $k++) {
-                    $sum += (ord($token[$k]) - 48) * ($k % 2 === 0 ? 1 : 3);
-                }
-                if ($sum % 10 === 0) {
-                    $kind = 13;
-                    $isbn13 = $token;
-                }
-            } elseif (preg_match('/\A[0-9]{9}[0-9X]\z/D', $token) === 1) {
-                $sum = 0;
-                for ($k = 0; $k < 10; $k++) {
-                    $sum += ($token[$k] === 'X' ? 10 : ord($token[$k]) - 48) * (10 - $k);
-                }
-                if ($sum % 11 === 0) {
-                    $kind = 10;
-                    $prefix = '978'.substr($token, 0, 9);
-                    $sum13 = 0;
-                    for ($k = 0; $k < 12; $k++) {
-                        $sum13 += (ord($prefix[$k]) - 48) * ($k % 2 === 0 ? 1 : 3);
-                    }
-                    $isbn13 = $prefix.(string) ((10 - $sum13 % 10) % 10);
-                }
-            }
-            if ($isbn13 === '') {
-                array_push($out, 0, 0, -1);
-
-                continue;
-            }
-            $first = $seen[$isbn13] ??= $i;
-            array_push($out, $kind, (int) $isbn13, $first === $i ? -1 : $first);
-        }
-
-        return $out;
-    }
-
-    /**
-     * One FFI crossing for the batch: NUL-joined tokens, three int64 words back per record. Null when
-     * the library is missing or declines.
-     *
-     * @return list<int>|null
-     */
-    private static function w51Call(string $text, string $ints, int $count): ?array
-    {
-        try {
-            self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w51', self::W51_FFI_CDEF) ?? false;
-            $ffi = self::$w51Ffi;
-            if ($ffi === false) {
-                return null;
-            }
-            $need = $count * 3;
-            $out = self::$w51Out;
-            if ($out === null || self::$w51OutCap < $need) {
-                self::$w51OutCap = max(1024, $need);
-                $out = self::$w51Out = $ffi->new('int64_t['.self::$w51OutCap.']');
-            }
-            // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
-            $written = $ffi->nntmux_w514_isbn_token_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w51OutCap);
-            if ($written !== $need) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($out, $need * 8));
-
-            return $values === false ? null : array_values($values);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** @param array<array-key, mixed> $values */
-    private static function w51AssertList(array $values): void
-    {
-        if (! array_is_list($values)) {
-            throw new InvalidArgumentException('W51 batch input must be a list.');
-        }
     }
 }

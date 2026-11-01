@@ -5,84 +5,11 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Facades\Search;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
-use Throwable;
 
 class DeleteReleases extends Command
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_maintenance_verification(const char *input, size_t len, uint32_t mode, char *out, size_t cap);
-        C;
-
-    // Single-call candidates remain opt-in until both performance gates pass.
-    private static bool $useRustFfi = false;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) !== null;
-    }
-
-    private static function transformNative(int $mode, string $input): string|false|null
-    {
-        if (! self::$useRustFfi || strlen($input) > 1_048_576) {
-            return null;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
-        if ($ffi === null) {
-            return null;
-        }
-        try {
-            $cap = 0;
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) * 4 + 256), $cap);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_maintenance_verification($input, strlen($input), $mode, $scratch, $cap);
-            if ($written === -3) {
-                return false;
-            }
-            if (! is_int($written) || $written < 0 || $written > $cap) {
-                return null;
-            }
-
-            return $written === 0 ? '' : FFI::string($scratch, $written);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** @return list<string>|null */
-    private static function decodeFrames(string $output): ?array
-    {
-        $values = [];
-        $offset = 0;
-        $size = strlen($output);
-        while ($offset < $size) {
-            if ($size - $offset < 4) {
-                return null;
-            }
-            $header = unpack('Vlength', substr($output, $offset, 4));
-            $length = $header['length'];
-            $offset += 4;
-            if ($length > $size - $offset) {
-                return null;
-            }
-            $values[] = substr($output, $offset, $length);
-            $offset += $length;
-        }
-
-        return $values;
-    }
-
     /**
      * The name and signature of the console command.
      *
@@ -338,11 +265,14 @@ class DeleteReleases extends Command
      */
     protected function formatCriterionToSql(string $criterion): ?string
     {
-        $parsed = $this->parseCriteria($criterion);
-        if ($parsed === false) {
+        $args = explode('=', $criterion);
+        if (count($args) !== 3) {
             return null;
         }
-        ['column' => $column, 'modifier' => $modifier, 'value' => $value] = $parsed;
+
+        $column = trim($args[0]);
+        $modifier = trim($args[1]);
+        $value = trim($args[2], '"\'');
 
         return match ($column) {
             'categories_id' => $modifier === 'equals' ? " AND categories_id = {$value}" : null,
@@ -410,52 +340,7 @@ class DeleteReleases extends Command
      */
     protected function cleanSpaces(string $string): string
     {
-        return (self::$useRustFfi ? self::cleanSpacesNative($string) : null) ?? self::cleanSpacesPhp($string);
-    }
-
-    public static function cleanSpacesPhp(string $string): string
-    {
         return preg_replace('/\s+/', ' ', trim($string));
-    }
-
-    public static function cleanSpacesNative(string $string): ?string
-    {
-        if ((int) ini_get('pcre.backtrack_limit') < strlen($string) + 1) {
-            return null;
-        }
-        $output = self::transformNative(0, $string);
-
-        return is_string($output) ? $output : null;
-    }
-
-    /** @return array{column: string, modifier: string, value: string}|false */
-    public static function parseCriteria(string $criterion): array|false
-    {
-        return (self::$useRustFfi ? self::parseCriteriaNative($criterion) : null) ?? self::parseCriteriaPhp($criterion);
-    }
-
-    /** @return array{column: string, modifier: string, value: string}|false */
-    public static function parseCriteriaPhp(string $criterion): array|false
-    {
-        $args = explode('=', $criterion);
-        if (count($args) !== 3) {
-            return false;
-        }
-
-        return ['column' => trim($args[0]), 'modifier' => trim($args[1]), 'value' => trim($args[2], "\"'")];
-    }
-
-    /** @return array{column: string, modifier: string, value: string}|false|null */
-    public static function parseCriteriaNative(string $criterion): array|false|null
-    {
-        $output = self::transformNative(1, $criterion);
-        if (! is_string($output)) {
-            return $output;
-        }
-        $parts = self::decodeFrames($output);
-
-        return $parts !== null && count($parts) === 3
-            ? ['column' => $parts[0], 'modifier' => $parts[1], 'value' => $parts[2]] : null;
     }
 
     /**

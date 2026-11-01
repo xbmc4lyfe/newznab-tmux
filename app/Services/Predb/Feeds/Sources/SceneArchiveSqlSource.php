@@ -6,8 +6,6 @@ namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\Contracts\CompleteCatalogueSource;
 use App\Services\Predb\Feeds\PredbFeedEntry;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use RuntimeException;
 
 /**
@@ -22,25 +20,6 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
     private const SCHEMA = "create table `predb` ( `id` int(10) not null auto_increment, `section` varchar(20) not null default '', `rlsname` varchar(255) not null default '', `grp` varchar(50) not null default '', `status` decimal(1,0) not null default '0', `nukereason` varchar(255) default null, `ctime` decimal(10,0) not null default '0', `size` int(8) default null, `files` int(6) default null, primary key (`id`), unique key `rlsname` (`rlsname`), key `grp` (`grp`) ) engine=myisam default charset=latin1;";
 
     private const FRAME_BYTES = 45;
-
-    private const NATIVE_CDEF = <<<'C'
-        int64_t nntmux_predb_scene_sql_scan_statement(const char *input, size_t len, uint8_t quoted, uint8_t escaped);
-        ssize_t nntmux_predb_scene_sql_parse_insert(const char *input, size_t len, uint32_t mode, char *output, size_t cap);
-        C;
-
-    /**
-     * Wave 45.2 production default for summarizeEligibilityBatch() is PHP: the paired benchmark in
-     * tests/Unit/RustPredbFeedsNzedbPredatabaseRssSceneArchiveSasW45ParityTest.php measures 1.72-1.88x mean but
-     * 1.37-2.38x p99 on common pages and 1.50-2.02x p99 on uncommon dumps, so p99 does not clear 1.5x in
-     * every round.
-     */
-    public const bool W452_RUST_FFI_DEFAULT = false;
-
-    private static ?bool $w452RustFfiOverride = null;
-
-    private static FFI|false|null $w452RustFfiHandle = null;
-
-    private static FFI|false|null $native = null;
 
     /** @var resource|null */
     private $input = null;
@@ -88,7 +67,6 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
         private readonly int $maxScratchBytes = 268435456,
         private readonly int $maxBucketBytes = 8388608,
         private readonly int $maxFrameIndexBytes = 4194304,
-        private readonly bool $useNative = true,
     ) {
         if ($pageSize < 1 || $pageSize > 10000 || $maxFileBytes < 1 || $maxFileBytes > 536870912
             || $maxStatementBytes < 1 || $maxStatementBytes > 4194304
@@ -160,14 +138,9 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
                     $this->activeFrame = $frame;
                     $this->pending = [];
                     $this->pendingOffset = 0;
-                    $native = $this->nativeInsert($statement, 1);
-                    if ($native !== null) {
-                        $this->pending = $native === '' ? [] : explode("\0", substr($native, 0, -1));
-                    } else {
-                        foreach ($this->rows($statement) as $row) {
-                            if (self::eligibilityReason($row) === null) {
-                                $this->pending[] = (string) $row[2];
-                            }
+                    foreach ($this->rows($statement) as $row) {
+                        if ($this->eligibilityReason($row) === null) {
+                            $this->pending[] = (string) $row[2];
                         }
                     }
                 }
@@ -232,72 +205,31 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
                     $state = 3;
                 } elseif ($state === 3 && str_starts_with($frame['statement'], 'INSERT INTO `predb` VALUES ')) {
                     $kind = 1;
-                    $native = $this->nativeInsert($frame['statement'], 0);
-                    if ($native !== null) {
-                        $counts = unpack('Vrows/Veligible/Vnoncanonical/Vconflict/VfirstNoncanonical/VfirstConflict', substr($native, 0, 24));
-                        $hasRows = $hasRows || $counts['rows'] > 0;
-                        $eligible = $counts['eligible'];
-                        $accepted += $eligible;
-                        $reasons = $counts['firstNoncanonical'] !== 0
-                            && ($counts['firstConflict'] === 0 || $counts['firstNoncanonical'] < $counts['firstConflict'])
-                            ? ['noncanonical_title' => $counts['noncanonical'], 'group_conflict' => $counts['conflict']]
-                            : ['group_conflict' => $counts['conflict'], 'noncanonical_title' => $counts['noncanonical']];
-                        foreach ($reasons as $reason => $count) {
-                            if ($count > 0) {
-                                $rejected[$reason] = ($rejected[$reason] ?? 0) + $count;
-                            }
-                        }
-                        // Group writes within one bounded statement, retaining the same per-hash
-                        // bucket and total scratch limits as the streaming PHP implementation.
-                        $writes = [];
-                        for ($position = 24, $length = strlen($native); $position < $length; $position += 32) {
-                            $hash = substr($native, $position, 32);
+                    foreach ($this->rows($frame['statement']) as $row) {
+                        $hasRows = true;
+                        foreach (["id\0".(string) $row[0], "title\0".strtolower((string) $row[2])] as $identity) {
+                            $hash = hash('sha256', $identity, true);
                             $bucket = ord($hash[0]) & 63;
-                            $bucketBytes[$bucket] = ($bucketBytes[$bucket] ?? 0) + 32;
-                            $this->scratchBytes += 32;
-                            if ($bucketBytes[$bucket] > $this->maxBucketBytes || $this->scratchBytes > $this->maxScratchBytes) {
-                                throw new RuntimeException('SCENE_ARCHIVE_SQL duplicate scratch exceeds its bounds or could not be written.');
-                            }
-                            $writes[$bucket] = ($writes[$bucket] ?? '').$hash;
-                        }
-                        foreach ($writes as $bucket => $bytes) {
                             if (! isset($buckets[$bucket])) {
                                 $buckets[$bucket] = fopen($this->workspace.'/bucket-'.$bucket, 'w+b');
                                 if ($buckets[$bucket] === false) {
                                     throw new RuntimeException('SCENE_ARCHIVE_SQL cannot create a duplicate-check bucket.');
                                 }
+                                $bucketBytes[$bucket] = 0;
                             }
-                            if (fwrite($buckets[$bucket], $bytes) !== strlen($bytes)) {
+                            $bucketBytes[$bucket] += 32;
+                            $this->scratchBytes += 32;
+                            if ($bucketBytes[$bucket] > $this->maxBucketBytes || $this->scratchBytes > $this->maxScratchBytes
+                                || fwrite($buckets[$bucket], $hash) !== 32) {
                                 throw new RuntimeException('SCENE_ARCHIVE_SQL duplicate scratch exceeds its bounds or could not be written.');
                             }
                         }
-                    } else {
-                        foreach ($this->rows($frame['statement']) as $row) {
-                            $hasRows = true;
-                            foreach (["id\0".(string) $row[0], "title\0".strtolower((string) $row[2])] as $identity) {
-                                $hash = hash('sha256', $identity, true);
-                                $bucket = ord($hash[0]) & 63;
-                                if (! isset($buckets[$bucket])) {
-                                    $buckets[$bucket] = fopen($this->workspace.'/bucket-'.$bucket, 'w+b');
-                                    if ($buckets[$bucket] === false) {
-                                        throw new RuntimeException('SCENE_ARCHIVE_SQL cannot create a duplicate-check bucket.');
-                                    }
-                                    $bucketBytes[$bucket] = 0;
-                                }
-                                $bucketBytes[$bucket] += 32;
-                                $this->scratchBytes += 32;
-                                if ($bucketBytes[$bucket] > $this->maxBucketBytes || $this->scratchBytes > $this->maxScratchBytes
-                                    || fwrite($buckets[$bucket], $hash) !== 32) {
-                                    throw new RuntimeException('SCENE_ARCHIVE_SQL duplicate scratch exceeds its bounds or could not be written.');
-                                }
-                            }
-                            $reason = self::eligibilityReason($row);
-                            if ($reason !== null) {
-                                $rejected[$reason] = ($rejected[$reason] ?? 0) + 1;
-                            } else {
-                                $eligible++;
-                                $accepted++;
-                            }
+                        $reason = $this->eligibilityReason($row);
+                        if ($reason !== null) {
+                            $rejected[$reason] = ($rejected[$reason] ?? 0) + 1;
+                        } else {
+                            $eligible++;
+                            $accepted++;
                         }
                     }
                 } elseif ($state === 3 && $normal === 'unlock tables;') {
@@ -379,44 +311,24 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
             if (strlen($buffer) + strlen($line) > $this->maxStatementBytes || str_contains($line, "\0")) {
                 throw new RuntimeException('SCENE_ARCHIVE_SQL statement exceeds its bounds or contains binary bytes.');
             }
-            $ffi = $this->useNative ? (self::$native ??= RustPipelineLibrary::resolveDomain('predb_sql_html', self::NATIVE_CDEF) ?? false) : false;
-            if ($ffi !== false) {
-                // @phpstan-ignore method.notFound
-                $boundary = $ffi->nntmux_predb_scene_sql_scan_statement($line, strlen($line), (int) $quoted, (int) $escaped);
-                if ($boundary >= 0) {
-                    $buffer .= substr($line, 0, $boundary + 1);
-                    if (fseek($this->input, $start + $boundary + 1) !== 0) {
+            for ($i = 0, $length = strlen($line); $i < $length; $i++) {
+                if ($escaped) {
+                    $escaped = false;
+
+                    continue;
+                }
+                $char = $line[$i];
+                if ($quoted && $char === '\\') {
+                    $escaped = true;
+                } elseif ($char === "'") {
+                    $quoted = ! $quoted;
+                } elseif (! $quoted && $char === ';') {
+                    $buffer .= substr($line, 0, $i + 1);
+                    if (fseek($this->input, $start + $i + 1) !== 0) {
                         throw new RuntimeException('SCENE_ARCHIVE_SQL cannot preserve statement boundaries.');
                     }
 
                     return ['offset' => $offset, 'statement' => $buffer];
-                }
-                if ($boundary >= -4) {
-                    $quoted = ((-$boundary - 1) & 1) !== 0;
-                    $escaped = ((-$boundary - 1) & 2) !== 0;
-                } else {
-                    throw new RuntimeException('SCENE_ARCHIVE_SQL statement exceeds its bounds or contains binary bytes.');
-                }
-            } else {
-                for ($i = 0, $length = strlen($line); $i < $length; $i++) {
-                    if ($escaped) {
-                        $escaped = false;
-
-                        continue;
-                    }
-                    $char = $line[$i];
-                    if ($quoted && $char === '\\') {
-                        $escaped = true;
-                    } elseif ($char === "'") {
-                        $quoted = ! $quoted;
-                    } elseif (! $quoted && $char === ';') {
-                        $buffer .= substr($line, 0, $i + 1);
-                        if (fseek($this->input, $start + $i + 1) !== 0) {
-                            throw new RuntimeException('SCENE_ARCHIVE_SQL cannot preserve statement boundaries.');
-                        }
-
-                        return ['offset' => $offset, 'statement' => $buffer];
-                    }
                 }
             }
             $buffer .= $line;
@@ -426,32 +338,6 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
         }
 
         return null;
-    }
-
-    /** Raw validated protocol, or null to retain PHP error and resource-limit precedence. */
-    private function nativeInsert(string $statement, int $mode): ?string
-    {
-        if (! $this->useNative) {
-            return null;
-        }
-        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_sql_html', self::NATIVE_CDEF) ?? false;
-        if ($ffi === false) {
-            return null;
-        }
-        // Every nine-field tuple occupies at least 19 input bytes, even before
-        // schema validation. Four times the statement bounds both hash and title output.
-        $capacity = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, strlen($statement) * ($mode === 0 ? 4 : 1) + 24, $capacity);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_predb_scene_sql_parse_insert($statement, strlen($statement), $mode, $scratch, $capacity);
-        if ($written < 0) {
-            return null;
-        }
-
-        return $written === 0 ? '' : FFI::string($scratch, $written);
     }
 
     /** @return \Generator<int, list<string|null>> */
@@ -556,8 +442,8 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
         }
     }
 
-    /** @param array<int, string|null> $row */
-    private static function eligibilityReason(array $row): ?string
+    /** @param list<string|null> $row */
+    private function eligibilityReason(array $row): ?string
     {
         $title = (string) $row[2];
         if (preg_match("/^[A-Za-z0-9_.()&'+,-]+-[A-Za-z0-9_]+$/D", $title) !== 1) {
@@ -649,140 +535,5 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
         $this->lastPage = [];
         $this->activeFrame = null;
         $this->scratchBytes = $this->frameBytes = $this->cursorPage = $this->pendingOffset = 0;
-    }
-
-    /** Force the Wave 45.2 helper onto Rust (true) or PHP (false); null restores W452_RUST_FFI_DEFAULT. */
-    public static function useW452RustFfi(?bool $enable = true): void
-    {
-        self::$w452RustFfiOverride = $enable;
-    }
-
-    public static function usesW452RustFfi(): bool
-    {
-        return self::$w452RustFfiOverride ?? self::W452_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW452RustFfi(): void
-    {
-        self::$w452RustFfiOverride = null;
-        self::$w452RustFfiHandle = null;
-    }
-
-    /**
-     * Summarize parsed INSERT rows as eligibilityReason() admits them, reading the title (index 2) and group
-     * (index 3): non-arrays and rows whose title or group is neither a string nor null are invalid; eligible
-     * titles also count their distinct strtolower() identities.
-     *
-     * @param  array<array-key, mixed>  $rows
-     * @return array{total: int, invalid: int, noncanonical_title: int, group_conflict: int, eligible: int, distinct: int}
-     */
-    public static function summarizeEligibilityBatch(array $rows): array
-    {
-        return (self::usesW452RustFfi() ? self::summarizeEligibilityBatchNative($rows) : null)
-            ?? self::summarizeEligibilityBatchPhp($rows);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rows
-     * @return array{total: int, invalid: int, noncanonical_title: int, group_conflict: int, eligible: int, distinct: int}
-     */
-    public static function summarizeEligibilityBatchPhp(array $rows): array
-    {
-        $summary = ['total' => \count($rows), 'invalid' => 0, 'noncanonical_title' => 0, 'group_conflict' => 0, 'eligible' => 0, 'distinct' => 0];
-        $titles = [];
-        foreach ($rows as $row) {
-            $title = \is_array($row) ? ($row[2] ?? null) : null;
-            $group = \is_array($row) ? ($row[3] ?? null) : null;
-            if (! \is_array($row) || ($title !== null && ! \is_string($title)) || ($group !== null && ! \is_string($group))) {
-                $summary['invalid']++;
-
-                continue;
-            }
-            $reason = self::eligibilityReason([2 => $title, 3 => $group]);
-            if ($reason !== null) {
-                $summary[$reason]++;
-
-                continue;
-            }
-            $summary['eligible']++;
-            $titles[strtolower((string) $title)] = true;
-        }
-        $summary['distinct'] = \count($titles);
-
-        return $summary;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rows
-     * @return array{total: int, invalid: int, noncanonical_title: int, group_conflict: int, eligible: int, distinct: int}|null
-     */
-    public static function summarizeEligibilityBatchNative(array $rows): ?array
-    {
-        // String titles and groups go NUL-delimited; any other row or field needs the length table.
-        $fields = [];
-        foreach ($rows as $row) {
-            if (! \is_array($row) || ! \is_string($row[2] ?? null) || ! \is_string($row[3] ?? null)) {
-                $fields = [];
-
-                break;
-            }
-            $fields[] = $row[2];
-            $fields[] = $row[3];
-        }
-        $blob = null;
-        if ($fields !== []) {
-            $blob = implode("\0", $fields);
-            if (substr_count($blob, "\0") !== \count($fields) - 1) {
-                $blob = null;
-            }
-        }
-        $lens = '';
-        $operation = 3 | PredatabaseSource::W452_DELIMITED;
-        if ($blob === null) {
-            $lengths = [];
-            $parts = [];
-            foreach ($rows as $row) {
-                $title = \is_array($row) ? ($row[2] ?? null) : null;
-                $group = \is_array($row) ? ($row[3] ?? null) : null;
-                if (! \is_array($row) || ($title !== null && ! \is_string($title)) || ($group !== null && ! \is_string($group))) {
-                    array_push($lengths, PredatabaseSource::W452_INVALID, PredatabaseSource::W452_INVALID);
-
-                    continue;
-                }
-                $lengths[] = $title === null ? PredatabaseSource::W452_NULL : \strlen($title);
-                $lengths[] = $group === null ? PredatabaseSource::W452_NULL : \strlen($group);
-                if ($title !== null) {
-                    $parts[] = $title;
-                }
-                if ($group !== null) {
-                    $parts[] = $group;
-                }
-            }
-            $blob = implode('', $parts);
-            $lens = pack('V*', ...$lengths);
-            $operation = 3;
-        }
-        if (\strlen($blob) > PredatabaseSource::W452_MAX_INPUT || \strlen($lens) > PredatabaseSource::W452_MAX_INPUT) {
-            return null;
-        }
-        $values = PredatabaseSource::callW452Native(self::w452RustFfi(), $operation, 0, $blob, $lens, 6);
-        if ($values === null) {
-            return null;
-        }
-        [$total, $invalid, $noncanonical, $conflict, $eligible, $distinct] = $values;
-        if ($total !== \count($rows) || min($values) < 0 || $invalid + $noncanonical + $conflict + $eligible !== $total
-            || $distinct > $eligible || ($distinct > 0) !== ($eligible > 0)) {
-            return null;
-        }
-
-        return ['total' => $total, 'invalid' => $invalid, 'noncanonical_title' => $noncanonical, 'group_conflict' => $conflict,
-            'eligible' => $eligible, 'distinct' => $distinct];
-    }
-
-    private static function w452RustFfi(): ?FFI
-    {
-        self::$w452RustFfiHandle ??= RustPipelineLibrary::resolveDomain(PredatabaseSource::W452_FFI_DOMAIN, PredatabaseSource::W452_FFI_CDEF) ?? false;
-
-        return self::$w452RustFfiHandle === false ? null : self::$w452RustFfiHandle;
     }
 }

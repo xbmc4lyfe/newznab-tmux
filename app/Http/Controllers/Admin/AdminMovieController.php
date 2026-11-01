@@ -11,76 +11,15 @@ use App\Models\Release;
 use App\Services\MovieService;
 use App\Services\ReleaseImageService;
 use App\Support\ReleaseSearchIndexSync;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\View\View;
-use Throwable;
 
 class AdminMovieController extends BasePageController
 {
-    private const FFI_CDEF = <<<'CDEF'
-    int32_t nntmux_admin_movie_is_numeric_imdb_id(
-        const char *id_ptr,
-        size_t id_len
-    );
-    ssize_t nntmux_admin_movie_build_image_keys(
-        const char *id_ptr,
-        size_t id_len,
-        size_t *out_lens,
-        char *out_buf,
-        size_t out_cap
-    );
-    int32_t nntmux_admin_movie_normalize_update_flags(
-        int64_t has_cover,
-        int64_t has_backdrop,
-        int64_t *out_flags
-    );
-    CDEF;
-
-    /**
-     * Production default stays false until benchmark/parity sign-off; see
-     * tests/Unit/RustAdminMediaCatalogControllersParityTest.php.
-     */
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
     protected MovieService $movieService;
 
     protected ReleaseImageService $imageService;
-
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useRustFfi = (bool) $useRustFfi;
-    }
-
-    public static function enableRustFfi(): void
-    {
-        self::$useRustFfi = true;
-    }
-
-    public static function disableRustFfi(): void
-    {
-        self::$useRustFfi = false;
-    }
-
-    public static function resetRustFfi(): void
-    {
-        self::$useRustFfi = false;
-        self::$ffi = null;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $ffi): void
-    {
-        self::$ffi = $ffi;
-    }
 
     public function __construct(MovieService $movieService, ReleaseImageService $imageService)
     {
@@ -128,7 +67,7 @@ class AdminMovieController extends BasePageController
         // Validate the IMDB ID
         $id = $request->input('id');
 
-        if (! self::isValidNumericImdbId($id)) {
+        if (! is_numeric($id)) {
             return redirect()->back()
                 ->with('error', 'Invalid IMDB ID. Please enter only numeric digits (without the "tt" prefix).')
                 ->withInput();
@@ -230,28 +169,33 @@ class AdminMovieController extends BasePageController
                     mkdir(public_path('covers/movies'), 0755, true);
                 }
 
-                $imageKeys = self::buildMovieImageKeys((string) $id);
-
                 // Handle cover upload
                 if ($request->hasFile('cover') && $request->file('cover')->isValid()) {
-                    $this->imageService->saveUploadedImage($imageKeys['cover'], $request->file('cover'), $imageDirectory);
+                    $this->imageService->saveUploadedImage($id.'-cover', $request->file('cover'), $imageDirectory);
                 }
 
                 // Handle backdrop upload
                 if ($request->hasFile('backdrop') && $request->file('backdrop')->isValid()) {
-                    $this->imageService->saveUploadedImage($imageKeys['backdrop'], $request->file('backdrop'), $imageDirectory);
+                    $this->imageService->saveUploadedImage($id.'-backdrop', $request->file('backdrop'), $imageDirectory);
                 }
 
-                $payload = self::buildMovieUpdatePayload(
-                    $id,
-                    $request->all(),
-                    $this->imageService->imageExists($imageDirectory, $imageKeys['cover']),
-                    $this->imageService->imageExists($imageDirectory, $imageKeys['backdrop']),
-                );
-                $request->merge(['cover' => $payload['cover']]);
-                $request->merge(['backdrop' => $payload['backdrop']]);
+                $request->merge(['cover' => (int) $this->imageService->imageExists($imageDirectory, $id.'-cover')]);
+                $request->merge(['backdrop' => (int) $this->imageService->imageExists($imageDirectory, $id.'-backdrop')]);
 
-                $this->movieService->update($payload);
+                $this->movieService->update([
+                    'actors' => $request->input('actors'),
+                    'backdrop' => $request->input('backdrop'),
+                    'cover' => $request->input('cover'),
+                    'director' => $request->input('director'),
+                    'genre' => $request->input('genre'),
+                    'imdbid' => $id,
+                    'language' => $request->input('language'),
+                    'plot' => $request->input('plot'),
+                    'rating' => $request->input('rating'),
+                    'tagline' => $request->input('tagline'),
+                    'title' => $request->input('title'),
+                    'year' => $request->input('year'),
+                ]);
 
                 // Link releases to this movie
                 $movieInfo = MovieInfo::query()->where('imdbid', $id)->first(['id']);
@@ -272,287 +216,5 @@ class AdminMovieController extends BasePageController
         }
 
         return view('admin.movies.edit', compact('title', 'mov'))->with('movie', $mov);
-    }
-
-    public static function isValidNumericImdbId(mixed $id): bool
-    {
-        if (self::$useRustFfi) {
-            return self::isValidNumericImdbIdNative($id);
-        }
-
-        return self::isValidNumericImdbIdPhp($id);
-    }
-
-    public static function isValidNumericImdbIdPhp(mixed $id): bool
-    {
-        return is_numeric($id);
-    }
-
-    public static function isValidNumericImdbIdNative(mixed $id): bool
-    {
-        if (! is_string($id)) {
-            return self::isValidNumericImdbIdPhp($id);
-        }
-
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::isValidNumericImdbIdPhp($id);
-        }
-
-        try {
-            $rc = (int) self::callFfi($ffi, 'nntmux_admin_movie_is_numeric_imdb_id', $id, strlen($id));
-            if ($rc < 0) {
-                return self::isValidNumericImdbIdPhp($id);
-            }
-
-            return $rc === 1;
-        } catch (Throwable) {
-            return self::isValidNumericImdbIdPhp($id);
-        }
-    }
-
-    /**
-     * @return array{cover: string, backdrop: string}
-     */
-    public static function buildMovieImageKeys(int|string $id): array
-    {
-        if (self::$useRustFfi) {
-            return self::buildMovieImageKeysNative($id);
-        }
-
-        return self::buildMovieImageKeysPhp($id);
-    }
-
-    /**
-     * @return array{cover: string, backdrop: string}
-     */
-    public static function buildMovieImageKeysPhp(int|string $id): array
-    {
-        $idStr = (string) $id;
-
-        return [
-            'cover' => $idStr.'-cover',
-            'backdrop' => $idStr.'-backdrop',
-        ];
-    }
-
-    /**
-     * @return array{cover: string, backdrop: string}
-     */
-    public static function buildMovieImageKeysNative(int|string $id): array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::buildMovieImageKeysPhp($id);
-        }
-
-        $idStr = (string) $id;
-
-        try {
-            $lens = $ffi->new('size_t[2]');
-            $cap = 0;
-            $buf = RustPipelineLibrary::obtainScratch($ffi, max(64, strlen($idStr) * 2 + 32), $cap);
-            if ($buf === null) {
-                return self::buildMovieImageKeysPhp($id);
-            }
-
-            $rc = (int) self::callFfi(
-                $ffi,
-                'nntmux_admin_movie_build_image_keys',
-                $idStr,
-                strlen($idStr),
-                $lens,
-                $buf,
-                $cap
-            );
-            if ($rc < -1) {
-                $buf = RustPipelineLibrary::obtainScratch($ffi, -$rc, $cap);
-                if ($buf === null) {
-                    return self::buildMovieImageKeysPhp($id);
-                }
-                $rc = (int) self::callFfi(
-                    $ffi,
-                    'nntmux_admin_movie_build_image_keys',
-                    $idStr,
-                    strlen($idStr),
-                    $lens,
-                    $buf,
-                    $cap
-                );
-            }
-            if ($rc < 0) {
-                return self::buildMovieImageKeysPhp($id);
-            }
-
-            $coverLen = (int) $lens[0];
-            $backdropLen = (int) $lens[1];
-            if ($coverLen + $backdropLen !== $rc) {
-                return self::buildMovieImageKeysPhp($id);
-            }
-
-            $packed = FFI::string($buf, $rc);
-
-            return [
-                'cover' => substr($packed, 0, $coverLen),
-                'backdrop' => substr($packed, $coverLen, $backdropLen),
-            ];
-        } catch (Throwable) {
-            return self::buildMovieImageKeysPhp($id);
-        }
-    }
-
-    /**
-     * @param  array<string, mixed>  $input
-     * @return array{
-     *     actors: mixed,
-     *     backdrop: int,
-     *     cover: int,
-     *     director: mixed,
-     *     genre: mixed,
-     *     imdbid: mixed,
-     *     language: mixed,
-     *     plot: mixed,
-     *     rating: mixed,
-     *     tagline: mixed,
-     *     title: mixed,
-     *     year: mixed
-     * }
-     */
-    public static function buildMovieUpdatePayload(
-        mixed $id,
-        array $input,
-        bool|int $hasCover = false,
-        bool|int $hasBackdrop = false,
-    ): array {
-        if (self::$useRustFfi) {
-            return self::buildMovieUpdatePayloadNative($id, $input, $hasCover, $hasBackdrop);
-        }
-
-        return self::buildMovieUpdatePayloadPhp($id, $input, $hasCover, $hasBackdrop);
-    }
-
-    /**
-     * @param  array<string, mixed>  $input
-     * @return array{
-     *     actors: mixed,
-     *     backdrop: int,
-     *     cover: int,
-     *     director: mixed,
-     *     genre: mixed,
-     *     imdbid: mixed,
-     *     language: mixed,
-     *     plot: mixed,
-     *     rating: mixed,
-     *     tagline: mixed,
-     *     title: mixed,
-     *     year: mixed
-     * }
-     */
-    public static function buildMovieUpdatePayloadPhp(
-        mixed $id,
-        array $input,
-        bool|int $hasCover = false,
-        bool|int $hasBackdrop = false,
-    ): array {
-        return [
-            'actors' => $input['actors'] ?? null,
-            'backdrop' => ((int) $hasBackdrop) !== 0 ? 1 : 0,
-            'cover' => ((int) $hasCover) !== 0 ? 1 : 0,
-            'director' => $input['director'] ?? null,
-            'genre' => $input['genre'] ?? null,
-            'imdbid' => $id,
-            'language' => $input['language'] ?? null,
-            'plot' => $input['plot'] ?? null,
-            'rating' => $input['rating'] ?? null,
-            'tagline' => $input['tagline'] ?? null,
-            'title' => $input['title'] ?? null,
-            'year' => $input['year'] ?? null,
-        ];
-    }
-
-    /**
-     * @param  array<string, mixed>  $input
-     * @return array{
-     *     actors: mixed,
-     *     backdrop: int,
-     *     cover: int,
-     *     director: mixed,
-     *     genre: mixed,
-     *     imdbid: mixed,
-     *     language: mixed,
-     *     plot: mixed,
-     *     rating: mixed,
-     *     tagline: mixed,
-     *     title: mixed,
-     *     year: mixed
-     * }
-     */
-    public static function buildMovieUpdatePayloadNative(
-        mixed $id,
-        array $input,
-        bool|int $hasCover = false,
-        bool|int $hasBackdrop = false,
-    ): array {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::buildMovieUpdatePayloadPhp($id, $input, $hasCover, $hasBackdrop);
-        }
-
-        try {
-            $flags = $ffi->new('int64_t[2]');
-            $rc = (int) self::callFfi(
-                $ffi,
-                'nntmux_admin_movie_normalize_update_flags',
-                (int) $hasCover,
-                (int) $hasBackdrop,
-                $flags
-            );
-            if ($rc !== 0) {
-                return self::buildMovieUpdatePayloadPhp($id, $input, $hasCover, $hasBackdrop);
-            }
-
-            return [
-                'actors' => $input['actors'] ?? null,
-                'backdrop' => (int) $flags[1],
-                'cover' => (int) $flags[0],
-                'director' => $input['director'] ?? null,
-                'genre' => $input['genre'] ?? null,
-                'imdbid' => $id,
-                'language' => $input['language'] ?? null,
-                'plot' => $input['plot'] ?? null,
-                'rating' => $input['rating'] ?? null,
-                'tagline' => $input['tagline'] ?? null,
-                'title' => $input['title'] ?? null,
-                'year' => $input['year'] ?? null,
-            ];
-        } catch (Throwable) {
-            return self::buildMovieUpdatePayloadPhp($id, $input, $hasCover, $hasBackdrop);
-        }
-    }
-
-    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
-    {
-        return $ffi->$symbol(...$args);
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === false) {
-            return null;
-        }
-
-        if (self::$ffi instanceof FFI) {
-            return self::$ffi;
-        }
-
-        $envLib = getenv('NNTMUX_PIPELINE_FFI_LIB');
-        $ffi = RustPipelineLibrary::resolveDomain(
-            'metadata',
-            self::FFI_CDEF,
-            is_string($envLib) && $envLib !== '' ? $envLib : null,
-        );
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
     }
 }

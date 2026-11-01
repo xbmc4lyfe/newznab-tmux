@@ -6,11 +6,6 @@ namespace App\Services\AdditionalProcessing\Config;
 
 use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\Configuration\ConfigurationProvider;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
-use ReflectionProperty;
-use Throwable;
 
 /**
  * Configuration DTO for additional post-processing.
@@ -18,18 +13,6 @@ use Throwable;
  */
 final readonly class ProcessingConfiguration
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_pcfg_kill_string(const char *path, size_t path_len, int32_t path_present, int64_t timeout_seconds, char *out, size_t cap);
-        ssize_t nntmux_pcfg_ffprobe_sibling(const char *path, size_t path_len, char *out, size_t cap);
-        int32_t nntmux_pcfg_normalize_limits(const int64_t *raw, size_t count, int64_t *out, size_t out_count);
-        C;
-
-    /** Number of integer limits handled by {@see normalizeLimits()}. */
-    public const int LIMIT_COUNT = 14;
-
-    // PHP remains the production default until benchmarks qualify Rust.
-    public bool $useRustFfi;
-
     public bool $echoCLI;
 
     public bool|string $innerFileBlacklist;
@@ -157,9 +140,8 @@ final readonly class ProcessingConfiguration
 
     public string $videoFileRegex;
 
-    public function __construct(bool $useRustFfi = false)
+    public function __construct()
     {
-        $this->useRustFfi = $useRustFfi;
         $this->echoCLI = (bool) config('nntmux.echocli');
         $innerFileBlacklistValue = app(ConfigurationProvider::class)->postProcessing()->innerFileBlacklist;
         $this->innerFileBlacklist = ($innerFileBlacklistValue === '' || $innerFileBlacklistValue === null)
@@ -176,6 +158,10 @@ final readonly class ProcessingConfiguration
         $this->queryLimit = (int) (app(ConfigurationProvider::class)->postProcessing()->maxAdditionalProcessed ?: 25);
         $this->segmentsToDownload = (int) (app(ConfigurationProvider::class)->postProcessing()->segmentsToDownload ?: 2);
         $this->maximumRarSegments = (int) (app(ConfigurationProvider::class)->postProcessing()->maxPartsProcessed ?: 3);
+        $this->maximumRarPasswordChecks = max((int) (app(ConfigurationProvider::class)->postProcessing()->passwordCheckAttempts ?: 1), 1);
+        $this->archiveProbeFiles = max(0, (int) config('nntmux.archive_probe_files', 3));
+        $this->seasonPackArchiveSets = max(1, min(50, (int) config('nntmux.season_pack_archive_sets', 3)));
+        $this->seasonPackMaxReleaseFiles = max(11, min(200, (int) config('nntmux.season_pack_max_release_files', 30)));
         // Delegate to AdditionalCandidateQuery so size-filter semantics
         // (explicit '0' means disabled, empty/null means default) are owned
         // in one place and shared between the bucket query and the per-worker
@@ -186,43 +172,22 @@ final readonly class ProcessingConfiguration
         $this->ffmpegDuration = (int) (app(ConfigurationProvider::class)->postProcessing()->ffmpegDuration ?: 5);
         $this->addPAR2Files = (bool) config('nntmux_settings.add_par2');
         $this->ffmpegPath = config('nntmux_settings.ffmpeg_path') ?: false;
-        $this->ffprobePath = self::resolveFfprobePath(config('nntmux_settings.ffprobe_path') ?: false, $this->ffmpegPath, $useRustFfi);
+        $this->ffprobePath = self::resolveFfprobePath(config('nntmux_settings.ffprobe_path') ?: false, $this->ffmpegPath);
         $this->mediaInfoPath = config('nntmux_settings.mediainfo_path') ?: false;
         $this->par2MediaMapping = (bool) config('nntmux.par2_media_mapping', true);
+        $this->par2IndexMaxSegments = max(1, (int) config('nntmux.par2_index_max_segments', 2));
+        $this->par2VerifyFiles = max(0, (int) config('nntmux.par2_verify_files', 2));
         $this->mediaArchiveSlicing = (bool) config('nntmux.media_archive_slicing', true);
         $this->mediaMainVideoFallback = (bool) config('nntmux.media_main_video_fallback', true);
         $this->mediaMidSources = (bool) config('nntmux.media_mid_sources', false);
-        [
-            $this->archiveProbeFiles,
-            $this->seasonPackArchiveSets,
-            $this->seasonPackMaxReleaseFiles,
-            $this->par2IndexMaxSegments,
-            $this->par2VerifyFiles,
-            $this->mediaMaxBytes,
-            $this->mediaSampleMaxBytes,
-            $this->mediaMidBytes,
-            $this->mediaMainVideoMinBytes,
-            $this->mediaImageMaxBytes,
-            $this->mediaStageMaxSeconds,
-            $this->mediaFfmpegTimeout,
-            $this->thumbnailFrameAttempts,
-            $this->maximumRarPasswordChecks,
-        ] = self::normalizeLimits([
-            (int) config('nntmux.archive_probe_files', 3),
-            (int) config('nntmux.season_pack_archive_sets', 3),
-            (int) config('nntmux.season_pack_max_release_files', 30),
-            (int) config('nntmux.par2_index_max_segments', 2),
-            (int) config('nntmux.par2_verify_files', 2),
-            (int) config('nntmux.media_max_bytes', 16777216),
-            (int) config('nntmux.media_sample_max_bytes', 8388608),
-            (int) config('nntmux.media_mid_bytes', 3145728),
-            (int) config('nntmux.media_main_video_min_bytes', 104857600),
-            (int) config('nntmux.media_image_max_bytes', 8388608),
-            (int) config('nntmux.media_stage_max_seconds', 30),
-            (int) config('nntmux.media_ffmpeg_timeout', 30),
-            (int) config('nntmux.thumbnail_frame_attempts', 4),
-            (int) (app(ConfigurationProvider::class)->postProcessing()->passwordCheckAttempts ?: 1),
-        ], $useRustFfi);
+        $this->mediaMaxBytes = max(0, (int) config('nntmux.media_max_bytes', 16777216));
+        $this->mediaSampleMaxBytes = max(1048576, (int) config('nntmux.media_sample_max_bytes', 8388608));
+        $this->mediaMidBytes = max(262144, (int) config('nntmux.media_mid_bytes', 3145728));
+        $this->mediaMainVideoMinBytes = max(0, (int) config('nntmux.media_main_video_min_bytes', 104857600));
+        $this->mediaImageMaxBytes = max(1048576, (int) config('nntmux.media_image_max_bytes', 8388608));
+        $this->mediaStageMaxSeconds = max(0, (int) config('nntmux.media_stage_max_seconds', 30));
+        $this->mediaFfmpegTimeout = max(1, (int) config('nntmux.media_ffmpeg_timeout', 30));
+        $this->thumbnailFrameAttempts = min(10, max(1, (int) config('nntmux.thumbnail_frame_attempts', 4)));
         $this->thumbnailMinStddev = (float) config('nntmux.thumbnail_min_stddev', 12);
         $this->thumbnailMinLuma = (float) config('nntmux.thumbnail_min_luma', 24);
         $this->thumbnailMaxLuma = (float) config('nntmux.thumbnail_max_luma', 232);
@@ -259,14 +224,14 @@ final readonly class ProcessingConfiguration
     /**
      * Use the configured ffprobe, or the one installed next to ffmpeg.
      */
-    public static function resolveFfprobePath(string|false $ffprobePath, string|false $ffmpegPath, bool $useRustFfi = false): string|false
+    public static function resolveFfprobePath(string|false $ffprobePath, string|false $ffmpegPath): string|false
     {
         if ($ffprobePath !== false && is_executable($ffprobePath)) {
             return $ffprobePath;
         }
 
         if ($ffmpegPath !== false) {
-            $sibling = self::ffprobeSiblingCandidate($ffmpegPath, $useRustFfi);
+            $sibling = dirname($ffmpegPath).DIRECTORY_SEPARATOR.'ffprobe';
             if (is_executable($sibling)) {
                 return $sibling;
             }
@@ -276,485 +241,14 @@ final readonly class ProcessingConfiguration
     }
 
     /**
-     * The ffprobe path installed next to an ffmpeg binary.
-     */
-    public static function ffprobeSiblingCandidate(string $ffmpegPath, bool $useRustFfi = false): string
-    {
-        return $useRustFfi
-            ? self::ffprobeSiblingCandidateNative($ffmpegPath)
-            : self::ffprobeSiblingCandidatePhp($ffmpegPath);
-    }
-
-    public static function ffprobeSiblingCandidatePhp(string $ffmpegPath): string
-    {
-        return dirname($ffmpegPath).DIRECTORY_SEPARATOR.'ffprobe';
-    }
-
-    public static function ffprobeSiblingCandidateNative(string $ffmpegPath): string
-    {
-        $ffi = self::ffi();
-        if ($ffi === null || DIRECTORY_SEPARATOR !== '/') {
-            return self::ffprobeSiblingCandidatePhp($ffmpegPath);
-        }
-
-        $length = strlen($ffmpegPath);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 16, $cap);
-        if ($scratch === null) {
-            return self::ffprobeSiblingCandidatePhp($ffmpegPath);
-        }
-
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_pcfg_ffprobe_sibling($ffmpegPath, $length, $scratch, $cap);
-
-        return is_int($written) && $written > 0
-            ? FFI::string($scratch, $written)
-            : self::ffprobeSiblingCandidatePhp($ffmpegPath);
-    }
-
-    /**
-     * Clamp the integer limits, in this order: archiveProbeFiles, seasonPackArchiveSets,
-     * seasonPackMaxReleaseFiles, par2IndexMaxSegments, par2VerifyFiles, mediaMaxBytes,
-     * mediaSampleMaxBytes, mediaMidBytes, mediaMainVideoMinBytes, mediaImageMaxBytes,
-     * mediaStageMaxSeconds, mediaFfmpegTimeout, thumbnailFrameAttempts and
-     * maximumRarPasswordChecks.
-     *
-     * @param  list<int>  $raw
-     * @return list<int>
-     */
-    public static function normalizeLimits(array $raw, bool $useRustFfi = false): array
-    {
-        return $useRustFfi ? self::normalizeLimitsNative($raw) : self::normalizeLimitsPhp($raw);
-    }
-
-    /**
-     * @param  list<int>  $raw
-     * @return list<int>
-     */
-    public static function normalizeLimitsPhp(array $raw): array
-    {
-        if (count($raw) !== self::LIMIT_COUNT) {
-            throw new \InvalidArgumentException('Expected '.self::LIMIT_COUNT.' configuration limits.');
-        }
-
-        return [
-            max(0, $raw[0]),
-            max(1, min(50, $raw[1])),
-            max(11, min(200, $raw[2])),
-            max(1, $raw[3]),
-            max(0, $raw[4]),
-            max(0, $raw[5]),
-            max(1048576, $raw[6]),
-            max(262144, $raw[7]),
-            max(0, $raw[8]),
-            max(1048576, $raw[9]),
-            max(0, $raw[10]),
-            max(1, $raw[11]),
-            min(10, max(1, $raw[12])),
-            max($raw[13], 1),
-        ];
-    }
-
-    /**
-     * @param  list<int>  $raw
-     * @return list<int>
-     */
-    public static function normalizeLimitsNative(array $raw): array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null || count($raw) !== self::LIMIT_COUNT) {
-            return self::normalizeLimitsPhp($raw);
-        }
-
-        try {
-            $buffer = $ffi->new('int64_t['.self::LIMIT_COUNT.']');
-            $packed = pack('q*', ...$raw);
-            FFI::memcpy($buffer, $packed, strlen($packed));
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_pcfg_normalize_limits($buffer, self::LIMIT_COUNT, $buffer, self::LIMIT_COUNT);
-            if ($written !== self::LIMIT_COUNT) {
-                return self::normalizeLimitsPhp($raw);
-            }
-            $values = unpack('q*', FFI::string($buffer, strlen($packed)));
-        } catch (Throwable) {
-            return self::normalizeLimitsPhp($raw);
-        }
-
-        return is_array($values) ? array_values($values) : self::normalizeLimitsPhp($raw);
-    }
-
-    /**
      * Build the kill string for timeout command wrapper.
      */
     public function getKillString(): string
     {
-        return self::killString($this->timeoutPath, $this->timeoutSeconds, $this->rustFfiEnabled());
-    }
-
-    public static function killString(string|false $timeoutPath, int $timeoutSeconds, bool $useRustFfi = false): string
-    {
-        return $useRustFfi
-            ? self::killStringNative($timeoutPath, $timeoutSeconds)
-            : self::killStringPhp($timeoutPath, $timeoutSeconds);
-    }
-
-    public static function killStringPhp(string|false $timeoutPath, int $timeoutSeconds): string
-    {
-        if ($timeoutPath && $timeoutSeconds > 0) {
-            return '"'.$timeoutPath.'" --foreground --signal=KILL '.$timeoutSeconds.' "';
+        if ($this->timeoutPath && $this->timeoutSeconds > 0) {
+            return '"'.$this->timeoutPath.'" --foreground --signal=KILL '.$this->timeoutSeconds.' "';
         }
 
         return '"';
-    }
-
-    public static function killStringNative(string|false $timeoutPath, int $timeoutSeconds): string
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::killStringPhp($timeoutPath, $timeoutSeconds);
-        }
-
-        $path = $timeoutPath === false ? '' : $timeoutPath;
-        $length = strlen($path);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 64, $cap);
-        if ($scratch === null) {
-            return self::killStringPhp($timeoutPath, $timeoutSeconds);
-        }
-
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_pcfg_kill_string($path, $length, $timeoutPath === false ? 0 : 1, $timeoutSeconds, $scratch, $cap);
-
-        return is_int($written) && $written > 0
-            ? FFI::string($scratch, $written)
-            : self::killStringPhp($timeoutPath, $timeoutSeconds);
-    }
-
-    private function rustFfiEnabled(): bool
-    {
-        // Configurations built without the constructor (tests) leave the toggle uninitialized.
-        return (new ReflectionProperty(self::class, 'useRustFfi'))->isInitialized($this) && $this->useRustFfi;
-    }
-
-    public static function ffi(): ?FFI
-    {
-        static $ffi = null;
-        if ($ffi === null) {
-            $ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
-        }
-
-        return $ffi === false ? null : $ffi;
-    }
-
-    // Wave 42.6 is independent of every earlier FFI toggle.
-    public const bool W426_RUST_FFI_DEFAULT = false;
-
-    private const string W426_FFI_CDEF = 'int32_t nntmux_w426_additional_file_manager_fallback_sync_sevenzip(uint8_t operation, const char *input, size_t input_len, char *output, size_t output_cap);';
-
-    /** @return array{enabled: ?bool, ffi: FFI|false|null} */
-    private static function &w426State(): array
-    {
-        // A static local also supports readonly configuration objects.
-        static $state = ['enabled' => null, 'ffi' => null];
-
-        return $state;
-    }
-
-    public static function useW426RustFfi(bool $enable = true): void
-    {
-        $state = &self::w426State();
-        $state['enabled'] = $enable;
-    }
-
-    public static function usesW426RustFfi(): bool
-    {
-        return self::w426State()['enabled'] ?? self::W426_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW426RustFfi(): void
-    {
-        $state = &self::w426State();
-        $state = ['enabled' => null, 'ffi' => null];
-    }
-
-    /** @return list<int>|null */
-    private static function w426Slots(int $operation, string $input, int $count): ?array
-    {
-        if (PHP_INT_SIZE !== 8 || \strlen($input) > 16_777_216) {
-            return null;
-        }
-        try {
-            $state = &self::w426State();
-            $state['ffi'] ??= RustPipelineLibrary::resolveDomain('additional', self::W426_FFI_CDEF) ?? false;
-            if ($state['ffi'] === false) {
-                return null;
-            }
-            $bytes = $count * 8;
-            $buffer = $state['ffi']->new('char['.$bytes.']');
-            // @phpstan-ignore method.notFound
-            $written = $state['ffi']->nntmux_w426_additional_file_manager_fallback_sync_sevenzip($operation, $input, \strlen($input), $buffer, $bytes);
-            if ($written !== $bytes) {
-                return null;
-            }
-            $values = unpack('q*', FFI::string($buffer, $bytes));
-            if ($values === false || \count($values) !== $count) {
-                return null;
-            }
-            $values = array_values($values);
-            foreach ($values as $index => $value) {
-                if (! \is_int($value) || ($value < 0 && ! ($operation === 3 && $index === 7))) {
-                    return null;
-                }
-            }
-
-            return $values;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private static function w426Add(int $a, int $b): int
-    {
-        return $a > PHP_INT_MAX - $b ? PHP_INT_MAX : $a + $b;
-    }
-
-    /**
-     * Summarize independent configuration snapshots; negative capacities clamp to zero and arithmetic saturates.
-     * Integer sums saturate at PHP_INT_MAX; malformed rows are counted without coercion.
-     *
-     * @param  array<array-key, mixed>  $files
-     * @return array{total: int, disabled: int, max_in_flight: int, max_timeout_seconds: int, total_max_bytes: int, invalid: int}
-     */
-    public static function summarizeLimitConfigurationBatch(array $files): array
-    {
-        return self::usesW426RustFfi()
-            ? self::summarizeLimitConfigurationBatchNative($files)
-            : self::summarizeLimitConfigurationBatchPhp($files);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $files
-     * @return array{total: int, disabled: int, max_in_flight: int, max_timeout_seconds: int, total_max_bytes: int, invalid: int}
-     */
-    public static function summarizeLimitConfigurationBatchPhp(array $files): array
-    {
-        $result = ['total' => \count($files), 'disabled' => 0, 'max_in_flight' => 0, 'max_timeout_seconds' => 0, 'total_max_bytes' => 0, 'invalid' => 0];
-        foreach ($files as $row) {
-            if (! self::w426ValidRow($row)) {
-                $result['invalid']++;
-
-                continue;
-            }
-            $batch = max(0, $row['batch_size']);
-            $threads = max(0, $row['threads']);
-            $capacity = $threads > 0 && $batch > intdiv(PHP_INT_MAX, $threads) ? PHP_INT_MAX : $batch * $threads;
-            $result['disabled'] += (int) ($batch === 0 || $threads === 0);
-            $result['max_in_flight'] = max($result['max_in_flight'], $capacity);
-            $result['max_timeout_seconds'] = max($result['max_timeout_seconds'], $row['timeout_seconds'], 0);
-            $result['total_max_bytes'] = self::w426Add($result['total_max_bytes'], max(0, $row['max_bytes']));
-        }
-
-        return $result;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $files
-     * @return array{total: int, disabled: int, max_in_flight: int, max_timeout_seconds: int, total_max_bytes: int, invalid: int}
-     */
-    public static function summarizeLimitConfigurationBatchNative(array $files): array
-    {
-        $total = \count($files);
-        if (PHP_INT_SIZE !== 8 || $total > 100_000) {
-            return self::summarizeLimitConfigurationBatchPhp($files);
-        }
-        $frame = pack('qV', 0, $total);
-        foreach ($files as $row) {
-            if (! self::w426ValidRow($row)) {
-                return self::summarizeLimitConfigurationBatchPhp($files);
-            }
-            $frame .= pack('qqqq', $row['batch_size'], $row['threads'], $row['timeout_seconds'], $row['max_bytes']);
-        }
-        $slots = self::w426Slots(5, $frame, 6);
-        if ($slots === null || $slots[0] !== $total || $slots[1] > $total || $slots[5] !== 0) {
-            return self::summarizeLimitConfigurationBatchPhp($files);
-        }
-
-        return ['total' => $slots[0], 'disabled' => $slots[1], 'max_in_flight' => $slots[2], 'max_timeout_seconds' => $slots[3], 'total_max_bytes' => $slots[4], 'invalid' => $slots[5]];
-    }
-
-    /** @phpstan-assert-if-true array{batch_size: int, threads: int, timeout_seconds: int, max_bytes: int} $row */
-    private static function w426ValidRow(mixed $row): bool
-    {
-        return \is_array($row) && \is_int($row['batch_size'] ?? null) && \is_int($row['threads'] ?? null) && \is_int($row['timeout_seconds'] ?? null) && \is_int($row['max_bytes'] ?? null);
-    }
-
-    // ---------------------------------------------------------------------
-    // Wave 52.4 batch helper
-    // ---------------------------------------------------------------------
-
-    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.85x, p99 2.66x; uncommon mean 3.50x, p99 3.83x); see RustWorkPlannerArchiveConfigConsoleMediaExtractW52ParityTest. */
-    private const bool W52_RUST_FFI_DEFAULT = true;
-
-    public const string W52_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w524_limit_snapshot_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * Normalize many limit snapshots at once. `$raw` holds LIMIT_COUNT integers per snapshot in
-     * normalizeLimits() order; each snapshot yields its LIMIT_COUNT normalized limits followed by
-     * a mask with bit k set when limit k was clamped.
-     *
-     * @param  list<int>  $raw
-     * @return list<int>
-     */
-    public static function normalizeLimitsBatch(array $raw): array
-    {
-        return self::usesW52RustFfi()
-            ? self::normalizeLimitsBatchNative($raw)
-            : self::normalizeLimitsBatchPhp($raw);
-    }
-
-    /**
-     * @param  list<int>  $raw
-     * @return list<int>
-     */
-    public static function normalizeLimitsBatchNative(array $raw): array
-    {
-        self::w52AssertSnapshots($raw);
-        if ($raw === []) {
-            return [];
-        }
-
-        return self::w52Call('', pack('P*', ...$raw), intdiv(\count($raw), self::LIMIT_COUNT))
-            ?? self::normalizeLimitsBatchPhp($raw);
-    }
-
-    /**
-     * @param  list<int>  $raw
-     * @return list<int>
-     */
-    public static function normalizeLimitsBatchPhp(array $raw): array
-    {
-        self::w52AssertSnapshots($raw);
-        $out = [];
-        foreach (array_chunk($raw, self::LIMIT_COUNT) as $snapshot) {
-            $mask = 0;
-            foreach (self::normalizeLimitsPhp($snapshot) as $index => $limit) {
-                $out[] = $limit;
-                if ($limit !== $snapshot[$index]) {
-                    $mask |= 1 << $index;
-                }
-            }
-            $out[] = $mask;
-        }
-
-        return $out;
-    }
-
-    /** @param array<array-key, mixed> $raw */
-    private static function w52AssertSnapshots(array $raw): void
-    {
-        self::w52AssertList($raw);
-        if (\count($raw) % self::LIMIT_COUNT !== 0) {
-            throw new \InvalidArgumentException('Expected a multiple of '.self::LIMIT_COUNT.' configuration limits.');
-        }
-    }
-
-    public static function usesW52RustFfi(): bool
-    {
-        $enabled = self::w52RustFfiState('enabled');
-
-        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Run $callback with the W52 batch dispatch forced on or off, then restore the previous choice.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w52RustFfiState('enabled');
-        self::w52RustFfiState('enabled', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w52RustFfiState('enabled', $previous);
-        }
-    }
-
-    /**
-     * One FFI crossing for the batch: encoded text and packed int64 columns in, 15 int64
-     * words back per record. Null when the library is missing or declines.
-     *
-     * @return list<int>|null
-     */
-    private static function w52Call(string $text, string $ints, int $count): ?array
-    {
-        try {
-            $state = self::w52RustFfiState();
-            $ffi = $state['ffi'] ?? null;
-            if ($ffi === null) {
-                $ffi = RustPipelineLibrary::resolveDomain('metadata_w52', self::W52_FFI_CDEF) ?? false;
-                self::w52RustFfiState('ffi', $ffi);
-            }
-            if (! $ffi instanceof FFI) {
-                return null;
-            }
-            $need = $count * 15;
-            $out = $state['out'] ?? null;
-            $cap = $state['cap'] ?? 0;
-            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
-                $cap = max(1024, $need);
-                $out = $ffi->new('int64_t['.$cap.']');
-                self::w52RustFfiState('out', $out);
-                self::w52RustFfiState('cap', $cap);
-            }
-            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
-            $written = $ffi->nntmux_w524_limit_snapshot_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
-            if ($written !== $need) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($out, $need * 8));
-
-            return $values === false ? null : array_values($values);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** @param array<array-key, mixed> $values */
-    private static function w52AssertList(array $values): void
-    {
-        if (! array_is_list($values)) {
-            throw new \InvalidArgumentException('W52 batch input must be a list.');
-        }
-    }
-
-    /**
-     * W52 routing override and cached binding. Readonly classes cannot declare static
-     * properties, so they live in a function static: no arguments returns the state, one
-     * argument reads a key ('reset' clears everything) and two arguments write a key.
-     */
-    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
-        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-        if ($op === null) {
-            return $state;
-        }
-        if ($op === 'reset') {
-            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-
-            return null;
-        }
-        if (\func_num_args() > 1) {
-            $state[$op] = $val;
-        }
-
-        return $state[$op] ?? null;
     }
 }

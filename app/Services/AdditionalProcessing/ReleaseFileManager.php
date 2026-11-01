@@ -27,10 +27,7 @@ use App\Services\Releases\ReleaseBrowseService;
 use App\Support\Par2FileHashEvidence;
 use App\Support\PredbSearchDocument;
 use App\Support\ReleaseArchiveNamingEvidence;
-use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
-use FFI;
-use FFI\CData;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Carbon;
@@ -44,21 +41,7 @@ use Illuminate\Support\Facades\Log;
  */
 class ReleaseFileManager
 {
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_rfm_is_nfo_filename(const char *ptr, size_t len);
-        ssize_t nntmux_rfm_extract_release_name(const char *ptr, size_t len, char *out_ptr, size_t out_cap);
-        int32_t nntmux_rfm_normalize_file_size(const char *ptr, size_t len, int64_t *out);
-        C;
-
     private const int DEFAULT_RELEASE_FILE_LIMIT = 11;
-
-    private static ?FFI $ffi = null;
-
-    private static bool $ffiResolved = false;
-
-    private static bool $useRustFfi = true;
-
-    private static ?CData $fileSizeOut = null;
 
     private readonly ReleaseUpdateService $releaseUpdateService;
 
@@ -935,19 +918,10 @@ class ReleaseFileManager
     /**
      * Check if a filename looks like an NFO file.
      *
-     * Retains the native PHP path in production: paired single-call benchmarks measured
-     * 1.25x-1.61x mean and 1.40x-2.00x p99, inconsistently below the 1.5x threshold on the
-     * uncommon mean and common p99; see isNfoFilenameNative().
-     *
      * @param  string  $filename  The filename to check.
      * @return bool True if the filename matches NFO patterns.
      */
     public function isNfoFilename(string $filename): bool
-    {
-        return self::isNfoFilenamePhp($filename);
-    }
-
-    public static function isNfoFilenamePhp(string $filename): bool
     {
         // Standard NFO extensions
         if (preg_match('/\.(?:nfo|diz|info?)$/i', $filename)) {
@@ -973,37 +947,6 @@ class ReleaseFileManager
         return false;
     }
 
-    public static function isNfoFilenameNative(string $filename, bool &$supported = false, ?string $libraryPath = null): bool
-    {
-        $supported = false;
-        $ffi = self::$useRustFfi && $libraryPath === null && self::$ffiResolved ? self::$ffi : self::rustFfi($libraryPath);
-        if ($ffi === null) {
-            return self::isNfoFilenamePhp($filename);
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_rfm_is_nfo_filename($filename, strlen($filename));
-        } catch (\Throwable) {
-            return self::isNfoFilenamePhp($filename);
-        }
-
-        if (! is_int($status) || $status < 0) {
-            return self::isNfoFilenamePhp($filename);
-        }
-        $supported = true;
-
-        return $status === 1;
-    }
-
-    /**
-     * Toggle the Rust helpers; disabled, every *Native method falls back to PHP.
-     */
-    public static function useRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
     /**
      * Normalize NFO encoding to UTF-8.
      *
@@ -1014,20 +957,6 @@ class ReleaseFileManager
      * @return string UTF-8 encoded NFO data.
      */
     protected function normalizeNfoEncoding(string $data): string
-    {
-        if ($data === '') {
-            return '';
-        }
-
-        $native = RustPipelineLibrary::normalizeNfoEncoding($data);
-        if ($native !== null) {
-            return $native;
-        }
-
-        return $this->normalizeNfoEncodingPhp($data);
-    }
-
-    protected function normalizeNfoEncodingPhp(string $data): string
     {
         // Check for UTF-8 BOM and remove it
         if (str_starts_with($data, "\xEF\xBB\xBF")) {
@@ -1051,7 +980,7 @@ class ReleaseFileManager
         // Try CP437 (DOS encoding - common for scene NFOs with ASCII art)
         // Use the cp437toUTF helper function
         if (function_exists('cp437toUTF')) {
-            return (string) iconv('CP437', 'UTF-8//IGNORE//TRANSLIT', $data);
+            return cp437toUTF($data);
         }
 
         // Fallback: try ISO-8859-1 (Latin-1)
@@ -1180,16 +1109,8 @@ class ReleaseFileManager
 
     /**
      * Extract the release name from a filename.
-     *
-     * Retains the native PHP path in production (~0.90x common, ~1.20x uncommon mean in
-     * paired benchmarks; FFI string marshaling dominates); see extractReleaseNameFromFileNative().
      */
     private function extractReleaseNameFromFile(string $filename): ?string
-    {
-        return $this->extractReleaseNameFromFilePhp($filename);
-    }
-
-    public function extractReleaseNameFromFilePhp(string $filename): ?string
     {
         $basename = basename($filename);
 
@@ -1213,42 +1134,6 @@ class ReleaseFileManager
         }
 
         return null;
-    }
-
-    public function extractReleaseNameFromFileNative(string $filename, bool &$supported = false, ?string $libraryPath = null): ?string
-    {
-        $supported = false;
-        // The fused export embeds the default cleaner's NZBSPLIT unwrapping.
-        $ffi = $this->fileNameCleaner::class === FileNameCleaner::class ? self::rustFfi($libraryPath) : null;
-        if ($ffi === null) {
-            return $this->extractReleaseNameFromFilePhp($filename);
-        }
-
-        $len = strlen($filename);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, $len + 16, $cap);
-        if ($scratch === null) {
-            return $this->extractReleaseNameFromFilePhp($filename);
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_rfm_extract_release_name($filename, $len, $scratch, $cap);
-        } catch (\Throwable) {
-            return $this->extractReleaseNameFromFilePhp($filename);
-        }
-
-        if ($written === -3) {
-            $supported = true;
-
-            return null;
-        }
-        if (! is_int($written) || $written < 0) {
-            return $this->extractReleaseNameFromFilePhp($filename);
-        }
-        $supported = true;
-
-        return $written === 0 ? '' : FFI::string($scratch, $written);
     }
 
     /**
@@ -1332,16 +1217,7 @@ class ReleaseFileManager
         return Carbon::createFromTimestamp($createdTime, date_default_timezone_get())->format('Y-m-d H:i:s');
     }
 
-    /**
-     * Retains the native PHP path in production (~0.90x mean in paired benchmarks); see
-     * normalizeFileSizeNative().
-     */
     private function normalizeFileSize(mixed $size): ?int
-    {
-        return self::normalizeFileSizePhp($size);
-    }
-
-    public static function normalizeFileSizePhp(mixed $size): ?int
     {
         if (is_int($size)) {
             return $size >= 0 ? $size : null;
@@ -1372,49 +1248,6 @@ class ReleaseFileManager
         return (int) $normalizedSize;
     }
 
-    public static function normalizeFileSizeNative(mixed $size, bool &$supported = false, ?string $libraryPath = null): ?int
-    {
-        $supported = false;
-        if (! is_string($size)) {
-            return self::normalizeFileSizePhp($size);
-        }
-        $ffi = self::rustFfi($libraryPath);
-        if ($ffi === null) {
-            return self::normalizeFileSizePhp($size);
-        }
-
-        try {
-            $out = self::$fileSizeOut ??= $ffi->new('int64_t[1]');
-            // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_rfm_normalize_file_size($size, strlen($size), $out);
-        } catch (\Throwable) {
-            return self::normalizeFileSizePhp($size);
-        }
-
-        if (! is_int($status) || $status < 0) {
-            return self::normalizeFileSizePhp($size);
-        }
-        $supported = true;
-
-        return $status === 1 ? (int) $out[0] : null;
-    }
-
-    private static function rustFfi(?string $libraryPath = null): ?FFI
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        if ($libraryPath !== null) {
-            return RustPipelineLibrary::resolveDomain('release_file_manager', self::FFI_CDEF, $libraryPath);
-        }
-        if (! self::$ffiResolved) {
-            self::$ffiResolved = true;
-            self::$ffi = RustPipelineLibrary::resolveDomain('release_file_manager', self::FFI_CDEF);
-        }
-
-        return self::$ffi;
-    }
-
     private function releaseHasNzbSplitWrapper(Release $release): bool
     {
         $name = (string) ($release->name ?? '');
@@ -1438,269 +1271,5 @@ class ReleaseFileManager
     private function isPlausibleReleaseTitle(string $title): bool
     {
         return $this->fileNameCleaner->isPlausibleReleaseTitle($title);
-    }
-
-    // Wave 42.6 is independent of every earlier FFI toggle.
-    public const bool W426_RUST_FFI_DEFAULT = false;
-
-    private const string W426_FFI_CDEF = 'int32_t nntmux_w426_additional_file_manager_fallback_sync_sevenzip(uint8_t operation, const char *input, size_t input_len, char *output, size_t output_cap);';
-
-    /** @return array{enabled: ?bool, ffi: FFI|false|null} */
-    private static function &w426State(): array
-    {
-        // A static local also supports readonly configuration objects.
-        static $state = ['enabled' => null, 'ffi' => null];
-
-        return $state;
-    }
-
-    public static function useW426RustFfi(bool $enable = true): void
-    {
-        $state = &self::w426State();
-        $state['enabled'] = $enable;
-    }
-
-    public static function usesW426RustFfi(): bool
-    {
-        return self::w426State()['enabled'] ?? self::W426_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW426RustFfi(): void
-    {
-        $state = &self::w426State();
-        $state = ['enabled' => null, 'ffi' => null];
-    }
-
-    /** @return list<int>|null */
-    private static function w426Slots(int $operation, string $input, int $count): ?array
-    {
-        if (PHP_INT_SIZE !== 8 || \strlen($input) > 16_777_216) {
-            return null;
-        }
-        try {
-            $state = &self::w426State();
-            $state['ffi'] ??= RustPipelineLibrary::resolveDomain('additional', self::W426_FFI_CDEF) ?? false;
-            if ($state['ffi'] === false) {
-                return null;
-            }
-            $bytes = $count * 8;
-            $buffer = $state['ffi']->new('char['.$bytes.']');
-            // @phpstan-ignore method.notFound
-            $written = $state['ffi']->nntmux_w426_additional_file_manager_fallback_sync_sevenzip($operation, $input, \strlen($input), $buffer, $bytes);
-            if ($written !== $bytes) {
-                return null;
-            }
-            $values = unpack('q*', FFI::string($buffer, $bytes));
-            if ($values === false || \count($values) !== $count) {
-                return null;
-            }
-            $values = array_values($values);
-            foreach ($values as $index => $value) {
-                if (! \is_int($value) || ($value < 0 && ! ($operation === 3 && $index === 7))) {
-                    return null;
-                }
-            }
-
-            return $values;
-        } catch (\Throwable) {
-            return null;
-        }
-    }
-
-    private static function w426Add(int $a, int $b): int
-    {
-        return $a > PHP_INT_MAX - $b ? PHP_INT_MAX : $a + $b;
-    }
-
-    /**
-     * Report file counts and byte totals without database writes. Empty names and negative sizes are invalid.
-     * Integer sums saturate at PHP_INT_MAX; malformed rows are counted without coercion.
-     *
-     * @param  array<array-key, mixed>  $files
-     * @return array{total: int, files: int, total_bytes: int, empty_files: int, name_bytes: int, exceeds_limit: bool, invalid: int}
-     */
-    public static function summarizeFilePersistenceBatch(array $files, int $limit = 11): array
-    {
-        return self::usesW426RustFfi()
-            ? self::summarizeFilePersistenceBatchNative($files, $limit)
-            : self::summarizeFilePersistenceBatchPhp($files, $limit);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $files
-     * @return array{total: int, files: int, total_bytes: int, empty_files: int, name_bytes: int, exceeds_limit: bool, invalid: int}
-     */
-    public static function summarizeFilePersistenceBatchPhp(array $files, int $limit = 11): array
-    {
-        $result = ['total' => \count($files), 'files' => 0, 'total_bytes' => 0, 'empty_files' => 0, 'name_bytes' => 0, 'exceeds_limit' => false, 'invalid' => 0];
-        foreach ($files as $row) {
-            if (! self::w426ValidRow($row)) {
-                $result['invalid']++;
-
-                continue;
-            }
-            $result['files']++;
-            $result['total_bytes'] = self::w426Add($result['total_bytes'], $row['size']);
-            $result['empty_files'] += (int) ($row['size'] === 0);
-            $result['name_bytes'] = self::w426Add($result['name_bytes'], \strlen($row['name']));
-        }
-        $result['exceeds_limit'] = $result['files'] > max(0, $limit);
-
-        return $result;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $files
-     * @return array{total: int, files: int, total_bytes: int, empty_files: int, name_bytes: int, exceeds_limit: bool, invalid: int}
-     */
-    public static function summarizeFilePersistenceBatchNative(array $files, int $limit = 11): array
-    {
-        $total = \count($files);
-        if (PHP_INT_SIZE !== 8 || $total > 100_000) {
-            return self::summarizeFilePersistenceBatchPhp($files, $limit);
-        }
-        $frame = pack('qV', $limit, $total);
-        foreach ($files as $row) {
-            if (! self::w426ValidRow($row)) {
-                return self::summarizeFilePersistenceBatchPhp($files, $limit);
-            }
-            if (\strlen($row['name']) > 16_777_216 - 12 - \strlen($frame)) {
-                return self::summarizeFilePersistenceBatchPhp($files, $limit);
-            }
-            $frame .= pack('qV', $row['size'], \strlen($row['name'])).$row['name'];
-        }
-        $slots = self::w426Slots(1, $frame, 7);
-        if ($slots === null || $slots[0] !== $total || $slots[1] !== $total || $slots[3] > $total || $slots[5] !== (int) ($total > max(0, $limit)) || $slots[6] !== 0) {
-            return self::summarizeFilePersistenceBatchPhp($files, $limit);
-        }
-
-        return ['total' => $slots[0], 'files' => $slots[1], 'total_bytes' => $slots[2], 'empty_files' => $slots[3], 'name_bytes' => $slots[4], 'exceeds_limit' => $slots[5] === 1, 'invalid' => $slots[6]];
-    }
-
-    /** @phpstan-assert-if-true array{name: string, size: int} $row */
-    private static function w426ValidRow(mixed $row): bool
-    {
-        return \is_array($row) && \is_string($row['name'] ?? null) && $row['name'] !== '' && \is_int($row['size'] ?? null) && $row['size'] >= 0;
-    }
-
-    /** Enabled: three paired runs cleared every 1.5x gate (common mean 5.57-5.71x, p99 4.13-5.05x; uncommon mean 5.50-5.64x, p99 4.21-5.33x); see RustReleaseFileArchiveProcessorSyncUsenetW52ParityTest. */
-    private const bool W52_RUST_FFI_DEFAULT = true;
-
-    public const string W52_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w523_release_file_name_size_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    private static ?bool $useW52RustFfi = null;
-
-    private static FFI|false|null $w52Ffi = null;
-
-    private static ?CData $w52Out = null;
-
-    private static int $w52OutCap = 0;
-
-    public static function usesW52RustFfi(): bool
-    {
-        return self::$useW52RustFfi ?? self::W52_RUST_FFI_DEFAULT;
-    }
-
-    /** Runs $callback with the Wave 52 Rust path forced on or off, then restores the previous setting. */
-    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::$useW52RustFfi;
-        self::$useW52RustFfi = $enabled;
-        try {
-            return $callback();
-        } finally {
-            self::$useW52RustFfi = $previous;
-        }
-    }
-
-    /**
-     * Classifies inner archive file rows: one `[flags, size]` pair per row, where flags are 1 for
-     * an isNfoFilenamePhp() name and 2 for a valid size, and size is normalizeFileSizePhp() of the
-     * size string (-1 when invalid). Then the NFO and valid-size counts. A missing size is ''.
-     *
-     * @param  array<int, string>  $names
-     * @param  array<int, string>  $sizes
-     * @return list<int>
-     */
-    public static function w52FileNameSizeBatch(array $names, array $sizes): array
-    {
-        return self::usesW52RustFfi() ? self::w52FileNameSizeBatchNative($names, $sizes) : self::w52FileNameSizeBatchPhp($names, $sizes);
-    }
-
-    /**
-     * @param  array<int, string>  $names
-     * @param  array<int, string>  $sizes
-     * @return list<int>
-     */
-    public static function w52FileNameSizeBatchNative(array $names, array $sizes): array
-    {
-        $count = \count($names);
-        if (\count($sizes) !== $count) {
-            return self::w52FileNameSizeBatchPhp($names, $sizes);
-        }
-        $blob = $count === 0 ? '' : implode("\0", $names)."\0".implode("\0", $sizes);
-
-        return self::w52Invoke($blob, '', $count, 2 * $count + 2)
-            ?? self::w52FileNameSizeBatchPhp($names, $sizes);
-    }
-
-    /**
-     * @param  array<int, string>  $names
-     * @param  array<int, string>  $sizes
-     * @return list<int>
-     */
-    public static function w52FileNameSizeBatchPhp(array $names, array $sizes): array
-    {
-        $sizes = array_values($sizes);
-        $out = [];
-        $nfo = 0;
-        $valid = 0;
-        foreach (array_values($names) as $i => $name) {
-            $isNfo = self::isNfoFilenamePhp((string) $name);
-            $size = self::normalizeFileSizePhp((string) ($sizes[$i] ?? ''));
-            $nfo += (int) $isNfo;
-            $valid += (int) ($size !== null);
-            $out[] = (int) $isNfo | ($size !== null ? 2 : 0);
-            $out[] = $size ?? -1;
-        }
-        $out[] = $nfo;
-        $out[] = $valid;
-
-        return $out;
-    }
-
-    /**
-     * Calls the Wave 52 export with NUL-joined strings and packed `i64` integers. Null when the
-     * library is missing, the call declines (for example a string holding a NUL byte) or it writes
-     * more than $cap words, so the caller falls back to PHP.
-     *
-     * @return list<int>|null
-     */
-    private static function w52Invoke(string $blob, string $ints, int $count, int $cap): ?array
-    {
-        self::$w52Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w52', self::W52_FFI_CDEF) ?? false;
-        $ffi = self::$w52Ffi;
-        if ($ffi === false) {
-            return null;
-        }
-        try {
-            if (self::$w52Out === null || self::$w52OutCap < $cap) {
-                self::$w52OutCap = max(1024, $cap * 2);
-                self::$w52Out = $ffi->new('int64_t['.self::$w52OutCap.']');
-            }
-            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
-            $written = $ffi->nntmux_w523_release_file_name_size_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w52Out, self::$w52OutCap);
-            if (! \is_int($written) || $written <= 0 || $written > $cap) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string(self::$w52Out, $written * 8));
-
-            /** @var list<int>|null */
-            return $values === false ? null : array_values($values);
-        } catch (\Throwable) {
-            return null;
-        }
     }
 }

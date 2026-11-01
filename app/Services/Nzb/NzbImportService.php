@@ -20,10 +20,7 @@ use App\Services\Releases\Verification\CandidateAdmissionDeferredException;
 use App\Services\Releases\Verification\CandidateCapacityException;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\NzbManifestReader;
-use App\Support\RustPipelineLibrary;
 use App\Support\Utf8;
-use FFI;
-use FFI\CData;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\LockTimeoutException;
@@ -34,32 +31,12 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
-use Throwable;
 
 /**
  * Service for importing NZB files into the database.
  */
 class NzbImportService
 {
-    public const string FFI_CDEF = <<<'C'
-        int64_t nntmux_nzb_derive_release_name_span(const char *path, size_t path_len);
-        ssize_t nntmux_nzb_normalize_imported_subject(const char *subject, size_t subject_len, char *out_buf, size_t out_cap);
-        C;
-
-    private static FFI|false|null $ffi = null;
-
-    private static bool $useRustFfi = true;
-
-    public static function setUseRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
     protected BlacklistService $blacklistService;
 
     protected ReleaseCleaningService $releaseCleaner;
@@ -317,7 +294,7 @@ class NzbImportService
                     continue;
                 } catch (NzbPasswordMetadataRejected) {
                     $importStatus = NzbImportStatus::MetadataIgnored;
-                } catch (Throwable $exception) {
+                } catch (\Throwable $exception) {
                     Log::error('NZB import failed while scanning or inserting a release.', [
                         'path' => $nzbFilePath,
                         'exception' => $exception,
@@ -364,7 +341,7 @@ class NzbImportService
                         if ($this->relId !== null) {
                             try {
                                 FingerprintDispatch::enqueue($this->relId);
-                            } catch (Throwable $dispatchException) {
+                            } catch (\Throwable $dispatchException) {
                                 Log::warning('Could not queue imported release fingerprint metadata collection.', [
                                     'release_id' => $this->relId,
                                     'exception' => $dispatchException::class,
@@ -433,42 +410,22 @@ class NzbImportService
      * extension (e.g. ".mkv", ".mp4"). Example:
      *   "Show - S01E07 [1080p].mkv.nzb.gz" => "Show - S01E07 [1080p]".
      */
-    public function deriveReleaseNameFromNzbPath(string $path): string
+    protected function deriveReleaseNameFromNzbPath(string $path): string
     {
-        // Retain native PHP in production: 1.45x-1.52x mean / 1.40x-1.46x p99 speedup is
-        // slightly below the strict >= 1.5x p99 adoption gate across both workloads.
-        return $this->deriveReleaseNameFromNzbPathPhp($path);
-    }
+        $name = basename($path);
 
-    public function deriveReleaseNameFromNzbPathPhp(string $path): string
-    {
-        return self::w56ReleaseName($path);
-    }
+        // Strip trailing .nzb or .nzb.gz (case-insensitive).
+        $name = preg_replace('/\.nzb(\.gz)?$/i', '', $name) ?? $name;
 
-    public static function deriveReleaseNameFromNzbPathNative(string $path): ?string
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return null;
-        }
+        // Strip one trailing known media/container extension from the allow-list.
+        $name = preg_replace(
+            '/\.(mkv|mp4|avi|mov|wmv|flv|m4v|ts|webm|mpg|mpeg|iso|m2ts|ogm|divx|vob)$/i',
+            '',
+            $name
+        ) ?? $name;
 
-        try {
-            // @phpstan-ignore method.notFound
-            $span = $ffi->nntmux_nzb_derive_release_name_span($path, \strlen($path));
-            if (! \is_int($span) || $span < 0) {
-                return null;
-            }
-
-            $start = $span >> 32;
-            $len = $span & 0xFFFFFFFF;
-
-            return $len === 0 ? '' : \substr($path, $start, $len);
-        } catch (Throwable) {
-            return null;
-        }
+        // Tidy up any trailing dots/whitespace left behind.
+        return rtrim($name, ". \t\n\r\0\x0B");
     }
 
     protected function writeCompressedNzb(string $path, string $contents): bool
@@ -503,7 +460,7 @@ class NzbImportService
             $stored = File::isFile($path);
 
             return $stored;
-        } catch (Throwable $exception) {
+        } catch (\Throwable $exception) {
             Log::error('Imported NZB compression failed.', [
                 'path' => $path,
                 'exception' => $exception,
@@ -657,13 +614,13 @@ class NzbImportService
      * Record the article fingerprint of a just-inserted release; if that fails, remove the release
      * so it is not left marked as having an NZB that was never stored.
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     protected function persistArticleFingerprint(int $releaseId, ?string $fingerprint): void
     {
         try {
             ReleaseArticleFingerprintStore::store($releaseId, $fingerprint);
-        } catch (Throwable $exception) {
+        } catch (\Throwable $exception) {
             // Delete through the model so ReleaseObserver also removes the search document.
             Release::query()->find($releaseId)?->delete();
 
@@ -701,7 +658,7 @@ class NzbImportService
 
                 return $stored;
             });
-        } catch (Throwable $exception) {
+        } catch (\Throwable $exception) {
             Log::error('NZB import failed while storing the compressed file.', [
                 'guid' => $this->relGuid,
                 'path' => $path,
@@ -781,7 +738,7 @@ class NzbImportService
      * @return TResult
      *
      * @throws LockTimeoutException When another import holds the lock for longer than the wait.
-     * @throws Throwable When the identity callback or cache backend fails.
+     * @throws \Throwable When the identity callback or cache backend fails.
      */
     protected function withArticleIdentityLock(?string $fingerprint, callable $callback): mixed
     {
@@ -831,12 +788,12 @@ class NzbImportService
                 $this->verificationAdmission = $admission?->toArray();
             } catch (CandidateCapacityException|CandidateAdmissionDeferredException) {
                 return NzbImportStatus::MetadataDeferred;
-            } catch (Throwable) {
+            } catch (\Throwable) {
                 try {
                     Log::warning('NZB verification admission deferred.', [
                         'category' => 'unexpected_admission_failure',
                     ]);
-                } catch (Throwable) {
+                } catch (\Throwable) {
                     // A diagnostic failure must not relinquish the retained upload.
                 }
 
@@ -960,75 +917,11 @@ class NzbImportService
         return NzbImportStatus::Inserted;
     }
 
-    public function normalizeImportedSubject(string $subject): string
-    {
-        if (self::$useRustFfi) {
-            $native = self::normalizeImportedSubjectNative($subject);
-            if ($native !== null) {
-                return $native;
-            }
-        }
-
-        return $this->normalizeImportedSubjectPhp($subject);
-    }
-
-    public function normalizeImportedSubjectPhp(string $subject): string
+    protected function normalizeImportedSubject(string $subject): string
     {
         $partLess = preg_replace('/(\(\d+\/\d+\))*$/', 'yEnc', $subject) ?? $subject;
 
         return mb_convert_encoding(trim(preg_replace('/yEnc.*$/i', 'yEnc', $partLess) ?? $partLess), 'UTF-8', mb_list_encodings());
-    }
-
-    public static function normalizeImportedSubjectNative(string $subject): ?string
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return null;
-        }
-
-        $len = \strlen($subject);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 16), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_nzb_normalize_imported_subject($subject, $len, $scratch, $cap);
-            if (! \is_int($written) || $written === -1) {
-                return null;
-            }
-            if ($written < -1) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($scratch === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_nzb_normalize_imported_subject($subject, $len, $scratch, $cap);
-                if (! \is_int($written) || $written < 0) {
-                    return null;
-                }
-            }
-
-            return $written === 0 ? '' : FFI::string($scratch, $written);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private static function resolveFfi(): ?FFI
-    {
-        if (self::$ffi !== null) {
-            return self::$ffi === false ? null : self::$ffi;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
     }
 
     protected function normalizeGroupName(\SimpleXMLElement|string $group): string
@@ -1069,328 +962,5 @@ class NzbImportService
         } elseif ($this->echoCLI) {
             cli()->notice($message);
         }
-    }
-
-    /**
-     * Default for the Wave 41.2 toggle only; it stays false because the paired benchmark in
-     * tests/Unit/RustNzbSyncNfoImportCoverageCandidateW41ParityTest.php is below 1.5x.
-     */
-    public const bool W412_RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useW412RustFfi = null;
-
-    public static function useW412RustFfi(bool $enable = true): void
-    {
-        self::$useW412RustFfi = $enable;
-    }
-
-    public static function usesW412RustFfi(): bool
-    {
-        return self::$useW412RustFfi ?? self::W412_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW412RustFfi(): void
-    {
-        self::$useW412RustFfi = null;
-    }
-
-    /** NzbImportStatus values in the Wave 41.2 output order; the Rust export matches these bytes exactly. */
-    public const array W412_IMPORT_STATUSES = ['inserted', 'queued', 'metadata_ignored', 'metadata_deferred', 'duplicate', 'blacklisted', 'nogroup', 'failed'];
-
-    /**
-     * Tally NZB import results (`status`, `bytes`). A status is an NzbImportStatus or its exact string value; anything
-     * else counts as unknown. Bytes count only as integers on inserted results, negatives as zero, saturating at PHP_INT_MAX.
-     *
-     * @param  array<array-key, mixed>  $results
-     * @return array{results: int, inserted: int, queued: int, metadata_ignored: int, metadata_deferred: int, duplicate: int, blacklisted: int, nogroup: int, failed: int, unknown: int, inserted_bytes: int}
-     */
-    public static function summarizeImportStatusBatch(array $results): array
-    {
-        return (self::usesW412RustFfi() ? self::summarizeImportStatusBatchNative($results) : null)
-            ?? self::summarizeImportStatusBatchPhp($results);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $results
-     * @return array{results: int, inserted: int, queued: int, metadata_ignored: int, metadata_deferred: int, duplicate: int, blacklisted: int, nogroup: int, failed: int, unknown: int, inserted_bytes: int}
-     */
-    public static function summarizeImportStatusBatchPhp(array $results): array
-    {
-        $counts = array_fill_keys(self::W412_IMPORT_STATUSES, 0);
-        $unknown = $bytes = 0;
-        foreach ($results as $result) {
-            [$status, $size] = self::importStatusFields($result);
-            if ($status === null || ! isset($counts[$status])) {
-                $unknown++;
-
-                continue;
-            }
-            $counts[$status]++;
-            if ($status === 'inserted') {
-                $size = max(0, $size);
-                $bytes = $bytes > PHP_INT_MAX - $size ? PHP_INT_MAX : $bytes + $size;
-            }
-        }
-
-        return self::importStatusSummary(\count($results), array_values($counts), $unknown, $bytes);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $results
-     * @return array{results: int, inserted: int, queued: int, metadata_ignored: int, metadata_deferred: int, duplicate: int, blacklisted: int, nogroup: int, failed: int, unknown: int, inserted_bytes: int}|null
-     */
-    public static function summarizeImportStatusBatchNative(array $results): ?array
-    {
-        $words = [0, \count($results)];
-        $texts = [];
-        $size = 16 + \count($results) * 16;
-        foreach ($results as $result) {
-            [$status, $bytes] = self::importStatusFields($result);
-            $words[] = $status === null ? -1 : \strlen($status);
-            $words[] = $bytes;
-            if ($status !== null) {
-                $texts[] = $status;
-                $size += \strlen($status);
-            }
-            if ($size > DirectorySyncBridge::W412_MAX_INPUT) {
-                return null;
-            }
-        }
-        $slots = DirectorySyncBridge::evaluateW412Native(4, pack('q*', ...$words).implode('', $texts), 11);
-        if ($slots === null) {
-            return null;
-        }
-        $count = $slots[0];
-        $counts = \array_slice($slots, 1, 8);
-        if ($count !== \count($results) || min($slots) < 0 || array_sum($counts) + $slots[9] !== $count) {
-            return null;
-        }
-
-        return self::importStatusSummary($count, $counts, $slots[9], $slots[10]);
-    }
-
-    /** @return array{string|null, int} the status text (null unless an NzbImportStatus or string) and the bytes (0 unless an integer) */
-    private static function importStatusFields(mixed $result): array
-    {
-        if (! \is_array($result)) {
-            return [null, 0];
-        }
-        $status = $result['status'] ?? null;
-        $bytes = $result['bytes'] ?? 0;
-
-        return [$status instanceof NzbImportStatus ? $status->value : (\is_string($status) ? $status : null), \is_int($bytes) ? $bytes : 0];
-    }
-
-    /**
-     * @param  list<int>  $counts  per W412_IMPORT_STATUSES entry
-     * @return array{results: int, inserted: int, queued: int, metadata_ignored: int, metadata_deferred: int, duplicate: int, blacklisted: int, nogroup: int, failed: int, unknown: int, inserted_bytes: int}
-     */
-    private static function importStatusSummary(int $results, array $counts, int $unknown, int $bytes): array
-    {
-        /** @var array{results: int, inserted: int, queued: int, metadata_ignored: int, metadata_deferred: int, duplicate: int, blacklisted: int, nogroup: int, failed: int, unknown: int, inserted_bytes: int} */
-        return ['results' => $results, ...array_combine(self::W412_IMPORT_STATUSES, $counts), 'unknown' => $unknown, 'inserted_bytes' => $bytes];
-    }
-
-    /** Wave 56.2 paired benchmarks decide this default; see RustDirectorySyncCoverageCreationImportNzbServiceW56ParityTest. */
-    private const bool W56_RUST_FFI_DEFAULT = true;
-
-    private const string W56_FFI_CDEF = <<<'C'
-        intptr_t nntmux_w56_import_file_plan_batch(const char *paths, size_t paths_len, const char *heads, size_t heads_len, const char *ints, size_t ints_len, size_t count, int64_t batch_size, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * Wave 56 routing, binding and output buffer, kept in function-local statics. Operations:
-     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
-     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
-     * least $val words (null without the library).
-     */
-    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $capacity = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = \is_bool($val) ? $val : null;
-
-                return $previous;
-            case 'ffi':
-                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w56', self::W56_FFI_CDEF) ?? false;
-
-                return $ffi === false ? null : $ffi;
-            case 'out':
-                $words = \is_int($val) ? $val : 0;
-                if (! $out instanceof CData || $capacity < $words) {
-                    $resolved = self::w56RustFfiState('ffi');
-                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
-                    if (! $buffer instanceof CData) {
-                        return null;
-                    }
-                    [$out, $capacity] = [$buffer, max(1024, $words)];
-                }
-
-                return [$ffi, $out, $capacity];
-            default:
-                return $enabled;
-        }
-    }
-
-    public static function usesW56RustFfi(): bool
-    {
-        $enabled = self::w56RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W56_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with planImportFileBatch() routed to Rust ($enabled) or PHP, then restores the
-     * previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w56RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w56RustFfiState('set', $previous);
-        }
-    }
-
-    /** @param  list<int>  $out */
-    private static function w56Digest(array $out): int
-    {
-        /** @var array{1: int} $digest */
-        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
-
-        return $digest[1];
-    }
-
-    /**
-     * The words the export wrote, or null when it declined (returning anything but $words).
-     *
-     * @return list<int>|null
-     */
-    private static function w56Words(mixed $written, CData $out, int $words): ?array
-    {
-        /** @var array<int, int>|false $values */
-        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
-
-        return \is_array($values) ? array_values($values) : null;
-    }
-
-    /**
-     * Batch import file plan over NZB paths and their leading bytes. Per file: `flags |
-     * min(release name length, 0xFFFFFF) << 8 | crc32(release name) << 32` (the name
-     * deriveReleaseNameFromNzbPathPhp() gives) and the import batch (importable ordinal /
-     * max(1, $batchSize)) of importable files (-1 otherwise). Flags: 1 `.nzb` basename, 2
-     * `.nzb.gz` basename (both case-insensitive), 4 gzip magic, 8 XML head (`<` after an
-     * optional UTF-8 BOM and spaces, tabs or line breaks), 16 extension/content mismatch (a
-     * `.nzb.gz` without gzip magic or a `.nzb` with it), 32 repeats an earlier non-empty release
-     * name, 64 importable (an NZB extension, gzip or XML content, no mismatch, a new non-empty
-     * name). NZB files, gzip heads, importable files, duplicates, batches and the XXH64 digest
-     * of all earlier words follow.
-     *
-     * @param  list<string>  $paths
-     * @param  list<string>  $heads
-     * @return list<int>
-     */
-    public static function planImportFileBatch(array $paths, array $heads, int $batchSize = 100): array
-    {
-        return self::usesW56RustFfi() ? self::planImportFileBatchNative($paths, $heads, $batchSize) : self::planImportFileBatchPhp($paths, $heads, $batchSize);
-    }
-
-    /**
-     * @param  list<string>  $paths
-     * @param  list<string>  $heads
-     * @return list<int>
-     */
-    public static function planImportFileBatchPhp(array $paths, array $heads, int $batchSize = 100): array
-    {
-        $size = max(1, $batchSize);
-        $heads = array_values($heads);
-        $out = $seen = [];
-        $nzb = $gzip = $importable = $duplicates = 0;
-        foreach (array_values($paths) as $i => $path) {
-            $head = $heads[$i] ?? '';
-            $base = strtolower(basename($path));
-            $gz = str_ends_with($base, '.nzb.gz');
-            $plain = ! $gz && str_ends_with($base, '.nzb');
-            $magic = str_starts_with($head, "\x1f\x8b");
-            $xml = str_starts_with(ltrim(str_starts_with($head, "\xEF\xBB\xBF") ? substr($head, 3) : $head, " \t\n\r"), '<');
-            $mismatch = ($gz && ! $magic) || ($plain && $magic);
-            $name = self::w56ReleaseName($path);
-            $duplicate = $name !== '' && isset($seen[$name]);
-            if ($name !== '') {
-                $seen[$name] = true;
-            }
-            $ok = ($gz || $plain) && ($magic || $xml) && ! $mismatch && $name !== '' && ! $duplicate;
-            $flags = ($plain ? 1 : 0) | ($gz ? 2 : 0) | ($magic ? 4 : 0) | ($xml ? 8 : 0) | ($mismatch ? 16 : 0) | ($duplicate ? 32 : 0) | ($ok ? 64 : 0);
-            $nzb += $gz || $plain ? 1 : 0;
-            $gzip += $magic ? 1 : 0;
-            $duplicates += $duplicate ? 1 : 0;
-            array_push($out, $flags | min(\strlen($name), 0xFFFFFF) << 8 | crc32($name) << 32, $ok ? intdiv($importable, $size) : -1);
-            $importable += $ok ? 1 : 0;
-        }
-        array_push($out, $nzb, $gzip, $importable, $duplicates, $importable > 0 ? intdiv($importable - 1, $size) + 1 : 0);
-        $out[] = self::w56Digest($out);
-
-        return $out;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing, PCRE's character tables are not
-     * the default (C) ones, a path holds a NUL byte or the columns are not lists of one length.
-     *
-     * @param  list<string>  $paths
-     * @param  list<string>  $heads
-     * @return list<int>
-     */
-    public static function planImportFileBatchNative(array $paths, array $heads, int $batchSize = 100): array
-    {
-        $count = \count($paths);
-        $words = 2 * $count + 6;
-        /** @var array{FFI, CData, int}|null $state */
-        $state = $count === 0 || \count($heads) !== $count ? null : self::w56RustFfiState('out', $words);
-        if ($state === null || ! array_is_list($paths) || ! array_is_list($heads) || ! NzbParserService::pcreUsesDefaultTables()) {
-            return self::planImportFileBatchPhp($paths, $heads, $batchSize);
-        }
-        $blob = implode("\0", $paths);
-        $headBlob = implode('', $heads);
-        $lengths = pack('P*', ...array_map(strlen(...), $heads));
-        [$ffi, $out, $cap] = $state;
-        try {
-            // @phpstan-ignore method.notFound (Declared by W56_FFI_CDEF.)
-            $written = $ffi->nntmux_w56_import_file_plan_batch($blob, \strlen($blob), $headBlob, \strlen($headBlob), $lengths, \strlen($lengths), $count, $batchSize, $out, $cap);
-        } catch (Throwable) {
-            $written = -1;
-        }
-
-        return self::w56Words($written, $out, $words) ?? self::planImportFileBatchPhp($paths, $heads, $batchSize);
-    }
-
-    private static function w56ReleaseName(string $path): string
-    {
-        $name = basename($path);
-
-        // Strip trailing .nzb or .nzb.gz (case-insensitive).
-        $name = preg_replace('/\.nzb(\.gz)?$/i', '', $name) ?? $name;
-
-        // Strip one trailing known media/container extension from the allow-list.
-        $name = preg_replace(
-            '/\.(mkv|mp4|avi|mov|wmv|flv|m4v|ts|webm|mpg|mpeg|iso|m2ts|ogm|divx|vob)$/i',
-            '',
-            $name
-        ) ?? $name;
-
-        // Tidy up any trailing dots/whitespace left behind.
-        return rtrim($name, ". \t\n\r\0\x0B");
     }
 }

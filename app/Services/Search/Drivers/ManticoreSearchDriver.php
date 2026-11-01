@@ -27,9 +27,7 @@ use App\Services\Search\Support\ReleaseIndexProjection;
 use App\Services\Search\Support\SearchFailureTracker;
 use App\Support\PredbSearchDocument;
 use App\Support\ReleaseSearchIndexDocument;
-use App\Support\RustPipelineLibrary;
 use App\Support\SecondaryIndexDocuments;
-use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -44,37 +42,6 @@ use Manticoresearch\Search;
 class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCandidateLookup, ReleaseCandidatePager, SearchDriverInterface
 {
     private const AVAILABILITY_CHECK_CACHE_TTL = 30;
-
-    private const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_manticore_phrases_to_fuzzy(const char *input_ptr, size_t input_len, size_t segment_count, uint8_t *out_buf, size_t out_cap);
-        C;
-
-    private static ?bool $useRustFfi = null;
-
-    private static \FFI|false|null $ffi = null;
-
-    private static ?CData $fuzzyBuf = null;
-
-    private static int $fuzzyCap = 0;
-
-    public static function setUseRustFfi(?bool $useRust): void
-    {
-        self::$useRustFfi = $useRust;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? false;
-    }
-
-    public static function ffi(): ?\FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('manticore_fuzzy_phrases', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
 
     /** @var list<string> */
     /**
@@ -833,16 +800,6 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
      */
     public static function escapeString(string $string): string
     {
-        $rust = RustPipelineLibrary::manticoreEscapeString($string);
-        if ($rust !== null) {
-            return $rust;
-        }
-
-        return self::escapeStringPhp($string);
-    }
-
-    public static function escapeStringPhp(string $string): string
-    {
         if ($string === '*' || empty($string)) {
             return '';
         }
@@ -858,24 +815,10 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
         return trim($string);
     }
 
-    public static function prepareReleaseFieldSearchQuery(string $field, string $query): string
+    private static function prepareReleaseFieldSearchQuery(string $field, string $query): string
     {
         if ($field !== 'fromname') {
             return self::prepareUserSearchQuery($query);
-        }
-
-        $rust = RustPipelineLibrary::manticorePrepareQuery($query, 1);
-        if ($rust !== null) {
-            return $rust;
-        }
-
-        return self::prepareReleaseFieldSearchQueryPhp($field, $query);
-    }
-
-    public static function prepareReleaseFieldSearchQueryPhp(string $field, string $query): string
-    {
-        if ($field !== 'fromname') {
-            return self::prepareUserSearchQueryPhp($query);
         }
 
         $query = trim($query);
@@ -906,16 +849,6 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
      * \, @, ~, &, /, $, =, ', [, ]
      */
     public static function prepareUserSearchQuery(string $query): string
-    {
-        $rust = RustPipelineLibrary::manticorePrepareQuery($query, 0);
-        if ($rust !== null) {
-            return $rust;
-        }
-
-        return self::prepareUserSearchQueryPhp($query);
-    }
-
-    public static function prepareUserSearchQueryPhp(string $query): string
     {
         $query = trim($query);
         if ($query === '' || $query === '*') {
@@ -1039,21 +972,6 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
      */
     public static function buildFieldSearchExpression(array $searchArray, ?array $allowedFields = null): ?string
     {
-        $supported = false;
-        $rust = RustPipelineLibrary::manticoreBuildFieldSearchExpression($searchArray, $allowedFields, null, $supported);
-        if ($supported) {
-            return $rust;
-        }
-
-        return self::buildFieldSearchExpressionPhp($searchArray, $allowedFields);
-    }
-
-    /**
-     * @param  array<string, mixed>  $searchArray
-     * @param  list<string>|null  $allowedFields
-     */
-    public static function buildFieldSearchExpressionPhp(array $searchArray, ?array $allowedFields = null): ?string
-    {
         $terms = [];
         foreach ($searchArray as $key => $value) {
             if ($allowedFields !== null && (! is_string($key) || ! in_array($key, $allowedFields, true))) {
@@ -1062,9 +980,9 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
             // An explicit check: empty() would also drop the legitimate search term "0".
             if ($value !== null && $value !== '') {
                 $rawValue = (string) $value;
-                $preparedValue = self::prepareUserSearchQueryPhp($rawValue);
+                $preparedValue = self::prepareUserSearchQuery($rawValue);
                 if ($preparedValue !== '') {
-                    $terms[] = self::scopeReleaseSearchQueryPhp($rawValue, $preparedValue, '@'.$key);
+                    $terms[] = self::scopeReleaseSearchQuery($rawValue, $preparedValue, '@'.$key);
                 }
             }
         }
@@ -1081,17 +999,7 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
      * indexing them as part of a word, though, so an ordinary release-name
      * query needs a normalized-token alternative as well.
      */
-    public static function scopeReleaseSearchQuery(string $rawQuery, string $preparedQuery, string $fieldSelector = ''): string
-    {
-        $rust = RustPipelineLibrary::manticoreScopeReleaseQuery($rawQuery, $preparedQuery, $fieldSelector);
-        if ($rust !== null) {
-            return $rust;
-        }
-
-        return self::scopeReleaseSearchQueryPhp($rawQuery, $preparedQuery, $fieldSelector);
-    }
-
-    public static function scopeReleaseSearchQueryPhp(string $rawQuery, string $preparedQuery, string $fieldSelector = ''): string
+    private static function scopeReleaseSearchQuery(string $rawQuery, string $preparedQuery, string $fieldSelector = ''): string
     {
         $primary = self::scopePreparedQueryToField($preparedQuery, $fieldSelector);
 
@@ -1107,7 +1015,7 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
 
         $normalized = preg_replace('/[._-]+/u', ' ', trim($rawQuery));
         $normalized = is_string($normalized) ? trim(preg_replace('/\s+/', ' ', $normalized) ?? '') : '';
-        $normalizedPrepared = self::prepareUserSearchQueryPhp($normalized);
+        $normalizedPrepared = self::prepareUserSearchQuery($normalized);
 
         if ($normalizedPrepared === '' || $normalizedPrepared === $preparedQuery) {
             return $primary;
@@ -2175,18 +2083,46 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
 
             $results = $search->get();
 
-            $searchnames = [];
+            $ranked = [];
             foreach ($results as $doc) {
                 $data = $doc->getData();
+                $searchname = '';
                 foreach ($fields as $field) {
                     if (! empty($data[$field])) {
-                        $searchnames[] = (string) $data[$field];
+                        $searchname = (string) $data[$field];
                         break;
                     }
                 }
+
+                if (empty($searchname)) {
+                    continue;
+                }
+
+                // Create a clean suggestion from the searchname
+                $suggestion = $this->extractSuggestion($searchname, $query);
+                if ($suggestion === null || $suggestion === '') {
+                    continue;
+                }
+
+                $normalized = mb_strtolower(trim((string) preg_replace('/\s+/', ' ', $suggestion)));
+                if ($normalized !== '') {
+                    if (! isset($ranked[$normalized])) {
+                        $ranked[$normalized] = [
+                            'suggest' => $suggestion,
+                            'distance' => 0,
+                            'docs' => 0,
+                            'prefix' => str_starts_with($normalized, mb_strtolower($query)) ? 1 : 0,
+                        ];
+                    }
+                    $ranked[$normalized]['docs']++;
+                }
             }
 
-            $suggestions = $this->rankAutocompleteCandidates($searchnames, $query, (int) $maxResults);
+            uasort($ranked, static fn (array $a, array $b): int => [$b['prefix'], $b['docs']] <=> [$a['prefix'], $a['docs']]);
+            foreach (array_slice($ranked, 0, $maxResults) as $item) {
+                unset($item['prefix']);
+                $suggestions[] = $item;
+            }
         } catch (\Throwable $e) {
             if (config('app.debug')) {
                 Log::warning('ManticoreSearch autocomplete error: '.$e->getMessage());
@@ -2202,79 +2138,13 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
     }
 
     /**
-     * @param  list<string>  $searchnames
-     * @return list<array{suggest: string, distance: int, docs: int}>
-     */
-    public function rankAutocompleteCandidates(array $searchnames, string $query, int $maxResults): array
-    {
-        $rust = RustPipelineLibrary::searchRankAutocompleteBatch($searchnames, $query, $maxResults);
-        if ($rust !== null) {
-            return $rust;
-        }
-
-        return $this->rankAutocompleteCandidatesPhp($searchnames, $query, $maxResults);
-    }
-
-    /**
-     * @param  list<string>  $searchnames
-     * @return list<array{suggest: string, distance: int, docs: int}>
-     */
-    public function rankAutocompleteCandidatesPhp(array $searchnames, string $query, int $maxResults): array
-    {
-        $ranked = [];
-        foreach ($searchnames as $searchname) {
-            if (empty($searchname)) {
-                continue;
-            }
-
-            $suggestion = $this->extractSuggestionPhp($searchname, $query);
-            if ($suggestion === null || $suggestion === '') {
-                continue;
-            }
-
-            $normalized = mb_strtolower(trim((string) preg_replace('/\s+/', ' ', $suggestion)));
-            if ($normalized !== '') {
-                if (! isset($ranked[$normalized])) {
-                    $ranked[$normalized] = [
-                        'suggest' => $suggestion,
-                        'distance' => 0,
-                        'docs' => 0,
-                        'prefix' => str_starts_with($normalized, mb_strtolower($query)) ? 1 : 0,
-                    ];
-                }
-                $ranked[$normalized]['docs']++;
-            }
-        }
-
-        uasort($ranked, static fn (array $a, array $b): int => [$b['prefix'], $b['docs']] <=> [$a['prefix'], $a['docs']]);
-        $suggestions = [];
-        foreach (array_slice($ranked, 0, $maxResults) as $item) {
-            unset($item['prefix']);
-            $suggestions[] = $item;
-        }
-
-        return $suggestions;
-    }
-
-    /**
      * Extract a clean suggestion from a searchname.
      *
      * @param  string  $searchname  The full searchname
      * @param  string  $query  The user's query
      * @return string|null The extracted suggestion
      */
-    public function extractSuggestion(string $searchname, string $query): ?string
-    {
-        $supported = false;
-        $rust = RustPipelineLibrary::searchExtractSuggestion($searchname, $query, null, $supported);
-        if ($supported) {
-            return $rust;
-        }
-
-        return $this->extractSuggestionPhp($searchname, $query);
-    }
-
-    public function extractSuggestionPhp(string $searchname, string $query): ?string
+    private function extractSuggestion(string $searchname, string $query): ?string
     {
         // Clean up the searchname - remove file extensions, quality tags at the end
         $clean = (string) preg_replace('/\.(mkv|avi|mp4|wmv|nfo|nzb|par2|rar|zip|r\d+)$/i', '', $searchname);
@@ -2428,18 +2298,47 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
 
             $results = $search->get();
 
-            $searchnames = [];
+            // Extract common terms from the results that differ from the query
+            $termCounts = [];
             foreach ($results as $doc) {
                 $data = $doc->getData();
+                $searchname = '';
                 foreach ($fields as $field) {
                     if (! empty($data[$field])) {
-                        $searchnames[] = (string) $data[$field];
+                        $searchname = (string) $data[$field];
                         break;
+                    }
+                }
+
+                // Extract words from searchname
+                $words = preg_split('/[\s.\-_]+/', strtolower($searchname)) ?: [];
+                foreach ($words as $word) {
+                    if (strlen($word) >= 3 && $word !== strtolower($query)) {
+                        // Check if word is similar to query (within edit distance)
+                        $distance = levenshtein(strtolower($query), $word);
+                        if ($distance > 0 && $distance <= 3) {
+                            if (! isset($termCounts[$word])) {
+                                $termCounts[$word] = ['count' => 0, 'distance' => $distance];
+                            }
+                            $termCounts[$word]['count']++;
+                        }
                     }
                 }
             }
 
-            return $this->rankSuggestFallbackCandidates($searchnames, $query, 5);
+            // Sort by count (most common first)
+            uasort($termCounts, fn ($a, $b) => $b['count'] - $a['count']);
+
+            $suggestions = [];
+            foreach (array_slice($termCounts, 0, 5, true) as $term => $data) {
+                $suggestions[] = [
+                    'suggest' => $term,
+                    'distance' => $data['distance'],
+                    'docs' => $data['count'],
+                ];
+            }
+
+            return $suggestions;
         } catch (\Throwable $e) {
             if (config('app.debug')) {
                 Log::debug('ManticoreSearch suggest fallback error: '.$e->getMessage());
@@ -2447,56 +2346,6 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
 
             return [];
         }
-    }
-
-    /**
-     * @param  list<string>  $searchnames
-     * @return list<array{suggest: string, distance: int, docs: int}>
-     */
-    public function rankSuggestFallbackCandidates(array $searchnames, string $query, int $maxResults = 5): array
-    {
-        $rust = RustPipelineLibrary::searchSuggestFallbackBatch($searchnames, $query, $maxResults);
-        if ($rust !== null) {
-            return $rust;
-        }
-
-        return $this->rankSuggestFallbackCandidatesPhp($searchnames, $query, $maxResults);
-    }
-
-    /**
-     * @param  list<string>  $searchnames
-     * @return list<array{suggest: string, distance: int, docs: int}>
-     */
-    public function rankSuggestFallbackCandidatesPhp(array $searchnames, string $query, int $maxResults = 5): array
-    {
-        $termCounts = [];
-        foreach ($searchnames as $searchname) {
-            $words = preg_split('/[\s.\-_]+/', strtolower($searchname)) ?: [];
-            foreach ($words as $word) {
-                if (strlen($word) >= 3 && $word !== strtolower($query)) {
-                    $distance = levenshtein(strtolower($query), $word);
-                    if ($distance > 0 && $distance <= 3) {
-                        if (! isset($termCounts[$word])) {
-                            $termCounts[$word] = ['count' => 0, 'distance' => $distance];
-                        }
-                        $termCounts[$word]['count']++;
-                    }
-                }
-            }
-        }
-
-        uasort($termCounts, fn ($a, $b) => $b['count'] - $a['count']);
-
-        $suggestions = [];
-        foreach (array_slice($termCounts, 0, $maxResults, true) as $term => $data) {
-            $suggestions[] = [
-                'suggest' => (string) $term,
-                'distance' => $data['distance'],
-                'docs' => $data['count'],
-            ];
-        }
-
-        return $suggestions;
     }
 
     /**
@@ -3362,10 +3211,10 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
     }
 
     /**
-     * @param  array<int|string, mixed>|string  $phrases
-     * @return array<int|string, mixed>
+     * @param  array<string, mixed>|string  $phrases
+     * @return array<string, mixed>
      */
-    private static function phrasesToSearchArrayStatic(array|string $phrases): array
+    private function phrasesToSearchArray(array|string $phrases): array
     {
         if (is_string($phrases)) {
             return ['searchname' => $phrases];
@@ -3380,152 +3229,10 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
 
     /**
      * @param  array<string, mixed>|string  $phrases
-     * @return array<string, mixed>
      */
-    private function phrasesToSearchArray(array|string $phrases): array
+    private function phrasesToFuzzyString(array|string $phrases): string
     {
-        return self::phrasesToSearchArrayStatic($phrases);
-    }
-
-    /**
-     * @param  array<int|string, mixed>|string  $phrases
-     */
-    public static function phrasesToFuzzyString(array|string $phrases): string
-    {
-        if (self::$useRustFfi === true) {
-            $native = self::phrasesToFuzzyStringNative($phrases);
-            if ($native !== null) {
-                return $native;
-            }
-        }
-
-        return self::phrasesToFuzzyStringPhp($phrases);
-    }
-
-    /**
-     * @param  array<int|string, mixed>|string  $phrases
-     */
-    public static function phrasesToFuzzyStringNative(array|string $phrases): ?string
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-
-        if (is_string($phrases)) {
-            if ($phrases === '' || $phrases === '0') {
-                return '';
-            }
-
-            return self::callManticorePhrasesToFuzzy($ffi, $phrases, 1);
-        }
-
-        if ($phrases === []) {
-            return '';
-        }
-
-        $isAssociative = false;
-        foreach ($phrases as $k => $_) {
-            if (is_string($k)) {
-                $isAssociative = true;
-                break;
-            }
-        }
-
-        if (! $isAssociative) {
-            $joined = implode(' ', $phrases);
-            if ($joined === '' || $joined === '0') {
-                return '';
-            }
-
-            return self::callManticorePhrasesToFuzzy($ffi, $joined, 1);
-        }
-
-        $segments = [];
-        $hasNul = false;
-        foreach ($phrases as $value) {
-            if (! empty($value)) {
-                $s = (string) $value;
-                if (str_contains($s, "\0")) {
-                    $hasNul = true;
-                }
-                $segments[] = $s;
-            }
-        }
-
-        $segCount = count($segments);
-        if ($segCount === 0) {
-            return '';
-        }
-        if ($segCount === 1) {
-            return self::callManticorePhrasesToFuzzy($ffi, $segments[0], 1);
-        }
-        if (! $hasNul) {
-            $packed = implode("\0", $segments);
-
-            return self::callManticorePhrasesToFuzzy($ffi, $packed, $segCount);
-        }
-
-        $cleaned = [];
-        foreach ($segments as $seg) {
-            $part = self::callManticorePhrasesToFuzzy($ffi, $seg, 1);
-            if ($part === null) {
-                return null;
-            }
-            if ($part !== '') {
-                $cleaned[] = $part;
-            }
-        }
-
-        return implode(' ', $cleaned);
-    }
-
-    private static function callManticorePhrasesToFuzzy(\FFI $ffi, string $packed, int $segCount): ?string
-    {
-        $len = strlen($packed);
-        $needed = max(256, $len + 16);
-        if (self::$fuzzyBuf === null || self::$fuzzyCap < $needed) {
-            self::$fuzzyCap = $needed;
-            self::$fuzzyBuf = $ffi->new("uint8_t[{$needed}]");
-        }
-
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_manticore_phrases_to_fuzzy(
-            $packed,
-            $len,
-            $segCount,
-            self::$fuzzyBuf,
-            self::$fuzzyCap,
-        );
-        if ($written < -1) {
-            $req = -$written;
-            self::$fuzzyCap = max($req + 16, 256);
-            self::$fuzzyBuf = $ffi->new('uint8_t['.self::$fuzzyCap.']');
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_manticore_phrases_to_fuzzy(
-                $packed,
-                $len,
-                $segCount,
-                self::$fuzzyBuf,
-                self::$fuzzyCap,
-            );
-        }
-        if ($written < 0) {
-            return null;
-        }
-        if ($written === 0) {
-            return '';
-        }
-
-        return \FFI::string(self::$fuzzyBuf, $written);
-    }
-
-    /**
-     * @param  array<int|string, mixed>|string  $phrases
-     */
-    public static function phrasesToFuzzyStringPhp(array|string $phrases): string
-    {
-        $searchArray = self::phrasesToSearchArrayStatic($phrases);
+        $searchArray = $this->phrasesToSearchArray($phrases);
         $searchTerms = [];
         foreach ($searchArray as $value) {
             if (! empty($value)) {
@@ -3841,305 +3548,5 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
         }
 
         return array_keys($seen);
-    }
-
-    /**
-     * Rust stays opt-in for the Wave 40.5 summary: the FFI round trip misses the 1.5x gate; see
-     * tests/Unit/RustManticoreElasticSearchServiceCircuitW40ParityTest.php.
-     */
-    public const bool W405_RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useW405RustFfi = null;
-
-    public static function useW405RustFfi(?bool $use = true): void
-    {
-        self::$useW405RustFfi = $use;
-    }
-
-    public static function usesW405RustFfi(): bool
-    {
-        return self::$useW405RustFfi ?? self::W405_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW405RustFfi(): void
-    {
-        self::$useW405RustFfi = null;
-    }
-
-    /**
-     * Summarizes a Manticore bulk upsert batch. A document is valid when it is an array whose `id`
-     * is a positive integer; only valid documents are sized and chunked. A document is estimated at
-     * 2 bytes plus, for each scalar field, `strlen(key) + strlen(value) + 4` (ints and floats as
-     * `(string)`, booleans as `1`/`0`; null and array fields are skipped). Chunks pack documents
-     * greedily up to `$maxBatchBytes`, and an oversized document gets its own chunk.
-     *
-     * @param  array<array-key, mixed>  $documents
-     * @return array{total_documents: int, valid_id_count: int, invalid_id_count: int, estimated_bytes: int, exceeds_batch_limit: bool, chunk_count: int}
-     */
-    public static function summarizeManticoreBulkUpsertBatch(array $documents, int $maxBatchBytes = 8388608): array
-    {
-        return self::usesW405RustFfi()
-            ? self::summarizeManticoreBulkUpsertBatchNative($documents, $maxBatchBytes)
-            : self::summarizeManticoreBulkUpsertBatchPhp($documents, $maxBatchBytes);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $documents
-     * @return array{total_documents: int, valid_id_count: int, invalid_id_count: int, estimated_bytes: int, exceeds_batch_limit: bool, chunk_count: int}
-     */
-    private static function summarizeManticoreBulkUpsertBatchNative(array $documents, int $maxBatchBytes): array
-    {
-        $parts = [(string) $maxBatchBytes];
-        foreach ($documents as $document) {
-            if (! \is_array($document)) {
-                array_push($parts, '', '0');
-
-                continue;
-            }
-            $id = $document['id'] ?? null;
-            $fields = [];
-            foreach ($document as $key => $value) {
-                $encoded = self::scalarField($value);
-                if ($encoded !== null) {
-                    array_push($fields, (string) $key, $encoded);
-                }
-            }
-            array_push($parts, \is_int($id) ? (string) $id : '', (string) intdiv(\count($fields), 2), ...$fields);
-        }
-        $fields = SearchService::evaluateW405Native(1, $parts);
-        if ($fields === null || \count($fields) !== 6) {
-            return self::summarizeManticoreBulkUpsertBatchPhp($documents, $maxBatchBytes);
-        }
-
-        return [
-            'total_documents' => (int) $fields[0],
-            'valid_id_count' => (int) $fields[1],
-            'invalid_id_count' => (int) $fields[2],
-            'estimated_bytes' => (int) $fields[3],
-            'exceeds_batch_limit' => $fields[4] === '1',
-            'chunk_count' => (int) $fields[5],
-        ];
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $documents
-     * @return array{total_documents: int, valid_id_count: int, invalid_id_count: int, estimated_bytes: int, exceeds_batch_limit: bool, chunk_count: int}
-     */
-    private static function summarizeManticoreBulkUpsertBatchPhp(array $documents, int $maxBatchBytes): array
-    {
-        $valid = $invalid = $total = $chunks = $current = 0;
-        foreach ($documents as $document) {
-            if (! \is_array($document) || ! \is_int($document['id'] ?? null) || $document['id'] <= 0) {
-                $invalid++;
-
-                continue;
-            }
-            $valid++;
-            $bytes = 2;
-            foreach ($document as $key => $value) {
-                $encoded = self::scalarField($value);
-                if ($encoded !== null) {
-                    $bytes += \strlen((string) $key) + \strlen($encoded) + 4;
-                }
-            }
-            $total += $bytes;
-            if ($chunks === 0 || $current + $bytes > $maxBatchBytes) {
-                $chunks++;
-                $current = $bytes;
-            } else {
-                $current += $bytes;
-            }
-        }
-
-        return [
-            'total_documents' => \count($documents),
-            'valid_id_count' => $valid,
-            'invalid_id_count' => $invalid,
-            'estimated_bytes' => $total,
-            'exceeds_batch_limit' => $total > $maxBatchBytes,
-            'chunk_count' => $chunks,
-        ];
-    }
-
-    private static function scalarField(mixed $value): ?string
-    {
-        return match (true) {
-            \is_string($value) => $value,
-            \is_int($value), \is_float($value) => (string) $value,
-            \is_bool($value) => $value ? '1' : '0',
-            default => null,
-        };
-    }
-
-    public const string W56_FFI_CDEF = 'int64_t nntmux_w565_manticore_user_query_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
-
-    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W56.5 parity test's QUALIFICATION). */
-    private const bool W56_RUST_FFI_DEFAULT = true;
-
-    /**
-     * Wave 56.5 routing and FFI cache, kept in function-local statics. Without $op it reports
-     * the routing; 'set' swaps the override for $val and returns the previous one; 'reset' replaces the
-     * cached handle with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[],
-     * capacity]` with room for at least $val words, or null without the library.
-     */
-    private static function w56RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'reset':
-                $ffi = $val;
-                $out = null;
-                $outCap = 0;
-
-                return null;
-            case 'buffer':
-                if ($ffi === null) {
-                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
-                    $ffi = RustPipelineLibrary::resolveDomain('w56_5', self::W56_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
-                }
-                if (! $ffi instanceof \FFI || ! \is_int($val)) {
-                    return null;
-                }
-                if ($out === null || $outCap < $val) {
-                    $outCap = max(1024, $val);
-                    $out = $ffi->new('int64_t['.$outCap.']');
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled ?? self::W56_RUST_FFI_DEFAULT;
-        }
-    }
-
-    public static function usesW56RustFfi(): bool
-    {
-        return self::w56RustFfiState() === true;
-    }
-
-    /**
-     * Runs $callback with userQueryPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW56RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w56RustFfiState('set', $enabled);
-
-        try {
-            return $callback();
-        } finally {
-            self::w56RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Exactly $words output words from the Wave 56.5 Rust helper over $count NUL-joined records, or null
-     * to fall back to PHP.
-     *
-     * @return list<int>|null
-     */
-    private static function w56Words(int $count, string $data, int $words): ?array
-    {
-        try {
-            $handle = self::w56RustFfiState('buffer', $words);
-            if (! \is_array($handle)) {
-                return null;
-            }
-            [$ffi, $out, $cap] = $handle;
-            $written = $ffi->nntmux_w565_manticore_user_query_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
-            if ($written !== $words) {
-                return null;
-            }
-            /** @var array<int, int>|false $values */
-            $values = unpack('P*', \FFI::string($out, $written * 8));
-
-            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
-        } catch (\Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Batch plan of the {@see self::prepareUserSearchQueryPhp()} tokenizer over the trimmed query
-     * (`[-!]?"[^"]*"|\S+`). Four words per query: `[tokens, negated, phrases, flags]`. Negated tokens are
-     * longer than one byte and start with `!` or `-`; phrases are quoted matches. Flags: 1 empty (or `*`)
-     * query, 2 `|` token, 4 unquoted token starting or ending with `*`, 8 non-ASCII.
-     *
-     * @param  list<string>  $queries
-     * @return list<int>
-     */
-    public static function userQueryPlanBatch(array $queries): array
-    {
-        return self::usesW56RustFfi() ? self::userQueryPlanBatchNative($queries) : self::userQueryPlanBatchPhp($queries);
-    }
-
-    /**
-     * @param  list<string>  $queries
-     * @return list<int>
-     */
-    public static function userQueryPlanBatchPhp(array $queries): array
-    {
-        $out = [];
-        foreach ($queries as $raw) {
-            $flags = preg_match('/[\x80-\xff]/', $raw) === 1 ? 8 : 0;
-            $query = trim($raw);
-            if ($query === '' || $query === '*') {
-                array_push($out, 0, 0, 0, $flags | 1);
-
-                continue;
-            }
-            preg_match_all('/[-!]?"[^"]*"|\S+/', $query, $matches);
-            $negated = $phrases = 0;
-            foreach ($matches[0] as $token) {
-                if ($token === '|') {
-                    $flags |= 2;
-
-                    continue;
-                }
-                $first = $token[0];
-                $length = \strlen($token);
-                if ($length > 1 && ($first === '!' || $first === '-')) {
-                    $negated++;
-                }
-                $open = $first === '"' ? 0 : (($first === '!' || $first === '-') && $length > 1 && $token[1] === '"' ? 1 : -1);
-                if ($open >= 0 && $length - $open >= 2 && $token[$length - 1] === '"') {
-                    $phrases++;
-                } elseif ($first === '*' || $token[$length - 1] === '*') {
-                    $flags |= 4;
-                }
-            }
-            array_push($out, \count($matches[0]), $negated, $phrases, $flags);
-        }
-
-        return $out;
-    }
-
-    /**
-     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds
-     * a NUL.
-     *
-     * @param  list<string>  $queries
-     * @return list<int>
-     */
-    public static function userQueryPlanBatchNative(array $queries): array
-    {
-        $count = \count($queries);
-        if ($count === 0) {
-            return [];
-        }
-
-        return self::w56Words($count, implode("\0", $queries), 4 * $count) ?? self::userQueryPlanBatchPhp($queries);
     }
 }

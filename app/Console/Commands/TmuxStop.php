@@ -8,120 +8,15 @@ use App\Enums\TmuxMode;
 use App\Enums\TmuxPaneRole;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
-use App\Services\Runners\BaseRunner;
 use App\Services\Tmux\TmuxCommand;
 use App\Services\Tmux\TmuxPaneManager;
 use App\Services\Tmux\TmuxSessionManager;
-use App\Support\RustPipelineLibrary;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Process;
 use RuntimeException;
 
 class TmuxStop extends Command
 {
-    public const string W386_FFI_CDEF = 'ssize_t nntmux_w386_tmux_drain_stop_runners(uint8_t operation, uint8_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
-
-    // Paired caller benchmarks must qualify before enabling this separate candidate.
-    private static ?bool $useRustW386 = null;
-
-    public static function setUseRustW386(?bool $enabled): void
-    {
-        self::$useRustW386 = $enabled;
-    }
-
-    public static function usesRustW386(): bool
-    {
-        return self::$useRustW386 ?? false;
-    }
-
-    private static function w386Transform(int $flags, string $input): ?string
-    {
-        $length = strlen($input);
-        if ($length > 16_777_216) {
-            return null;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('additional_w386', self::W386_FFI_CDEF);
-        if ($ffi === null) {
-            return null;
-        }
-        try {
-            $capacity = 0;
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $capacity);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w386_tmux_drain_stop_runners(2, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
-            if (is_int($written) && $written < -1 && -$written <= 16_777_216) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($scratch === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_w386_tmux_drain_stop_runners(2, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
-            }
-            if (! is_int($written) || $written < 0 || $written > min($capacity, 16_777_216)) {
-                return null;
-            }
-
-            return $written === 0 ? '' : \FFI::string($scratch, $written);
-        } catch (\Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Interrupt decisions for an already-selected list of active worker roles.
-     * This plan neither selects workers nor sends signals.
-     *
-     * @param  list<string>  $roles
-     * @return list<bool>
-     */
-    public static function stopInterruptPlan(array $roles, bool $wait): array
-    {
-        return (self::usesRustW386() ? self::stopInterruptPlanNative($roles, $wait) : null)
-            ?? self::stopInterruptPlanPhp($roles, $wait);
-    }
-
-    /**
-     * @param  list<string>  $roles
-     * @return list<bool>
-     */
-    public static function stopInterruptPlanPhp(array $roles, bool $wait): array
-    {
-        return array_map(static fn (string $role): bool => ! $wait || in_array($role, ['monitor', 'irc_scraper'], true), $roles);
-    }
-
-    /**
-     * @param  list<string>  $roles
-     * @return list<bool>|null
-     */
-    public static function stopInterruptPlanNative(array $roles, bool $wait): ?array
-    {
-        $input = pack('V', count($roles));
-        foreach ($roles as $role) {
-            $input .= pack('V', strlen($role)).$role;
-        }
-        $output = self::w386Transform((int) $wait, $input);
-        if ($output === null || strlen($output) !== 4 + count($roles)) {
-            return null;
-        }
-
-        return array_map(static fn (string $flag): bool => $flag === "\1", str_split(substr($output, 4)));
-    }
-
-    private static ?bool $useRustFfi = null;
-
-    public static function setUseRustFfi(?bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? false;
-    }
-
     /**
      * The name and signature of the console command.
      *
@@ -239,40 +134,19 @@ class TmuxStop extends Command
     private function confirmSessionAbsent(string $sessionName): void
     {
         $result = Process::timeout(10)->run(TmuxCommand::arguments(['list-sessions', '-F', '#{session_name}']));
-        $successful = $result->successful();
-        $output = $successful ? $result->output() : '';
-        $error = $successful ? '' : $result->errorOutput();
-        $exitCode = $successful ? null : $result->exitCode();
-        $status = (self::usesRustFfi() ? self::sessionAbsenceNative($sessionName, $successful, $output, $error, $exitCode) : null)
-            ?? self::sessionAbsencePhp($sessionName, $successful, $output, $error, $exitCode);
-        if ($status === 1) {
-            throw new RuntimeException('The tmux session still exists; keeping the stop request.');
-        }
-        if ($status === 2) {
-            throw new RuntimeException('Unable to confirm the tmux session is absent; keeping the stop request.');
-        }
-    }
+        if ($result->successful()) {
+            if (in_array($sessionName, explode("\n", trim($result->output())), true)) {
+                throw new RuntimeException('The tmux session still exists; keeping the stop request.');
+            }
 
-    /** 0 means absent, 1 means still present, 2 means the check failed. */
-    public static function sessionAbsenceNative(string $sessionName, bool $successful, string $output, string $error, ?int $exitCode): ?int
-    {
-        $result = BaseRunner::runnerTransformNative(11, [$sessionName, $successful ? '1' : '0', $output, $error, $exitCode === null ? '' : (string) $exitCode]);
-
-        return in_array($result, ['0', '1', '2'], true) ? (int) $result : null;
-    }
-
-    /** 0 means absent, 1 means still present, 2 means the check failed. */
-    public static function sessionAbsencePhp(string $sessionName, bool $successful, string $output, string $error, ?int $exitCode): int
-    {
-        if ($successful) {
-            return in_array($sessionName, explode("\n", trim($output)), true) ? 1 : 0;
+            return;
         }
-        $error = trim($error);
-        if ($exitCode === 1 && (str_starts_with($error, 'no server running on ')
+        $error = trim($result->errorOutput());
+        if ($result->exitCode() === 1 && (str_starts_with($error, 'no server running on ')
             || (str_starts_with($error, 'error connecting to ') && str_ends_with($error, '(No such file or directory)')))) {
-            return 0;
+            return;
         }
 
-        return 2;
+        throw new RuntimeException('Unable to confirm the tmux session is absent; keeping the stop request.');
     }
 }

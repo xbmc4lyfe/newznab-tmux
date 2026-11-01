@@ -12,9 +12,6 @@ use App\Models\ServiceIncident;
 use App\Models\ServiceStatus;
 use App\Services\StatusProbes\ProbeResult;
 use App\Services\StatusProbes\ServiceProbeRegistry;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
@@ -24,16 +21,6 @@ use Illuminate\Support\Facades\Mail;
 
 class SiteStatusService
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_site_status_merge_intervals(const int64_t *flat_pairs_ptr, size_t pair_count, int64_t *out_pairs_ptr, size_t out_pair_cap);
-        int32_t nntmux_site_status_aggregate_worst_nul(const char *input_ptr, size_t input_len, size_t count);
-        int32_t nntmux_site_status_map_incident_impact(const char *impact_ptr, size_t impact_len);
-        C;
-
-    public static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
     public const CACHE_KEY_ENABLED_SERVICES = 'admin:site-status:enabled-services';
 
     public const CACHE_KEY_ACTIVE_INCIDENTS = 'admin:site-status:active-incidents';
@@ -46,22 +33,6 @@ class SiteStatusService
      * @var array{0: int, 1: int}
      */
     private const CACHE_TTL = [60, 600];
-
-    public static function setUseRustFfi(bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi;
-    }
-
-    public static function categorizeFfi(): ?FFI
-    {
-        if (self::$ffi !== null) {
-            return self::$ffi === false ? null : self::$ffi;
-        }
-
-        self::$ffi = RustPipelineLibrary::resolveDomain('categorize', self::FFI_CDEF) ?? false;
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
 
     public function __construct(
         private readonly ServiceProbeRegistry $probeRegistry,
@@ -124,69 +95,24 @@ class SiteStatusService
     }
 
     /**
-     * @param  iterable<int, ServiceStatus|ServiceStatusEnum>  $services
+     * @param  \Illuminate\Database\Eloquent\Collection<int, ServiceStatus>  $services
      */
-    public function aggregateWorstStatus(iterable $services): ServiceStatusEnum
+    private function aggregateWorstStatus(\Illuminate\Database\Eloquent\Collection $services): ServiceStatusEnum
     {
-        return self::$useRustFfi
-            ? $this->aggregateWorstStatusNative($services)
-            : $this->aggregateWorstStatusPhp($services);
-    }
+        if ($services->isEmpty()) {
+            return ServiceStatusEnum::Operational;
+        }
 
-    /**
-     * @param  iterable<int, ServiceStatus|ServiceStatusEnum>  $services
-     */
-    public function aggregateWorstStatusPhp(iterable $services): ServiceStatusEnum
-    {
         $worst = ServiceStatusEnum::Operational;
 
         foreach ($services as $service) {
-            $current = $service instanceof ServiceStatusEnum ? $service : $service->status;
+            $current = $service->status;
             if ($current->severity() > $worst->severity()) {
                 $worst = $current;
             }
         }
 
         return $worst;
-    }
-
-    /**
-     * @param  iterable<int, ServiceStatus|ServiceStatusEnum>  $services
-     */
-    public function aggregateWorstStatusNative(iterable $services): ServiceStatusEnum
-    {
-        $ffi = self::categorizeFfi();
-        if ($ffi === null) {
-            return $this->aggregateWorstStatusPhp($services);
-        }
-
-        $tokens = [];
-        foreach ($services as $service) {
-            $status = $service instanceof ServiceStatusEnum ? $service : $service->status;
-            $tokens[] = $status->value;
-        }
-
-        $count = \count($tokens);
-        if ($count === 0) {
-            return ServiceStatusEnum::Operational;
-        }
-
-        $joined = implode("\0", $tokens);
-
-        // @phpstan-ignore method.notFound
-        $code = $ffi->nntmux_site_status_aggregate_worst_nul($joined, \strlen($joined), $count);
-        if (! \is_int($code)) {
-            return $this->aggregateWorstStatusPhp($services);
-        }
-
-        return match ($code) {
-            0 => ServiceStatusEnum::Operational,
-            1 => ServiceStatusEnum::Degraded,
-            2 => ServiceStatusEnum::Maintenance,
-            3 => ServiceStatusEnum::PartialOutage,
-            4 => ServiceStatusEnum::MajorOutage,
-            default => $this->aggregateWorstStatusPhp($services),
-        };
     }
 
     /**
@@ -347,18 +273,7 @@ class SiteStatusService
      * @param  list<array{0: int, 1: int}>  $intervals  [[start, end], ...]
      * @return list<array{0: int, 1: int}>
      */
-    public function mergeIntervals(array $intervals): array
-    {
-        return self::$useRustFfi
-            ? $this->mergeIntervalsNative($intervals)
-            : $this->mergeIntervalsPhp($intervals);
-    }
-
-    /**
-     * @param  list<array{0: int, 1: int}>  $intervals
-     * @return list<array{0: int, 1: int}>
-     */
-    public function mergeIntervalsPhp(array $intervals): array
+    private function mergeIntervals(array $intervals): array
     {
         if ($intervals === []) {
             return [];
@@ -375,49 +290,6 @@ class SiteStatusService
             } else {
                 $merged[] = $intervals[$i];
             }
-        }
-
-        return $merged;
-    }
-
-    /**
-     * @param  list<array{0: int, 1: int}>  $intervals
-     * @return list<array{0: int, 1: int}>
-     */
-    public function mergeIntervalsNative(array $intervals): array
-    {
-        if ($intervals === []) {
-            return [];
-        }
-
-        $ffi = self::categorizeFfi();
-        if ($ffi === null) {
-            return $this->mergeIntervalsPhp($intervals);
-        }
-
-        $pairCount = \count($intervals);
-        $elemCount = $pairCount * 2;
-        $inPairs = $ffi->new("int64_t[{$elemCount}]");
-        $outPairs = $ffi->new("int64_t[{$elemCount}]");
-
-        foreach ($intervals as $idx => $pair) {
-            $inPairs[$idx * 2] = $pair[0];
-            $inPairs[$idx * 2 + 1] = $pair[1];
-        }
-
-        // @phpstan-ignore method.notFound
-        $mergedCount = $ffi->nntmux_site_status_merge_intervals($inPairs, $pairCount, $outPairs, $pairCount);
-        if (! \is_int($mergedCount) || $mergedCount < 0) {
-            return $this->mergeIntervalsPhp($intervals);
-        }
-
-        $merged = [];
-        for ($i = 0; $i < $mergedCount; $i++) {
-            /** @var int $s */
-            $s = $outPairs[$i * 2];
-            /** @var int $e */
-            $e = $outPairs[$i * 2 + 1];
-            $merged[] = [$s, $e];
         }
 
         return $merged;
@@ -751,14 +623,7 @@ class SiteStatusService
         }
     }
 
-    public function mapIncidentImpactToServiceHealth(IncidentImpactEnum $impact): ServiceStatusEnum
-    {
-        return self::$useRustFfi
-            ? $this->mapIncidentImpactToServiceHealthNative($impact)
-            : $this->mapIncidentImpactToServiceHealthPhp($impact);
-    }
-
-    public function mapIncidentImpactToServiceHealthPhp(IncidentImpactEnum $impact): ServiceStatusEnum
+    private function mapIncidentImpactToServiceHealth(IncidentImpactEnum $impact): ServiceStatusEnum
     {
         return match ($impact) {
             IncidentImpactEnum::None => ServiceStatusEnum::Degraded,
@@ -766,219 +631,5 @@ class SiteStatusService
             IncidentImpactEnum::Major => ServiceStatusEnum::PartialOutage,
             IncidentImpactEnum::Critical => ServiceStatusEnum::MajorOutage,
         };
-    }
-
-    public function mapIncidentImpactToServiceHealthNative(IncidentImpactEnum $impact): ServiceStatusEnum
-    {
-        $ffi = self::categorizeFfi();
-        if ($ffi === null) {
-            return $this->mapIncidentImpactToServiceHealthPhp($impact);
-        }
-
-        $raw = $impact->value;
-
-        // @phpstan-ignore method.notFound
-        $code = $ffi->nntmux_site_status_map_incident_impact($raw, \strlen($raw));
-        if (! \is_int($code)) {
-            return $this->mapIncidentImpactToServiceHealthPhp($impact);
-        }
-
-        return match ($code) {
-            1 => ServiceStatusEnum::Degraded,
-            3 => ServiceStatusEnum::PartialOutage,
-            4 => ServiceStatusEnum::MajorOutage,
-            default => $this->mapIncidentImpactToServiceHealthPhp($impact),
-        };
-    }
-
-    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51 parity test). */
-    private const bool W51_RUST_FFI_DEFAULT = true;
-
-    private const string W51_FFI_CDEF = 'ssize_t nntmux_w511_site_status_downtime_batch(const char *starts, size_t starts_len, const char *ends, size_t ends_len, const char *nulls, size_t nulls_len, size_t count, int64_t window_start, int64_t window_end, int64_t *out, size_t out_cap);';
-
-    public static function usesW51RustFfi(): bool
-    {
-        $enabled = self::w51RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
-    }
-
-    /** Runs $callback with the Wave 51 batch routed to Rust or PHP, then restores the routing. */
-    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w51RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w51RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * {@see recalculateUptime()} downtime for one window: each incident is clamped to
-     * `[$windowStart, $windowEnd]` (a null end is still open), empty spans are dropped and the
-     * rest merged like {@see mergeIntervalsPhp()}. Returns `[downtimeSeconds, start0, end0, ...]`.
-     *
-     * @param  list<int>  $starts
-     * @param  list<int|null>  $ends
-     * @return list<int>
-     */
-    public static function downtimeSummary(int $windowStart, int $windowEnd, array $starts, array $ends): array
-    {
-        return self::usesW51RustFfi()
-            ? self::downtimeSummaryNative($windowStart, $windowEnd, $starts, $ends)
-            : self::downtimeSummaryPhp($windowStart, $windowEnd, $starts, $ends);
-    }
-
-    /**
-     * @param  list<int>  $starts
-     * @param  list<int|null>  $ends
-     * @return list<int>
-     */
-    public static function downtimeSummaryPhp(int $windowStart, int $windowEnd, array $starts, array $ends): array
-    {
-        self::w51Count($starts, $ends);
-        $intervals = [];
-        foreach ($starts as $i => $start) {
-            $end = $ends[$i];
-            $s = max($start, $windowStart);
-            $e = $end === null ? $windowEnd : min($end, $windowEnd);
-            if ($s < $e) {
-                $intervals[] = [$s, $e];
-            }
-        }
-        $merged = [];
-        if ($intervals !== []) {
-            usort($intervals, static fn (array $a, array $b): int => $a[0] <=> $b[0]);
-            $merged = [$intervals[0]];
-            $last = 0;
-            for ($i = 1, $count = \count($intervals); $i < $count; $i++) {
-                if ($intervals[$i][0] <= $merged[$last][1]) {
-                    $merged[$last][1] = max($merged[$last][1], $intervals[$i][1]);
-                } else {
-                    $merged[++$last] = $intervals[$i];
-                }
-            }
-        }
-        $downtime = 0;
-        $words = [0];
-        foreach ($merged as [$s, $e]) {
-            $downtime += $e - $s;
-            $words[] = $s;
-            $words[] = $e;
-        }
-        if (! \is_int($downtime)) {
-            throw new \InvalidArgumentException('Site status downtime overflows an integer.');
-        }
-        $words[0] = $downtime;
-
-        return $words;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing or declines the batch (an
-     * overflowing sum, which PHP then rejects).
-     *
-     * @param  list<int>  $starts
-     * @param  list<int|null>  $ends
-     * @return list<int>
-     */
-    public static function downtimeSummaryNative(int $windowStart, int $windowEnd, array $starts, array $ends): array
-    {
-        $count = self::w51Count($starts, $ends);
-        $maxWords = 2 * $count + 1;
-        $buffer = $count === 0 ? null : self::w51Buffer($maxWords);
-        if ($buffer === null) {
-            return self::downtimeSummaryPhp($windowStart, $windowEnd, $starts, $ends);
-        }
-        [$ffi, $out, $cap] = $buffer;
-        $packedStarts = pack('P*', ...$starts);
-        $packedEnds = pack('P*', ...$ends);
-        $nulls = pack('V*', ...array_keys($ends, null, true));
-        try {
-            // @phpstan-ignore method.notFound
-            $words = self::w51Decode($out, $ffi->nntmux_w511_site_status_downtime_batch($packedStarts, \strlen($packedStarts), $packedEnds, \strlen($packedEnds), $nulls, \strlen($nulls), $count, $windowStart, $windowEnd, $out, $cap), $maxWords);
-        } catch (\Throwable) {
-            $words = null;
-        }
-
-        return $words !== null && $words !== [] && \count($words) % 2 === 1
-            ? $words
-            : self::downtimeSummaryPhp($windowStart, $windowEnd, $starts, $ends);
-    }
-
-    /**
-     * @param  array<mixed>  ...$columns
-     */
-    private static function w51Count(array ...$columns): int
-    {
-        $count = \count($columns[0]);
-        foreach ($columns as $column) {
-            if (\count($column) !== $count) {
-                throw new \InvalidArgumentException('Site status downtime columns must have the same length.');
-            }
-        }
-
-        return $count;
-    }
-
-    /**
-     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
-     *
-     * @return array{0: FFI, 1: CData, 2: int}|null
-     */
-    private static function w51Buffer(int $words): ?array
-    {
-        $buffer = self::w51RustFfiState('out', $words);
-
-        return \is_array($buffer) ? $buffer : null;
-    }
-
-    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
-    private static function w51Decode(CData $out, mixed $written, int $maxWords): ?array
-    {
-        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
-            return null;
-        }
-        if ($written === 0) {
-            return [];
-        }
-        $decoded = unpack('P*', FFI::string($out, $written * 8));
-
-        /** @var list<int>|null */
-        return \is_array($decoded) ? array_values($decoded) : null;
-    }
-
-    /**
-     * Wave 51 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
-     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
-     */
-    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'out':
-                $ffi ??= RustPipelineLibrary::resolveDomain('admin_status_w51', self::W51_FFI_CDEF) ?? false;
-                if (! $ffi instanceof FFI || ! \is_int($val)) {
-                    return null;
-                }
-                if (! $out instanceof CData || $outCap < $val) {
-                    $outCap = max(512, $val * 2);
-                    $out = $ffi->new("int64_t[{$outCap}]");
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled;
-        }
     }
 }

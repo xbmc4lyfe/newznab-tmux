@@ -22,9 +22,6 @@ use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\ReleaseExtraService;
 use App\Services\ReleaseImageService;
 use App\Support\Par2FileHashEvidence;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use FFMpeg\Coordinate\Dimension;
 use FFMpeg\Coordinate\TimeCode;
 use FFMpeg\FFMpeg;
@@ -35,7 +32,6 @@ use FFMpeg\Media\Video;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
-use InvalidArgumentException;
 use Mhor\MediaInfo\MediaInfo;
 
 /**
@@ -44,27 +40,6 @@ use Mhor\MediaInfo\MediaInfo;
  */
 class MediaExtractionService
 {
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_rfm_audio_tag_span(const char *ptr, size_t len, size_t *out);
-        ssize_t nntmux_rfm_audio_release_title(const char *performer_ptr, size_t performer_len, const char *album_ptr, size_t album_len, const char *date_ptr, size_t date_len, int32_t has_date, const char *ext_ptr, size_t ext_len, char *out_ptr, size_t out_cap);
-        C;
-
-    /** Wave 40.6 paired benchmarks decide this default; see RustArchiveExtractionMediaUsenetDownloadReleaseProcW40ParityTest. */
-    public const bool W406_RUST_FFI_DEFAULT = false;
-
-    /** Resolution tiers indexed by the Wave 40.6 export's tier code. */
-    private const array W406_RESOLUTION_TIERS = ['sd', 'hd_720', 'fhd_1080', 'uhd_4k', 'invalid'];
-
-    private static ?FFI $ffi = null;
-
-    private static bool $ffiResolved = false;
-
-    private static bool $useRustFfi = true;
-
-    private static ?bool $w406UseRustFfi = null;
-
-    private static ?CData $audioTagSpan = null;
-
     private readonly MediaToolFactory $tools;
 
     private readonly ThumbnailFrameSelector $frameSelector;
@@ -346,8 +321,14 @@ class MediaExtractionService
                         $renamed = false;
                         if ((int) $current->predb_id === 0 && $this->config->renameMusicMediaInfo) {
                             $ext = strtoupper($fileExtension);
-                            $title = self::audioReleaseTitle($performer, $album, $this->audioTagText($track->get('recorded_date')), $fileExtension);
-                            if ($title !== null) {
+                            $title = $performer.' - '.$album;
+                            $date = $this->audioTagText($track->get('recorded_date'));
+                            if ($date !== null && preg_match('/(?:19|20)\d\d/', $date, $year)) {
+                                $title .= ' ('.$year[0].')';
+                            }
+                            $title .= ' '.$ext;
+                            if (mb_check_encoding($title, 'UTF-8') && mb_strlen($title, 'UTF-8') <= 255
+                                && preg_match('/\p{C}/u', $title) === 0) {
                                 $category = match ($ext) {
                                     'MP3' => Category::MUSIC_MP3,
                                     'FLAC' => Category::MUSIC_LOSSLESS,
@@ -428,16 +409,7 @@ class MediaExtractionService
         return $result;
     }
 
-    /**
-     * Retains the native PHP path in production (~0.50x-0.61x mean in paired benchmarks);
-     * see audioTagTextNative().
-     */
     private function audioTagText(mixed $value): ?string
-    {
-        return self::audioTagTextPhp($value);
-    }
-
-    public static function audioTagTextPhp(mixed $value): ?string
     {
         if (! is_string($value) && ! is_int($value) && ! is_float($value) && ! $value instanceof \Stringable) {
             return null;
@@ -445,198 +417,6 @@ class MediaExtractionService
         $text = trim((string) $value);
 
         return $text !== '' && mb_check_encoding($text, 'UTF-8') && ! preg_match('/[\x00-\x1f\x7f]/', $text) ? $text : null;
-    }
-
-    public static function audioTagTextNative(mixed $value, bool &$supported = false, ?string $libraryPath = null): ?string
-    {
-        $supported = false;
-        if (! is_string($value)) {
-            return self::audioTagTextPhp($value);
-        }
-        $ffi = self::rustFfi($libraryPath);
-        if ($ffi === null) {
-            return self::audioTagTextPhp($value);
-        }
-
-        try {
-            $span = self::$audioTagSpan ??= $ffi->new('size_t[2]');
-            // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_rfm_audio_tag_span($value, strlen($value), $span);
-        } catch (\Throwable) {
-            return self::audioTagTextPhp($value);
-        }
-
-        if (! is_int($status) || $status < 0) {
-            return self::audioTagTextPhp($value);
-        }
-        $supported = true;
-
-        return $status === 1 ? substr($value, (int) $span[0], (int) $span[1]) : null;
-    }
-
-    /**
-     * Build the MediaInfo music title, or null when it is not a valid searchname.
-     *
-     * Retains the native PHP path in production (~0.73x-0.76x mean in paired benchmarks);
-     * see audioReleaseTitleNative().
-     */
-    public static function audioReleaseTitle(string $performer, string $album, ?string $date, string $fileExtension): ?string
-    {
-        return self::audioReleaseTitlePhp($performer, $album, $date, $fileExtension);
-    }
-
-    public static function audioReleaseTitlePhp(string $performer, string $album, ?string $date, string $fileExtension): ?string
-    {
-        $title = $performer.' - '.$album;
-        if ($date !== null && preg_match('/(?:19|20)\d\d/', $date, $year)) {
-            $title .= ' ('.$year[0].')';
-        }
-        $title .= ' '.strtoupper($fileExtension);
-
-        return mb_check_encoding($title, 'UTF-8') && mb_strlen($title, 'UTF-8') <= 255
-            && preg_match('/\p{C}/u', $title) === 0 ? $title : null;
-    }
-
-    public static function audioReleaseTitleNative(
-        string $performer,
-        string $album,
-        ?string $date,
-        string $fileExtension,
-        bool &$supported = false,
-        ?string $libraryPath = null,
-    ): ?string {
-        $supported = false;
-        $ffi = self::rustFfi($libraryPath);
-        if ($ffi === null) {
-            return self::audioReleaseTitlePhp($performer, $album, $date, $fileExtension);
-        }
-
-        $dateText = $date ?? '';
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $cap);
-        if ($scratch === null) {
-            return self::audioReleaseTitlePhp($performer, $album, $date, $fileExtension);
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_rfm_audio_release_title(
-                $performer,
-                strlen($performer),
-                $album,
-                strlen($album),
-                $dateText,
-                strlen($dateText),
-                $date === null ? 0 : 1,
-                $fileExtension,
-                strlen($fileExtension),
-                $scratch,
-                $cap,
-            );
-        } catch (\Throwable) {
-            return self::audioReleaseTitlePhp($performer, $album, $date, $fileExtension);
-        }
-
-        if ($written === -3) {
-            $supported = true;
-
-            return null;
-        }
-        if (! is_int($written) || $written < 0) {
-            return self::audioReleaseTitlePhp($performer, $album, $date, $fileExtension);
-        }
-        $supported = true;
-
-        return FFI::string($scratch, $written);
-    }
-
-    /**
-     * Toggle the Rust helpers; disabled, every *Native method falls back to PHP.
-     */
-    public static function useRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    public static function useW406RustFfi(?bool $enabled): void
-    {
-        self::$w406UseRustFfi = $enabled;
-    }
-
-    public static function usesW406RustFfi(): bool
-    {
-        return self::$w406UseRustFfi ?? self::W406_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW406RustFfi(): void
-    {
-        self::$w406UseRustFfi = null;
-    }
-
-    /**
-     * Classify probed media metrics. Non-positive dimensions are invalid; otherwise the tier is uhd_4k from 3840
-     * wide or 2160 high, fhd_1080 from 1920 or 1080, hd_720 from 1280 or 720, else sd. A duration is valid within
-     * 1 ms..24 h, six or more channels are surround, and a sample needs a valid duration of at least 10 s, valid
-     * dimensions and a positive video bitrate.
-     *
-     * @return array{resolution_tier: string, valid_duration: bool, surround_audio: bool, sample_eligible: bool}
-     */
-    public static function summarizeMediaProbeMetrics(int $durationMs, int $width, int $height, int $videoBitrateKbps, int $audioChannels): array
-    {
-        return (self::usesW406RustFfi() ? self::summarizeMediaProbeMetricsNative($durationMs, $width, $height, $videoBitrateKbps, $audioChannels) : null)
-            ?? self::summarizeMediaProbeMetricsPhp($durationMs, $width, $height, $videoBitrateKbps, $audioChannels);
-    }
-
-    /** @return array{resolution_tier: string, valid_duration: bool, surround_audio: bool, sample_eligible: bool} */
-    public static function summarizeMediaProbeMetricsPhp(int $durationMs, int $width, int $height, int $videoBitrateKbps, int $audioChannels): array
-    {
-        $tier = match (true) {
-            $width <= 0 || $height <= 0 => 'invalid',
-            $width >= 3840 || $height >= 2160 => 'uhd_4k',
-            $width >= 1920 || $height >= 1080 => 'fhd_1080',
-            $width >= 1280 || $height >= 720 => 'hd_720',
-            default => 'sd',
-        };
-        $validDuration = $durationMs > 0 && $durationMs <= 86_400_000;
-
-        return [
-            'resolution_tier' => $tier,
-            'valid_duration' => $validDuration,
-            'surround_audio' => $audioChannels >= 6,
-            'sample_eligible' => $validDuration && $durationMs >= 10_000 && $tier !== 'invalid' && $videoBitrateKbps > 0,
-        ];
-    }
-
-    /** @return array{resolution_tier: string, valid_duration: bool, surround_audio: bool, sample_eligible: bool}|null */
-    public static function summarizeMediaProbeMetricsNative(int $durationMs, int $width, int $height, int $videoBitrateKbps, int $audioChannels): ?array
-    {
-        $slots = ArchiveExtractionService::w406Slots(2, pack('q5', $durationMs, $width, $height, $videoBitrateKbps, $audioChannels), 4);
-        if ($slots === null || ! isset(self::W406_RESOLUTION_TIERS[$slots[0]]) || ($slots[1] & ~1) !== 0 || ($slots[2] & ~1) !== 0 || ($slots[3] & ~1) !== 0) {
-            return null;
-        }
-
-        return [
-            'resolution_tier' => self::W406_RESOLUTION_TIERS[$slots[0]],
-            'valid_duration' => $slots[1] === 1,
-            'surround_audio' => $slots[2] === 1,
-            'sample_eligible' => $slots[3] === 1,
-        ];
-    }
-
-    private static function rustFfi(?string $libraryPath = null): ?FFI
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        if ($libraryPath !== null) {
-            return RustPipelineLibrary::resolveDomain('media_extraction', self::FFI_CDEF, $libraryPath);
-        }
-        if (! self::$ffiResolved) {
-            self::$ffiResolved = true;
-            self::$ffi = RustPipelineLibrary::resolveDomain('media_extraction', self::FFI_CDEF);
-        }
-
-        return self::$ffi;
     }
 
     /**
@@ -787,194 +567,5 @@ class MediaExtractionService
         }
 
         return $this->mediaInfo;
-    }
-
-    // ---------------------------------------------------------------------
-    // Wave 52.4 batch helper
-    // ---------------------------------------------------------------------
-
-    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.53x, p99 1.91x; uncommon mean 2.17x, p99 1.80x); see RustWorkPlannerArchiveConfigConsoleMediaExtractW52ParityTest. */
-    private const bool W52_RUST_FFI_DEFAULT = true;
-
-    public const string W52_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w524_audio_tag_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /** audioTagBatch() flags; valid is exclusive. */
-    public const int W52_TAG_VALID = 1;
-
-    public const int W52_TAG_EMPTY = 2;
-
-    public const int W52_TAG_INVALID_UTF8 = 4;
-
-    public const int W52_TAG_CONTROL = 8;
-
-    /**
-     * Validate MediaInfo tag strings, four ints each: [flags, trimmed offset << 32 | length,
-     * UTF-8 characters in the trimmed text or -1 when it is invalid, first `(?:19|20)\d\d`
-     * year in the value (as audioReleaseTitlePhp() reads a date) or -1]. Flags: 1 valid
-     * (audioTagTextPhp() returns the trimmed text), otherwise 2 empty after trim(), 4 invalid
-     * UTF-8 and 8 control byte (0x00-0x1f, 0x7f) in the trimmed text.
-     *
-     * @param  list<string>  $values
-     * @return list<int>
-     */
-    public static function audioTagBatch(array $values): array
-    {
-        return self::usesW52RustFfi()
-            ? self::audioTagBatchNative($values)
-            : self::audioTagBatchPhp($values);
-    }
-
-    /**
-     * @param  list<string>  $values
-     * @return list<int>
-     */
-    public static function audioTagBatchNative(array $values): array
-    {
-        self::w52AssertList($values);
-        if ($values === []) {
-            return [];
-        }
-
-        [$text, $twin] = self::w52Text($values);
-
-        return self::w52Call($text, $twin, \count($values))
-            ?? self::audioTagBatchPhp($values);
-    }
-
-    /**
-     * @param  list<string>  $values
-     * @return list<int>
-     */
-    public static function audioTagBatchPhp(array $values): array
-    {
-        self::w52AssertList($values);
-        $out = [];
-        foreach ($values as $value) {
-            $text = trim($value);
-            $utf8 = mb_check_encoding($text, 'UTF-8');
-            $flags = ($text === '' ? self::W52_TAG_EMPTY : 0)
-                | ($utf8 ? 0 : self::W52_TAG_INVALID_UTF8)
-                | (preg_match('/[\x00-\x1f\x7f]/', $text) === 1 ? self::W52_TAG_CONTROL : 0);
-            $out[] = $flags === 0 ? self::W52_TAG_VALID : $flags;
-            $out[] = (strspn($value, " \t\n\r\0\x0B") << 32) | \strlen($text);
-            $out[] = $utf8 ? mb_strlen($text, 'UTF-8') : -1;
-            $out[] = preg_match('/(?:19|20)\d\d/', $value, $year) === 1 ? (int) $year[0] : -1;
-        }
-
-        return $out;
-    }
-
-    public static function usesW52RustFfi(): bool
-    {
-        $enabled = self::w52RustFfiState('enabled');
-
-        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Run $callback with the W52 batch dispatch forced on or off, then restore the previous choice.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w52RustFfiState('enabled');
-        self::w52RustFfiState('enabled', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w52RustFfiState('enabled', $previous);
-        }
-    }
-
-    /**
-     * One FFI crossing for the batch: encoded text and packed int64 columns in, 4 int64
-     * words back per record. Null when the library is missing or declines.
-     *
-     * @return list<int>|null
-     */
-    private static function w52Call(string $text, string $ints, int $count): ?array
-    {
-        try {
-            $state = self::w52RustFfiState();
-            $ffi = $state['ffi'] ?? null;
-            if ($ffi === null) {
-                $ffi = RustPipelineLibrary::resolveDomain('metadata_w52', self::W52_FFI_CDEF) ?? false;
-                self::w52RustFfiState('ffi', $ffi);
-            }
-            if (! $ffi instanceof FFI) {
-                return null;
-            }
-            $need = $count * 4;
-            $out = $state['out'] ?? null;
-            $cap = $state['cap'] ?? 0;
-            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
-                $cap = max(1024, $need);
-                $out = $ffi->new('int64_t['.$cap.']');
-                self::w52RustFfiState('out', $out);
-                self::w52RustFfiState('cap', $cap);
-            }
-            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
-            $written = $ffi->nntmux_w524_audio_tag_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
-            if ($written !== $need) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($out, $need * 8));
-
-            return $values === false ? null : array_values($values);
-        } catch (\Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Text column encoding: NUL-joined values and, when a value holds a NUL byte, the same
-     * values joined with 0x01 so Rust finds the separators where the two buffers differ.
-     *
-     * @param  list<string>  $values
-     * @return array{0: string, 1: string}
-     */
-    private static function w52Text(array $values): array
-    {
-        $joined = implode("\0", $values);
-
-        return [$joined, substr_count($joined, "\0") === \count($values) - 1 ? '' : implode("\x01", $values)];
-    }
-
-    /** @param array<array-key, mixed> $values */
-    private static function w52AssertList(array $values): void
-    {
-        if (! array_is_list($values)) {
-            throw new InvalidArgumentException('W52 batch input must be a list.');
-        }
-    }
-
-    /**
-     * W52 routing override and cached binding. Readonly classes cannot declare static
-     * properties, so they live in a function static: no arguments returns the state, one
-     * argument reads a key ('reset' clears everything) and two arguments write a key.
-     */
-    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
-        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-        if ($op === null) {
-            return $state;
-        }
-        if ($op === 'reset') {
-            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-
-            return null;
-        }
-        if (\func_num_args() > 1) {
-            $state[$op] = $val;
-        }
-
-        return $state[$op] ?? null;
     }
 }

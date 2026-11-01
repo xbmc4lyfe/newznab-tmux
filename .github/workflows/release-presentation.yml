@@ -28,10 +28,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: release-presentation-${{ github.ref }}-${{ github.event_name }}-${{ github.run_id }}
-  cancel-in-progress: false
-
 jobs:
   native-presentation:
     # Needs the Docker daemon that GitHub-hosted images provide.

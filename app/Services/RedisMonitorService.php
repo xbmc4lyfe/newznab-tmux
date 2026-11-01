@@ -4,11 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Facades\Redis;
-use Throwable;
 
 /**
  * Service for monitoring Redis server status and performance metrics.
@@ -18,28 +14,6 @@ use Throwable;
  */
 class RedisMonitorService
 {
-    public const string FFI_CDEF = <<<'C'
-        int64_t nntmux_redis_sum_db_keys_nul(const char *input, size_t input_len, size_t count);
-        double nntmux_redis_hit_rate(int64_t hits, int64_t misses);
-        ssize_t nntmux_redis_format_bytes(int64_t bytes, char *out_buf, size_t out_cap);
-        C;
-
-    private static bool $useRustFfi = false;
-
-    private static ?FFI $ffi = null;
-
-    private static bool $ffiResolved = false;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
     // ANSI color codes
     private const RED = "\033[0;31m";
 
@@ -258,16 +232,6 @@ class RedisMonitorService
         return $this->parseRedisInfo($info);
     }
 
-    private static function ffi(): ?FFI
-    {
-        if (! self::$ffiResolved) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('irc', self::FFI_CDEF);
-            self::$ffiResolved = true;
-        }
-
-        return self::$ffi;
-    }
-
     /**
      * Parse Redis INFO into structured data.
      *
@@ -275,137 +239,6 @@ class RedisMonitorService
      * @return array<string, mixed>
      */
     protected function parseRedisInfo(array $info): array
-    {
-        if (! self::$useRustFfi) {
-            return $this->parseRedisInfoPhp($info);
-        }
-
-        $flatInfo = [];
-        foreach ($info as $key => $value) {
-            if (is_array($value)) {
-                $flatInfo = array_merge($flatInfo, $value);
-            } else {
-                $flatInfo[$key] = $value;
-            }
-        }
-
-        $hits = (int) ($flatInfo['keyspace_hits'] ?? 0);
-        $misses = (int) ($flatInfo['keyspace_misses'] ?? 0);
-        $totalOps = $hits + $misses;
-        $hitRate = $totalOps > 0
-            ? (self::hitRateNative($hits, $misses) ?? round(($hits * 100) / $totalOps, 2))
-            : 0;
-
-        $dbKeys = 0;
-        $stringSpecs = [];
-        for ($i = 0; $i <= 15; $i++) {
-            $dbKey = "db{$i}";
-            if (isset($flatInfo[$dbKey])) {
-                $dbValue = $flatInfo[$dbKey];
-                if (is_array($dbValue)) {
-                    $dbKeys += (int) ($dbValue['keys'] ?? 0);
-                } elseif (is_string($dbValue)) {
-                    $stringSpecs[] = $dbValue;
-                }
-            }
-        }
-
-        if ($stringSpecs !== []) {
-            $nativeSum = self::sumDbKeysNative($stringSpecs);
-            if ($nativeSum !== null) {
-                $dbKeys += $nativeSum;
-            } else {
-                foreach ($stringSpecs as $spec) {
-                    if (preg_match('/keys=(\d+)/', $spec, $matches)) {
-                        $dbKeys += (int) $matches[1];
-                    }
-                }
-            }
-        }
-
-        return [
-            'connected' => true,
-            'host' => $this->host,
-            'port' => $this->port,
-            'version' => $flatInfo['redis_version'] ?? 'unknown',
-            'uptime_days' => (int) ($flatInfo['uptime_in_days'] ?? 0),
-            'uptime_seconds' => (int) ($flatInfo['uptime_in_seconds'] ?? 0),
-            'role' => $flatInfo['role'] ?? 'standalone',
-            'connected_clients' => (int) ($flatInfo['connected_clients'] ?? 0),
-            'blocked_clients' => (int) ($flatInfo['blocked_clients'] ?? 0),
-            'total_connections' => (int) ($flatInfo['total_connections_received'] ?? 0),
-            'connected_slaves' => (int) ($flatInfo['connected_slaves'] ?? 0),
-            'used_memory' => (int) ($flatInfo['used_memory'] ?? 0),
-            'used_memory_peak' => (int) ($flatInfo['used_memory_peak'] ?? 0),
-            'used_memory_rss' => (int) ($flatInfo['used_memory_rss'] ?? 0),
-            'maxmemory' => (int) ($flatInfo['maxmemory'] ?? 0),
-            'mem_fragmentation_ratio' => $flatInfo['mem_fragmentation_ratio'] ?? 'N/A',
-            'total_commands' => (int) ($flatInfo['total_commands_processed'] ?? 0),
-            'ops_per_sec' => (int) ($flatInfo['instantaneous_ops_per_sec'] ?? 0),
-            'input_kbps' => (float) ($flatInfo['instantaneous_input_kbps'] ?? 0),
-            'output_kbps' => (float) ($flatInfo['instantaneous_output_kbps'] ?? 0),
-            'db_keys' => $dbKeys,
-            'keyspace_hits' => $hits,
-            'keyspace_misses' => $misses,
-            'hit_rate' => $hitRate,
-            'expired_keys' => (int) ($flatInfo['expired_keys'] ?? 0),
-            'evicted_keys' => (int) ($flatInfo['evicted_keys'] ?? 0),
-            'rdb_changes' => (int) ($flatInfo['rdb_changes_since_last_save'] ?? 0),
-            'rdb_last_save' => (int) ($flatInfo['rdb_last_save_time'] ?? 0),
-        ];
-    }
-
-    /**
-     * @param  list<string>  $specs
-     */
-    public static function sumDbKeysNative(array $specs): ?int
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $count = count($specs);
-        if ($count === 0) {
-            return 0;
-        }
-        $joined = implode("\0", $specs);
-        if (substr_count($joined, "\0") !== $count - 1) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $sum = $ffi->nntmux_redis_sum_db_keys_nul($joined, strlen($joined), $count);
-
-            return is_int($sum) && $sum >= 0 ? $sum : null;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    public static function hitRateNative(int $hits, int $misses): int|float|null
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        if ($hits + $misses <= 0) {
-            return 0;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $rate = $ffi->nntmux_redis_hit_rate($hits, $misses);
-
-            return is_float($rate) && $rate >= 0.0 ? $rate : null;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * @param  array<string, mixed>  $info
-     * @return array<string, mixed>
-     */
-    private function parseRedisInfoPhp(array $info): array
     {
         // Flatten nested arrays if present
         $flatInfo = [];
@@ -666,35 +499,6 @@ class RedisMonitorService
      */
     protected function formatBytes(int $bytes): string
     {
-        return $this->formatBytesPhp($bytes);
-    }
-
-    public static function formatBytesNative(int $bytes): ?string
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_redis_format_bytes($bytes, $scratch, $cap);
-            if (! is_int($written) || $written <= 0) {
-                return null;
-            }
-
-            return FFI::string($scratch, $written);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private function formatBytesPhp(int $bytes): string
-    {
         if ($bytes >= 1073741824) {
             return sprintf('%.2f GB', $bytes / 1073741824);
         } elseif ($bytes >= 1048576) {
@@ -744,141 +548,5 @@ class RedisMonitorService
     protected function clearScreen(): void
     {
         echo "\033[2J\033[H";
-    }
-
-    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51 parity test). */
-    private const bool W51_RUST_FFI_DEFAULT = true;
-
-    private const string W51_FFI_CDEF = 'ssize_t nntmux_w511_redis_keyspace_keys_batch(const char *specs, size_t specs_len, size_t count, int64_t *out, size_t out_cap);';
-
-    public static function usesW51RustFfi(): bool
-    {
-        $enabled = self::w51RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
-    }
-
-    /** Runs $callback with the Wave 51 batch routed to Rust or PHP, then restores the routing. */
-    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w51RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w51RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Key count of each `INFO keyspace` spec (`keys=123,expires=0,avg_ttl=0`) as
-     * {@see parseRedisInfoPhp()} reads it: the first `keys=<digits>` value, or -1 without one.
-     *
-     * @param  list<string>  $specs
-     * @return list<int>
-     */
-    public static function keyspaceKeyCounts(array $specs): array
-    {
-        return self::usesW51RustFfi() ? self::keyspaceKeyCountsNative($specs) : self::keyspaceKeyCountsPhp($specs);
-    }
-
-    /**
-     * @param  list<string>  $specs
-     * @return list<int>
-     */
-    public static function keyspaceKeyCountsPhp(array $specs): array
-    {
-        $words = [];
-        foreach ($specs as $spec) {
-            $words[] = preg_match('/keys=(\d+)/', $spec, $matches) === 1 ? (int) $matches[1] : -1;
-        }
-
-        return $words;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing or a spec holds a NUL byte
-     * (Rust rejects the extra rows it splits into).
-     *
-     * @param  list<string>  $specs
-     * @return list<int>
-     */
-    public static function keyspaceKeyCountsNative(array $specs): array
-    {
-        $count = \count($specs);
-        $maxWords = $count;
-        $buffer = $count === 0 ? null : self::w51Buffer($maxWords);
-        if ($buffer === null) {
-            return self::keyspaceKeyCountsPhp($specs);
-        }
-        [$ffi, $out, $cap] = $buffer;
-        $joined = implode("\0", $specs);
-        try {
-            // @phpstan-ignore method.notFound
-            $words = self::w51Decode($out, $ffi->nntmux_w511_redis_keyspace_keys_batch($joined, \strlen($joined), $count, $out, $cap), $maxWords);
-        } catch (Throwable) {
-            $words = null;
-        }
-
-        return $words !== null && \count($words) === $count ? $words : self::keyspaceKeyCountsPhp($specs);
-    }
-
-    /**
-     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
-     *
-     * @return array{0: FFI, 1: CData, 2: int}|null
-     */
-    private static function w51Buffer(int $words): ?array
-    {
-        $buffer = self::w51RustFfiState('out', $words);
-
-        return \is_array($buffer) ? $buffer : null;
-    }
-
-    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
-    private static function w51Decode(CData $out, mixed $written, int $maxWords): ?array
-    {
-        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
-            return null;
-        }
-        if ($written === 0) {
-            return [];
-        }
-        $decoded = unpack('P*', FFI::string($out, $written * 8));
-
-        /** @var list<int>|null */
-        return \is_array($decoded) ? array_values($decoded) : null;
-    }
-
-    /**
-     * Wave 51 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
-     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
-     */
-    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'out':
-                $ffi ??= RustPipelineLibrary::resolveDomain('admin_status_w51', self::W51_FFI_CDEF) ?? false;
-                if (! $ffi instanceof FFI || ! \is_int($val)) {
-                    return null;
-                }
-                if (! $out instanceof CData || $outCap < $val) {
-                    $outCap = max(512, $val * 2);
-                    $out = $ffi->new("int64_t[{$outCap}]");
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled;
-        }
     }
 }

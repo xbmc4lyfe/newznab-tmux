@@ -4,11 +4,9 @@ declare(strict_types=1);
 
 namespace App\Services\NameFixing;
 
-use App\Support\RustPipelineLibrary;
-
 final class NzbSplitUnwrapper
 {
-    public const PREDB_IDENTITY_POLICY = 'a432aa3a34036ff4bd711f48647836d51bde9b84d69b9d1f8dd28c0b200e0cb5';
+    public const PREDB_IDENTITY_POLICY = '8d164fea7ac837a63195af3da05ba4ed09d34087937123240474e20cb555e52e';
 
     private const string WRAPPER_PATTERN = '/__NZBSPLIT__([a-f0-9]{8,})__NZBSPLIT__(.+)$/i';
 
@@ -39,20 +37,6 @@ final class NzbSplitUnwrapper
     /** Decode a single wrapper's literal payload; the caller owns suffix handling. */
     public function literalPayload(string $value): ?string
     {
-        if (stripos($value, '__NZBSPLIT__') === false) {
-            return null;
-        }
-        $supported = false;
-        $ffiResult = RustPipelineLibrary::nzbsplitLiteralPayload($value, supported: $supported);
-        if ($supported) {
-            return $ffiResult;
-        }
-
-        return $this->literalPayloadPhp($value);
-    }
-
-    public function literalPayloadPhp(string $value): ?string
-    {
         $first = stripos($value, '__NZBSPLIT__');
         if ($first === false) {
             return null;
@@ -70,16 +54,7 @@ final class NzbSplitUnwrapper
     /** Remove a bounded transport trailer only from a valid archive-wrapped NZBSPLIT filename. */
     public function stripLiteralSubjectTrailer(string $value): string
     {
-        if (stripos($value, '__NZBSPLIT__') === false) {
-            return $value;
-        }
-
-        return RustPipelineLibrary::nzbsplitStripLiteralTrailer($value) ?? $this->stripLiteralSubjectTrailerPhp($value);
-    }
-
-    public function stripLiteralSubjectTrailerPhp(string $value): string
-    {
-        if ($this->literalPayloadPhp($value) === null) {
+        if ($this->literalPayload($value) === null) {
             return $value;
         }
 
@@ -98,21 +73,7 @@ final class NzbSplitUnwrapper
 
     public function unwrap(string $value): ?string
     {
-        if (stripos($value, '__NZBSPLIT__') === false) {
-            return null;
-        }
-        $supported = false;
-        $ffiResult = RustPipelineLibrary::nzbsplitUnwrap($value, supported: $supported);
-        if ($supported) {
-            return $ffiResult;
-        }
-
-        return $this->unwrapPhp($value);
-    }
-
-    public function unwrapPhp(string $value): ?string
-    {
-        if (stripos($value, '__NZBSPLIT__') === false || ! preg_match(self::WRAPPER_PATTERN, $value, $matches)) {
+        if (! preg_match(self::WRAPPER_PATTERN, $value, $matches)) {
             return null;
         }
 

@@ -6,36 +6,13 @@ namespace App\Http\Requests\Admin;
 
 use App\Services\LogViewer\LogEntryParser;
 use App\Services\LogViewer\SearchQuery;
-use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
-use FFI;
 use Illuminate\Foundation\Http\FormRequest;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\Validator;
-use Throwable;
 
 class AdminLogSearchRequest extends FormRequest
 {
-    public const int BOUNDARY_EXACT = 0;
-
-    public const int BOUNDARY_DAY = 1;
-
-    public const int BOUNDARY_MINUTE = 2;
-
-    /**
-     * Rust parity export; the boundary shape check stays in PHP (below the 1.5x adoption gate, see
-     * `tests/Unit/RustLogViewerAndAuditParserParityTest.php`).
-     */
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_admin_log_boundary_shape(const char *value, size_t len);
-        C;
-
-    private static bool $useRustFfi = true;
-
-    private static ?FFI $ffi = null;
-
-    private static bool $ffiResolved = false;
-
     public function authorize(): bool
     {
         return true;
@@ -142,100 +119,16 @@ class AdminLogSearchRequest extends FormRequest
             return null;
         }
 
-        return self::parseBoundary($key, $value);
-    }
-
-    /**
-     * Parse a non-empty `from`/`to` value; see {@see boundary()}.
-     */
-    public static function parseBoundary(string $key, string $value): CarbonImmutable
-    {
         $date = CarbonImmutable::parse($value);
 
         if ($key !== 'to') {
             return $date;
         }
 
-        return match (self::boundaryShape($value)) {
-            self::BOUNDARY_DAY => $date->endOfDay(),
-            self::BOUNDARY_MINUTE => $date->endOfMinute(),
-            default => $date,
-        };
-    }
-
-    /**
-     * Whether an upper bound covers a whole day (`Y-m-d`), a whole minute (`… H:i`), or is exact.
-     */
-    public static function boundaryShape(string $value): int
-    {
         return match (true) {
-            preg_match('/^\d{4}-\d{2}-\d{2}$/', $value) === 1 => self::BOUNDARY_DAY,
-            preg_match('/[T ]\d{2}:\d{2}$/', $value) === 1 => self::BOUNDARY_MINUTE,
-            default => self::BOUNDARY_EXACT,
-        };
-    }
-
-    /**
-     * Rust parity helper for {@see boundaryShape()}; null when the library is unavailable or disabled.
-     */
-    public static function boundaryShapeNative(string $value): ?int
-    {
-        $ffi = self::ffi();
-
-        if ($ffi === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $shape = $ffi->nntmux_admin_log_boundary_shape($value, strlen($value));
-        } catch (Throwable) {
-            return null;
-        }
-
-        return is_int($shape) && $shape >= 0 ? $shape : null;
-    }
-
-    /**
-     * Rust parity helper for {@see parseBoundary()}; null when the library is unavailable or disabled.
-     */
-    public static function parseBoundaryNative(string $key, string $value): ?CarbonImmutable
-    {
-        $date = CarbonImmutable::parse($value);
-
-        if ($key !== 'to') {
-            return $date;
-        }
-
-        return match (self::boundaryShapeNative($value)) {
-            null => null,
-            self::BOUNDARY_DAY => $date->endOfDay(),
-            self::BOUNDARY_MINUTE => $date->endOfMinute(),
+            preg_match('/^\d{4}-\d{2}-\d{2}$/', $value) === 1 => $date->endOfDay(),
+            preg_match('/[T ]\d{2}:\d{2}$/', $value) === 1 => $date->endOfMinute(),
             default => $date,
         };
-    }
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-
-        if (! self::$ffiResolved) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
-            self::$ffiResolved = true;
-        }
-
-        return self::$ffi;
     }
 }

@@ -20,14 +20,11 @@ use App\Services\Search\Drivers\ManticoreSearchDriver;
 use App\Services\Search\Support\ReleaseIndexProjection;
 use App\Support\PredbSearchDocument;
 use App\Support\ReleaseSearchIndexDocument;
-use App\Support\RustPipelineLibrary;
 use App\Support\SecondaryIndexDocuments;
 use Exception;
-use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\DB;
-use Throwable;
 
 class NntmuxPopulateSearchIndexes extends Command
 {
@@ -78,22 +75,6 @@ class NntmuxPopulateSearchIndexes extends Command
     private const DEFAULT_PARALLEL_PROCESSES = 4;
 
     private const DEFAULT_BATCH_SIZE = 5000;
-
-    public const string FFI_CDEF = 'ptrdiff_t nntmux_w37_search_index_offset_worker_command(uint32_t mode, const char *input, size_t input_len, char *out, size_t cap);';
-
-    /**
-     * Rust stays opt-in: the FFI round trip is slower than the PHP helper (< 1.5x); see
-     * tests/Unit/RustSearchIndexOffsetWorkerCommandParityTest.php.
-     */
-    public const bool RUST_FFI_DEFAULT = false;
-
-    private const int NATIVE_MAX_PARTS = 4096;
-
-    private const int NATIVE_MAX_BYTES = 16_777_216;
-
-    private static ?bool $useRustFfi = null;
-
-    private static FFI|false|null $ffi = null;
 
     /**
      * Execute the console command.
@@ -1315,191 +1296,5 @@ class NntmuxPopulateSearchIndexes extends Command
     private function setGroupConcatMaxLen(): void
     {
         DB::statement('SET SESSION group_concat_max_len = ?', [self::GROUP_CONCAT_MAX_LEN]);
-    }
-
-    public static function useRustFfi(?bool $use = true): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Clears the toggle and the cached library handle shared by the Wave 37.5 command helpers.
-     */
-    public static function resetRustFfi(): void
-    {
-        self::$useRustFfi = null;
-        self::$ffi = null;
-    }
-
-    /**
-     * Plans a population run from CLI flags without touching the database: the first engine flag
-     * wins (manticore before elastic), requested index names are trimmed, lowercased and returned in
-     * SUPPORTED_INDEXES order (`$all` selects every index), unknown names are counted and
-     * non-positive sizes fall back to the defaults. `--optimize` takes precedence over population.
-     *
-     * @param  list<string>  $requested
-     * @return array{mode: string, engine: ?string, indexes: list<string>, methods: list<string>, unknown: int, chunk_size: int, batch_size: int}
-     */
-    public static function planPopulation(bool $manticore, bool $elastic, array $requested, bool $all = false, int $count = self::DEFAULT_CHUNK_SIZE, int $batchSize = self::DEFAULT_BATCH_SIZE, bool $optimize = false): array
-    {
-        return self::usesRustFfi()
-            ? self::planPopulationNative($manticore, $elastic, $requested, $all, $count, $batchSize, $optimize)
-            : self::planPopulationPhp($manticore, $elastic, $requested, $all, $count, $batchSize, $optimize);
-    }
-
-    /**
-     * @param  list<string>  $requested
-     * @return array{mode: string, engine: ?string, indexes: list<string>, methods: list<string>, unknown: int, chunk_size: int, batch_size: int}
-     */
-    private static function planPopulationNative(bool $manticore, bool $elastic, array $requested, bool $all, int $count, int $batchSize, bool $optimize): array
-    {
-        $fields = self::evaluateNative(5, [
-            $manticore ? '1' : '0', $elastic ? '1' : '0', $all ? '1' : '0', $optimize ? '1' : '0',
-            (string) $count, (string) $batchSize, ...$requested,
-        ]);
-        $selected = $fields !== null && \count($fields) >= 7 ? (int) $fields[6] : -1;
-        $methods = $fields !== null && $fields[0] === 'populate' ? $selected : 0;
-        if ($fields === null || $selected < 0 || \count($fields) !== 7 + $selected + $methods) {
-            return self::planPopulationPhp($manticore, $elastic, $requested, $all, $count, $batchSize, $optimize);
-        }
-
-        return [
-            'mode' => $fields[0],
-            'engine' => $fields[1] === '1' ? $fields[2] : null,
-            'indexes' => \array_slice($fields, 7, $selected),
-            'methods' => \array_slice($fields, 7 + $selected),
-            'unknown' => (int) $fields[3],
-            'chunk_size' => (int) $fields[4],
-            'batch_size' => (int) $fields[5],
-        ];
-    }
-
-    /**
-     * @param  list<string>  $requested
-     * @return array{mode: string, engine: ?string, indexes: list<string>, methods: list<string>, unknown: int, chunk_size: int, batch_size: int}
-     */
-    private static function planPopulationPhp(bool $manticore, bool $elastic, array $requested, bool $all, int $count, int $batchSize, bool $optimize): array
-    {
-        $engine = $manticore ? 'manticore' : ($elastic ? 'elastic' : null);
-        $wanted = [];
-        $unknown = 0;
-        foreach ($requested as $name) {
-            $name = strtolower(trim($name));
-            if (\in_array($name, self::SUPPORTED_INDEXES, true)) {
-                $wanted[$name] = true;
-            } else {
-                $unknown++;
-            }
-        }
-        $indexes = $all
-            ? self::SUPPORTED_INDEXES
-            : array_values(array_filter(self::SUPPORTED_INDEXES, static fn (string $index): bool => isset($wanted[$index])));
-        $mode = $optimize ? 'optimize' : ($engine !== null && $indexes !== [] ? 'populate' : 'invalid');
-
-        return [
-            'mode' => $mode,
-            'engine' => $engine,
-            'indexes' => $indexes,
-            'methods' => $mode === 'populate' ? array_map(static fn (string $index): string => $engine.ucfirst($index), $indexes) : [],
-            'unknown' => $unknown,
-            'chunk_size' => $count > 0 ? $count : self::DEFAULT_CHUNK_SIZE,
-            'batch_size' => $batchSize > 0 ? $batchSize : self::DEFAULT_BATCH_SIZE,
-        ];
-    }
-
-    /**
-     * Shared Wave 37.5 bridge for the search index and offset worker commands: count- and
-     * length-prefixed (little-endian u32) packets preserve PHP byte strings. Returns the output parts,
-     * or null when Rust declined the input or is unavailable.
-     *
-     * @param  list<string>  $parts
-     * @return list<string>|null
-     */
-    public static function evaluateNative(int $mode, array $parts): ?array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null || $mode < 0 || \count($parts) > self::NATIVE_MAX_PARTS) {
-            return null;
-        }
-
-        try {
-            $input = pack('V', \count($parts));
-            foreach ($parts as $part) {
-                $input .= pack('V', \strlen($part)).$part;
-            }
-            if (\strlen($input) > self::NATIVE_MAX_BYTES) {
-                return null;
-            }
-
-            $minBytes = \strlen($input) * 2 + 1024;
-            for ($attempt = 0; $attempt < 2; $attempt++) {
-                $capacity = 0;
-                $out = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $capacity);
-                if ($out === null) {
-                    return null;
-                }
-                $capacity = min($capacity, self::NATIVE_MAX_BYTES);
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_w37_search_index_offset_worker_command($mode, $input, \strlen($input), $out, $capacity);
-                if (! \is_int($written)) {
-                    return null;
-                }
-                if ($written >= 4 && $written <= $capacity) {
-                    return self::unpackNative(FFI::string($out, $written));
-                }
-                if ($written > -4 || -$written <= $capacity || -$written > self::NATIVE_MAX_BYTES) {
-                    return null;
-                }
-                $minBytes = -$written;
-            }
-        } catch (Throwable) {
-            return null;
-        }
-
-        return null;
-    }
-
-    /** @return list<string>|null */
-    private static function unpackNative(string $packet): ?array
-    {
-        $length = \strlen($packet);
-        $header = unpack('V', $packet);
-        $count = \is_array($header) ? $header[1] : null;
-        if (! \is_int($count) || $count > intdiv($length - 4, 4)) {
-            return null;
-        }
-
-        $offset = 4;
-        $parts = [];
-        for ($i = 0; $i < $count; $i++) {
-            if ($offset + 4 > $length) {
-                return null;
-            }
-            $size = unpack('V', $packet, $offset);
-            $size = \is_array($size) ? $size[1] : null;
-            $offset += 4;
-            if (! \is_int($size) || $size > $length - $offset) {
-                return null;
-            }
-            $parts[] = substr($packet, $offset, $size);
-            $offset += $size;
-        }
-
-        return $offset === $length ? $parts : null;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
-            self::$ffi = RustPipelineLibrary::resolveDomain('search_w375', self::FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
-        }
-
-        return self::$ffi instanceof FFI ? self::$ffi : null;
     }
 }

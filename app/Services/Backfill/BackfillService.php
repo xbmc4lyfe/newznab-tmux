@@ -6,16 +6,11 @@ namespace App\Services\Backfill;
 
 use App\Models\UsenetGroup;
 use App\Services\Binaries\BinariesService;
-use App\Services\Binaries\HeaderStorageTransaction;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
-use Throwable;
 
 /**
  * Service for backfilling Usenet groups with historical articles.
@@ -28,64 +23,6 @@ use Throwable;
  */
 final class BackfillService
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_backfill_calculate(uint32_t mode, const int64_t *input, size_t len, int64_t *out, size_t cap);
-        C;
-
-    // PHP remains the default unless every paired common/uncommon mean and p99 gains 1.5x.
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function setUseRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
-    /**
-     * @param  list<int>  $values
-     * @return list<int>|null
-     */
-    private static function calculateNative(int $mode, array $values, int $size): ?array
-    {
-        try {
-            $ffi = self::ffi();
-            if ($ffi === null || count($values) > 1024) {
-                return null;
-            }
-            $input = $ffi->new('int64_t['.max(1, count($values)).']');
-            foreach ($values as $i => $value) {
-                $input[$i] = $value;
-            }
-            $out = $ffi->new('int64_t['.$size.']');
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_backfill_calculate($mode, $input, count($values), $out, $size);
-            if ($written !== $size) {
-                return null;
-            }
-            $result = [];
-            for ($i = 0; $i < $size; $i++) {
-                $result[] = (int) $out[$i];
-            }
-
-            return $result;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
     private const DEFAULT_ARTICLE_COUNT = 20000;
 
     private BackfillConfig $config;
@@ -111,7 +48,7 @@ final class BackfillService
      * @param  int|string  $articles  Number of articles to backfill, or empty for date-based
      * @param  string  $type  Backfill type filter
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function backfillAllGroups(string $groupName = '', int|string $articles = '', string $type = ''): void
     {
@@ -147,7 +84,7 @@ final class BackfillService
      * @param  int  $remainingGroups  Number of groups remaining after this one
      * @param  int|string  $articles  Number of articles to backfill, or empty for date-based
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function backfillGroup(array $groupArr, int $remainingGroups, int|string $articles = ''): void
     {
@@ -189,7 +126,7 @@ final class BackfillService
      *
      * @param  int|string  $articles  Number of articles to backfill
      *
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function safeBackfill(int|string $articles = ''): void
     {
@@ -293,11 +230,14 @@ final class BackfillService
      */
     private function calculateTargetPost(array $groupArr, int|string $articles, array $serverData): int
     {
-        if ($articles !== '') {
-            return self::targetArticle((int) $groupArr['first_record'], (int) $articles, (int) $serverData['first']);
-        }
+        $isArticleBased = $articles !== '';
 
-        return self::clampDatePost((int) $this->binaries->daytopost($groupArr['backfill_target'], $serverData), (int) $serverData['first']);
+        $targetPost = $isArticleBased
+            ? (int) round($groupArr['first_record'] - (int) $articles)
+            : (int) $this->binaries->daytopost($groupArr['backfill_target'], $serverData);
+
+        // Ensure target is not below server's oldest article
+        return max($targetPost, (int) $serverData['first']);
     }
 
     /**
@@ -334,7 +274,8 @@ final class BackfillService
     private function processBackfillChunks(array $groupArr, int $targetPost, int $remainingGroups, string $shortGroupName): void
     {
         $messageBuffer = $this->binaries->getMessageBuffer();
-        [$first, $last] = self::backfillChunk((int) $groupArr['first_record'], $targetPost, $messageBuffer);
+        $last = $groupArr['first_record'] - 1;
+        $first = max($last - $messageBuffer + 1, $targetPost);
 
         while (true) {
             if (app(ProcessingRuntimeStateRepository::class)->stopRequested() || ! app(CandidateRepository::class)->capacityAvailable()) {
@@ -355,7 +296,8 @@ final class BackfillService
             }
 
             // Move to next chunk
-            [$first, $last] = self::backfillChunk($first, $targetPost, $messageBuffer);
+            $last = $first - 1;
+            $first = max($last - $messageBuffer + 1, $targetPost);
         }
     }
 
@@ -462,301 +404,5 @@ final class BackfillService
     {
         $duration = number_format(now()->timestamp - $startTime->timestamp, 2);
         $this->log(PHP_EOL."Group {$shortGroupName} processed in {$duration} seconds.");
-    }
-
-    public static function targetArticle(int $first, int $articles, int $oldest): int
-    {
-        return self::$useRustFfi ? self::targetArticleNative($first, $articles, $oldest) : self::targetArticlePhp($first, $articles, $oldest);
-    }
-
-    public static function targetArticleNative(int $first, int $articles, int $oldest): int
-    {
-        return self::calculateNative(0, [$first, $articles, $oldest], 1)[0] ?? self::targetArticlePhp($first, $articles, $oldest);
-    }
-
-    public static function targetArticlePhp(int $first, int $articles, int $oldest): int
-    {
-        return max((int) round($first - $articles), $oldest);
-    }
-
-    public static function clampDatePost(int $target, int $oldest): int
-    {
-        return self::$useRustFfi ? self::clampDatePostNative($target, $oldest) : self::clampDatePostPhp($target, $oldest);
-    }
-
-    public static function clampDatePostNative(int $target, int $oldest): int
-    {
-        return self::calculateNative(1, [$target, $oldest], 1)[0] ?? self::clampDatePostPhp($target, $oldest);
-    }
-
-    public static function clampDatePostPhp(int $target, int $oldest): int
-    {
-        return max($target, $oldest);
-    }
-
-    /** @return array{int, int} */
-    public static function backfillChunk(int $previousFirst, int $target, int $buffer): array
-    {
-        return self::$useRustFfi ? self::backfillChunkNative($previousFirst, $target, $buffer) : self::backfillChunkPhp($previousFirst, $target, $buffer);
-    }
-
-    /** @return array{int, int} */
-    public static function backfillChunkNative(int $previousFirst, int $target, int $buffer): array
-    {
-        $values = self::calculateNative(2, [$previousFirst, $target, $buffer], 2);
-
-        return $values === null ? self::backfillChunkPhp($previousFirst, $target, $buffer) : [$values[0], $values[1]];
-    }
-
-    /** @return array{int, int} */
-    public static function backfillChunkPhp(int $previousFirst, int $target, int $buffer): array
-    {
-        $last = $previousFirst - 1;
-
-        return [max($last - $buffer + 1, $target), $last];
-    }
-
-    /**
-     * PHP stays the default for summarizeBackfillChunkPlanBatch(): the paired benchmark in
-     * tests/Unit/RustBinariesTransactionMissedPartBackfillW42ParityTest.php does not clear 1.5x.
-     */
-    public const bool W421_RUST_FFI_DEFAULT = false;
-
-    private const array W421_CHUNK_KEYS = ['groups', 'invalid_rows', 'bad_bounds', 'exhausted', 'runnable', 'total_chunks', 'total_articles',
-        'max_chunks'];
-
-    private static ?bool $w421UseRustFfi = null;
-
-    private static FFI|false|null $w421Ffi = null;
-
-    /**
-     * Summarizes backfill chunk plans (`first_record`, `target`, `oldest`): a bound that is not a non-negative int (or
-     * 1-18 digit string) is bad; like validateTargetPost(), a target at or above the first record, or a first record
-     * at or below the oldest server article, is exhausted. A runnable group backfills `first_record - max(target,
-     * oldest)` articles in ceil(articles / max(1, `$buffer`)) backfillChunk() steps; the totals saturate at
-     * PHP_INT_MAX and the largest step count is reported. Non-array rows are invalid.
-     *
-     * @param  array<array-key, mixed>  $groups
-     * @return array<string, int>
-     */
-    public static function summarizeBackfillChunkPlanBatch(array $groups, int $buffer = self::DEFAULT_ARTICLE_COUNT): array
-    {
-        return (self::usesW421RustFfi() ? self::summarizeBackfillChunkPlanBatchNative($groups, $buffer) : null)
-            ?? self::summarizeBackfillChunkPlanBatchPhp($groups, $buffer);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $groups
-     * @return array<string, int>
-     */
-    public static function summarizeBackfillChunkPlanBatchPhp(array $groups, int $buffer = self::DEFAULT_ARTICLE_COUNT): array
-    {
-        $summary = array_fill_keys(self::W421_CHUNK_KEYS, 0);
-        $summary['groups'] = \count($groups);
-        $size = max(1, $buffer);
-        foreach ($groups as $group) {
-            if (! \is_array($group)) {
-                $summary['invalid_rows']++;
-
-                continue;
-            }
-            $first = BinariesService::w411Int($group['first_record'] ?? null);
-            $target = BinariesService::w411Int($group['target'] ?? null);
-            $oldest = BinariesService::w411Int($group['oldest'] ?? null);
-            if ($first === null || $target === null || $oldest === null || min($first, $target, $oldest) < 0) {
-                $summary['bad_bounds']++;
-            } elseif ($target >= $first || $first <= $oldest) {
-                $summary['exhausted']++;
-            } else {
-                $summary['runnable']++;
-                $articles = $first - max($target, $oldest);
-                $chunks = HeaderStorageTransaction::w421Chunks($articles, $size);
-                $summary['total_chunks'] = HeaderStorageTransaction::w421SaturatingAdd($summary['total_chunks'], $chunks);
-                $summary['total_articles'] = HeaderStorageTransaction::w421SaturatingAdd($summary['total_articles'], $articles);
-                $summary['max_chunks'] = max($summary['max_chunks'], $chunks);
-            }
-        }
-
-        return $summary;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $groups
-     * @return array<string, int>|null
-     */
-    public static function summarizeBackfillChunkPlanBatchNative(array $groups, int $buffer = self::DEFAULT_ARTICLE_COUNT): ?array
-    {
-        $words = [$buffer, \count($groups)];
-        $blob = [];
-        foreach ($groups as $group) {
-            if (\is_array($group)) {
-                BinariesService::w411PackRow($words, $blob, [$group['first_record'] ?? null, $group['target'] ?? null, $group['oldest'] ?? null]);
-            } else {
-                $words[] = 0;
-            }
-        }
-        $values = HeaderStorageTransaction::w421Invoke(self::$w421Ffi, 5, $words, $blob);
-
-        return $values !== null && \count($values) === \count(self::W421_CHUNK_KEYS) ? array_combine(self::W421_CHUNK_KEYS, $values) : null;
-    }
-
-    public static function useW421RustFfi(bool $enable = true): void
-    {
-        self::$w421UseRustFfi = $enable;
-    }
-
-    public static function usesW421RustFfi(): bool
-    {
-        return self::$w421UseRustFfi ?? self::W421_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW421RustFfi(): void
-    {
-        self::$w421UseRustFfi = null;
-        self::$w421Ffi = null;
-    }
-
-    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W52 parity test). */
-    private const bool W52_RUST_FFI_DEFAULT = true;
-
-    private const string W52_FFI_CDEF = 'ssize_t nntmux_w521_backfill_article_date_batch(const char *dates, size_t dates_len, size_t count, int64_t *out, size_t out_cap);';
-
-    public static function usesW52RustFfi(): bool
-    {
-        $enabled = self::w52RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
-    }
-
-    /** Runs $callback with the Wave 52 batch routed to Rust or PHP, then restores the routing. */
-    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w52RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w52RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * strtotime() of each article `Date` header ({@see updateGroupRecord()} resolves the first
-     * article date this way).
-     *
-     * @param  list<string>  $dates
-     * @return list<int|false>
-     */
-    public static function articleDateTimestamps(array $dates): array
-    {
-        return self::usesW52RustFfi() ? self::articleDateTimestampsNative($dates) : self::articleDateTimestampsPhp($dates);
-    }
-
-    /**
-     * @param  list<string>  $dates
-     * @return list<int|false>
-     */
-    public static function articleDateTimestampsPhp(array $dates): array
-    {
-        $stamps = [];
-        foreach ($dates as $date) {
-            $stamps[] = strtotime($date);
-        }
-
-        return $stamps;
-    }
-
-    /**
-     * Rust parses the RFC 5322 shape NNTP servers send (`[Www, ]D Mon YYYY HH:MM:SS ZONE`) and
-     * reports every other row, which PHP resolves with strtotime(); falls back to PHP when the
-     * library is missing or declines the batch (a date holding a NUL byte).
-     *
-     * @param  list<string>  $dates
-     * @return list<int|false>
-     */
-    public static function articleDateTimestampsNative(array $dates): array
-    {
-        $count = \count($dates);
-        $buffer = $count === 0 ? null : self::w52Buffer(2 * $count);
-        if ($buffer === null) {
-            return self::articleDateTimestampsPhp($dates);
-        }
-        [$ffi, $out, $cap] = $buffer;
-        $dates = array_values($dates);
-        $joined = implode("\0", $dates);
-        try {
-            // @phpstan-ignore method.notFound
-            $words = self::w52Decode($out, $ffi->nntmux_w521_backfill_article_date_batch($joined, \strlen($joined), $count, $out, $cap), 2 * $count);
-        } catch (Throwable) {
-            $words = null;
-        }
-        if ($words === null || \count($words) < $count) {
-            return self::articleDateTimestampsPhp($dates);
-        }
-        $stamps = \array_slice($words, 0, $count);
-        foreach (\array_slice($words, $count) as $index) {
-            $stamps[$index] = strtotime($dates[$index]);
-        }
-
-        return $stamps;
-    }
-
-    /**
-     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
-     *
-     * @return array{0: FFI, 1: CData, 2: int}|null
-     */
-    private static function w52Buffer(int $words): ?array
-    {
-        $buffer = self::w52RustFfiState('out', $words);
-
-        return \is_array($buffer) ? $buffer : null;
-    }
-
-    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
-    private static function w52Decode(CData $out, mixed $written, int $maxWords): ?array
-    {
-        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
-            return null;
-        }
-        if ($written === 0) {
-            return [];
-        }
-        $decoded = unpack('P*', FFI::string($out, $written * 8));
-
-        /** @var list<int>|null */
-        return \is_array($decoded) ? array_values($decoded) : null;
-    }
-
-    /**
-     * Wave 52 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
-     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
-     */
-    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'out':
-                $ffi ??= RustPipelineLibrary::resolveDomain('backfill_binaries_w52', self::W52_FFI_CDEF) ?? false;
-                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
-                    return null;
-                }
-                if (! $out instanceof CData || $outCap < $val) {
-                    $outCap = max(512, $val * 2);
-                    $out = $ffi->new("int64_t[{$outCap}]");
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled;
-        }
     }
 }

@@ -8,39 +8,10 @@ use App\Facades\Search;
 use App\Models\Category;
 use App\Models\Release;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
-use App\Support\ReleaseNameDisplay;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Console\Command;
-use Throwable;
 
 class NntmuxResetPostProcessing extends Command
 {
-    public const string W381_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w381_obfuscation_gate_router_admin_names(uint32_t operation, uint32_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        C;
-
-    /**
-     * PHP remains the default: the paired benchmark in
-     * tests/Unit/RustObfuscationGateRouterAdminNamesParityTest.php is below 1.5x.
-     */
-    public const bool W381_RUST_FFI_DEFAULT = false;
-
-    private const int W381_RUST_MAX_INPUT = 16_777_216;
-
-    private static ?bool $w381UseRustFfi = null;
-
-    private static FFI|false|null $w381Ffi = null;
-
-    /** `planCategoryReset()` actions by Wave 38.1 action code. */
-    private const array W381_ACTIONS = [1 => 'refuse_environment', 2 => 'invalid', 3 => 'full', 4 => 'categories'];
-
-    /** Categories whose reset also refreshes search documents. */
-    private const array W381_REINDEXING = ['movie', 'tv', 'misc'];
-
-    /** Null selects the benchmark-qualified default for each helper. */
-    public ?bool $useRustFfi = null;
-
     /**
      * @var array<string, mixed>
      */
@@ -189,44 +160,10 @@ class NntmuxResetPostProcessing extends Command
      * Handles comma-separated values, repeated options, casing, simple plurals,
      * and values provided as key=value (e.g. category=tv or the single-dash typo -category=tv).
      *
-     * @param  array<array-key, mixed>  $raw
+     * @param  array<string, mixed>  $raw
      * @return array<string, mixed>
      */
     private function normalizeCategories(array $raw): array
-    {
-        return ($this->useRustFfi ?? true) ? $this->normalizeCategoriesNative($raw) : $this->normalizeCategoriesPhp($raw);
-    }
-
-    /** @param array<array-key, mixed> $raw
-     * @return array<array-key, mixed>
-     */
-    public function normalizeCategoriesNative(array $raw): array
-    {
-        $input = '';
-        foreach ($raw as $value) {
-            if (is_array($value)) {
-                // Let PHP perform coercion once, including errors for nested options.
-                foreach ($value as $part) {
-                    if (! is_string($part)) {
-                        return $this->normalizeCategoriesPhp($raw);
-                    }
-                }
-                $value = implode(',', $value);
-            }
-            if (! is_string($value)) {
-                return $this->normalizeCategoriesPhp($raw);
-            }
-            $input .= pack('V', strlen($value)).$value;
-        }
-        $output = ReleaseNameDisplay::transformNative(6, $input);
-
-        return $output === null ? $this->normalizeCategoriesPhp($raw) : ($output === '' ? [] : explode("\0", $output));
-    }
-
-    /** @param array<array-key, mixed> $raw
-     * @return array<array-key, mixed>
-     */
-    public function normalizeCategoriesPhp(array $raw): array
     {
         $normalized = collect($raw)
             ->flatMap(function ($opt) {
@@ -262,35 +199,10 @@ class NntmuxResetPostProcessing extends Command
      * Return invalid categories from a normalized list.
      * Keeps 'all' as a special allowed token.
      *
-     * @param  array<array-key, mixed>  $normalized
+     * @param  array<string, mixed>  $normalized
      * @return array<int, string>
      */
     private function invalidCategories(array $normalized): array
-    {
-        return ($this->useRustFfi ?? false) ? $this->invalidCategoriesNative($normalized) : $this->invalidCategoriesPhp($normalized);
-    }
-
-    /** @param array<array-key, mixed> $normalized
-     * @return array<array-key, mixed>
-     */
-    public function invalidCategoriesNative(array $normalized): array
-    {
-        $input = '';
-        foreach ($normalized as $value) {
-            if (! is_string($value)) {
-                return $this->invalidCategoriesPhp($normalized);
-            }
-            $input .= pack('V', strlen($value)).$value;
-        }
-        $output = ReleaseNameDisplay::transformNative(7, $input);
-
-        return $output === null ? $this->invalidCategoriesPhp($normalized) : ($output === '' ? [] : explode("\0", $output));
-    }
-
-    /** @param array<array-key, mixed> $normalized
-     * @return array<array-key, mixed>
-     */
-    public function invalidCategoriesPhp(array $normalized): array
     {
         return collect($normalized)
             ->reject(function ($opt) {
@@ -470,171 +382,6 @@ class NntmuxResetPostProcessing extends Command
             $this->info(number_format($total).' misc releases reset.');
         } else {
             $this->info('No releases to reset');
-        }
-    }
-
-    /**
-     * Plans `nntmux:resetpp` for already normalized categories, as {@see handle()} applies them:
-     * outside the local environment only a leading `misc` option may run; unknown categories
-     * abort; `all` or an empty list resets everything; otherwise each category resets in order.
-     * `reindexes_search` reports whether the run refreshes search documents.
-     *
-     * @param  array<array-key, mixed>  $normalized
-     * @return array{action: string, invalid: list<mixed>, steps: list<string>, reindexes_search: bool}
-     */
-    public static function planCategoryReset(string $environment, ?string $firstOption, array $normalized): array
-    {
-        return (self::usesW381RustFfi() ? self::planCategoryResetNative($environment, $firstOption, $normalized) : null)
-            ?? self::planCategoryResetPhp($environment, $firstOption, $normalized);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $normalized
-     * @return array{action: string, invalid: list<mixed>, steps: list<string>, reindexes_search: bool}
-     */
-    private static function planCategoryResetPhp(string $environment, ?string $firstOption, array $normalized): array
-    {
-        if ($environment !== 'local' && $firstOption !== 'misc') {
-            return ['action' => 'refuse_environment', 'invalid' => [], 'steps' => [], 'reindexes_search' => false];
-        }
-        $invalid = [];
-        $steps = [];
-        foreach ($normalized as $category) {
-            if (! in_array($category, self::$allowedCategories, true) && $category !== 'all') {
-                $invalid[] = $category;
-            } elseif (is_string($category) && $category !== 'all') {
-                $steps[] = $category;
-            }
-        }
-        if ($invalid !== []) {
-            return ['action' => 'invalid', 'invalid' => $invalid, 'steps' => [], 'reindexes_search' => false];
-        }
-        if ($normalized === [] || in_array('all', $normalized, true)) {
-            return ['action' => 'full', 'invalid' => [], 'steps' => [], 'reindexes_search' => true];
-        }
-
-        return ['action' => 'categories', 'invalid' => [], 'steps' => $steps, 'reindexes_search' => array_intersect($steps, self::W381_REINDEXING) !== []];
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $normalized
-     * @return array{action: string, invalid: list<mixed>, steps: list<string>, reindexes_search: bool}|null
-     */
-    private static function planCategoryResetNative(string $environment, ?string $firstOption, array $normalized): ?array
-    {
-        $input = self::w381PackString($environment).self::w381PackString($firstOption ?? '').pack('q', count($normalized));
-        foreach ($normalized as $category) {
-            if (! is_string($category)) {
-                return null;
-            }
-            $input .= self::w381PackString($category);
-        }
-        $output = self::w381CallRustFfi(4, $firstOption === null ? 0 : 1, $input);
-        $header = self::w381UnpackInts($output === null ? null : substr($output, 0, 32), 4);
-        if ($output === null || $header === null || ! isset(self::W381_ACTIONS[$header[0]]) || $header[1] & ~1 || $header[2] < 0 || $header[3] < 0) {
-            return null;
-        }
-        $length = strlen($output);
-        $offset = 32;
-        $invalid = [];
-        for ($i = 0; $i < $header[2]; $i++) {
-            $size = $offset + 8 <= $length ? unpack('q', $output, $offset)[1] ?? -1 : -1;
-            if (! is_int($size) || $size < 0 || $size > $length - $offset - 8) {
-                return null;
-            }
-            $invalid[] = substr($output, $offset + 8, $size);
-            $offset += 8 + $size;
-        }
-        $categories = array_values(self::$allowedCategories);
-        $steps = [];
-        for ($i = 0; $i < $header[3]; $i++) {
-            $code = $offset + 8 <= $length ? unpack('q', $output, $offset)[1] ?? -1 : -1;
-            if (! is_int($code) || ! is_string($categories[$code] ?? null)) {
-                return null;
-            }
-            $steps[] = $categories[$code];
-            $offset += 8;
-        }
-        if ($offset !== $length) {
-            return null;
-        }
-
-        return ['action' => self::W381_ACTIONS[$header[0]], 'invalid' => $invalid, 'steps' => $steps, 'reindexes_search' => $header[1] === 1];
-    }
-
-    public static function useW381RustFfi(?bool $enabled): void
-    {
-        self::$w381UseRustFfi = $enabled;
-    }
-
-    public static function usesW381RustFfi(): bool
-    {
-        return self::$w381UseRustFfi ?? self::W381_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW381RustFfi(): void
-    {
-        self::$w381UseRustFfi = null;
-        self::$w381Ffi = null;
-    }
-
-    private static function w381PackString(string $value): string
-    {
-        return pack('q', strlen($value)).$value;
-    }
-
-    /**
-     * @return list<int>|null
-     */
-    private static function w381UnpackInts(?string $bytes, int $count): ?array
-    {
-        if ($bytes === null || strlen($bytes) !== $count * 8) {
-            return null;
-        }
-        $values = unpack('q*', $bytes);
-
-        return $values === false ? null : array_values($values);
-    }
-
-    /**
-     * Calls the Wave 38.1 export, retrying once with a larger scratch buffer when it reports `-required`.
-     */
-    private static function w381CallRustFfi(int $operation, int $flags, string $input): ?string
-    {
-        if (strlen($input) > self::W381_RUST_MAX_INPUT) {
-            return null;
-        }
-        try {
-            self::$w381Ffi ??= RustPipelineLibrary::resolveDomain('cleaning_w381', self::W381_FFI_CDEF) ?? false;
-            if (self::$w381Ffi === false) {
-                return null;
-            }
-            $ffi = self::$w381Ffi;
-            $capacity = 0;
-            $buffer = RustPipelineLibrary::obtainScratch($ffi, strlen($input) + 256, $capacity);
-            if ($buffer === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w381_obfuscation_gate_router_admin_names($operation, $flags, $input, strlen($input), $buffer, $capacity);
-            if (is_int($written) && $written < -1) {
-                if (-$written <= $capacity || -$written > self::W381_RUST_MAX_INPUT) {
-                    return null;
-                }
-                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($buffer === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_w381_obfuscation_gate_router_admin_names($operation, $flags, $input, strlen($input), $buffer, $capacity);
-            }
-            if (! is_int($written) || $written < 0 || $written > $capacity) {
-                return null;
-            }
-
-            return FFI::string($buffer, $written);
-        } catch (Throwable) {
-            return null;
         }
     }
 }

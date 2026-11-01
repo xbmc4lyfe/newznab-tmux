@@ -14,9 +14,6 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\TvProcessing\Providers\TraktProvider;
 use App\Support\ReleaseSearchIndexSync;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Carbon;
@@ -24,176 +21,18 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
-use Throwable;
 
 /**
  * Service class for movie data fetching and processing.
  */
 class MovieService
 {
-    /** Disabled unless paired common and uncommon mean/p99 gains all reach 1.5x. */
-    public const bool W404_RUST_FFI_DEFAULT = false;
-
-    public const string W404_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w404_movie_metadata_completeness(const char *input, size_t len, char *out, size_t cap);
-        C;
-
-    private static ?bool $w404UseRustFfi = null;
-
-    private static FFI|false|null $w404Ffi = null;
-
-    public static function useW404RustFfi(?bool $use = true): void
-    {
-        self::$w404UseRustFfi = $use;
-        if ($use === null) {
-            self::$w404Ffi = null;
-        }
-    }
-
-    public static function usesW404RustFfi(): bool
-    {
-        return self::$w404UseRustFfi ?? self::W404_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW404RustFfi(): void
-    {
-        self::$w404UseRustFfi = null;
-        self::$w404Ffi = null;
-    }
-
-    /** @param list<list<string>> $rows
-     * @return array<string, int>|null
-     */
-    private static function w404Call(array $rows): ?array
-    {
-        try {
-            $input = serialize([$rows]);
-            if (strlen($input) > 16777216) {
-                return null;
-            }
-            self::$w404Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w404', self::W404_FFI_CDEF) ?? false;
-            $ffi = self::$w404Ffi;
-            if ($ffi === false) {
-                return null;
-            }
-            $capacity = 0;
-            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
-            if ($out === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
-            $written = $ffi->nntmux_w404_movie_metadata_completeness($input, strlen($input), $out, $capacity);
-            if (is_int($written) && $written < -1 && $written >= -16777216) {
-                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($out === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
-                $written = $ffi->nntmux_w404_movie_metadata_completeness($input, strlen($input), $out, $capacity);
-            }
-            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
-                return null;
-            }
-            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
-            $keys = ['total_rows', 'valid_imdb_id_count', 'has_tmdb_id_count', 'has_cover_count', 'missing_year_count', 'complete_record_count'];
-            if (! is_array($result) || array_keys($result) !== $keys) {
-                return null;
-            }
-            $summary = [];
-            foreach ($keys as $key) {
-                $value = $result[$key];
-                if (! is_int($value) || $value < 0 || $value > count($rows)) {
-                    return null;
-                }
-                $summary[$key] = $value;
-            }
-
-            return $summary;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** Only integer and string fields participate; objects are never cast or serialized. */
-    private static function w404Text(mixed $value): string
-    {
-        return is_string($value) || is_int($value) ? trim((string) $value) : '';
-    }
-
-    /** @param array<array-key, mixed> $input
-     * @return list<list<string>>
-     */
-    private static function w404Rows(array $input): array
-    {
-        $rows = [];
-        foreach ($input as $row) {
-            $row = is_array($row) ? $row : [];
-            $rows[] = [self::w404Text($row['imdbid'] ?? null), self::w404Text($row['tmdbid'] ?? null), self::w404Text($row['cover'] ?? null), self::w404Text($row['year'] ?? null)];
-        }
-
-        return $rows;
-    }
-
-    /**
-     * Summarize imdbid, tmdbid, cover and year fields. IMDb IDs have an optional
-     * lowercase tt prefix and 7-10 nonzero-as-a-whole digits. TMDb/cover are
-     * positive decimals; years are 1000-2999. Complete means all four qualify.
-     *
-     * @param  array<array-key, mixed>  $movies
-     * @return array<string, int>
-     */
-    public static function summarizeMovieMetadataCompleteness(array $movies): array
-    {
-        if (self::usesW404RustFfi()) {
-            $native = self::w404Call(self::w404Rows($movies));
-            if ($native !== null) {
-                return $native;
-            }
-        }
-
-        return self::summarizeMovieMetadataCompletenessPhp($movies);
-    }
-
-    /** @param array<array-key, mixed> $movies
-     * @return array<string, int>
-     */
-    public static function summarizeMovieMetadataCompletenessPhp(array $movies): array
-    {
-        $summary = array_fill_keys(['total_rows', 'valid_imdb_id_count', 'has_tmdb_id_count', 'has_cover_count', 'missing_year_count', 'complete_record_count'], 0);
-        $summary['total_rows'] = count($movies);
-        foreach (self::w404Rows($movies) as [$imdb, $tmdb, $cover, $year]) {
-            $validImdb = preg_match('/\A(?:tt)?[0-9]{7,10}\z/', $imdb) === 1 && strspn($imdb, 't0') !== strlen($imdb);
-            $hasTmdb = preg_match('/\A[0-9]+\z/', $tmdb) === 1 && strspn($tmdb, '0') !== strlen($tmdb);
-            $hasCover = preg_match('/\A[0-9]+\z/', $cover) === 1 && strspn($cover, '0') !== strlen($cover);
-            $hasYear = preg_match('/\A[12][0-9]{3}\z/', $year) === 1;
-            $summary['valid_imdb_id_count'] += (int) $validImdb;
-            $summary['has_tmdb_id_count'] += (int) $hasTmdb;
-            $summary['has_cover_count'] += (int) $hasCover;
-            $summary['missing_year_count'] += (int) ! $hasYear;
-            $summary['complete_record_count'] += (int) ($validImdb && $hasTmdb && $hasCover && $hasYear);
-        }
-
-        return $summary;
-    }
-
     protected const MATCH_PERCENT = 75;
 
     /** Lower threshold when year matches exactly; allows matching by alternate title (e.g. "Girl Cops" vs primary). */
     protected const MATCH_PERCENT_ALT_TITLE = 55;
 
     protected const YEAR_MATCH_PERCENT = 80;
-
-    private const string FFI_CDEF = <<<'C'
-        int32_t nntmux_movie_matches_context(const char *current_title, size_t current_title_len, const char *current_year, size_t current_year_len, const char *title, size_t title_len, const char *year, size_t year_len);
-        ssize_t nntmux_movie_score_local_candidates_batch_nul(const char *current_title, size_t current_title_len, const char *current_year, size_t current_year_len, const char *titles, size_t titles_len, const char *years, size_t years_len, size_t count, double *out_score);
-        const char *nntmux_movie_clean_release_name(const char *name, size_t name_len);
-        C;
-
-    private static ?FFI $ffi = null;
-
-    private static bool $ffiResolved = false;
-
-    private static ?CData $scoreOut = null;
 
     protected string $currentTitle = '';
 
@@ -539,7 +378,7 @@ class MovieService
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save FanartTV cover for '.$imdbId.' from URL: '.$fanart['cover']);
                 }
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 Log::error('Error saving FanartTV cover for '.$imdbId.': '.$e->getMessage());
                 $mov['cover'] = 0;
             }
@@ -551,7 +390,7 @@ class MovieService
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save TMDB cover for '.$imdbId.' from URL: '.$tmdb['cover']);
                 }
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 Log::error('Error saving TMDB cover for '.$imdbId.': '.$e->getMessage());
                 $mov['cover'] = 0;
             }
@@ -563,7 +402,7 @@ class MovieService
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save IMDB cover for '.$imdbId.' from URL: '.$imdb['cover']);
                 }
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 Log::error('Error saving IMDB cover for '.$imdbId.': '.$e->getMessage());
                 $mov['cover'] = 0;
             }
@@ -575,7 +414,7 @@ class MovieService
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save OMDB cover for '.$imdbId.' from URL: '.$omdb['cover']);
                 }
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 Log::error('Error saving OMDB cover for '.$imdbId.': '.$e->getMessage());
                 $mov['cover'] = 0;
             }
@@ -585,7 +424,7 @@ class MovieService
         if (! empty($fanart['backdrop'])) {
             try {
                 $mov['backdrop'] = $this->saveRemoteAsset($imdbId.'-backdrop', $fanart['backdrop'], ImageAssetProfile::Backdrop);
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 Log::warning('Error saving FanartTV backdrop for '.$imdbId.': '.$e->getMessage());
                 $mov['backdrop'] = 0;
             }
@@ -594,7 +433,7 @@ class MovieService
         if ($mov['backdrop'] === 0 && ! empty($tmdb['backdrop'])) {
             try {
                 $mov['backdrop'] = $this->saveRemoteAsset($imdbId.'-backdrop', $tmdb['backdrop'], ImageAssetProfile::Backdrop);
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 Log::warning('Error saving TMDB backdrop for '.$imdbId.': '.$e->getMessage());
                 $mov['backdrop'] = 0;
             }
@@ -604,7 +443,7 @@ class MovieService
         if (! empty($fanart['banner'])) {
             try {
                 $mov['banner'] = $this->saveRemoteAsset($imdbId.'-banner', $fanart['banner']);
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 Log::warning('Error saving FanartTV banner for '.$imdbId.': '.$e->getMessage());
                 $mov['banner'] = 0;
             }
@@ -718,7 +557,7 @@ class MovieService
 
                 return $result;
             }
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::warning('FanartTV API error for '.$imdbId.': '.$e->getMessage());
         }
 
@@ -877,7 +716,7 @@ class MovieService
 
             return $ret;
 
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::warning('TMDB API error for '.$lookupId.': '.$e->getMessage());
             Cache::put($cacheKey, false, now()->addHours(6));
 
@@ -961,7 +800,7 @@ class MovieService
             }
 
             return $scraped;
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::warning('IMDb scrape error for '.$imdbId.': '.$e->getMessage());
             Cache::put($cacheKey, false, now()->addHours(6));
 
@@ -1029,7 +868,7 @@ class MovieService
 
             return $movieData;
 
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::warning('Trakt API error for '.$imdbId.': '.$e->getMessage());
             Cache::put($cacheKey, false, now()->addHours(6));
 
@@ -1114,7 +953,7 @@ class MovieService
 
             return $movieData;
 
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::warning('OMDB API error for '.$imdbId.': '.$e->getMessage());
             Cache::put($cacheKey, false, now()->addHours(6));
 
@@ -1383,7 +1222,7 @@ class MovieService
                     return true;
                 }
             }
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::debug('IMDb scraper search failed: '.$e->getMessage());
         }
 
@@ -1514,7 +1353,7 @@ class MovieService
                 }
             }
 
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::warning('TMDB API error: '.$e->getMessage());
         }
 
@@ -1551,31 +1390,8 @@ class MovieService
             return false;
         }
 
-        $match = $this->bestLocalMatch($potentialMatches->all());
-
-        if ($match !== null) {
-            Cache::put($cacheKey, $match, now()->addDays(7));
-
-            if ($this->echooutput) {
-                cli()->info("Found local match: {$this->currentTitle} ({$match})");
-            }
-
-            return $match;
-        }
-
-        Cache::put($cacheKey, false, now()->addHours(6));
-
-        return false;
-    }
-
-    /**
-     * IMDb id of the best local movieinfo candidate for the current title/year, or null.
-     *
-     * @param  array<int, MovieInfo|array<string, mixed>>  $potentialMatches
-     */
-    protected function bestLocalMatch(array $potentialMatches): ?string
-    {
         $candidates = [];
+
         foreach ($potentialMatches as $match) {
             $percent = $this->similarityPercent($this->currentTitle, $match['title']);
 
@@ -1595,54 +1411,21 @@ class MovieService
             $candidates[] = ['imdbid' => $match['imdbid'], 'percent' => $percent];
         }
 
-        return $this->pickBestLocalCandidate($candidates);
-    }
+        $match = $this->pickBestLocalCandidate($candidates);
 
-    /**
-     * Rust `nntmux_movie_score_local_candidates_batch_nul` for parity testing: the index and percent of
-     * the candidate `bestLocalMatch()` picks, `false` when none is accepted, or `null` when the library
-     * is unavailable or declines (non-digit current year, NUL bytes, non-string/int fields). Production
-     * keeps the PHP loop: Eloquent attribute reads dominate, leaving common p99 at 1.33-1.57x.
-     *
-     * @param  array<int, array{title: mixed, year: mixed}>  $candidates
-     * @return array{index: int, percent: float}|false|null
-     */
-    public static function scoreLocalCandidatesNative(string $currentTitle, string $currentYear, array $candidates): array|false|null
-    {
-        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
-        $count = count($candidates);
-        if ($ffi === null || $count === 0) {
-            return null;
-        }
-        $titles = [];
-        $years = [];
-        foreach ($candidates as $candidate) {
-            $title = self::ffiScalar($candidate['title']);
-            $year = self::ffiScalar($candidate['year']);
-            if ($title === null || $year === null) {
-                return null;
+        if ($match !== null) {
+            Cache::put($cacheKey, $match, now()->addDays(7));
+
+            if ($this->echooutput) {
+                cli()->info("Found local match: {$this->currentTitle} ({$match})");
             }
-            $titles[] = $title;
-            $years[] = $year;
-        }
-        $titles = implode("\0", $titles);
-        $years = implode("\0", $years);
-        if (substr_count($titles, "\0") !== $count - 1 || substr_count($years, "\0") !== $count - 1) {
-            return null;
-        }
-        try {
-            $out = self::$scoreOut ??= $ffi->new('double');
-            // @phpstan-ignore method.notFound
-            $index = $ffi->nntmux_movie_score_local_candidates_batch_nul($currentTitle, strlen($currentTitle), $currentYear, strlen($currentYear), $titles, strlen($titles), $years, strlen($years), $count, FFI::addr($out));
-        } catch (Throwable) {
-            return null;
-        }
-        if ($index === -2) {
-            return false;
+
+            return $match;
         }
 
-        // @phpstan-ignore property.notFound
-        return is_int($index) && $index >= 0 && $index < $count ? ['index' => $index, 'percent' => (float) $out->cdata] : null;
+        Cache::put($cacheKey, false, now()->addHours(6));
+
+        return false;
     }
 
     /**
@@ -1657,26 +1440,6 @@ class MovieService
         usort($candidates, static fn (array $a, array $b): int => $b['percent'] <=> $a['percent']);
 
         return $candidates[0]['imdbid'];
-    }
-
-    /**
-     * Rust `nntmux_movie_clean_release_name` for parity testing; `null` when the library is unavailable or
-     * declines (NUL bytes). Production keeps PHP: the FFI call costs more on short names (0.79-0.81x).
-     */
-    public static function cleanReleaseNameForMovieLookupNative(string $searchname): ?string
-    {
-        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
-        if ($ffi === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $clean = $ffi->nntmux_movie_clean_release_name($searchname, strlen($searchname));
-        } catch (Throwable) {
-            return null;
-        }
-
-        return is_string($clean) ? $clean : null;
     }
 
     /**
@@ -1704,32 +1467,6 @@ class MovieService
         similar_text($normalizedLeft, $normalizedRight, $percent);
 
         return $percent;
-    }
-
-    /**
-     * Rust `nntmux_movie_matches_context`: bit 0 is `matchesCurrentContext()`'s result and bit 1 is set when
-     * it flags `candidateMismatch`; `null` when the library is unavailable or declines (non-digit current
-     * year, non-string/int title or year). Production keeps PHP: common-path gains are 1.34-1.36x.
-     */
-    public static function matchesContextNative(string $currentTitle, string $currentYear, mixed $title, mixed $year): ?int
-    {
-        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
-        if ($ffi === null) {
-            return null;
-        }
-        $title = self::ffiScalar($title);
-        $year = self::ffiScalar($year);
-        if ($title === null || $year === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $packed = $ffi->nntmux_movie_matches_context($currentTitle, strlen($currentTitle), $currentYear, strlen($currentYear), $title, strlen($title), $year, strlen($year));
-        } catch (Throwable) {
-            return null;
-        }
-
-        return is_int($packed) && $packed >= 0 ? $packed : null;
     }
 
     /**
@@ -1830,30 +1567,6 @@ class MovieService
         return $this->candidateMatchesLocalInfo($imdbId);
     }
 
-    /**
-     * A title/year as the Rust helpers receive it: `null` and ints keep their `empty()`,
-     * `(string)` and `similar_text()` behaviour as strings; other types decline to PHP.
-     */
-    private static function ffiScalar(mixed $value): ?string
-    {
-        return match (true) {
-            is_string($value) => $value,
-            is_int($value) => (string) $value,
-            $value === null => '',
-            default => null,
-        };
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (! self::$ffiResolved) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('movie_candidate_scoring', self::FFI_CDEF);
-            self::$ffiResolved = true;
-        }
-
-        return self::$ffi;
-    }
-
     private function normalizeComparisonValue(mixed $value): ?string
     {
         if (is_string($value)) {
@@ -1872,25 +1585,6 @@ class MovieService
     }
 
     protected function parseMovieSearchName(string $releaseName): bool
-    {
-        $title = '';
-        $year = '';
-        $rust = RustPipelineLibrary::movieParseSearchName($releaseName, $title, $year);
-        if ($rust !== null) {
-            if ($rust) {
-                $this->currentTitle = $title;
-                $this->currentYear = $year;
-
-                return true;
-            }
-
-            return false;
-        }
-
-        return $this->parseMovieSearchNamePhp($releaseName);
-    }
-
-    public function parseMovieSearchNamePhp(string $releaseName): bool
     {
         $releaseName = $this->cleanReleaseNameForMovieLookup($releaseName);
 
@@ -2012,7 +1706,7 @@ class MovieService
                     return true;
                 }
             }
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::debug('Fanart cover fetch failed for '.$imdbId.': '.$e->getMessage());
         }
 
@@ -2023,7 +1717,7 @@ class MovieService
                     return true;
                 }
             }
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::debug('TMDB cover fetch failed for '.$imdbId.': '.$e->getMessage());
         }
 
@@ -2034,7 +1728,7 @@ class MovieService
                     return true;
                 }
             }
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::debug('IMDB cover fetch failed for '.$imdbId.': '.$e->getMessage());
         }
 
@@ -2045,7 +1739,7 @@ class MovieService
                     return true;
                 }
             }
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             Log::debug('OMDB cover fetch failed for '.$imdbId.': '.$e->getMessage());
         }
 
@@ -2063,186 +1757,5 @@ class MovieService
             $this->imgSavePath,
             $profile,
         )->success;
-    }
-
-    // ---------------------------------------------------------------------
-    // Wave 53.4 batch helper
-    // ---------------------------------------------------------------------
-
-    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 3.73x, p99 2.90x; uncommon mean 3.85x, p99 2.68x); see RustAnidbArchiveMovieBrowseMovieServiceIgdbExW53ParityTest. */
-    private const bool W53_RUST_FFI_DEFAULT = true;
-
-    public const string W53_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w534_movie_metadata_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * Per-row metadata completeness for many movies at once, with the
-     * summarizeMovieMetadataCompletenessPhp() rules on trimmed values. `$fields` holds four
-     * strings per movie ([imdbid, tmdbid, cover, year]); each movie yields four words: flags
-     * (1 valid IMDb id, 2 TMDb id, 4 cover, 8 year, 16 complete), the IMDb number, the TMDb id
-     * (saturating like an (int) cast) and the year, each -1 when invalid.
-     *
-     * @param  list<string>  $fields
-     * @return list<int>
-     */
-    public static function movieMetadataRowBatch(array $fields): array
-    {
-        return self::usesW53RustFfi()
-            ? self::movieMetadataRowBatchNative($fields)
-            : self::movieMetadataRowBatchPhp($fields);
-    }
-
-    /**
-     * @param  list<string>  $fields
-     * @return list<int>
-     */
-    public static function movieMetadataRowBatchNative(array $fields): array
-    {
-        self::w53AssertRows($fields);
-        if ($fields === []) {
-            return [];
-        }
-
-        return self::w53Call(implode("\0", $fields), '', intdiv(\count($fields), 4), 4)
-            ?? self::movieMetadataRowBatchPhp($fields);
-    }
-
-    /**
-     * @param  list<string>  $fields
-     * @return list<int>
-     */
-    public static function movieMetadataRowBatchPhp(array $fields): array
-    {
-        self::w53AssertRows($fields);
-        $out = [];
-        for ($i = 0, $n = \count($fields); $i < $n; $i += 4) {
-            $imdb = trim($fields[$i]);
-            $tmdb = trim($fields[$i + 1]);
-            $cover = trim($fields[$i + 2]);
-            $year = trim($fields[$i + 3]);
-            $validImdb = preg_match('/\A(?:tt)?[0-9]{7,10}\z/', $imdb) === 1 && strspn($imdb, 't0') !== \strlen($imdb);
-            $hasTmdb = preg_match('/\A[0-9]+\z/', $tmdb) === 1 && strspn($tmdb, '0') !== \strlen($tmdb);
-            $hasCover = preg_match('/\A[0-9]+\z/', $cover) === 1 && strspn($cover, '0') !== \strlen($cover);
-            $hasYear = preg_match('/\A[12][0-9]{3}\z/', $year) === 1;
-            $flags = ($validImdb ? 1 : 0) | ($hasTmdb ? 2 : 0) | ($hasCover ? 4 : 0) | ($hasYear ? 8 : 0);
-            array_push(
-                $out,
-                $flags === 15 ? 31 : $flags,
-                $validImdb ? (int) (str_starts_with($imdb, 'tt') ? substr($imdb, 2) : $imdb) : -1,
-                $hasTmdb ? (int) $tmdb : -1,
-                $hasYear ? (int) $year : -1,
-            );
-        }
-
-        return $out;
-    }
-
-    /** @param array<array-key, mixed> $fields */
-    private static function w53AssertRows(array $fields): void
-    {
-        self::w53AssertList($fields);
-        if (\count($fields) % 4 !== 0) {
-            throw new \InvalidArgumentException('Expected four movie metadata fields per row.');
-        }
-    }
-
-    public static function usesW53RustFfi(): bool
-    {
-        $enabled = self::w53RustFfiState('enabled');
-
-        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Run $callback with the W53 batch dispatch forced on or off, then restore the previous choice.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w53RustFfiState('enabled');
-        self::w53RustFfiState('enabled', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w53RustFfiState('enabled', $previous);
-        }
-    }
-
-    /** @param array<array-key, mixed> $values */
-    private static function w53AssertList(array $values): void
-    {
-        if (! array_is_list($values)) {
-            throw new \InvalidArgumentException('W53 batch input must be a list.');
-        }
-    }
-
-    /**
-     * One FFI crossing for the batch: NUL-joined text fields and packed int64 columns in,
-     * `$words` int64 words back per record. Null when the library is missing or declines
-     * (a value holding a NUL byte adds a field, which the export rejects).
-     *
-     * @return list<int>|null
-     */
-    private static function w53Call(string $text, string $ints, int $count, int $words): ?array
-    {
-        try {
-            $state = self::w53RustFfiState();
-            $ffi = $state['ffi'] ?? null;
-            if ($ffi === null) {
-                $ffi = RustPipelineLibrary::resolveDomain('metadata_w53', self::W53_FFI_CDEF) ?? false;
-                self::w53RustFfiState('ffi', $ffi);
-            }
-            if (! $ffi instanceof FFI) {
-                return null;
-            }
-            $need = $count * $words;
-            $out = $state['out'] ?? null;
-            $cap = $state['cap'] ?? 0;
-            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
-                $cap = max(1024, $need);
-                $out = $ffi->new('int64_t['.$cap.']');
-                self::w53RustFfiState('out', $out);
-                self::w53RustFfiState('cap', $cap);
-            }
-            // @phpstan-ignore method.notFound (Declared by W53_FFI_CDEF.)
-            $written = $ffi->nntmux_w534_movie_metadata_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
-            if ($written !== $need) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($out, $need * 8));
-
-            return $values === false ? null : array_values($values);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * W53 routing override and cached binding plus reusable output buffer, kept in a function
-     * static: no arguments returns the state, one argument reads a key ('reset' clears
-     * everything) and two arguments write a key.
-     */
-    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
-        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-        if ($op === null) {
-            return $state;
-        }
-        if ($op === 'reset') {
-            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
-
-            return null;
-        }
-        if (\func_num_args() > 1) {
-            $state[$op] = $val;
-        }
-
-        return $state[$op] ?? null;
     }
 }

@@ -6,93 +6,12 @@ namespace App\Console\Commands;
 
 use App\Models\Release;
 use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
-use App\Support\ReleaseNameDisplay;
-use App\Support\RustPipelineLibrary;
 use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 
 class RetryArchiveInspection extends Command
 {
-    public const string W386_FFI_CDEF = 'ssize_t nntmux_w386_tmux_drain_stop_runners(uint8_t operation, uint8_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
-
-    // Paired caller benchmarks must qualify before enabling this separate candidate.
-    private static ?bool $useRustW386 = null;
-
-    public static function setUseRustW386(?bool $enabled): void
-    {
-        self::$useRustW386 = $enabled;
-    }
-
-    public static function usesRustW386(): bool
-    {
-        return self::$useRustW386 ?? false;
-    }
-
-    private static function w386Transform(int $flags, string $input): ?string
-    {
-        $length = strlen($input);
-        if ($length > 16_777_216) {
-            return null;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('additional_w386', self::W386_FFI_CDEF);
-        if ($ffi === null) {
-            return null;
-        }
-        try {
-            $capacity = 0;
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $capacity);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w386_tmux_drain_stop_runners(3, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
-            if (is_int($written) && $written < -1 && -$written <= 16_777_216) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($scratch === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_w386_tmux_drain_stop_runners(3, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
-            }
-            if (! is_int($written) || $written < 0 || $written > min($capacity, 16_777_216)) {
-                return null;
-            }
-
-            return $written === 0 ? '' : \FFI::string($scratch, $written);
-        } catch (\Throwable) {
-            return null;
-        }
-    }
-
-    /** Remaining bounded retry chunk; a nonpositive limit is unlimited. */
-    public static function retryChunkPlan(int $limit, int $queued): int
-    {
-        return (self::usesRustW386() ? self::retryChunkPlanNative($limit, $queued) : null)
-            ?? self::retryChunkPlanPhp($limit, $queued);
-    }
-
-    public static function retryChunkPlanPhp(int $limit, int $queued): int
-    {
-        $queued = max(0, $queued);
-
-        return $limit <= 0 ? self::CHUNK_SIZE : ($queued >= $limit ? 0 : min(self::CHUNK_SIZE, $limit - $queued));
-    }
-
-    public static function retryChunkPlanNative(int $limit, int $queued): ?int
-    {
-        $output = self::w386Transform(0, pack('q2', $limit, $queued));
-        if ($output === null || strlen($output) !== 8) {
-            return null;
-        }
-        /** @var array{value: int} $decoded */
-        $decoded = unpack('qvalue', $output);
-
-        return $decoded['value'];
-    }
-
-    public bool $useRustFfi = false;
-
     private const int CHUNK_SIZE = 1000;
 
     protected $signature = 'releases:retry-archive-inspection
@@ -175,16 +94,6 @@ class RetryArchiveInspection extends Command
     }
 
     private function archiveType(string $name): string
-    {
-        return $this->useRustFfi ? $this->archiveTypeNative($name) : $this->archiveTypePhp($name);
-    }
-
-    public function archiveTypeNative(string $name): string
-    {
-        return ReleaseNameDisplay::transformNative(4, $name) ?? $this->archiveTypePhp($name);
-    }
-
-    public function archiveTypePhp(string $name): string
     {
         return match (true) {
             preg_match('/\.7z(\.\d{3})?\b/i', $name) === 1 => '7z',

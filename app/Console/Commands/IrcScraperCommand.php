@@ -10,11 +10,8 @@ use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Services\Predb\Irc\IrcNetworks;
 use App\Services\Predb\Stream\PredbStreamListener;
 use App\Services\Predb\Stream\WebSocketClient;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Console\Command;
 use Symfony\Component\Process\Process;
-use Throwable;
 
 class IrcScraperCommand extends Command
 {
@@ -29,18 +26,6 @@ class IrcScraperCommand extends Command
      * A child that ran at least this long counts as healthy, which resets its backoff.
      */
     public const HEALTHY_RUN_SECONDS = 600;
-
-    public const string FFI_CDEF = <<<'C'
-        int64_t nntmux_irc_scraper_restart_delay(int64_t failures);
-        C;
-
-    /**
-     * restartDelay() stays on PHP: two integer operations cannot amortise a single FFI call (see
-     * RustPredbFeedsAndStreamParityTest for the paired benchmark evidence).
-     */
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
 
     /**
      * The name and signature of the console command.
@@ -132,7 +117,7 @@ class IrcScraperCommand extends Command
             new IRCScraper($silent, $debug, $network);
 
             return self::SUCCESS;
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             // Always reported: the supervisor relays it, and a quiet failure loop is hard to diagnose.
             $this->error("[{$network}] ".$e->getMessage());
 
@@ -197,54 +182,6 @@ class IrcScraperCommand extends Command
      * Seconds to wait before the next start after $failures consecutive short runs (1 = first failure).
      */
     public static function restartDelay(int $failures): int
-    {
-        if (self::$useRustFfi) {
-            $native = self::restartDelayNative($failures);
-            if ($native !== null) {
-                return $native;
-            }
-        }
-
-        return self::restartDelayPhp($failures);
-    }
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        self::$ffi ??= RustPipelineLibrary::resolveDomain('predb', self::FFI_CDEF) ?? false;
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
-    /**
-     * Rust restartDelay(); null when the library is unavailable.
-     */
-    public static function restartDelayNative(int $failures): ?int
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $delay = $ffi->nntmux_irc_scraper_restart_delay($failures);
-        } catch (Throwable) {
-            return null;
-        }
-
-        return is_int($delay) && $delay >= 0 ? $delay : null;
-    }
-
-    public static function restartDelayPhp(int $failures): int
     {
         return (int) min(self::MAX_RESTART_DELAY, self::RESTART_DELAY * (2 ** max(0, min(16, $failures - 1))));
     }

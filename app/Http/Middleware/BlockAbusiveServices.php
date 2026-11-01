@@ -6,15 +6,12 @@ namespace App\Http\Middleware;
 
 use App\Services\Security\IndexerProxyDetector;
 use App\Services\Security\ProxyRequestContext;
-use App\Support\RustPipelineLibrary;
 use Closure;
-use FFI;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\Response;
-use Throwable;
 
 /**
  * Middleware to block abusive streaming services and cloud providers.
@@ -32,20 +29,6 @@ use Throwable;
  */
 class BlockAbusiveServices
 {
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_http_matches_user_agent_patterns_nul(const char *user_agent, size_t user_agent_len, uint32_t use_default_blocked, const char *patterns_nul, size_t patterns_len, size_t patterns_count);
-        ssize_t nntmux_http_redact_sensitive_query_keys_nul(const char *keys_nul, size_t keys_len, size_t keys_count, char *out_buf, size_t out_cap);
-        C;
-
-    /**
-     * @var array<int, string>
-     */
-    private const DEFAULT_BLOCKED_USER_AGENTS = [
-        'aiostreams',
-        'usenetstreamer',
-        'stremio',
-    ];
-
     /**
      * @var array<int, string>
      */
@@ -55,20 +38,6 @@ class BlockAbusiveServices
         'token',
         'passkey',
     ];
-
-    private static FFI|false|null $ffi = null;
-
-    private static bool $useRustFfi = true;
-
-    public static function setUseRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
 
     /**
      * User-Agent patterns to block (case-insensitive).
@@ -182,58 +151,18 @@ class BlockAbusiveServices
 
     /**
      * Check if the User-Agent matches any blocked patterns.
-     *
-     * @param  array<int, string>|null  $blockedPatterns
      */
-    public function isBlockedUserAgent(string $userAgent, ?array $blockedPatterns = null): bool
+    protected function isBlockedUserAgent(string $userAgent): bool
     {
-        // Retain native PHP in production: single-string `strtolower` + 3 `str_contains` checks (~116 ns)
-        // beats FFI call boundary overhead (~185 ns, 0.49x-0.63x).
-        return $this->isBlockedUserAgentPhp($userAgent, $blockedPatterns);
-    }
-
-    /**
-     * @param  array<int, string>|null  $blockedPatterns
-     */
-    public function isBlockedUserAgentPhp(string $userAgent, ?array $blockedPatterns = null): bool
-    {
-        $patterns = $blockedPatterns ?? $this->blockedUserAgents;
         $lowerUserAgent = strtolower($userAgent);
 
-        foreach ($patterns as $pattern) {
+        foreach ($this->blockedUserAgents as $pattern) {
             if (str_contains($lowerUserAgent, strtolower($pattern))) {
                 return true;
             }
         }
 
         return false;
-    }
-
-    /**
-     * @param  array<int, string>|null  $blockedPatterns
-     */
-    public function isBlockedUserAgentNative(string $userAgent, ?array $blockedPatterns = null): ?bool
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        $patterns = $blockedPatterns ?? $this->blockedUserAgents;
-        if ($patterns === self::DEFAULT_BLOCKED_USER_AGENTS) {
-            $ffi = self::$ffi ?? self::resolveFfi();
-            if ($ffi === null || $ffi === false) {
-                return null;
-            }
-            try {
-                // @phpstan-ignore method.notFound
-                $res = $ffi->nntmux_http_matches_user_agent_patterns_nul($userAgent, \strlen($userAgent), 1, null, 0, 0);
-
-                return \is_int($res) && $res >= 0 ? ($res === 1) : null;
-            } catch (Throwable) {
-                return null;
-            }
-        }
-
-        return self::matchesAnyUserAgentPatternNative($userAgent, $patterns);
     }
 
     /**
@@ -340,17 +269,7 @@ class BlockAbusiveServices
     /**
      * @param  array<int, string>  $patterns
      */
-    public function matchesAnyUserAgentPattern(string $userAgent, array $patterns): bool
-    {
-        // Retain native PHP in production: NUL-joining `$patterns` + FFI boundary (~255-505 ns)
-        // exceeds in-process `strtolower` + `str_contains` loop (~150-260 ns, 0.51x-0.59x).
-        return $this->matchesAnyUserAgentPatternPhp($userAgent, $patterns);
-    }
-
-    /**
-     * @param  array<int, string>  $patterns
-     */
-    public function matchesAnyUserAgentPatternPhp(string $userAgent, array $patterns): bool
+    protected function matchesAnyUserAgentPattern(string $userAgent, array $patterns): bool
     {
         $lowerUserAgent = strtolower($userAgent);
 
@@ -361,51 +280,6 @@ class BlockAbusiveServices
         }
 
         return false;
-    }
-
-    /**
-     * @param  array<int, string>  $patterns
-     */
-    public static function matchesAnyUserAgentPatternNative(string $userAgent, array $patterns): ?bool
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        $count = \count($patterns);
-        if ($count === 0) {
-            return false;
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return null;
-        }
-
-        if ($patterns === self::DEFAULT_BLOCKED_USER_AGENTS) {
-            try {
-                // @phpstan-ignore method.notFound
-                $res = $ffi->nntmux_http_matches_user_agent_patterns_nul($userAgent, \strlen($userAgent), 1, null, 0, 0);
-
-                return \is_int($res) && $res >= 0 ? ($res === 1) : null;
-            } catch (Throwable) {
-                return null;
-            }
-        }
-
-        foreach ($patterns as $p) {
-            if (\str_contains($p, "\0")) {
-                return null;
-            }
-        }
-        $joined = implode("\0", $patterns);
-
-        try {
-            // @phpstan-ignore method.notFound
-            $res = $ffi->nntmux_http_matches_user_agent_patterns_nul($userAgent, \strlen($userAgent), 0, $joined, \strlen($joined), $count);
-
-            return \is_int($res) && $res >= 0 ? ($res === 1) : null;
-        } catch (Throwable) {
-            return null;
-        }
     }
 
     /**
@@ -434,16 +308,7 @@ class BlockAbusiveServices
      * @param  array<string, mixed>  $parameters
      * @return array<string, mixed>
      */
-    public function redactSensitiveQueryParameters(array $parameters): array
-    {
-        return $this->redactSensitiveQueryParametersPhp($parameters);
-    }
-
-    /**
-     * @param  array<string, mixed>  $parameters
-     * @return array<string, mixed>
-     */
-    public function redactSensitiveQueryParametersPhp(array $parameters): array
+    protected function redactSensitiveQueryParameters(array $parameters): array
     {
         $redacted = [];
 
@@ -455,90 +320,11 @@ class BlockAbusiveServices
             }
 
             $redacted[$key] = is_array($value)
-                ? $this->redactSensitiveQueryParametersPhp($value)
+                ? $this->redactSensitiveQueryParameters($value)
                 : $value;
         }
 
         return $redacted;
-    }
-
-    /**
-     * @param  array<string, mixed>  $parameters
-     * @return array<string, mixed>|null
-     */
-    public function redactSensitiveQueryParametersNative(array $parameters): ?array
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        $count = \count($parameters);
-        if ($count === 0) {
-            return [];
-        }
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return null;
-        }
-
-        $strKeys = [];
-        foreach ($parameters as $key => $_) {
-            $ks = (string) $key;
-            if (\str_contains($ks, "\0")) {
-                return null;
-            }
-            $strKeys[] = $ks;
-        }
-        $joined = implode("\0", $strKeys);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(64, $count), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_http_redact_sensitive_query_keys_nul($joined, \strlen($joined), $count, $scratch, $cap);
-            if (! \is_int($written) || $written !== $count) {
-                return null;
-            }
-            $flags = FFI::string($scratch, $count);
-        } catch (Throwable) {
-            return null;
-        }
-
-        $redacted = [];
-        $idx = 0;
-        foreach ($parameters as $key => $value) {
-            if ($flags[$idx] === '1') {
-                $redacted[$key] = '[redacted]';
-                $idx++;
-
-                continue;
-            }
-            $idx++;
-            if (is_array($value)) {
-                $nested = $this->redactSensitiveQueryParametersNative($value);
-                if ($nested === null) {
-                    return null;
-                }
-                $redacted[$key] = $nested;
-            } else {
-                $redacted[$key] = $value;
-            }
-        }
-
-        return $redacted;
-    }
-
-    private static function resolveFfi(): ?FFI
-    {
-        if (self::$ffi !== null) {
-            return self::$ffi === false ? null : self::$ffi;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
     }
 
     /**

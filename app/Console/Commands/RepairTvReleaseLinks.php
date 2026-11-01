@@ -14,14 +14,11 @@ use App\Services\TvProcessing\ParsedTvRelease;
 use App\Services\TvProcessing\Providers\LocalDbProvider;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Support\ReleaseSearchIndexSync;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
-use Throwable;
 
 /**
  * Repairs TV release links left behind by the legacy per-provider TV processor.
@@ -32,38 +29,6 @@ use Throwable;
  */
 class RepairTvReleaseLinks extends Command
 {
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_repair_tv_matches_episode(uint32_t flags, int64_t season, int64_t episode, const char *airdate, size_t airdate_len, int64_t series, int64_t episode_number, const char *first_aired, size_t first_aired_len);
-        int64_t nntmux_repair_tv_capped(int64_t count, int64_t limit);
-        C;
-
-    /** Null selects the benchmark-qualified production default (PHP; see RustTvShowAdderAndMetadataParityTest). */
-    private static ?bool $useRustFfi = null;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function setUseRustFfi(?bool $use = true): void
-    {
-        self::$useRustFfi = $use;
-        if ($use === null) {
-            self::$ffi = null;
-        }
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? false;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
     /**
      * @var string
      */
@@ -241,48 +206,6 @@ class RepairTvReleaseLinks extends Command
 
     private function matchesEpisode(?ParsedTvRelease $parsed, TvEpisode $episode): bool
     {
-        return self::usesRustFfi()
-            ? self::matchesEpisodeNative($parsed, $episode)
-            : self::matchesEpisodePhp($parsed, $episode);
-    }
-
-    public static function matchesEpisodeNative(?ParsedTvRelease $parsed, TvEpisode $episode): bool
-    {
-        if ($parsed === null) {
-            return false;
-        }
-        if (($ffi = self::ffi()) === null) {
-            return self::matchesEpisodePhp($parsed, $episode);
-        }
-        $flags = ($parsed->season !== null ? 1 : 0) | ($parsed->episode !== null ? 2 : 0) | ($parsed->airdate !== null ? 4 : 0);
-        $airdate = (string) $parsed->airdate;
-        $firstAired = (string) $episode->firstaired;
-        try {
-            // @phpstan-ignore method.notFound
-            $matched = $ffi->nntmux_repair_tv_matches_episode(
-                $flags,
-                $parsed->season ?? 0,
-                $parsed->episode ?? 0,
-                $airdate,
-                \strlen($airdate),
-                (int) $episode->series,
-                (int) $episode->episode,
-                $firstAired,
-                \strlen($firstAired),
-            );
-        } catch (Throwable) {
-            return self::matchesEpisodePhp($parsed, $episode);
-        }
-
-        return match ($matched) {
-            1 => true,
-            0 => false,
-            default => self::matchesEpisodePhp($parsed, $episode),
-        };
-    }
-
-    public static function matchesEpisodePhp(?ParsedTvRelease $parsed, TvEpisode $episode): bool
-    {
         if ($parsed === null) {
             return false;
         }
@@ -435,29 +358,7 @@ class RepairTvReleaseLinks extends Command
 
     private function capped(int $count): int
     {
-        return self::usesRustFfi()
-            ? self::cappedNative($count, $this->limit)
-            : self::cappedPhp($count, $this->limit);
-    }
-
-    public static function cappedNative(int $count, int $limit): int
-    {
-        if (($ffi = self::ffi()) === null) {
-            return self::cappedPhp($count, $limit);
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $capped = $ffi->nntmux_repair_tv_capped($count, $limit);
-        } catch (Throwable) {
-            return self::cappedPhp($count, $limit);
-        }
-
-        return \is_int($capped) ? $capped : self::cappedPhp($count, $limit);
-    }
-
-    public static function cappedPhp(int $count, int $limit): int
-    {
-        return $limit > 0 ? min($count, $limit) : $count;
+        return $this->limit > 0 ? min($count, $this->limit) : $count;
     }
 
     private function parse(string $searchname): ?ParsedTvRelease

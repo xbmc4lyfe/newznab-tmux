@@ -6,8 +6,6 @@ namespace App\Console\Commands;
 
 use App\Services\NntmuxUpdateLock;
 use App\Services\Tmux\Tmux;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Contracts\Process\ProcessResult;
 use Illuminate\Support\Facades\App;
@@ -17,83 +15,9 @@ use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Str;
 use Symfony\Component\Console\Helper\ProgressBar;
-use Throwable;
 
 class UpdateNNTmux extends Command
 {
-    private const FFI_CDEF = <<<'CDEF'
-ssize_t nntmux_installer_update_sequence(uint8_t maintenance_down, uint8_t seed, uint8_t *out, size_t cap);
-CDEF;
-
-    // The end-to-end FFI benchmark must qualify before changing this default.
-    private const bool RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useRustFfi = null;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
-    }
-
-    public static function setUseRustFfi(?bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    private static function additionalFfi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi instanceof FFI ? self::$ffi : null;
-    }
-
-    /** @return list<string> */
-    public static function buildUpdateSubcommandSequence(bool $maintenanceWasDown, bool $seedRequested): array
-    {
-        return self::usesRustFfi()
-            ? self::buildUpdateSubcommandSequenceNative($maintenanceWasDown, $seedRequested)
-            : self::buildUpdateSubcommandSequencePhp($maintenanceWasDown, $seedRequested);
-    }
-
-    /** @return list<string> */
-    public static function buildUpdateSubcommandSequencePhp(bool $maintenanceWasDown, bool $seedRequested): array
-    {
-        $commands = ['nntmux:git', 'nntmux:composer', 'nntmux:db'];
-        if ($seedRequested) {
-            $commands[] = 'db:seed';
-        }
-        if (! $maintenanceWasDown) {
-            array_unshift($commands, 'down');
-            $commands[] = 'up';
-        }
-
-        return $commands;
-    }
-
-    /** @return list<string> */
-    public static function buildUpdateSubcommandSequenceNative(bool $maintenanceWasDown, bool $seedRequested): array
-    {
-        try {
-            $ffi = self::additionalFfi();
-            if ($ffi !== null) {
-                $out = $ffi->new('uint8_t[128]');
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_installer_update_sequence((int) $maintenanceWasDown, (int) $seedRequested, $out, 128);
-                if (is_int($written) && $written > 0 && $written <= 128) {
-                    return explode("\n", FFI::string($out, $written));
-                }
-            }
-        } catch (Throwable) {
-            // Preserve the PHP sequence if native planning is unavailable.
-        }
-
-        return self::buildUpdateSubcommandSequencePhp($maintenanceWasDown, $seedRequested);
-    }
-
     /**
      * The name and signature of the console command.
      */
@@ -141,7 +65,7 @@ CDEF;
                 $this->checkRedisRuntimeIsHealthy();
 
                 return Command::SUCCESS;
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 $this->error($e->getMessage());
 
                 return Command::FAILURE;
@@ -229,7 +153,7 @@ CDEF;
 
         // Check if app is in maintenance mode
         $this->wasInMaintenance = App::isDownForMaintenance();
-        if (in_array('down', self::buildUpdateSubcommandSequence($this->wasInMaintenance, false), true)) {
+        if (! $this->wasInMaintenance) {
             $this->call('down', [
                 '--render' => 'errors::maintenance',
                 '--retry' => 120,
@@ -252,14 +176,19 @@ CDEF;
      */
     private function executeUpdateSteps(): void
     {
-        foreach (self::buildUpdateSubcommandSequence($this->wasInMaintenance, false) as $command) {
-            if ($command === 'nntmux:git' && ! $this->option('skip-git')) {
-                $this->performGitUpdate();
-            } elseif ($command === 'nntmux:composer' && ! $this->option('skip-composer')) {
-                $this->performComposerUpdate();
-            } elseif ($command === 'nntmux:db' && ! $this->option('skip-db')) {
-                $this->performDatabaseUpdate();
-            }
+        // Git operations
+        if (! $this->option('skip-git')) {
+            $this->performGitUpdate();
+        }
+
+        // Composer operations
+        if (! $this->option('skip-composer')) {
+            $this->performComposerUpdate();
+        }
+
+        // Database migrations
+        if (! $this->option('skip-db')) {
+            $this->performDatabaseUpdate();
         }
 
         // NPM operations
@@ -535,7 +464,7 @@ CDEF;
     private function restoreEnvironment(bool $startTmux): void
     {
         // Restore maintenance mode state
-        if (in_array('up', self::buildUpdateSubcommandSequence($this->wasInMaintenance, false), true) && App::isDownForMaintenance()) {
+        if (! $this->wasInMaintenance && App::isDownForMaintenance()) {
             $this->call('up');
         }
 
@@ -586,7 +515,7 @@ CDEF;
             if (! $isHealthy) {
                 throw new \Exception('Redis ping returned unexpected response: '.(string) $pong);
             }
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             throw new \Exception('Redis preflight failed: '.$e->getMessage(), 0, $e);
         }
     }

@@ -10,9 +10,7 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\OversizedCollectionDeferrals;
-use App\Support\RustPipelineLibrary;
 use DateTimeInterface;
-use FFI;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Carbon;
@@ -25,64 +23,6 @@ use Throwable;
 
 class CollectionCleanupService
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_cleanup_calculate(uint32_t mode, const int64_t *input, size_t len, int64_t *out, size_t cap);
-        C;
-
-    // PHP remains the default unless every paired common/uncommon mean and p99 gains 1.5x.
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function setUseRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
-    /**
-     * @param  list<int>  $values
-     * @return list<int>|null
-     */
-    private static function calculateNative(int $mode, array $values, int $size): ?array
-    {
-        try {
-            $ffi = self::ffi();
-            if ($ffi === null || count($values) > 1024) {
-                return null;
-            }
-            $input = $ffi->new('int64_t['.max(1, count($values)).']');
-            foreach ($values as $i => $value) {
-                $input[$i] = $value;
-            }
-            $out = $ffi->new('int64_t['.$size.']');
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_cleanup_calculate($mode, $input, count($values), $out, $size);
-            if ($written !== $size) {
-                return null;
-            }
-            $result = [];
-            for ($i = 0; $i < $size; $i++) {
-                $result[] = (int) $out[$i];
-            }
-
-            return $result;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
     /**
      * Maximum number of retries for a lock-related DB error before giving up.
      */
@@ -167,7 +107,7 @@ class CollectionCleanupService
         // explicitly remove parts/binaries/collections even when FK cascades
         // are not present in the runtime schema.
         $retentionHours = app(ConfigurationProvider::class)->ingestion()->partRetentionHours;
-        $cutoff = self::cutoffDate(now(), $retentionHours);
+        $cutoff = now()->subHours($retentionHours);
         $batchDeleted = 0;
         $verificationRequired = (bool) config('release_verification.required', true);
         if ($verificationRequired) {
@@ -175,7 +115,7 @@ class CollectionCleanupService
         } else {
             // Collections still waiting for reconciliation or release creation are owed an attempt
             // that a capped release pass may not have reached yet, so they get one more retention period.
-            $readyCutoff = self::cutoffDate(now(), 2 * $retentionHours);
+            $readyCutoff = now()->subHours(2 * $retentionHours);
             do {
                 $ids = DB::table('collections')
                     ->where(static fn ($age) => $age->where('dateadded', '<', $readyCutoff)
@@ -201,7 +141,7 @@ class CollectionCleanupService
             $batchDeleted += $this->deleteRetentionBandExceptReady($readyCutoff, $cutoff, $echoCLI);
         }
 
-        $deletedCount = self::cleanupTotal([$deletedCount, $batchDeleted]);
+        $deletedCount += $batchDeleted;
 
         if ($echoCLI) {
             $elapsed = now()->diffInSeconds($startTime, true);
@@ -221,7 +161,7 @@ class CollectionCleanupService
         }
 
         $orphanDeleted = $this->deleteOrphanCollections($echoCLI);
-        $deletedCount = self::cleanupTotal([$deletedCount, $orphanDeleted]);
+        $deletedCount += $orphanDeleted;
 
         if ($echoCLI) {
             $totalTime = now()->diffInSeconds($startTime, true);
@@ -241,7 +181,7 @@ class CollectionCleanupService
         }
 
         $missedDeleted = $this->deleteCollectionsMissedAfterNzb($echoCLI);
-        $deletedCount = self::cleanupTotal([$deletedCount, $missedDeleted]);
+        $deletedCount += $missedDeleted;
 
         $totalTime = now()->diffInSeconds($startTime, true);
 
@@ -339,7 +279,7 @@ class CollectionCleanupService
                 $lastId = 0;
                 $maxId = (int) DB::table('collections')->max('id');
             }
-            $archiveBudget = self::batchBound($this->sqlChunkSize(), PHP_INT_MIN, self::VERIFICATION_OLD_SWEEP_MAX_CANDIDATES);
+            $archiveBudget = min(self::VERIFICATION_OLD_SWEEP_MAX_CANDIDATES, $this->sqlChunkSize());
             $deadline = microtime(true) + $this->verificationSweepSeconds();
             $deleted = 0;
             do {
@@ -433,7 +373,7 @@ class CollectionCleanupService
             return [];
         }
         sort($ids);
-        $expiresBefore = self::cutoffDate(now(), (int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
+        $expiresBefore = now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
         $rows = DB::table('collections')
             ->when($lock && in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
             ->whereIn('id', $ids)->orderBy('id')->when($lock, fn ($query) => $query->lockForUpdate())->get();
@@ -486,7 +426,7 @@ class CollectionCleanupService
     private function verificationSweepSeconds(): int
     {
         // Archival after the last page starts is not timed, so stay well inside the sweep lock's lifetime.
-        return self::batchBound((int) config('nntmux.cbp.verification_sweep_seconds', 60), 0, 120);
+        return max(0, min(120, (int) config('nntmux.cbp.verification_sweep_seconds', 60)));
     }
 
     /**
@@ -573,7 +513,7 @@ class CollectionCleanupService
         if ($cursor >= $maxId) {
             $cursor = 0;
         }
-        $windowEnd = self::batchEnd($cursor, $this->orphanScanWindow(), $maxId);
+        $windowEnd = min($cursor + $this->orphanScanWindow(), $maxId);
         $batchSize = $this->sqlChunkSize();
         $deleted = 0;
 
@@ -890,483 +830,5 @@ class CollectionCleanupService
         }
 
         return false;
-    }
-
-    public static function cutoffTimestamp(int $timestamp, int $hours): int
-    {
-        return self::$useRustFfi ? self::cutoffTimestampNative($timestamp, $hours) : self::cutoffTimestampPhp($timestamp, $hours);
-    }
-
-    public static function cutoffTimestampNative(int $timestamp, int $hours): int
-    {
-        return self::calculateNative(0, [$timestamp, $hours], 1)[0] ?? self::cutoffTimestampPhp($timestamp, $hours);
-    }
-
-    public static function cutoffTimestampPhp(int $timestamp, int $hours): int
-    {
-        return $timestamp - $hours * 3600;
-    }
-
-    // Carbon subHours uses elapsed hours across DST transitions. Preserve timezone and microseconds.
-    public static function cutoffDate(Carbon $now, int $hours): Carbon
-    {
-        $cutoff = $now->copy();
-        $cutoff->setTimestamp(self::cutoffTimestamp($now->timestamp, $hours));
-        $cutoff->setMicrosecond($now->micro);
-
-        return $cutoff;
-    }
-
-    public static function batchEnd(int $cursor, int $window, int $maximum): int
-    {
-        return self::$useRustFfi ? self::batchEndNative($cursor, $window, $maximum) : self::batchEndPhp($cursor, $window, $maximum);
-    }
-
-    public static function batchEndNative(int $cursor, int $window, int $maximum): int
-    {
-        return self::calculateNative(1, [$cursor, $window, $maximum], 1)[0] ?? self::batchEndPhp($cursor, $window, $maximum);
-    }
-
-    public static function batchEndPhp(int $cursor, int $window, int $maximum): int
-    {
-        return min($cursor + $window, $maximum);
-    }
-
-    public static function batchBound(int $value, int $minimum, int $maximum): int
-    {
-        return self::$useRustFfi ? self::batchBoundNative($value, $minimum, $maximum) : self::batchBoundPhp($value, $minimum, $maximum);
-    }
-
-    public static function batchBoundNative(int $value, int $minimum, int $maximum): int
-    {
-        return self::calculateNative(2, [$value, $minimum, $maximum], 1)[0] ?? self::batchBoundPhp($value, $minimum, $maximum);
-    }
-
-    public static function batchBoundPhp(int $value, int $minimum, int $maximum): int
-    {
-        return max($minimum, min($maximum, $value));
-    }
-
-    /** @param list<int> $counts */
-    public static function cleanupTotal(array $counts): int
-    {
-        return self::$useRustFfi ? self::cleanupTotalNative($counts) : self::cleanupTotalPhp($counts);
-    }
-
-    /** @param list<int> $counts */
-    public static function cleanupTotalNative(array $counts): int
-    {
-        return self::calculateNative(3, $counts, 1)[0] ?? self::cleanupTotalPhp($counts);
-    }
-
-    /** @param list<int> $counts */
-    public static function cleanupTotalPhp(array $counts): int
-    {
-        return array_sum($counts);
-    }
-
-    public const string W401_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w401_collection_cleaning_remover_blacklist(uint32_t operation, uint32_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        C;
-
-    /**
-     * Rust is the default for summarizeCleanupRetentionBatch(): the paired benchmark in
-     * tests/Unit/RustCollectionCleaningRemoverBlacklistHandlerW40ParityTest.php clears 1.5x on every workload.
-     */
-    public const bool W401_RUST_FFI_DEFAULT = true;
-
-    private const int W401_RUST_MAX_INPUT = 16_777_216;
-
-    /** Filecheck statuses deleteRetentionBandExceptReady() keeps: the in-progress statuses, sized rows and 10. */
-    private const array W401_READY_STATUSES = [CollectionFileCheckStatus::Default->value, CollectionFileCheckStatus::CompleteCollection->value,
-        CollectionFileCheckStatus::CompleteParts->value, CollectionFileCheckStatus::TempComplete->value, CollectionFileCheckStatus::ZeroPart->value,
-        CollectionFileCheckStatus::Sized->value, 10];
-
-    private const array W401_RETENTION_KEYS = ['rows', 'invalid_rows', 'expired', 'ready_protected', 'active_window', 'invalid_timestamp'];
-
-    private static ?bool $w401UseRustFfi = null;
-
-    private static FFI|false|null $w401Ffi = null;
-
-    /**
-     * Buckets collection cleanup rows (`dateadded`, `filecheck`) against `$nowUnix` (negative values read as 0): rows added
-     * less than `$retentionHours` ago are in the active window; older rows are ready-protected when the retention band keeps
-     * their filecheck status and expired otherwise. A `dateadded` that is not a non-negative Unix time or a
-     * `YYYY-MM-DD[ HH:MM:SS]` UTC string counts as an invalid timestamp; non-array rows are invalid rows.
-     *
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>
-     */
-    public static function summarizeCleanupRetentionBatch(array $rows, int $nowUnix, int $retentionHours = 48): array
-    {
-        return (self::usesW401RustFfi() ? self::summarizeCleanupRetentionBatchNative($rows, $nowUnix, $retentionHours) : null)
-            ?? self::summarizeCleanupRetentionBatchPhp($rows, $nowUnix, $retentionHours);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>
-     */
-    private static function summarizeCleanupRetentionBatchPhp(array $rows, int $nowUnix, int $retentionHours): array
-    {
-        $now = max(0, $nowUnix);
-        $threshold = $retentionHours <= 0 ? 0 : ($retentionHours > intdiv(PHP_INT_MAX, 3_600) ? PHP_INT_MAX : $retentionHours * 3_600);
-        $summary = array_fill_keys(self::W401_RETENTION_KEYS, 0);
-        $summary['rows'] = count($rows);
-        foreach ($rows as $row) {
-            if (! is_array($row)) {
-                $summary['invalid_rows']++;
-
-                continue;
-            }
-            $added = self::w401Timestamp($row['dateadded'] ?? null);
-            if ($added === null) {
-                $summary['invalid_timestamp']++;
-            } elseif ($now - $added < $threshold) {
-                $summary['active_window']++;
-            } elseif (in_array(self::w401Int($row['filecheck'] ?? null), self::W401_READY_STATUSES, true)) {
-                $summary['ready_protected']++;
-            } else {
-                $summary['expired']++;
-            }
-        }
-
-        return $summary;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>|null
-     */
-    private static function summarizeCleanupRetentionBatchNative(array $rows, int $nowUnix, int $retentionHours): ?array
-    {
-        $words = [$nowUnix, $retentionHours, count($rows)];
-        $blob = [];
-        foreach ($rows as $row) {
-            if (is_array($row)) {
-                self::w401PackRow($words, $blob, [$row['dateadded'] ?? null, $row['filecheck'] ?? null]);
-            } else {
-                $words[] = 0;
-            }
-        }
-        $values = self::w401Invoke(self::$w401Ffi, 1, $words, $blob);
-
-        return $values !== null && count($values) === count(self::W401_RETENTION_KEYS) ? array_combine(self::W401_RETENTION_KEYS, $values) : null;
-    }
-
-    public static function useW401RustFfi(?bool $enabled): void
-    {
-        self::$w401UseRustFfi = $enabled;
-    }
-
-    public static function usesW401RustFfi(): bool
-    {
-        return self::$w401UseRustFfi ?? self::W401_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW401RustFfi(): void
-    {
-        self::$w401UseRustFfi = null;
-        self::$w401Ffi = null;
-    }
-
-    /**
-     * Wave 40.1 integer reading shared by the second-pass summaries: an int, or a string of an optional `-` and
-     * 1-18 ASCII digits; anything else (floats, bools, other strings) is null.
-     */
-    public static function w401Int(mixed $value): ?int
-    {
-        if (is_int($value)) {
-            return $value;
-        }
-        if (! is_string($value)) {
-            return null;
-        }
-        $digits = $value !== '' && $value[0] === '-' ? substr($value, 1) : $value;
-        $length = strlen($digits);
-
-        return $length >= 1 && $length <= 18 && strspn($digits, '0123456789') === $length ? (int) $value : null;
-    }
-
-    /**
-     * A non-negative int, or a `YYYY-MM-DD[ HH:MM:SS]` string read as UTC (year 1970+, month 1-12, day 1-31,
-     * time fields in range; days past a month's end roll over arithmetically).
-     */
-    public static function w401Timestamp(mixed $value): ?int
-    {
-        if (is_int($value)) {
-            return $value >= 0 ? $value : null;
-        }
-        $length = is_string($value) ? strlen($value) : 0;
-        if (! is_string($value) || ($length !== 10 && $length !== 19)) {
-            return null;
-        }
-        $long = $length === 19;
-        if ($value[4] !== '-' || $value[7] !== '-' || ($long && ($value[10] !== ' ' || $value[13] !== ':' || $value[16] !== ':'))) {
-            return null;
-        }
-        $digits = substr($value, 0, 4).substr($value, 5, 2).substr($value, 8, 2).($long ? substr($value, 11, 2).substr($value, 14, 2).substr($value, 17, 2) : '000000');
-        if (strspn($digits, '0123456789') !== 14) {
-            return null;
-        }
-        [$year, $month, $day, $hour, $minute, $second] = [(int) substr($digits, 0, 4), (int) substr($digits, 4, 2), (int) substr($digits, 6, 2),
-            (int) substr($digits, 8, 2), (int) substr($digits, 10, 2), (int) substr($digits, 12, 2)];
-        if ($year < 1970 || $month < 1 || $month > 12 || $day < 1 || $day > 31 || $hour > 23 || $minute > 59 || $second > 59) {
-            return null;
-        }
-        $y = $year - ($month <= 2 ? 1 : 0);
-        $era = intdiv($y, 400);
-        $yearOfEra = $y - $era * 400;
-        $dayOfEra = $yearOfEra * 365 + intdiv($yearOfEra, 4) - intdiv($yearOfEra, 100) + intdiv(153 * (($month + 9) % 12) + 2, 5) + $day - 1;
-
-        return ($era * 146_097 + $dayOfEra - 719_468) * 86_400 + $hour * 3_600 + $minute * 60 + $second;
-    }
-
-    /**
-     * Appends an array row to a Wave 40.1 frame: marker 1, then per value its string length (bytes to the blob),
-     * -2 and the int, -3 and a float's 8 bytes, or -1.
-     *
-     * @param  list<int>  $words
-     * @param  list<string>  $blob
-     * @param  list<mixed>  $values
-     */
-    public static function w401PackRow(array &$words, array &$blob, array $values): void
-    {
-        $words[] = 1;
-        foreach ($values as $value) {
-            if (is_string($value)) {
-                $words[] = strlen($value);
-                $blob[] = $value;
-            } elseif (is_int($value)) {
-                $words[] = -2;
-                $words[] = $value;
-            } elseif (is_float($value)) {
-                $words[] = -3;
-                $blob[] = pack('d', $value);
-            } else {
-                $words[] = -1;
-            }
-        }
-    }
-
-    /**
-     * Calls the Wave 40.1 export with a frame, retrying once with a larger scratch buffer when it reports
-     * `-required`; `$ffi` is the caller's cached library handle. Returns the decoded ints or null to fall back.
-     *
-     * @param  list<int>  $words
-     * @param  list<string>  $blob
-     * @return list<int>|null
-     */
-    public static function w401Invoke(FFI|false|null &$ffi, int $operation, array $words, array $blob): ?array
-    {
-        $input = pack('q', count($words)).pack('q*', ...$words).implode('', $blob);
-        if (strlen($input) > self::W401_RUST_MAX_INPUT) {
-            return null;
-        }
-        try {
-            $ffi ??= RustPipelineLibrary::resolveDomain('cleaning_w401', self::W401_FFI_CDEF) ?? false;
-            if ($ffi === false) {
-                return null;
-            }
-            $capacity = 0;
-            $buffer = RustPipelineLibrary::obtainScratch($ffi, 1024, $capacity);
-            if ($buffer === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w401_collection_cleaning_remover_blacklist($operation, 0, $input, strlen($input), $buffer, $capacity);
-            if (is_int($written) && $written < -1) {
-                if (-$written <= $capacity || -$written > self::W401_RUST_MAX_INPUT) {
-                    return null;
-                }
-                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($buffer === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_w401_collection_cleaning_remover_blacklist($operation, 0, $input, strlen($input), $buffer, $capacity);
-            }
-            if (! is_int($written) || $written <= 0 || $written > $capacity || $written % 8 !== 0) {
-                return null;
-            }
-            $values = unpack('q*', FFI::string($buffer, $written));
-
-            return $values === false ? null : array_values($values);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Enabled: the paired benchmark in the W54 parity test measures 3.17x common mean, 2.09x common
-     * p99, 2.50x uncommon mean and 2.59x uncommon p99 (per-metric minimum of three runs), above the
-     * 1.5x rule.
-     */
-    private const bool W54_RUST_FFI_DEFAULT = true;
-
-    private const string W54_FFI_CDEF = 'ssize_t nntmux_w541_deletion_id_plan_batch(const char *ids, size_t ids_len, size_t count, int64_t chunk_size, int64_t *out, size_t out_cap);';
-
-    public static function usesW54RustFfi(): bool
-    {
-        $enabled = self::w54RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W54_RUST_FFI_DEFAULT;
-    }
-
-    /** Runs $callback with the Wave 54 batch routed to Rust or PHP, then restores the routing. */
-    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w54RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w54RustFfiState('set', $previous);
-        }
-    }
-
-    /** {@see planDeletionIds()} keys, in the order the Rust export writes them. */
-    private const array W54_ID_PLAN_KEYS = ['ids', 'invalid', 'distinct', 'duplicates', 'runs', 'chunks', 'min_id', 'max_id'];
-
-    /**
-     * Plans a collection deletion id batch: ids at or below 0 are invalid, repeated valid ids are
-     * duplicates, runs counts the maximal consecutive ranges of the sorted distinct ids, chunks is
-     * the number of `max(1, $chunkSize)` id chunks deleteCollectionsAndDescendants() would issue,
-     * and min/max are 0 without a valid id.
-     *
-     * @param  array<array-key, int>  $ids
-     * @return array{ids: int, invalid: int, distinct: int, duplicates: int, runs: int, chunks: int, min_id: int, max_id: int}
-     */
-    public static function planDeletionIds(array $ids, int $chunkSize = 500): array
-    {
-        return self::usesW54RustFfi() ? self::planDeletionIdsNative($ids, $chunkSize) : self::planDeletionIdsPhp($ids, $chunkSize);
-    }
-
-    /**
-     * @param  array<array-key, int>  $ids
-     * @return array{ids: int, invalid: int, distinct: int, duplicates: int, runs: int, chunks: int, min_id: int, max_id: int}
-     */
-    public static function planDeletionIdsPhp(array $ids, int $chunkSize = 500): array
-    {
-        $invalid = 0;
-        $seen = [];
-        foreach ($ids as $id) {
-            if ($id > 0) {
-                $seen[$id] = true;
-            } else {
-                $invalid++;
-            }
-        }
-        $sorted = array_keys($seen);
-        sort($sorted);
-        $runs = 0;
-        $previous = null;
-        foreach ($sorted as $id) {
-            if ($previous === null || $id - 1 !== $previous) {
-                $runs++;
-            }
-            $previous = $id;
-        }
-        $distinct = \count($sorted);
-        $size = max(1, $chunkSize);
-
-        return [
-            'ids' => \count($ids),
-            'invalid' => $invalid,
-            'distinct' => $distinct,
-            'duplicates' => \count($ids) - $invalid - $distinct,
-            'runs' => $runs,
-            'chunks' => intdiv($distinct, $size) + (int) ($distinct % $size !== 0),
-            'min_id' => $sorted[0] ?? 0,
-            'max_id' => $distinct === 0 ? 0 : $sorted[$distinct - 1],
-        ];
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing or declines the batch.
-     *
-     * @param  array<array-key, int>  $ids
-     * @return array{ids: int, invalid: int, distinct: int, duplicates: int, runs: int, chunks: int, min_id: int, max_id: int}
-     */
-    public static function planDeletionIdsNative(array $ids, int $chunkSize = 500): array
-    {
-        $count = \count($ids);
-        $buffer = $count === 0 ? null : self::w54Buffer(8);
-        if ($buffer === null) {
-            return self::planDeletionIdsPhp($ids, $chunkSize);
-        }
-        [$ffi, $out, $cap] = $buffer;
-        try {
-            $packed = pack('P*', ...(array_is_list($ids) ? $ids : array_values($ids)));
-            // @phpstan-ignore method.notFound
-            $words = self::w54Decode($out, $ffi->nntmux_w541_deletion_id_plan_batch($packed, \strlen($packed), $count, $chunkSize, $out, $cap), 8);
-        } catch (Throwable) {
-            $words = null;
-        }
-        if ($words === null || \count($words) !== 8) {
-            return self::planDeletionIdsPhp($ids, $chunkSize);
-        }
-
-        /** @var array{ids: int, invalid: int, distinct: int, duplicates: int, runs: int, chunks: int, min_id: int, max_id: int} */
-        return array_combine(self::W54_ID_PLAN_KEYS, $words);
-    }
-
-    /**
-     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
-     *
-     * @return array{0: FFI, 1: FFI\CData, 2: int}|null
-     */
-    private static function w54Buffer(int $words): ?array
-    {
-        $buffer = self::w54RustFfiState('out', $words);
-
-        return \is_array($buffer) ? $buffer : null;
-    }
-
-    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
-    private static function w54Decode(FFI\CData $out, mixed $written, int $maxWords): ?array
-    {
-        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
-            return null;
-        }
-        if ($written === 0) {
-            return [];
-        }
-        $decoded = unpack('P*', FFI::string($out, $written * 8));
-
-        /** @var list<int>|null */
-        return \is_array($decoded) ? array_values($decoded) : null;
-    }
-
-    /**
-     * Wave 54 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
-     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
-     */
-    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'out':
-                $ffi ??= RustPipelineLibrary::resolveDomain('collection_cleanup_w54', self::W54_FFI_CDEF) ?? false;
-                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
-                    return null;
-                }
-                if (! $out instanceof FFI\CData || $outCap < $val) {
-                    $outCap = max(512, $val * 2);
-                    $out = $ffi->new("int64_t[{$outCap}]");
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled;
-        }
     }
 }
