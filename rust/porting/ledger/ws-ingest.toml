@@ -1,0 +1,67 @@
+# Entry points owned by ws-ingest. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "command"
+id = "articles:get-range"
+source = "app/Console/Commands/GetArticleRange.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "backfill:group"
+source = "app/Console/Commands/BackfillGroup.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "binaries:part-repair"
+source = "app/Console/Commands/PartRepair.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "group:update-all"
+source = "app/Console/Commands/UpdatePerGroup.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "group:update-headers"
+source = "app/Console/Commands/UpdateGroupHeaders.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "groups:update"
+source = "app/Console/Commands/GroupsUpdate.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "multiprocessing:backfill"
+source = "app/Console/Commands/ProcessBackfill.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "multiprocessing:safe"
+source = "app/Console/Commands/ProcessSafe.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "multiprocessing:update-per-group"
+source = "app/Console/Commands/ProcessUpdatePerGroup.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:backfill-user-activity-stats"
+source = "app/Console/Commands/BackfillUserActivityStats.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "releases:reclassify-header-rejections"
+source = "app/Console/Commands/ReclassifyHeaderRejections.php"
+status = "todo"

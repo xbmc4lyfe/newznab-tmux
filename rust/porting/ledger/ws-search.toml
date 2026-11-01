@@ -1,0 +1,55 @@
+# Entry points owned by ws-search. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "command"
+id = "manticore:create-indexes"
+source = "app/Console/Commands/CreateManticoreIndexes.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "manticore:inspect"
+source = "app/Console/Commands/InspectManticore.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:check-index"
+source = "app/Console/Commands/NntmuxCheckIndex.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:create-media-indexes"
+source = "app/Console/Commands/CreateMediaIndexes.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:index-logs"
+source = "app/Console/Commands/IndexLogs.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:search-diag"
+source = "app/Console/Commands/NntmuxSearchDiag.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:search-reconcile"
+source = "app/Console/Commands/NntmuxSearchReconcile.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:search-repair"
+source = "app/Console/Commands/NntmuxSearchRepair.php"
+status = "todo"
+
+[[entry]]
+kind = "job"
+id = "ReindexReleaseJob"
+source = "app/Jobs/ReindexReleaseJob.php"
+status = "todo"

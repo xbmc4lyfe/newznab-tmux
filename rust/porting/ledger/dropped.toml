@@ -1,0 +1,862 @@
+# Entry points owned by dropped. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "route"
+id = "DELETE /forum/api/bulk/post"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\Bulk\\PostController@delete"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "DELETE /forum/api/bulk/thread"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\Bulk\\ThreadController@delete"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "DELETE /forum/api/category/{category}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\CategoryController@delete"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "DELETE /forum/api/post/{post}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\PostController@delete"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "DELETE /forum/api/thread/{thread}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@delete"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "DELETE /forum/bulk/post"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\PostController@delete"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "DELETE /forum/bulk/thread"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\ThreadController@delete"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "DELETE /forum/c/{category_id}-{category_slug}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\CategoryController@delete"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "DELETE /forum/t/{thread_id}-{thread_slug}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@delete"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "DELETE /forum/t/{thread_id}-{thread_slug}/p/{post_id}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@delete"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "DELETE /horizon/api/monitoring/{tag}"
+source = "Laravel\\Horizon\\Http\\Controllers\\MonitoringController@destroy"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /_ignition/health-check"
+source = "Spatie\\LaravelIgnition\\Http\\Controllers\\HealthCheckController"
+status = "dropped"
+note = "Laravel dev tooling"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\CategoryController@index"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/api/category"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\CategoryController@index"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/api/category/{category}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\CategoryController@fetch"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/api/category/{category}/thread"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@indexByCategory"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/api/post/recent"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\PostController@recent"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/api/post/unread"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\PostController@unread"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/api/post/{post}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\PostController@fetch"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/api/thread/recent"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@recent"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/api/thread/unread"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@unread"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/api/thread/{thread}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@fetch"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/api/thread/{thread}/posts"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\PostController@indexByThread"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/c/{category_id}-{category_slug}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\CategoryController@show"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/c/{category_id}-{category_slug}/t/create"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@create"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/manage"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\CategoryController@manage"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/pending-approval/posts"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@pendingApproval"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/pending-approval/threads"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@pendingApproval"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/recent"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@recent"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/t/{thread_id}-{thread_slug}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@show"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/t/{thread_id}-{thread_slug}/p/{post_id}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@show"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/t/{thread_id}-{thread_slug}/p/{post_id}/delete"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@confirmDelete"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/t/{thread_id}-{thread_slug}/p/{post_id}/edit"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@edit"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/t/{thread_id}-{thread_slug}/p/{post_id}/restore"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@confirmRestore"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/t/{thread_id}-{thread_slug}/reply"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@create"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /forum/unread"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@unread"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/batches"
+source = "Laravel\\Horizon\\Http\\Controllers\\BatchesController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/batches/{id}"
+source = "Laravel\\Horizon\\Http\\Controllers\\BatchesController@show"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/jobs/completed"
+source = "Laravel\\Horizon\\Http\\Controllers\\CompletedJobsController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/jobs/failed"
+source = "Laravel\\Horizon\\Http\\Controllers\\FailedJobsController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/jobs/failed/{id}"
+source = "Laravel\\Horizon\\Http\\Controllers\\FailedJobsController@show"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/jobs/pending"
+source = "Laravel\\Horizon\\Http\\Controllers\\PendingJobsController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/jobs/silenced"
+source = "Laravel\\Horizon\\Http\\Controllers\\SilencedJobsController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/jobs/{id}"
+source = "Laravel\\Horizon\\Http\\Controllers\\JobsController@show"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/masters"
+source = "Laravel\\Horizon\\Http\\Controllers\\MasterSupervisorController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/metrics/jobs"
+source = "Laravel\\Horizon\\Http\\Controllers\\JobMetricsController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/metrics/jobs/{id}"
+source = "Laravel\\Horizon\\Http\\Controllers\\JobMetricsController@show"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/metrics/queues"
+source = "Laravel\\Horizon\\Http\\Controllers\\QueueMetricsController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/metrics/queues/{id}"
+source = "Laravel\\Horizon\\Http\\Controllers\\QueueMetricsController@show"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/monitoring"
+source = "Laravel\\Horizon\\Http\\Controllers\\MonitoringController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/monitoring/{tag}"
+source = "Laravel\\Horizon\\Http\\Controllers\\MonitoringController@paginate"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/stats"
+source = "Laravel\\Horizon\\Http\\Controllers\\DashboardStatsController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/api/workload"
+source = "Laravel\\Horizon\\Http\\Controllers\\WorkloadController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /horizon/{view?}"
+source = "Laravel\\Horizon\\Http\\Controllers\\HomeController@index"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /livewire/livewire.js"
+source = "Livewire\\Mechanisms\\FrontendAssets\\FrontendAssets@returnJavaScriptAsFile"
+status = "dropped"
+note = "Livewire goes away; pages use htmx"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /livewire/livewire.min.js.map"
+source = "Livewire\\Mechanisms\\FrontendAssets\\FrontendAssets@maps"
+status = "dropped"
+note = "Livewire goes away; pages use htmx"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /livewire/preview-file/{filename}"
+source = "Livewire\\Features\\SupportFileUploads\\FilePreviewController@handle"
+status = "dropped"
+note = "Livewire goes away; pages use htmx"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /pulse"
+source = "Closure"
+status = "dropped"
+note = "Laravel Pulse goes away; Grafana covers it"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /storage/{path}"
+source = "Closure"
+status = "dropped"
+note = "Laravel local storage route, not used in production"
+
+[[entry]]
+kind = "route"
+id = "GET|POST|HEAD /broadcasting/auth"
+source = "Illuminate\\Broadcasting\\BroadcastController@authenticate"
+status = "dropped"
+note = "Laravel Echo auth, unused by the htmx pages"
+
+[[entry]]
+kind = "route"
+id = "PATCH /forum/api/category/{category}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\CategoryController@update"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "PATCH /forum/api/post/{post}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\PostController@update"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "PATCH /forum/api/thread/unread/mark-as-read"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@markAsRead"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "PATCH /forum/c/{category_id}-{category_slug}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\CategoryController@update"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "PATCH /forum/t/{thread_id}-{thread_slug}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@update"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "PATCH /forum/t/{thread_id}-{thread_slug}/p/{post_id}"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@update"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "PATCH /forum/unread/mark-as-read"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@markAsRead"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /_boost/browser-logs"
+source = "Closure"
+status = "dropped"
+note = "Laravel dev tooling"
+
+[[entry]]
+kind = "route"
+id = "POST /_ignition/execute-solution"
+source = "Spatie\\LaravelIgnition\\Http\\Controllers\\ExecuteSolutionController"
+status = "dropped"
+note = "Laravel dev tooling"
+
+[[entry]]
+kind = "route"
+id = "POST /_ignition/update-config"
+source = "Spatie\\LaravelIgnition\\Http\\Controllers\\UpdateConfigController"
+status = "dropped"
+note = "Laravel dev tooling"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/bulk/category/reorder"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\Bulk\\CategoryController@reorder"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/bulk/post/restore"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\Bulk\\PostController@restore"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/bulk/thread/lock"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\Bulk\\ThreadController@lock"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/bulk/thread/move"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\Bulk\\ThreadController@move"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/bulk/thread/pin"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\Bulk\\ThreadController@pin"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/bulk/thread/restore"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\Bulk\\ThreadController@restore"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/bulk/thread/unlock"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\Bulk\\ThreadController@unlock"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/bulk/thread/unpin"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\Bulk\\ThreadController@unpin"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/category"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\CategoryController@store"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/category/{category}/thread"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@store"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/post/search"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\PostController@search"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/post/{post}/restore"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\PostController@restore"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/thread/{thread}/lock"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@lock"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/thread/{thread}/move"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@move"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/thread/{thread}/pin"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@pin"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/thread/{thread}/posts"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\PostController@store"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/thread/{thread}/rename"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@rename"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/thread/{thread}/restore"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@restore"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/thread/{thread}/unlock"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@unlock"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/api/thread/{thread}/unpin"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Api\\ThreadController@unpin"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/category/reorder"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\CategoryController@reorder"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/post/approve"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\PostController@approve"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/post/restore"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\PostController@restore"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/post/unapprove"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\PostController@unapprove"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/thread/approve"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\ThreadController@approve"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/thread/lock"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\ThreadController@lock"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/thread/move"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\ThreadController@move"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/thread/pin"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\ThreadController@pin"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/thread/restore"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\ThreadController@restore"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/thread/unapprove"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\ThreadController@unapprove"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/thread/unlock"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\ThreadController@unlock"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/bulk/thread/unpin"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\Bulk\\ThreadController@unpin"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/c/create"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\CategoryController@store"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/c/{category_id}-{category_slug}/t/create"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@store"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/approve"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@approve"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/lock"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@lock"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/move"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@move"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/p/{post_id}/approve"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@approve"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/p/{post_id}/restore"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@restore"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/p/{post_id}/unapprove"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@unapprove"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/pin"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@pin"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/rename"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@rename"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/reply"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\PostController@store"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/restore"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@restore"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/unapprove"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@unapprove"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/unlock"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@unlock"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /forum/t/{thread_id}-{thread_slug}/unpin"
+source = "TeamTeaTime\\Forum\\Http\\Controllers\\Blade\\ThreadController@unpin"
+status = "dropped"
+note = "the forum is dropped"
+
+[[entry]]
+kind = "route"
+id = "POST /horizon/api/batches/retry/{id}"
+source = "Laravel\\Horizon\\Http\\Controllers\\BatchesController@retry"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "POST /horizon/api/jobs/retry/{id}"
+source = "Laravel\\Horizon\\Http\\Controllers\\RetryController@store"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "POST /horizon/api/monitoring"
+source = "Laravel\\Horizon\\Http\\Controllers\\MonitoringController@store"
+status = "dropped"
+note = "Horizon goes away; the Rust workers don't use it"
+
+[[entry]]
+kind = "route"
+id = "POST /livewire/update"
+source = "Livewire\\Mechanisms\\HandleRequests\\HandleRequests@handleUpdate"
+status = "dropped"
+note = "Livewire goes away; pages use htmx"
+
+[[entry]]
+kind = "route"
+id = "POST /livewire/upload-file"
+source = "Livewire\\Features\\SupportFileUploads\\FileUploadController@handle"
+status = "dropped"
+note = "Livewire goes away; pages use htmx"
+
+[[entry]]
+kind = "route"
+id = "PUT /storage/{path}"
+source = "Closure"
+status = "dropped"
+note = "Laravel local storage route, not used in production"

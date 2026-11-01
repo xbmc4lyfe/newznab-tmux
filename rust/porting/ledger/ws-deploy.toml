@@ -1,0 +1,37 @@
+# Entry points owned by ws-deploy. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "command"
+id = "monitoring:install"
+source = "app/Console/Commands/InstallMonitoring.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:deploy-init"
+source = "app/Console/Commands/DeployInitialize.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:install"
+source = "app/Console/Commands/InstallNntmux.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "update:backfill"
+source = "app/Console/Commands/UpdateBackfill.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "update:binaries"
+source = "app/Console/Commands/UpdateBinaries.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "update:postprocess"
+source = "app/Console/Commands/UpdatePostProcess.php"
+status = "todo"

@@ -1,0 +1,433 @@
+# Entry points owned by ws-ops. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "command"
+id = "metrics:collect"
+source = "app/Console/Commands/CollectSystemMetrics.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "monitoring:export-metrics"
+source = "app/Console/Commands/ExportMonitoringMetrics.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "multiprocessing:binaries"
+source = "app/Console/Commands/ProcessBinaries.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:all"
+source = "app/Console/Commands/UpdateNNTmux.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:check-service-health"
+source = "app/Console/Commands/CheckServiceHealth.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:check-service-uptime"
+source = "app/Console/Commands/CheckServiceUptime.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:collect-stats"
+source = "app/Console/Commands/CollectStats.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:composer"
+source = "app/Console/Commands/UpdateNNTmuxComposer.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:db"
+source = "app/Console/Commands/UpdateNNTmuxDB.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:disable-expired-promotions"
+source = "app/Console/Commands/DisableExpiredPromotions.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:disable-expired-registration-periods"
+source = "app/Console/Commands/DisableExpiredRegistrationPeriods.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:fetch-movie"
+source = "app/Console/Commands/FetchMovieByImdb.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:find-size-mismatches"
+source = "app/Console/Commands/FindSizeMismatchedReleases.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:git"
+source = "app/Console/Commands/UpdateNNTmuxGit.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:offset-populate"
+source = "app/Console/Commands/NntmuxOffsetPopulate.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:offset-worker"
+source = "app/Console/Commands/NntmuxOffsetWorker.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:optimize-tables"
+source = "app/Console/Commands/NntmuxOptimizeTables.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:populate"
+source = "app/Console/Commands/NntmuxPopulateSearchIndexes.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:populate-steam-apps"
+source = "app/Console/Commands/NntmuxPopulateSteamApps.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:remove-bad"
+source = "app/Console/Commands/NntmuxRemoveBadReleases.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:reset-truncate"
+source = "app/Console/Commands/NntmuxResetTruncate.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:reset-tv-show"
+source = "app/Console/Commands/NntmuxResetTvShowPostProcessing.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:resetdb"
+source = "app/Console/Commands/NntmuxResetDb.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:resetpp"
+source = "app/Console/Commands/NntmuxResetPostProcessing.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:update-expired-roles"
+source = "app/Console/Commands/NntmuxUpdateExpiredRoles.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:yenc-doctor"
+source = "app/Console/Commands/YencDoctorCommand.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "redis:monitor"
+source = "app/Console/Commands/RedisMonitor.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "tmux:attach"
+source = "app/Console/Commands/TmuxAttach.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "tmux:drain"
+source = "app/Console/Commands/TmuxDrain.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "tmux:health-check"
+source = "app/Console/Commands/TmuxHealthCheck.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "tmux:monitor"
+source = "app/Console/Commands/TmuxMonitor.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "tmux:start"
+source = "app/Console/Commands/TmuxStart.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
+id = "tmux:stop"
+source = "app/Console/Commands/TmuxStop.php"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /internal/release-verification/publish"
+source = "App\\Http\\Controllers\\ReleaseVerificationPublicationController"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /internal/release-verification/publish-batch"
+source = "App\\Http\\Controllers\\ReleaseVerificationPublicationBatchController"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "call: function () {"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "call: function () {"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "call: function () {"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: \"releases:fix-names 7 --update --category={$par2Category} --set-status --limit={$par2Limit"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: \"releases:fix-names 8 --update --category={$par2Category} --set-status --limit={$par2Limit"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'admin:warm-dashboard')->everyFifteenMinutes()->withoutOverlapping();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'cache:prune-stale-tags')->hourly();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'clean:directories')->hourly()->withoutOverlapping();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'cloudflare:reload')->daily()->withoutOverlapping();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'disposable:update')->weekly();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'gdpr:purge-expired-exports')->dailyAt('03:30')->withoutOverlapping();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'horizon:snapshot')->everyFiveMinutes()->withoutOverlapping(5)->when(static fn (): bool =>"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'metrics:collect --cleanup')->dailyAt('03:00');"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'metrics:collect')->everyFiveMinutes()->withoutOverlapping();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'monitoring:export-metrics --scheduled')->everyMinute()->withoutOverlapping(5)->when(stati"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBac"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'nntmux:check-service-health')->everyMinute()->withoutOverlapping();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'nntmux:collect-stats')->everyFifteenMinutes()->withoutOverlapping();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'nntmux:delete-unverified-users')->twiceDaily(1, 13);"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'nntmux:disable-expired-promotions')->daily();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'nntmux:disable-expired-registration-periods')->everyFiveMinutes()->withoutOverlapping();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'nntmux:index-logs')->everyMinute()->withoutOverlapping()->runInBackground()->when(static "
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'nntmux:populate-steam-apps')->monthly();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'nntmux:remove-bad')->hourly()->withoutOverlapping();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'nntmux:search-repair --limit=100')->everyMinute()->withoutOverlapping();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'nntmux:update-expired-roles')->daily();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'predb:check 3 --quiet')->everyTenMinutes()->withoutOverlapping()->runInBackground();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'predb:import-feed --quiet')->everyFiveMinutes()->withoutOverlapping()->runInBackground()-"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'releases:fingerprint-backfill --stale --limit=200')->everyFifteenMinutes()->withoutOverla"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'tmux:health-check --auto-restart')->everyThirtyMinutes()->withoutOverlapping()->when(stat"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'tv:repair-links --legacy --stuck --orphans --limit=50000')->dailyAt('05:15')->withoutOver"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "command: 'tv:reprocess-missing-episodes --scheduled --limit=500')->everyThirtyMinutes()->withoutOve"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "exec: $forwarderCommand)->everyMinute()->runInBackground()"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "exec: $preparationCommand)->everyMinute()->runInBackground()"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "exec: $verificationCommand)->everyMinute()->runInBackground()"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "job: new PurgeDeletedAccounts)->daily();"
+source = "routes/console.php"
+status = "todo"
+
+[[entry]]
+kind = "schedule"
+id = "job: new RemoveInactiveAccounts)->daily();"
+source = "routes/console.php"
+status = "todo"

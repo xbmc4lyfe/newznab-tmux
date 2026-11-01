@@ -1,0 +1,71 @@
+name: Rust
+
+on:
+  pull_request:
+    branches: [master, rust-native]
+    paths:
+      - 'rust/**'
+      - '!rust/indexer/**'
+      - '.github/workflows/rust.yml'
+  push:
+    branches: [master, rust-native]
+    paths:
+      - 'rust/**'
+      - '!rust/indexer/**'
+      - '.github/workflows/rust.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      mariadb:
+        image: mariadb:11.4.8
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports: ['33306:3306']
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      redis:
+        image: redis:7.4.2-alpine
+        ports: ['36379:6379']
+      manticore:
+        image: manticoresearch/manticore:28.4.4
+        ports: ['39306:9306', '39308:9308']
+    env:
+      TEST_DATABASE_URL: mysql://root:root@127.0.0.1:33306
+      TEST_REDIS_URL: redis://127.0.0.1:36379/
+      TEST_MANTICORE_SQL: 127.0.0.1:39306
+      TEST_MANTICORE_HTTP: 127.0.0.1:39308
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust/Cargo.lock', 'rust/rust-toolchain.toml') }}
+          restore-keys: rust-${{ runner.os }}-${{ runner.arch }}-
+      - name: No FFI, and a valid ledger
+        run: python3 porting/check.py
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked

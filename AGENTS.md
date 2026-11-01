@@ -1,3 +1,7 @@
+# Rust-native rewrite (branch `rust-native`)
+
+The PHP is deleted on this branch and all work targets `rust-native`, not `master`. Follow [rust/WORKSTREAMS.md](rust/WORKSTREAMS.md). It overrides the Laravel-specific instructions below, which remain as reference for deployment rules and for reading the `php-final` tag. Production and deployment rules still apply in full.
+
 # Codex routing
 
 These model rules apply to Codex subagents only; Claude uses `CLAUDE.md`. Keep the human-selected main-session model unchanged. Delegate bounded independent work when useful; do small coupled work directly.
