@@ -65,7 +65,7 @@ return [
         'app/Services/Categorization' => 'Release categorization pipeline',
         'app/Services/NameFixing' => 'Release name analysis and correction',
         'app/Services/NNTP' => 'NNTP connections and article retrieval',
-        'app/Services/Search' => 'Manticore and Elasticsearch abstraction',
+        'app/Services/Search' => 'Manticore search abstraction',
         'app/Services/StatusProbes' => 'Read-only service health probes',
         'app/Services/Tmux' => 'Tmux processing orchestration and monitoring',
         'resources' => 'Blade, Alpine, Tailwind, and frontend assets',

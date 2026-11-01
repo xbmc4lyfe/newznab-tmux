@@ -60,12 +60,7 @@ class DeployInitialize extends Command
                 throw new RuntimeException('Administrator or configuration verification failed.');
             }
 
-            $searchCommand = config('search.default') === 'elasticsearch' ? 'nntmux:create-es-indexes' : 'manticore:create-indexes';
-            $searchOptions = ['--no-interaction' => true];
-            if (config('search.default') === 'elasticsearch') {
-                $searchOptions['--create-missing'] = true;
-            }
-            if ($this->call($searchCommand, $searchOptions) !== self::SUCCESS) {
+            if ($this->call('manticore:create-indexes', ['--no-interaction' => true]) !== self::SUCCESS) {
                 throw new RuntimeException('Search initialization failed; initialization remains incomplete.');
             }
 
@@ -94,7 +89,7 @@ class DeployInitialize extends Command
 
     private function validateConfiguration(): void
     {
-        if (! in_array(config('search.default'), ['manticore', 'elasticsearch'], true)) {
+        if (config('search.default') !== 'manticore') {
             throw new RuntimeException('Unsupported deployment search driver.');
         }
 

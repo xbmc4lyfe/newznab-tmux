@@ -10,7 +10,6 @@ use App\Services\Search\Contracts\PredbFilenameCandidateLookup;
 use App\Services\Search\Contracts\ReleaseCandidatePager;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\Contracts\SearchServiceInterface;
-use App\Services\Search\Drivers\ElasticSearchDriver;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
@@ -22,7 +21,7 @@ use Illuminate\Support\Manager;
  * Search Service Manager - handles driver resolution for search functionality.
  *
  * This service manager provides a unified interface for full-text search operations,
- * supporting multiple backends (ManticoreSearch, Elasticsearch) that can be configured
+ * supporting pluggable backends (currently ManticoreSearch) that can be configured
  * via the SEARCH_DRIVER environment variable.
  */
 class SearchService extends Manager implements SearchServiceInterface
@@ -80,16 +79,6 @@ class SearchService extends Manager implements SearchServiceInterface
         $config = $this->config->get('search.drivers.manticore', []);
 
         return new ManticoreSearchDriver($config);
-    }
-
-    /**
-     * Create the Elasticsearch driver instance.
-     */
-    protected function createElasticsearchDriver(): SearchDriverInterface
-    {
-        $config = $this->config->get('search.drivers.elasticsearch', []);
-
-        return new ElasticSearchDriver($config);
     }
 
     /**

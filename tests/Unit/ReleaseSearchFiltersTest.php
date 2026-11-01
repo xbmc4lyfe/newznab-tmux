@@ -7,13 +7,10 @@ namespace Tests\Unit;
 use App\Facades\Search;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
-use App\Services\Search\Drivers\ElasticSearchDriver;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
 use App\Services\Search\SearchService;
-use Elastic\Elasticsearch\ClientBuilder;
-use GuzzleHttp\Psr7\Response;
 use Illuminate\Cache\ArrayStore;
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
@@ -29,9 +26,6 @@ use Manticoresearch\Search as ManticoreQuery;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
-use Psr\Http\Client\ClientInterface;
-use Psr\Http\Message\RequestInterface;
-use Psr\Http\Message\ResponseInterface;
 use ReflectionClass;
 
 final class ReleaseSearchFiltersTest extends TestCase
@@ -100,67 +94,6 @@ final class ReleaseSearchFiltersTest extends TestCase
         }
     }
 
-    public static function posterFuzzyModes(): array
-    {
-        return [
-            'poster miss' => ['alice', false],
-            'forced poster' => ['alice', true],
-            'zero poster miss' => ['0', false],
-            'forced zero poster' => ['0', true],
-            'title miss still retries' => [null, false],
-            'forced title still fuzzy' => [null, true],
-        ];
-    }
-
-    #[Test]
-    #[DataProvider('posterFuzzyModes')]
-    public function elasticsearch_fuzzy_modes_never_relax_a_poster_constraint(?string $poster, bool $fuzzyOnly): void
-    {
-        $http = $this->createStub(ClientInterface::class);
-        $requests = [];
-        $http->method('sendRequest')->willReturnCallback(static function (RequestInterface $request) use (&$requests): ResponseInterface {
-            $body = json_decode((string) $request->getBody(), true, flags: JSON_THROW_ON_ERROR);
-            $requests[] = $body;
-            $fuzzy = str_contains(json_encode($body, JSON_THROW_ON_ERROR), 'fuzziness');
-
-            return new Response(200, ['Content-Type' => 'application/json', 'X-Elastic-Product' => 'Elasticsearch'], json_encode([
-                'hits' => ['total' => ['value' => $fuzzy ? 1 : 0], 'hits' => $fuzzy ? [['_id' => '99']] : []],
-            ], JSON_THROW_ON_ERROR));
-        });
-        $client = ClientBuilder::create()->setHosts(['http://127.0.0.1:9200'])->setHttpClient($http)->build();
-        $reflection = new ReflectionClass(ElasticSearchDriver::class);
-        $previous = [];
-        foreach (['client' => $client, 'availabilityCache' => true, 'availabilityCacheTime' => time()] as $name => $value) {
-            $property = $reflection->getProperty($name);
-            $previous[$name] = $property->getValue();
-            $property->setValue(null, $value);
-        }
-        try {
-            $phrases = ['searchname' => 'Example title'];
-            if ($poster !== null) {
-                $phrases['fromname'] = $poster;
-            }
-            $driver = new ElasticSearchDriver(['indexes' => ['releases' => 'releases'], 'fuzzy' => ['enabled' => true]]);
-            $result = $driver->searchReleasesFiltered(['phrases' => $phrases, 'groups_id' => 7, 'try_fuzzy' => true, 'fuzzy_only' => $fuzzyOnly], 25);
-            $this->assertSame($poster === null ? [99] : [], $result['ids']);
-            $this->assertSame($poster === null ? 1 : 0, $result['total']);
-            $this->assertSame($poster === null, $result['fuzzy']);
-            $this->assertCount($poster === null && ! $fuzzyOnly ? 2 : 1, $requests);
-            foreach ($requests as $body) {
-                $this->assertContains(['term' => ['groups_id' => 7]], $body['query']['bool']['filter']);
-                $this->assertSame('Example title', $body['query']['bool']['must'][0]['multi_match']['query']);
-                if ($poster !== null) {
-                    $this->assertContains(['match' => ['fromname' => ['query' => $poster, 'operator' => 'and']]], $body['query']['bool']['must']);
-                    $this->assertStringNotContainsString('fuzziness', json_encode($body, JSON_THROW_ON_ERROR));
-                }
-            }
-        } finally {
-            foreach ($previous as $name => $value) {
-                $reflection->getProperty($name)->setValue(null, $value);
-            }
-        }
-    }
-
     #[Test]
     public function ranges_keep_zero_bounds_and_drop_untrusted_fields_and_values(): void
     {
@@ -191,16 +124,9 @@ final class ReleaseSearchFiltersTest extends TestCase
     }
 
     #[Test]
-    public function both_index_drivers_apply_inclusive_ranges_and_keyset_bounds(): void
+    public function manticore_applies_inclusive_ranges_and_keyset_bounds(): void
     {
         $criteria = ['ranges' => ['size' => ['min' => 12, 'max' => 100], 'comments' => ['max' => 0], 'adddate_ts' => ['min' => 1700000000]], 'min_id' => 5, 'max_id' => 2501];
-        $reflection = new ReflectionClass(ElasticSearchDriver::class);
-        $filters = $reflection->getMethod('buildElasticsearchReleaseFilters')->invoke($reflection->newInstanceWithoutConstructor(), $criteria);
-        $this->assertContains(['range' => ['size' => ['gte' => 12, 'lte' => 100]]], $filters);
-        $this->assertContains(['range' => ['comments' => ['lte' => 0]]], $filters);
-        $this->assertContains(['range' => ['adddate_ts' => ['gte' => 1700000000]]], $filters);
-        $this->assertContains(['range' => ['id' => ['gte' => 5, 'lte' => 2501]]], $filters);
-
         $query = new ManticoreQuery(new Client);
         $reflection = new ReflectionClass(ManticoreSearchDriver::class);
         $reflection->getMethod('applyManticoreReleaseIndexFilters')->invoke($reflection->newInstanceWithoutConstructor(), $query, $criteria);
@@ -212,37 +138,6 @@ final class ReleaseSearchFiltersTest extends TestCase
         $this->assertContains(['range' => ['id' => ['lte' => 2501]]], $filters);
     }
 
-    #[Test]
-    public function elasticsearch_orders_keyset_windows_by_actual_numeric_id(): void
-    {
-        $http = $this->createStub(ClientInterface::class);
-        $requests = [];
-        $http->method('sendRequest')->willReturnCallback(static function (RequestInterface $request) use (&$requests): ResponseInterface {
-            $requests[] = json_decode((string) $request->getBody(), true);
-
-            return new Response(200, ['Content-Type' => 'application/json', 'X-Elastic-Product' => 'Elasticsearch'], json_encode(['hits' => ['total' => ['value' => 1], 'hits' => [['_id' => '2501', 'sort' => [2501, 2501]]]]], JSON_THROW_ON_ERROR));
-        });
-        $client = ClientBuilder::create()->setHosts(['http://127.0.0.1:9200'])->setHttpClient($http)->build();
-        $reflection = new ReflectionClass(ElasticSearchDriver::class);
-        $previous = [];
-        foreach (['client' => $client, 'availabilityCache' => true, 'availabilityCacheTime' => time()] as $name => $value) {
-            $property = $reflection->getProperty($name);
-            $previous[$name] = $property->getValue();
-            $property->setValue(null, $value);
-        }
-        try {
-            $driver = new ElasticSearchDriver(['indexes' => ['releases' => 'releases']]);
-            $result = $driver->searchReleasesFiltered(['sort_field' => 'id', 'sort_dir' => 'desc', 'max_id' => 2501], 1);
-            $this->assertSame([2501], $result['ids']);
-            $this->assertSame(['id' => ['order' => 'desc']], $requests[0]['sort'][0]);
-            $this->assertSame(1, $requests[0]['size']);
-            $this->assertSame(0, $requests[0]['from']);
-        } finally {
-            foreach ($previous as $name => $value) {
-                $reflection->getProperty($name)->setValue(null, $value);
-            }
-        }
-    }
 
     #[Test]
     public function manticore_orders_comments_with_id_ties_and_keeps_fuzzy_windows_fuzzy(): void

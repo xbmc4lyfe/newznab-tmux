@@ -5,12 +5,9 @@ declare(strict_types=1);
 namespace Tests\Unit;
 
 use App\Services\Search\Contracts\SearchDriverInterface;
-use App\Services\Search\Drivers\ElasticSearchDriver;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use App\Services\Search\SearchService;
 use App\Services\Search\Support\SearchFailureTracker;
-use Elastic\Elasticsearch\ClientBuilder;
-use GuzzleHttp\Psr7\Response as HttpResponse;
 use Illuminate\Cache\ArrayStore;
 use Illuminate\Cache\Repository as CacheRepository;
 use Illuminate\Config\Repository;
@@ -22,8 +19,6 @@ use Manticoresearch\Client;
 use Manticoresearch\Response;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
-use Psr\Http\Client\ClientInterface;
-use Psr\Http\Message\RequestInterface;
 use Psr\Log\NullLogger;
 use ReflectionProperty;
 use RuntimeException;
@@ -51,7 +46,6 @@ final class ReleaseCandidatePagingTest extends TestCase
 
     protected function tearDown(): void
     {
-        (new ElasticSearchDriver(['indexes' => ['releases' => 'custom_releases']]))->resetConnection();
         (new ReflectionProperty(ManticoreSearchDriver::class, 'availabilityCache'))->setValue(null, null);
         (new ReflectionProperty(ManticoreSearchDriver::class, 'availabilityCacheTime'))->setValue(null, null);
         Facade::clearResolvedInstances();
@@ -63,7 +57,7 @@ final class ReleaseCandidatePagingTest extends TestCase
     /** @return array<string,array{string}> */
     public static function backends(): array
     {
-        return ['manticore' => ['manticore'], 'elasticsearch' => ['elasticsearch']];
+        return ['manticore' => ['manticore']];
     }
 
     #[DataProvider('backends')]
@@ -79,17 +73,10 @@ final class ReleaseCandidatePagingTest extends TestCase
         $this->assertSame(['ids' => [22], 'available' => true, 'has_more' => false], $second);
         $this->assertCount(2, $queries);
         foreach ($queries as $index => $query) {
-            if ($backend === 'manticore') {
-                $this->assertSame('custom_releases', $query['table']);
-                $this->assertSame(22, $query['limit']);
-                $this->assertSame([['id' => 'asc']], $query['sort']);
-                $this->assertSame(['range' => ['id' => ['gt' => $index === 0 ? 0 : 21]]], $query['query']['bool']['must'][1]);
-            } else {
-                $this->assertSame(22, $query['size']);
-                $this->assertSame([['id' => ['order' => 'asc']]], $query['sort']);
-                $this->assertSame([['range' => ['id' => ['gt' => $index === 0 ? 0 : 21]]]], $query['query']['bool']['filter']);
-                $this->assertFalse($query['_source']);
-            }
+            $this->assertSame('custom_releases', $query['table']);
+            $this->assertSame(22, $query['limit']);
+            $this->assertSame([['id' => 'asc']], $query['sort']);
+            $this->assertSame(['range' => ['id' => ['gt' => $index === 0 ? 0 : 21]]], $query['query']['bool']['must'][1]);
             $this->assertArrayNotHasKey('offset', $query);
             $this->assertArrayNotHasKey('from', $query);
         }
@@ -103,17 +90,9 @@ final class ReleaseCandidatePagingTest extends TestCase
 
         $this->assertSame([7], $driver->searchReleaseCandidatesPage("Movie_(It's_2026)!|@name-WEB-GRP", 21)['ids']);
 
-        if ($backend === 'manticore') {
-            $query = $queries[0]['query']['bool']['must'][0]['query_string'];
-            $this->assertSame('@@relaxed (@name (Movie It s 2026 name WEB GRP) | @searchname (Movie It s 2026 name WEB GRP))', $query);
-            $this->assertArrayNotHasKey('fuzzy', $queries[0]['options']);
-        } else {
-            $boolean = $queries[0]['query']['bool'];
-            $this->assertSame(1, $boolean['minimum_should_match']);
-            $this->assertSame(['match' => ['name' => ['query' => "Movie_(It's_2026)!|@name-WEB-GRP", 'operator' => 'and']]], $boolean['should'][0]);
-            $this->assertSame(['multi_match' => ['query' => "Movie_(It's_2026)!|@name-WEB-GRP", 'fields' => ['searchname^3', 'plainsearchname^2'], 'type' => 'cross_fields', 'operator' => 'and']], $boolean['should'][1]);
-            $this->assertArrayNotHasKey('must', $boolean);
-        }
+        $query = $queries[0]['query']['bool']['must'][0]['query_string'];
+        $this->assertSame('@@relaxed (@name (Movie It s 2026 name WEB GRP) | @searchname (Movie It s 2026 name WEB GRP))', $query);
+        $this->assertArrayNotHasKey('fuzzy', $queries[0]['options']);
     }
 
     #[DataProvider('backends')]
@@ -142,18 +121,11 @@ final class ReleaseCandidatePagingTest extends TestCase
 
         $ids = $driver->searchReleases(['name' => 'Movie.Release-GRP', 'searchname' => 'Movie.Release-GRP'], 21);
 
-        if ($backend === 'manticore') {
-            $this->assertSame(['7'], $ids);
-            $this->assertSame(21, $queries[0]['limit']);
-            $expression = $queries[0]['query']['bool']['must'][0]['query_string'];
-            $this->assertStringContainsString('@(name,searchname)', $expression);
-            $this->assertStringContainsString('|', $expression);
-        } else {
-            $this->assertSame([999], $ids);
-            $this->assertSame(21, $queries[0]['size']);
-            $this->assertSame('Movie Release\\-GRP Movie Release\\-GRP', $queries[0]['query']['query_string']['query']);
-            $this->assertSame(['id'], $queries[0]['_source']);
-        }
+        $this->assertSame(['7'], $ids);
+        $this->assertSame(21, $queries[0]['limit']);
+        $expression = $queries[0]['query']['bool']['must'][0]['query_string'];
+        $this->assertStringContainsString('@(name,searchname)', $expression);
+        $this->assertStringContainsString('|', $expression);
     }
 
     #[DataProvider('backends')]
@@ -192,7 +164,7 @@ final class ReleaseCandidatePagingTest extends TestCase
     /** @return iterable<string,array{string,int,int}> */
     public static function invalidDimensions(): iterable
     {
-        foreach (['manticore', 'elasticsearch'] as $backend) {
+        foreach (['manticore'] as $backend) {
             yield $backend.' zero limit' => [$backend, 0, 0];
             yield $backend.' excessive limit' => [$backend, 1001, 0];
             yield $backend.' negative cursor' => [$backend, 21, -1];
@@ -217,18 +189,12 @@ final class ReleaseCandidatePagingTest extends TestCase
 
         $failures = [
             'manticore transport' => ['manticore', new RuntimeException('synthetic backend failed')],
-            'elasticsearch transport' => ['elasticsearch', new RuntimeException('synthetic backend failed')],
             'manticore timed out' => ['manticore', $timedOut],
-            'elasticsearch timed out' => ['elasticsearch', $timedOut],
-            'elasticsearch shard failed' => ['elasticsearch', ['hits' => ['hits' => [], 'total' => 0], '_shards' => ['failed' => 1]]],
             'manticore malformed response' => ['manticore', []],
-            'elasticsearch malformed response' => ['elasticsearch', []],
             'manticore duplicate IDs' => ['manticore', ['hits' => ['hits' => [['_id' => 7], ['_id' => 7]], 'total' => 2]]],
-            'elasticsearch reversed IDs' => ['elasticsearch', ['hits' => ['hits' => [['_id' => 8], ['_id' => 7]], 'total' => 2]]],
             'manticore invalid ID' => ['manticore', ['hits' => ['hits' => [['_id' => 'not-an-id']], 'total' => 1]]],
-            'elasticsearch missing ID' => ['elasticsearch', ['hits' => ['hits' => [[]], 'total' => 1]]],
         ];
-        foreach (['manticore', 'elasticsearch'] as $backend) {
+        foreach (['manticore'] as $backend) {
             foreach ([
                 'boolean' => true,
                 'float' => 7.0,
@@ -283,44 +249,25 @@ final class ReleaseCandidatePagingTest extends TestCase
      * @param  list<array<string,mixed>|RuntimeException>  $responses
      * @param  list<array<string,mixed>>  $queries
      */
-    private function driver(string $backend, array $responses, array &$queries): ManticoreSearchDriver|ElasticSearchDriver
+    private function driver(string $backend, array $responses, array &$queries): ManticoreSearchDriver
     {
-        if ($backend === 'manticore') {
-            $client = $this->createMock(Client::class);
-            $client->expects($this->exactly(count($responses)))->method('search')->willReturnCallback(function (array $request) use (&$responses, &$queries): Response {
-                $queries[] = $request['body'];
-                $body = array_shift($responses);
-                if ($body instanceof RuntimeException) {
-                    throw $body;
-                }
-                $response = $this->createStub(Response::class);
-                $response->method('getResponse')->willReturn($body);
-
-                return $response;
-            });
-            $driver = new ManticoreSearchDriver(['indexes' => ['releases' => 'custom_releases']]);
-            $driver->manticoreSearch = $client;
-            (new ReflectionProperty(ManticoreSearchDriver::class, 'availabilityCache'))->setValue(null, true);
-            (new ReflectionProperty(ManticoreSearchDriver::class, 'availabilityCacheTime'))->setValue(null, time());
-
-            return $driver;
-        }
-        $http = $this->createMock(ClientInterface::class);
-        $http->expects($this->exactly(count($responses)))->method('sendRequest')->willReturnCallback(function (RequestInterface $request) use (&$responses, &$queries): HttpResponse {
-            $this->assertSame('/custom_releases/_search', $request->getUri()->getPath());
-            $queries[] = json_decode((string) $request->getBody(), true, flags: JSON_THROW_ON_ERROR);
+        $client = $this->createMock(Client::class);
+        $client->expects($this->exactly(count($responses)))->method('search')->willReturnCallback(function (array $request) use (&$responses, &$queries): Response {
+            $queries[] = $request['body'];
             $body = array_shift($responses);
             if ($body instanceof RuntimeException) {
                 throw $body;
             }
+            $response = $this->createStub(Response::class);
+            $response->method('getResponse')->willReturn($body);
 
-            return new HttpResponse(200, ['X-Elastic-Product' => 'Elasticsearch', 'Content-Type' => 'application/json'], json_encode($body, JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION));
+            return $response;
         });
-        $client = ClientBuilder::create()->setHosts(['http://localhost:9200'])->setHttpClient($http)->build();
-        (new ReflectionProperty(ElasticSearchDriver::class, 'client'))->setValue(null, $client);
-        (new ReflectionProperty(ElasticSearchDriver::class, 'availabilityCache'))->setValue(null, true);
-        (new ReflectionProperty(ElasticSearchDriver::class, 'availabilityCacheTime'))->setValue(null, time());
+        $driver = new ManticoreSearchDriver(['indexes' => ['releases' => 'custom_releases']]);
+        $driver->manticoreSearch = $client;
+        (new ReflectionProperty(ManticoreSearchDriver::class, 'availabilityCache'))->setValue(null, true);
+        (new ReflectionProperty(ManticoreSearchDriver::class, 'availabilityCacheTime'))->setValue(null, time());
 
-        return new ElasticSearchDriver(['indexes' => ['releases' => 'custom_releases']]);
+        return $driver;
     }
 }

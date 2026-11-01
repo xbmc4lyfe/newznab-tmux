@@ -13,20 +13,13 @@ use App\Services\NameFixing\Extractors\FileNameExtractor;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\Predb\PredbIdentityRebuild;
-use App\Services\Search\Drivers\ElasticSearchDriver;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use App\Services\Search\SearchService;
-use Elastic\Elasticsearch\Client as ElasticClient;
-use Elastic\Elasticsearch\ClientBuilder;
-use GuzzleHttp\Psr7\Response as HttpResponse;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Manticoresearch\Client;
 use Manticoresearch\Response;
 use PHPUnit\Framework\Attributes\DataProvider;
-use Psr\Http\Client\ClientInterface;
-use Psr\Http\Message\RequestInterface;
-use ReflectionProperty;
 use RuntimeException;
 use Tests\Support\Par2RenameTestDatabase;
 use Tests\TestCase;
@@ -35,25 +28,10 @@ final class PredbFilenameBackendCompletenessTest extends TestCase
 {
     use Par2RenameTestDatabase;
 
-    private ?ElasticClient $previousElasticClient = null;
-
-    private bool $replacedElasticClient = false;
-
-    protected function tearDown(): void
-    {
-        try {
-            if ($this->replacedElasticClient) {
-                (new ReflectionProperty(ElasticSearchDriver::class, 'client'))->setValue(null, $this->previousElasticClient);
-            }
-        } finally {
-            parent::tearDown();
-        }
-    }
-
     public static function scenarios(): array
     {
         $cases = [];
-        foreach (['manticore', 'elasticsearch'] as $backend) {
+        foreach (['manticore'] as $backend) {
             foreach (['prefile', 'list', 'files'] as $caller) {
                 foreach ([false, true] as $alias) {
                     foreach (['complete', 'full window', 'truncated', 'error', 'late competitor', 'new mapping', 'current row changed'] as $scenario) {
@@ -92,25 +70,13 @@ final class PredbFilenameBackendCompletenessTest extends TestCase
 
             return ['timed_out' => false, '_shards' => ['total' => 1, 'successful' => 1, 'failed' => 0], 'hits' => [
                 'hits' => $hits, 'total_relation' => 'eq',
-                'total' => $backend === 'manticore' ? $total : ['value' => $total, 'relation' => 'eq'],
+                'total' => $total,
             ]];
         };
-        if ($backend === 'manticore') {
-            $client = $this->createStub(Client::class);
-            $client->method('search')->willReturnCallback(static fn (): Response => new Response($response()));
-            $driver = new ManticoreSearchDriver(['indexes' => ['predb' => 'custom_pre']]);
-            $driver->manticoreSearch = $client;
-        } else {
-            $http = $this->createStub(ClientInterface::class);
-            $http->method('sendRequest')->willReturnCallback(static fn (RequestInterface $request): HttpResponse => new HttpResponse(200,
-                ['X-Elastic-Product' => 'Elasticsearch', 'Content-Type' => 'application/json'], json_encode($response(), JSON_THROW_ON_ERROR)));
-            $client = ClientBuilder::create()->setHosts(['http://localhost:9200'])->setHttpClient($http)->build();
-            $clientProperty = new ReflectionProperty(ElasticSearchDriver::class, 'client');
-            $this->previousElasticClient = $clientProperty->getValue();
-            $this->replacedElasticClient = true;
-            $clientProperty->setValue(null, $client);
-            $driver = new ElasticSearchDriver(['indexes' => ['predb' => 'custom_pre']]);
-        }
+        $client = $this->createStub(Client::class);
+        $client->method('search')->willReturnCallback(static fn (): Response => new Response($response()));
+        $driver = new ManticoreSearchDriver(['indexes' => ['predb' => 'custom_pre']]);
+        $driver->manticoreSearch = $client;
         $search = new class($this->app) extends SearchService
         {
             public function supportsReleaseCandidatePaging(): bool

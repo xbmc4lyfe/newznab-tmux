@@ -18,14 +18,14 @@ final class SearchCursorCodecTest extends TestCase
     public function it_round_trips_an_opaque_signed_cursor(): void
     {
         $codec = new SearchCursorCodec(new Encrypter(random_bytes(32), 'AES-256-CBC'));
-        $cursor = new SearchCursor([1710000000, 42], 250, 'query-hash', 'elasticsearch', '7', time() + 60);
+        $cursor = new SearchCursor([1710000000, 42], 250, 'query-hash', 'manticore', '7', time() + 60);
 
         $decoded = $codec->decode($codec->encode($cursor));
 
         $this->assertSame($cursor->sortValues, $decoded->sortValues);
         $this->assertSame(250, $decoded->total);
         $this->assertSame('query-hash', $decoded->queryHash);
-        $this->assertSame('elasticsearch', $decoded->driver);
+        $this->assertSame('manticore', $decoded->driver);
         $this->assertSame('7', $decoded->indexGeneration);
     }
 
@@ -52,7 +52,7 @@ final class SearchCursorCodecTest extends TestCase
     public function it_round_trips_with_an_encrypter_that_only_implements_the_contract(): void
     {
         $codec = new SearchCursorCodec($this->contractEncrypter(new Encrypter(str_repeat('k', 32), 'AES-256-CBC')));
-        $cursor = new SearchCursor([1710000000, 42], 250, 'query-hash', 'elasticsearch', '7', 4102444800);
+        $cursor = new SearchCursor([1710000000, 42], 250, 'query-hash', 'manticore', '7', 4102444800);
 
         $decoded = $codec->decode($codec->encode($cursor));
 
@@ -64,14 +64,14 @@ final class SearchCursorCodecTest extends TestCase
     {
         $encrypter = new Encrypter(str_repeat('k', 32), 'AES-256-CBC');
         $codec = new SearchCursorCodec($this->contractEncrypter($encrypter));
-        $token = $encrypter->encryptString('{"sort":[1710000000,42],"total":250,"query":"query-hash","driver":"elasticsearch","generation":"7","expires":4102444800}');
+        $token = $encrypter->encryptString('{"sort":[1710000000,42],"total":250,"query":"query-hash","driver":"manticore","generation":"7","expires":4102444800}');
 
         $decoded = $codec->decode($token);
 
         $this->assertSame([1710000000, 42], $decoded->sortValues);
         $this->assertSame(250, $decoded->total);
         $this->assertSame('query-hash', $decoded->queryHash);
-        $this->assertSame('elasticsearch', $decoded->driver);
+        $this->assertSame('manticore', $decoded->driver);
         $this->assertSame('7', $decoded->indexGeneration);
         $this->assertSame(4102444800, $decoded->expiresAt);
     }
@@ -81,11 +81,11 @@ final class SearchCursorCodecTest extends TestCase
     {
         $encrypter = new Encrypter(str_repeat('k', 32), 'AES-256-CBC');
         $codec = new SearchCursorCodec($this->contractEncrypter($encrypter));
-        $cursor = new SearchCursor([1710000000, 42], 250, 'query-hash', 'elasticsearch', '7', 4102444800);
+        $cursor = new SearchCursor([1710000000, 42], 250, 'query-hash', 'manticore', '7', 4102444800);
 
         $token = $codec->encode($cursor);
 
-        $this->assertSame('{"sort":[1710000000,42],"total":250,"query":"query-hash","driver":"elasticsearch","generation":"7","expires":4102444800}', $encrypter->decryptString($token));
+        $this->assertSame('{"sort":[1710000000,42],"total":250,"query":"query-hash","driver":"manticore","generation":"7","expires":4102444800}', $encrypter->decryptString($token));
     }
 
     private function contractEncrypter(Encrypter $encrypter): EncrypterContract

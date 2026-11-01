@@ -4,10 +4,7 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
-use App\Services\Search\Support\ElasticsearchClientFactory;
-use App\Services\Search\Support\ElasticsearchResponseHelper;
 use App\Services\Search\Support\ManticoreClientFactory;
-use Elastic\Elasticsearch\Client as ElasticsearchClient;
 use Illuminate\Console\Command;
 use Manticoresearch\Client as ManticoreClient;
 use Manticoresearch\Exceptions\ResponseException;
@@ -40,8 +37,6 @@ class CreateMediaIndexes extends Command
 
         if ($driver === 'manticore') {
             return $this->createManticoreIndexes();
-        } elseif ($driver === 'elasticsearch') {
-            return $this->createElasticsearchIndexes();
         } else {
             $this->error("Unsupported search driver: {$driver}");
 
@@ -207,131 +202,6 @@ class CreateMediaIndexes extends Command
             $this->error("Unexpected error creating index {$indexName}: ".$e->getMessage());
 
             return false;
-        }
-    }
-
-    /**
-     * Create Elasticsearch indexes for movies and tvshows.
-     */
-    private function createElasticsearchIndexes(): int
-    {
-        $this->info('Creating Elasticsearch media indexes...');
-
-        $dropExisting = $this->option('drop');
-
-        // Movies index mapping
-        $moviesMapping = [
-            'mappings' => [
-                'properties' => [
-                    'imdbid' => ['type' => 'keyword'],
-                    'tmdbid' => ['type' => 'integer'],
-                    'traktid' => ['type' => 'integer'],
-                    'title' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'year' => ['type' => 'keyword'],
-                    'genre' => ['type' => 'text'],
-                    'actors' => ['type' => 'text'],
-                    'director' => ['type' => 'text'],
-                    'rating' => ['type' => 'keyword'],
-                    'plot' => ['type' => 'text'],
-                ],
-            ],
-            'settings' => [
-                'number_of_shards' => 1,
-                'number_of_replicas' => 0,
-            ],
-        ];
-
-        // TV shows index mapping
-        $tvshowsMapping = [
-            'mappings' => [
-                'properties' => [
-                    'title' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'tvdb' => ['type' => 'integer'],
-                    'trakt' => ['type' => 'integer'],
-                    'tvmaze' => ['type' => 'integer'],
-                    'tvrage' => ['type' => 'integer'],
-                    'imdb' => ['type' => 'keyword'],
-                    'tmdb' => ['type' => 'integer'],
-                    'started' => ['type' => 'keyword'],
-                    'type' => ['type' => 'integer'],
-                ],
-            ],
-            'settings' => [
-                'number_of_shards' => 1,
-                'number_of_replicas' => 0,
-            ],
-        ];
-
-        try {
-            $esConfig = config('search.drivers.elasticsearch');
-            /** @var ElasticsearchClient $esClient */
-            $esClient = ElasticsearchClientFactory::make($esConfig ?? []);
-
-            // Create movies index
-            $moviesIndex = config('search.drivers.elasticsearch.indexes.movies', 'movies');
-            if ($dropExisting && (ElasticsearchResponseHelper::boolResponse($esClient, function (ElasticsearchClient $client) use ($moviesIndex) {
-                return $client->indices()->exists(['index' => $moviesIndex]);
-            }))) {
-                $this->warn("Dropping existing index: {$moviesIndex}");
-                $esClient->indices()->delete(['index' => $moviesIndex]);
-            }
-
-            if (! (ElasticsearchResponseHelper::boolResponse($esClient, function (ElasticsearchClient $client) use ($moviesIndex) {
-                return $client->indices()->exists(['index' => $moviesIndex]);
-            }))) {
-                $this->info("Creating index: {$moviesIndex}");
-                $esClient->indices()->create([
-                    'index' => $moviesIndex,
-                    'body' => $moviesMapping,
-                ]);
-                $this->info("Index {$moviesIndex} created successfully.");
-            } else {
-                $this->info("Index {$moviesIndex} already exists. Use --drop to recreate.");
-            }
-
-            // Create tvshows index
-            $tvshowsIndex = config('search.drivers.elasticsearch.indexes.tvshows', 'tvshows');
-            if ($dropExisting && (ElasticsearchResponseHelper::boolResponse($esClient, function (ElasticsearchClient $client) use ($tvshowsIndex) {
-                return $client->indices()->exists(['index' => $tvshowsIndex]);
-            }))) {
-                $this->warn("Dropping existing index: {$tvshowsIndex}");
-                $esClient->indices()->delete(['index' => $tvshowsIndex]);
-            }
-
-            if (! (ElasticsearchResponseHelper::boolResponse($esClient, function (ElasticsearchClient $client) use ($tvshowsIndex) {
-                return $client->indices()->exists(['index' => $tvshowsIndex]);
-            }))) {
-                $this->info("Creating index: {$tvshowsIndex}");
-                $esClient->indices()->create([
-                    'index' => $tvshowsIndex,
-                    'body' => $tvshowsMapping,
-                ]);
-                $this->info("Index {$tvshowsIndex} created successfully.");
-            } else {
-                $this->info("Index {$tvshowsIndex} already exists. Use --drop to recreate.");
-            }
-
-            $this->info('Elasticsearch media indexes created successfully!');
-
-            // Optionally populate the indexes
-            if ($this->option('populate')) {
-                $this->info('Populating indexes...');
-                $this->call('nntmux:populate', [
-                    '--elastic' => true,
-                    '--movies' => true,
-                ]);
-                $this->call('nntmux:populate', [
-                    '--elastic' => true,
-                    '--tvshows' => true,
-                ]);
-            }
-
-            return Command::SUCCESS;
-
-        } catch (\Throwable $e) {
-            $this->error('Failed to create Elasticsearch indexes: '.$e->getMessage());
-
-            return Command::FAILURE;
         }
     }
 }
