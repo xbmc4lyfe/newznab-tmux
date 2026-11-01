@@ -298,6 +298,35 @@ const COUNT_COLUMNS: [&str; 12] = [
 
 /// Computes the snapshot. Any failure fails the whole thing: publishing partial counts would read
 /// as real drops, while a skipped publish shows as the snapshot's age growing.
+fn fix_names_scope() -> (String, bool) {
+    let category_scope = nntmux_core::var_or("TMUX_FIX_NAMES_CATEGORY", "other");
+    let full_backlog = !matches!(
+        nntmux_core::var_or("TMUX_FIX_NAMES_FULL_BACKLOG", "true")
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false"
+    );
+    (category_scope, full_backlog)
+}
+
+/// `total_work` alone, for the post-processing kill switch.
+pub async fn total_work(db: &MySqlPool) -> Result<i64> {
+    let settings = backlog_settings(db).await?;
+    let (category_scope, full_backlog) = fix_names_scope();
+    let sql = release_counts_sql(&settings, &category_scope, full_backlog);
+    let row = sqlx::query(AssertSqlSafe(sql)).fetch_one(db).await?;
+    let mut total = 0;
+    for column in COUNT_COLUMNS {
+        if column.starts_with("process") {
+            total += row.try_get::<i64, _>(column)?;
+        }
+    }
+    if settings.sequential_mode == 2 || matches!(settings.post_mode, 1 | 3) {
+        total += additional_backlog(db).await?.0;
+    }
+    Ok(total)
+}
+
 pub async fn collect(ctx: &Ctx) -> Result<Value> {
     let db = &ctx.db;
     let mut counts: BTreeMap<String, i64> = BTreeMap::new();
@@ -308,13 +337,7 @@ pub async fn collect(ctx: &Ctx) -> Result<Value> {
     timers.insert("tmux_time", started.elapsed().as_secs_f64());
 
     let started = Instant::now();
-    let category_scope = nntmux_core::var_or("TMUX_FIX_NAMES_CATEGORY", "other");
-    let full_backlog = !matches!(
-        nntmux_core::var_or("TMUX_FIX_NAMES_FULL_BACKLOG", "true")
-            .to_ascii_lowercase()
-            .as_str(),
-        "0" | "false"
-    );
+    let (category_scope, full_backlog) = fix_names_scope();
     let sql = release_counts_sql(&settings, &category_scope, full_backlog);
     let row = sqlx::query(AssertSqlSafe(sql)).fetch_one(db).await?;
     for column in COUNT_COLUMNS {

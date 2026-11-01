@@ -40,6 +40,8 @@ enum Command {
     Ops(nntmux_ops::Command),
     #[command(subcommand)]
     Mail(nntmux_mail::Command),
+    #[command(subcommand)]
+    Admin(nntmux_admin::Command),
 }
 
 #[tokio::main]
@@ -70,5 +72,6 @@ async fn main() -> Result<()> {
         Command::Search(command) => nntmux_search::ctl(ctx, command).await,
         Command::Ops(command) => nntmux_ops::ctl(ctx, command).await,
         Command::Mail(command) => nntmux_mail::ctl(ctx, command).await,
+        Command::Admin(command) => nntmux_admin::ctl(ctx, command).await,
     }
 }

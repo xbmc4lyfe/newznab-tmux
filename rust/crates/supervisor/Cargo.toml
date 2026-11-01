@@ -10,6 +10,7 @@ anyhow.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 metrics.workspace = true
+nntmux-admin.workspace = true
 nntmux-core.workspace = true
 nntmux-namefix.workspace = true
 nntmux-ops.workspace = true
