@@ -1,0 +1,4 @@
+{% if let Some(captcha) = layout.captcha %}
+<div><div class="{{ captcha.class() }}" data-sitekey="{{ captcha.sitekey }}"{% if captcha.turnstile %} data-theme="auto" data-size="normal"{% endif %}></div></div>
+{% if let Some(message) = layout.error(captcha.field()) %}<p class="mt-2 text-sm text-red-600 dark:text-red-400">{{ message }}</p>{% endif %}
+{% endif %}

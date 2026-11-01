@@ -49,5 +49,6 @@ Merging `rust-native` into `master` is the last step, and `ws-deploy` owns getti
 
 - Keep GitHub Pages deploying. This branch deleted `.github/workflows/benchmark-pages.yml`, which also publishes the rewrite's progress figure. Restore it and its scripts from `master`, including `scripts/rewrite-metrics/`, and remove any PHP steps it no longer needs.
 - The progress metric reads the ledger, so keep two conventions stable: entries whose `source` is a `.rs` file don't count toward the headline, and `rust/porting/ledger/dropped.toml` holds vendor routes and is excluded. Record other dropped entries in the owning workstream's file, not there.
+- Rebuild the PreDB identity index once at cutover with `nntmux-ctl predb identity-rebuild`. Put this in the deployment owner's handoff, because it runs against production.
 
 `rust/indexer` is a separate SQLite and Tantivy experiment. Leave it alone unless the owner says otherwise.
