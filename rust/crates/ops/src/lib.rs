@@ -4,6 +4,7 @@
 
 pub mod accounts;
 pub mod activity;
+pub mod disposable;
 pub mod runtime_state;
 pub mod stats;
 pub mod system_metrics;
@@ -27,6 +28,8 @@ pub enum Command {
     DisableExpiredPromotions,
     /// Complete registration periods past their end (`nntmux:disable-expired-registration-periods`).
     DisableExpiredRegistrationPeriods,
+    /// Refresh the disposable-domain list the site reads (`disposable:update`).
+    DisposableUpdate,
     /// Let workers claim work again and clear any drain (`tmux:start`).
     Start,
     /// Pause processing until the next start (`tmux:stop`). Workers finish what they hold.
@@ -81,6 +84,11 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 println!("Marked registration period as done: {name}");
             }
             println!("Completed {} expired registration period(s).", names.len());
+        }
+        Command::DisposableUpdate => {
+            let path = disposable::list_path();
+            let count = disposable::refresh(disposable::SOURCE, &path).await?;
+            println!("Saved {count} domains to {}.", path.display());
         }
         Command::Start => {
             runtime_state::start(&ctx).await?;
