@@ -97,11 +97,11 @@ fn rp_id() -> String {
     }
 }
 
-/// `scheme://host[:port]` of `APP_URL`.
+/// `APP_URL`'s host and port over HTTPS, since `APP_URL` can say `http://` behind TLS.
 fn app_origin() -> String {
     let url = config::app_url();
-    let (scheme, rest) = url.split_once("://").unwrap_or(("", url.as_str()));
-    format!("{scheme}://{}", rest.split('/').next().unwrap_or_default())
+    let rest = url.split_once("://").map_or(url.as_str(), |(_, rest)| rest);
+    format!("https://{}", rest.split('/').next().unwrap_or_default())
 }
 
 fn party<'a>(rp_id: &'a str, app_origin: &'a str) -> webauthn::Party<'a> {

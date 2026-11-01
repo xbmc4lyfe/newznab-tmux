@@ -149,14 +149,14 @@ pub async fn submit(
             auth::clear_two_factor(&session);
             return Ok(Redirect::to("/2fa/verify").into_response());
         }
-        session.put("2fa:trusted_device", true);
         passed = true;
     }
 
     auth::login(&session, &user);
-    // `login` clears this, so it follows.
+    // `login` clears these, so they follow.
     if passed {
         auth::mark_two_factor_passed(&session);
+        session.put("2fa:trusted_device", true);
     }
     auth::rotate_session_token(&ctx, &session, user.id).await?;
     throttle::clear(&ctx, &key).await;
