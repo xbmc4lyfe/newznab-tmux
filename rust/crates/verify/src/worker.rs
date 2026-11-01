@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 
+use crate::audit;
 use crate::candidates::{self, Claim, FinishedAttempt};
 use crate::cleaning::ReleaseCleaner;
 use crate::context::Verify;
@@ -528,8 +529,8 @@ impl Worker {
         }
     }
 
-    /// Recovers interrupted terminal cleanup without delaying claims indefinitely. Entries with a
-    /// release still to delete wait for the audit port.
+    /// Recovers interrupted terminal cleanup without delaying claims indefinitely, including the
+    /// files an audit deletion left.
     async fn clean_terminal_scratch(
         &self,
         locks: &mut WorkerLocks,
@@ -554,7 +555,8 @@ impl Worker {
         }
         let entries: Vec<ScratchEntry> = sqlx::query_as(
             "SELECT CAST(id AS SIGNED) AS id, CAST(candidate_id AS SIGNED) AS candidate_id, \
-             CAST(audit_release_id AS SIGNED) AS audit_release_id, terminal, CAST(version AS SIGNED) AS version, delete_guid \
+             CAST(audit_release_id AS SIGNED) AS audit_release_id, terminal, CAST(version AS SIGNED) AS version, delete_guid, \
+             audit_verdict, delete_paths \
              FROM release_verification_scratch WHERE host = ? AND id > ? AND id <= ? ORDER BY id LIMIT 100",
         )
         .bind(host)
@@ -605,8 +607,15 @@ impl Worker {
         entry: &ScratchEntry,
         deadline: Instant,
     ) -> Result<()> {
-        if entry.delete_guid.is_some() {
-            return Ok(());
+        if let Some(guid) = &entry.delete_guid {
+            let deleted = audit::DeletedAudit {
+                terminal: entry.terminal,
+                audit_release_id: entry.audit_release_id,
+                audit_verdict: entry.audit_verdict.clone(),
+                delete_guid: guid.clone(),
+                delete_paths: entry.delete_paths.clone(),
+            };
+            audit::cleanup(&self.verify.db, &deleted).await?;
         }
         let directory = scratch.join(entry.directory_name());
         match std::fs::symlink_metadata(&directory) {
@@ -686,6 +695,8 @@ struct ScratchEntry {
     terminal: bool,
     version: i64,
     delete_guid: Option<String>,
+    audit_verdict: Option<String>,
+    delete_paths: Option<String>,
 }
 
 impl ScratchEntry {

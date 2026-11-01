@@ -22,31 +22,32 @@ status = "todo"
 kind = "command"
 id = "gdpr:purge-expired-exports"
 source = "app/Console/Commands/GdprPurgeExpiredExports.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "gdpr:purge-expired-exports"
 source = "app/Console/Commands/PurgeExpiredGdprExports.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "mail:preview"
 source = "app/Console/Commands/MailPreview.php"
-status = "todo"
+status = "dropped"
+note = "Wrote every mailable to HTML files for visual QA. `nntmux-ctl mail test <address>` sends a real message through the configured mailer instead."
 
 [[entry]]
 kind = "command"
 id = "nntmux:delete-unverified-users"
 source = "app/Console/Commands/NntmuxDeleteUnVerifiedUsers.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:purge-deleted-accounts"
 source = "app/Console/Commands/NntmuxPurgeDeletedAccounts.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -58,61 +59,69 @@ status = "todo"
 kind = "job"
 id = "PurgeDeletedAccounts"
 source = "app/Jobs/PurgeDeletedAccounts.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "job"
 id = "RemoveInactiveAccounts"
 source = "app/Jobs/RemoveInactiveAccounts.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "job"
 id = "SendAccountChangedEmail"
 source = "app/Jobs/SendAccountChangedEmail.php"
-status = "todo"
+status = "ported"
+note = "nntmux_mail::account renders it for the role changes that send it."
 
 [[entry]]
 kind = "job"
 id = "SendAccountDeletedEmail"
 source = "app/Jobs/SendAccountDeletedEmail.php"
-status = "todo"
+status = "ported"
+note = "nntmux_mail::account renders it for account deletion."
 
 [[entry]]
 kind = "job"
 id = "SendAccountExpiredEmail"
 source = "app/Jobs/SendAccountExpiredEmail.php"
-status = "todo"
+status = "ported"
+note = "nntmux_mail::account renders it for nntmux:update-expired-roles."
 
 [[entry]]
 kind = "job"
 id = "SendAccountWillExpireEmail"
 source = "app/Jobs/SendAccountWillExpireEmail.php"
-status = "todo"
+status = "ported"
+note = "nntmux_mail::account renders it for nntmux:update-expired-roles."
 
 [[entry]]
 kind = "job"
 id = "SendContactUsEmail"
 source = "app/Jobs/SendContactUsEmail.php"
-status = "todo"
+status = "ported"
+note = "The mail role delivers it; the site renders it."
 
 [[entry]]
 kind = "job"
 id = "SendNewRegisteredAccountMail"
 source = "app/Jobs/SendNewRegisteredAccountMail.php"
-status = "todo"
+status = "ported"
+note = "The mail role delivers it; the site renders it."
 
 [[entry]]
 kind = "job"
 id = "SendPasswordForgottenEmail"
 source = "app/Jobs/SendPasswordForgottenEmail.php"
-status = "todo"
+status = "ported"
+note = "The mail role delivers it; the site renders it."
 
 [[entry]]
 kind = "job"
 id = "SendWelcomeEmail"
 source = "app/Jobs/SendWelcomeEmail.php"
-status = "todo"
+status = "ported"
+note = "The mail role delivers it; the site renders it."
 
 [[entry]]
 kind = "route"

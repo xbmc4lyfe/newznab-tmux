@@ -105,6 +105,13 @@ fn article(name: &str, payload: &[u8]) -> Vec<u8> {
     nntmux_yenc::encode(payload, name.as_bytes(), 128, true).expect("encodes")
 }
 
+mod support;
+
+use md5::{Digest, Md5};
+use nntmux_postprocess::additional::download::{DownloadKind, Par2FileEntry};
+
+use support::{article, serve, service};
+
 fn ids(list: &[&str]) -> Vec<String> {
     list.iter().map(|id| (*id).to_owned()).collect()
 }

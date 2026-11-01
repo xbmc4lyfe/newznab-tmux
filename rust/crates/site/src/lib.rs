@@ -8,7 +8,7 @@ mod covers;
 mod details;
 mod guest;
 mod invitations;
-mod mailer;
+pub mod mailer;
 mod pages;
 mod profile;
 mod releases;

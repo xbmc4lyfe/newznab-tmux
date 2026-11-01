@@ -122,26 +122,6 @@ impl MissedParts {
         Ok(())
     }
 
-    /// One more attempt on a range the server failed to return.
-    pub async fn increment_range(
-        &self,
-        pool: &MySqlPool,
-        group: u32,
-        first: u64,
-        last: u64,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE missed_parts SET attempts = attempts + 1, updated_at = NOW() \
-             WHERE groups_id = ? AND numberid BETWEEN ? AND ?",
-        )
-        .bind(group)
-        .bind(first)
-        .bind(last)
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-
     /// Gives up on articles that used all their tries.
     pub async fn remove_exhausted(&self, pool: &MySqlPool, group: u32) -> Result<()> {
         sqlx::query("DELETE FROM missed_parts WHERE groups_id = ? AND attempts >= ?")

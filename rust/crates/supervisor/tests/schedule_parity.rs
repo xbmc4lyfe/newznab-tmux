@@ -21,6 +21,12 @@ fn tasks_match_the_php_schedule() {
         if task.name == "processing-stats" {
             continue;
         }
+        // `routes/console.php` added these jobs only with `PURGE_INACTIVE_USERS=true`, so the
+        // default-environment dump has no row for them. Both were `->daily()`.
+        if matches!(task.name, "RemoveInactiveAccounts" | "PurgeDeletedAccounts") {
+            assert_eq!(task.cadence.cron(), "0 0 * * *", "{}", task.name);
+            continue;
+        }
         let cron = task.cadence.cron();
         let found = php
             .iter()
