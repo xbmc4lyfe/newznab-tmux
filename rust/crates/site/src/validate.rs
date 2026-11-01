@@ -1,7 +1,10 @@
 //! Rules for account forms: Laravel's validator messages, the password policy, the breached
 //! password check and the disposable-address check.
 
-use std::time::Duration;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime};
 
 use hickory_resolver::TokioResolver;
 use sha1::{Digest, Sha1};
@@ -157,6 +160,53 @@ const BLOCKED_DOMAINS: [&str; 41] = [
     "harakirimail.com",
 ];
 
+/// propaganistas/laravel-disposable-email's bundled list (MIT), which PHP checked.
+static BUNDLED_DOMAINS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    serde_json::from_str::<Vec<&str>>(include_str!("../data/disposable_domains.json"))
+        .expect("the bundled list is valid JSON")
+        .into_iter()
+        .collect()
+});
+
+/// The weekly refresh, kept until its file changes.
+static REFRESHED_DOMAINS: Mutex<Option<(SystemTime, HashSet<String>)>> = Mutex::new(None);
+
+fn refreshed_path() -> PathBuf {
+    PathBuf::from(nntmux_core::var_or("NNTMUX_STORAGE_DIR", "storage"))
+        .join("framework/disposable_domains.json")
+}
+
+/// `nntmux-ctl ops disposable-update` writes this. It only adds to the bundled list, and a
+/// missing or broken file adds nothing, so a failed refresh can't open the form.
+fn in_refreshed_list(path: &Path, domain: &str) -> bool {
+    let Some(modified) = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+    else {
+        return false;
+    };
+    let mut cache = REFRESHED_DOMAINS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.as_ref().is_none_or(|(loaded, _)| *loaded != modified) {
+        let domains: HashSet<String> = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+            .inspect(|domains| tracing::debug!(count = domains.len(), "loaded disposable domains"))
+            .unwrap_or_else(|| {
+                warn!("the refreshed disposable domain list can't be read");
+                Vec::new()
+            })
+            .into_iter()
+            .map(|domain| domain.to_ascii_lowercase())
+            .collect();
+        *cache = Some((modified, domains));
+    }
+    cache
+        .as_ref()
+        .is_some_and(|(_, domains)| domains.contains(domain))
+}
+
 /// The domain half of `ValidEmailDomain`, without DNS. The message, if the address is refused.
 pub fn disposable_error(email: &str) -> Option<&'static str> {
     const REFUSED: &str = "Temporary or disposable email addresses are not allowed.";
@@ -166,6 +216,8 @@ pub fn disposable_error(email: &str) -> Option<&'static str> {
         return Some("The email must be a valid email address.");
     }
     if BLOCKED_DOMAINS.contains(&domain.as_str())
+        || BUNDLED_DOMAINS.contains(domain.as_str())
+        || in_refreshed_list(&refreshed_path(), &domain)
         || SUSPICIOUS_PATTERNS
             .iter()
             .any(|pattern| domain.contains(pattern))
@@ -199,6 +251,55 @@ pub async fn domain_has_mail_records(domain: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bundled_list_is_complete_and_lowercase() {
+        assert!(BUNDLED_DOMAINS.len() > 90_000);
+        assert!(
+            BUNDLED_DOMAINS
+                .iter()
+                .all(|domain| *domain == domain.to_ascii_lowercase())
+        );
+        assert!(disposable_error("someone@mailinator.com").is_some());
+        assert!(disposable_error("someone@example.org").is_none());
+    }
+
+    #[test]
+    fn the_refreshed_list_adds_and_reloads_and_survives_damage() {
+        let dir = std::env::temp_dir().join(format!("disposable-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("list.json");
+        assert!(
+            !in_refreshed_list(&path, "fresh.example"),
+            "no file adds nothing"
+        );
+
+        std::fs::write(&path, r#"["Fresh.Example"]"#).unwrap();
+        assert!(in_refreshed_list(&path, "fresh.example"));
+        assert!(!in_refreshed_list(&path, "other.example"));
+
+        // A rewrite counts once its modified time moves.
+        std::fs::write(&path, r#"["other.example"]"#).unwrap();
+        let later = SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(in_refreshed_list(&path, "other.example"));
+
+        std::fs::write(&path, "not json").unwrap();
+        let later = SystemTime::now() + Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(!in_refreshed_list(&path, "other.example"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
