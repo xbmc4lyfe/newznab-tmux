@@ -159,7 +159,7 @@ async fn an_over_budget_statement_is_recognised_as_a_timeout() -> Result<()> {
         return Ok(());
     };
     let failure = sqlx::query(
-        "SET STATEMENT max_statement_time=0.01 FOR SELECT COUNT(*) FROM seq_1_to_1000000000",
+        "SET STATEMENT max_statement_time=0.01 FOR SELECT COUNT(*) FROM seq_1_to_1000000000 WHERE seq % 7 = 3",
     )
     .execute(&test.pool)
     .await
