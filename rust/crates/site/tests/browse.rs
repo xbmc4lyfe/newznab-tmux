@@ -325,3 +325,45 @@ async fn failure_reports_need_a_token_or_a_browser_session() {
     assert_eq!(failures, 1);
     db.drop_database().await.unwrap();
 }
+
+#[tokio::test]
+async fn browser_failure_reports_need_a_session_and_token() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let group = add_group(&db.pool, &unique("alt.binaries.post")).await;
+    let (release, guid) = add_release(&db.pool, "Post.Release", 2040, group).await;
+    let name = unique("beth");
+    add_user(&db.pool, &name, true, 1).await;
+    let mut browser = Browser::new(&ctx);
+
+    // A guest with a valid token is still nobody.
+    let (response, _) = browser.post("/failed", &[("guid", &guid)]).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    browser
+        .post("/login", &[("username", &name), ("password", PASSWORD)])
+        .await;
+    let request = axum::http::Request::post("/failed").header(
+        axum::http::header::CONTENT_TYPE,
+        "application/x-www-form-urlencoded",
+    );
+    let (response, _) = browser
+        .send(request, format!("guid={guid}&_token=wrong"))
+        .await;
+    assert_eq!(response.status().as_u16(), 419);
+    let (response, _) = browser.post_authed("/failed", &[("guid", &guid)]).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "signed in, with no alternate to offer"
+    );
+    let failures: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM dnzb_failures WHERE release_id = ?")
+            .bind(release)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(failures, 1);
+    db.drop_database().await.unwrap();
+}

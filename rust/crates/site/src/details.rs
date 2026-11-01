@@ -1,5 +1,7 @@
 //! The release page, its comments, and the DNZB failure route.
 
+use std::sync::LazyLock;
+
 use anyhow::Result;
 use askama::Template;
 use axum::Router;
@@ -15,6 +17,7 @@ use nntmux_webkit::config::{self, encode_component};
 use nntmux_webkit::{
     ClientIp, CurrentUser, Input, Layout, MaybeUser, Session, User, WebResult, guard, throttle,
 };
+use regex::Regex;
 use serde_json::Value;
 use sqlx::{MySqlPool, Row};
 
@@ -366,8 +369,9 @@ async fn load_panels(
         ));
     }
     if ids.anidbid > 0
-        && let Some(info) = fetch_info(
+        && let Some(info) = anime_info(
             db,
+            ids.anidbid,
             &[
                 "media_type",
                 "type",
@@ -383,8 +387,6 @@ async fn load_panels(
                 "creators",
                 "description",
             ],
-            "anidb_info WHERE anidbid = ?",
-            &ids.anidbid.to_string(),
         )
         .await?
     {
@@ -440,6 +442,22 @@ async fn load_panels(
         ));
     }
     Ok(panels)
+}
+
+/// The info row, or empty columns when only titles exist. PHP joined from the titles table, so
+/// either one is enough for a panel.
+async fn anime_info(db: &MySqlPool, anidbid: i64, columns: &[&str]) -> Result<Option<Info>> {
+    let id = anidbid.to_string();
+    if let Some(info) = fetch_info(db, columns, "anidb_info WHERE anidbid = ?", &id).await? {
+        return Ok(Some(info));
+    }
+    let titles: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM anidb_titles WHERE anidbid = ?")
+        .bind(anidbid)
+        .fetch_one(db)
+        .await?;
+    Ok((titles > 0).then(|| Info {
+        columns: Vec::new(),
+    }))
 }
 
 fn valid_imdb(imdbid: &str) -> bool {
@@ -913,6 +931,9 @@ async fn show(
     Ok(Html(page.render()?).into_response())
 }
 
+/// `release_comments.text` is varchar(2000).
+const MAX_COMMENT: usize = 2000;
+
 async fn add_comment(
     State(ctx): State<Ctx>,
     session: Session,
@@ -930,6 +951,11 @@ async fn add_comment(
     let Some(id) = id else {
         return Ok(back(&headers, "/"));
     };
+    let text: String = input
+        .str("txtAddComment")
+        .chars()
+        .take(MAX_COMMENT)
+        .collect();
     let store_ip = matches!(
         nntmux_core::var_or("STORE_USER_IP", "false").as_str(),
         "1" | "true" | "on" | "yes"
@@ -942,7 +968,7 @@ async fn add_comment(
     let mut tx = ctx.db.begin().await?;
     sqlx::query("INSERT INTO release_comments (releases_id, text, users_id, host, username, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NOW(), NOW())")
         .bind(id)
-        .bind(input.str("txtAddComment"))
+        .bind(text)
         .bind(signed_in.user.id)
         .bind(host)
         .bind(&signed_in.user.username)
@@ -967,27 +993,12 @@ fn dnzb_error(status: StatusCode, message: &'static str) -> Response {
 }
 
 /// `(^\w+[-_. ].+?\.(\d+p)).+`: the title up to the resolution, what alternates must share.
+/// ASCII classes, because PHP's pattern had no `u` flag.
 fn similar_title(name: &str) -> Option<String> {
-    for (index, _) in name.match_indices('.') {
-        let rest = &name[index + 1..];
-        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-        if digits > 0 && rest[digits..].to_ascii_lowercase().starts_with('p') {
-            let end = index + 1 + digits + 1;
-            let leading = name
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .count();
-            let starts_right = leading > 0
-                && name
-                    .chars()
-                    .nth(leading)
-                    .is_some_and(|c| matches!(c, '-' | '_' | '.' | ' '));
-            if starts_right && end < name.len() {
-                return Some(name[..end].to_owned());
-            }
-        }
-    }
-    None
+    static PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^([0-9A-Za-z_]+[-_. ].+?\.[0-9]+p).+").expect("the pattern is valid")
+    });
+    Some(PATTERN.captures(name)?.get(1)?.as_str().to_owned())
 }
 
 async fn alternate(ctx: &Ctx, guid: &str, user_id: i64) -> Result<Option<String>> {
