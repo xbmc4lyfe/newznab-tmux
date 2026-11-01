@@ -2,6 +2,7 @@
 
 mod confirm;
 mod login;
+mod passkeys;
 mod password;
 mod register;
 mod two_factor;
@@ -18,6 +19,7 @@ use nntmux_webkit::{Input, Session, guard, throttle};
 
 use crate::guest::Captcha;
 
+pub(crate) use passkeys::router as passkeys_router;
 pub(crate) use register::registration_status;
 pub(crate) use two_factor::verify_code;
 pub(crate) use verify::send_verification;
