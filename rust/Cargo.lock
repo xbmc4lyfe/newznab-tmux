@@ -1859,7 +1859,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "nntmux-categorize",
+ "nntmux-core",
+ "nntmux-predb",
  "nntmux-runtime",
+ "regex",
+ "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]
