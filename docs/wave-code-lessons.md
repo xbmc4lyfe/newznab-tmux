@@ -44,3 +44,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 7 | Wave 67.3 plans: `GamesProcessor`, `GdprNotificationService`, `GenreService`, `IGDB/Client`, `IgdbHttpException`, their Rust module and parity test | `e16bffea1` | 21, 22 |
 | 8 | Wave 66.6 plans: `MiscSafetyNetPipe`, `MoviePipe`, `MusicPipe`, `PcPipe`, `TvPipe`, their Rust module and parity test | `3e4315e2d` | 23 |
 | 9 | Wave 66.1 plans: `BackfillConfig`, `BackfillService`, `BinariesConfig`, `BinariesService`, `BinaryHandler`, their Rust module and parity test | `f028654f5` | None new |
+| 10 | Wave 66.4 plans: `BooksProcessor`, `CategorizationPipeline`, `CategorizationResult`, `CategorizationService`, `AbstractCategorizationPipe`, their Rust module and parity test | `9a6f92653` | None new |
