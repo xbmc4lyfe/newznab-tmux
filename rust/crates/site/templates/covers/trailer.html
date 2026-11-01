@@ -1,0 +1,7 @@
+{% extends "layout.html" %}
+{% import "components.html" as c %}
+{% block content %}
+{% call c::page_header_open(title, "Trailer", "", "fas fa-film") %}{% endcall %}
+{% call c::page_header_close() %}{% endcall %}
+{% if let Some(trailer) = trailer %}<iframe width="{{ layout.site.trailers_size_x }}" height="{{ layout.site.trailers_size_y }}" src="{{ trailer }}" title="Trailer"></iframe>{% else %}<p class="text-gray-600 dark:text-gray-400">There is no trailer for this movie.</p>{% endif %}
+{% endblock %}

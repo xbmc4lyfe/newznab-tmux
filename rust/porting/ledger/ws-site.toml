@@ -172,37 +172,37 @@ status = "ported"
 kind = "route"
 id = "GET|POST|HEAD /Audio/{id?}"
 source = "App\\Http\\Controllers\\MusicController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /Books/{id?}"
 source = "App\\Http\\Controllers\\BooksController@index"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /Console/{id?}"
 source = "App\\Http\\Controllers\\ConsoleController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /Games"
 source = "App\\Http\\Controllers\\GamesController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /Movies/{id?}"
 source = "App\\Http\\Controllers\\MovieController@showMovies"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /XXX/{id?}"
 source = "App\\Http\\Controllers\\AdultController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -263,19 +263,19 @@ status = "ported"
 kind = "route"
 id = "GET|POST|HEAD /movie"
 source = "App\\Http\\Controllers\\MovieController@showMovies"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /movie/{imdbid}"
 source = "App\\Http\\Controllers\\MovieController@showMovie"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /movietrailers"
 source = "App\\Http\\Controllers\\MovieController@showTrailer"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -335,7 +335,7 @@ status = "ported"
 kind = "route"
 id = "GET|POST|HEAD /trending-movies"
 source = "App\\Http\\Controllers\\MovieController@showTrending"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -443,7 +443,7 @@ status = "ported"
 kind = "route"
 id = "POST /movies/update-layout"
 source = "App\\Http\\Controllers\\MovieController@updateLayout"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
