@@ -148,7 +148,7 @@ impl TvdbProvider {
         }
     }
 
-    async fn format_show(&self, show: &Value) -> Result<Show> {
+    pub async fn format_show(&self, show: &Value) -> Result<Show> {
         let services = &self.0;
         let tvdb = php::int(show.get("tvdb_id"));
         let artworks = Self::quietly(services.tvdb.series_artworks(tvdb)).await?;
@@ -397,7 +397,7 @@ impl TvMazeProvider {
         }
     }
 
-    async fn format_show(&self, show: &MazeShow) -> Show {
+    pub async fn format_show(&self, show: &MazeShow) -> Show {
         let externals = &show.externals;
         let tvdb = php::int(externals.get("thetvdb"));
         let imdb = imdb_digits(&php::text(externals.get("imdb")));
@@ -422,6 +422,7 @@ impl TvMazeProvider {
             tmdb,
             aliases: show.akas.clone(),
             localzone: show.timezone.clone(),
+            ..Show::default()
         }
     }
 }
@@ -530,6 +531,55 @@ impl TmdbProvider {
 
     fn has_required_episode(episode: &Value) -> bool {
         php::present(episode.get("season_number")) && php::present(episode.get("episode_number"))
+    }
+
+    /// `show` is a search result or the details themselves, which carry the same fields.
+    pub async fn format_show(&self, show: &Value, details: &Value) -> Show {
+        let tmdb = php::int(show.get("id"));
+        let aliases = php::items(
+            details
+                .get("alternative_titles")
+                .and_then(|titles| titles.get("results")),
+        )
+        .iter()
+        .filter_map(|aka| aka.get("title"))
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+        let external = details.get("external_ids").unwrap_or(&Value::Null);
+        let imdb = imdb_digits(&php::text(external.get("imdb_id")));
+        let tvdb = php::int(external.get("tvdb_id"));
+        let trakt = self.lookup_trakt_id(tmdb, &imdb, tvdb).await;
+        let poster_path = show
+            .get("poster_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let text_of = |key: &str| {
+            show.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Show {
+            title: php::text(show.get("name")),
+            summary: text_of("overview"),
+            started: text_of("first_air_date"),
+            publisher: php::text(
+                php::items(details.get("networks"))
+                    .first()
+                    .and_then(|network| network.get("name")),
+            ),
+            country: php::text(php::items(show.get("origin_country")).first()),
+            poster: Tmdb::image_url(poster_path),
+            source: SOURCE_TMDB,
+            imdb,
+            tvdb,
+            trakt,
+            tvrage: php::int(external.get("tvrage_id")),
+            tmdb,
+            aliases,
+            ..Show::default()
+        }
     }
 
     /// Tries the TMDB id first, then IMDb, then TVDB. Optional enrichment.
@@ -644,52 +694,7 @@ impl TvProvider for TmdbProvider {
             .tv_show(tmdb, &["external_ids", "alternative_titles"])
             .await?
             .unwrap_or(Value::Null);
-        let aliases = php::items(
-            details
-                .get("alternative_titles")
-                .and_then(|titles| titles.get("results")),
-        )
-        .iter()
-        .filter_map(|aka| aka.get("title"))
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect();
-        let external = details.get("external_ids").unwrap_or(&Value::Null);
-        let imdb = imdb_digits(&php::text(external.get("imdb_id")));
-        let tvdb = php::int(external.get("tvdb_id"));
-        let trakt = self.lookup_trakt_id(tmdb, &imdb, tvdb).await;
-        let poster_path = show
-            .get("poster_path")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        Ok(Some(Show {
-            title: php::text(show.get("name")),
-            summary: show
-                .get("overview")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            started: show
-                .get("first_air_date")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            publisher: php::text(
-                php::items(details.get("networks"))
-                    .first()
-                    .and_then(|n| n.get("name")),
-            ),
-            country: php::text(php::items(show.get("origin_country")).first()),
-            poster: Tmdb::image_url(poster_path),
-            source: SOURCE_TMDB,
-            imdb,
-            tvdb,
-            trakt,
-            tvrage: php::int(external.get("tvrage_id")),
-            tmdb,
-            aliases,
-            ..Show::default()
-        }))
+        Ok(Some(self.format_show(show, &details).await))
     }
 
     async fn all_episodes(&self, site_id: i64, video_id: i64) -> Result<Vec<Episode>> {
@@ -800,7 +805,7 @@ impl TraktProvider {
         show.map_or(0, |show| php::int(Some(&show.id)))
     }
 
-    async fn format_show(&self, show: &Value) -> Show {
+    pub async fn format_show(&self, show: &Value) -> Show {
         let ids = show.get("ids").unwrap_or(&Value::Null);
         let airs = show.get("airs").unwrap_or(&Value::Null);
         let images = show.get("images").unwrap_or(&Value::Null);
@@ -815,6 +820,7 @@ impl TraktProvider {
             publisher: php::text(show.get("network")),
             country: php::text(show.get("country")),
             poster: image_url(images.get("poster")),
+            fallback_poster: image_url(images.get("fanart")),
             source: SOURCE_TRAKT,
             imdb,
             tvdb,
@@ -824,6 +830,7 @@ impl TraktProvider {
             tmdb: php::int(ids.get("tmdb")),
             aliases: string_list(show.get("aliases")),
             localzone: zone,
+            ..Show::default()
         }
     }
 }

@@ -69,12 +69,6 @@ status = "ported"
 
 [[entry]]
 kind = "command"
-id = "nntmux:fetch-movie"
-source = "app/Console/Commands/FetchMovieByImdb.php"
-status = "todo"
-
-[[entry]]
-kind = "command"
 id = "nntmux:find-size-mismatches"
 source = "app/Console/Commands/FindSizeMismatchedReleases.php"
 status = "todo"
