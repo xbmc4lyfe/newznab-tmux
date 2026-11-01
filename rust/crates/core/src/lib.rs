@@ -1,6 +1,8 @@
 //! Configuration every binary shares. Values come from the environment, which Compose fills
 //! from `docker/config/app.env`, so the names match what the Laravel app read.
 
+pub mod pcre;
+
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
