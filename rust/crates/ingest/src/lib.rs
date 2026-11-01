@@ -5,6 +5,7 @@
 pub mod backfill;
 pub mod blacklist;
 pub mod clean;
+pub mod client;
 pub mod config;
 pub mod get_range;
 pub mod groups;
@@ -35,9 +36,16 @@ pub async fn run_backfill(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()
     run::run_backfill_role(ctx, args.once, stop).await
 }
 
-/// Where news server connections come from. `ws-formats` owns the client.
-pub(crate) fn connector() -> Result<Arc<dyn Connector>> {
-    bail!("the NNTP client isn't merged yet")
+/// News server connections, from the `NNTP_*` environment and the `nntp_retries` setting.
+pub(crate) async fn connector(pool: &sqlx::MySqlPool) -> Result<Arc<dyn Connector>> {
+    let retries: u32 =
+        sqlx::query_scalar("SELECT nntp_retries FROM ingestion_configurations WHERE id = 1")
+            .fetch_one(pool)
+            .await
+            .context("reading nntp_retries")?;
+    let mut config = nntmux_nntp::NntpConfig::from_env();
+    config.retries = retries;
+    Ok(Arc::new(client::ClientConnector::new(config)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]

@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use nntmux_core::parsed_or;
-use nntmux_runtime::{Ctx, Shutdown};
+use nntmux_runtime::{Ctx, Shutdown, busy};
 use nntmux_verify::cache::Cache;
 use nntmux_verify::context::Verify;
 use redis::AsyncCommands;
@@ -142,10 +142,15 @@ pub fn plan_safe_backfill(
     let wanted = if count > budget { budget } else { count };
     // Rounded up.
     let chunks = (wanted + max_messages - 1) / max_messages;
+    // The oldest chunk stops at the server's first article, rather than running below it.
+    let lowest = their_first.max(1);
     (0..chunks)
         .filter_map(|index| {
-            let first = our_first - index * max_messages - max_messages;
+            let first = (our_first - index * max_messages - max_messages).max(lowest);
             let last = our_first - index * max_messages - 1;
+            if last < first {
+                return None;
+            }
             Some(Job::Range(RangeJob {
                 mode: RangeMode::Backfill,
                 group: group.to_owned(),
@@ -433,7 +438,7 @@ pub fn backfill_sleep(settings: &RoleSettings, collections: i64) -> u64 {
     }
 }
 
-/// Builds a runner for a role or a command. Fails until a news server client is available.
+/// Builds a runner for a role or a command.
 pub async fn runner(ctx: &Ctx, stop: Option<Shutdown>) -> Result<Runner> {
     let config = Arc::new(IngestConfig::load(&ctx.db).await?);
     let seconds: u64 = parsed_or("NN_MULTIPROCESSING_MAX_CHILD_TIME", 1800)?;
@@ -445,7 +450,7 @@ pub async fn runner(ctx: &Ctx, stop: Option<Shutdown>) -> Result<Runner> {
     Ok(Runner {
         pool: ctx.db.clone(),
         config,
-        connector: crate::connector()?,
+        connector: crate::connector(&ctx.db).await?,
         hooks,
         stop,
         job_timeout: Duration::from_secs(seconds),
@@ -466,9 +471,9 @@ pub async fn run_update_role(ctx: Ctx, once: bool, stop: Shutdown) -> Result<()>
 }
 
 async fn update_pass(ctx: &Ctx, stop: &Shutdown) -> Result<Duration> {
-    if ctx.paused().await? {
+    let Some(_busy) = busy::enter(ctx, "ingest").await? else {
         return Ok(PAUSED_REST);
-    }
+    };
     let settings = role_settings(&ctx.db).await?;
     if settings.binaries_enabled {
         let runner = runner(ctx, Some(stop.clone())).await?;
@@ -499,9 +504,9 @@ pub async fn run_backfill_role(ctx: Ctx, once: bool, stop: Shutdown) -> Result<(
 }
 
 async fn backfill_pass(ctx: &Ctx, stop: &Shutdown) -> Result<Duration> {
-    if ctx.paused().await? {
+    let Some(_busy) = busy::enter(ctx, "backfill").await? else {
         return Ok(PAUSED_REST);
-    }
+    };
     let settings = role_settings(&ctx.db).await?;
     let collections: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collections")
         .fetch_one(&ctx.db)
@@ -623,6 +628,17 @@ mod tests {
         assert!(plan_safe_backfill("g", 1000, 1000, 300, 1, 100).is_empty());
         // Fewer articles remain than the budget.
         assert_eq!(plan_safe_backfill("g", 1000, 950, 300, 1, 100).len(), 1);
+        // A chunk larger than what's left stops at the server's first article.
+        let jobs = plan_safe_backfill("g", 10000, 1, 100_000, 1, 20000);
+        let Job::Range(only) = &jobs[0] else {
+            panic!();
+        };
+        assert_eq!((jobs.len(), only.first, only.last), (1, 1, 9999));
+        let jobs = plan_safe_backfill("g", 10000, 9990, 100_000, 1, 20000);
+        let Job::Range(only) = &jobs[0] else {
+            panic!();
+        };
+        assert_eq!((jobs.len(), only.first, only.last), (1, 9990, 9999));
     }
 
     #[test]

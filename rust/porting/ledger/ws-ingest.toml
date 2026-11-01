@@ -4,19 +4,19 @@
 kind = "command"
 id = "articles:get-range"
 source = "app/Console/Commands/GetArticleRange.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "backfill:group"
 source = "app/Console/Commands/BackfillGroup.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "binaries:part-repair"
 source = "app/Console/Commands/PartRepair.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -28,25 +28,25 @@ status = "todo"
 kind = "command"
 id = "group:update-headers"
 source = "app/Console/Commands/UpdateGroupHeaders.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "groups:update"
 source = "app/Console/Commands/GroupsUpdate.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "multiprocessing:backfill"
 source = "app/Console/Commands/ProcessBackfill.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "multiprocessing:safe"
 source = "app/Console/Commands/ProcessSafe.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -70,10 +70,10 @@ status = "ported"
 kind = "command"
 id = "update:backfill"
 source = "app/Console/Commands/UpdateBackfill.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "update:binaries"
 source = "app/Console/Commands/UpdateBinaries.php"
-status = "todo"
+status = "ported"

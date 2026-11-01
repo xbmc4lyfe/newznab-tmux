@@ -411,3 +411,36 @@ async fn finds_the_article_for_a_date() {
     assert_eq!(ingest.day_to_post(5000, &selected).await.unwrap(), 1);
     db.drop_database().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_failed_parallel_range_is_deferred_before_a_sibling_can_pass_it() {
+    let Some(db) = TestDb::create().await.unwrap() else {
+        return;
+    };
+    let (_, config) = setup(&db, 1000, 900).await;
+    let mut server = FakeServer::with_articles(801..=802, 1, 1040);
+    server.xover_failures = VecDeque::from([failure(502), failure(502)]);
+    let mut ingest = Ingest::new(&db.pool, &config, &NoHooks, &mut server, None);
+    let failed = get_range(&mut ingest, &range(RangeMode::Backfill, 801, 802, false)).await;
+    assert!(failed.is_err());
+    assert_eq!(cursor(&db.pool).await, (900, 1000));
+    assert_eq!(missed_numbers(&db.pool).await, [801, 802]);
+    db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_binaries_range_queues_what_the_server_skipped_before_moving_the_cursor() {
+    let Some(db) = TestDb::create().await.unwrap() else {
+        return;
+    };
+    let (_, config) = setup(&db, 1000, 900).await;
+    assert!(!config.safe_part_repair);
+    let mut server = FakeServer::with_articles([1001, 1003], 1, 1040);
+    let mut ingest = Ingest::new(&db.pool, &config, &NoHooks, &mut server, None);
+    get_range(&mut ingest, &range(RangeMode::Binaries, 1001, 1003, true))
+        .await
+        .unwrap();
+    assert_eq!(cursor(&db.pool).await, (900, 1003));
+    assert_eq!(missed_numbers(&db.pool).await, [1002]);
+    db.drop_database().await.unwrap();
+}

@@ -120,7 +120,9 @@ async fn attempt(ingest: &mut Ingest<'_>, request: &RangeRequest) -> Result<(), 
         return Ok(());
     }
 
-    let kind = if config.safe_part_repair {
+    // A binaries range moves the cursor past whatever it doesn't get, so it always tracks what the
+    // server didn't return. PHP only did that with `safe_part_repair` on, and lost those articles.
+    let kind = if request.mode == RangeMode::Binaries || config.safe_part_repair {
         ScanKind::Update
     } else {
         ScanKind::Backfill
@@ -150,6 +152,17 @@ async fn attempt(ingest: &mut Ingest<'_>, request: &RangeRequest) -> Result<(), 
             .await
             .map_err(scanned)?;
         return Ok(());
+    }
+    // A sibling range can move the cursor past this one, so a failed download has to be queued
+    // now or it's never fetched. PHP returned here with nothing queued.
+    if outcome.completed_end.is_none() {
+        missed
+            .defer_range(pool, request.first, request.last, group.id)
+            .await
+            .map_err(scanned)?;
+        return Err(scanned(anyhow::anyhow!(
+            "Header download failed; the range was deferred to part repair."
+        )));
     }
     let Some(summary) = outcome.summary else {
         return Ok(());

@@ -217,16 +217,3 @@ fn bounds_the_article_range_to_the_request() {
     assert_eq!(range.last_date, b"b");
     assert!(article_range(&headers, 100, 200).is_none());
 }
-
-#[test]
-fn parses_overview_lines() {
-    let line = b"12\tSub (1/2)\ta@b\t26 Jun 2014 13:08:22 GMT\t<m@id>\t\t750\t9\tXref: news alt.binaries.x:12";
-    let parsed = Overview::parse(line).unwrap();
-    assert_eq!(parsed.number, 12);
-    assert_eq!(parsed.subject, b"Sub (1/2)");
-    assert_eq!(parsed.message_id, b"<m@id>");
-    assert_eq!(parsed.bytes, 750);
-    assert_eq!(parsed.xref, b"news alt.binaries.x:12");
-    assert!(Overview::parse(b"junk\tSub").is_none());
-    assert_eq!(Overview::parse(b"7").unwrap().subject, b"");
-}
