@@ -1,0 +1,1 @@
+Sample inputs for `archive_golden.rs`. Everything except `nntmux__*` comes from the BSD-3-Clause `dariusiii/rarinfo` test fixtures. Files over 80 KiB are cut to their first 64 KiB, which is the shape real samples have anyway.
