@@ -34,7 +34,7 @@ status = "todo"
 kind = "command"
 id = "nntmux:test-categorization"
 source = "app/Console/Commands/TestCategorization.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"

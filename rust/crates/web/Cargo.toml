@@ -18,7 +18,9 @@ nntmux-core.workspace = true
 nntmux-runtime.workspace = true
 nntmux-site.workspace = true
 nntmux-telemetry.workspace = true
+nntmux-webkit.workspace = true
 tokio.workspace = true
+tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 

@@ -1,0 +1,1 @@
+{% for cat in layout.nav %}<option value="{{ cat.id }}"{% if layout.header_cat == cat.id.to_string() %} selected{% endif %} class="font-semibold">{{ cat.title }}</option>{% for sub in cat.subs %}<option value="{{ sub.id }}"{% if layout.header_cat == sub.id.to_string() %} selected{% endif %}>&nbsp;&nbsp;{{ sub.title }}</option>{% endfor %}{% endfor %}

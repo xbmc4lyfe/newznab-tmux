@@ -244,21 +244,17 @@ fn parenthesized(subject: &[u8], at: usize) -> Option<(&[u8], &[u8])> {
     Some((part, &subject[cursor..cursor + total_length]))
 }
 
-/// The first 17 digits of a 309-digit value where PHP's double rounds either to `f64::MAX` or to
-/// infinity; below it PHP's `(int)` saturates, above it (and from 310 digits) the value is
-/// infinite and `(int)` gives 0.
-const PHP_DOUBLE_OVERFLOW_PREFIX: &[u8] = b"17976931348623158";
+/// 2^1024 - 2^970: from here up PHP's double rounds to infinity. Below it, a value too large for
+/// an integer rounds to at most `f64::MAX`.
+const PHP_DOUBLE_OVERFLOW: &[u8] = b"179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792";
 
 /// PHP's `(int)` of an unsigned ASCII digit string: exact values in the i64 range, saturation
-/// beyond it, and 0 once PHP's double is infinite. A 309-digit value on the rounding boundary
-/// itself saturates; no real part counter is that long.
+/// beyond it, and 0 once PHP's double is infinite.
 fn php_int(digits: &[u8]) -> i64 {
     let significant = &digits[digits.iter().take_while(|byte| **byte == b'0').count()..];
     match significant.len() {
         310.. => return 0,
-        309 if significant[..PHP_DOUBLE_OVERFLOW_PREFIX.len()] > *PHP_DOUBLE_OVERFLOW_PREFIX => {
-            return 0;
-        }
+        309 if significant >= PHP_DOUBLE_OVERFLOW => return 0,
         309 => return i64::MAX,
         _ => {}
     }
@@ -523,6 +519,11 @@ mod tests {
         let at = |prefix: &str| format!("{prefix}{}", "0".repeat(292));
         assert_eq!(php_int(at("17976931348623157").as_bytes()), i64::MAX);
         assert_eq!(php_int(at("17976931348623158").as_bytes()), i64::MAX);
+        assert_eq!(php_int(PHP_DOUBLE_OVERFLOW), 0);
+        assert_eq!(
+            php_int(format!("{}{}", "17976931348623158", "1".repeat(292)).as_bytes()),
+            0
+        );
         assert_eq!(php_int(at("17976931348623159").as_bytes()), 0);
         assert_eq!(php_int("9".repeat(309).as_bytes()), 0);
         assert_eq!(php_int("1".repeat(310).as_bytes()), 0);

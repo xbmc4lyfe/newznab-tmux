@@ -1,0 +1,20 @@
+{
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "build": "vite build"
+    },
+    "devDependencies": {
+        "@tailwindcss/forms": "^0.5.11",
+        "@tailwindcss/vite": "^4.3.3",
+        "tailwindcss": "^4.3.3",
+        "vite": "^8.3"
+    },
+    "dependencies": {
+        "@alpinejs/csp": "^3.17.4",
+        "@fortawesome/fontawesome-free": "^7.3.1",
+        "@simplewebauthn/browser": "^14.0.0",
+        "axios": "1.20.0",
+        "chart.js": "^4.5.1"
+    }
+}

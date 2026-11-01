@@ -358,6 +358,10 @@ fn caseless_eq(first: char, second: char) -> bool {
             _ => original,
         }
     }
+    // U+0131 uppercases to I, but PCRE gives it no case partner.
+    if first == '\u{131}' || second == '\u{131}' {
+        return first == second;
+    }
     first == second
         || single(first.to_lowercase(), first) == single(second.to_lowercase(), second)
         || single(first.to_uppercase(), first) == single(second.to_uppercase(), second)
@@ -936,6 +940,12 @@ mod tests {
         }
         assert!(accepted > 500 && rejected > 500, "{accepted}/{rejected}");
         assert!(non_ascii > 100, "{non_ascii}");
+    }
+
+    #[test]
+    fn dotless_i_is_not_a_case_variant_of_i() {
+        assert!(!verdict("SETUP.ISO YENC", "setup.\u{131}so"));
+        assert!(verdict("SETUP.ISO YENC", "setup.iso"));
     }
 
     #[test]
