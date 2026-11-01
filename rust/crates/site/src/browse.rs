@@ -185,6 +185,7 @@ async fn browse_all(
         categories: &[-1],
         excluded: &excluded,
         group: None,
+        ..BrowseFilter::default()
     };
     let list = build_list(&ctx, &signed_in, "/browse/All", &input, &filter).await?;
     let page = BrowsePage {
@@ -267,6 +268,7 @@ async fn show_browse(
         categories: &categories,
         excluded: &excluded,
         group: None,
+        ..BrowseFilter::default()
     };
     let mut list = build_list(&ctx, &signed_in, &path, &input, &filter).await?;
 
@@ -363,6 +365,7 @@ async fn browse_group(
         categories: &[-1],
         excluded: &excluded,
         group: Some(&group),
+        ..BrowseFilter::default()
     };
     let mut list = build_list(&ctx, &signed_in, "/browse/group", &input, &filter).await?;
     list.search_placeholder = search_placeholder(&group, "all");
