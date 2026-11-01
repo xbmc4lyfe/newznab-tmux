@@ -77,14 +77,12 @@ concurrency:
 jobs:
   paired-decoding:
     if: github.event_name != 'workflow_dispatch' || inputs.comparison == 'all' || inputs.comparison == 'cpp'
-    # PR code requires disposable workers. The optional x86 label is reserved for
-    # a one-job ephemeral VM pinned to an exact candidate SHA; the actual decoder
-    # must still qualify as VBMI2. Other revisions keep the standard routing.
+    # PR code requires disposable workers, which GitHub-hosted runners provide.
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: [spot, '${{ matrix.runner }}']
+    runs-on: ${{ matrix.runner }}
     # Keep the original comparison budget plus bounded diagnostics and upload time.
     timeout-minutes: 60
     env:
@@ -382,7 +380,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: [spot, '${{ matrix.runner }}']
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     env:
       RUST_TOOLCHAIN: '1.98.0'
@@ -633,7 +631,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: [spot, '${{ matrix.runner }}']
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     env:
       RUST_TOOLCHAIN: '1.98.0'
