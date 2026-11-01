@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 metrics.workspace = true
 nntmux-core.workspace = true
 nntmux-db.workspace = true
@@ -16,6 +17,9 @@ sqlx.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+nntmux-testkit.workspace = true
 
 [lints]
 workspace = true
