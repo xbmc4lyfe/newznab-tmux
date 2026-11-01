@@ -47,7 +47,7 @@
             "uid": "nntmux-prometheus"
           },
           "expr": "up{job=\"nntmux-roles\"}",
-          "legendFormat": "{{role}}",
+          "legendFormat": "{{service}}",
           "refId": "A",
           "instant": true,
           "range": false
