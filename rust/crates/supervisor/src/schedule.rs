@@ -24,19 +24,6 @@ fn task(
     }
 }
 
-/// Laravel's `(bool) env()`: unset takes the default, and empty, `0` and `false` are off.
-fn flag(key: &str, default: bool) -> bool {
-    nntmux_core::optional(key).map_or(default, |value| {
-        let value = value.to_ascii_lowercase();
-        !matches!(value.as_str(), "" | "0" | "false" | "(false)")
-    })
-}
-
-/// The role runs this pass itself unless the schedule owns it, so it has exactly one launcher.
-fn predbft_scheduled() -> bool {
-    flag("TMUX_FIX_NAMES_PREDBFT", true) && flag("TMUX_FIX_NAMES_PREDBFT_SCHEDULED", true)
-}
-
 pub fn tasks() -> Vec<Task<Ctx>> {
     use nntmux_ops::{accounts, activity, disposable, resets, stats, system_metrics};
     vec![
@@ -109,20 +96,6 @@ pub fn tasks() -> Vec<Task<Ctx>> {
                 Ok(())
             })
         }),
-        Task {
-            enabled: predbft_scheduled,
-            ..task(
-                "multiprocessing:fixrelnames predbft",
-                EveryMinutes(5),
-                |ctx| {
-                    Box::pin(async move {
-                        let kind = "predbft".to_owned();
-                        nntmux_namefix::ctl(ctx, nntmux_namefix::Command::Fixrelnames { kind })
-                            .await
-                    })
-                },
-            )
-        },
         task("nntmux:remove-bad", Cadence::Hourly, |ctx| {
             Box::pin(async move {
                 resets::remove_bad(&ctx.db).await?;
