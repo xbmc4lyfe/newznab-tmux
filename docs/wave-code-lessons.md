@@ -55,3 +55,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 17 | Wave 65.3 plans: `SevenZipListingParser`, `MediaByteBudget`, `PersistenceMetricsCollector`, `ProcessingMetrics`, `ReleaseProcessingContext`, their Rust module and parity test | `df5fa307b` | 24 |
 | 18 | Wave 65.5 plans: `ApiCapabilitiesService`, `ApiReleaseRowCache`, `ApiUsageService`, `ApiUserResolver`, `ApiV1Presenter`, their Rust module and parity test | `99a5ed42a` | None new |
 | 19 | Wave 65.1 plans: `MediaSourceStage`, `MediaToolFactory`, `Par2FileMapper`, `ThumbnailFrameSelector`, `MediaExtractionService`, their Rust module and parity test | `ed15b5be4` | None new |
+| 20 | Wave 64.4 plans: `MediaSourcePlan`, `Par2FileEntry`, `PersistenceMetrics`, `ArchivedMediaSlicer`, `ContainerSplicer`, their Rust module and parity test | `2a50c0765` | None new |
