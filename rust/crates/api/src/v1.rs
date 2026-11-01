@@ -6,11 +6,16 @@ use anyhow::Result;
 use nntmux_runtime::Ctx;
 
 use crate::auth::{self, User};
-use crate::caps;
+use crate::caps::{self, Server};
+use crate::filename;
+use crate::getnzb::{self, Errors};
 use crate::input::{Input, php_int};
+use crate::misc::{cp437_to_utf8, nl2br};
 use crate::params;
+use crate::present_v1::{Params, api_output};
 use crate::reply::{Reply, xml_error};
 use crate::request::ApiRequest;
+use crate::rows;
 use crate::settings::Settings;
 use crate::usage::{self, Statistics, rfc2822};
 
@@ -55,6 +60,7 @@ impl Function {
 
 /// The account values every v1 response reports.
 pub struct Account {
+    pub token: String,
     pub user: User,
     pub stats: Statistics,
     pub oldest_api: String,
@@ -113,6 +119,7 @@ pub async fn api(ctx: &Ctx, settings: &Arc<Settings>, request: &ApiRequest) -> R
     }
 
     let account = Account {
+        token,
         oldest_api: stats.api_time.map(rfc2822).unwrap_or_default(),
         oldest_grab: stats.grab_time.map(rfc2822).unwrap_or_default(),
         stats,
@@ -271,7 +278,33 @@ async fn get(
         return Ok(error);
     }
     audit(ctx, settings, request, account).await?;
-    Ok(not_ported())
+    // Unlike the v2 path, the suffix isn't stripped before this check.
+    let id = request.input.string("id");
+    if !getnzb::guid_exists(ctx, &id).await? {
+        return Ok(xml_error(
+            300,
+            "No such item (the guid you provided has no release in our database)",
+        ));
+    }
+    getnzb::download(ctx, request, &account.user, &id, Errors::Xml, false).await
+}
+
+/// `$params` for the release output.
+fn output_params(input: &Input, account: &Account) -> Params {
+    let flag = |key: &str| input.str(key).is_some_and(|value| php_int(value) == 1);
+    Params {
+        uid: account.user.id,
+        token: account.token.clone(),
+        extended: flag("extended"),
+        delete_from_cart: flag("del"),
+        include_enclosure: true,
+        api_limit: account.user.api_requests,
+        requests: account.stats.api_count,
+        download_limit: account.user.download_requests,
+        grabs: account.stats.grab_count,
+        oldest_api: account.oldest_api.clone(),
+        oldest_grab: account.oldest_grab.clone(),
+    }
 }
 
 async fn details(
@@ -280,14 +313,25 @@ async fn details(
     request: &ApiRequest,
     account: &Account,
 ) -> Result<Reply> {
-    if !request.input.has("id") {
+    let input = &request.input;
+    if !input.has("id") {
         return Ok(xml_error(
             200,
             "Missing parameter (guid is required for single release details)",
         ));
     }
     audit(ctx, settings, request, account).await?;
-    Ok(not_ported())
+    let found = rows::by_guid_for_api(ctx, &input.string("id"), true).await?;
+    let rows: Vec<rows::Row> = found.into_iter().collect();
+    let server = Server::load(ctx, settings, request.base_url()).await?;
+    let xml = input.str("o") != Some("json");
+    Ok(api_output(
+        &rows,
+        &output_params(input, account),
+        &server,
+        params::offset(input),
+        xml,
+    ))
 }
 
 async fn nfo(
@@ -296,14 +340,47 @@ async fn nfo(
     request: &ApiRequest,
     account: &Account,
 ) -> Result<Reply> {
-    if !request.input.has("id") {
+    let input = &request.input;
+    if !input.has("id") {
         return Ok(xml_error(
             200,
             "Missing parameter (id is required for retrieving an NFO)",
         ));
     }
     audit(ctx, settings, request, account).await?;
-    Ok(not_ported())
+    let release: Option<(u32, String)> =
+        sqlx::query_as("SELECT id, searchname FROM releases WHERE guid = ? LIMIT 1")
+            .bind(input.string("id"))
+            .fetch_optional(&ctx.db)
+            .await?;
+    let Some((id, searchname)) = release else {
+        return Ok(xml_error(300, "Release does not exist."));
+    };
+    let nfo: Option<Option<Vec<u8>>> =
+        sqlx::query_scalar("SELECT UNCOMPRESS(nfo) FROM release_nfos WHERE releases_id = ? AND nfo IS NOT NULL LIMIT 1")
+            .bind(id)
+            .fetch_optional(&ctx.db)
+            .await?;
+    let Some(Some(nfo)) = nfo else {
+        return Ok(xml_error(
+            300,
+            "Release does not have an NFO file associated.",
+        ));
+    };
+    if input.str("o") == Some("file") {
+        let stem = format!("nfo-{id}");
+        let clean = filename::sanitize(&searchname, &stem);
+        let ascii = filename::ascii_fallback(&clean, &stem);
+        return Ok(Reply::new(200, "application/octet-stream", nfo).header(
+            "content-disposition",
+            filename::attachment(&format!("{clean}.nfo"), &format!("{ascii}.nfo")),
+        ));
+    }
+    Ok(Reply::new(
+        200,
+        "text/html; charset=utf-8",
+        nl2br(&cp437_to_utf8(&nfo)),
+    ))
 }
 
 async fn nzb_add(

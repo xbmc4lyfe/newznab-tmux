@@ -6,5 +6,206 @@
  {
   "name": "audit_v2_long",
   "path": "/api/v2/details?api_token=tokenalice&id=nope&q=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "name": "v1_details_movie",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=aaaa000000000000000000000000000000000001"
+ },
+ {
+  "name": "v1_details_movie_ext_json",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=aaaa000000000000000000000000000000000001&o=json&extended=1"
+ },
+ {
+  "name": "v1_details_movie_ext_xml",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=aaaa000000000000000000000000000000000001&extended=1&del=1"
+ },
+ {
+  "name": "v2_details_movie",
+  "path": "/api/v2/details?api_token=tokenalice&id=aaaa000000000000000000000000000000000001"
+ },
+ {
+  "name": "v1_details_tv",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=bbbb000000000000000000000000000000000002"
+ },
+ {
+  "name": "v1_details_tv_ext_json",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=bbbb000000000000000000000000000000000002&o=json&extended=1"
+ },
+ {
+  "name": "v1_details_tv_ext_xml",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=bbbb000000000000000000000000000000000002&extended=1&del=1"
+ },
+ {
+  "name": "v2_details_tv",
+  "path": "/api/v2/details?api_token=tokenalice&id=bbbb000000000000000000000000000000000002"
+ },
+ {
+  "name": "v1_details_music",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=cccc000000000000000000000000000000000003"
+ },
+ {
+  "name": "v1_details_music_ext_json",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=cccc000000000000000000000000000000000003&o=json&extended=1"
+ },
+ {
+  "name": "v1_details_music_ext_xml",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=cccc000000000000000000000000000000000003&extended=1&del=1"
+ },
+ {
+  "name": "v2_details_music",
+  "path": "/api/v2/details?api_token=tokenalice&id=cccc000000000000000000000000000000000003"
+ },
+ {
+  "name": "v1_details_game",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=dddd000000000000000000000000000000000004"
+ },
+ {
+  "name": "v1_details_game_ext_json",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=dddd000000000000000000000000000000000004&o=json&extended=1"
+ },
+ {
+  "name": "v1_details_game_ext_xml",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=dddd000000000000000000000000000000000004&extended=1&del=1"
+ },
+ {
+  "name": "v2_details_game",
+  "path": "/api/v2/details?api_token=tokenalice&id=dddd000000000000000000000000000000000004"
+ },
+ {
+  "name": "v1_details_book",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=eeee000000000000000000000000000000000005"
+ },
+ {
+  "name": "v1_details_book_ext_json",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=eeee000000000000000000000000000000000005&o=json&extended=1"
+ },
+ {
+  "name": "v1_details_book_ext_xml",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=eeee000000000000000000000000000000000005&extended=1&del=1"
+ },
+ {
+  "name": "v2_details_book",
+  "path": "/api/v2/details?api_token=tokenalice&id=eeee000000000000000000000000000000000005"
+ },
+ {
+  "name": "v1_details_anime",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=ffff000000000000000000000000000000000006"
+ },
+ {
+  "name": "v1_details_anime_ext_json",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=ffff000000000000000000000000000000000006&o=json&extended=1"
+ },
+ {
+  "name": "v1_details_anime_ext_xml",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=ffff000000000000000000000000000000000006&extended=1&del=1"
+ },
+ {
+  "name": "v2_details_anime",
+  "path": "/api/v2/details?api_token=tokenalice&id=ffff000000000000000000000000000000000006"
+ },
+ {
+  "name": "v1_details_adult",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=7777000000000000000000000000000000000007"
+ },
+ {
+  "name": "v1_details_adult_ext_json",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=7777000000000000000000000000000000000007&o=json&extended=1"
+ },
+ {
+  "name": "v1_details_adult_ext_xml",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=7777000000000000000000000000000000000007&extended=1&del=1"
+ },
+ {
+  "name": "v2_details_adult",
+  "path": "/api/v2/details?api_token=tokenalice&id=7777000000000000000000000000000000000007"
+ },
+ {
+  "name": "v1_details_partial",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=8888000000000000000000000000000000000008"
+ },
+ {
+  "name": "v1_details_partial_ext_json",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=8888000000000000000000000000000000000008&o=json&extended=1"
+ },
+ {
+  "name": "v1_details_partial_ext_xml",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=8888000000000000000000000000000000000008&extended=1&del=1"
+ },
+ {
+  "name": "v2_details_partial",
+  "path": "/api/v2/details?api_token=tokenalice&id=8888000000000000000000000000000000000008"
+ },
+ {
+  "name": "v1_details_pw",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=9999000000000000000000000000000000000009"
+ },
+ {
+  "name": "v1_details_pw_ext_json",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=9999000000000000000000000000000000000009&o=json&extended=1"
+ },
+ {
+  "name": "v1_details_pw_ext_xml",
+  "path": "/api/v1/api?t=d&apikey=tokenposter&id=9999000000000000000000000000000000000009&extended=1&del=1"
+ },
+ {
+  "name": "v2_details_pw",
+  "path": "/api/v2/details?api_token=tokenalice&id=9999000000000000000000000000000000000009"
+ },
+ {
+  "name": "v1_details_missing_row",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=nope"
+ },
+ {
+  "name": "v1_details_stats",
+  "path": "/api/v1/api?t=details&apikey=tokenalice&id=aaaa000000000000000000000000000000000001&o=json",
+  "setup": [
+   "INSERT INTO user_requests (users_id, request, timestamp) VALUES (1, 'x', NOW() - INTERVAL 1 HOUR), (1, 'x', NOW() - INTERVAL 2 HOUR);",
+   "INSERT INTO user_downloads (users_id, releases_id, timestamp) VALUES (1, 1, NOW() - INTERVAL 3 HOUR);"
+  ],
+  "mask_oldest": true
+ },
+ {
+  "name": "v1_details_query",
+  "method": "QUERY",
+  "path": "/api/v1/api",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"t\": \"details\", \"apikey\": \"tokenalice\", \"id\": \"bbbb000000000000000000000000000000000002\", \"cat\": [2000, \"5030\"]}"
+ },
+ {
+  "name": "v2_details_missing_row",
+  "path": "/api/v2/details?api_token=tokenalice&id=nope"
+ },
+ {
+  "name": "v2_details_query",
+  "method": "QUERY",
+  "path": "/api/v2/details",
+  "headers": {
+   "Content-Type": "application/json"
+  },
+  "body": "{\"api_token\": \"tokenalice\", \"id\": \"aaaa000000000000000000000000000000000001\"}"
+ },
+ {
+  "name": "v1_nfo_missing_release",
+  "path": "/api/v1/api?t=nfo&apikey=tokenalice&id=nope"
+ },
+ {
+  "name": "v1_nfo_none",
+  "path": "/api/v1/api?t=nfo&apikey=tokenalice&id=bbbb000000000000000000000000000000000002"
+ },
+ {
+  "name": "v1_nfo_html",
+  "path": "/api/v1/api?t=info&apikey=tokenalice&id=aaaa000000000000000000000000000000000001",
+  "setup": [
+   "INSERT INTO release_nfos (releases_id, nfo) VALUES (1, COMPRESS(CONCAT('line one\\r\\nline ', X'DB2582', '\\nlast <b>&')));"
+  ]
+ },
+ {
+  "name": "v1_nfo_file",
+  "path": "/api/v1/api?t=gn&apikey=tokenalice&id=aaaa000000000000000000000000000000000001&o=file",
+  "setup": [
+   "INSERT INTO release_nfos (releases_id, nfo) VALUES (1, COMPRESS('plain nfo'));"
+  ]
  }
 ]
