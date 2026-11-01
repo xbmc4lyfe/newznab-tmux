@@ -65,7 +65,7 @@ def audit():
 def kernel_fetch(case):
     done = subprocess.run(
         ["php", str(HERE / "record_request.php"), str(REF)],
-        input=json.dumps(case).encode(),
+        input=json.dumps({"method": "GET"} | case).encode(),
         env=os.environ | QUERY_ENV,
         capture_output=True,
         check=True,
@@ -77,7 +77,7 @@ def kernel_fetch(case):
 
 
 def fetch(case):
-    if case.get("method") == "QUERY":
+    if case.get("method") == "QUERY" or case.get("as_user"):
         return kernel_fetch(case)
     conn = http.client.HTTPConnection(HOST, PORT, timeout=60)
     body = case.get("body")

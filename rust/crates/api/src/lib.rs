@@ -11,6 +11,7 @@ mod cache;
 mod caps;
 mod category;
 mod db;
+mod filelist;
 mod filename;
 mod getnzb;
 mod input;
@@ -30,11 +31,12 @@ mod upload;
 pub mod usage;
 mod v1;
 mod v2;
+mod web;
 mod xml;
 
 use std::sync::Arc;
 
-use axum::routing::any;
+use axum::routing::{MethodFilter, any, on};
 use axum::{Extension, Router};
 use nntmux_runtime::Ctx;
 
@@ -81,7 +83,11 @@ pub fn router_with(settings: Settings) -> Router<Ctx> {
             "/rss/trending-shows",
             route(Endpoint::Rss(Feed::TrendingShows)),
         )
-        .route("/getnzb", route(Endpoint::GetNzb))
-        .route("/getnzb/{guid}", route(Endpoint::GetNzb))
+        .merge(web::router(on(
+            MethodFilter::GET
+                .or(MethodFilter::POST)
+                .or(MethodFilter::OPTIONS),
+            dispatch(Endpoint::GetNzb),
+        )))
         .layer(Extension(Arc::new(settings)))
 }

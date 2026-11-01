@@ -79,7 +79,7 @@ pub async fn find_verified(ctx: &Ctx, token: &str) -> Result<Option<User>> {
         .filter(|user| user.verified))
 }
 
-async fn find_by_token(ctx: &Ctx, token: &str) -> Result<Option<User>> {
+pub async fn find_by_token(ctx: &Ctx, token: &str) -> Result<Option<User>> {
     let row = sqlx::query(
         "SELECT u.id, u.username, u.api_token, u.roles_id, u.rate_limit, u.can_post,
                 (u.verified = 1 OR u.email_verified_at IS NOT NULL) AS is_verified,
