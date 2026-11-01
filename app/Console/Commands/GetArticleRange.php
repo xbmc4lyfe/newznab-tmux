@@ -152,6 +152,17 @@ class GetArticleRange extends Command
                 return self::SUCCESS;
             }
 
+            if ($binaries->completedRangeEnd() === null) {
+                if (! $this->queueRangeForRepair($groupName, $firstArticle, $lastArticle)) {
+                    $this->error('Header download did not complete and this range could not be queued for repair; retry this worker.');
+
+                    return self::FAILURE;
+                }
+                $this->error('Header download did not complete; queued this range for part repair.');
+
+                return self::FAILURE;
+            }
+
             if (empty($return)) {
                 return self::SUCCESS;
             }
@@ -184,7 +195,7 @@ class GetArticleRange extends Command
                 return true;
             }
         } catch (\Throwable $e) {
-            Log::error('Unable to queue a failed article range for part repair: '.$e->getMessage());
+            Log::error("Unable to queue articles {$first}-{$last} of {$groupName} for part repair: ".$e->getMessage());
         }
 
         return false;
