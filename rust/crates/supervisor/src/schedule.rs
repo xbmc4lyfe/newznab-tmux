@@ -32,8 +32,8 @@ const EXPORT_LIMIT: Duration = Duration::from_secs(240);
 
 pub fn tasks() -> Vec<Task<Ctx>> {
     use nntmux_ops::{
-        accounts, activity, disposable, metrics_export, processing_stats, resets, stats,
-        system_metrics,
+        accounts, activity, disposable, metrics_export, processing_stats, resets, site_status,
+        stats, system_metrics,
     };
     vec![
         Task {
@@ -56,6 +56,12 @@ pub fn tasks() -> Vec<Task<Ctx>> {
                 Box::pin(async move { processing_stats::publish(&ctx).await })
             })
         },
+        task("nntmux:check-service-health", EveryMinutes(1), |ctx| {
+            Box::pin(async move {
+                site_status::check_all(&ctx, site_status::UPTIME_DAYS).await?;
+                Ok(())
+            })
+        }),
         task("nntmux:collect-stats", EveryMinutes(15), |ctx| {
             Box::pin(async move { stats::collect(&ctx.db).await })
         }),

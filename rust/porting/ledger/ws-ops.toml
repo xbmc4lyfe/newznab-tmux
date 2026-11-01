@@ -30,13 +30,13 @@ note = "Self-update for a checkout-based install. Deploys now ship images, and `
 kind = "command"
 id = "nntmux:check-service-health"
 source = "app/Console/Commands/CheckServiceHealth.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:check-service-uptime"
 source = "app/Console/Commands/CheckServiceUptime.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -324,7 +324,7 @@ note = "Waiting on the fixnames role reading TMUX_FIX_NAMES_PREDBFT and TMUX_FIX
 kind = "schedule"
 id = "command: 'nntmux:check-service-health')->everyMinute()->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"

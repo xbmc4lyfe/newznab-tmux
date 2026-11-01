@@ -10,6 +10,7 @@ use nntmux_core::var_or;
 use nntmux_runtime::Ctx;
 use redis::AsyncCommands;
 use serde_json::Value;
+use sqlx::mysql::MySqlDatabaseError;
 use sqlx::{AssertSqlSafe, MySqlPool};
 use tracing::warn;
 
@@ -23,8 +24,8 @@ const CATEGORIES: [&str; 8] = [
     "tv", "movies", "audio", "books", "console", "pc", "xxx", "misc",
 ];
 const UNVERIFIED: &str = "'ready', 'waiting_upload', 'pending', 'unknown', 'header_rejected', 'verifying', 'dirty', 'unrepairable'";
-/// MariaDB's and MySQL's errors for a statement over its time limit.
-const STATEMENT_TIMEOUTS: [&str; 2] = ["1969", "3024"];
+/// MariaDB's and MySQL's error numbers for a statement over its time limit.
+const STATEMENT_TIMEOUTS: [u16; 2] = [1969, 3024];
 
 fn application() -> Vec<Family> {
     let mut build = Family::gauge("nntmux_build_info", "NNTmux runtime versions.");
@@ -127,11 +128,11 @@ async fn failed_jobs(db: &MySqlPool) -> Result<Vec<Family>> {
     ])
 }
 
-fn timed_out(failure: &sqlx::Error) -> bool {
+pub fn timed_out(failure: &sqlx::Error) -> bool {
     failure
         .as_database_error()
-        .and_then(|error| error.code())
-        .is_some_and(|code| STATEMENT_TIMEOUTS.contains(&code.as_ref()))
+        .and_then(|error| error.try_downcast_ref::<MySqlDatabaseError>())
+        .is_some_and(|error| STATEMENT_TIMEOUTS.contains(&error.number()))
 }
 
 /// The status file the verifier writes, and when it was written. Oversized or unreadable counts as

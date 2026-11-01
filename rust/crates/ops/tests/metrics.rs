@@ -152,3 +152,23 @@ async fn a_failing_collector_is_reported_without_stopping_the_rest() -> Result<(
     assert!(text.contains("nntmux_up 1"));
     test.drop_database().await
 }
+
+#[tokio::test]
+async fn an_over_budget_statement_is_recognised_as_a_timeout() -> Result<()> {
+    let Some(test) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let failure = sqlx::query(
+        "SET STATEMENT max_statement_time=0.01 FOR SELECT COUNT(*) FROM seq_1_to_1000000000",
+    )
+    .execute(&test.pool)
+    .await
+    .expect_err("the statement runs over its limit");
+    assert!(metrics_export::timed_out(&failure), "{failure}");
+    let other = sqlx::query("SELECT * FROM no_such_table")
+        .execute(&test.pool)
+        .await
+        .expect_err("the table doesn't exist");
+    assert!(!metrics_export::timed_out(&other));
+    test.drop_database().await
+}

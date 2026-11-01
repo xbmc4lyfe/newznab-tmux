@@ -70,6 +70,7 @@ redis = { version = "1", default-features = false, features = ["aio", "connectio
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["cookies", "gzip", "json", "rustls", "stream"] }
 rustls-native-certs = "0.8"
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 scraper = "0.26"
 serde = { version = "1", features = ["derive"] }

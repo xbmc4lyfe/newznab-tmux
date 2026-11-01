@@ -11,6 +11,7 @@ pub mod processing_stats;
 pub mod prometheus;
 pub mod resets;
 pub mod runtime_state;
+pub mod site_status;
 pub mod stats;
 pub mod system_metrics;
 
@@ -33,6 +34,18 @@ pub enum Command {
     DisableExpiredPromotions,
     /// Complete registration periods past their end (`nntmux:disable-expired-registration-periods`).
     DisableExpiredRegistrationPeriods,
+    /// Probe services, open and resolve incidents, refresh uptime (`nntmux:check-service-health`).
+    CheckServiceHealth {
+        /// Rolling window in days for uptime.
+        #[arg(long, default_value_t = site_status::UPTIME_DAYS)]
+        days: i64,
+    },
+    /// Recalculate uptime from incident history (`nntmux:check-service-uptime`).
+    CheckServiceUptime {
+        /// Rolling window in days for uptime.
+        #[arg(long, default_value_t = site_status::UPTIME_DAYS)]
+        days: i64,
+    },
     /// Push application metrics to the Pushgateway (`monitoring:export-metrics`).
     ExportMetrics {
         /// Print the metrics instead of pushing them.
@@ -146,6 +159,15 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 println!("Marked registration period as done: {name}");
             }
             println!("Completed {} expired registration period(s).", names.len());
+        }
+        Command::CheckServiceHealth { days } => {
+            for (service, outcome) in site_status::check_all(&ctx, days).await? {
+                println!("{service}: {outcome}");
+            }
+        }
+        Command::CheckServiceUptime { days } => {
+            site_status::refresh_uptime(&ctx.db, days).await?;
+            println!("Recalculated service uptime over a {days}-day window.");
         }
         Command::ExportMetrics { print } => {
             if print {

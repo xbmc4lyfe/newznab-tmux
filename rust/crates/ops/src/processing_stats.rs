@@ -14,7 +14,6 @@ use nntmux_runtime::Ctx;
 use redis::AsyncCommands;
 use serde_json::{Value, json};
 use sqlx::{AssertSqlSafe, MySqlPool, Row};
-use tracing::error;
 
 const SNAPSHOT_TTL_SECONDS: u64 = 900;
 /// Above this the planner's estimate stands in for an exact count.
@@ -335,8 +334,8 @@ const COUNT_COLUMNS: [&str; 12] = [
     "predb_matched",
 ];
 
-/// Computes the snapshot. A failing group of counts is logged and leaves its values out, as the
-/// monitor's try blocks did, so one slow query can't hide everything else.
+/// Computes the snapshot. Any failure fails the whole thing: publishing partial counts would read
+/// as real drops, while a skipped publish shows as the snapshot's age growing.
 pub async fn collect(ctx: &Ctx) -> Result<Value> {
     let db = &ctx.db;
     let mut counts: BTreeMap<String, i64> = BTreeMap::new();
@@ -355,57 +354,36 @@ pub async fn collect(ctx: &Ctx) -> Result<Value> {
         "0" | "false"
     );
     let sql = release_counts_sql(&settings, &category_scope, full_backlog);
-    match sqlx::query(AssertSqlSafe(sql)).fetch_one(db).await {
-        Ok(row) => {
-            for column in COUNT_COLUMNS {
-                counts.insert(column.to_owned(), row.try_get::<i64, _>(column)?);
-            }
-        }
-        Err(failure) => error!(error = %failure, "error collecting release counts"),
+    let row = sqlx::query(AssertSqlSafe(sql)).fetch_one(db).await?;
+    for column in COUNT_COLUMNS {
+        counts.insert(column.to_owned(), row.try_get::<i64, _>(column)?);
     }
     timers.insert("proc1_time", started.elapsed().as_secs_f64());
 
     let started = Instant::now();
-    let groups: Result<(i64, i64), _> = sqlx::query_as(
+    let (active, all): (i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(id) FROM usenet_groups WHERE active = 1), \
          (SELECT COUNT(id) FROM usenet_groups WHERE name IS NOT NULL)",
     )
     .fetch_one(db)
-    .await;
-    match groups {
-        Ok((active, all)) => {
-            counts.insert("active_groups".to_owned(), active);
-            counts.insert("all_groups".to_owned(), all);
-        }
-        Err(failure) => error!(error = %failure, "error collecting group counts"),
-    }
+    .await?;
+    counts.insert("active_groups".to_owned(), active);
+    counts.insert("all_groups".to_owned(), all);
     let sequential = settings.sequential_mode == 2;
     let (mut work, mut available) = (0, 0);
     if sequential || matches!(settings.post_mode, 1 | 3) {
-        match additional_backlog(db).await {
-            Ok((total, claimable)) => (work, available) = (total, claimable),
-            Err(failure) => error!(
-                error = format!("{failure:#}"),
-                "error collecting the additional backlog"
-            ),
-        }
+        (work, available) = additional_backlog(db).await?;
     }
     counts.insert("work".to_owned(), work);
     counts.insert("work_available".to_owned(), available);
     timers.insert("proc2_time", started.elapsed().as_secs_f64());
 
     let started = Instant::now();
-    match category_counts(db).await {
-        Ok(found) => counts.extend(found),
-        Err(failure) => error!(error = %failure, "error collecting category counts"),
-    }
+    counts.extend(category_counts(db).await?);
     timers.insert("init_time", started.elapsed().as_secs_f64());
 
     let started = Instant::now();
-    match table_counts(db).await {
-        Ok(found) => counts.extend(found),
-        Err(failure) => error!(error = %failure, "error collecting table counts"),
-    }
+    counts.extend(table_counts(db).await?);
     timers.insert("tpg_time", started.elapsed().as_secs_f64());
 
     let backlog: i64 = counts
