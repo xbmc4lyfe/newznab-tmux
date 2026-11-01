@@ -1966,10 +1966,12 @@ name = "nntmux-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "askama",
  "axum",
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "fancy-regex",
  "flate2",
  "futures-util",
  "hex",
@@ -2086,8 +2088,22 @@ name = "nntmux-ingest"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "chrono",
  "clap",
+ "hex",
+ "md-5 0.10.6",
+ "nntmux-core",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "rand 0.9.5",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sqlx",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2156,8 +2172,20 @@ name = "nntmux-releases"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "hex",
+ "nntmux-categorize",
+ "nntmux-core",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "nntmux-verify",
+ "rand 0.9.5",
+ "redis",
+ "serde",
+ "sqlx",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2184,8 +2212,26 @@ name = "nntmux-search"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "chrono",
  "clap",
+ "hex",
+ "hmac 0.12.1",
+ "nntmux-core",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "rand 0.9.5",
+ "redis",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

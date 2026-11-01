@@ -593,7 +593,8 @@
   "path": "/getnzb",
   "headers": {
    "User-Agent": "usenetstreamer"
-  }
+  },
+  "status_only": true
  },
  {
   "name": "block_ua_before_method",
