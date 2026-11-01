@@ -1,0 +1,386 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="surface-panel rounded-xl shadow-sm mb-6">
+    {% let eyebrow = "Developer resources" %}{% let description = "Integrate with the index using the Newznab-compatible XML API and authenticated download endpoints." %}{% let icon = "fas fa-code" %}{% include "page_header.html" %}
+    <div class="p-6">
+        <p class="text-lg text-gray-700 dark:text-gray-300 mb-6 dark:text-gray-300">
+            Here lives the documentation for the API for accessing NZB and index data. API functions require your API key
+            except public capabilities; direct <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">/getnzb</code>
+            downloads may also use your logged-in browser session.
+        </p>
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6">
+            XML error responses include a <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">&lt;error code="..."&gt;</code>
+            body and use matching HTTP statuses such as 400 for missing/incorrect parameters, 401 for invalid credentials,
+            403 for suspended accounts, 404 for missing functions/items, and 429 for request or download limits.
+        </p>
+        {% if layout.signed_in %}
+            <div class="surface-panel-alt rounded-lg p-6 mb-6 border">
+                <h4 class="text-lg font-semibold mb-3 text-gray-900 dark:text-gray-100 dark:text-white flex items-center">
+                    <i class="fa fa-key mr-2 text-gray-600 dark:text-gray-400"></i>Your API Credentials
+                </h4>
+                <div class="flex rounded-md shadow-sm" x-data="copyToClipboard()">
+                    <input type="text" class="flex-1 rounded-l-md border-gray-300 dark:border-gray-600 font-mono text-sm focus:border-primary-500 focus:ring-primary-500 dark:bg-gray-600 dark:border-gray-500 dark:text-white" value="apikey={{ token }}" readonly id="apikeyInput">
+                    <button class="inline-flex items-center px-4 py-2 border border-l-0 border-gray-300 dark:border-gray-600 rounded-r-md bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:bg-gray-900 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-600 dark:text-gray-200 dark:border-gray-500 dark:hover:bg-gray-500" type="button" @click="copy('apikeyInput')" title="Copy to clipboard" :class="copied ? 'text-green-600' : ''">
+                        <i class="fa" :class="copied ? 'fa-check' : 'fa-copy'"></i>
+                    </button>
+                </div>
+            </div>
+        {% endif %}
+        <h4 class="text-lg font-semibold mb-3 text-gray-900 dark:text-gray-100 dark:text-white flex items-center">
+            <i class="fa fa-plug mr-2 text-gray-600 dark:text-gray-400"></i>Available Functions
+        </h4>
+        <p class="text-gray-700 dark:text-gray-300 mb-4 dark:text-gray-300">Use the parameter <code class="px-2 py-1 bg-gray-100 dark:bg-gray-800 rounded text-sm text-red-600 dark:bg-gray-700 dark:text-red-400">?t=</code> to specify the function being called. In addition to search, TV, and movies, this site supports <strong class="text-gray-900 dark:text-gray-100">music</strong> (<code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">t=music</code> or <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">t=audio</code>), <strong class="text-gray-900 dark:text-gray-100">books</strong> (<code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">t=book</code> or <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">t=b</code>), and <strong class="text-gray-900 dark:text-gray-100">anime</strong> (<code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">t=anime</code>). See <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">?t=caps</code> for capability flags.</p>
+        <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                <thead class="bg-gray-50 dark:bg-gray-900 dark:bg-gray-700">
+                    <tr>
+                        <th scope="col" class="w-1/6 px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider dark:text-gray-300">Function</th>
+                        <th scope="col" class="w-1/2 px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider dark:text-gray-300">Description</th>
+                        <th scope="col" class="w-1/3 px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider dark:text-gray-300">Example</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:bg-gray-800 dark:divide-gray-700">
+                    <tr class="hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-700">
+                        <td class="px-6 py-4"><strong class="text-gray-900 dark:text-gray-100 dark:text-white">Capabilities</strong></td>
+                        <td class="px-6 py-4">
+                            <span class="text-gray-700 dark:text-gray-300">
+                                Reports the capabilities of the server. Includes information about the server name,
+                                available search categories and version number of the newznab protocol being used.
+                            </span>
+                            <div class="text-gray-500 text-sm mt-1 dark:text-gray-400">
+                                <i class="fa fa-info-circle mr-1"></i>No credentials required
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">
+                            <a href="{{ base }}/api/v1/api?t=caps" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                <i class="fa fa-external-link-alt mr-1"></i>
+                                <code class="text-primary-700 dark:text-primary-400">?t=caps</code>
+                            </a>
+                        </td>
+                    </tr>
+                    <tr class="hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-700">
+                        <td class="px-6 py-4"><strong class="text-gray-900 dark:text-gray-100 dark:text-white">Search</strong></td>
+                        <td class="px-6 py-4">
+                            <span class="text-gray-700 dark:text-gray-300">
+                                Returns a list of NZBs matching a query. You can filter by site category by including
+                                a comma separated list of categories.
+                            </span>
+                            <div class="mt-2">
+                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary-100 text-primary-800 dark:bg-primary-900/50 dark:text-primary-200">OPTIONS</span>
+                                <div class="mt-1 ml-2 text-sm text-gray-700 dark:text-gray-300">
+                                    <code class="px-2 py-1 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:bg-gray-700 dark:text-red-400">extended=1</code> - Return extended information in results
+                                </div>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">
+                            <div class="flex flex-col gap-2">
+                                {% if layout.signed_in %}
+                                <a href="{{ base }}/api/v1/api?t=search&q=linux&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                    <i class="fa fa-external-link-alt mr-1"></i>
+                                    <code class="text-primary-700 dark:text-primary-400">?t=search&amp;q=linux</code>
+                                </a>
+                                <a href="{{ base }}/api/v1/api?t=search&cat=1000,2000&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                    <i class="fa fa-external-link-alt mr-1"></i>
+                                    <code class="text-primary-700 dark:text-primary-400">?t=search&amp;cat=1000,2000</code>
+                                </a>
+                                {% else %}
+                                <span class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700">
+                                    <code>?t=search&amp;q=linux</code>
+                                </span>
+                                <span class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700">
+                                    <code>?t=search&amp;cat=1000,2000</code>
+                                </span>
+                                {% endif %}
+                            </div>
+                        </td>
+                    </tr>
+                    <tr class="hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-700">
+                        <td class="px-6 py-4"><strong class="text-gray-900 dark:text-gray-100 dark:text-white">TV Search</strong></td>
+                        <td class="px-6 py-4">
+                            <span class="text-gray-700 dark:text-gray-300">
+                                Returns a list of NZBs matching a query, category, or TV ID. Filter by season, episode, or various database IDs.
+                            </span>
+                            <div class="mt-2">
+                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary-100 text-primary-800 dark:bg-primary-900/50 dark:text-primary-200">ID OPTIONS</span>
+                                <div class="mt-1 ml-2 text-sm text-gray-700 dark:text-gray-300">
+                                    <code class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:bg-gray-700 dark:text-red-400">rid=25056</code> - TVRage<br>
+                                    <code class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:bg-gray-700 dark:text-red-400">tvdbid=153021</code> - TVDB<br>
+                                    <code class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:bg-gray-700 dark:text-red-400">traktid=1393</code> - Trakt<br>
+                                    <code class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:bg-gray-700 dark:text-red-400">tvmazeid=73</code> - TVMaze<br>
+                                    <code class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:bg-gray-700 dark:text-red-400">imdbid=1520211</code> - IMDB<br>
+                                    <code class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:bg-gray-700 dark:text-red-400">tmdbid=1402</code> - TMDB
+                                </div>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">
+                            {% if layout.signed_in %}
+                            <a href="{{ base }}/api/v1/api?t=tvsearch&q=law%20and%20order&season=7&ep=12&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                <i class="fa fa-external-link-alt mr-1"></i>
+                                <code class="text-primary-700 dark:text-primary-400">?t=tvsearch&amp;q=law and order&amp;season=7&amp;ep=12</code>
+                            </a>
+                            {% else %}
+                            <span class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700">
+                                <code>?t=tvsearch&amp;q=law and order&amp;season=7&amp;ep=12</code>
+                            </span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr class="hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-700">
+                        <td class="px-6 py-4"><strong class="text-gray-900 dark:text-gray-100 dark:text-white">Movies</strong></td>
+                        <td class="px-6 py-4">
+                            <span class="text-gray-700 dark:text-gray-300">
+                                Returns a list of NZBs matching a query, an IMDB ID and optionally a category.
+                            </span>
+                            <div class="mt-2">
+                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary-100 text-primary-800 dark:bg-primary-900/50 dark:text-primary-200">OPTIONS</span>
+                                <div class="mt-1 ml-2 text-sm text-gray-700 dark:text-gray-300">
+                                    <code class="px-2 py-1 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:bg-gray-700 dark:text-red-400">extended=1</code> - Return extended information in results
+                                </div>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">
+                            {% if layout.signed_in %}
+                            <a href="{{ base }}/api/v1/api?t=movie&imdbid=1418646&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                <i class="fa fa-external-link-alt mr-1"></i>
+                                <code class="text-primary-700 dark:text-primary-400">?t=movie&amp;imdbid=1418646</code>
+                            </a>
+                            {% else %}
+                            <span class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700">
+                                <code>?t=movie&amp;imdbid=1418646</code>
+                            </span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr class="hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-700">
+                        <td class="px-6 py-4"><strong class="text-gray-900 dark:text-gray-100 dark:text-white">Music / Audio</strong></td>
+                        <td class="px-6 py-4">
+                            <span class="text-gray-700 dark:text-gray-300">
+                                Returns NZBs in music categories matching artist/title text (<code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">q</code>).
+                                Same as general search, you may filter by category, age, size, and group.
+                            </span>
+                            <div class="mt-2">
+                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary-100 text-primary-800 dark:bg-primary-900/50 dark:text-primary-200">ALIASES</span>
+                                <div class="mt-1 ml-2 text-sm text-gray-700 dark:text-gray-300">
+                                    <code class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:text-gray-700 dark:text-red-400">t=music</code> or <code class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:text-gray-700 dark:text-red-400">t=audio</code>
+                                </div>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">
+                            {% if layout.signed_in %}
+                            <a href="{{ base }}/api/v1/api?t=music&q=pink%20floyd&cat=3000&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                <i class="fa fa-external-link-alt mr-1"></i>
+                                <code class="text-primary-700 dark:text-primary-400">?t=music&amp;q=…&amp;cat=3000</code>
+                            </a>
+                            {% else %}
+                            <span class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700">
+                                <code>?t=music&amp;q=&lt;artist or title&gt;&amp;cat=3000</code>
+                            </span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr class="hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-700">
+                        <td class="px-6 py-4"><strong class="text-gray-900 dark:text-gray-100 dark:text-white">Books</strong></td>
+                        <td class="px-6 py-4">
+                            <span class="text-gray-700 dark:text-gray-300">
+                                Returns NZBs in book categories matching author/title text (<code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">q</code>).
+                                Optional filters: category, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">maxage</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">minsize</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">group</code>.
+                            </span>
+                            <div class="mt-2">
+                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary-100 text-primary-800 dark:bg-primary-900/50 dark:text-primary-200">ALIASES</span>
+                                <div class="mt-1 ml-2 text-sm text-gray-700 dark:text-gray-300">
+                                    <code class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:text-gray-700 dark:text-red-400">t=book</code> or <code class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:text-gray-700 dark:text-red-400">t=b</code>
+                                </div>
+                            </div>
+                        </td>
+                        <td class="px-6 py-4">
+                            {% if layout.signed_in %}
+                            <a href="{{ base }}/api/v1/api?t=book&q=science%20fiction&cat=7000&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                <i class="fa fa-external-link-alt mr-1"></i>
+                                <code class="text-primary-700 dark:text-primary-400">?t=book&amp;q=…&amp;cat=7000</code>
+                            </a>
+                            {% else %}
+                            <span class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700">
+                                <code>?t=book&amp;q=&lt;author or title&gt;&amp;cat=7000</code>
+                            </span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr class="hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-700">
+                        <td class="px-6 py-4"><strong class="text-gray-900 dark:text-gray-100 dark:text-white">Anime</strong></td>
+                        <td class="px-6 py-4">
+                            <span class="text-gray-700 dark:text-gray-300">
+                                Returns NZBs in anime categories. Provide a title search (<code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">q</code>), internal <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">anidbid</code>, and/or <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">anilistid</code> (at least one required).
+                                Optional: <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">cat</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">maxage</code>.
+                            </span>
+                        </td>
+                        <td class="px-6 py-4">
+                            <div class="flex flex-col gap-2">
+                                {% if layout.signed_in %}
+                                <a href="{{ base }}/api/v1/api?t=anime&q=attack%20on%20titan&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                    <i class="fa fa-external-link-alt mr-1"></i>
+                                    <code class="text-primary-700 dark:text-primary-400">?t=anime&amp;q=attack on titan</code>
+                                </a>
+                                <a href="{{ base }}/api/v1/api?t=anime&anilistid=21&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                    <i class="fa fa-external-link-alt mr-1"></i>
+                                    <code class="text-primary-700 dark:text-primary-400">?t=anime&amp;anilistid=21</code>
+                                </a>
+                                {% else %}
+                                <span class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700">
+                                    <code>?t=anime&amp;q=&lt;title&gt;</code>
+                                </span>
+                                <span class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700">
+                                    <code>?t=anime&amp;anidbid=&lt;id&gt;</code> or <code>?t=anime&amp;anilistid=&lt;id&gt;</code>
+                                </span>
+                                {% endif %}
+                            </div>
+                        </td>
+                    </tr>
+                    <tr class="hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-700">
+                        <td class="px-6 py-4"><strong class="text-gray-900 dark:text-gray-100 dark:text-white">Details</strong></td>
+                        <td class="px-6 py-4"><span class="text-gray-700 dark:text-gray-300">Returns detailed information about an NZB.</span></td>
+                        <td class="px-6 py-4">
+                            {% if layout.signed_in %}
+                            <a href="{{ base }}/api/v1/api?t=details&id=9ca52909ba9b9e5e6758d815fef4ecda&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                <i class="fa fa-external-link-alt mr-1"></i>
+                                <code class="text-primary-700 dark:text-primary-400">?t=details&amp;id=9ca52909ba9b9e5e6758d815fef4ecda</code>
+                            </a>
+                            {% else %}
+                            <span class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700">
+                                <code>?t=details&amp;id=&lt;guid&gt;</code>
+                            </span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr class="hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-700">
+                        <td class="px-6 py-4"><strong class="text-gray-900 dark:text-gray-100 dark:text-white">Info</strong></td>
+                        <td class="px-6 py-4">
+                            <span class="text-gray-700 dark:text-gray-300">
+                                Returns NFO contents for an NZB. Retrieve the NFO as file by specifying o=file in the request URI.
+                            </span>
+                        </td>
+                        <td class="px-6 py-4">
+                            {% if layout.signed_in %}
+                            <a href="{{ base }}/api/v1/api?t=info&id=9ca52909ba9b9e5e6758d815fef4ecda&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                <i class="fa fa-external-link-alt mr-1"></i>
+                                <code class="text-primary-700 dark:text-primary-400">?t=info&amp;id=9ca52909ba9b9e5e6758d815fef4ecda</code>
+                            </a>
+                            {% else %}
+                            <span class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700">
+                                <code>?t=info&amp;id=&lt;guid&gt;</code>
+                            </span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr class="hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-700">
+                        <td class="px-6 py-4"><strong class="text-gray-900 dark:text-gray-100 dark:text-white">Get</strong></td>
+                        <td class="px-6 py-4"><span class="text-gray-700 dark:text-gray-300">Downloads the NZB file associated with an ID.</span></td>
+                        <td class="px-6 py-4">
+                            {% if layout.signed_in %}
+                            <a href="{{ base }}/api/v1/api?t=get&id=9ca52909ba9b9e5e6758d815fef4ecda&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                                <i class="fa fa-external-link-alt mr-1"></i>
+                                <code class="text-primary-700 dark:text-primary-400">?t=get&amp;id=9ca52909ba9b9e5e6758d815fef4ecda</code>
+                            </a>
+                            {% else %}
+                            <span class="inline-flex items-center px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700">
+                                <code>?t=get&amp;id=&lt;guid&gt;</code>
+                            </span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <h4 class="text-lg font-semibold mt-6 mb-3 text-gray-900 dark:text-gray-100 dark:text-white flex items-center">
+            <i class="fa fa-sort-amount-down mr-2 text-gray-600 dark:text-gray-400"></i>Sorting Results (v1)
+        </h4>
+        <p class="text-gray-700 dark:text-gray-300 mb-4 dark:text-gray-300">
+            Search-style endpoints support <code class="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-xs text-red-600 dark:bg-gray-700 dark:text-red-400">sort=field_direction</code>.
+            Allowed fields: <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">cat</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">name</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">size</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">files</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">stats</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">posted</code>. Direction is <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">asc</code> or <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">desc</code>.
+        </p>
+        <div class="surface-panel-alt rounded-lg border shadow-sm mb-4">
+            <div class="p-6">
+                <h5 class="text-base font-semibold mb-2 text-gray-900 dark:text-gray-100 dark:text-white">Sort request examples</h5>
+                <div class="flex flex-col gap-2">
+                    {% if layout.signed_in %}
+                        <a href="{{ base }}/api/v1/api?t=search&q=ubuntu&sort=posted_desc&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                            <i class="fa fa-external-link-alt mr-1"></i>
+                            <code class="text-primary-700 dark:text-primary-400">?t=search&amp;q=ubuntu&amp;sort=posted_desc</code>
+                        </a>
+                        <a href="{{ base }}/api/v1/api?t=search&q=ubuntu&sort=name_asc&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                            <i class="fa fa-external-link-alt mr-1"></i>
+                            <code class="text-primary-700 dark:text-primary-400">?t=search&amp;q=ubuntu&amp;sort=name_asc</code>
+                        </a>
+                        <a href="{{ base }}/api/v1/api?t=search&q=ubuntu&sort=size_desc&limit=50&offset=0&apikey={{ token }}" class="inline-flex items-center px-3 py-1.5 border border-primary-300 rounded text-xs font-medium text-primary-700 bg-white dark:bg-gray-800 hover:bg-primary-50 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 dark:bg-gray-700 dark:text-primary-400 dark:border-primary-600 dark:hover:bg-gray-600">
+                            <i class="fa fa-external-link-alt mr-1"></i>
+                            <code class="text-primary-700 dark:text-primary-400">?t=search&amp;q=ubuntu&amp;sort=size_desc&amp;limit=50</code>
+                        </a>
+                    {% else %}
+                        <code class="block bg-gray-100 dark:bg-gray-800 p-2 rounded text-sm text-red-600 dark:bg-gray-700 dark:text-red-400">?t=search&amp;q=ubuntu&amp;sort=posted_desc</code>
+                        <code class="block bg-gray-100 dark:bg-gray-800 p-2 rounded text-sm text-red-600 dark:bg-gray-700 dark:text-red-400">?t=search&amp;q=ubuntu&amp;sort=name_asc</code>
+                        <code class="block bg-gray-100 dark:bg-gray-800 p-2 rounded text-sm text-red-600 dark:bg-gray-700 dark:text-red-400">?t=search&amp;q=ubuntu&amp;sort=size_desc&amp;limit=50&amp;offset=0</code>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+        <div class="surface-panel-alt rounded-lg border shadow-sm mb-4">
+            <div class="p-6">
+                <h5 class="text-base font-semibold mb-2 text-gray-900 dark:text-gray-100 dark:text-white">XML sort response snippet (<code class="text-xs">sort=size_desc</code>)</h5>
+                <pre class="bg-gray-100 dark:bg-gray-800 p-3 rounded text-xs text-gray-800 dark:text-gray-200 overflow-x-auto"><code>&lt;item&gt;
+  &lt;title&gt;Ubuntu ISO x64&lt;/title&gt;
+  &lt;newznab:attr name="size" value="734003200"/&gt;
+&lt;/item&gt;
+&lt;item&gt;
+  &lt;title&gt;Ubuntu ISO x86&lt;/title&gt;
+  &lt;newznab:attr name="size" value="367001600"/&gt;
+&lt;/item&gt;</code></pre>
+                <p class="text-sm text-gray-600 dark:text-gray-400 mt-2 mb-0">Larger release appears first because <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">size_desc</code> sorts descending.</p>
+            </div>
+        </div>
+        <h4 class="text-lg font-semibold mt-6 mb-3 text-gray-900 dark:text-gray-100 dark:text-white flex items-center">
+            <i class="fa fa-filter mr-2 text-gray-600 dark:text-gray-400"></i>HTTP QUERY Method
+        </h4>
+        <p class="text-gray-700 dark:text-gray-300 mb-4">
+            The API also accepts the HTTP <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">QUERY</code> method (RFC 10008), which sends the same parameters as a JSON body instead of the URL.
+            Only read-only functions are available over QUERY: <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">search</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">tvsearch</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">movie</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">music</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">book</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">anime</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">details</code>, <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">caps</code> and <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">nfo</code> (and their short aliases).
+            <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">get</code> and <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">nzbadd</code> return error 203; keep using <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">GET</code>/<code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">POST</code> for them.
+        </p>
+        <div class="surface-panel-alt rounded-lg border shadow-sm mb-4">
+            <div class="p-6">
+                <h5 class="text-base font-semibold mb-2 text-gray-900 dark:text-gray-100">QUERY request example</h5>
+                <pre class="bg-gray-100 dark:bg-gray-800 p-3 rounded text-xs text-gray-800 dark:text-gray-200 overflow-x-auto"><code>curl -X QUERY {{ base }}/api/v1/api \
+  -H 'Content-Type: application/json' \
+  -d '{"t":"search","apikey":"&lt;your api key&gt;","q":"linux","cat":[2000,5030]}'</code></pre>
+                <p class="text-sm text-gray-600 dark:text-gray-400 mt-2 mb-0">
+                    <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">Content-Type</code> must be <code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">application/json</code> and the body a JSON object of at most 8,192 bytes with string or number values (<code class="px-1 bg-gray-100 dark:bg-gray-800 rounded text-xs">cat</code> may be a list).
+                    Do not send the same parameter in both the URL and the body.
+                </p>
+            </div>
+        </div>
+
+        <h4 class="text-lg font-semibold mt-6 mb-3 text-gray-900 dark:text-gray-100 dark:text-white flex items-center">
+            <i class="fa fa-file-code mr-2 text-gray-600 dark:text-gray-400"></i>Output Format
+        </h4>
+        <p class="text-gray-700 dark:text-gray-300 mb-4 dark:text-gray-300">Select your preferred output format (not applicable to functions which return an NZB/NFO file).</p>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="surface-panel-alt rounded-lg border shadow-sm h-full">
+                <div class="p-6">
+                    <h5 class="text-lg font-semibold mb-2 text-gray-900 dark:text-gray-100 dark:text-white flex items-center">
+                        <i class="fa fa-code mr-2 text-primary-600 dark:text-primary-400"></i>XML (default)
+                    </h5>
+                    <p class="text-gray-700 dark:text-gray-300 mb-3 dark:text-gray-300">Returns the data in an XML document.</p>
+                    <code class="block bg-gray-100 dark:bg-gray-800 p-2 rounded text-sm text-red-600 dark:bg-gray-700 dark:text-red-400">?t=search&amp;q=linux&amp;o=xml</code>
+                </div>
+            </div>
+            <div class="surface-panel-alt rounded-lg border shadow-sm h-full">
+                <div class="p-6">
+                    <h5 class="text-lg font-semibold mb-2 text-gray-900 dark:text-gray-100 dark:text-white flex items-center">
+                        <i class="fa fa-brackets-curly mr-2 text-primary-600 dark:text-primary-400"></i>JSON
+                    </h5>
+                    <p class="text-gray-700 dark:text-gray-300 mb-3 dark:text-gray-300">Returns the data in a JSON object.</p>
+                    <code class="block bg-gray-100 dark:bg-gray-800 p-2 rounded text-sm text-red-600 dark:bg-gray-700 dark:text-red-400">?t=search&amp;q=linux&amp;o=json</code>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

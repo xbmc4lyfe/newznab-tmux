@@ -78,34 +78,40 @@ async fn downloads_today(ctx: &Ctx, user_id: i64) -> Result<i64> {
     .await?)
 }
 
-/// The `/getnzb` route: `r` carries the token. Session sign-in arrives with the site's `webkit`.
-pub async fn web(ctx: &Ctx, request: &ApiRequest, path_guid: Option<&str>) -> Result<Reply> {
-    if request.method == "POST" {
-        // The web group's CSRF check stops a POST with no session token before the controller.
-        return Ok(Reply::new(419, "text/html; charset=utf-8", "Page Expired"));
-    }
+/// The `/getnzb` route: the signed-in user, else `r` carries the token. The web stack around it has
+/// already refused a POST with no CSRF token.
+pub async fn web(
+    ctx: &Ctx,
+    request: &ApiRequest,
+    session_token: Option<&str>,
+    path_guid: Option<&str>,
+) -> Result<Reply> {
     let input = &request.input;
-    let Some(token) = input.get("r") else {
-        return Ok(web_headers(xml_error(200, "")));
+    let user = match session_token {
+        Some(token) => auth::find_by_token(ctx, token).await?,
+        None => {
+            let Some(token) = input.get("r") else {
+                return Ok(xml_error(200, ""));
+            };
+            auth::find_verified(ctx, token.as_str().unwrap_or_default()).await?
+        }
     };
-    let Some(user) = auth::find_verified(ctx, token.as_str().unwrap_or_default()).await? else {
-        return Ok(web_headers(xml_error(100, "")));
+    let Some(user) = user else {
+        return Ok(xml_error(100, ""));
     };
     let id = match path_guid {
         Some(guid) if !input.has("id") => guid.to_owned(),
         _ => scalar_id(input),
     };
-    Ok(web_headers(
-        download(ctx, request, &user, &id, Errors::Xml, false).await?,
-    ))
-}
-
-/// What the web middleware group adds to every response it lets through.
-fn web_headers(reply: Reply) -> Reply {
-    reply
-        .header("referrer-policy", "strict-origin-when-cross-origin")
-        .header("x-content-type-options", "nosniff")
-        .header("x-frame-options", "SAMEORIGIN")
+    download(
+        ctx,
+        request,
+        &user,
+        &id,
+        Errors::Xml,
+        session_token.is_some(),
+    )
+    .await
 }
 
 /// The controller from `authenticateUser` on, with the user already resolved.

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="color-scheme" content="light dark">
+    <meta name="csrf-token" content="{{ layout.csrf }}">
+    <meta name="theme-preference" content="system">
+    {% include "theme_init.html" %}
+    <title>{{ layout.app_name }}</title>
+    {% for href in layout.assets.styles %}<link rel="stylesheet" href="{{ href }}" nonce="{{ layout.nonce }}">
+    {% endfor %}
+    {% for src in layout.assets.scripts %}<script type="module" src="{{ src }}" nonce="{{ layout.nonce }}"></script>
+    {% endfor %}
+    {% if let Some(captcha) = layout.captcha %}<script src="{{ captcha.script() }}" nonce="{{ layout.nonce }}" async defer></script>{% endif %}
+</head>
+<body class="guest-view-stack font-sans antialiased pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)]">
+    <main id="main-content" tabindex="-1">
+        {% block content %}{% endblock %}
+    </main>
+    {% include "chrome_widgets.html" %}
+    <div id="flash-messages-data" data-messages="{{ layout.flash_json }}" class="hidden"></div>
+</body>
+</html>

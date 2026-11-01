@@ -61,7 +61,8 @@
   "setup": [
    "INSERT INTO release_nzb_contents (guid, releases_id, body, source_digest, generation, decoded_bytes, created_at, updated_at) VALUES ('bbbb000000000000000000000000000000000002', 2, FROM_BASE64('H4sIAAAAAAAA/12OTQ7CIBCF9z0Fmb1idy6AsvIE9QCFjqSmQNMBUz29RZuauHpf8n7yRLP4kT1wpiEGCfXxBAyDjf0QnIRrezmcoVGVCC+jxG0YkU2REs4SOm2A9V3CtQWMsrmjTRIIlHBzzBNtqpzgX9h0NQidx5B+xMwzIX2WQvam7NegvF4E3xJqp7XFy5O/P1b3sDu8/K3ehlej2N0AAAA='), '0a0e0db53e7fcf30880f76fc913a822ca1ea5d926760eb5acecc532d40bbdc55', REPEAT('a',32), 221, NOW(), NOW());"
   ],
-  "ignore_body": true
+  "ignore_body": true,
+  "status_only": true
  },
  {
   "name": "getnzb_del",
@@ -101,7 +102,8 @@
   "name": "getnzb_method",
   "method": "DELETE",
   "path": "/getnzb",
-  "ignore_body": true
+  "ignore_body": true,
+  "status_only": true
  },
  {
   "name": "v1_get_no_id",
