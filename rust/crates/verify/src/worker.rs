@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -704,9 +704,11 @@ pub async fn run_role(ctx: Ctx, args: RoleArgs, stop: Shutdown, verify: Verify) 
     let last = WorkerLocks::new(&verify.db, &verify.config)
         .await?
         .last_slot();
+    let failed = Arc::new(AtomicBool::new(false));
     let mut tasks = JoinSet::new();
     for slot in first..=last {
-        let (worker, ctx, stop) = (worker.clone(), ctx.clone(), stop.clone());
+        let (worker, ctx, stop, failed) =
+            (worker.clone(), ctx.clone(), stop.clone(), failed.clone());
         let idle = Duration::from_secs(args.idle_seconds);
         let once = args.once;
         tasks.spawn(async move {
@@ -727,7 +729,11 @@ pub async fn run_role(ctx: Ctx, args: RoleArgs, stop: Shutdown, verify: Verify) 
                         continue;
                     }
                     Err(failure) => {
-                        error!(slot, error = format!("{failure:#}"), "can't mark this worker busy");
+                        error!(
+                            slot,
+                            error = format!("{failure:#}"),
+                            "can't mark this worker busy"
+                        );
                         if once {
                             return;
                         }
@@ -743,6 +749,7 @@ pub async fn run_role(ctx: Ctx, args: RoleArgs, stop: Shutdown, verify: Verify) 
                         error = format!("{failure:#}"),
                         "verification run failed"
                     );
+                    failed.store(true, Ordering::Relaxed);
                 }
                 if once {
                     return;
@@ -773,7 +780,15 @@ pub async fn run_role(ctx: Ctx, args: RoleArgs, stop: Shutdown, verify: Verify) 
             }
         });
     }
-    while tasks.join_next().await.is_some() {}
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(failure) = joined {
+            error!(error = %failure, "a verification task stopped");
+            failed.store(true, Ordering::Relaxed);
+        }
+    }
+    if args.once && failed.load(Ordering::Relaxed) {
+        bail!("A verification task failed.");
+    }
     Ok(())
 }
 
