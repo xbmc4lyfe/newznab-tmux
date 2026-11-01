@@ -166,7 +166,10 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
                         continue;
                     }
                     Err(failure) => {
-                        error!(error = format!("{failure:#}"), "can't mark this worker busy");
+                        error!(
+                            error = format!("{failure:#}"),
+                            "can't mark this worker busy"
+                        );
                         if once {
                             return;
                         }
