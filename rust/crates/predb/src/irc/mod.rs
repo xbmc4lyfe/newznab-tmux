@@ -119,18 +119,30 @@ async fn supervise_one(ctx: Ctx, network: String, stop: Shutdown) {
         if stop.requested() {
             return;
         }
-        if ctx.paused().await.unwrap_or(false) {
-            // A drain: stay down until it lifts. A deploy's stop signal ends the wait.
-            tokio::select! {
-                () = stop.token().cancelled_owned() => return,
-                () = tokio::time::sleep(Duration::from_secs(5)) => continue,
+        let busy = match nntmux_runtime::busy::enter(&ctx, "predb").await {
+            Ok(Some(busy)) => busy,
+            // A drain or an unknown state: stay down until it lifts. A deploy's stop signal ends
+            // the wait.
+            outcome => {
+                if let Err(error) = outcome {
+                    tracing::warn!(
+                        network,
+                        error = format!("{error:#}"),
+                        "scraper not admitted"
+                    );
+                }
+                tokio::select! {
+                    () = stop.token().cancelled_owned() => return,
+                    () = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                }
             }
-        }
+        };
         let started = Instant::now();
         let run = {
             let (ctx, network, stop) = (ctx.clone(), network.clone(), stop.clone());
             tokio::spawn(async move { scrape_one(&ctx, &network, &stop).await }).await
         };
+        drop(busy);
         if stop.requested() {
             return;
         }

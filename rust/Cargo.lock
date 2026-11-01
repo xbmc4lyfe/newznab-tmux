@@ -2320,6 +2320,9 @@ dependencies = [
  "anyhow",
  "clap",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
@@ -2364,6 +2367,8 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "metrics",
+ "metrics-exporter-prometheus",
  "nntmux-testkit",
  "nntmux-yenc",
  "rand 0.9.5",
@@ -2545,9 +2550,11 @@ dependencies = [
  "redis",
  "regex",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha1 0.10.7",
+ "sha2 0.10.9",
  "sqlx",
  "tokio",
  "totp-rs",

@@ -16,6 +16,7 @@ mod search;
 mod statics;
 mod tv;
 pub mod validate;
+mod webauthn;
 
 use axum::Router;
 use nntmux_runtime::Ctx;
@@ -23,6 +24,7 @@ use nntmux_runtime::Ctx;
 pub fn router() -> Router<Ctx> {
     let pages = Router::new()
         .merge(auth::router())
+        .merge(auth::passkeys_router())
         .merge(pages::router())
         .merge(invitations::router())
         .merge(profile::router())
