@@ -84,7 +84,7 @@ fn format_media_id(id: &str) -> Option<String> {
     }
 }
 
-/// One of `getEpisodeSummaryWithFallback`'s ids.
+/// The ids `episode_with_fallback` tries.
 #[derive(Clone, Copy, Debug)]
 pub struct EpisodeIds<'a> {
     pub trakt: i64,
@@ -333,69 +333,54 @@ impl Trakt {
         }))
     }
 
-    async fn episode_summary(
-        &self,
-        show: &str,
-        id_type: &str,
-        season: i64,
-        episode: i64,
-    ) -> Result<Option<Value>> {
-        if season < 0 || episode < 0 {
-            return Ok(None);
-        }
-        let id = php::trim(show);
-        if id.is_empty() {
-            return Ok(None);
-        }
-        let id = if id_type == "imdb" {
-            let Some(imdb) = format_imdb_id(id) else {
-                return Ok(None);
-            };
-            imdb
-        } else {
-            id.to_owned()
-        };
-        self.cached(
-            &format!("trakt_episode_{id_type}_{id}_{season}_{episode}_full"),
-            &format!("shows/{id}/seasons/{season}/episodes/{episode}"),
-            &[("extended", "full".to_owned())],
-        )
-        .await
-    }
-
     pub async fn episode_by_trakt_id(
         &self,
         trakt: i64,
         season: i64,
         episode: i64,
     ) -> Result<Option<Value>> {
-        if trakt <= 0 {
+        if trakt <= 0 || season < 0 || episode < 0 {
             return Ok(None);
         }
-        self.episode_summary(&trakt.to_string(), "trakt", season, episode)
-            .await
+        self.cached(
+            &format!("trakt_episode_trakt_{trakt}_{season}_{episode}_full"),
+            &format!("shows/{trakt}/seasons/{season}/episodes/{episode}"),
+            &[("extended", "full".to_owned())],
+        )
+        .await
     }
 
-    /// Tries the Trakt id, then TMDB, TVDB and IMDb.
+    /// Tries the Trakt id, then the show found by its TMDB, TVDB or IMDb id. The episode endpoint
+    /// only takes Trakt's own ids, so the others go through the ID lookup first.
     pub async fn episode_with_fallback(
         &self,
         ids: EpisodeIds<'_>,
         season: i64,
         episode: i64,
     ) -> Result<Option<Value>> {
-        for (id_type, id) in [("trakt", ids.trakt), ("tmdb", ids.tmdb), ("tvdb", ids.tvdb)] {
-            if id > 0
-                && let Some(found) = self
-                    .episode_summary(&id.to_string(), id_type, season, episode)
+        if let Some(found) = self.episode_by_trakt_id(ids.trakt, season, episode).await? {
+            return Ok(Some(found));
+        }
+        let tmdb = ids.tmdb.to_string();
+        let tvdb = ids.tvdb.to_string();
+        for (id_type, id, usable) in [
+            ("tmdb", tmdb.as_str(), ids.tmdb > 0),
+            ("tvdb", tvdb.as_str(), ids.tvdb > 0),
+            ("imdb", ids.imdb, format_imdb_id(ids.imdb).is_some()),
+        ] {
+            if !usable {
+                continue;
+            }
+            let Some(found) = self.lookup_show_ids(id, id_type).await? else {
+                continue;
+            };
+            if found.trakt != ids.trakt
+                && let Some(episode) = self
+                    .episode_by_trakt_id(found.trakt, season, episode)
                     .await?
             {
-                return Ok(Some(found));
+                return Ok(Some(episode));
             }
-        }
-        if format_imdb_id(ids.imdb).is_some() {
-            return self
-                .episode_summary(ids.imdb, "imdb", season, episode)
-                .await;
         }
         Ok(None)
     }

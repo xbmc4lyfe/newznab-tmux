@@ -625,10 +625,12 @@ async fn find_existing(db: &MySqlPool, show: &Show) -> Result<i64> {
         if id > 0 {
             let column = site.column();
             let statement = format!(
-                "SELECT CAST(id AS SIGNED) FROM videos WHERE {column} = ? ORDER BY id LIMIT 1"
+                "SELECT CAST(id AS SIGNED) FROM videos WHERE {column} = ? AND type = ? \
+                 ORDER BY id LIMIT 1"
             );
             let found: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
                 .bind(id)
+                .bind(TYPE_TV)
                 .fetch_optional(db)
                 .await?;
             if let Some(found) = found {

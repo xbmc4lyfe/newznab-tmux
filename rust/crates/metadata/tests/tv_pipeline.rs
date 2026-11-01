@@ -6,13 +6,14 @@ use nntmux_metadata::cache::Cache;
 use nntmux_metadata::candidates::tv_status;
 use nntmux_metadata::clients::fanart::Fanart;
 use nntmux_metadata::clients::tmdb::Tmdb;
-use nntmux_metadata::clients::trakt::Trakt;
+use nntmux_metadata::clients::trakt::{EpisodeIds, Trakt};
 use nntmux_metadata::clients::tvdb::Tvdb;
 use nntmux_metadata::clients::tvmaze::TvMaze;
 use nntmux_metadata::images::Images;
 use nntmux_metadata::services::Services;
 use nntmux_metadata::tv::commands::{TvRepairLinksOptions, repair_links};
 use nntmux_metadata::tv::providers::{TvMazeProvider, TvProvider, TvdbProvider};
+use nntmux_metadata::tv::store::{Show, add_show};
 use nntmux_metadata::tv::{Candidate, Outcome, Pipeline, RunState};
 use nntmux_metadata::{LookupMode, MetadataSettings, Renamed};
 use nntmux_testkit::TestDb;
@@ -647,5 +648,73 @@ async fn repair_links_normalizes_and_is_idempotent() {
             .await
             .is_err()
     );
+    h.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_id_matches_stay_on_tv_rows() {
+    let Some(h) = harness("").await else { return };
+    let film = sqlx::query(
+        "INSERT INTO videos (type, title, started, tmdb) VALUES (1, 'A Film', '2011-01-01', 55)",
+    )
+    .execute(&h.db.pool)
+    .await
+    .unwrap()
+    .last_insert_id() as i64;
+    let show = Show {
+        title: "A Show".to_owned(),
+        started: "2012-01-01".to_owned(),
+        tmdb: 55,
+        ..Show::default()
+    };
+    let added = add_show(&h.services, &show).await.unwrap();
+    assert_ne!(
+        added, film,
+        "a film with the same TMDB id is another entity"
+    );
+    h.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn trakt_resolves_external_ids_before_asking_for_an_episode() {
+    let Some(h) = harness("").await else { return };
+    let cache = h.services.cache.clone();
+    let mut trakt = Trakt::new(Client::new(), cache, "key".to_owned(), 5, 1, 1);
+    trakt.base_url = h.mock.uri();
+    trakt.throttled = false;
+    Mock::given(path("/search/tmdb/55"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"show": {"ids": {"trakt": 900, "tmdb": 55}}},
+        ])))
+        .mount(&h.mock)
+        .await;
+    // Trakt id 55 is some other show: asking for it would store that show's episode.
+    Mock::given(path("/shows/55/seasons/1/episodes/2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"season": 1, "number": 2, "title": "Wrong"})),
+        )
+        .expect(0)
+        .mount(&h.mock)
+        .await;
+    Mock::given(path("/shows/900/seasons/1/episodes/2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"season": 1, "number": 2, "title": "Right"})),
+        )
+        .mount(&h.mock)
+        .await;
+    let ids = EpisodeIds {
+        trakt: 0,
+        tmdb: 55,
+        tvdb: 0,
+        imdb: "",
+    };
+    let episode = trakt
+        .episode_with_fallback(ids, 1, 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(episode["title"], "Right");
     h.db.drop_database().await.unwrap();
 }
