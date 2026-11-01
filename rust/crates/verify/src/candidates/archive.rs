@@ -9,6 +9,7 @@ use regex::Regex;
 use sqlx::{Connection, MySql, MySqlConnection, QueryBuilder};
 
 use super::deferrals::unlocked_by_raised_budget;
+use super::expiry::owed_partial_attempt;
 use super::{Candidate, now, release_late_article_fence};
 use crate::collections::{self, ELIGIBLE, STATUS_INSERTED};
 use crate::context::Verify;
@@ -874,7 +875,12 @@ async fn archive_locked(
         (Some(row), ..) if new_articles => arrival.max(row.last_unique_at),
         (Some(row), ..) => row.last_unique_at,
     };
-    let expired = last_unique_at < now() - TimeDelta::hours(config.expiry_hours);
+    // A replay must not discard an upload still owed its partial attempt, which expiry itself leaves.
+    let owed = config.partial_after_hours > 0
+        && existing
+            .as_ref()
+            .is_some_and(|row| owed_partial_attempt(verify, row));
+    let expired = last_unique_at < now() - TimeDelta::hours(config.expiry_hours) && !owed;
     let delta = (if expired { 0 } else { size })
         - existing.as_ref().map_or(0, |row| row.manifest_bytes)
         - previous.as_ref().map_or(0, |row| row.manifest_bytes)

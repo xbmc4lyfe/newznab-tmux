@@ -162,7 +162,7 @@ async fn expirable_ids(
 
 /// A stalled upload not yet tried as a partial, or queued for that try, which expiry must leave: for
 /// one expiry window past its hold, so a promotion backlog can't keep inventory indefinitely.
-fn owed_partial_attempt(verify: &Verify, row: &Candidate) -> bool {
+pub(super) fn owed_partial_attempt(verify: &Verify, row: &Candidate) -> bool {
     row.last_unique_at >= owed_partial_cutoff(&verify.config)
         && ((row.status == "waiting_upload"
             && !row

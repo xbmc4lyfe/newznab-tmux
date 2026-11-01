@@ -748,3 +748,33 @@ async fn a_collection_with_a_usable_part_owed_verification_is_never_plain_delete
     assert_eq!(harness.count("parts").await?, 1);
     harness.finish().await
 }
+
+#[tokio::test]
+async fn a_replay_leaves_an_upload_still_owed_its_partial_attempt() -> Result<()> {
+    let Some(harness) = Harness::start().await? else {
+        return Ok(());
+    };
+    let first = harness.collection("e7", 1, &[("f1", 2, &[1])], 3).await?;
+    candidates::archive(&harness.verify, first).await?;
+    sqlx::query(
+        "UPDATE release_verification_candidates SET last_unique_at = UTC_TIMESTAMP() - INTERVAL 50 HOUR",
+    )
+    .execute(&harness.db())
+    .await?;
+    let replay = harness.collection("e7", 1, &[("f1", 2, &[1])], 3).await?;
+    sqlx::query(
+        "UPDATE collections SET last_seen_at = UTC_TIMESTAMP() - INTERVAL 50 HOUR WHERE id = ?",
+    )
+    .bind(replay)
+    .execute(&harness.db())
+    .await?;
+    candidates::archive(&harness.verify, replay).await?;
+    let (status, path): (String, String) =
+        sqlx::query_as("SELECT status, manifest_path FROM release_verification_candidates")
+            .fetch_one(&harness.db())
+            .await?;
+    assert_eq!(status, "waiting_upload");
+    assert_ne!(path, "");
+    assert_eq!(harness.count("collections").await?, 0);
+    harness.finish().await
+}
