@@ -1,0 +1,1198 @@
+[
+ {
+  "name": "rss_missing_token",
+  "path": "/rss/full-feed",
+  "expect": {
+   "status": 400,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [200] Missing parameter (api_token)"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"error\":\"Missing parameter (api_token)\"}",
+   "audit": []
+  }
+ },
+ {
+  "name": "rss_bad_token",
+  "path": "/rss/full-feed?api_token=nope",
+  "expect": {
+   "status": 401,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [100] Incorrect user credentials"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"error\":\"Incorrect user credentials\"}",
+   "audit": []
+  }
+ },
+ {
+  "name": "rss_disabled",
+  "path": "/rss/full-feed?api_token=tokendisabled",
+  "expect": {
+   "status": 403,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [101] Account suspended"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"error\":\"Account suspended\"}",
+   "audit": []
+  }
+ },
+ {
+  "name": "rss_limit_exact_passes",
+  "path": "/rss/full-feed?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_requests (users_id, request, timestamp) SELECT 1, 'x', NOW() FROM seq_1_to_10;"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "10849"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"7\"/><nntmux:apilimits apicurrent=\"10\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\" apioldesttime=\"Sun, 01 Nov 2026 13:49:17 +0000\"/><item><title>Partial.Release.2026-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/8888000000000000000000000000000000000008</guid><link>http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/8888000000000000000000000000000000000008#comments</comments><pubDate>Fri, 08 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\">8888000000000000000000000000000000000008</a></li>\n\t<li>Name: Partial.Release.2026-GRP</li>\n\t<li>Size: 1kB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: p@example.test</li>\n\t<li>Posted: 2026-05-08 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"1000\"/><nntmux:attr name=\"files\" value=\"10\"/><nntmux:attr name=\"articles_found\" value=\"80\"/><nntmux:attr name=\"articles_expected\" value=\"100\"/><nntmux:attr name=\"files_found\" value=\"8\"/><nntmux:attr name=\"files_expected\" value=\"10\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 08 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Adult.Release.XXX-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/7777000000000000000000000000000000000007</guid><link>http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/7777000000000000000000000000000000000007#comments</comments><pubDate>Thu, 07 May 2026 12:00:00 +0000</pubDate><category>XXX &gt; x264</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\">7777000000000000000000000000000000000007</a></li>\n\t<li>Name: Adult.Release.XXX-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/XXX > x264\">XXX > x264</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: x@example.test</li>\n\t<li>Posted: 2026-05-07 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"6040\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Thu, 07 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Anime.E01.1080p-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006</guid><link>http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006#comments</comments><pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate><category>TV &gt; Anime</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\">ffff000000000000000000000000000000000006</a></li>\n\t<li>Name: An.Anime.E01.1080p-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > Anime\">TV > Anime</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: anime@example.test</li>\n\t<li>Posted: 2026-05-06 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5070\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Wed, 06 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Author-A.Book.EPUB</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005</guid><link>http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005#comments</comments><pubDate>Tue, 05 May 2026 12:00:00 +0000</pubDate><category>Books &gt; Ebook</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\">eeee000000000000000000000000000000000005</a></li>\n\t<li>Name: An.Author-A.Book.EPUB</li>\n\t<li>Size: 1MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Books > Ebook\">Books > Ebook</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: book@example.test</li>\n\t<li>Posted: 2026-05-05 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"7020\"/><nntmux:attr name=\"size\" value=\"1048576\"/><nntmux:attr name=\"files\" value=\"1\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Tue, 05 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Game.PS4-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004</guid><link>http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004#comments</comments><pubDate>Mon, 04 May 2026 12:00:00 +0000</pubDate><category>Console &gt; PS4</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\">dddd000000000000000000000000000000000004</a></li>\n\t<li>Name: A.Game.PS4-GRP</li>\n\t<li>Size: 20GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Console > PS4\">Console > PS4</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: game@example.test</li>\n\t<li>Posted: 2026-05-04 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"1180\"/><nntmux:attr name=\"size\" value=\"21474836480\"/><nntmux:attr name=\"files\" value=\"90\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Mon, 04 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > HD\">TV > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Movie.2024.1080p.BluRay-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001</guid><link>http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments</comments><pubDate>Fri, 01 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" src=\"http://127.0.0.1:8765/covers/movies/no-cover.jpg\" width=\"120\" alt=\"A.Movie.2024.1080p.BluRay-GRP\" />\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\">aaaa000000000000000000000000000000000001</a></li>\n\t<li>Name: A.Movie.2024.1080p.BluRay-GRP</li>\n\t<li>Size: 5GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.moovee\">alt.binaries.moovee</a></li>\n\t<li>Poster: poster@example.test (Poster)</li>\n\t<li>Posted: 2026-05-01 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"5368709120\"/><nntmux:attr name=\"files\" value=\"40\"/><nntmux:attr name=\"imdb\" value=\"1234567\"/><nntmux:attr name=\"grabs\" value=\"3\"/><nntmux:attr name=\"comments\" value=\"2\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 01 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.moovee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/full-feed?api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_limit_over",
+  "path": "/rss/full-feed?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_requests (users_id, request, timestamp) SELECT 1, 'x', NOW() FROM seq_1_to_11;"
+  ],
+  "expect": {
+   "status": 429,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [500] Request limit reached (11/10)"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"error\":\"Request limit reached (11\\/10)\"}",
+   "audit": []
+  }
+ },
+ {
+  "name": "rss_full",
+  "path": "/rss/full-feed?api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "10800"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"7\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>Partial.Release.2026-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/8888000000000000000000000000000000000008</guid><link>http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/8888000000000000000000000000000000000008#comments</comments><pubDate>Fri, 08 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\">8888000000000000000000000000000000000008</a></li>\n\t<li>Name: Partial.Release.2026-GRP</li>\n\t<li>Size: 1kB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: p@example.test</li>\n\t<li>Posted: 2026-05-08 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"1000\"/><nntmux:attr name=\"files\" value=\"10\"/><nntmux:attr name=\"articles_found\" value=\"80\"/><nntmux:attr name=\"articles_expected\" value=\"100\"/><nntmux:attr name=\"files_found\" value=\"8\"/><nntmux:attr name=\"files_expected\" value=\"10\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 08 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Adult.Release.XXX-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/7777000000000000000000000000000000000007</guid><link>http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/7777000000000000000000000000000000000007#comments</comments><pubDate>Thu, 07 May 2026 12:00:00 +0000</pubDate><category>XXX &gt; x264</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\">7777000000000000000000000000000000000007</a></li>\n\t<li>Name: Adult.Release.XXX-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/XXX > x264\">XXX > x264</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: x@example.test</li>\n\t<li>Posted: 2026-05-07 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"6040\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Thu, 07 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Anime.E01.1080p-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006</guid><link>http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006#comments</comments><pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate><category>TV &gt; Anime</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\">ffff000000000000000000000000000000000006</a></li>\n\t<li>Name: An.Anime.E01.1080p-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > Anime\">TV > Anime</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: anime@example.test</li>\n\t<li>Posted: 2026-05-06 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5070\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Wed, 06 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Author-A.Book.EPUB</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005</guid><link>http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005#comments</comments><pubDate>Tue, 05 May 2026 12:00:00 +0000</pubDate><category>Books &gt; Ebook</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\">eeee000000000000000000000000000000000005</a></li>\n\t<li>Name: An.Author-A.Book.EPUB</li>\n\t<li>Size: 1MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Books > Ebook\">Books > Ebook</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: book@example.test</li>\n\t<li>Posted: 2026-05-05 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"7020\"/><nntmux:attr name=\"size\" value=\"1048576\"/><nntmux:attr name=\"files\" value=\"1\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Tue, 05 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Game.PS4-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004</guid><link>http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004#comments</comments><pubDate>Mon, 04 May 2026 12:00:00 +0000</pubDate><category>Console &gt; PS4</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\">dddd000000000000000000000000000000000004</a></li>\n\t<li>Name: A.Game.PS4-GRP</li>\n\t<li>Size: 20GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Console > PS4\">Console > PS4</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: game@example.test</li>\n\t<li>Posted: 2026-05-04 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"1180\"/><nntmux:attr name=\"size\" value=\"21474836480\"/><nntmux:attr name=\"files\" value=\"90\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Mon, 04 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > HD\">TV > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Movie.2024.1080p.BluRay-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001</guid><link>http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments</comments><pubDate>Fri, 01 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" src=\"http://127.0.0.1:8765/covers/movies/no-cover.jpg\" width=\"120\" alt=\"A.Movie.2024.1080p.BluRay-GRP\" />\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\">aaaa000000000000000000000000000000000001</a></li>\n\t<li>Name: A.Movie.2024.1080p.BluRay-GRP</li>\n\t<li>Size: 5GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.moovee\">alt.binaries.moovee</a></li>\n\t<li>Poster: poster@example.test (Poster)</li>\n\t<li>Posted: 2026-05-01 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"5368709120\"/><nntmux:attr name=\"files\" value=\"40\"/><nntmux:attr name=\"imdb\" value=\"1234567\"/><nntmux:attr name=\"grabs\" value=\"3\"/><nntmux:attr name=\"comments\" value=\"2\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 01 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.moovee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/full-feed?api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_full_post",
+  "method": "POST",
+  "path": "/rss/full-feed",
+  "headers": {
+   "Content-Type": "application/x-www-form-urlencoded"
+  },
+  "body": "api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "10800"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"7\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>Partial.Release.2026-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/8888000000000000000000000000000000000008</guid><link>http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/8888000000000000000000000000000000000008#comments</comments><pubDate>Fri, 08 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\">8888000000000000000000000000000000000008</a></li>\n\t<li>Name: Partial.Release.2026-GRP</li>\n\t<li>Size: 1kB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: p@example.test</li>\n\t<li>Posted: 2026-05-08 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"1000\"/><nntmux:attr name=\"files\" value=\"10\"/><nntmux:attr name=\"articles_found\" value=\"80\"/><nntmux:attr name=\"articles_expected\" value=\"100\"/><nntmux:attr name=\"files_found\" value=\"8\"/><nntmux:attr name=\"files_expected\" value=\"10\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 08 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Adult.Release.XXX-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/7777000000000000000000000000000000000007</guid><link>http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/7777000000000000000000000000000000000007#comments</comments><pubDate>Thu, 07 May 2026 12:00:00 +0000</pubDate><category>XXX &gt; x264</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\">7777000000000000000000000000000000000007</a></li>\n\t<li>Name: Adult.Release.XXX-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/XXX > x264\">XXX > x264</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: x@example.test</li>\n\t<li>Posted: 2026-05-07 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"6040\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Thu, 07 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Anime.E01.1080p-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006</guid><link>http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006#comments</comments><pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate><category>TV &gt; Anime</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\">ffff000000000000000000000000000000000006</a></li>\n\t<li>Name: An.Anime.E01.1080p-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > Anime\">TV > Anime</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: anime@example.test</li>\n\t<li>Posted: 2026-05-06 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5070\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Wed, 06 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Author-A.Book.EPUB</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005</guid><link>http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005#comments</comments><pubDate>Tue, 05 May 2026 12:00:00 +0000</pubDate><category>Books &gt; Ebook</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\">eeee000000000000000000000000000000000005</a></li>\n\t<li>Name: An.Author-A.Book.EPUB</li>\n\t<li>Size: 1MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Books > Ebook\">Books > Ebook</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: book@example.test</li>\n\t<li>Posted: 2026-05-05 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"7020\"/><nntmux:attr name=\"size\" value=\"1048576\"/><nntmux:attr name=\"files\" value=\"1\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Tue, 05 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Game.PS4-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004</guid><link>http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004#comments</comments><pubDate>Mon, 04 May 2026 12:00:00 +0000</pubDate><category>Console &gt; PS4</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\">dddd000000000000000000000000000000000004</a></li>\n\t<li>Name: A.Game.PS4-GRP</li>\n\t<li>Size: 20GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Console > PS4\">Console > PS4</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: game@example.test</li>\n\t<li>Posted: 2026-05-04 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"1180\"/><nntmux:attr name=\"size\" value=\"21474836480\"/><nntmux:attr name=\"files\" value=\"90\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Mon, 04 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > HD\">TV > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Movie.2024.1080p.BluRay-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001</guid><link>http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments</comments><pubDate>Fri, 01 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" src=\"http://127.0.0.1:8765/covers/movies/no-cover.jpg\" width=\"120\" alt=\"A.Movie.2024.1080p.BluRay-GRP\" />\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\">aaaa000000000000000000000000000000000001</a></li>\n\t<li>Name: A.Movie.2024.1080p.BluRay-GRP</li>\n\t<li>Size: 5GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.moovee\">alt.binaries.moovee</a></li>\n\t<li>Poster: poster@example.test (Poster)</li>\n\t<li>Posted: 2026-05-01 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"5368709120\"/><nntmux:attr name=\"files\" value=\"40\"/><nntmux:attr name=\"imdb\" value=\"1234567\"/><nntmux:attr name=\"grabs\" value=\"3\"/><nntmux:attr name=\"comments\" value=\"2\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 01 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.moovee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/full-feed"
+   ]
+  }
+ },
+ {
+  "name": "rss_full_json",
+  "path": "/rss/full-feed?o=json&api_token=tokenalice",
+  "expect": {
+   "status": 400,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "93"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [201] Incorrect parameter"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"201\" description=\"Incorrect parameter\"/>\n",
+   "audit": [
+    "/rss/full-feed?o=json&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_full_dl",
+  "path": "/rss/full-feed?dl=1&del=1&num=1&api_token=tokenposter",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "10332"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "2"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "1"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"6\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"1000\" grabcurrent=\"0\" grabmax=\"1000\"/><item><title>Adult.Release.XXX-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/7777000000000000000000000000000000000007</guid><link>http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&amp;r=tokenposter&amp;del=1</link><comments>http://127.0.0.1:8765/details/7777000000000000000000000000000000000007#comments</comments><pubDate>Thu, 07 May 2026 12:00:00 +0000</pubDate><category>XXX &gt; x264</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\">7777000000000000000000000000000000000007</a></li>\n\t<li>Name: Adult.Release.XXX-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/XXX > x264\">XXX > x264</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: x@example.test</li>\n\t<li>Posted: 2026-05-07 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><enclosure url=\"http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&amp;r=tokenposter&amp;del=1\" length=\"1073741824\" type=\"application/x-nzb\"/><nntmux:attr name=\"category\" value=\"6040\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Thu, 07 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Anime.E01.1080p-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006</guid><link>http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&amp;r=tokenposter&amp;del=1</link><comments>http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006#comments</comments><pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate><category>TV &gt; Anime</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\">ffff000000000000000000000000000000000006</a></li>\n\t<li>Name: An.Anime.E01.1080p-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > Anime\">TV > Anime</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: anime@example.test</li>\n\t<li>Posted: 2026-05-06 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><enclosure url=\"http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&amp;r=tokenposter&amp;del=1\" length=\"1073741824\" type=\"application/x-nzb\"/><nntmux:attr name=\"category\" value=\"5070\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Wed, 06 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Author-A.Book.EPUB</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005</guid><link>http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&amp;r=tokenposter&amp;del=1</link><comments>http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005#comments</comments><pubDate>Tue, 05 May 2026 12:00:00 +0000</pubDate><category>Books &gt; Ebook</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\">eeee000000000000000000000000000000000005</a></li>\n\t<li>Name: An.Author-A.Book.EPUB</li>\n\t<li>Size: 1MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Books > Ebook\">Books > Ebook</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: book@example.test</li>\n\t<li>Posted: 2026-05-05 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><enclosure url=\"http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&amp;r=tokenposter&amp;del=1\" length=\"1048576\" type=\"application/x-nzb\"/><nntmux:attr name=\"category\" value=\"7020\"/><nntmux:attr name=\"size\" value=\"1048576\"/><nntmux:attr name=\"files\" value=\"1\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Tue, 05 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Game.PS4-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004</guid><link>http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&amp;r=tokenposter&amp;del=1</link><comments>http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004#comments</comments><pubDate>Mon, 04 May 2026 12:00:00 +0000</pubDate><category>Console &gt; PS4</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\">dddd000000000000000000000000000000000004</a></li>\n\t<li>Name: A.Game.PS4-GRP</li>\n\t<li>Size: 20GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Console > PS4\">Console > PS4</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: game@example.test</li>\n\t<li>Posted: 2026-05-04 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><enclosure url=\"http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&amp;r=tokenposter&amp;del=1\" length=\"21474836480\" type=\"application/x-nzb\"/><nntmux:attr name=\"category\" value=\"1180\"/><nntmux:attr name=\"size\" value=\"21474836480\"/><nntmux:attr name=\"files\" value=\"90\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Mon, 04 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenposter&amp;del=1</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > HD\">TV > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><enclosure url=\"http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenposter&amp;del=1\" length=\"734003200\" type=\"application/x-nzb\"/><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Movie.2024.1080p.BluRay-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001</guid><link>http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&amp;r=tokenposter&amp;del=1</link><comments>http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments</comments><pubDate>Fri, 01 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" src=\"http://127.0.0.1:8765/covers/movies/no-cover.jpg\" width=\"120\" alt=\"A.Movie.2024.1080p.BluRay-GRP\" />\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\">aaaa000000000000000000000000000000000001</a></li>\n\t<li>Name: A.Movie.2024.1080p.BluRay-GRP</li>\n\t<li>Size: 5GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.moovee\">alt.binaries.moovee</a></li>\n\t<li>Poster: poster@example.test (Poster)</li>\n\t<li>Posted: 2026-05-01 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><enclosure url=\"http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&amp;r=tokenposter&amp;del=1\" length=\"5368709120\" type=\"application/x-nzb\"/><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"5368709120\"/><nntmux:attr name=\"files\" value=\"40\"/><nntmux:attr name=\"imdb\" value=\"1234567\"/><nntmux:attr name=\"grabs\" value=\"3\"/><nntmux:attr name=\"comments\" value=\"2\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 01 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.moovee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/full-feed?dl=1&del=1&num=1&api_token=tokenposter"
+   ]
+  }
+ },
+ {
+  "name": "rss_limit_param",
+  "path": "/rss/full-feed?limit=2&api_token=tokenalice",
+  "expect": {
+   "status": 500,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "text/html; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<!DOCTYPE html>\n<html lang=\"en\">\n    <head>\n        <meta charset=\"utf-8\">\n        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\n        <title>Server Error</title>\n\n        <style>\n            /*! normalize.css v8.0.1 | MIT License | github.com/necolas/normalize.css */html{line-height:1.15;-webkit-text-size-adjust:100%}body{margin:0}a{background-color:transparent}code{font-family:monospace,monospace;font-size:1em}[hidden]{display:none}html{font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,Noto Sans,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;line-height:1.5}*,:after,:before{box-sizing:border-box;border:0 solid #e2e8f0}a{color:inherit;text-decoration:inherit}code{font-family:Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace}svg,video{display:block;vertical-align:middle}video{max-width:100%;height:auto}.bg-white{--bg-opacity:1;background-color:#fff;background-color:rgba(255,255,255,var(--bg-opacity))}.bg-gray-100{--bg-opacity:1;background-color:#f7fafc;background-color:rgba(247,250,252,var(--bg-opacity))}.border-gray-200{--border-opacity:1;border-color:#edf2f7;border-color:rgba(237,242,247,var(--border-opacity))}.border-gray-400{--border-opacity:1;border-color:#cbd5e0;border-color:rgba(203,213,224,var(--border-opacity))}.border-t{border-top-width:1px}.border-r{border-right-width:1px}.flex{display:flex}.grid{display:grid}.hidden{display:none}.items-center{align-items:center}.justify-center{justify-content:center}.font-semibold{font-weight:600}.h-5{height:1.25rem}.h-8{height:2rem}.h-16{height:4rem}.text-sm{font-size:.875rem}.text-lg{font-size:1.125rem}.leading-7{line-height:1.75rem}.mx-auto{margin-left:auto;margin-right:auto}.ml-1{margin-left:.25rem}.mt-2{margin-top:.5rem}.mr-2{margin-right:.5rem}.ml-2{margin-left:.5rem}.mt-4{margin-top:1rem}.ml-4{margin-left:1rem}.mt-8{margin-top:2rem}.ml-12{margin-left:3rem}.-mt-px{margin-top:-1px}.max-w-xl{max-width:36rem}.max-w-6xl{max-width:72rem}.min-h-screen{min-height:100vh}.overflow-hidden{overflow:hidden}.p-6{padding:1.5rem}.py-4{padding-top:1rem;padding-bottom:1rem}.px-4{padding-left:1rem;padding-right:1rem}.px-6{padding-left:1.5rem;padding-right:1.5rem}.pt-8{padding-top:2rem}.fixed{position:fixed}.relative{position:relative}.top-0{top:0}.right-0{right:0}.shadow{box-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px 0 rgba(0,0,0,.06)}.text-center{text-align:center}.text-gray-200{--text-opacity:1;color:#edf2f7;color:rgba(237,242,247,var(--text-opacity))}.text-gray-300{--text-opacity:1;color:#e2e8f0;color:rgba(226,232,240,var(--text-opacity))}.text-gray-400{--text-opacity:1;color:#cbd5e0;color:rgba(203,213,224,var(--text-opacity))}.text-gray-500{--text-opacity:1;color:#a0aec0;color:rgba(160,174,192,var(--text-opacity))}.text-gray-600{--text-opacity:1;color:#718096;color:rgba(113,128,150,var(--text-opacity))}.text-gray-700{--text-opacity:1;color:#4a5568;color:rgba(74,85,104,var(--text-opacity))}.text-gray-900{--text-opacity:1;color:#1a202c;color:rgba(26,32,44,var(--text-opacity))}.uppercase{text-transform:uppercase}.underline{text-decoration:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.tracking-wider{letter-spacing:.05em}.w-5{width:1.25rem}.w-8{width:2rem}.w-auto{width:auto}.grid-cols-1{grid-template-columns:repeat(1,minmax(0,1fr))}@-webkit-keyframes spin{0%{transform:rotate(0deg)}to{transform:rotate(1turn)}}@keyframes spin{0%{transform:rotate(0deg)}to{transform:rotate(1turn)}}@-webkit-keyframes ping{0%{transform:scale(1);opacity:1}75%,to{transform:scale(2);opacity:0}}@keyframes ping{0%{transform:scale(1);opacity:1}75%,to{transform:scale(2);opacity:0}}@-webkit-keyframes pulse{0%,to{opacity:1}50%{opacity:.5}}@keyframes pulse{0%,to{opacity:1}50%{opacity:.5}}@-webkit-keyframes bounce{0%,to{transform:translateY(-25%);-webkit-animation-timing-function:cubic-bezier(.8,0,1,1);animation-timing-function:cubic-bezier(.8,0,1,1)}50%{transform:translateY(0);-webkit-animation-timing-function:cubic-bezier(0,0,.2,1);animation-timing-function:cubic-bezier(0,0,.2,1)}}@keyframes bounce{0%,to{transform:translateY(-25%);-webkit-animation-timing-function:cubic-bezier(.8,0,1,1);animation-timing-function:cubic-bezier(.8,0,1,1)}50%{transform:translateY(0);-webkit-animation-timing-function:cubic-bezier(0,0,.2,1);animation-timing-function:cubic-bezier(0,0,.2,1)}}@media (min-width:640px){.sm\\:rounded-lg{border-radius:.5rem}.sm\\:block{display:block}.sm\\:items-center{align-items:center}.sm\\:justify-start{justify-content:flex-start}.sm\\:justify-between{justify-content:space-between}.sm\\:h-20{height:5rem}.sm\\:ml-0{margin-left:0}.sm\\:px-6{padding-left:1.5rem;padding-right:1.5rem}.sm\\:pt-0{padding-top:0}.sm\\:text-left{text-align:left}.sm\\:text-right{text-align:right}}@media (min-width:768px){.md\\:border-t-0{border-top-width:0}.md\\:border-l{border-left-width:1px}.md\\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}}@media (min-width:1024px){.lg\\:px-8{padding-left:2rem;padding-right:2rem}}@media (prefers-color-scheme:dark){.dark\\:bg-gray-800{--bg-opacity:1;background-color:#2d3748;background-color:rgba(45,55,72,var(--bg-opacity))}.dark\\:bg-gray-900{--bg-opacity:1;background-color:#1a202c;background-color:rgba(26,32,44,var(--bg-opacity))}.dark\\:border-gray-700{--border-opacity:1;border-color:#4a5568;border-color:rgba(74,85,104,var(--border-opacity))}.dark\\:text-white{--text-opacity:1;color:#fff;color:rgba(255,255,255,var(--text-opacity))}.dark\\:text-gray-400{--text-opacity:1;color:#cbd5e0;color:rgba(203,213,224,var(--text-opacity))}}\n        </style>\n\n        <style>\n            body {\n                font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, \"Noto Sans\", sans-serif, \"Apple Color Emoji\", \"Segoe UI Emoji\", \"Segoe UI Symbol\", \"Noto Color Emoji\";\n            }\n        </style>\n    </head>\n    <body class=\"antialiased\">\n        <div class=\"relative flex items-top justify-center min-h-screen bg-gray-100 dark:bg-gray-800 sm:items-center sm:pt-0\">\n            <div class=\"max-w-xl mx-auto sm:px-6 lg:px-8\">\n                <div class=\"flex items-center pt-8 sm:justify-start sm:pt-0\">\n                    <div class=\"px-4 text-lg text-gray-500 border-r border-gray-400 tracking-wider\">\n                        500                    </div>\n\n                    <div class=\"ml-4 text-lg text-gray-500 uppercase tracking-wider\">\n                        Server Error                    </div>\n                </div>\n            </div>\n        </div>\n    </body>\n</html>\n",
+   "audit": [
+    "/rss/full-feed?limit=2&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_limit_nonnumeric",
+  "path": "/rss/full-feed?limit=x&api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "10800"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"7\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>Partial.Release.2026-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/8888000000000000000000000000000000000008</guid><link>http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/8888000000000000000000000000000000000008#comments</comments><pubDate>Fri, 08 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\">8888000000000000000000000000000000000008</a></li>\n\t<li>Name: Partial.Release.2026-GRP</li>\n\t<li>Size: 1kB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: p@example.test</li>\n\t<li>Posted: 2026-05-08 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"1000\"/><nntmux:attr name=\"files\" value=\"10\"/><nntmux:attr name=\"articles_found\" value=\"80\"/><nntmux:attr name=\"articles_expected\" value=\"100\"/><nntmux:attr name=\"files_found\" value=\"8\"/><nntmux:attr name=\"files_expected\" value=\"10\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 08 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Adult.Release.XXX-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/7777000000000000000000000000000000000007</guid><link>http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/7777000000000000000000000000000000000007#comments</comments><pubDate>Thu, 07 May 2026 12:00:00 +0000</pubDate><category>XXX &gt; x264</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\">7777000000000000000000000000000000000007</a></li>\n\t<li>Name: Adult.Release.XXX-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/XXX > x264\">XXX > x264</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: x@example.test</li>\n\t<li>Posted: 2026-05-07 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"6040\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Thu, 07 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Anime.E01.1080p-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006</guid><link>http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006#comments</comments><pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate><category>TV &gt; Anime</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\">ffff000000000000000000000000000000000006</a></li>\n\t<li>Name: An.Anime.E01.1080p-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > Anime\">TV > Anime</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: anime@example.test</li>\n\t<li>Posted: 2026-05-06 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5070\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Wed, 06 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Author-A.Book.EPUB</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005</guid><link>http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005#comments</comments><pubDate>Tue, 05 May 2026 12:00:00 +0000</pubDate><category>Books &gt; Ebook</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\">eeee000000000000000000000000000000000005</a></li>\n\t<li>Name: An.Author-A.Book.EPUB</li>\n\t<li>Size: 1MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Books > Ebook\">Books > Ebook</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: book@example.test</li>\n\t<li>Posted: 2026-05-05 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"7020\"/><nntmux:attr name=\"size\" value=\"1048576\"/><nntmux:attr name=\"files\" value=\"1\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Tue, 05 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Game.PS4-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004</guid><link>http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004#comments</comments><pubDate>Mon, 04 May 2026 12:00:00 +0000</pubDate><category>Console &gt; PS4</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\">dddd000000000000000000000000000000000004</a></li>\n\t<li>Name: A.Game.PS4-GRP</li>\n\t<li>Size: 20GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Console > PS4\">Console > PS4</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: game@example.test</li>\n\t<li>Posted: 2026-05-04 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"1180\"/><nntmux:attr name=\"size\" value=\"21474836480\"/><nntmux:attr name=\"files\" value=\"90\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Mon, 04 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > HD\">TV > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Movie.2024.1080p.BluRay-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001</guid><link>http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments</comments><pubDate>Fri, 01 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" src=\"http://127.0.0.1:8765/covers/movies/no-cover.jpg\" width=\"120\" alt=\"A.Movie.2024.1080p.BluRay-GRP\" />\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\">aaaa000000000000000000000000000000000001</a></li>\n\t<li>Name: A.Movie.2024.1080p.BluRay-GRP</li>\n\t<li>Size: 5GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.moovee\">alt.binaries.moovee</a></li>\n\t<li>Poster: poster@example.test (Poster)</li>\n\t<li>Posted: 2026-05-01 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"5368709120\"/><nntmux:attr name=\"files\" value=\"40\"/><nntmux:attr name=\"imdb\" value=\"1234567\"/><nntmux:attr name=\"grabs\" value=\"3\"/><nntmux:attr name=\"comments\" value=\"2\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 01 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.moovee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/full-feed?limit=x&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_show",
+  "path": "/rss/full-feed?show=70&api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "2241"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"1\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > HD\">TV > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/full-feed?show=70&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_anidb",
+  "path": "/rss/full-feed?anidb=93&api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "2209"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"1\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>An.Anime.E01.1080p-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006</guid><link>http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006#comments</comments><pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate><category>TV &gt; Anime</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\">ffff000000000000000000000000000000000006</a></li>\n\t<li>Name: An.Anime.E01.1080p-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > Anime\">TV > Anime</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: anime@example.test</li>\n\t<li>Posted: 2026-05-06 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5070\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Wed, 06 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/full-feed?anidb=93&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_airdate",
+  "path": "/rss/full-feed?airdate=100000&api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "2241"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"1\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > HD\">TV > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/full-feed?airdate=100000&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_cart_empty",
+  "path": "/rss/cart?api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "max-age=0, must-revalidate, no-cache, no-store, private, s-maxage=0"
+    ],
+    [
+     "cdn-cache-control",
+     "no-store"
+    ],
+    [
+     "cloudflare-cdn-cache-control",
+     "no-store"
+    ],
+    [
+     "content-length",
+     "852"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "pragma",
+     "no-cache"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"0\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/></channel></rss>\n",
+   "audit": [
+    "/rss/cart?api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_cart",
+  "path": "/rss/cart?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO users_releases (users_id, releases_id) VALUES (1,2),(1,1);"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "max-age=0, must-revalidate, no-cache, no-store, private, s-maxage=0"
+    ],
+    [
+     "cdn-cache-control",
+     "no-store"
+    ],
+    [
+     "cloudflare-cdn-cache-control",
+     "no-store"
+    ],
+    [
+     "content-length",
+     "3837"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "pragma",
+     "no-cache"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"2\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > HD\">TV > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Movie.2024.1080p.BluRay-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001</guid><link>http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments</comments><pubDate>Fri, 01 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" src=\"http://127.0.0.1:8765/covers/movies/no-cover.jpg\" width=\"120\" alt=\"A.Movie.2024.1080p.BluRay-GRP\" />\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\">aaaa000000000000000000000000000000000001</a></li>\n\t<li>Name: A.Movie.2024.1080p.BluRay-GRP</li>\n\t<li>Size: 5GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.moovee\">alt.binaries.moovee</a></li>\n\t<li>Poster: poster@example.test (Poster)</li>\n\t<li>Posted: 2026-05-01 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"5368709120\"/><nntmux:attr name=\"files\" value=\"40\"/><nntmux:attr name=\"imdb\" value=\"1234567\"/><nntmux:attr name=\"grabs\" value=\"3\"/><nntmux:attr name=\"comments\" value=\"2\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 01 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.moovee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/cart?api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_cart_no_token",
+  "path": "/rss/cart",
+  "expect": {
+   "status": 400,
+   "headers": [
+    [
+     "cache-control",
+     "max-age=0, must-revalidate, no-cache, no-store, private, s-maxage=0"
+    ],
+    [
+     "cdn-cache-control",
+     "no-store"
+    ],
+    [
+     "cloudflare-cdn-cache-control",
+     "no-store"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "pragma",
+     "no-cache"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [200] Missing parameter (api_token)"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"error\":\"Missing parameter (api_token)\"}",
+   "audit": []
+  }
+ },
+ {
+  "name": "rss_category_missing",
+  "path": "/rss/category",
+  "expect": {
+   "status": 403,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"error\":\"Category ID is missing\"}",
+   "audit": []
+  }
+ },
+ {
+  "name": "rss_category_bad",
+  "path": "/rss/category?id=x&api_token=tokenalice",
+  "expect": {
+   "status": 403,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"error\":\"Category ID is missing\"}",
+   "audit": [
+    "/rss/category?id=x&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_category_missing_auth_order",
+  "path": "/rss/category?id=2040",
+  "expect": {
+   "status": 400,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-nntmux",
+     "API ERROR [200] Missing parameter (api_token)"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"error\":\"Missing parameter (api_token)\"}",
+   "audit": []
+  }
+ },
+ {
+  "name": "rss_category",
+  "path": "/rss/category?id=2040&api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "3991"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"2\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>Partial.Release.2026-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/8888000000000000000000000000000000000008</guid><link>http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/8888000000000000000000000000000000000008#comments</comments><pubDate>Fri, 08 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\">8888000000000000000000000000000000000008</a></li>\n\t<li>Name: Partial.Release.2026-GRP</li>\n\t<li>Size: 1kB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: p@example.test</li>\n\t<li>Posted: 2026-05-08 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"1000\"/><nntmux:attr name=\"files\" value=\"10\"/><nntmux:attr name=\"articles_found\" value=\"80\"/><nntmux:attr name=\"articles_expected\" value=\"100\"/><nntmux:attr name=\"files_found\" value=\"8\"/><nntmux:attr name=\"files_expected\" value=\"10\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 08 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Movie.2024.1080p.BluRay-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001</guid><link>http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments</comments><pubDate>Fri, 01 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" src=\"http://127.0.0.1:8765/covers/movies/no-cover.jpg\" width=\"120\" alt=\"A.Movie.2024.1080p.BluRay-GRP\" />\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\">aaaa000000000000000000000000000000000001</a></li>\n\t<li>Name: A.Movie.2024.1080p.BluRay-GRP</li>\n\t<li>Size: 5GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.moovee\">alt.binaries.moovee</a></li>\n\t<li>Poster: poster@example.test (Poster)</li>\n\t<li>Posted: 2026-05-01 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"5368709120\"/><nntmux:attr name=\"files\" value=\"40\"/><nntmux:attr name=\"imdb\" value=\"1234567\"/><nntmux:attr name=\"grabs\" value=\"3\"/><nntmux:attr name=\"comments\" value=\"2\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 01 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.moovee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/category?id=2040&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_category_root",
+  "path": "/rss/category?id=5000,7020&api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "4958"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"3\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>An.Anime.E01.1080p-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006</guid><link>http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006#comments</comments><pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate><category>TV &gt; Anime</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\">ffff000000000000000000000000000000000006</a></li>\n\t<li>Name: An.Anime.E01.1080p-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > Anime\">TV > Anime</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: anime@example.test</li>\n\t<li>Posted: 2026-05-06 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5070\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Wed, 06 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Author-A.Book.EPUB</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005</guid><link>http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005#comments</comments><pubDate>Tue, 05 May 2026 12:00:00 +0000</pubDate><category>Books &gt; Ebook</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\">eeee000000000000000000000000000000000005</a></li>\n\t<li>Name: An.Author-A.Book.EPUB</li>\n\t<li>Size: 1MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Books > Ebook\">Books > Ebook</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: book@example.test</li>\n\t<li>Posted: 2026-05-05 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"7020\"/><nntmux:attr name=\"size\" value=\"1048576\"/><nntmux:attr name=\"files\" value=\"1\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Tue, 05 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > HD\">TV > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/category?id=5000,7020&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_category_all",
+  "path": "/rss/category?id=-1&api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "10800"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"7\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>Partial.Release.2026-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/8888000000000000000000000000000000000008</guid><link>http://127.0.0.1:8765/getnzb?id=8888000000000000000000000000000000000008.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/8888000000000000000000000000000000000008#comments</comments><pubDate>Fri, 08 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/8888000000000000000000000000000000000008\">8888000000000000000000000000000000000008</a></li>\n\t<li>Name: Partial.Release.2026-GRP</li>\n\t<li>Size: 1kB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: p@example.test</li>\n\t<li>Posted: 2026-05-08 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"1000\"/><nntmux:attr name=\"files\" value=\"10\"/><nntmux:attr name=\"articles_found\" value=\"80\"/><nntmux:attr name=\"articles_expected\" value=\"100\"/><nntmux:attr name=\"files_found\" value=\"8\"/><nntmux:attr name=\"files_expected\" value=\"10\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 08 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Adult.Release.XXX-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/7777000000000000000000000000000000000007</guid><link>http://127.0.0.1:8765/getnzb?id=7777000000000000000000000000000000000007.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/7777000000000000000000000000000000000007#comments</comments><pubDate>Thu, 07 May 2026 12:00:00 +0000</pubDate><category>XXX &gt; x264</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/7777000000000000000000000000000000000007\">7777000000000000000000000000000000000007</a></li>\n\t<li>Name: Adult.Release.XXX-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/XXX > x264\">XXX > x264</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: x@example.test</li>\n\t<li>Posted: 2026-05-07 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"6040\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Thu, 07 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Anime.E01.1080p-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006</guid><link>http://127.0.0.1:8765/getnzb?id=ffff000000000000000000000000000000000006.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006#comments</comments><pubDate>Wed, 06 May 2026 12:00:00 +0000</pubDate><category>TV &gt; Anime</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/ffff000000000000000000000000000000000006\">ffff000000000000000000000000000000000006</a></li>\n\t<li>Name: An.Anime.E01.1080p-GRP</li>\n\t<li>Size: 1GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > Anime\">TV > Anime</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: anime@example.test</li>\n\t<li>Posted: 2026-05-06 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5070\"/><nntmux:attr name=\"size\" value=\"1073741824\"/><nntmux:attr name=\"files\" value=\"8\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Wed, 06 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>An.Author-A.Book.EPUB</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005</guid><link>http://127.0.0.1:8765/getnzb?id=eeee000000000000000000000000000000000005.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005#comments</comments><pubDate>Tue, 05 May 2026 12:00:00 +0000</pubDate><category>Books &gt; Ebook</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/eeee000000000000000000000000000000000005\">eeee000000000000000000000000000000000005</a></li>\n\t<li>Name: An.Author-A.Book.EPUB</li>\n\t<li>Size: 1MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Books > Ebook\">Books > Ebook</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: book@example.test</li>\n\t<li>Posted: 2026-05-05 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"7020\"/><nntmux:attr name=\"size\" value=\"1048576\"/><nntmux:attr name=\"files\" value=\"1\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Tue, 05 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Game.PS4-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004</guid><link>http://127.0.0.1:8765/getnzb?id=dddd000000000000000000000000000000000004.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004#comments</comments><pubDate>Mon, 04 May 2026 12:00:00 +0000</pubDate><category>Console &gt; PS4</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/dddd000000000000000000000000000000000004\">dddd000000000000000000000000000000000004</a></li>\n\t<li>Name: A.Game.PS4-GRP</li>\n\t<li>Size: 20GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Console > PS4\">Console > PS4</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: game@example.test</li>\n\t<li>Posted: 2026-05-04 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"1180\"/><nntmux:attr name=\"size\" value=\"21474836480\"/><nntmux:attr name=\"files\" value=\"90\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Mon, 04 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > HD\">TV > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item><item><title>A.Movie.2024.1080p.BluRay-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001</guid><link>http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments</comments><pubDate>Fri, 01 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" src=\"http://127.0.0.1:8765/covers/movies/no-cover.jpg\" width=\"120\" alt=\"A.Movie.2024.1080p.BluRay-GRP\" />\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\">aaaa000000000000000000000000000000000001</a></li>\n\t<li>Name: A.Movie.2024.1080p.BluRay-GRP</li>\n\t<li>Size: 5GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.moovee\">alt.binaries.moovee</a></li>\n\t<li>Poster: poster@example.test (Poster)</li>\n\t<li>Posted: 2026-05-01 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"5368709120\"/><nntmux:attr name=\"files\" value=\"40\"/><nntmux:attr name=\"imdb\" value=\"1234567\"/><nntmux:attr name=\"grabs\" value=\"3\"/><nntmux:attr name=\"comments\" value=\"2\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 01 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.moovee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/category?id=-1&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_category_cart",
+  "path": "/rss/category?id=-2&api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "852"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"0\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/></channel></rss>\n",
+   "audit": [
+    "/rss/category?id=-2&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_mymovies_empty",
+  "path": "/rss/mymovies?api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "852"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"0\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/></channel></rss>\n",
+   "audit": [
+    "/rss/mymovies?api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_mymovies",
+  "path": "/rss/mymovies?num=5&api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_movies (users_id, imdbid, categories) VALUES (1, '1234567', NULL);"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "2228"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"1\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>A.Movie.2024.1080p.BluRay-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001</guid><link>http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments</comments><pubDate>Fri, 01 May 2026 12:00:00 +0000</pubDate><category>Movies-HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\">aaaa000000000000000000000000000000000001</a></li>\n\t<li>Name: A.Movie.2024.1080p.BluRay-GRP</li>\n\t<li>Size: 5GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies-HD\">Movies-HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.moovee\">alt.binaries.moovee</a></li>\n\t<li>Poster: poster@example.test (Poster)</li>\n\t<li>Posted: 2026-05-01 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"5368709120\"/><nntmux:attr name=\"files\" value=\"40\"/><nntmux:attr name=\"grabs\" value=\"3\"/><nntmux:attr name=\"comments\" value=\"2\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 01 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.moovee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/mymovies?num=5&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_mymovies_cat_filter",
+  "path": "/rss/mymovies?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_movies (users_id, imdbid, categories) VALUES (1, '1234567', '2030|2050');"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "852"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"0\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/></channel></rss>\n",
+   "audit": [
+    "/rss/mymovies?api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_myshows",
+  "path": "/rss/myshows?num=5&api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_series (users_id, videos_id, categories) VALUES (1, 70, '');"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "2232"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"1\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV-HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV-HD\">TV-HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/myshows?num=5&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_myshows_airdate",
+  "path": "/rss/myshows?airdate=1&api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_series (users_id, videos_id, categories) VALUES (1, 70, 'NULL');"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "852"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"0\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/></channel></rss>\n",
+   "audit": [
+    "/rss/myshows?airdate=1&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_trending_movies_empty",
+  "path": "/rss/trending-movies?api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "852"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"0\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/></channel></rss>\n",
+   "audit": [
+    "/rss/trending-movies?api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_trending_movies",
+  "path": "/rss/trending-movies?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_downloads (users_id, releases_id, timestamp) VALUES (4, 1, NOW());"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "2448"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"1\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>A.Movie.2024.1080p.BluRay-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001</guid><link>http://127.0.0.1:8765/getnzb?id=aaaa000000000000000000000000000000000001.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001#comments</comments><pubDate>Fri, 01 May 2026 12:00:00 +0000</pubDate><category>Movies &gt; HD</category><description><![CDATA[\n\t<div>\n\t<img style=\"margin-left:10px;margin-bottom:10px;float:right;\" src=\"http://127.0.0.1:8765/covers/movies/no-cover.jpg\" width=\"120\" alt=\"A.Movie.2024.1080p.BluRay-GRP\" />\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/aaaa000000000000000000000000000000000001\">aaaa000000000000000000000000000000000001</a></li>\n\t<li>Name: A.Movie.2024.1080p.BluRay-GRP</li>\n\t<li>Size: 5GB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Movies > HD\">Movies > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.moovee\">alt.binaries.moovee</a></li>\n\t<li>Poster: poster@example.test (Poster)</li>\n\t<li>Posted: 2026-05-01 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"2040\"/><nntmux:attr name=\"size\" value=\"5368709120\"/><nntmux:attr name=\"files\" value=\"40\"/><nntmux:attr name=\"imdb\" value=\"1234567\"/><nntmux:attr name=\"grabs\" value=\"3\"/><nntmux:attr name=\"comments\" value=\"2\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Fri, 01 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.moovee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/trending-movies?api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_trending_shows",
+  "path": "/rss/trending-shows?api_token=tokenalice",
+  "setup": [
+   "INSERT INTO user_downloads (users_id, releases_id, timestamp) VALUES (4, 2, NOW());"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "2241"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"1\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>Some.Show.S02E03.720p.WEB-GRP &amp; &lt;more&gt;</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002</guid><link>http://127.0.0.1:8765/getnzb?id=bbbb000000000000000000000000000000000002.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002#comments</comments><pubDate>Sat, 02 May 2026 12:00:00 +0000</pubDate><category>TV &gt; HD</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/bbbb000000000000000000000000000000000002\">bbbb000000000000000000000000000000000002</a></li>\n\t<li>Name: Some.Show.S02E03.720p.WEB-GRP & <more></li>\n\t<li>Size: 700MB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/TV > HD\">TV > HD</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: tv@example.test</li>\n\t<li>Posted: 2026-05-02 10:00:00</li>\n\t<li>Password: None</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"5040\"/><nntmux:attr name=\"size\" value=\"734003200\"/><nntmux:attr name=\"files\" value=\"12\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"0\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 02 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/trending-shows?api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_excludes_passworded_row",
+  "path": "/rss/category?id=10&api_token=tokenalice",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "852"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"0\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/></channel></rss>\n",
+   "audit": [
+    "/rss/category?id=10&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_passworded_allowed",
+  "path": "/rss/category?id=10&api_token=tokenalice",
+  "setup": [
+   "UPDATE ingestion_configurations SET show_passworded_releases = 1;"
+  ],
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-length",
+     "2219"
+    ],
+    [
+     "content-type",
+     "text/xml; charset=utf-8"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:nntmux=\"http://127.0.0.1:8765/rss-info/\" encoding=\"utf-8\"><channel><atom:link href=\"http://127.0.0.1:8765/rss\" rel=\"self\" type=\"application/rss+xml\"/><title>NNTmux</title><description>NNTmux RSS Details</description><link>http://127.0.0.1:8765</link><language>en-gb</language><webMaster>admin@example.test NNTmux</webMaster><category>usenet,nzbs,cms,community</category><generator>nntmux</generator><ttl>10</ttl><docs>http://127.0.0.1:8765/rss-info/</docs><image url=\"http://127.0.0.1:8765/assets/images/tmux_logo.png\" title=\"NNTmux\" link=\"http://127.0.0.1:8765\" description=\"Visit NNTmux - A great usenet indexer\"/><nntmux:response offset=\"0\" total=\"1\"/><nntmux:apilimits apicurrent=\"0\" apimax=\"10\" grabcurrent=\"0\" grabmax=\"10\"/><item><title>Passworded.Release-GRP</title><guid isPermaLink=\"true\">http://127.0.0.1:8765/details/9999000000000000000000000000000000000009</guid><link>http://127.0.0.1:8765/getnzb?id=9999000000000000000000000000000000000009.nzb&amp;r=tokenalice</link><comments>http://127.0.0.1:8765/details/9999000000000000000000000000000000000009#comments</comments><pubDate>Sat, 09 May 2026 12:00:00 +0000</pubDate><category>Other &gt; Misc</category><description><![CDATA[\n\t<div>\n\t<li>ID: <a href=\"http://127.0.0.1:8765/details/9999000000000000000000000000000000000009\">9999000000000000000000000000000000000009</a></li>\n\t<li>Name: Passworded.Release-GRP</li>\n\t<li>Size: 1kB</li>\n\t<li>Category: <a href=\"http://127.0.0.1:8765/browse/Other > Misc\">Other > Misc</a></li>\n\t<li>Group: <a href=\"http://127.0.0.1:8765/browse/group?g=alt.binaries.teevee\">alt.binaries.teevee</a></li>\n\t<li>Poster: p@example.test</li>\n\t<li>Posted: 2026-05-09 10:00:00</li>\n\t<li>Password: Possibly Passworded</li>\n\t</div>]]></description><nntmux:attr name=\"category\" value=\"10\"/><nntmux:attr name=\"size\" value=\"1000\"/><nntmux:attr name=\"files\" value=\"10\"/><nntmux:attr name=\"grabs\" value=\"0\"/><nntmux:attr name=\"comments\" value=\"0\"/><nntmux:attr name=\"password\" value=\"1\"/><nntmux:attr name=\"usenetdate\" value=\"Sat, 09 May 2026 10:00:00 +0000\"/><nntmux:attr name=\"group\" value=\"alt.binaries.teevee\"/></item></channel></rss>\n",
+   "audit": [
+    "/rss/category?id=10&api_token=tokenalice"
+   ]
+  }
+ },
+ {
+  "name": "rss_method",
+  "method": "DELETE",
+  "path": "/rss/cart",
+  "ignore_body": true,
+  "expect": {
+   "status": 405,
+   "headers": [
+    [
+     "allow",
+     "GET, HEAD, POST"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "text/html; charset=utf-8"
+    ]
+   ],
+   "body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\" />\n    <meta name=\"robots\" content=\"noindex,nofollow,noarchive\" />\n    <title>An Error Occurred: Method Not Allowed</title>\n    <link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 128 128%22><text y=%221.2em%22 font-size=%2296%22>❌</text></svg>\" />\n    <style>body { background-color: #fff; color: #222; font: 16px/1.5 -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif; margin: 0; }\n.container { margin: 30px; max-width: 600px; }\nh1 { color: #dc3545; font-size: 24px; }\nh2 { font-size: 18px; }</style>\n</head>\n<body>\n<div class=\"container\">\n    <h1>Oops! An Error Occurred</h1>\n    <h2>The server returned a \"405 Method Not Allowed\".</h2>\n\n    <p>\n        Something is broken. Please let us know what you were doing when this error occurred.\n        We will fix it as soon as possible. Sorry for any inconvenience caused.\n    </p>\n</div>\n</body>\n</html>",
+   "audit": []
+  }
+ }
+]

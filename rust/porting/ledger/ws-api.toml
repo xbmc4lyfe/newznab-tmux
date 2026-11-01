@@ -4,7 +4,7 @@
 kind = "middleware"
 id = "BlockAbusiveServices"
 source = "app/Http/Middleware/BlockAbusiveServices.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "job"
@@ -65,7 +65,7 @@ status = "ported"
 kind = "route"
 id = "GET|HEAD /api/v2/getnzb"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@getNzb"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -77,19 +77,19 @@ status = "ported"
 kind = "route"
 id = "GET|HEAD /rss/cart"
 source = "App\\Http\\Controllers\\RssController@cartRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /rss/category"
 source = "App\\Http\\Controllers\\RssController@categoryFeedRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /rss/full-feed"
 source = "App\\Http\\Controllers\\RssController@fullFeedRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -101,25 +101,25 @@ status = "ported"
 kind = "route"
 id = "GET|HEAD /rss/mymovies"
 source = "App\\Http\\Controllers\\RssController@myMoviesRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /rss/myshows"
 source = "App\\Http\\Controllers\\RssController@myShowsRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /rss/trending-movies"
 source = "App\\Http\\Controllers\\RssController@trendingMoviesRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /rss/trending-shows"
 source = "App\\Http\\Controllers\\RssController@trendingShowsRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -173,7 +173,7 @@ status = "todo"
 kind = "route"
 id = "GET|QUERY|HEAD /api/v2/details"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@details"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -251,43 +251,43 @@ status = "todo"
 kind = "route"
 id = "POST /rss/cart"
 source = "App\\Http\\Controllers\\RssController@cartRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /rss/category"
 source = "App\\Http\\Controllers\\RssController@categoryFeedRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /rss/full-feed"
 source = "App\\Http\\Controllers\\RssController@fullFeedRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /rss/mymovies"
 source = "App\\Http\\Controllers\\RssController@myMoviesRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /rss/myshows"
 source = "App\\Http\\Controllers\\RssController@myShowsRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /rss/trending-movies"
 source = "App\\Http\\Controllers\\RssController@trendingMoviesRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /rss/trending-shows"
 source = "App\\Http\\Controllers\\RssController@trendingShowsRss"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"

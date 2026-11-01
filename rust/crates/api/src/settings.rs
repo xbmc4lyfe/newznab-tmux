@@ -1,12 +1,14 @@
 //! Values the API reads from the environment. The names match Laravel's `config/` files.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use nntmux_core::{parsed_or, var_or};
 
+use crate::abuse::AbuseConfig;
 use crate::json::J;
 
 pub struct Settings {
@@ -18,13 +20,16 @@ pub struct Settings {
     pub access_update_interval: u64,
     /// Prefixes every Redis key, so parallel tests can't collide. Empty in production.
     pub redis_prefix: String,
+    /// Where cover images live, checked in order.
+    pub cover_roots: Vec<PathBuf>,
+    pub abuse: AbuseConfig,
     /// Small read-mostly values such as the v1 server menu, which every XML response needs.
     local: Mutex<HashMap<String, (Instant, J)>>,
 }
 
 impl Settings {
     pub fn from_env() -> Result<Self> {
-        Ok(Self::new(
+        let mut settings = Self::new(
             var_or("APP_NAME", "NNTmux"),
             var_or("MAIL_FROM_ADDRESS", "hello@example.com"),
             parsed_or("API_MAX_LIMIT", 500)?,
@@ -32,7 +37,9 @@ impl Settings {
             parsed_or("API_QUERY_MAX_BODY_BYTES", 8192)?,
             parsed_or("API_ACCESS_UPDATE_INTERVAL", 60)?,
             var_or("NNTMUX_API_REDIS_PREFIX", ""),
-        ))
+        );
+        settings.abuse = AbuseConfig::from_env()?;
+        Ok(settings)
     }
 
     pub fn new(
@@ -52,6 +59,12 @@ impl Settings {
             query_max_body_bytes,
             access_update_interval,
             redis_prefix,
+            cover_roots: vec![
+                PathBuf::from(var_or("COVERS_PATH", "/app/storage/covers")),
+                PathBuf::from("/app/storage/covers"),
+                PathBuf::from("/app/public/covers"),
+            ],
+            abuse: AbuseConfig::default(),
             local: Mutex::new(HashMap::new()),
         }
     }
