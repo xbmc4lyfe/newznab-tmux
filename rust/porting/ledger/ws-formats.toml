@@ -42,25 +42,25 @@ note = "C ABI behind an off-by-default feature; production used the lenient kern
 kind = "library"
 id = "formats:archive-metadata"
 source = "docker/app/nzb-yenc-ffi/src/formats.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:par2"
 source = "docker/app/nzb-yenc-ffi/src/par2.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:par2-source-ranges"
 source = "docker/app/nzb-yenc-ffi/src/par2_source_ranges.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "formats:seven-zip-ranges"
 source = "docker/app/nzb-yenc-ffi/src/seven_zip_ranges.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
