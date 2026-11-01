@@ -72,6 +72,12 @@ status = "ported"
 
 [[entry]]
 kind = "command"
+id = "nntmux:find-size-mismatches"
+source = "app/Console/Commands/FindSizeMismatchedReleases.php"
+status = "todo"
+
+[[entry]]
+kind = "command"
 id = "nntmux:git"
 source = "app/Console/Commands/UpdateNNTmuxGit.php"
 status = "dropped"
