@@ -12,12 +12,13 @@ use nntmux_webkit::{
     ClientIp, Input, MaybeUser, Session, User, WebResult, config, guard, throttle,
 };
 
-use super::{captcha_error, two_factor};
+use super::{captcha_error, two_factor, verify};
 use crate::guest::GuestLayout;
 use crate::validate;
 
 const GENERIC_FAILURE: &str =
     "Username or email and password combination used does not match our records!";
+const UNVERIFIED: &str = "Please verify your email address before signing in. We have sent you a fresh verification link.";
 pub(crate) const BREACH_WARNING: &str = "Security Alert: Your password has been found in a data breach. We strongly recommend changing it immediately in your account settings.";
 /// Checked when no account matches, so a miss costs the same time as a real check.
 static DUMMY_HASH: LazyLock<String> =
@@ -110,6 +111,15 @@ pub async fn submit(
     let Some(user) = found.filter(|_| matches) else {
         return Ok(failed(&ctx, &session, &key, &username, &ip, GENERIC_FAILURE).await);
     };
+    // The right password proves the address is theirs to re-verify. Registration signs nobody
+    // in, so this is the only way to replace a verification link that expired or never arrived.
+    if !user.is_disabled() && !user.has_verified_email() {
+        auth::log_if_failed(
+            verify::send_verification(&ctx, user.id, &user.email, &user.username).await,
+            "resending verification from login",
+        );
+        return Ok(failed(&ctx, &session, &key, &username, &ip, UNVERIFIED).await);
+    }
     if !user.eligible_for_authentication() {
         return Ok(failed(&ctx, &session, &key, &username, &ip, GENERIC_FAILURE).await);
     }

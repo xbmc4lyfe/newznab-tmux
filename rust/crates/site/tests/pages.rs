@@ -15,12 +15,13 @@ async fn home_needs_a_login_and_shows_index_content() {
         "INSERT INTO content (title, body, metadescription, metakeywords, contenttype, status, role, ordinal)
          VALUES ('Welcome', '&lt;b&gt;Hello there&lt;/b&gt;', 'front desc', 'front,keys', 3, 1, 0, 0),
                 ('Staff notes', 'staff body', 'staff desc', 'k', 2, 1, 2, 5),
+                ('Staff home', 'staff home body', 'd', 'k', 3, 1, 2, 7),
                 ('Open notes', 'open body', 'open desc', 'k', 2, 1, 0, 6)",
     )
     .execute(&db.pool)
     .await
     .unwrap();
-    sqlx::query("DELETE FROM content WHERE title NOT IN ('Welcome','Staff notes','Open notes')")
+    sqlx::query("DELETE FROM content WHERE title NOT IN ('Welcome','Staff notes','Staff home','Open notes')")
         .execute(&db.pool)
         .await
         .unwrap();
@@ -45,6 +46,10 @@ async fn home_needs_a_login_and_shows_index_content() {
         "admin-written HTML renders"
     );
     assert!(html.contains(&name), "the header greets the account");
+    assert!(
+        !html.contains("staff home body"),
+        "staff-only home rows stay hidden"
+    );
     assert!(html.contains("<title>Welcome - "));
     assert!(html.contains(r#"content="front,keys""#));
 

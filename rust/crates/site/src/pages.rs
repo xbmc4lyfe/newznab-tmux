@@ -159,16 +159,15 @@ async fn content(
         }
         (query.fetch_all(&ctx.db).await?, false)
     } else {
+        // Laravel showed staff-only home rows to everyone. Their own pages already hid them.
         let sql = format!(
-            "SELECT {CONTENT_COLUMNS} FROM content WHERE status = 1 AND contenttype = ? {ORDERED}"
+            "SELECT {CONTENT_COLUMNS} FROM content WHERE status = 1 AND contenttype = ? AND {visible} {ORDERED}"
         );
-        (
-            sqlx::query_as(sqlx::AssertSqlSafe(sql))
-                .bind(TYPE_INDEX)
-                .fetch_all(&ctx.db)
-                .await?,
-            true,
-        )
+        let mut query = sqlx::query_as(sqlx::AssertSqlSafe(sql)).bind(TYPE_INDEX);
+        if !staff {
+            query = query.bind(ROLE_EVERYONE).bind(role);
+        }
+        (query.fetch_all(&ctx.db).await?, true)
     };
     if rows.is_empty() {
         return Ok((
