@@ -17,7 +17,7 @@ use nntmux_core::{parsed_or, var_or};
 use nntmux_nntp::pipeline::{Batch, BatchError, Mode, verification_article_batch};
 use nntmux_nntp::{NntpClient, NntpConfig, NntpError};
 use nntmux_predb::PredbIndex;
-use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
+use nntmux_runtime::{Ctx, RoleArgs, Shutdown, busy};
 use tokio::sync::{Mutex, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
@@ -128,6 +128,8 @@ pub struct Worker {
     pub predb: PredbIndex,
     pub categorizer: Categorizer,
     pub nntp: Arc<NntpConfig>,
+    /// Reads the operators' pause between candidates. Absent in tests.
+    ctx: Option<Ctx>,
     /// Where terminal scratch cleanup resumes, for this host's next maintenance turn.
     scratch_after: AtomicI64,
     scratch_ceiling: AtomicI64,
@@ -158,6 +160,7 @@ impl Worker {
             cleaner: ReleaseCleaner::new(),
             predb: PredbIndex::new(&ctx.config.manticore),
             nntp: Arc::new(NntpConfig::from_env()),
+            ctx: Some(ctx.clone()),
             scratch_after: AtomicI64::new(0),
             scratch_ceiling: AtomicI64::new(0),
         })
@@ -171,6 +174,7 @@ impl Worker {
             cleaner: ReleaseCleaner::new(),
             predb: PredbIndex::disabled(),
             nntp,
+            ctx: None,
             scratch_after: AtomicI64::new(0),
             scratch_ceiling: AtomicI64::new(0),
         })
@@ -228,6 +232,11 @@ impl Worker {
                 bail!("Verification worker locks were lost.");
             }
             if !locks.admitting().await? {
+                break;
+            }
+            if let Some(ctx) = &self.ctx
+                && ctx.paused().await.unwrap_or(true)
+            {
                 break;
             }
             let prefer_ready = locks.prefer_primary_queue(true);
@@ -708,14 +717,26 @@ pub async fn run_role(ctx: Ctx, args: RoleArgs, stop: Shutdown, verify: Verify) 
                 max_seconds: settings.worker_seconds.max(1),
             };
             while !stop.requested() {
-                if ctx.paused().await.unwrap_or(true) {
-                    if once {
-                        return;
+                let busy = match busy::enter(&ctx, "verify").await {
+                    Ok(Some(busy)) => busy,
+                    Ok(None) => {
+                        if once {
+                            return;
+                        }
+                        stop.sleep(Duration::from_secs(5)).await;
+                        continue;
                     }
-                    stop.sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
+                    Err(failure) => {
+                        error!(slot, error = format!("{failure:#}"), "can't mark this worker busy");
+                        if once {
+                            return;
+                        }
+                        stop.sleep(idle).await;
+                        continue;
+                    }
+                };
                 let run = worker.run(&source, options, &stop).await;
+                drop(busy);
                 if let Err(failure) = &run {
                     error!(
                         slot,
