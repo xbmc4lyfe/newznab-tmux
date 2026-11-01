@@ -196,6 +196,55 @@ pub fn tasks() -> Vec<Task<Ctx>> {
                 })
             },
         ),
+        task(
+            "nntmux:delete-unverified-users",
+            Cadence::TwiceDaily(1, 13),
+            |ctx| {
+                Box::pin(async move {
+                    let now = chrono::Utc::now().naive_utc();
+                    nntmux_admin::accounts::delete_unverified(&ctx.db, now).await?;
+                    Ok(())
+                })
+            },
+        ),
+        task(
+            "gdpr:purge-expired-exports",
+            Daily {
+                hour: 3,
+                minute: 30,
+            },
+            |ctx| {
+                Box::pin(async move {
+                    let now = chrono::Utc::now().naive_utc();
+                    let storage = nntmux_admin::gdpr::storage_dir();
+                    nntmux_admin::gdpr::purge_expired_exports(&ctx.db, &storage, now).await?;
+                    Ok(())
+                })
+            },
+        ),
+        // Both jobs only ran with `PURGE_INACTIVE_USERS=true`.
+        Task {
+            enabled: nntmux_admin::accounts::purge_enabled,
+            ..task("RemoveInactiveAccounts", Cadence::MIDNIGHT, |ctx| {
+                Box::pin(async move {
+                    let now = chrono::Utc::now().naive_utc();
+                    let days = nntmux_admin::accounts::purge_days()?;
+                    nntmux_admin::accounts::remove_inactive(&ctx, now, days).await?;
+                    Ok(())
+                })
+            })
+        },
+        Task {
+            enabled: nntmux_admin::accounts::purge_enabled,
+            ..task("PurgeDeletedAccounts", Cadence::MIDNIGHT, |ctx| {
+                Box::pin(async move {
+                    let now = chrono::Utc::now().naive_utc();
+                    let days = nntmux_admin::accounts::purge_days()?;
+                    nntmux_admin::accounts::purge_deleted(&ctx, now, days).await?;
+                    Ok(())
+                })
+            })
+        },
         task("cleanup-api-request-logs", Cadence::Hourly, |ctx| {
             Box::pin(async move {
                 activity::cleanup_request_logs(&ctx.db).await?;

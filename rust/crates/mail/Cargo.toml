@@ -8,7 +8,20 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+lettre.workspace = true
+metrics.workspace = true
+nntmux-core.workspace = true
 nntmux-runtime.workspace = true
+nntmux-site.workspace = true
+nntmux-webkit.workspace = true
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

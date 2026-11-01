@@ -78,3 +78,9 @@ kind = "command"
 id = "releases:recategorize-onlyfans"
 source = "app/Console/Commands/RecategorizeOnlyFans.php"
 status = "ported"
+
+[[entry]]
+kind = "command"
+id = "nntmux:find-size-mismatches"
+source = "app/Console/Commands/FindSizeMismatchedReleases.php"
+status = "ported"
