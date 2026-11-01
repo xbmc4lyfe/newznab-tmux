@@ -26,8 +26,9 @@ pub mod releases;
 pub mod reset;
 pub mod spot_check;
 pub mod txn;
+pub mod worker;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Subcommand;
 use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
 
@@ -45,13 +46,26 @@ fn context(ctx: &Ctx) -> Result<Verify> {
     ))
 }
 
-pub async fn run(_ctx: Ctx, _args: RoleArgs, _stop: Shutdown) -> Result<()> {
-    bail!("the verify role isn't ported yet")
+pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
+    let verify = context(&ctx)?;
+    worker::run_role(ctx, args, stop, verify).await
 }
 
 /// `nntmux-ctl verify ...`
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Spot check bounded articles before publishing complete candidate NZBs.
+    Candidates {
+        /// Maximum candidates in this run.
+        #[arg(long, default_value_t = 1)]
+        limit: i64,
+        /// Worker slot. Zero selects a free slot.
+        #[arg(long, default_value_t = 0)]
+        slot: i64,
+        /// Stop claiming after this duration, and finish the active candidate.
+        #[arg(long, default_value_t = 0)]
+        max_seconds: u64,
+    },
     /// Separate complete header inventories from uploads waiting for articles.
     PrepareCandidates {
         /// Maximum metadata records inspected.
@@ -99,6 +113,34 @@ pub enum Command {
 pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
     let verify = context(&ctx)?;
     match command {
+        Command::Candidates {
+            limit,
+            slot,
+            max_seconds,
+        } => {
+            worker::refuse_remote_publication()?;
+            let worker = worker::Worker::new(&ctx, verify.clone()).await?;
+            let source = worker::NntpSource::new(worker.nntp.clone(), &verify);
+            let options = worker::RunOptions {
+                limit,
+                slot,
+                max_seconds,
+            };
+            let report = worker
+                .run(&source, options, &Shutdown::on_signals()?)
+                .await?;
+            if !report.started {
+                println!(
+                    "Verification worker slots are occupied or exclusive maintenance is running."
+                );
+            }
+            let mut counts: Vec<_> = worker::status_counts(&verify).await?.into_iter().collect();
+            counts.sort();
+            for (status, count) in counts {
+                println!("{status}: {count}");
+            }
+            Ok(())
+        }
         Command::PrepareCandidates {
             limit,
             max_seconds,

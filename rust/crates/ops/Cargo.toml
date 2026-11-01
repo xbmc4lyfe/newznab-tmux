@@ -13,6 +13,7 @@ crc32fast.workspace = true
 futures-util.workspace = true
 nntmux-categorize.workspace = true
 nntmux-core.workspace = true
+nntmux-metadata.workspace = true
 nntmux-nntp.workspace = true
 nntmux-postprocess.workspace = true
 nntmux-runtime.workspace = true

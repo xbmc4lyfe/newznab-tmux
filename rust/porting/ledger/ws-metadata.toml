@@ -52,19 +52,19 @@ status = "todo"
 kind = "command"
 id = "tv:repair-links"
 source = "app/Console/Commands/RepairTvReleaseLinks.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "tv:reprocess"
 source = "app/Console/Commands/ReprocessTvRelease.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "tv:reprocess-missing-episodes"
 source = "app/Console/Commands/ReprocessMissingEpisodes.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"

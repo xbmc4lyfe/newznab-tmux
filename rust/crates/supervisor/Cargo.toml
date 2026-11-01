@@ -11,6 +11,7 @@ chrono.workspace = true
 futures-util.workspace = true
 metrics.workspace = true
 nntmux-core.workspace = true
+nntmux-metadata.workspace = true
 nntmux-namefix.workspace = true
 nntmux-ops.workspace = true
 nntmux-runtime.workspace = true

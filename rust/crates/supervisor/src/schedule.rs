@@ -29,6 +29,8 @@ fn task(
 
 /// Stops a slow export before its next runs pile up behind it.
 const EXPORT_LIMIT: Duration = Duration::from_secs(240);
+/// The command line's default, which `Default` doesn't carry.
+const TV_REPAIR_CHUNK: i64 = 1000;
 /// A wedged service can't hold the every-minute health checks for long.
 const HEALTH_LIMIT: Duration = Duration::from_secs(300);
 
@@ -70,6 +72,46 @@ pub fn tasks() -> Vec<Task<Ctx>> {
                 })
             })
         },
+        task(
+            "tv:reprocess-missing-episodes --scheduled --limit=500",
+            EveryMinutes(30),
+            |ctx| {
+                Box::pin(async move {
+                    let Some(_busy) = busy::enter(&ctx, "tv-episodes").await? else {
+                        return Ok(());
+                    };
+                    let options = nntmux_metadata::TvMissingEpisodesOptions {
+                        scheduled: true,
+                        limit: 500,
+                        ..Default::default()
+                    };
+                    nntmux_metadata::tv_reprocess_missing_episodes(&ctx, options).await
+                })
+            },
+        ),
+        task(
+            "tv:repair-links --legacy --stuck --orphans --limit=50000",
+            Daily {
+                hour: 5,
+                minute: 15,
+            },
+            |ctx| {
+                Box::pin(async move {
+                    let Some(_busy) = busy::enter(&ctx, "tv-repair").await? else {
+                        return Ok(());
+                    };
+                    let options = nntmux_metadata::TvRepairLinksOptions {
+                        legacy: true,
+                        stuck: true,
+                        orphans: true,
+                        limit: 50_000,
+                        chunk: TV_REPAIR_CHUNK,
+                        ..Default::default()
+                    };
+                    nntmux_metadata::tv_repair_links(&ctx, options).await
+                })
+            },
+        ),
         task("nntmux:update-expired-roles", Cadence::MIDNIGHT, |ctx| {
             Box::pin(async move {
                 expired_roles::update_expired_roles(&ctx).await?;
@@ -183,6 +225,10 @@ pub fn tasks() -> Vec<Task<Ctx>> {
         },
         task("nntmux:remove-bad", Cadence::Hourly, |ctx| {
             Box::pin(async move {
+                // Deleting releases is processing, so it waits out a pause and a drain sees it.
+                let Some(_busy) = busy::enter(&ctx, "remove-bad").await? else {
+                    return Ok(());
+                };
                 resets::remove_bad(&ctx.db).await?;
                 Ok(())
             })

@@ -389,13 +389,13 @@ note = "Compose restarts the supervisor; nothing runs in tmux."
 kind = "schedule"
 id = "command: 'tv:repair-links --legacy --stuck --orphans --limit=50000')->dailyAt('05:15')->withoutOver"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
 id = "command: 'tv:reprocess-missing-episodes --scheduled --limit=500')->everyThirtyMinutes()->withoutOve"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"

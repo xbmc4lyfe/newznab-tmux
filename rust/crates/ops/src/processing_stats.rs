@@ -8,6 +8,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use nntmux_categorize::cat;
+use nntmux_metadata::{LookupMode, book_work_condition, imdb_needs_lookup_sql, tv_work_condition};
 use nntmux_postprocess::additional::candidates::{Scope, backlog_counts};
 use nntmux_postprocess::config::{Config as PostprocessConfig, Settings};
 use nntmux_runtime::Ctx;
@@ -84,46 +85,6 @@ fn ready_lookup(condition: &str, mode: i64, enabled: bool, renamed_only: bool) -
         ""
     };
     format!("{condition}{renamed} AND {SETTLED}")
-}
-
-/// `TvProcessingCandidateQuery::workCondition`.
-pub fn tv_work(mode: i64) -> String {
-    if mode <= 0 {
-        return NEVER.to_owned();
-    }
-    let renamed = if mode == 2 { " AND isrenamed = 1" } else { "" };
-    format!(
-        "(categories_id BETWEEN {} AND {} AND categories_id <> {} AND size > 1048576) \
-         AND videos_id = 0 AND tv_episodes_id = 0 AND {SETTLED} \
-         AND (tv_lookup_retry_at IS NULL OR tv_lookup_retry_at <= CURRENT_TIMESTAMP){renamed}",
-        cat::TV_ROOT,
-        cat::TV_OTHER,
-        cat::TV_ANIME
-    )
-}
-
-/// `BookProcessingCandidateQuery::workCondition`.
-pub fn book_work(mode: i64) -> String {
-    if mode <= 0 {
-        return format!(
-            "(categories_id BETWEEN {} AND {} OR categories_id = {}) AND {SETTLED} AND ({NEVER} OR {NEVER})",
-            cat::BOOKS_ROOT,
-            cat::BOOKS_UNKNOWN,
-            cat::MUSIC_AUDIOBOOK
-        );
-    }
-    let renamed = if mode == 2 { " AND isrenamed = 1" } else { "" };
-    let not_renamed = if mode == 2 { "" } else { "isrenamed = 0 OR " };
-    format!(
-        "(categories_id BETWEEN {} AND {} OR categories_id = {}) AND {SETTLED} AND (\
-         (bookinfo_id IS NULL AND book_lookup_attempts < 5 \
-         AND (book_lookup_retry_at IS NULL OR book_lookup_retry_at <= CURRENT_TIMESTAMP){renamed}) OR \
-         (book_name_normalized_at IS NULL AND ({not_renamed}searchname LIKE 'N:/NZB%' OR searchname LIKE 'N_NZB_%' \
-         OR name LIKE 'N:/NZB%' OR name LIKE 'N_NZB_%')))",
-        cat::BOOKS_ROOT,
-        cat::BOOKS_UNKNOWN,
-        cat::MUSIC_AUDIOBOOK
-    )
 }
 
 /// `NfoService::NfoQueryString`.
@@ -206,7 +167,7 @@ pub fn release_counts_sql(
         (
             "processtv",
             if non_amazon {
-                tv_work(settings.tv_lookup)
+                tv_work_condition(LookupMode::from_value(settings.tv_lookup))
             } else {
                 NEVER.to_owned()
             },
@@ -224,9 +185,10 @@ pub fn release_counts_sql(
             "processmovies",
             ready_lookup(
                 &format!(
-                    "categories_id BETWEEN {} AND {} AND (imdbid IS NULL OR imdbid IN ('0', '0000000', '00000000'))",
+                    "categories_id BETWEEN {} AND {} AND {}",
                     cat::MOVIE_ROOT,
-                    cat::MOVIE_OTHER
+                    cat::MOVIE_OTHER,
+                    imdb_needs_lookup_sql("imdbid")
                 ),
                 settings.movie_lookup,
                 non_amazon,
@@ -263,7 +225,7 @@ pub fn release_counts_sql(
         (
             "processbooks",
             if amazon {
-                book_work(settings.book_lookup)
+                book_work_condition(LookupMode::from_value(settings.book_lookup))
             } else {
                 NEVER.to_owned()
             },

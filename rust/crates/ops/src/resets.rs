@@ -23,8 +23,10 @@ const CATEGORIES: [&str; 8] = [
     "music", "console", "movie", "game", "tv", "adult", "book", "misc",
 ];
 
-/// Tables `nntmux:resetdb` empties, in the order PHP did.
-const RESET_TABLES: [&str; 41] = [
+/// Tables `nntmux:resetdb` empties. Truncating with foreign keys off doesn't cascade, and release ids
+/// start over, so everything that points at a release has to go too. PHP's list missed the last six;
+/// a leftover `release_nzb_contents` row would block the NZB of a new release with the same id.
+pub const RESET_TABLES: [&str; 47] = [
     "binaries",
     "collections",
     "collection_groups",
@@ -66,6 +68,12 @@ const RESET_TABLES: [&str; 41] = [
     "anidb_titles",
     "anidb_info",
     "releases_groups",
+    "dnzb_failures",
+    "release_archive_naming_evidence",
+    "release_fingerprint_jobs",
+    "release_fingerprint_metadata",
+    "release_nzb_contents",
+    "search_index_failures",
 ];
 
 pub const RESET_INDEXES: [&str; 9] = [
