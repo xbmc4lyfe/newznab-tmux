@@ -2056,8 +2056,24 @@ name = "nntmux-fingerprint"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "crc32fast",
+ "flate2",
+ "hex",
+ "md-5 0.10.6",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "nntmux-verify",
+ "nntmux-yenc",
+ "quick-xml",
+ "rand 0.9.5",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]

@@ -28,7 +28,8 @@ status = "todo"
 kind = "command"
 id = "nntmux:update-releases-index"
 source = "app/Console/Commands/UpdateReleasesIndexSchema.php"
-status = "todo"
+status = "dropped"
+note = "A one-time migration for indexes older than the media fields. The Rust registry creates the full schema, and search documents already carry those fields, so rebuilding through ws-search replaces it. An older production index must be migrated on PHP before cutover or rebuilt."
 
 [[entry]]
 kind = "command"
@@ -52,13 +53,15 @@ status = "todo"
 kind = "command"
 id = "releases:fingerprint-backfill"
 source = "app/Console/Commands/BackfillReleaseFingerprintMetadata.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl fingerprint backfill."
 
 [[entry]]
 kind = "command"
 id = "releases:fingerprint-transfer"
 source = "app/Console/Commands/TransferFingerprintQueue.php"
-status = "todo"
+status = "dropped"
+note = "Moves Redis Horizon jobs to the database queue. Run once on PHP before cutover: Rust has no Horizon queue to transfer from."
 
 [[entry]]
 kind = "command"
