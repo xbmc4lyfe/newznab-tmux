@@ -1,14 +1,9 @@
 ## Testing
 
-PHPUnit only (no Pest). Create tests: `php artisan make:test --phpunit {name}`
-
-- In-memory SQLite (`DB_CONNECTION=testing`)
-- App boot can hit `Settings::settingValue()` via `CategorizationPipeline` (`app/Providers/CategorizationServiceProvider.php` → `app/Services/Categorization/CategorizationPipeline.php`), even in focused controller tests
-- For isolated tests that bypass the normal app test DB setup, seed a minimal `settings` table before app bootstrap; `categorizeforeign` and `catwebdl` are the minimum keys needed for this path, and `tests/Feature/AdminContentControllerTest.php` shows the file-backed SQLite workaround when `php artisan test` would otherwise fail during startup
-- Feature tests that render shared layouts or admin pages may need to clear `App\View\Composers\GlobalDataComposer::$resolvedData`; see `resetGlobalComposerState()` helpers in `tests/Feature/AdminContentControllerTest.php`, `AdminGroupControllerTest.php`, and `NzbAndRssAccessTest.php`
-- All HTTP mocked - no real API calls
-- Suites: `Install`, `Unit`, `Feature` (also `tests/Integration/` for live API tests, not in CI)
-- Use model factories; check for custom states first
-- Mocks in `tests/Fixtures/`, `tests/mock_data/`
-- Test harnesses in `tests/Support/` (e.g., `DatabaseTestCase`, `TestBinariesHarness`)
-- PHPUnit 12 — use `#[Test]` attributes or `test` prefix naming
+- `just test` starts the shared services in `rust/compose.test.yml` (MariaDB on 33306, Redis on 36379, Manticore on 39306 and 39308), sets the `TEST_*` variables, then runs `cargo test --locked`. Extra arguments go to cargo: `just test -p nntmux-search`.
+- `just check` runs `cargo fmt --all --check`, clippy with `-D warnings`, and `python3 rust/porting/check.py` (the FFI ban and the ledger gate). CI runs the same checks plus the workspace tests.
+- Database tests use `nntmux_testkit::TestDb`. Each test gets its own database on `TEST_DATABASE_URL`, and the test skips itself when the variable is unset. Prefix any Redis keys and Manticore tables the same way, because the services are shared by all worktrees.
+- Pure logic needs a golden test. Provider and HTTP clients need `wiremock` tests. No real API or NNTP calls. Tests that only restate the implementation don't count.
+- Fixtures come from the PHP reference (`php-final`). Commit them under `rust/crates/<crate>/tests/fixtures/` with the small script that made them. API XML and JSON must match recorded PHP responses byte for byte.
+- Set `CARGO_BUILD_JOBS=4` and test one crate with `-p` while working; run the whole workspace before a PR.
+- When you port a ledger entry, set it to `ported` in `rust/porting/ledger/<workstream>.toml` in the same PR.

@@ -9,18 +9,18 @@ These procedures supplement `AGENTS.md`. They do not authorize dependency instal
 
 ## Choose the experiment
 
-- Start with existing PHPUnit tests, real storage handlers, MariaDB `EXPLAIN` and lock-wait metadata, and OS/container resource counters.
-- Treat temporary benchmark harnesses as experimental until committed, reviewed, and documented. Use Sysbench for a reproduced SQL transaction or PHPBench for pure PHP only when existing tools cannot answer the question; follow dependency approval rules.
+- Start with existing `cargo test` integration tests (`just test`), real storage handlers, MariaDB `EXPLAIN` and lock-wait metadata, and OS/container resource counters.
+- Treat temporary benchmark harnesses as experimental until committed, reviewed, and documented. Use Sysbench for a reproduced SQL transaction or a `cargo bench`/criterion harness for pure Rust only when existing tools cannot answer the question; follow dependency approval rules.
 - Use one executor and a uniquely named disposable database/runtime per experiment. Run concurrency/capacity benchmarks on a separate host; production-host resource limits do not eliminate shared-resource interference.
-- Keep production endpoints, credentials, bind mounts, `.env` files, and cached application configuration out of validation runtimes.
-- Before a MariaDB fixture, clear Laravel connection `url` and `unix_socket`, explicitly set private host and port, and pass that endpoint to every child connection. Use random fixture database names. Roll back transactions, reap children, and drop only owned fixtures in `finally`.
-- Full-suite runtimes need locked test tools and extensions, including GD/EXIF, Node, Git, make, and procps as required. Copy all tracked test inputs (Docker, frontend, monitoring) without production data/config. Classify runtime/fixture failures before changing code and rerun affected checks after fixing the environment.
+- Keep production endpoints, credentials, bind mounts, and `.env` files (`docker/.env`, `docker/config/app.env`) out of validation runtimes. Use the services in `rust/compose.test.yml`.
+- Before a MariaDB fixture, set an explicit private host and port (`TEST_DATABASE_URL`) and pass that endpoint to every child connection. Use `nntmux_testkit::TestDb`, which gives each test a random database name. Roll back transactions, reap children, and drop only owned fixtures.
+- Full-suite runtimes need the pinned Rust toolchain (`rust/rust-toolchain.toml`), `--locked` builds, Node for the front end, and ffmpeg, mediainfo, unrar and 7z for post-processing tests. Copy all tracked test inputs (Docker, frontend, monitoring) without production data/config. Classify runtime/fixture failures before changing code and rerun affected checks after fixing the environment.
 
 ## Freeze and preserve correctness
 
-- Freeze baseline/candidate source hashes, lockfile/vendor identity, runtime image IDs, PHP/MariaDB versions, schema/indexes/collations, isolation/durability settings, resource caps, storage type, and protocol/order hashes. Record differences from deployment. A reduced fixture proves only its reproduced mechanism, not full-schema behavior or production capacity.
+- Freeze baseline/candidate source hashes, `Cargo.lock` identity, runtime image IDs, Rust toolchain and MariaDB versions, schema/indexes/collations, isolation/durability settings, resource caps, storage type, and protocol/order hashes. Record differences from deployment. A reduced fixture proves only its reproduced mechanism, not full-schema behavior or production capacity.
 - Reproduce deadlocks through the actual handler with deterministic synchronization and an observed competing lock wait. Record both clients' statement and transaction outcomes and the matched wait graph. Show baseline failure and candidate success; an unrelated artificial deadlock or victim label is insufficient.
-- Preserve transaction boundaries, upserts, aggregate COUNT/SUM/CASE calculations, retry policy, lifecycle/deletion guards, and SQLite behavior unless a separately evidenced change covers them.
+- Preserve transaction boundaries, upserts, aggregate COUNT/SUM/CASE calculations, retry policy, and lifecycle/deletion guards unless a separately evidenced change covers them.
 - Capture access-plan evidence for dense, sparse, small, and actual maximum chunk sizes. Index hints and logical ID order do not guarantee bounded access or physical lock order; label preflight plans separately from executed-plan evidence.
 - Independently verify initial committed unique parts/bytes, binary aggregates, collection readiness, crosspost membership, and orphans. Cover conflicting duplicates/first-write, replay, rollback, missing parents, and deletion races. Insert IDs remain provisional until commit; replay recovery does not make an initially exhausted batch successful.
 
