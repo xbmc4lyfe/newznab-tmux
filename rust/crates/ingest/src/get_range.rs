@@ -165,6 +165,20 @@ async fn attempt(ingest: &mut Ingest<'_>, request: &RangeRequest) -> Result<(), 
         )));
     }
     let Some(summary) = outcome.summary else {
+        // A window with no articles still counts, or a pass inside a gap in the article numbers
+        // would ask for the same ranges forever. PHP left the cursor where it was.
+        if request.mode == RangeMode::Backfill {
+            sqlx::query(
+                "UPDATE usenet_groups SET first_record = ?, last_updated = NOW() \
+                 WHERE id = ? AND first_record > ?",
+            )
+            .bind(request.first)
+            .bind(group.id)
+            .bind(request.first)
+            .execute(pool)
+            .await
+            .map_err(|failure| scanned(failure.into()))?;
+        }
         return Ok(());
     };
     let update = match request.mode {

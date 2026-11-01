@@ -421,6 +421,12 @@ impl<'a> Ingest<'a> {
             return Ok(ScanOutcome::default());
         };
         if headers.is_empty() {
+            // The cursor moves past this window, and its articles can still arrive late. PHP queued
+            // them whenever one header came back, but not when none did.
+            if kind == ScanKind::Update && self.config.part_repair {
+                self.queue_not_received(group.id, first, last, &HashSet::new())
+                    .await?;
+            }
             return Ok(ScanOutcome {
                 summary: None,
                 completed_end: Some(last),

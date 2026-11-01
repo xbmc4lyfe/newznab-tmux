@@ -231,6 +231,11 @@ async fn a_423_completes_an_empty_window() {
     assert_eq!(outcome.completed_end, Some(1020));
     assert_eq!(outcome.summary, None);
     assert!(server.reconnects.is_empty());
+    // The cursor will pass these, and they can still arrive late.
+    assert_eq!(
+        missed_numbers(&db.pool).await,
+        (1001..=1020).collect::<Vec<u64>>()
+    );
     db.drop_database().await.unwrap();
 }
 
@@ -470,5 +475,25 @@ async fn a_failed_part_repair_uses_one_attempt() {
         .await
         .unwrap();
     assert_eq!(attempts, 2);
+    db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_empty_backfill_range_still_moves_the_first_record_down() {
+    let Some(db) = TestDb::create().await.unwrap() else {
+        return;
+    };
+    let (_, config) = setup(&db, 1000, 900).await;
+    let mut server = FakeServer::with_articles([], 1, 1040);
+    let mut ingest = Ingest::new(&db.pool, &config, &NoHooks, &mut server, None);
+    get_range(&mut ingest, &range(RangeMode::Backfill, 800, 899, false))
+        .await
+        .unwrap();
+    assert_eq!(cursor(&db.pool).await, (800, 1000));
+    // A later range above the cursor doesn't move it back up.
+    get_range(&mut ingest, &range(RangeMode::Backfill, 850, 860, false))
+        .await
+        .unwrap();
+    assert_eq!(cursor(&db.pool).await, (800, 1000));
     db.drop_database().await.unwrap();
 }
