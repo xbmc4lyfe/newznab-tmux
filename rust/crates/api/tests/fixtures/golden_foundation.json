@@ -4543,6 +4543,7 @@
   "headers": {
    "User-Agent": "usenetstreamer"
   },
+  "status_only": true,
   "expect": {
    "status": 403,
    "headers": [
@@ -4633,6 +4634,166 @@
    ],
    "body": "",
    "audit": []
+  }
+ },
+ {
+  "name": "inform_rename",
+  "path": "/api/inform/release?api_token=tokenalice&relo=A.Game.PS4-GRP&relp=Better.Game.Name.PS4-GROUP",
+  "after": "SELECT CONCAT_WS('|', searchname, categories_id, isrenamed, iscategorized, proc_files) FROM releases WHERE id = 4 UNION ALL SELECT CONCAT_WS('|', relOName, relPName) FROM release_informs",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"message\":\"Release Information Added!\"}",
+   "audit": [],
+   "after": [
+    "A.Game.PS4-GRP|1180|0|0|0",
+    "A.Game.PS4-GRP|Better.Game.Name.PS4-GROUP"
+   ]
+  }
+ },
+ {
+  "name": "inform_rename_same",
+  "path": "/api/inform/release?api_token=tokenalice&relo=A.Game.PS4-GRP&relp=A.Game.PS4-GRP",
+  "after": "SELECT CONCAT_WS('|', searchname, categories_id, isrenamed, iscategorized, proc_files) FROM releases WHERE id = 4 UNION ALL SELECT CONCAT_WS('|', relOName, relPName) FROM release_informs",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"message\":\"Release Information Added!\"}",
+   "audit": [],
+   "after": [
+    "A.Game.PS4-GRP|1180|0|0|0",
+    "A.Game.PS4-GRP|A.Game.PS4-GRP"
+   ]
+  }
+ },
+ {
+  "name": "inform_rename_movie",
+  "path": "/api/inform/release?api_token=tokenalice&relo=An.Author-A.Book.EPUB&relp=Some.Movie.2024.1080p.BluRay.x264-GROUP",
+  "after": "SELECT CONCAT_WS('|', searchname, categories_id, isrenamed, iscategorized, proc_files) FROM releases WHERE id = 5 UNION ALL SELECT CONCAT_WS('|', relOName, relPName) FROM release_informs",
+  "status_only": true,
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "\n\u001b[33mNew name:   \u001b[0m  \n\u001b[33mOld name:   \u001b[0m  \n\u001b[33mUse name:   \u001b[0m  \n\n\u001b[33mNew cat:    \u001b[0m  \n\u001b[33mOld cat:    \u001b[0m  \n\u001b[33mGroup:      \u001b[0m  \n\n\u001b[33mMethod:     \u001b[0m  \n\u001b[33mRelease ID: \u001b[0m  \n\n{\"message\":\"Release Information Added!\"}",
+   "audit": [],
+   "after": [
+    "Some.Movie.2024.1080p.BluRay.x264-GROUP|2040|1|1|1",
+    "An.Author-A.Book.EPUB|Some.Movie.2024.1080p.BluRay.x264-GROUP"
+   ]
+  }
+ },
+ {
+  "name": "inform_unknown",
+  "path": "/api/inform/release?api_token=tokenalice&relo=nothing&relp=b",
+  "after": "SELECT CONCAT_WS('|', relOName, relPName) FROM release_informs",
+  "expect": {
+   "status": 200,
+   "headers": [
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-ratelimit-limit",
+     "60"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "59"
+    ]
+   ],
+   "body": "{\"message\":\"Release Information Added!\"}",
+   "audit": [],
+   "after": [
+    "nothing|b"
+   ]
   }
  }
 ]

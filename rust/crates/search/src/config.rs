@@ -57,6 +57,14 @@ impl IndexNames {
             .map_or("", |(_, table)| table.as_str())
     }
 
+    /// The logical index configured to use this table, if any.
+    pub fn configured(&self, table: &str) -> Option<&'static str> {
+        self.0
+            .iter()
+            .find(|(_, configured)| configured == table)
+            .map(|(logical, _)| *logical)
+    }
+
     /// The configured name wins over the `<logical>_rt` default.
     pub fn logical(&self, table: &str) -> Option<&'static str> {
         self.0

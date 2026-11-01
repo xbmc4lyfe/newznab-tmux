@@ -4,31 +4,32 @@
 kind = "command"
 id = "benchmark:rename"
 source = "app/Console/Commands/BenchmarkRename.php"
-status = "todo"
+status = "dropped"
+note = "A benchmark of the PHP rename pipeline against a stored sample. It has no production callers."
 
 [[entry]]
 kind = "command"
 id = "irc:scrape"
 source = "app/Console/Commands/IrcScraperCommand.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "match:prefiles"
 source = "app/Console/Commands/MatchPrefiles.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "multiprocessing:fixrelnames"
 source = "app/Console/Commands/ProcessFixRelNames.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:recategorize-releases"
 source = "app/Console/Commands/RecategorizeReleases.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -40,40 +41,40 @@ status = "ported"
 kind = "command"
 id = "predb:check"
 source = "app/Console/Commands/PredbCheck.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "predb:identity-rebuild"
 source = "app/Console/Commands/PredbIdentityRebuildCommand.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "predb:import-feed"
 source = "app/Console/Commands/PredbImportFeed.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "releases:fix-names"
 source = "app/Console/Commands/FixReleaseNames.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "releases:fix-names-group"
 source = "app/Console/Commands/ReleasesFixNamesGroup.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "releases:fix-nzbsplit"
 source = "app/Console/Commands/FixNzbSplitNames.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "releases:recategorize-onlyfans"
 source = "app/Console/Commands/RecategorizeOnlyFans.php"
-status = "todo"
+status = "ported"

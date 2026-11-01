@@ -1,0 +1,20 @@
+{% extends "layout.html" %}
+{% import "components.html" as c %}
+{% block content %}
+{% call c::page_header_open(heading, "Your list", "Choose the categories you want from this title.", "fas fa-list-check") %}{% endcall %}
+{% call c::page_header_close() %}{% endcall %}
+<form method="POST" action="{{ action }}" class="surface-panel rounded-xl shadow-sm p-4 sm:p-6">
+    <input type="hidden" name="_token" value="{{ layout.csrf }}">
+    <input type="hidden" name="{{ action_field }}" value="{{ action_value }}">
+    <input type="hidden" name="{{ id_field }}" value="{{ id_value }}">
+    <input type="hidden" name="from" value="{{ from }}">
+    <fieldset class="space-y-2 mb-4">
+        <legend class="font-semibold text-gray-800 dark:text-gray-200 mb-2">{{ title }}</legend>
+        {% for category in categories %}
+        <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"><input type="checkbox" name="category[]" value="{{ category.id }}"{% if category.selected %} checked{% endif %} class="rounded border-gray-300 dark:border-gray-600">{{ category.title }}</label>
+        {% endfor %}
+    </fieldset>
+    <button type="submit" class="px-4 py-2 bg-primary-600 text-white rounded-lg text-sm">Save</button>
+    <a href="{{ from }}" class="ml-2 text-sm text-gray-600 dark:text-gray-400">Cancel</a>
+</form>
+{% endblock %}

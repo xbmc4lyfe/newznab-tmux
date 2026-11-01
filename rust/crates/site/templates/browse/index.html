@@ -1,0 +1,18 @@
+{% extends "layout.html" %}
+{% import "components.html" as c %}
+{% block modals %}{% include "releases/modals.html" %}{% endblock %}
+{% block content %}
+<div class="surface-panel rounded-xl shadow-sm transition-colors duration-200">
+    {% call c::page_header_open(browse_title, "Discover and download", "Browse the latest indexed releases, refine the list, and open details or download directly.", "fas fa-compass") %}{% endcall %}
+        <div class="flex flex-wrap gap-2 text-sm xl:justify-end">
+            <span class="workspace-hero__stat"><i class="fas fa-layer-group" aria-hidden="true"></i>{{ list.pager.total }} releases</span>
+            <span class="workspace-hero__stat"><i class="fas fa-folder-open" aria-hidden="true"></i>{{ category_label }}</span>
+        </div>
+    {% call c::page_header_close() %}{% endcall %}
+    {% if !list.rows.is_empty() %}
+        {% include "releases/panel.html" %}
+    {% else %}
+        {% call c::empty_state("fas fa-search", "No releases found", "Try adjusting your search criteria or browse other categories.") %}{% endcall %}
+    {% endif %}
+</div>
+{% endblock %}

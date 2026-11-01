@@ -7,8 +7,22 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
+hex.workspace = true
+nntmux-core.workspace = true
 nntmux-runtime.workspace = true
+nntmux-verify.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+nntmux-testkit.workspace = true
 
 [lints]
 workspace = true

@@ -127,7 +127,7 @@ pub fn parse_urlencoded(raw: &str) -> Bag {
     bag
 }
 
-fn decode(raw: &str) -> String {
+pub fn decode(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;

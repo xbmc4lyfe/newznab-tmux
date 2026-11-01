@@ -4262,6 +4262,92 @@
             ]
         }
     },
+    "lookups": {
+        "candidates": [
+            {
+                "table": "releases_rt",
+                "strip_bad_utf8": true,
+                "sort": [
+                    {
+                        "id": "asc"
+                    }
+                ],
+                "options": {
+                    "ranker": "sph04",
+                    "field_weights": {
+                        "searchname": 12,
+                        "plainsearchname": 10,
+                        "name": 8,
+                        "filename": 5,
+                        "fromname": 1
+                    }
+                },
+                "max_matches": 22,
+                "limit": 22,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "query_string": "@@relaxed (@name (Dead Circus 2019) | @searchname (Dead Circus 2019))"
+                            },
+                            {
+                                "range": {
+                                    "id": {
+                                        "gt": 5
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        ],
+        "exact": [
+            {
+                "table": "predb_rt",
+                "limit": 5,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "query_string": "@title \"^Some.Release\\-GRP \\[x\\]$\""
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "table": "predb_rt",
+                "limit": 5,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "query_string": "@filename \"^Some.Release\\-GRP \\[x\\]$\""
+                            }
+                        ]
+                    }
+                }
+            }
+        ],
+        "filename": [
+            {
+                "table": "predb_rt",
+                "max_matches": 1000,
+                "limit": 1000,
+                "strip_bad_utf8": false,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "query_string": "@@relaxed @(title,filename) (some.release.nfo)"
+                            }
+                        ]
+                    }
+                }
+            }
+        ]
+    },
     "results": {
         "pages": {
             "browse": {
@@ -5320,6 +5406,142 @@
                         }
                     ]
                 }
+            ]
+        ],
+        "candidates": [
+            [
+                "dead circus",
+                1,
+                0,
+                {
+                    "ids": [
+                        1
+                    ],
+                    "available": true,
+                    "has_more": true
+                }
+            ],
+            [
+                "dead circus",
+                21,
+                0,
+                {
+                    "ids": [
+                        1,
+                        2
+                    ],
+                    "available": true,
+                    "has_more": false
+                }
+            ],
+            [
+                "dead circus",
+                21,
+                1,
+                {
+                    "ids": [
+                        2
+                    ],
+                    "available": true,
+                    "has_more": false
+                }
+            ],
+            [
+                "...",
+                21,
+                0,
+                {
+                    "ids": [],
+                    "available": false,
+                    "has_more": false
+                }
+            ],
+            [
+                "nosuch",
+                21,
+                0,
+                {
+                    "ids": [],
+                    "available": true,
+                    "has_more": false
+                }
+            ]
+        ],
+        "predb_exact": [
+            [
+                "Some.Release-GRP",
+                {
+                    "id": 1,
+                    "title": "Some.Release-GRP",
+                    "filename": "some.release.nfo",
+                    "source": "srrdb"
+                }
+            ],
+            [
+                "some.release-grp",
+                {
+                    "id": 1,
+                    "title": "Some.Release-GRP",
+                    "filename": "some.release.nfo",
+                    "source": "srrdb"
+                }
+            ],
+            [
+                "some.release.nfo",
+                {
+                    "id": 1,
+                    "title": "Some.Release-GRP",
+                    "filename": "some.release.nfo",
+                    "source": "srrdb"
+                }
+            ],
+            [
+                "Some.Release",
+                null
+            ],
+            [
+                "...",
+                null
+            ],
+            [
+                "nosuch",
+                null
+            ]
+        ],
+        "predb_filename": [
+            [
+                "some.release.nfo",
+                [
+                    {
+                        "id": 1,
+                        "title": "Some.Release-GRP",
+                        "filename": "some.release.nfo",
+                        "source": "srrdb"
+                    }
+                ]
+            ],
+            [
+                "some",
+                [
+                    {
+                        "id": 1,
+                        "title": "Some.Release-GRP",
+                        "filename": "some.release.nfo",
+                        "source": "srrdb"
+                    }
+                ]
+            ],
+            [
+                "nosuch",
+                []
+            ],
+            [
+                "*",
+                null
+            ],
+            [
+                "0",
+                null
             ]
         ]
     }

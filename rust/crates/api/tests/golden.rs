@@ -8,11 +8,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::{Body, to_bytes};
+use axum::extract::State;
 use axum::http::Request;
 use base64::Engine;
 use nntmux_api::{Settings, router_with};
 use nntmux_core::{Config, DatabaseConfig, ManticoreConfig};
 use nntmux_runtime::Ctx;
+use nntmux_search::config::IndexNames;
+use nntmux_search::{CursorCodec, SearchClient, SearchConfig, create_table_sql};
 use nntmux_testkit::TestDb;
 use rand::Rng;
 use redis::aio::ConnectionManager;
@@ -20,8 +23,13 @@ use serde_json::Value;
 use sqlx::{AssertSqlSafe, MySqlPool};
 use tower::ServiceExt;
 
-/// PHP streams JSON without a length; the two stacks may differ only here.
-const IGNORED_HEADERS: [&str; 2] = ["content-length", "expires"];
+/// The two stacks may differ here: PHP streams JSON without a length, the rest vary per request.
+const IGNORED_HEADERS: [&str; 4] = [
+    "content-length",
+    "expires",
+    "content-security-policy",
+    "set-cookie",
+];
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -82,14 +90,20 @@ fn settings_with_cap() -> Settings {
 }
 
 fn app(ctx: &Ctx) -> Router {
-    router_with(settings()).with_state(ctx.clone())
+    router_with(settings())
+        .layer(axum::Extension(ctx.clone()))
+        .with_state(ctx.clone())
 }
 
 /// Volatile response parts become placeholders on both sides before comparing.
 fn mask(value: &str) -> String {
     let date = regex::Regex::new(r#"("(?:apiOldestTime|grabOldestTime|apioldesttime|graboldesttime)":|(?:apioldesttime|graboldesttime)=)"[^"]+""#)
         .expect("static regex");
-    date.replace_all(value, "$1\"<now>\"").into_owned()
+    let masked = date.replace_all(value, "$1\"<now>\"");
+    let cursor = regex::Regex::new(r#""next_cursor":"[^"]+""#).expect("static regex");
+    cursor
+        .replace_all(&masked, "\"next_cursor\":\"<cursor>\"")
+        .into_owned()
 }
 
 fn headers_of(value: &Value) -> Vec<(String, String)> {
@@ -110,6 +124,10 @@ fn headers_of(value: &Value) -> Vec<(String, String)> {
 }
 
 async fn replay(file: &str, skip: &[&str]) -> Result<()> {
+    replay_with(file, skip, None).await
+}
+
+async fn replay_with(file: &str, skip: &[&str], search: Option<SearchConfig>) -> Result<()> {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
     else {
@@ -156,7 +174,13 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
             }
             _ => Body::empty(),
         };
-        let response = app(&ctx).oneshot(builder.body(body)?).await?;
+        let mut settings = settings();
+        settings.search_config = search.clone();
+        settings.cursor_codec = Some(CursorCodec::new("test-key", "1", 15));
+        let app = router_with(settings)
+            .layer(axum::Extension(ctx.clone()))
+            .with_state(ctx.clone());
+        let response = app.oneshot(builder.body(body)?).await?;
         let status = response.status().as_u16();
         let mut got_headers: Vec<(String, String)> = response
             .headers()
@@ -405,7 +429,8 @@ async fn releases_match_php() -> Result<()> {
 
 #[tokio::test]
 async fn getnzb_matches_php() -> Result<()> {
-    replay("golden_getnzb.json", &[]).await
+    // DELETE meets the web stack's CSRF check first here (419), before routing would say 405.
+    replay("golden_getnzb.json", &["getnzb_method"]).await
 }
 
 /// The archive holds each stored NZB under its release name, unmodified, skipping unknown GUIDs.
@@ -475,7 +500,9 @@ async fn rss_limit_is_honored() -> Result<()> {
         ("/rss/full-feed?limit=-1&api_token=tokenalice", app(&ctx), 1),
         (
             "/rss/full-feed?limit=1e30&api_token=tokenalice",
-            router_with(settings_with_cap()).with_state(ctx.clone()),
+            router_with(settings_with_cap())
+                .layer(axum::Extension(ctx.clone()))
+                .with_state(ctx.clone()),
             1,
         ),
     ] {
@@ -508,7 +535,9 @@ async fn proxy_detection_scores_like_php() -> Result<()> {
     run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
     let mut settings = settings();
     settings.abuse.detection_enabled = true;
-    let app = router_with(settings).with_state(ctx.clone());
+    let app = router_with(settings)
+        .layer(axum::Extension(ctx.clone()))
+        .with_state(ctx.clone());
     let call = |uri: &str, referer: Option<&str>| {
         let mut builder = Request::builder()
             .uri(uri)
@@ -535,4 +564,226 @@ async fn proxy_detection_scores_like_php() -> Result<()> {
 #[tokio::test]
 async fn uploads_match_php() -> Result<()> {
     replay("golden_upload.json", &[]).await
+}
+
+/// Signs in through the site's session, then replays what Laravel answered a signed-in user.
+#[tokio::test]
+async fn signed_in_routes_match_php() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    let seed = fs::read_to_string(fixtures().join("seed.sql"))?;
+    let cases: Vec<Value> =
+        serde_json::from_str(&fs::read_to_string(fixtures().join("golden_web.json"))?)?;
+    for case in &cases {
+        run_sql(&db.pool, &seed).await?;
+        for statement in case["setup"].as_array().into_iter().flatten() {
+            run_sql(&db.pool, statement.as_str().context("setup")?).await?;
+        }
+        let mut cookie = String::new();
+        if let Some(user) = case["session_user"].as_i64() {
+            let login = axum::routing::get(
+                move |session: nntmux_webkit::Session, State(state): State<Ctx>| async move {
+                    let found = nntmux_webkit::User::find(&state.db, user)
+                        .await
+                        .expect("query")
+                        .expect("user");
+                    nntmux_webkit::auth::login(&session, &found);
+                    "in"
+                },
+            );
+            let signer = nntmux_webkit::stack(Router::<Ctx>::new().route("/in", login))
+                .layer(axum::Extension(ctx.clone()))
+                .with_state(ctx.clone());
+            let response = signer
+                .oneshot(Request::get("/in").body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), 200);
+            cookie = response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok()?.split(';').next().map(str::to_owned))
+                .collect::<Vec<_>>()
+                .join("; ");
+        }
+        let mut builder = Request::builder()
+            .uri(case["path"].as_str().context("path")?)
+            .header("host", "127.0.0.1:8765");
+        if !cookie.is_empty() {
+            builder = builder.header("cookie", cookie);
+        }
+        if let Some(accept) = case["headers"]["Accept"].as_str() {
+            builder = builder.header("accept", accept);
+        }
+        let response = app(&ctx).oneshot(builder.body(Body::empty())?).await?;
+        let name = case["name"].as_str().unwrap_or_default();
+        assert_eq!(
+            i64::from(response.status().as_u16()),
+            case["expect"]["status"].as_i64().unwrap_or_default(),
+            "{name}"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            case["expect"]["body"].as_str().unwrap_or_default(),
+            "{name}"
+        );
+    }
+    db.drop_database().await
+}
+
+/// The help pages render inside the layout, with this user's token in the examples.
+#[tokio::test]
+async fn help_pages_render_for_a_signed_in_user() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    let login = axum::routing::get(
+        |session: nntmux_webkit::Session, State(state): State<Ctx>| async move {
+            let found = nntmux_webkit::User::find(&state.db, 1)
+                .await
+                .expect("query")
+                .expect("user");
+            nntmux_webkit::auth::login(&session, &found);
+            "in"
+        },
+    );
+    let signer = nntmux_webkit::stack(Router::<Ctx>::new().route("/in", login))
+        .layer(axum::Extension(ctx.clone()))
+        .with_state(ctx.clone());
+    let response = signer
+        .oneshot(Request::get("/in").body(Body::empty())?)
+        .await?;
+    let cookie = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok()?.split(';').next().map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("; ");
+    for (path, marker, wanted) in [
+        ("/apihelp", "Api Help", "apikey=tokenalice"),
+        ("/apiv2help", "Api V2 Help", "tokenalice"),
+        ("/rsshelp", "Rss Info", "/rss/category?id=2040"),
+    ] {
+        let request = Request::get(path)
+            .header("host", "x.test")
+            .header("cookie", &cookie)
+            .body(Body::empty())?;
+        let response = app(&ctx).oneshot(request).await?;
+        assert_eq!(response.status(), 200, "{path}");
+        let html = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
+        assert!(html.contains(marker), "{path}");
+        assert!(html.contains(wanted), "{path}");
+        assert!(html.contains("http://x.test/"), "{path}");
+    }
+    let guest = app(&ctx)
+        .oneshot(Request::get("/apihelp").body(Body::empty())?)
+        .await?;
+    assert_eq!(guest.status(), 303);
+    db.drop_database().await
+}
+
+/// Loads the documents PHP's populate wrote into tables only this test uses, then replays.
+#[tokio::test]
+async fn search_matches_php() -> Result<()> {
+    let Ok(endpoint) = std::env::var("TEST_MANTICORE_HTTP") else {
+        eprintln!("TEST_MANTICORE_HTTP is unset, skipping");
+        return Ok(());
+    };
+    let prefix = format!("t{:012x}_", rand::rng().random::<u64>() >> 16);
+    let mut config = SearchConfig::new(format!("http://{endpoint}"));
+    config.indexes = IndexNames::prefixed(&prefix);
+    let client = SearchClient::new(config.clone(), None)?;
+    let documents: Value = serde_json::from_str(&fs::read_to_string(
+        fixtures().join("index_documents.json"),
+    )?)?;
+    let logical = [
+        "releases", "predb", "movies", "tvshows", "music", "books", "games", "console", "steam",
+        "anime",
+    ];
+    for name in logical {
+        let table = config.indexes.table(name).to_owned();
+        client.sql(&create_table_sql(&table, name)).await?;
+        let docs: Vec<(i64, Value)> = documents[name]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                (
+                    entry["id"].as_i64().unwrap_or_default(),
+                    entry["doc"].clone(),
+                )
+            })
+            .collect();
+        client.replace_documents(&table, &docs).await?;
+    }
+    let result = replay_with("golden_search.json", &[], Some(config.clone())).await;
+    for name in logical {
+        client
+            .sql(&format!(
+                "DROP TABLE IF EXISTS {}",
+                config.indexes.table(name)
+            ))
+            .await?;
+    }
+    result
+}
+
+/// With Manticore unreachable a search can't claim "no matches": it answers a retryable 503, and
+/// v1 and v2 each use their own error format.
+#[tokio::test]
+async fn unreachable_search_answers_503() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    for (uri, kind) in [
+        (
+            "/api/v1/api?t=search&q=Movie&apikey=tokenposter",
+            "text/xml; charset=utf-8",
+        ),
+        (
+            "/api/v2/search?id=Movie&api_token=tokenposter",
+            "application/json",
+        ),
+    ] {
+        let mut settings = settings();
+        settings.search_config = Some(SearchConfig::new("http://127.0.0.1:9"));
+        let app = router_with(settings)
+            .layer(axum::Extension(ctx.clone()))
+            .with_state(ctx.clone());
+        let request = Request::builder()
+            .uri(uri)
+            .header("host", "x.test")
+            .body(Body::empty())?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), 503, "{uri}");
+        assert_eq!(response.headers()["retry-after"], "30");
+        assert_eq!(response.headers()["content-type"], kind);
+    }
+    db.drop_database().await
 }

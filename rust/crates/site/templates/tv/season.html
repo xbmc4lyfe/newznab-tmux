@@ -1,0 +1,18 @@
+{% for episode in episodes %}
+<div class="border-b border-gray-200 dark:border-gray-700 py-3">
+    <h4 class="font-semibold text-gray-800 dark:text-gray-200 mb-1">Episode {{ episode.number }}{% if !episode.aired.is_empty() %}<span class="ml-2 text-xs font-normal text-gray-500 dark:text-gray-400">Aired {{ episode.aired }}</span>{% endif %}</h4>
+    <ul class="text-sm space-y-1">
+        {% for release in episode.releases %}
+        <li class="flex flex-wrap items-center justify-between gap-2">
+            <a href="/details/{{ release.guid }}" class="min-w-0 truncate text-primary-600 dark:text-primary-400 hover:underline" title="{{ release.name }}">{{ release.name }}</a>
+            <span class="flex items-center gap-2 shrink-0 text-xs text-gray-500 dark:text-gray-400">
+                {% if release.failed > 0 %}<span class="text-red-600">Failed ({{ release.failed }})</span>{% endif %}
+                <span>{{ release.size }}</span><span>{{ release.posted }}</span>
+                <a href="/getnzb/{{ release.guid }}" class="download-nzb text-green-600 dark:text-green-400" title="Download NZB"><i class="fa fa-download" aria-hidden="true"></i><span class="sr-only">Download</span></a>
+                <button type="button" class="add-to-cart text-primary-600 dark:text-primary-400" data-guid="{{ release.guid }}" title="Add to basket"><i class="icon_cart fa fa-shopping-basket" aria-hidden="true"></i><span class="sr-only">Add to basket</span></button>
+            </span>
+        </li>
+        {% endfor %}
+    </ul>
+</div>
+{% endfor %}

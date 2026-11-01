@@ -7,8 +7,35 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
 clap.workspace = true
+hex.workspace = true
+md-5.workspace = true
+nntmux-categorize.workspace = true
+nntmux-core.workspace = true
+nntmux-nntp.workspace = true
+nntmux-predb.workspace = true
 nntmux-runtime.workspace = true
+nntmux-search.workspace = true
+nntmux-verify.workspace = true
+nntmux-yenc.workspace = true
+quick-xml.workspace = true
+rand.workspace = true
+redis.workspace = true
+regex.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+nntmux-testkit.workspace = true
 
 [lints]
 workspace = true

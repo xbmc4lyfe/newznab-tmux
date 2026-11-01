@@ -1,5 +1,6 @@
 //! The HTTP connection to Manticore. Every call either returns what Manticore said or an error.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,6 +29,7 @@ pub struct SearchClient {
     http: reqwest::Client,
     next_endpoint: Arc<AtomicUsize>,
     availability: Arc<Mutex<Option<(Instant, bool)>>>,
+    verified_tables: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SearchClient {
@@ -43,6 +45,7 @@ impl SearchClient {
             http,
             next_endpoint: Arc::new(AtomicUsize::new(0)),
             availability: Arc::new(Mutex::new(None)),
+            verified_tables: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -73,6 +76,18 @@ impl SearchClient {
         available
     }
 
+    pub(crate) fn table_verified(&self, table: &str) -> bool {
+        self.verified_tables
+            .lock()
+            .is_ok_and(|tables| tables.contains(table))
+    }
+
+    pub(crate) fn mark_table_verified(&self, table: &str) {
+        if let Ok(mut tables) = self.verified_tables.lock() {
+            tables.insert(table.to_owned());
+        }
+    }
+
     pub(crate) async fn require_available(&self) -> Result<(), SearchError> {
         if self.is_available().await {
             Ok(())
@@ -89,16 +104,9 @@ impl SearchClient {
     }
 
     /// Runs one statement through `/sql` and returns its rows.
+    #[doc(hidden)]
     pub async fn sql(&self, statement: &str) -> Result<Vec<Map<String, Value>>, SearchError> {
-        let mut encoder = Url::parse("http://localhost/").expect("a valid constant URL");
-        encoder
-            .query_pairs_mut()
-            .append_pair("mode", "raw")
-            .append_pair("query", statement);
-        let body = encoder.query().unwrap_or_default().to_owned();
-        let response = self
-            .send("sql", "application/x-www-form-urlencoded", body)
-            .await?;
+        let response = self.sql_response(statement).await?;
         let mut rows = Vec::new();
         for result in response.as_array().into_iter().flatten() {
             let data = result.get("data").and_then(Value::as_array);
@@ -111,8 +119,31 @@ impl SearchClient {
         Ok(rows)
     }
 
+    async fn sql_response(&self, statement: &str) -> Result<Value, SearchError> {
+        let mut encoder = Url::parse("http://localhost/").expect("a valid constant URL");
+        encoder
+            .query_pairs_mut()
+            .append_pair("mode", "raw")
+            .append_pair("query", statement);
+        let body = encoder.query().unwrap_or_default().to_owned();
+        self.send("sql", "application/x-www-form-urlencoded", body)
+            .await
+    }
+
+    /// Runs one statement and returns its whole response, including `total` and `warning`.
+    pub(crate) async fn sql_envelope(&self, statement: &str) -> Result<Value, SearchError> {
+        let response = self.sql_response(statement).await?;
+        response
+            .as_array()
+            .and_then(|results| match results.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| SearchError::Malformed(format!("unexpected /sql response: {response}")))
+    }
+
     /// Replaces one document, creating it if it's new.
-    pub async fn replace_document(
+    pub(crate) async fn replace_document(
         &self,
         table: &str,
         id: i64,
@@ -125,6 +156,7 @@ impl SearchClient {
     }
 
     /// Replaces many documents in one request. `documents` holds each one's id and fields.
+    #[doc(hidden)]
     pub async fn replace_documents(
         &self,
         table: &str,
@@ -143,6 +175,22 @@ impl SearchClient {
         self.send("bulk", "application/x-ndjson", body)
             .await
             .map(drop)
+    }
+
+    /// Inserts many documents in one request and returns Manticore's acknowledgement.
+    pub(crate) async fn insert_documents(
+        &self,
+        table: &str,
+        documents: &[(i64, Value)],
+    ) -> Result<Value, SearchError> {
+        let mut body = String::new();
+        for (id, document) in documents {
+            body.push_str(
+                &json!({"insert": {"table": table, "id": id, "doc": document}}).to_string(),
+            );
+            body.push('\n');
+        }
+        self.send("bulk", "application/x-ndjson", body).await
     }
 
     pub(crate) async fn delete_documents(
