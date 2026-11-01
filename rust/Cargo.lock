@@ -1707,8 +1707,20 @@ name = "nntmux-releases"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "hex",
+ "nntmux-categorize",
+ "nntmux-core",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "nntmux-verify",
+ "rand 0.9.5",
+ "redis",
+ "serde",
+ "sqlx",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
