@@ -219,3 +219,151 @@ async fn nfo_pages_convert_cp437() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     db.drop_database().await.unwrap();
 }
+
+#[tokio::test]
+async fn details_show_metadata_and_take_comments() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let name = unique("zane");
+    add_user(&db.pool, &name, true, 1).await;
+    let group = add_group(&db.pool, &unique("alt.binaries.details")).await;
+    let (release, guid) = add_release(&db.pool, "Details.Movie.2024.1080p.WEB", 2040, group).await;
+    sqlx::query("INSERT INTO movieinfo (imdbid, title, year, genre, actors, plot, tagline, rating, type, director, language, cover, backdrop) VALUES ('1234567', 'Details Movie', '2024', 'Drama, War', 'Ann Lee, Bob Ray', 'A plot.', '', '7.1', '', '', '', 0, 0)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE releases SET imdbid = '1234567', passwordstatus = 1 WHERE id = ?")
+        .bind(release)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO video_data (releases_id, videowidth, videoheight, videocodec, videoduration) VALUES (?, 1920, 1080, 'h264', '5400000')")
+        .bind(release)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO release_subtitles (releases_id, subsid, subslanguage) VALUES (?, 1, 'en'), (?, 2, 'de')")
+        .bind(release)
+        .bind(release)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut browser = Browser::new(&ctx);
+    browser
+        .post("/login", &[("username", &name), ("password", PASSWORD)])
+        .await;
+
+    let (response, html) = browser.get(&format!("/details/{guid}")).await;
+    assert_eq!(response.status(), StatusCode::OK, "{html}");
+    assert!(html.contains("Details Movie"));
+    assert!(html.contains("/Movies?actors=Ann+Lee"));
+    assert!(html.contains("1920x1080"));
+    assert!(html.contains("90 min"));
+    assert!(html.contains("en, de"));
+    assert!(html.contains("Password Protected Release"));
+
+    // Comments are escaped and counted.
+    let (response, _) = browser
+        .post_authed(
+            &format!("/details/{guid}"),
+            &[("txtAddComment", "<script>x</script> good")],
+        )
+        .await;
+    assert_eq!(location(&response), format!("/details/{guid}"));
+    let (_, html) = browser.get(&format!("/details/{guid}")).await;
+    assert!(!html.contains("<script>x</script>"));
+    assert!(html.contains("good"));
+    let comments: i64 =
+        sqlx::query_scalar("SELECT CAST(comments AS SIGNED) FROM releases WHERE id = ?")
+            .bind(release)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(comments, 1);
+
+    // A guid nobody has goes back rather than erroring.
+    let (response, _) = browser.get("/details/missing").await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn failure_reports_need_a_token_or_a_browser_session() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let name = unique("abel");
+    let id = add_user(&db.pool, &name, true, 1).await;
+    let group = add_group(&db.pool, &unique("alt.binaries.failed")).await;
+    let (release, guid) = add_release(&db.pool, "Failed.Release", 2040, group).await;
+    let mut browser = Browser::new(&ctx);
+
+    let (response, _) = browser.get(&format!("/failed?guid={guid}")).await;
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let (response, _) = browser
+        .get(&format!("/failed?guid={guid}&api_token=wrong"))
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()["x-dnzb-rcode"], "401");
+    let (response, _) = browser.get("/failed?api_token=wrong").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // A real token records the failure, even with no alternate to offer.
+    let (response, _) = browser
+        .get(&format!("/failed?guid={guid}&api_token=token-{name}"))
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let failures: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM dnzb_failures WHERE release_id = ? AND users_id = ?",
+    )
+    .bind(release)
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(failures, 1);
+    db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn browser_failure_reports_need_a_session_and_token() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let group = add_group(&db.pool, &unique("alt.binaries.post")).await;
+    let (release, guid) = add_release(&db.pool, "Post.Release", 2040, group).await;
+    let name = unique("beth");
+    add_user(&db.pool, &name, true, 1).await;
+    let mut browser = Browser::new(&ctx);
+
+    // A guest with a valid token is still nobody.
+    let (response, _) = browser.post("/failed", &[("guid", &guid)]).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    browser
+        .post("/login", &[("username", &name), ("password", PASSWORD)])
+        .await;
+    let request = axum::http::Request::post("/failed").header(
+        axum::http::header::CONTENT_TYPE,
+        "application/x-www-form-urlencoded",
+    );
+    let (response, _) = browser
+        .send(request, format!("guid={guid}&_token=wrong"))
+        .await;
+    assert_eq!(response.status().as_u16(), 419);
+    let (response, _) = browser.post_authed("/failed", &[("guid", &guid)]).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "signed in, with no alternate to offer"
+    );
+    let failures: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM dnzb_failures WHERE release_id = ?")
+            .bind(release)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(failures, 1);
+    db.drop_database().await.unwrap();
+}

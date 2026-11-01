@@ -251,13 +251,13 @@ status = "ported"
 kind = "route"
 id = "GET|POST|HEAD /details/{guid}"
 source = "App\\Http\\Controllers\\DetailsController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /failed"
 source = "App\\Http\\Controllers\\FailedReleasesController@failed"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
