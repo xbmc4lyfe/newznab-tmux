@@ -2316,6 +2316,9 @@ dependencies = [
  "anyhow",
  "clap",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
