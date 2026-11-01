@@ -23,8 +23,7 @@ note = "Books are out of scope: the indexer keeps only TV and movies."
 kind = "command"
 id = "cbp:optimize-storage"
 source = "app/Console/Commands/OptimizeCbpStorage.php"
-status = "dropped"
-note = "A one-time conversion to compact collection/binary/part storage. The Rust baseline schema already has collection_groups, the compact parts layout, cbp_optimization_checkpoints and the cascading foreign keys, so there's nothing to convert."
+status = "todo"
 
 [[entry]]
 kind = "command"
