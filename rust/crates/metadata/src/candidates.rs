@@ -33,12 +33,33 @@ pub mod tv_status {
 pub const TV_MAX_TRANSIENT_ATTEMPTS: i64 = 8;
 /// Episode lookups for a known show before the release stops being retried.
 pub const TV_MAX_EPISODE_ATTEMPTS: i64 = 6;
+/// Delay after a transient failure on a release whose show is already known.
+pub const TV_KNOWN_SHOW_TRANSIENT_DELAY: i64 = 900;
 /// Book lookup failures before the release is marked exhausted.
 pub const BOOK_MAX_FAILURES: i64 = 5;
 
 /// A partial awaiting a late-article upgrade may be renamed and reset, so a lookup on its title
 /// would go stale.
 pub const SETTLED: &str = "late_article_candidate_id IS NULL";
+
+pub fn tv_transient_delay(attempts: i64, provider_retry_after: i64) -> i64 {
+    provider_retry_after.max(match attempts {
+        1 => 300,
+        2 => 900,
+        3 => 3600,
+        _ => 21600,
+    })
+}
+
+pub fn tv_episode_delay(attempts: i64) -> i64 {
+    match attempts {
+        1 => 3600,
+        2 => 21600,
+        3 => 86400,
+        4 => 259200,
+        _ => 604800,
+    }
+}
 
 const TV_DUE: &str = "(tv_lookup_retry_at IS NULL OR tv_lookup_retry_at <= CURRENT_TIMESTAMP)";
 
