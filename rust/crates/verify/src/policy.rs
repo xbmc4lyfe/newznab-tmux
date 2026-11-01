@@ -29,13 +29,13 @@ struct Limits {
 }
 
 async fn limits(pool: &MySqlPool, group: i64) -> Result<Limits> {
-    let settings: Option<(i64, i64, i64)> = sqlx::query_as(
+    // Missing settings stop publication rather than removing every limit.
+    let (min_size, max_size, min_files): (i64, i64, i64) = sqlx::query_as(
         "SELECT CAST(min_size_to_form_release AS SIGNED), CAST(max_size_to_form_release AS SIGNED), \
-         CAST(min_files_to_form_release AS SIGNED) FROM ingestion_configurations ORDER BY id LIMIT 1",
+         CAST(min_files_to_form_release AS SIGNED) FROM ingestion_configurations WHERE id = 1",
     )
-    .fetch_optional(pool)
+    .fetch_one(pool)
     .await?;
-    let (min_size, max_size, min_files) = settings.unwrap_or_default();
     let row: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
         "SELECT CAST(minsizetoformrelease AS SIGNED), CAST(minfilestoformrelease AS SIGNED) \
          FROM usenet_groups WHERE id = ?",

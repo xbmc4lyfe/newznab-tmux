@@ -107,9 +107,12 @@ fn guid() -> String {
 }
 
 fn check_passworded_rars() -> bool {
+    // Only these spellings make a config value true in Laravel, and the setting compares to true.
     matches!(
-        nntmux_core::var_or("CHECK_PASSWORDED_RARS", "false").as_str(),
-        "1" | "true" | "TRUE" | "True"
+        nntmux_core::var_or("CHECK_PASSWORDED_RARS", "false")
+            .to_ascii_lowercase()
+            .as_str(),
+        "true" | "(true)"
     )
 }
 
@@ -158,7 +161,13 @@ async fn prepare(
         return Err(PublishError::Stale.into());
     };
     let metadata = resolver.resolve(manifest).await?;
-    let rendered = document(manifest, manifest.verified_file_count.unwrap_or(0))?;
+    // A filtered candidate never writes or compares an NZB, so one it can't render is still filtered.
+    let rejection = policy::verified_rejection(&verify.db, &verify.config, manifest).await?;
+    let rendered = if rejection.is_none() {
+        document(manifest, manifest.verified_file_count.unwrap_or(0))?
+    } else {
+        String::new()
+    };
     let parsed = parse_document(rendered.as_bytes());
     let fingerprint = parsed.as_ref().and_then(document_fingerprint);
     let size = inventory::bytes(manifest);
@@ -183,7 +192,6 @@ async fn prepare(
     let archived = manifest::read(&verify.db, &verify.config, &archived_path)
         .await
         .ok();
-    let rejection = policy::verified_rejection(&verify.db, &verify.config, manifest).await?;
     let required = parsed.as_ref().and_then(coverage_ids);
     let body = compress(rendered.as_bytes())?;
     Ok(Prepared {
