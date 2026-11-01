@@ -600,7 +600,9 @@ async fn repair_links_normalizes_and_is_idempotent() {
 
 #[tokio::test]
 async fn external_id_matches_stay_on_tv_rows() {
-    let Some(h) = harness(Keys::default()).await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     let film = sqlx::query(
         "INSERT INTO videos (type, title, started, tmdb) VALUES (1, 'A Film', '2011-01-01', 55)",
     )
@@ -624,7 +626,9 @@ async fn external_id_matches_stay_on_tv_rows() {
 
 #[tokio::test]
 async fn trakt_resolves_external_ids_before_asking_for_an_episode() {
-    let Some(h) = harness(Keys::default()).await else { return };
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
     let cache = h.services.cache.clone();
     let mut trakt = Trakt::new(Client::new(), cache, "key".to_owned(), 5, 1, 1);
     trakt.base_url = h.mock.uri();
