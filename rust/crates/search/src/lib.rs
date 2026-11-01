@@ -16,6 +16,7 @@ pub mod query;
 mod read;
 mod registry;
 mod release_query;
+mod writes;
 
 use anyhow::{Result, bail};
 use clap::Subcommand;
@@ -25,6 +26,7 @@ pub use config::SearchConfig;
 pub use cursor::{CursorCodec, SearchCursor};
 pub use document::{ReleaseDocument, ReleaseRow};
 pub use error::SearchError;
+pub use index::{BulkResult, DEFERRED_OPERATION, DeferredUpdates};
 pub use manticore::SearchClient;
 pub use read::{
     ExternalId, FuzzyIds, IndexHits, MovieExternalIds, MoviesByFields, PredbHit, ReleaseCandidates,
@@ -34,6 +36,7 @@ pub use registry::{SecondaryIndex, create_table_sql};
 pub use release_query::{
     Bounds, Phrases, Ranges, ReleaseSearchQuery, SearchPage, SortDirection, SortField,
 };
+pub use writes::{MovieDocument, TvShowDocument};
 
 pub async fn run_sync(_ctx: Ctx, _args: RoleArgs, _stop: Shutdown) -> Result<()> {
     bail!("the search-sync role isn't ported yet")

@@ -1,5 +1,6 @@
 //! The HTTP connection to Manticore. Every call either returns what Manticore said or an error.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,6 +29,7 @@ pub struct SearchClient {
     http: reqwest::Client,
     next_endpoint: Arc<AtomicUsize>,
     availability: Arc<Mutex<Option<(Instant, bool)>>>,
+    verified_tables: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SearchClient {
@@ -43,6 +45,7 @@ impl SearchClient {
             http,
             next_endpoint: Arc::new(AtomicUsize::new(0)),
             availability: Arc::new(Mutex::new(None)),
+            verified_tables: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -71,6 +74,18 @@ impl SearchClient {
             *guard = Some((Instant::now(), available));
         }
         available
+    }
+
+    pub(crate) fn table_verified(&self, table: &str) -> bool {
+        self.verified_tables
+            .lock()
+            .is_ok_and(|tables| tables.contains(table))
+    }
+
+    pub(crate) fn mark_table_verified(&self, table: &str) {
+        if let Ok(mut tables) = self.verified_tables.lock() {
+            tables.insert(table.to_owned());
+        }
     }
 
     pub(crate) async fn require_available(&self) -> Result<(), SearchError> {
@@ -143,6 +158,22 @@ impl SearchClient {
         self.send("bulk", "application/x-ndjson", body)
             .await
             .map(drop)
+    }
+
+    /// Inserts many documents in one request and returns Manticore's acknowledgement.
+    pub(crate) async fn insert_documents(
+        &self,
+        table: &str,
+        documents: &[(i64, Value)],
+    ) -> Result<Value, SearchError> {
+        let mut body = String::new();
+        for (id, document) in documents {
+            body.push_str(
+                &json!({"insert": {"table": table, "id": id, "doc": document}}).to_string(),
+            );
+            body.push('\n');
+        }
+        self.send("bulk", "application/x-ndjson", body).await
     }
 
     pub(crate) async fn delete_documents(
