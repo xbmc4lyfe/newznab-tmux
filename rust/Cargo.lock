@@ -2347,6 +2347,8 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "metrics",
+ "metrics-exporter-prometheus",
  "nntmux-testkit",
  "nntmux-yenc",
  "rand 0.9.5",

@@ -486,7 +486,7 @@ async fn the_sync_role_repairs_and_holds_off_while_paused() {
     sync_loop(
         &client,
         pool,
-        || async { Ok(true) },
+        || async { Ok(None::<()>) },
         &role_args(true),
         &stop,
     )
@@ -500,7 +500,7 @@ async fn the_sync_role_repairs_and_holds_off_while_paused() {
     sync_loop(
         &client,
         pool,
-        || async { Ok(false) },
+        || async { Ok(Some(())) },
         &role_args(true),
         &stop,
     )
@@ -523,7 +523,7 @@ async fn the_sync_role_reports_failures_once_and_survives_them_otherwise() {
     let paused_failed = sync_loop(
         &client,
         pool,
-        || async { Err(anyhow::anyhow!("the database went away")) },
+        || async { Err::<Option<()>, _>(anyhow::anyhow!("the database went away")) },
         &role_args(true),
         &stop,
     )
@@ -537,7 +537,7 @@ async fn the_sync_role_reports_failures_once_and_survives_them_otherwise() {
     let repair_failed = sync_loop(
         &client,
         pool,
-        || async { Ok(false) },
+        || async { Ok(Some(())) },
         &role_args(true),
         &stop,
     )
@@ -555,10 +555,10 @@ async fn the_sync_role_reports_failures_once_and_survives_them_otherwise() {
             async move {
                 match call {
                     0 => Err(anyhow::anyhow!("the database went away")),
-                    1 => Ok(false),
+                    1 => Ok(Some(())),
                     _ => {
                         stop.request();
-                        Ok(true)
+                        Ok(None)
                     }
                 }
             }
