@@ -23,7 +23,7 @@ status = "ported"
 kind = "route"
 id = "GET|HEAD /api/inform/release"
 source = "App\\Http\\Controllers\\Api\\ApiInformController@release"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"

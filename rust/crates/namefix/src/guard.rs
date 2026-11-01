@@ -1,11 +1,15 @@
 //! A filename pass: ordered PreDB observations for a release's files, and the guard that
 //! re-establishes them inside the transaction that acts on them.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use nntmux_predb::filename::{OriginalFilenameEvidence, clean_for_filename_discovery, exact_value};
 use nntmux_predb::identity::{self, Candidate, Lookup};
 use nntmux_predb::selector::{PredbHit, select_best_match};
 use sqlx::{MySqlConnection, MySqlPool};
+
+use crate::par2_support::Guard;
 
 /// One filename's observation.
 #[derive(Clone, Debug, PartialEq)]
@@ -198,9 +202,29 @@ pub struct FilenameGuard {
     minimum_length: usize,
     inventory: Vec<String>,
     valid: bool,
+    /// A caller's claim on the release, asked again inside the write transaction.
+    claim: Option<Arc<dyn Guard>>,
+    /// Whether the file inventory and lookups are part of what the write depends on.
+    files_matter: bool,
 }
 
 impl FilenameGuard {
+    /// A guard that only asks whether the caller still holds its claim, for writes whose
+    /// evidence isn't a filename pass (the PAR2 rename path).
+    pub fn claim_only(release_id: i64, claim: Arc<dyn Guard>) -> Self {
+        Self {
+            release_id,
+            pass: FilenamePass {
+                lookups: Vec::new(),
+            },
+            minimum_length: 0,
+            inventory: Vec::new(),
+            valid: true,
+            claim: Some(claim),
+            files_matter: false,
+        }
+    }
+
     pub fn new(
         release_id: i64,
         pass: &FilenamePass,
@@ -213,6 +237,8 @@ impl FilenameGuard {
             minimum_length,
             inventory: sorted_unique(inventory),
             valid: true,
+            claim: None,
+            files_matter: true,
         }
     }
 
@@ -223,6 +249,15 @@ impl FilenameGuard {
     pub async fn accepted(&mut self, conn: &mut MySqlConnection) -> Result<bool> {
         if !self.valid {
             return Ok(false);
+        }
+        if let Some(claim) = &self.claim
+            && !claim.holds().await
+        {
+            self.valid = false;
+            return Ok(false);
+        }
+        if !self.files_matter {
+            return Ok(true);
         }
         let current = sorted_unique(locked_inventory(conn, self.release_id).await?);
         if current != self.inventory || !self.pass.complete() {

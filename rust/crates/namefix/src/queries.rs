@@ -26,7 +26,7 @@ pub enum Source {
 }
 
 impl Source {
-    fn status_column(self) -> &'static str {
+    pub(crate) fn status_column(self) -> &'static str {
         match self {
             Self::Nfo => "proc_nfo",
             Self::Files | Self::Xxx => "proc_files",
@@ -38,7 +38,7 @@ impl Source {
         }
     }
 
-    fn exists(self) -> &'static str {
+    pub(crate) fn exists(self) -> &'static str {
         match self {
             Self::Nfo => {
                 "EXISTS (SELECT 1 FROM release_nfos source_nfo WHERE source_nfo.releases_id = r.id)"
@@ -69,7 +69,7 @@ impl Source {
     }
 }
 
-fn others_group() -> String {
+pub(crate) fn others_group() -> String {
     cat::OTHERS_GROUP
         .iter()
         .map(i32::to_string)
