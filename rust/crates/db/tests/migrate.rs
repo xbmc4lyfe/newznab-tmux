@@ -7,7 +7,7 @@ async fn a_fresh_database_gets_the_whole_schema_and_a_second_run_does_nothing() 
         return Ok(());
     };
     let ran = nntmux_db::migrate::run(&db.pool).await?;
-    assert_eq!(ran, [1, 2, 3, 4]);
+    assert_eq!(ran, [1, 2, 3]);
 
     let tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
@@ -19,7 +19,7 @@ async fn a_fresh_database_gets_the_whole_schema_and_a_second_run_does_nothing() 
     let categories: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM categories")
         .fetch_one(&db.pool)
         .await?;
-    assert_eq!(categories, 70);
+    assert_eq!(categories, 68);
 
     let triggers: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema = DATABASE()",
@@ -57,27 +57,12 @@ async fn a_database_laravel_built_only_records_the_baseline() -> Result<()> {
     let Some(db) = laravel_database(Some(LARAVEL_BASELINE)).await? else {
         return Ok(());
     };
-    // Laravel's own migrations already added this category, so it stays as it is.
-    sqlx::query(
-        "CREATE TABLE categories (id INT PRIMARY KEY, title VARCHAR(255), root_categories_id BIGINT,
-         status INT, description VARCHAR(255), disablepreview TINYINT, minsizetoformrelease BIGINT,
-         maxsizetoformrelease BIGINT)",
-    )
-    .execute(&db.pool)
-    .await?;
-    sqlx::query("INSERT INTO categories (id, title) VALUES (6047, 'Renamed')")
-        .execute(&db.pool)
-        .await?;
-    assert_eq!(nntmux_db::migrate::run(&db.pool).await?, [3, 4]);
-    let title: String = sqlx::query_scalar("SELECT title FROM categories WHERE id = 6047")
-        .fetch_one(&db.pool)
-        .await?;
-    assert_eq!(title, "Renamed");
+    assert_eq!(nntmux_db::migrate::run(&db.pool).await?, [3]);
 
     let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rust_migrations")
         .fetch_one(&db.pool)
         .await?;
-    assert_eq!(recorded, 4);
+    assert_eq!(recorded, 3);
     let tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.tables
          WHERE table_schema = DATABASE() AND table_name = 'releases'",
