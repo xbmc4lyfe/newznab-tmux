@@ -269,8 +269,8 @@ status = "todo"
 kind = "schedule"
 id = "command: 'disposable:update')->weekly();"
 source = "routes/console.php"
-status = "dropped"
-note = "Refreshed a vendor package's list. The site crate checks a fixed list, and nothing reads the vendor file."
+status = "todo"
+note = "ValidEmailDomain checked the vendor list first, so the Rust site needs that list too. Waiting on ws-site."
 
 [[entry]]
 kind = "schedule"

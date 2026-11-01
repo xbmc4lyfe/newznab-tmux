@@ -22,21 +22,26 @@ use crate::leader::Leader;
 /// host, the schedule picks up at the current minute, as a restarted Laravel scheduler did.
 const MAX_CATCH_UP_MINUTES: i64 = 5;
 
+/// How long a stopping supervisor waits for running tasks.
+const STOP_LIMIT: Duration = Duration::from_secs(30);
+
 pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
     let Some(mut leader) = Leader::acquire(&ctx.db, &stop).await? else {
         return Ok(());
     };
-    monitor::compensate_on_start(&ctx, &stop).await?;
     let mut engine = Engine::new(ctx.clone(), schedule::tasks());
     if args.once {
-        engine.tick(minute_of(Utc::now()));
-        engine.drain().await;
+        monitor::compensate_on_start(&ctx, &stop).await?;
+        if !stop.requested() {
+            engine.tick(minute_of(Utc::now()));
+            engine.drain().await;
+        }
         return Ok(());
     }
     let monitoring = tokio::spawn(monitor::run(ctx, stop.clone()));
     let lost = schedule_loop(&mut engine, &mut leader, &stop).await;
     info!("waiting for running tasks");
-    engine.drain().await;
+    engine.drain_within(STOP_LIMIT).await;
     stop.request();
     monitoring.await?;
     if lost {
@@ -45,16 +50,20 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
     Ok(())
 }
 
-/// True if the lock was lost; a stop returns false.
+/// True if the lock was lost; a stop returns false. The minute the supervisor starts in doesn't
+/// run, so a restart can't run its tasks twice. Laravel's scheduler only ran on the minute too.
 async fn schedule_loop(engine: &mut Engine<Ctx>, leader: &mut Leader, stop: &Shutdown) -> bool {
     let mut last = minute_of(Utc::now());
-    engine.tick(last);
     loop {
         stop.sleep(until_next_minute(Utc::now())).await;
         if stop.requested() {
             return false;
         }
-        if !leader.still_held().await {
+        let held = tokio::select! {
+            held = leader.still_held() => held,
+            () = stop.token().cancelled_owned() => return false,
+        };
+        if !held {
             warn!("lost the supervisor lock; stopping so a new start can take it back");
             return true;
         }

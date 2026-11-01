@@ -136,6 +136,7 @@ pub async fn users_by_month(db: &MySqlPool) -> Result<()> {
     let months: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT DATE_FORMAT(created_at, '%Y-%m-01') AS sort_date, DATE_FORMAT(created_at, '%M %Y') AS mth, \
          COUNT(id) FROM users WHERE deleted_at IS NULL AND created_at IS NOT NULL \
+         AND created_at <> '0000-00-00 00:00:00' \
          GROUP BY sort_date, mth ORDER BY sort_date DESC",
     )
     .fetch_all(db)

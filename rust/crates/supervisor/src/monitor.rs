@@ -24,8 +24,8 @@ async fn collection_delay_hours(ctx: &Ctx) -> Result<i64> {
     Ok(delay.map_or(DEFAULT_DELAY_HOURS, i64::from))
 }
 
-/// Runs before anything is scheduled. While processing is paused nothing is consuming the outage
-/// yet: the first activity recorded after the resume compensates for it.
+/// While processing is paused nothing is consuming the outage yet: the first activity recorded
+/// after the resume compensates for it.
 pub async fn compensate_on_start(ctx: &Ctx, stop: &Shutdown) -> Result<()> {
     if ctx.paused().await? {
         return Ok(());
@@ -43,8 +43,16 @@ pub async fn compensate_on_start(ctx: &Ctx, stop: &Shutdown) -> Result<()> {
     Ok(())
 }
 
+/// Runs beside the schedule, because the compensation lock can be held for a long time. A failed
+/// compensation only warns: the next activity recorded claims the same outage.
 pub async fn run(ctx: Ctx, stop: Shutdown) {
     let delay = parsed_or("TMUX_MONITOR_DELAY", 10u64).unwrap_or(10).max(1);
+    if let Err(failure) = compensate_on_start(&ctx, &stop).await {
+        warn!(
+            error = format!("{failure:#}"),
+            "unable to compensate on start"
+        );
+    }
     while !stop.requested() {
         beat(&ctx, &stop).await;
         stop.sleep(Duration::from_secs(delay)).await;

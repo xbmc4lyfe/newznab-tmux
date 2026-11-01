@@ -46,6 +46,20 @@ async fn grabbers_signups_and_roles_skip_deleted_users_and_update_in_place() -> 
     let alice = user(db, "alice", 5, false, role).await?;
     user(db, "gone", 50, true, role).await?;
     user(db, "idle", 0, false, role).await?;
+    let mut zero_date = db.acquire().await?;
+    sqlx::query("SET SESSION sql_mode = ''")
+        .execute(&mut *zero_date)
+        .await?;
+    sqlx::query(
+        "INSERT INTO users (username, email, password, api_token, roles_id, created_at) \
+         VALUES ('old', 'old@example.com', 'x', 'old', 1, '0000-00-00 00:00:00')",
+    )
+    .execute(&mut *zero_date)
+    .await?;
+    sqlx::query("SET SESSION sql_mode = DEFAULT")
+        .execute(&mut *zero_date)
+        .await?;
+    drop(zero_date);
 
     stats::top_grabbers(db).await?;
     stats::users_by_month(db).await?;

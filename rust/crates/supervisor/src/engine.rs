@@ -4,14 +4,14 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use tokio::task::JoinSet;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::cadence::Cadence;
 
@@ -83,9 +83,22 @@ impl<C: Clone + Send + 'static> Engine<C> {
         }
     }
 
-    /// Waits for what's in flight. Each task owns its stop handling.
+    /// Waits for what's in flight.
     pub async fn drain(&mut self) {
         while self.tasks.join_next().await.is_some() {}
+    }
+
+    /// Waits for what's in flight, then aborts the rest. Every task is safe to run again, so an
+    /// aborted one just starts over at its next time.
+    pub async fn drain_within(&mut self, limit: Duration) {
+        if tokio::time::timeout(limit, self.drain()).await.is_err() {
+            warn!(
+                tasks = self.tasks.len(),
+                "aborting tasks still running at the stop limit"
+            );
+            self.tasks.abort_all();
+            self.drain().await;
+        }
     }
 }
 
@@ -205,6 +218,28 @@ mod tests {
             engine.drain().await;
             assert_eq!(probe.starts.load(Ordering::SeqCst), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn a_stuck_task_is_aborted_at_the_limit_and_can_run_again() {
+        let probe = Probe::default();
+        let mut engine = Engine::new(
+            probe.clone(),
+            vec![task(|probe| {
+                Box::pin(async move {
+                    probe.starts.fetch_add(1, Ordering::SeqCst);
+                    probe.release.notified().await;
+                    Ok(())
+                })
+            })],
+        );
+        engine.tick(minute(0));
+        settle(&probe, 1).await;
+        engine.drain_within(Duration::from_millis(10)).await;
+        engine.tick(minute(1));
+        settle(&probe, 2).await;
+        probe.release.notify_one();
+        engine.drain().await;
     }
 
     #[tokio::test]
