@@ -117,6 +117,10 @@ pub fn tasks() -> Vec<Task<Ctx>> {
         },
         task("nntmux:remove-bad", Cadence::Hourly, |ctx| {
             Box::pin(async move {
+                // Deleting releases is processing, so it waits out a pause and a drain sees it.
+                let Some(_busy) = busy::enter(&ctx, "remove-bad").await? else {
+                    return Ok(());
+                };
                 resets::remove_bad(&ctx.db).await?;
                 Ok(())
             })
