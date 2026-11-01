@@ -31,6 +31,7 @@ tempfile.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+nntmux-categorize.workspace = true
 nntmux-testkit.workspace = true
 
 [lints]

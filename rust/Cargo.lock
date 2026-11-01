@@ -2631,6 +2631,7 @@ dependencies = [
  "crc32fast",
  "hex",
  "md-5 0.10.6",
+ "nntmux-categorize",
  "nntmux-core",
  "nntmux-metadata",
  "nntmux-namefix",
