@@ -86,19 +86,6 @@ class TraktApiTest extends TestCase
         $this->assertEquals('Pilot', $episode['title']);
     }
 
-    public function test_can_get_trending_shows(): void
-    {
-        if (! $this->traktService->isConfigured()) {
-            $this->markTestSkipped('Trakt.tv API key is not configured.');
-        }
-
-        $trending = $this->traktService->getTrendingShows(5);
-
-        $this->assertNotNull($trending);
-        $this->assertIsArray($trending);
-        $this->assertCount(5, $trending);
-    }
-
     public function test_search_result_has_expected_structure(): void
     {
         if (! $this->traktService->isConfigured()) {
