@@ -22,7 +22,8 @@ status = "ported"
 kind = "command"
 id = "group:update-all"
 source = "app/Console/Commands/UpdatePerGroup.php"
-status = "todo"
+status = "dropped"
+note = "Rust runs headers, backfill, releases and postprocessing as separate per-group roles, so a combined run of all four has no place; `nntmux-ctl ingest update-headers <group>` and `backfill-group <group>` cover one group by hand."
 
 [[entry]]
 kind = "command"
@@ -52,7 +53,8 @@ status = "ported"
 kind = "command"
 id = "multiprocessing:update-per-group"
 source = "app/Console/Commands/ProcessUpdatePerGroup.php"
-status = "todo"
+status = "dropped"
+note = "Rust runs headers, backfill, releases and postprocessing as separate per-group roles, so a combined run of all four has no place; `nntmux-ctl ingest update-headers <group>` and `backfill-group <group>` cover one group by hand."
 
 [[entry]]
 kind = "command"
