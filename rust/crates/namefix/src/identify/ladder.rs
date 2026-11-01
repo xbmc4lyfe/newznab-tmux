@@ -921,14 +921,16 @@ mod tests {
     #[test]
     fn anime_with_no_tag_is_out_of_scope() {
         let mut predb = predb();
-        predb.insert(PredbRow {
-            id: 90,
-            title: "Dan.Da.Dan.S02E12.German.2025.ANiME.DL.1080p.WEB.h264-GRP".to_owned(),
-            category: "TV-1080P-DE".to_owned(),
-            size_mib: 0,
-            files: 0,
-            pre_at: None,
-        });
+        for (id, episode) in [(90, 11), (91, 12)] {
+            predb.insert(PredbRow {
+                id,
+                title: format!("Dan.Da.Dan.S02E{episode}.German.2025.ANiME.DL.1080p.WEB.h264-GRP"),
+                category: "TV-1080P-DE".to_owned(),
+                size_mib: 0,
+                files: 0,
+                pre_at: None,
+            });
+        }
         predb.finish();
         let donors = DonorIndex::default();
         let context = Context {

@@ -83,7 +83,7 @@ async fn load_rows(pool: &MySqlPool, evidence: &Evidence) -> Result<LocalPredb> 
         query.push_bind(high);
         rows.extend(query.build_query_as::<Row>().fetch_all(pool).await?);
     }
-    // One row per title settles whether PreDB has it as anime.
+    // Two rows per title settle whether PreDB has it as anime.
     let mut seen: Vec<String> = Vec::new();
     for name in candidate_names(evidence) {
         let title = parse(&name).title;
@@ -98,7 +98,7 @@ async fn load_rows(pool: &MySqlPool, evidence: &Evidence) -> Result<LocalPredb> 
         let mut query = QueryBuilder::new(COLUMNS);
         query.push(" WHERE title LIKE ");
         query.push_bind(format!("{like}.%"));
-        query.push(" AND (category LIKE 'ANIME%' OR title LIKE '%.ANiME.%') LIMIT 1");
+        query.push(" AND (category LIKE 'ANIME%' OR title LIKE '%.ANiME.%') LIMIT 2");
         rows.extend(query.build_query_as::<Row>().fetch_all(pool).await?);
         seen.push(title);
     }

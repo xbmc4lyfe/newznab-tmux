@@ -92,6 +92,14 @@ async fn identifies_by_name_and_by_size_from_mariadb() {
         -3600,
     )
     .await;
+    predb(
+        &db.pool,
+        5,
+        "Dan.Da.Dan.S02E12.German.2025.ANiME.DL.1080p.WEB.h264-GRP",
+        "",
+        -3600,
+    )
+    .await;
     let anime = evidence(
         r#""Dan.da.Dan.S02E03.1080p.BluRay.FLAC.2.0.x265.DUAL-FRNcR.mkv" yEnc"#,
         3_000_000_000,

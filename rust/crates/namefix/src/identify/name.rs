@@ -289,7 +289,11 @@ fn is_anime(name: &str, tv: bool, year: Option<u16>, title_end: usize) -> bool {
         .find(name)
         .is_some_and(|found| found.start() >= title_end)
         || FANSUB.is_match(name)
-        || (!tv && year.is_none() && name.starts_with('[') && token!(r"\d{2,4}").is_match(name))
+        || (!tv
+            && year.is_none()
+            && name.starts_with('[')
+            && !name.contains("]-[")
+            && token!(r"\d{2,4}").is_match(name))
 }
 
 /// Long-running anime that scene names rarely tag, for when PreDB has no row to say so. Keep it
@@ -806,6 +810,12 @@ mod tests {
     fn a_crunchyroll_tag_means_anime() {
         let parsed = parse("Some.Show.S01E02.1080p.CR.WEB-DL.AAC2.0.H.264-GRP");
         assert_eq!(scope(&parsed, None, None), Scope::Anime);
+    }
+
+    #[test]
+    fn an_indexer_wrapper_is_not_a_fansub_tag() {
+        let parsed = parse("[9220]-[FULL]-[a.b.teeveeEFNet]-[ Ally.Mcbeal.S01E01.DVDRip.XviD ]");
+        assert_ne!(parsed.kind, Kind::Anime);
     }
 
     #[test]
