@@ -12,7 +12,6 @@ futures-util.workspace = true
 metrics.workspace = true
 nntmux-core.workspace = true
 nntmux-ops.workspace = true
-nntmux-predb.workspace = true
 nntmux-runtime.workspace = true
 redis.workspace = true
 sqlx.workspace = true

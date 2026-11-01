@@ -16,7 +16,8 @@ status = "todo"
 kind = "command"
 id = "multiprocessing:binaries"
 source = "app/Console/Commands/ProcessBinaries.php"
-status = "todo"
+status = "dropped"
+note = "The ingest role replaces this. ws-ingest owns that role, which is not merged yet."
 
 [[entry]]
 kind = "command"
@@ -166,37 +167,38 @@ status = "todo"
 kind = "command"
 id = "tmux:attach"
 source = "app/Console/Commands/TmuxAttach.php"
-status = "todo"
+status = "dropped"
+note = "Nothing runs in tmux. Each role is a Compose service with its own logs."
 
 [[entry]]
 kind = "command"
 id = "tmux:drain"
 source = "app/Console/Commands/TmuxDrain.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "tmux:health-check"
 source = "app/Console/Commands/TmuxHealthCheck.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "tmux:monitor"
 source = "app/Console/Commands/TmuxMonitor.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "tmux:start"
 source = "app/Console/Commands/TmuxStart.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "tmux:stop"
 source = "app/Console/Commands/TmuxStop.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -232,13 +234,15 @@ status = "ported"
 kind = "schedule"
 id = "command: \"releases:fix-names 7 --update --category={$par2Category} --set-status --limit={$par2Limit"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "The fixnames role runs levels 7 and 8. ws-naming's PAR2 PR is still to land."
 
 [[entry]]
 kind = "schedule"
 id = "command: \"releases:fix-names 8 --update --category={$par2Category} --set-status --limit={$par2Limit"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "The fixnames role runs levels 7 and 8. ws-naming's PAR2 PR is still to land."
 
 [[entry]]
 kind = "schedule"
@@ -269,8 +273,7 @@ status = "todo"
 kind = "schedule"
 id = "command: 'disposable:update')->weekly();"
 source = "routes/console.php"
-status = "todo"
-note = "ValidEmailDomain checked the vendor list first, so the Rust site needs that list too. Waiting on ws-site."
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -374,19 +377,22 @@ status = "todo"
 kind = "schedule"
 id = "command: 'predb:check 3 --quiet')->everyTenMinutes()->withoutOverlapping()->runInBackground();"
 source = "routes/console.php"
-status = "ported"
+status = "dropped"
+note = "The predb role runs this every 10 minutes."
 
 [[entry]]
 kind = "schedule"
 id = "command: 'predb:import-feed --quiet')->everyFiveMinutes()->withoutOverlapping()->runInBackground()-"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "The predb role runs this every 5 minutes."
 
 [[entry]]
 kind = "schedule"
 id = "command: 'releases:fingerprint-backfill --stale --limit=200')->everyFifteenMinutes()->withoutOverla"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "The fingerprint role runs the stale sweep."
 
 [[entry]]
 kind = "schedule"
@@ -411,19 +417,22 @@ status = "todo"
 kind = "schedule"
 id = "exec: $forwarderCommand)->everyMinute()->runInBackground()"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "The verify role forwards on hosts that publish remotely."
 
 [[entry]]
 kind = "schedule"
 id = "exec: $preparationCommand)->everyMinute()->runInBackground()"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "The verify role runs this on its own loop."
 
 [[entry]]
 kind = "schedule"
 id = "exec: $verificationCommand)->everyMinute()->runInBackground()"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "The verify role runs this on its own loop."
 
 [[entry]]
 kind = "schedule"
