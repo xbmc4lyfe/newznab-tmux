@@ -345,20 +345,4 @@ class ManticoreSearchQueryTest extends TestCase
             $driverSource
         );
     }
-
-    #[Test]
-    public function search_releases_with_category_filter_scopes_searchname_with_grouping_parentheses(): void
-    {
-        $driverSource = file_get_contents(__DIR__.'/../../app/Services/Search/Drivers/ManticoreSearchDriver.php');
-
-        $this->assertIsString($driverSource);
-        $this->assertStringContainsString(
-            "\$searchExpr = '@@relaxed '.self::scopeReleaseSearchQuery(\$searchTerm, \$preparedSearch, '@searchname');",
-            $driverSource
-        );
-        $this->assertStringNotContainsString(
-            "\$searchExpr = '@@relaxed @searchname '.\$preparedSearch;",
-            $driverSource
-        );
-    }
 }

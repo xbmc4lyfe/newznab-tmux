@@ -78,12 +78,12 @@ final class ReleaseIndexProjectionTest extends TestCase
     }
 
     #[Test]
-    public function both_search_engines_bulk_populate_from_the_canonical_projection(): void
+    public function manticore_bulk_populates_from_the_canonical_projection(): void
     {
         $commandSource = file_get_contents(__DIR__.'/../../../../app/Console/Commands/NntmuxPopulateSearchIndexes.php');
 
         self::assertIsString($commandSource);
-        self::assertGreaterThanOrEqual(2, substr_count($commandSource, 'ReleaseIndexProjection::query()->orderBy(\'r.id\')'));
-        self::assertGreaterThanOrEqual(2, substr_count($commandSource, 'ReleaseSearchIndexDocument::normalize((array) $item)'));
+        self::assertSame(1, substr_count($commandSource, 'ReleaseIndexProjection::query()->orderBy(\'r.id\')'));
+        self::assertSame(1, substr_count($commandSource, 'ReleaseSearchIndexDocument::normalize((array) $item)'));
     }
 }

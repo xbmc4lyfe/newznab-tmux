@@ -18,7 +18,7 @@ use RuntimeException;
 
 final class NameFixingQueryService
 {
-    public const PREDB_IDENTITY_POLICY = 'ff9ba61a9f1d2e1adaf9d556da5a2d804b05f98b958845152a966abe69ee9fc9';
+    public const PREDB_IDENTITY_POLICY = 'e4cfc402a033712046c0523345e4cbd76616dc32b01b04d081bd1fcba586de06';
 
     public const SOURCE_NFO = 'nfo';
 

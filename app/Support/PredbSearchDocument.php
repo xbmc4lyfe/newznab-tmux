@@ -6,7 +6,7 @@ namespace App\Support;
 
 final class PredbSearchDocument
 {
-    public const PREDB_IDENTITY_POLICY = '2ca16d6496f3ad5cec424f796b17fae0cf25e17cc84522ad874727c821e5f579';
+    public const PREDB_IDENTITY_POLICY = '50f8235fba9c3de439431e0d83e45b393187d7f2997451d98c60b9af5ecd6445';
 
     public static function exactValue(string $value): string
     {
