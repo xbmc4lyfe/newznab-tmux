@@ -14,6 +14,9 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 6. **Generated volume hides its cost.** One pull request added 3,612 lines and changed one existing line, and it passed review with no blocking findings. Each class also gained its own toggles, library handle and packed bit layout. Review should ask whether the code should exist, not only whether it is correct.
 7. **One test can hide the rest of CI.** The master run on 2026-10-26 reached the full PHPUnit step only after a stale pin was fixed, then stopped about 40 minutes in. Every later MariaDB qualification step depends on that step. Keep critical checks in separate jobs, so one failure can't skip them.
 8. **Stress tests belong apart from unit tests.** The test that stopped that run feeds 16 MB strings and a 2,000,000-item array through the wave helpers. It printed `Premature end of PHP process` in CI but passed when run alone on an M-series Mac, so the cause isn't known. Run large-input tests in their own bounded job, so a crash can be told apart from the suite's own state.
+9. **Speed up where the time goes.** Wave 67.4 sped up in-memory plans by 1.73x to 4.18x. `IsbnDbService`'s real work is an HTTP request through `$this->client->get`, which the plans never touch. The indexer's speed work should target I/O: NNTP, the database and metadata APIs.
+10. **Check scope before porting.** Wave 67.4 covers IGDB games, ISBNdb books and invitations. The indexer covers TV and movies, so none of this is worth porting.
+11. **Layers pile up when nothing gets removed.** `IsbnDbService` already had Wave 39.4 toggles when Wave 67.4 added a second set. Delete the old route when adding a new one, so each behavior has one path.
 
 ## Slices
 
@@ -21,3 +24,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | --- | --- | --- | --- |
 | 1 | Wave 68.3 monitoring plans: 5 PHP classes, `monitoring_horizon_verification_status_tmux_grafana_w683` and its parity test | `436c89705` | 1 to 6 |
 | 1 | Wave 44.2 parity test only. Its PHP and Rust code goes with Wave 44 | `719bd8f9e` | 7, 8 |
+| 2 | Wave 67.4 metadata plans: `Company`, `Game`, `Platform`, `InvitationService`, `IsbnDbService`, their Rust module and parity test | `2fac89eed` | 9 to 11 |
