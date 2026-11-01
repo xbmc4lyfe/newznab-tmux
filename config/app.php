@@ -1,6 +1,5 @@
 <?php
 
-use App\Facades\Elasticsearch;
 use App\Facades\Yenc;
 use Illuminate\Support\Facades\Facade;
 use Illuminate\Support\Facades\Redis;
@@ -42,7 +41,6 @@ return [
     'timezone' => env('APP_TIMEZONE', 'UTC'),
 
     'aliases' => Facade::defaultAliases()->merge([
-        'Elasticsearch' => Elasticsearch::class,
         'Google2FA' => PragmaRX\Google2FALaravel\Facade::class,
         'RedisManager' => Redis::class,
         'Yenc' => Yenc::class,

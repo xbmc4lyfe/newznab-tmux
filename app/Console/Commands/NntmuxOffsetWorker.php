@@ -4,11 +4,9 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
-use App\Facades\Elasticsearch;
 use App\Facades\Search;
 use App\Models\Predb;
 use App\Services\Search\Support\ReleaseIndexProjection;
-use App\Support\PredbSearchDocument;
 use App\Support\ReleaseSearchIndexDocument;
 use Exception;
 use Illuminate\Console\Command;
@@ -23,7 +21,6 @@ class NntmuxOffsetWorker extends Command
      */
     protected $signature = 'nntmux:offset-worker
                                        {--manticore : Use ManticoreSearch}
-                                       {--elastic : Use ElasticSearch}
                                        {--releases : Populates the releases index}
                                        {--predb : Populates the predb index}
                                        {--offset=0 : Start offset}
@@ -87,80 +84,40 @@ class NntmuxOffsetWorker extends Command
     {
         $batchSize = (int) $this->option('batch-size');
         $query = $this->buildOffsetQuery($index, $offset, $limit);
-        $transformer = $this->getTransformer($engine, $index);
+        $transformer = $this->getTransformer($index);
 
-        $indexName = $this->getIndexName($engine, $index);
         $processed = 0;
         $errors = 0;
 
         $this->info("Worker {$workerId}: Processing {$limit} records with batch size {$batchSize}");
         $startTime = microtime(true);
 
-        if ($engine === 'manticore') {
-            $batchData = [];
+        $batchData = [];
 
-            $query->chunk($batchSize, function ($items) use ($transformer, $index, &$processed, &$errors, &$batchData, $batchSize, $workerId) {
-                $this->info("Worker {$workerId}: Processing chunk of {$items->count()} items");
+        $query->chunk($batchSize, function ($items) use ($transformer, $index, &$processed, &$errors, &$batchData, $batchSize, $workerId) {
+            $this->info("Worker {$workerId}: Processing chunk of {$items->count()} items");
 
-                foreach ($items as $item) {
-                    try {
-                        $batchData[] = $transformer($item);
-                        $processed++;
+            foreach ($items as $item) {
+                try {
+                    $batchData[] = $transformer($item);
+                    $processed++;
 
-                        if (count($batchData) >= $batchSize) {
-                            $this->processSearchBatch($batchData, $index, $workerId); // @phpstan-ignore argument.type
-                            $this->info("Worker {$workerId}: Inserted batch of ".count($batchData).' records');
-                            $batchData = [];
-                        }
-                    } catch (Exception $e) {
-                        $errors++;
-                        $this->error("Worker {$workerId}: Error processing item {$item->id}: {$e->getMessage()}");
+                    if (count($batchData) >= $batchSize) {
+                        $this->processSearchBatch($batchData, $index, $workerId); // @phpstan-ignore argument.type
+                        $this->info("Worker {$workerId}: Inserted batch of ".count($batchData).' records');
+                        $batchData = [];
                     }
+                } catch (Exception $e) {
+                    $errors++;
+                    $this->error("Worker {$workerId}: Error processing item {$item->id}: {$e->getMessage()}");
                 }
-            });
-
-            // Process remaining items
-            if (! empty($batchData)) {
-                $this->processSearchBatch($batchData, $index, $workerId); // @phpstan-ignore argument.type
-                $this->info("Worker {$workerId}: Inserted final batch of ".count($batchData).' records');
             }
+        });
 
-        } else { // ElasticSearch
-            if ($index === 'predb') {
-                Elasticsearch::indices()->putMapping([
-                    'index' => $indexName,
-                    'body' => ['properties' => PredbSearchDocument::elasticsearchExactMappings()],
-                ]);
-            }
-
-            $query->chunk($batchSize, function ($items) use ($indexName, $transformer, &$processed, &$errors, $workerId) {
-                $this->info("Worker {$workerId}: Processing chunk of {$items->count()} items");
-                $data = ['body' => []];
-
-                foreach ($items as $item) {
-                    try {
-                        $transformedData = $transformer($item);
-
-                        $data['body'][] = [
-                            'index' => [
-                                '_index' => $indexName,
-                                '_id' => $item->id,
-                            ],
-                        ];
-                        $data['body'][] = $transformedData;
-
-                        $processed++;
-                    } catch (Exception $e) {
-                        $errors++;
-                        $this->error("Worker {$workerId}: Error processing item {$item->id}: {$e->getMessage()}");
-                    }
-                }
-
-                if (! empty($data['body'])) {
-                    $this->processElasticBatch($data, $workerId);
-                    $this->info("Worker {$workerId}: Inserted batch of ".(count($data['body']) / 2).' records');
-                }
-            });
+        // Process remaining items
+        if (! empty($batchData)) {
+            $this->processSearchBatch($batchData, $index, $workerId); // @phpstan-ignore argument.type
+            $this->info("Worker {$workerId}: Inserted final batch of ".count($batchData).' records');
         }
 
         $executionTime = round(microtime(true) - $startTime, 2);
@@ -191,44 +148,19 @@ class NntmuxOffsetWorker extends Command
     /**
      * Get transformer function
      */
-    private function getTransformer(string $engine, string $index): callable
+    private function getTransformer(string $index): callable
     {
         if ($index === 'releases') {
-            return function ($item) use ($engine): array {
-                $row = (array) $item;
-
-                return $engine === 'manticore'
-                    ? ReleaseSearchIndexDocument::normalize($row)
-                    : array_merge($row, [
-                        'plainsearchname' => str_replace(['.', '-'], ' ', (string) ($item->searchname ?? '')),
-                    ]);
-            };
-        } else { // predb
-            return function ($item) use ($engine): array {
-                $document = [
-                    'id' => $item->id,
-                    'title' => (string) ($item->title ?? ''),
-                    'filename' => (string) ($item->filename ?? ''),
-                    'source' => (string) ($item->source ?? ''),
-                ];
-
-                return $engine === 'elastic'
-                    ? PredbSearchDocument::forElasticsearch($document)
-                    : $document;
-            };
+            return fn ($item): array => ReleaseSearchIndexDocument::normalize((array) $item);
         }
-    }
 
-    /**
-     * Get index name
-     */
-    private function getIndexName(string $engine, string $index): string
-    {
-        if ($engine === 'manticore') {
-            return (string) config("search.drivers.manticore.indexes.{$index}", $index.'_rt');
-        } else {
-            return (string) config("search.drivers.elasticsearch.indexes.{$index}", $index);
-        }
+        // predb
+        return fn ($item): array => [
+            'id' => $item->id,
+            'title' => (string) ($item->title ?? ''),
+            'filename' => (string) ($item->filename ?? ''),
+            'source' => (string) ($item->source ?? ''),
+        ];
     }
 
     /**
@@ -257,42 +189,6 @@ class NntmuxOffsetWorker extends Command
                 $attempt++;
                 if ($attempt >= $retries) {
                     throw new Exception("Worker {$workerId}: Failed to process search batch after {$retries} attempts: {$e->getMessage()}");
-                }
-                usleep(200000); // 200ms delay before retry
-            }
-        }
-    }
-
-    /**
-     * Process ElasticSearch batch
-     *
-     * @param  array<string, mixed>  $data
-     */
-    private function processElasticBatch(array $data, int $workerId): void
-    {
-        $retries = 3;
-        $attempt = 0;
-
-        while ($attempt < $retries) {
-            try {
-                $response = Elasticsearch::bulk($data);
-
-                if (isset($response['errors']) && $response['errors']) {
-                    $errorCount = 0;
-                    foreach ($response['items'] as $item) {
-                        if (isset($item['index']['error'])) {
-                            $errorCount++;
-                        }
-                    }
-                    if ($errorCount > 0) {
-                        $this->warn("Worker {$workerId}: ElasticSearch batch had {$errorCount} errors");
-                    }
-                }
-                break;
-            } catch (Exception $e) {
-                $attempt++;
-                if ($attempt >= $retries) {
-                    throw new Exception("Worker {$workerId}: Failed to process ElasticSearch batch after {$retries} attempts: {$e->getMessage()}");
                 }
                 usleep(200000); // 200ms delay before retry
             }
@@ -332,7 +228,7 @@ class NntmuxOffsetWorker extends Command
      */
     private function getSelectedEngine(): ?string
     {
-        return $this->option('manticore') ? 'manticore' : ($this->option('elastic') ? 'elastic' : null);
+        return $this->option('manticore') ? 'manticore' : null;
     }
 
     /**

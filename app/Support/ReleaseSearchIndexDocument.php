@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace App\Support;
 
 /**
- * Normalizes release rows into search index document fields (Manticore + Elasticsearch).
+ * Normalizes release rows into search index document fields (Manticore).
  */
 final class ReleaseSearchIndexDocument
 {

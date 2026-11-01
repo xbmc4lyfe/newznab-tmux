@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace App\Enums;
 
 /**
- * Logical names for metadata indexes (Manticore *_rt / Elasticsearch).
+ * Logical names for metadata indexes (Manticore *_rt).
  */
 enum SecondarySearchIndex: string
 {

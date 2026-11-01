@@ -192,10 +192,10 @@ class ViteDockerConfigurationTest extends TestCase
     {
         $directory = sys_get_temp_dir().'/dotenv-get-'.bin2hex(random_bytes(4));
         mkdir($directory);
-        file_put_contents($directory.'/.env', "SEARCH_DRIVER=elasticsearch # engine\nMONITORING_ENABLED=\"true\" # on\nWWWUSER = 501\nWWWUSER=502\nCOMPOSE_PROFILES=\n");
+        file_put_contents($directory.'/.env', "SEARCH_DRIVER=custom # engine\nMONITORING_ENABLED=\"true\" # on\nWWWUSER = 501\nWWWUSER=502\nCOMPOSE_PROFILES=\n");
         try {
             $read = fn (string $key, string $default = ''): string => (new Process([__DIR__.'/../../scripts/dotenv-get', $key, $default], $directory))->mustRun()->getOutput();
-            $this->assertSame('elasticsearch', $read('SEARCH_DRIVER', 'manticore'));
+            $this->assertSame('custom', $read('SEARCH_DRIVER', 'manticore'));
             $this->assertSame('true', $read('MONITORING_ENABLED'));
             $this->assertSame('502', $read('WWWUSER'));
             $this->assertSame('9090', $read('FORWARD_PROMETHEUS_PORT', '9090'));

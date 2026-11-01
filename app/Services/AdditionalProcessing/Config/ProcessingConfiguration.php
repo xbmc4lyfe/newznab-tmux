@@ -209,7 +209,7 @@ final readonly class ProcessingConfiguration
         $this->tmpUnrarPath = config('nntmux.tmp_unrar_path');
         $this->debugMode = (bool) config('app.debug');
         $this->searchDriver = config('search.default', 'manticore');
-        $this->searchEnabled = in_array($this->searchDriver, ['manticore', 'elasticsearch']);
+        $this->searchEnabled = $this->searchDriver === 'manticore';
         $this->renameMusicMediaInfo = (bool) config('nntmux.rename_music_mediainfo');
         $this->renamePar2 = (bool) config('nntmux.rename_par2');
         $this->releaseProcessingTimeout = (int) (app(ConfigurationProvider::class)->postProcessing()->releaseTimeoutSeconds ?: 120);

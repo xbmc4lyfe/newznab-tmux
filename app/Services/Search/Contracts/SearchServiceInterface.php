@@ -9,7 +9,7 @@ use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
 
 /**
- * Interface for full-text search services (ManticoreSearch, Elasticsearch).
+ * Interface for full-text search services (ManticoreSearch).
  *
  * Provides a common API for release and predb search, indexing, and autocomplete.
  */

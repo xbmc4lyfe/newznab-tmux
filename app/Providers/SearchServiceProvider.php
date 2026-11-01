@@ -6,13 +6,10 @@ namespace App\Providers;
 
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\Contracts\SearchServiceInterface;
-use App\Services\Search\Drivers\ElasticSearchDriver;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use App\Services\Search\MediaSearchService;
 use App\Services\Search\SearchService;
-use App\Services\Search\Support\ElasticsearchClientFactory;
 use App\Services\Search\Support\SearchFailureTracker;
-use Elastic\Elasticsearch\Client;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Support\ServiceProvider;
 
@@ -59,22 +56,9 @@ class SearchServiceProvider extends ServiceProvider
             return new ManticoreSearchDriver($config);
         });
 
-        $this->app->singleton(ElasticSearchDriver::class, function (Application $app) {
-            $config = config('search.drivers.elasticsearch', []);
-
-            return new ElasticSearchDriver($config);
-        });
-
-        $this->app->singleton('elasticsearch', function (): Client {
-            $config = config('search.drivers.elasticsearch', []);
-
-            return ElasticsearchClientFactory::make($config);
-        });
-
         // Register aliases (using prefixed names to avoid conflicts with other packages)
         $this->app->alias(SearchService::class, 'search');
         $this->app->alias(ManticoreSearchDriver::class, 'search.manticore');
-        $this->app->alias(ElasticSearchDriver::class, 'search.elasticsearch');
         $this->app->alias(MediaSearchService::class, 'search.media');
     }
 

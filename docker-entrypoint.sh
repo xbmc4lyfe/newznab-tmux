@@ -80,16 +80,9 @@ if [ "$1" != 'php' ] && [ "$1" != 'sh' ]; then
         echo "NNTmux installation..."
         php artisan nntmux:install --yes
 
-        if [ "${ELASTICSEARCH_ENABLED}" == "true" ]; then
-            echo "Elasticsearch initialisation"
-            php artisan nntmux:create-es-indexes
-            php artisan nntmux:populate --elastic --releases
-            php artisan nntmux:populate --elastic --predb
-        else
-            echo "Manticore initialisation"
-            php artisan nntmux:populate --manticore --releases
-            php artisan nntmux:populate --manticore --predb
-        fi
+        echo "Manticore initialisation"
+        php artisan nntmux:populate --manticore --releases
+        php artisan nntmux:populate --manticore --predb
     fi
 fi
 
