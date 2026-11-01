@@ -585,43 +585,6 @@ class MusicService
     }
 
     /**
-     * Match browse node ID to genre name.
-     */
-    public function matchBrowseNode(string $nodeId): string|false
-    {
-        $str = '';
-
-        $str = match ($nodeId) {
-            '163420' => 'Music Video & Concerts',
-            '30', '624869011' => 'Alternative Rock',
-            '31', '624881011' => 'Blues',
-            '265640', '624894011' => 'Broadway & Vocalists',
-            '173425', '624899011' => "Children's Music",
-            '173429', '2231705011', '624905011' => 'Christian & Gospel',
-            '67204', '624916011' => 'Classic Rock',
-            '85', '624926011' => 'Classical',
-            '16', '624976011' => 'Country',
-            '7', '624988011' => 'Dance & Electronic',
-            '32', '625003011' => 'Folk',
-            '67207', '625011011' => 'Hard Rock & Metal',
-            '33', '625021011' => 'World Music',
-            '34', '625036011' => 'Jazz',
-            '289122', '625054011' => 'Latin Music',
-            '36', '625070011' => 'New Age',
-            '625075011' => 'Opera & Vocal',
-            '37', '625092011' => 'Pop',
-            '39', '625105011' => 'R&B',
-            '38', '625117011' => 'Rap & Hip-Hop',
-            '40', '625129011' => 'Rock',
-            '42', '625144011' => 'Soundtracks',
-            '35', '625061011' => 'Miscellaneous',
-            default => '',
-        };
-
-        return ($str !== '') ? $str : false;
-    }
-
-    /**
      * Fetch music properties from iTunes.
      *
      * @return array<string, mixed>

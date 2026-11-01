@@ -246,28 +246,6 @@ class TmdbClient
     }
 
     /**
-     * Get movie credits (cast and crew)
-     *
-     * @param  int  $movieId  The TMDB movie ID
-     * @return array<string, mixed>|null Credits data or null on failure
-     */
-    public function getMovieCredits(int $movieId): ?array
-    {
-        return $this->get('/movie/'.$movieId.'/credits');
-    }
-
-    /**
-     * Get movie external IDs (IMDB, etc.)
-     *
-     * @param  int  $movieId  The TMDB movie ID
-     * @return array<string, mixed>|null External IDs or null on failure
-     */
-    public function getMovieExternalIds(int $movieId): ?array
-    {
-        return $this->get('/movie/'.$movieId.'/external_ids');
-    }
-
-    /**
      * Get alternative titles for a movie (including international / alternate names).
      *
      * @param  int  $movieId  The TMDB movie ID

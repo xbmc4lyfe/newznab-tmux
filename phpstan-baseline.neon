@@ -415,19 +415,6 @@ parameters:
 			path: app/Services/BookService.php
 
 		-
-			message: '#^Method App\\Services\\Categorization\\CategorizationService\:\:batchCategorize\(\) should return array\<string, mixed\> but returns list\<array\<string, mixed\>\>\.$#'
-			identifier: return.type
-			count: 1
-			path: app/Services/Categorization/CategorizationService.php
-
-		-
-			message: '#^PHPDoc tag @return with type list\<array\<string, mixed\>\> is incompatible with native type App\\Services\\Categorization\\CategorizationPipeline\.$#'
-			identifier: return.phpDocType
-			count: 1
-			path: app/Services/Categorization/CategorizationService.php
-
-
-		-
 			message: '#^Strict comparison using \!\=\= between non\-empty\-array\<mixed, mixed\> and array\{\} will always evaluate to true\.$#'
 			identifier: notIdentical.alwaysTrue
 			count: 1
@@ -720,12 +707,6 @@ parameters:
 			identifier: nullsafe.neverNull
 			count: 2
 			path: app/Services/SiteStatusService.php
-
-		-
-			message: '#^Method App\\Services\\SteamService\:\:getDLCList\(\) should return array\<string, mixed\> but returns list\<array\<string, mixed\>\>\.$#'
-			identifier: return.type
-			count: 1
-			path: app/Services/SteamService.php
 
 		-
 			message: '#^Method App\\Services\\SteamService\:\:tokenize\(\) should return array\<string, mixed\> but returns list\<string\>\.$#'

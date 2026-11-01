@@ -10,7 +10,6 @@ use Illuminate\Support\Facades\Facade;
 /**
  * @method static array categorize(int|string $groupId, string $releaseName, ?string $poster = '', bool $debug = false)
  * @method static \Illuminate\Support\Collection getCategorizers()
- * @method static CategorizationPipeline addCategorizer(\App\Services\Categorization\Contracts\CategorizerInterface $categorizer)
  *
  * @see CategorizationPipeline
  */

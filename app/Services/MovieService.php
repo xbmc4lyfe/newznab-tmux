@@ -240,19 +240,6 @@ class MovieService
     }
 
     /**
-     * Get array of column keys, for inserting / updating.
-     *
-     * @return array<int, string>
-     */
-    public function getColumnKeys(): array
-    {
-        return [
-            'actors', 'backdrop', 'cover', 'director', 'genre', 'imdbid', 'language',
-            'plot', 'rating', 'rtrating', 'tagline', 'title', 'tmdbid', 'traktid', 'trailer', 'type', 'year',
-        ];
-    }
-
-    /**
      * Choose the first non-empty variable from up to five inputs.
      *
      * @param  array<string, mixed>  $variable1

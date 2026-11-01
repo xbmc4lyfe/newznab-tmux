@@ -33,19 +33,6 @@ class XrefService
         return $tokens;
     }
 
-    /**
-     * Returns tokens that appear in $headerXref but not in $existingXref.
-     *
-     * @return list<string>
-     */
-    public function diffNewTokens(?string $existingXref, ?string $headerXref): array
-    {
-        $existing = $this->extractTokens($existingXref);
-        $incoming = $this->extractTokens($headerXref);
-
-        return array_values(array_diff($incoming, $existing));
-    }
-
     /** @return list<string> */
     public function extractGroupNames(?string $xref): array
     {

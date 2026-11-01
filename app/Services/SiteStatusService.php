@@ -41,14 +41,6 @@ class SiteStatusService
     /**
      * @return \Illuminate\Database\Eloquent\Collection<int, ServiceStatus>
      */
-    public function getAllStatuses(): \Illuminate\Database\Eloquent\Collection
-    {
-        return $this->getEnabledServices();
-    }
-
-    /**
-     * @return \Illuminate\Database\Eloquent\Collection<int, ServiceStatus>
-     */
     public function getEnabledServices(): \Illuminate\Database\Eloquent\Collection
     {
         return Cache::flexible(self::CACHE_KEY_ENABLED_SERVICES, self::CACHE_TTL, fn () => ServiceStatus::query()
@@ -67,11 +59,6 @@ class SiteStatusService
             ->orderBy('sort_order')
             ->orderBy('id')
             ->get();
-    }
-
-    public function getOverallStatus(): ServiceStatusEnum
-    {
-        return $this->aggregateWorstStatus($this->getEnabledServices());
     }
 
     /**
@@ -293,16 +280,6 @@ class SiteStatusService
         }
 
         return $merged;
-    }
-
-    /**
-     * Placeholder for per-day uptime history when a dedicated metrics table exists.
-     *
-     * @return Collection<int, array{date: string, uptime: float}>
-     */
-    public function getUptimeHistory(ServiceStatus $service, int $days = 90): Collection
-    {
-        return collect();
     }
 
     /**

@@ -21,38 +21,6 @@ class ReleaseContext
     ) {}
 
     /**
-     * Get the release name in lowercase for case-insensitive matching.
-     */
-    public function getLowerReleaseName(): string
-    {
-        return strtolower($this->releaseName);
-    }
-
-    /**
-     * Check if the release name matches a pattern.
-     */
-    public function matchesPattern(string $pattern): bool
-    {
-        return (bool) preg_match($pattern, $this->releaseName);
-    }
-
-    /**
-     * Check if the release name contains a substring (case-insensitive).
-     */
-    public function containsString(string $needle): bool
-    {
-        return stripos($this->releaseName, $needle) !== false;
-    }
-
-    /**
-     * Check if the group name matches a pattern.
-     */
-    public function groupMatchesPattern(string $pattern): bool
-    {
-        return (bool) preg_match($pattern, $this->groupName);
-    }
-
-    /**
      * Check whether the release name contains a delimiter-bounded season-pack token.
      */
     public function hasStandaloneSeasonToken(): bool
