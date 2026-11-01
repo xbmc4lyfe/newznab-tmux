@@ -66,9 +66,14 @@ Pass `KEY=VALUE` after a recipe to set an option for one run, for example `just 
 
 1. Takes a lock directory (`DEPLOY_LOCK_DIR`, default `docker/.deploy.lock`). If another deploy holds it, it exits with status 75.
 2. Requires the checkout to be on `DEPLOY_GIT_BRANCH` (default `master`) with no commits missing from `DEPLOY_GIT_REMOTE` (default `origin`), and fast-forwards it. `DEPLOY_SYNC_REMOTE=0` skips this, for offline testing only.
-3. Builds the image while the old stack keeps running.
-4. Runs `docker compose up -d --wait` (timeout `DEPLOY_HEALTH_TIMEOUT`, default 600 s). `migrate` runs first; changed services are recreated; unchanged ones are left alone.
-5. Appends `deploy result=started` and `deploy result=finished rc=<n>` lines to `DEPLOY_LOG` (default `docker/.deploy.log`).
+3. Preflight, before anything changes. It refuses to run while containers of services the Compose file no longer defines are running (the PHP `horizon`, `scheduler` and `indexer` after the cutover), while `docker/config/app.env` has a `$` Compose would interpolate (single-quote such values), or when a data service's (`DEPLOY_DATA_SERVICES`, default `mariadb redis manticore`) mounted config changed, unless `DEPLOY_RECREATE_DATA=1`.
+4. Builds the image while the old stack keeps running.
+5. Runs `migrate` on its own. If it fails, nothing has been recreated and the old stack keeps serving.
+6. Runs `docker compose up -d --wait` (timeout `DEPLOY_HEALTH_TIMEOUT`, default 600 s). Changed services are recreated; unchanged ones are left alone. Compose doesn't notice an edited mounted file, so services whose mounted config (Caddyfile, Prometheus, Grafana provisioning) changed since the last healthy deploy are force-recreated. The hashes live in `DEPLOY_CONFIG_STAMP` (default `docker/.deploy.config`).
+7. Checks that every running app container runs the image just built, and sets Grafana's admin password from `GRAFANA_ADMIN_PASSWORD`.
+8. Appends `deploy result=started` and `deploy result=finished rc=<n>` lines to `DEPLOY_LOG` (default `docker/.deploy.log`).
+
+Remote verification workers (`docker/worker`) aren't part of the stack. Stop them before a deploy that adds a migration, and start them again after it.
 
 Workers get SIGTERM, stop claiming work, and finish in-flight units within their `stop_grace_period` (30 s `web`, 120 s default, 1920 s `fingerprint`, `verify` and `postprocess`). A long job can delay a rollout.
 

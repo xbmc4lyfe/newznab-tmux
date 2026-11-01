@@ -39,7 +39,7 @@ The goal is zero PHP, with every entry point in Rust: all routes, commands, jobs
 | `ws-site` | `webkit`, `site` | M10 | Public pages, auth (bcrypt hashes, TOTP, passkeys, sessions), accounts, profile, cart. Templates use askama and htmx. Everyone logs in again once at cutover, since sharing Laravel's session cookie isn't worth building |
 | `ws-admin` | `admin`, `mail` | M10 | `/admin`, mail, GDPR, invitations, roles, payments (BTCPay), account jobs. Build on `webkit` |
 | `ws-ops` | `supervisor`, `ops` | M8 | `routes/console.php`, tmux layout and monitor, status probes, log viewer, MCP, every artisan command nobody else owns |
-| `ws-deploy` | `Dockerfile`, `docker/`, `Justfile`, `deploy/`, `.github/`, docs | M2, M11 | Rust image and Compose services for each role and `nntmux-web`, the deploy guard and drain, Caddy routes, Grafana, `AGENTS.md` and `.ai/` rules rewritten for Rust, final removal of leftover PHP and `nzb-yenc-ffi` |
+| `ws-deploy` | `Dockerfile`, `docker/`, `Justfile`, `deploy/`, `.github/`, docs | M2, M11 | Rust image and Compose services for each role and `nntmux-web`, the deploy guard and drain, Caddy routes, Grafana, final removal of leftover PHP and `nzb-yenc-ffi` |
 
 Order: `ws-formats` first if threads must be staggered, since `ws-ingest`, `ws-releases` and `ws-postprocess` call it. They can start in parallel against the agreed API, which `ws-formats` should publish early as a first small PR. `ws-site` publishes `webkit` early for `ws-admin`. Everything else is independent, because it meets at the database.
 
