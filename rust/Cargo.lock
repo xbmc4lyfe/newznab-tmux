@@ -2068,6 +2068,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "askama",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -2078,7 +2079,10 @@ dependencies = [
  "hex",
  "md-5 0.10.6",
  "multer",
+ "nntmux-categorize",
  "nntmux-core",
+ "nntmux-namefix",
+ "nntmux-predb",
  "nntmux-runtime",
  "nntmux-search",
  "nntmux-testkit",
