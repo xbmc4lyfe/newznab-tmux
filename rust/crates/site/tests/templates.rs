@@ -9,7 +9,10 @@ fn html_files(dir: &Path, found: &mut Vec<PathBuf>) {
         let path = entry.unwrap().path();
         if path.is_dir() {
             html_files(&path, found);
-        } else if path.extension().is_some_and(|extension| extension == "html") {
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "html")
+        {
             found.push(path);
         }
     }
@@ -21,7 +24,29 @@ fn no_blade_is_left_in_the_templates() {
     let mut files = Vec::new();
     html_files(&root.join("templates"), &mut files);
     html_files(&root.join("../webkit/templates"), &mut files);
-    let banned = ["<x-page", "<x-empty", "<x-release", "<x-report", "<x-slot", "<x-cover", "<x-inline", "<x-view", "<x-sort", "{{ $", "{!!", "@php", "@foreach", "@include", "@forelse", "@unless", "@isset", "@endif", "@selected", "TODO(", "#ROUTE"];
+    let banned = [
+        "<x-page",
+        "<x-empty",
+        "<x-release",
+        "<x-report",
+        "<x-slot",
+        "<x-cover",
+        "<x-inline",
+        "<x-view",
+        "<x-sort",
+        "{{ $",
+        "{!!",
+        "@php",
+        "@foreach",
+        "@include",
+        "@forelse",
+        "@unless",
+        "@isset",
+        "@endif",
+        "@selected",
+        "TODO(",
+        "#ROUTE",
+    ];
     let mut problems = Vec::new();
     for file in files {
         let text = fs::read_to_string(&file).unwrap();
@@ -31,5 +56,9 @@ fn no_blade_is_left_in_the_templates() {
             }
         }
     }
-    assert!(problems.is_empty(), "Blade left in templates:\n{}", problems.join("\n"));
+    assert!(
+        problems.is_empty(),
+        "Blade left in templates:\n{}",
+        problems.join("\n")
+    );
 }

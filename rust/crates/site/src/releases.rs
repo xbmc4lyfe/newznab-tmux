@@ -209,7 +209,7 @@ impl ReleaseRow {
     /// `imdb_id_is_valid`
     pub fn imdb_valid(&self) -> bool {
         let digits: String = self.imdbid.chars().filter(char::is_ascii_digit).collect();
-        !digits.is_empty() && digits.parse::<u64>().map_or(true, |id| id != 0)
+        !digits.is_empty() && digits.parse::<u64>() != Ok(0)
     }
 }
 
@@ -257,7 +257,7 @@ pub fn cover_url(kind: &str, base: &str) -> Option<String> {
 
 fn release_cover(imdbid: &str, videos_id: i64) -> Option<String> {
     let digits: String = imdbid.chars().filter(char::is_ascii_digit).collect();
-    if !digits.is_empty() && digits.parse::<u64>().map_or(true, |id| id != 0) {
+    if !digits.is_empty() && digits.parse::<u64>() != Ok(0) {
         return cover_url("movies", &format!("{imdbid}-cover"));
     }
     if videos_id > 0 {

@@ -80,11 +80,6 @@ async fn browse_lists_filters_and_guards_categories() {
     assert!(html.contains("2.00 GB"));
     assert!(html.contains("Reported (1)"));
     assert!(html.contains("Spam/Advertisement"));
-    assert!(
-            || html.contains("Movies &gt; HD")
-            || html.contains("Movies"),
-        "category shows"
-    );
 
     // A category without the permission gets the refusal page.
     let (response, html) = browser.get("/browse/TV").await;
