@@ -71,14 +71,6 @@ class GenreService
     }
 
     /**
-     * Get genre by ID.
-     */
-    public function getById(int $id): ?Genre
-    {
-        return Genre::find($id);
-    }
-
-    /**
      * Update genre disabled status.
      */
     public function update(int $id, int $disabled): int

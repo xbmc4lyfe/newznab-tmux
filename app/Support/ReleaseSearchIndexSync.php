@@ -83,29 +83,4 @@ final class ReleaseSearchIndexSync
             return true;
         }, 'releases.id');
     }
-
-    /**
-     * Reindex every release (chunked). Use after mass UPDATEs that match an optional raw WHERE suffix.
-     *
-     * @param  string  $whereSuffix  SQL fragment starting with "AND ..." or empty for all rows
-     */
-    public static function reindexMatchingWhere(string $whereSuffix = ''): void
-    {
-        $query = Release::query()->select('releases.id')->orderBy('releases.id');
-        $trimmed = trim($whereSuffix);
-        if ($trimmed !== '') {
-            $condition = preg_replace('/^\s*AND\s+/i', '', $trimmed);
-            if ($condition !== '') {
-                $query->whereRaw($condition);
-            }
-        }
-
-        $query->chunkById(500, function ($releases): bool {
-            foreach ($releases as $release) {
-                Search::updateRelease((int) $release->id);
-            }
-
-            return true;
-        });
-    }
 }

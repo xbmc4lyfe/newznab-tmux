@@ -140,21 +140,6 @@ class FanartTvService
     }
 
     /**
-     * Get fan art for music by MusicBrainz ID.
-     *
-     * @param  string  $mbId  MusicBrainz ID
-     * @return array<string, mixed>|null Music art data or null on failure
-     */
-    public function getMusicFanArt(string $mbId): ?array
-    {
-        $cacheKey = 'fanarttv_music_'.$mbId;
-
-        return Cache::remember($cacheKey, now()->addHours(self::CACHE_TTL_HOURS), function () use ($mbId) {
-            return $this->get('music/'.$mbId);
-        });
-    }
-
-    /**
      * Extract movie properties from Fanart.TV response.
      *
      * @param  string  $imdbId  IMDB ID (with or without 'tt' prefix)
@@ -198,67 +183,6 @@ class FanartTvService
     }
 
     /**
-     * Extract TV show properties from Fanart.TV response.
-     *
-     * @param  int|string  $tvdbId  TVDB ID
-     * @return array<string, mixed>|null Array with 'poster', 'banner', 'background', 'title' keys or null on failure
-     */
-    public function getTvProperties(int|string $tvdbId): ?array
-    {
-        $art = $this->getTvFanArt($tvdbId);
-
-        if (empty($art)) {
-            return null;
-        }
-
-        $result = [];
-
-        // Get poster (sort by likes)
-        if (! empty($art['tvposter'])) {
-            /** @phpstan-ignore argument.templateType */
-            $best = collect($art['tvposter'])->sortByDesc('likes')->first();
-            if (! empty($best['url'])) {
-                $result['poster'] = $best['url'];
-            }
-        }
-
-        // Get banner (sort by likes)
-        if (! empty($art['tvbanner'])) {
-            /** @phpstan-ignore argument.templateType */
-            $best = collect($art['tvbanner'])->sortByDesc('likes')->first();
-            if (! empty($best['url'])) {
-                $result['banner'] = $best['url'];
-            }
-        }
-
-        // Get background (sort by likes)
-        if (! empty($art['showbackground'])) {
-            /** @phpstan-ignore argument.templateType */
-            $best = collect($art['showbackground'])->sortByDesc('likes')->first();
-            if (! empty($best['url'])) {
-                $result['background'] = $best['url'];
-            }
-        }
-
-        // Get HD clearlogo (sort by likes)
-        if (! empty($art['hdtvlogo'])) {
-            /** @phpstan-ignore argument.templateType */
-            $best = collect($art['hdtvlogo'])->sortByDesc('likes')->first();
-            if (! empty($best['url'])) {
-                $result['logo'] = $best['url'];
-            }
-        }
-
-        if (! empty($result)) {
-            $result['title'] = $art['name'] ?? (string) $tvdbId;
-
-            return $result;
-        }
-
-        return null;
-    }
-
-    /**
      * Get the best poster URL for a TV show.
      *
      * @param  int|string  $tvdbId  TVDB ID
@@ -279,26 +203,6 @@ class FanartTvService
     }
 
     /**
-     * Get the best poster URL for a movie.
-     *
-     * @param  string  $imdbId  IMDB ID (with or without 'tt' prefix)
-     * @return string|null Poster URL or null if not found
-     */
-    public function getBestMoviePoster(string $imdbId): ?string
-    {
-        $art = $this->getMovieFanArt($imdbId);
-
-        if (empty($art['movieposter'])) {
-            return null;
-        }
-
-        /** @phpstan-ignore argument.templateType */
-        $best = collect($art['movieposter'])->sortByDesc('likes')->first();
-
-        return $best['url'] ?? null;
-    }
-
-    /**
      * Normalize IMDB ID to include 'tt' prefix.
      */
     protected function normalizeImdbId(string $imdbId): string
@@ -308,23 +212,5 @@ class FanartTvService
         }
 
         return 'tt'.$imdbId;
-    }
-
-    /**
-     * Clear cached data for a specific movie.
-     */
-    public function clearMovieCache(string $imdbId): bool
-    {
-        $id = $this->normalizeImdbId($imdbId);
-
-        return Cache::forget('fanarttv_movie_'.$id);
-    }
-
-    /**
-     * Clear cached data for a specific TV show.
-     */
-    public function clearTvCache(int|string $tvdbId): bool
-    {
-        return Cache::forget('fanarttv_tv_'.$tvdbId);
     }
 }

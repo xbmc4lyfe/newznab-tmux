@@ -201,38 +201,6 @@ class ForkingService
     }
 
     /**
-     * Generic work type processor for backwards compatibility.
-     *
-     * @deprecated Use specific methods instead (e.g., backfill(), binaries(), etc.)
-     *
-     * @param  array<string, mixed>  $options
-     */
-    public function processWorkType(string $type, array $options = []): void
-    {
-        match ($type) {
-            'backfill' => $this->backfill($options),
-            'binaries' => $this->binaries((int) ($options[0] ?? 0)),
-            'fixRelNames_standard' => $this->fixRelNames('standard'),
-            'fixRelNames_predbft' => $this->fixRelNames('predbft'),
-            'releases' => $this->releases(),
-            'postProcess_add' => $this->processAdditional(),
-            'postProcess_ani' => $this->processAnime(),
-            'postProcess_ama' => $this->processAmazon(),
-            'postProcess_boo' => $this->processBooks(),
-            'postProcess_con' => $this->processConsoles(),
-            'postProcess_gam' => $this->processGames(),
-            'postProcess_mov' => $this->processMovies($options[0] ?? false),
-            'postProcess_mus' => $this->processMusic(),
-            'postProcess_nfo' => $this->processNfo(),
-            'postProcess_tv' => $this->processTv($options[0] ?? false),
-            'safe_backfill' => $this->safeBackfill(),
-            'safe_binaries' => $this->safeBinaries(),
-            'update_per_group' => $this->updatePerGroup(),
-            default => Log::warning("Unknown work type: {$type}"),
-        };
-    }
-
-    /**
      * Run a task with timing output.
      */
     protected function runWithTiming(string $taskName, callable $task): void

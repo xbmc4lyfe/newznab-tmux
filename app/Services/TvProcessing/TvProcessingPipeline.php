@@ -52,17 +52,6 @@ class TvProcessingPipeline
         $this->resetStats();
     }
 
-    /**
-     * Add a provider pipe to the pipeline.
-     */
-    public function addPipe(AbstractTvProviderPipe $pipe): self
-    {
-        $this->pipes->push($pipe);
-        $this->pipes = $this->pipes->sortBy(fn (AbstractTvProviderPipe $p) => $p->getPriority())->values();
-
-        return $this;
-    }
-
     public function setEchoOutput(bool $echoOutput): self
     {
         $this->echoOutput = $echoOutput;
@@ -197,14 +186,6 @@ class TvProcessingPipeline
         $maxTvProcessed = (int) app(ConfigurationProvider::class)->metadata()->maxTvProcessed;
 
         return $maxTvProcessed > 0 ? $maxTvProcessed : 75;
-    }
-
-    /**
-     * @return Collection<int, AbstractTvProviderPipe>
-     */
-    public function getPipes(): Collection
-    {
-        return $this->pipes;
     }
 
     /**

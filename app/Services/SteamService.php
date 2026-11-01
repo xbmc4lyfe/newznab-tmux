@@ -278,38 +278,6 @@ class SteamService
     }
 
     /**
-     * Get DLC list for a game.
-     *
-     * @return array<string, mixed>
-     */
-    public function getDLCList(int $appId): array
-    {
-        $details = $this->getGameDetails($appId);
-        if ($details === false) {
-            return [];
-        }
-
-        $dlcIds = $details['dlc'] ?? [];
-        if (empty($dlcIds)) {
-            return [];
-        }
-
-        $dlcList = [];
-        foreach (array_slice($dlcIds, 0, 20) as $dlcId) { // Limit to prevent too many API calls
-            $dlcDetails = $this->getGameDetails($dlcId);
-            if ($dlcDetails !== false) {
-                $dlcList[] = [
-                    'appid' => $dlcId,
-                    'name' => $dlcDetails['title'],
-                    'price' => $dlcDetails['price'] ?? null,
-                ];
-            }
-        }
-
-        return $dlcList;
-    }
-
-    /**
      * Populate the steam_apps table with the full app list from Steam.
      *
      * @return array{inserted: int<0, max>, updated: int<0, max>, skipped: int<0, max>, errors: int<0, max>}

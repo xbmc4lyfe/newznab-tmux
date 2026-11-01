@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Support;
 
-use App\Models\BookInfo;
 use App\Support\Data\BookParseResult;
 
 class BookMatchScorer
@@ -40,19 +39,6 @@ class BookMatchScorer
         }
 
         return $titleScore;
-    }
-
-    public function scoreBookInfo(BookInfo $book, BookParseResult $parsed): float
-    {
-        return $this->score([
-            'title' => $book->title,
-            'author' => $book->author,
-            'isbn' => $book->isbn,
-            'ean' => $book->ean,
-            'publishdate' => $book->publishdate,
-            'publisher' => $book->publisher,
-            'cover' => $book->cover ? 1 : 0,
-        ], $parsed);
     }
 
     public function titleScore(string $left, string $right): float

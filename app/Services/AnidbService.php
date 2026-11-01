@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Models\AnidbTitle;
-use App\Models\Category;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\DB;
 
@@ -78,45 +77,6 @@ class AnidbService
                 )
             );
         }, 3);
-    }
-
-    /**
-     * Retrieves a list of Anime titles, optionally filtered by starting character and title.
-     *
-     * @return array<string, mixed>
-     */
-    public function getAnimeList(string $letter = '', string $animeTitle = ''): array
-    {
-        $rsql = $tsql = '';
-
-        if ($letter !== '') {
-            if ($letter === '0-9') {
-                $letter = '[0-9]';
-            }
-            $rsql .= sprintf('AND at.title REGEXP %s', escapeString('^'.$letter));
-        }
-
-        if ($animeTitle !== '') {
-            $tsql .= sprintf('AND at.title LIKE %s', escapeString('%'.$animeTitle.'%'));
-        }
-
-        return DB::select(
-            sprintf(
-                '
-				SELECT at.anidbid, at.title,
-					ai.type, ai.categories, ai.rating, ai.startdate, ai.enddate
-				FROM anidb_titles at
-				LEFT JOIN anidb_info ai USING (anidbid)
-				STRAIGHT_JOIN releases r ON at.anidbid = r.anidbid
-				WHERE at.anidbid > 0 %s %s
-				AND r.categories_id = %d
-				GROUP BY at.anidbid
-				ORDER BY at.title ASC',
-                $rsql,
-                $tsql,
-                Category::TV_ANIME
-            )
-        );
     }
 
     /**

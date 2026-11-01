@@ -111,39 +111,6 @@ class InvitationService
     }
 
     /**
-     * Accept an invitation (use it for registration)
-     *
-     * @param  array<string, mixed>  $userData
-     */
-    public function acceptInvitation(string $token, array $userData): User
-    {
-        $invitation = Invitation::findValidByToken($token);
-
-        if (! $invitation) {
-            throw new \Exception('Invalid or expired invitation token.');
-        }
-
-        // Get the user who sent the invitation
-        $inviter = User::find($invitation->invited_by);
-
-        // Create the user
-        $user = User::create(array_merge($userData, [
-            'email' => $invitation->email,
-            'invited_by' => $invitation->invited_by,
-        ]));
-
-        // Mark invitation as used
-        $invitation->markAsUsed($user->id);
-
-        // Now decrement the inviter's available invites (only when actually used)
-        if ($inviter) {
-            $inviter->decrement('invites');
-        }
-
-        return $user;
-    }
-
-    /**
      * Get invitation statistics for a user
      *
      * @return array<string, mixed>
@@ -185,20 +152,6 @@ class InvitationService
     }
 
     /**
-     * Check if a user can send more invitations
-     */
-    public function canUserSendInvitation(int $userId, ?int $maxInvitations = null): bool
-    {
-        if ($maxInvitations === null) {
-            return true; // No limit set
-        }
-
-        $sentCount = Invitation::where('invited_by', $userId)->count();
-
-        return $sentCount < $maxInvitations;
-    }
-
-    /**
      * Get invitation by token for preview
      *
      * @return array<string, mixed>
@@ -219,55 +172,6 @@ class InvitationService
             'is_expired' => $invitation->isExpired(),
             'is_used' => $invitation->isUsed(),
             'metadata' => $invitation->metadata,
-        ];
-    }
-
-    /**
-     * Get detailed invitation information for a user (for debugging)
-     *
-     * @return array<string, mixed>
-     */
-    public function getUserInvitationDetails(int $userId): array
-    {
-        $user = User::find($userId);
-        if (! $user) {
-            return [];
-        }
-
-        $totalInvites = $user->invites;
-
-        $activeInvitations = Invitation::where('invited_by', $userId)
-            ->where('is_active', true)
-            ->where('used_at', null)
-            ->where('expires_at', '>', now())
-            ->count();
-
-        $usedInvitations = Invitation::where('invited_by', $userId)
-            ->whereNotNull('used_at')
-            ->count();
-
-        $expiredInvitations = Invitation::where('invited_by', $userId)
-            ->where('expires_at', '<=', now())
-            ->where('used_at', null)
-            ->count();
-
-        $cancelledInvitations = Invitation::where('invited_by', $userId)
-            ->where('is_active', false)
-            ->where('used_at', null)
-            ->count();
-
-        $availableInvites = $totalInvites - $activeInvitations;
-
-        return [
-            'user_id' => $userId,
-            'username' => $user->username,
-            'total_invites' => $totalInvites,
-            'active_pending' => $activeInvitations,
-            'used_invitations' => $usedInvitations,
-            'expired_invitations' => $expiredInvitations,
-            'cancelled_invitations' => $cancelledInvitations,
-            'calculated_available' => $availableInvites,
-            'can_send_invite' => $availableInvites > 0,
         ];
     }
 }
