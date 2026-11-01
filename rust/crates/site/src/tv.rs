@@ -375,7 +375,7 @@ async fn series(
                 CAST((SELECT COUNT(*) FROM dnzb_failures df WHERE df.release_id = r.id) AS SIGNED)
          FROM releases r
          WHERE r.videos_id = ? AND (r.tv_episodes_id IS NULL OR r.tv_episodes_id <= 0) {clause}
-         ORDER BY r.postdate DESC LIMIT {FALLBACK_SCAN_LIMIT}"
+         ORDER BY r.postdate DESC, r.id DESC LIMIT {FALLBACK_SCAN_LIMIT}"
     )))
     .bind(video)
     .fetch_all(db)
@@ -434,7 +434,7 @@ async fn series(
                         CAST((SELECT COUNT(*) FROM dnzb_failures df WHERE df.release_id = r.id) AS SIGNED)
                  FROM releases r JOIN tv_episodes tve ON r.tv_episodes_id = tve.id
                  WHERE r.videos_id = ? AND tve.videos_id = ? AND tve.series = ? {clause}
-                 ORDER BY r.postdate DESC LIMIT {} OFFSET {offset}",
+                 ORDER BY r.postdate DESC, r.id DESC LIMIT {} OFFSET {offset}",
                 pager.per_page
             );
             let matched: Vec<EpisodeRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
@@ -730,6 +730,9 @@ fn added(at: Option<DateTime<Utc>>) -> String {
         .unwrap_or_default()
 }
 
+/// A followed title: its key, title, stored categories and when it was added.
+type ListRow<Key, Title = String> = (Key, Title, Option<String>, Option<DateTime<Utc>>);
+
 const LIST_KEYWORDS: &str = "search,add,to,cart,nzb,description,details";
 
 async fn my_shows(
@@ -747,6 +750,9 @@ async fn my_shows(
     let db = &ctx.db;
     let user_id = signed_in.user.id;
     let video = input.str("id");
+    if !video.is_empty() && !video.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(Redirect::to("/myshows").into_response());
+    }
     let from = local_return(&input, "/myshows");
     let row: Option<Option<String>> = sqlx::query_scalar(
         "SELECT categories FROM user_series WHERE users_id = ? AND videos_id = ?",
@@ -844,7 +850,7 @@ async fn my_shows(
         }
         _ => {
             let categories = children(db, TV_ROOT, TV_WEBDL, false).await?;
-            let rows: Vec<(i64, String, Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+            let rows: Vec<ListRow<i64>> = sqlx::query_as(
                 "SELECT CAST(us.videos_id AS SIGNED), v.title, us.categories, us.created_at FROM user_series us
                  JOIN videos v ON v.id = us.videos_id WHERE us.users_id = ? ORDER BY v.title",
             )
@@ -1118,7 +1124,7 @@ async fn my_movies(
         }
         "browse" => {
             let follows: Vec<(String, Option<String>)> =
-                sqlx::query_as("SELECT imdbid, categories FROM user_movies WHERE users_id = ?")
+                sqlx::query_as("SELECT imdbid, categories FROM user_movies WHERE users_id = ? AND imdbid IS NOT NULL")
                     .bind(user_id)
                     .fetch_all(db)
                     .await?;
@@ -1140,9 +1146,9 @@ async fn my_movies(
         }
         _ => {
             let categories = children(db, MOVIE_ROOT, MOVIE_WEBDL, false).await?;
-            let rows: Vec<(String, Option<String>, Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+            let rows: Vec<ListRow<String, Option<String>>> = sqlx::query_as(
                 "SELECT um.imdbid, mi.title, um.categories, um.created_at FROM user_movies um
-                 LEFT JOIN movieinfo mi ON mi.imdbid = um.imdbid WHERE um.users_id = ? ORDER BY mi.title",
+                 LEFT JOIN movieinfo mi ON mi.imdbid = um.imdbid WHERE um.users_id = ? AND um.imdbid IS NOT NULL ORDER BY mi.title",
             )
             .bind(user_id)
             .fetch_all(db)
