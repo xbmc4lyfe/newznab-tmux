@@ -4,7 +4,9 @@
 
 pub mod accounts;
 pub mod activity;
+pub mod clean_directories;
 pub mod disposable;
+pub mod expired_roles;
 pub mod metrics_export;
 pub mod populate;
 pub mod processing_stats;
@@ -34,6 +36,10 @@ pub enum Command {
     DisableExpiredPromotions,
     /// Complete registration periods past their end (`nntmux:disable-expired-registration-periods`).
     DisableExpiredRegistrationPeriods,
+    /// Warn about expiring roles and move expired users (`nntmux:update-expired-roles`).
+    UpdateExpiredRoles,
+    /// Clear old files from the extraction temp directories (`clean:directories`).
+    CleanDirectories,
     /// Probe services, open and resolve incidents, refresh uptime (`nntmux:check-service-health`).
     CheckServiceHealth {
         /// Rolling window in days for uptime.
@@ -159,6 +165,16 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 println!("Marked registration period as done: {name}");
             }
             println!("Completed {} expired registration period(s).", names.len());
+        }
+        Command::UpdateExpiredRoles => {
+            let report = expired_roles::update_expired_roles(&ctx).await?;
+            println!(
+                "Warned {} user(s), activated {} pending role(s), downgraded {} user(s).",
+                report.warned, report.activated, report.downgraded
+            );
+        }
+        Command::CleanDirectories => {
+            println!("Deleted {} file(s).", clean_directories::clean_all().await?);
         }
         Command::CheckServiceHealth { days } => {
             for (service, outcome) in site_status::check_all(&ctx, days).await? {

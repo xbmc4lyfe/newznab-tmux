@@ -71,3 +71,17 @@ kind = "command"
 id = "tv:reprocess-unmatched"
 source = "app/Console/Commands/ReprocessUnmatchedTvReleases.php"
 status = "todo"
+
+[[entry]]
+kind = "command"
+id = "nntmux:fetch-movie"
+source = "app/Console/Commands/FetchMovieByImdb.php"
+status = "todo"
+note = "Moved from ws-ops."
+
+[[entry]]
+kind = "command"
+id = "nntmux:populate-steam-apps"
+source = "app/Console/Commands/NntmuxPopulateSteamApps.php"
+status = "todo"
+note = "Moved from ws-ops."

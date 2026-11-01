@@ -581,7 +581,8 @@ fn incident_mail(
         escape_html(&incident.description).replace('\n', "<br>"),
         escape_html(status_url)
     );
-    let prefix = optional("MAIL_SUBJECT_PREFIX").unwrap_or_default();
+    let prefix = optional("MAIL_SUBJECT_PREFIX")
+        .unwrap_or_else(|| format!("[{}] ", var_or("APP_NAME", "NNTmux")));
     OutgoingMail {
         to: to.to_owned(),
         subject: format!(
