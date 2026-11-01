@@ -1,0 +1,25 @@
+{% extends "layout.html" %}
+{% import "components.html" as c %}
+{% block modals %}{% include "releases/modals.html" %}{% endblock %}
+{% block content %}
+{% call c::page_header_open(title, "TV series", "", "fas fa-tv") %}{% endcall %}
+    <div class="app-page-header__actions flex flex-wrap items-center gap-3">
+        {% if show_id > 0 %}{% if following %}<a href="/myshows?action=edit&amp;id={{ show_id }}" class="workspace-hero__action">Edit in My Shows</a>{% else %}<a href="/myshows?action=add&amp;id={{ show_id }}" class="workspace-hero__action">Add to My Shows</a>{% endif %}{% endif %}
+    </div>
+{% call c::page_header_close() %}{% endcall %}
+{% if !nodata.is_empty() %}
+<div class="surface-panel rounded-xl shadow-sm">{% call c::empty_state("fas fa-tv", "Nothing here yet", nodata) %}{% endcall %}</div>
+{% else %}
+<div class="surface-panel rounded-xl shadow-sm p-4 sm:p-6 mb-6">
+    {% if !summary.is_empty() %}<p class="text-gray-700 dark:text-gray-300 mb-3">{{ summary }}</p>{% endif %}
+    <p class="text-sm text-gray-600 dark:text-gray-400">{% if !country.is_empty() %}{{ country }} · {% endif %}{{ seasons_aired }} seasons, {{ episodes_aired }} episodes aired{% if !first_aired.is_empty() %} · {{ first_aired }} to {{ last_aired }}{% endif %}</p>
+</div>
+<div class="surface-panel rounded-xl shadow-sm p-4 sm:p-6" id="series-episodes">
+    <nav class="flex flex-wrap gap-1 text-sm mb-4" aria-label="Seasons">
+        {% for tab in tabs %}<a href="{{ tab.url }}" class="px-3 py-1.5 rounded {% if tab.active %}bg-primary-600 text-white{% else %}text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700{% endif %}">Season {{ tab.season }} ({{ tab.count }})</a>{% endfor %}
+    </nav>
+    {% include "tv/season.html" %}
+    <div class="mt-4">{% include "pager.html" %}</div>
+</div>
+{% endif %}
+{% endblock %}

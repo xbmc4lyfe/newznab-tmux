@@ -1,0 +1,29 @@
+{% extends "layout.html" %}
+{% import "components.html" as c %}
+{% block content %}
+{% call c::page_header_open(heading, "Your list", description, icon) %}{% endcall %}
+    <div class="app-page-header__actions flex flex-wrap items-center gap-3"><a href="{{ browse_url }}" class="workspace-hero__action">Browse releases</a><a href="{{ rss_url }}" class="workspace-hero__action">RSS</a></div>
+{% call c::page_header_close() %}{% endcall %}
+{% if items.is_empty() %}
+<div class="surface-panel rounded-xl shadow-sm">{% call c::empty_state(icon, "Nothing here yet", "Add items from the browse pages to follow them here.") %}{% endcall %}</div>
+{% else %}
+<div class="surface-panel rounded-xl shadow-sm overflow-x-auto">
+    <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700 text-sm">
+        <thead class="bg-gray-100 dark:bg-gray-900"><tr><th scope="col" class="px-4 py-3 text-left">Title</th><th scope="col" class="px-4 py-3 text-left">Categories</th><th scope="col" class="px-4 py-3 text-left">Added</th><th scope="col" class="px-4 py-3 text-left">Actions</th></tr></thead>
+        <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+            {% for item in items %}
+            <tr>
+                <td class="px-4 py-3"><a href="{{ item.href }}" class="text-primary-600 dark:text-primary-400 hover:underline">{{ item.title }}</a></td>
+                <td class="px-4 py-3 text-gray-600 dark:text-gray-400">{{ item.categories }}</td>
+                <td class="px-4 py-3 text-gray-600 dark:text-gray-400">{{ item.added }}</td>
+                <td class="px-4 py-3 flex gap-3">
+                    <a href="{{ item.edit_url }}" class="text-primary-600 dark:text-primary-400">Edit</a>
+                    <form method="POST" action="{{ item.delete_url }}"><input type="hidden" name="_token" value="{{ layout.csrf }}"><button type="submit" class="text-red-600 dark:text-red-400">Remove</button></form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+{% endblock %}
