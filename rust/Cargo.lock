@@ -2588,10 +2588,12 @@ name = "nntmux-releases"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "flate2",
  "hex",
+ "ipnet",
  "nntmux-api",
  "nntmux-categorize",
  "nntmux-core",
@@ -2600,6 +2602,7 @@ dependencies = [
  "nntmux-runtime",
  "nntmux-testkit",
  "nntmux-verify",
+ "nntmux-webkit",
  "rand 0.9.5",
  "redis",
  "serde",
@@ -2609,6 +2612,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -2749,6 +2753,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "chrono",
  "clap",
  "crc32fast",
@@ -2768,6 +2773,7 @@ dependencies = [
  "rand 0.9.5",
  "redis",
  "regex",
+ "reqwest",
  "roxmltree",
  "serde",
  "serde_json",
@@ -2778,6 +2784,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "wiremock",
 ]
 
 [[package]]
@@ -2789,6 +2796,7 @@ dependencies = [
  "nntmux-admin",
  "nntmux-api",
  "nntmux-core",
+ "nntmux-releases",
  "nntmux-runtime",
  "nntmux-site",
  "nntmux-telemetry",

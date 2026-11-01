@@ -71,7 +71,8 @@ note = "Moves Redis Horizon jobs to the database queue. Run once on PHP before c
 kind = "command"
 id = "releases:forward-verified-publications"
 source = "app/Console/Commands/ForwardVerifiedPublications.php"
-status = "todo"
+status = "dropped"
+note = "The per-host outbox existed so a blocking PHP worker could free its slot while another process forwarded batches. Rust workers wait on the request without holding a process, so each publishes synchronously. RELEASE_VERIFICATION_PUBLISH_ASYNC, PUBLISH_BATCH_URL and the forwarder settings have no effect on workers; the primary still serves publish-batch."
 
 [[entry]]
 kind = "command"
@@ -143,3 +144,15 @@ id = "CollectionDowntimeCompensator"
 source = "app/Services/Tmux/CollectionDowntimeCompensator.php"
 status = "ported"
 note = "nntmux_runtime::downtime. ws-ingest and ws-ops call note_ingestion and record_activity, and ws-releases calls the barrier. The PHP marker file isn't imported, so the first Rust start only records and an outage across the cutover isn't compensated."
+
+[[entry]]
+kind = "route"
+id = "POST /internal/release-verification/publish"
+source = "App\\Http\\Controllers\\ReleaseVerificationPublicationController"
+status = "ported"
+
+[[entry]]
+kind = "route"
+id = "POST /internal/release-verification/publish-batch"
+source = "App\\Http\\Controllers\\ReleaseVerificationPublicationBatchController"
+status = "ported"

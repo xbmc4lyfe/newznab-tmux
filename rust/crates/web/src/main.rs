@@ -28,6 +28,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .merge(nntmux_api::router())
+        .merge(nntmux_releases::router())
         .merge(
             Router::new()
                 .merge(nntmux_site::router())
