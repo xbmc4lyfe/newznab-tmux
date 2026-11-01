@@ -301,15 +301,18 @@ fn looks_like_domain(url: &str) -> bool {
         && rest.chars().take_while(char::is_ascii_alphabetic).count() >= 2
 }
 
-/// PHP's `html_entity_decode` for what useful-link bodies hold, after trimming wrapping quotes.
-fn useful_link_body(body: &str) -> String {
-    body.trim_matches(|c| c == '\'' || c == '"')
-        .replace("&lt;", "<")
+/// PHP's `html_entity_decode` for what admin-entered content holds.
+pub fn resolve_entities(body: &str) -> String {
+    body.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#039;", "'")
         .replace("&#39;", "'")
         .replace("&amp;", "&")
+}
+
+fn useful_link_body(body: &str) -> String {
+    resolve_entities(body.trim_matches(|c| c == '\'' || c == '"'))
 }
 
 async fn load_useful_links(db: &MySqlPool) -> anyhow::Result<Vec<UsefulLink>> {
@@ -369,9 +372,20 @@ pub struct Layout {
     pub show_adult: bool,
     pub show_books: bool,
     pub upgrade_label: Option<&'static str>,
+    session: Session,
 }
 
 impl Layout {
+    /// The first flashed validation error for a form field.
+    pub fn error(&self, field: &str) -> Option<String> {
+        self.session.error(field)
+    }
+
+    /// A field from the last submission, or an empty string.
+    pub fn old(&self, field: &str) -> String {
+        self.session.old(field)
+    }
+
     /// Sets the page title, the description and the keywords.
     pub fn titled(
         mut self,
@@ -502,6 +516,7 @@ impl FromRequestParts<Ctx> for Layout {
             show_adult: false,
             show_books: false,
             upgrade_label: None,
+            session,
         };
 
         if let Some(auth) = auth {

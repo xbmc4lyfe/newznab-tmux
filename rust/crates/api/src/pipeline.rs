@@ -9,6 +9,7 @@ use axum::extract::Request;
 use axum::handler::Handler;
 use axum::response::Response;
 use nntmux_runtime::Ctx;
+use nntmux_webkit::auth::Auth;
 use sha1::{Digest, Sha1};
 use tracing::error;
 
@@ -205,6 +206,7 @@ async fn respond(
         return Ok(preflight(&request));
     }
 
+    let request_auth = request.extensions().get::<Auth>().cloned();
     let mut api = ApiRequest::read(request).await?;
     // Global middleware runs before routing, so it also sees requests that end in a 405.
     if let Some(reply) = abuse::check(ctx, settings, &api).await {
@@ -246,7 +248,10 @@ async fn respond(
 
     // Only the web group's /getnzb runs outside the API throttle.
     if endpoint == Endpoint::GetNzb {
-        return getnzb::web(ctx, &api, route_id.as_deref()).await;
+        let session = request_auth
+            .as_ref()
+            .map(|auth| auth.user.api_token.as_str());
+        return getnzb::web(ctx, &api, session, route_id.as_deref()).await;
     }
     let group = match hit_group(ctx, settings, &api).await {
         Ok(group) => group,

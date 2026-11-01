@@ -123,20 +123,8 @@ impl ApiRequest {
         self.headers.get(name).and_then(|value| value.to_str().ok())
     }
 
-    /// `url('/')`: the request's scheme and host, with no trailing slash. Laravel trusts forwarded
-    /// headers only from known proxies; the Rust web role always sits behind one.
     pub fn base_url(&self) -> String {
-        let scheme = self
-            .header("x-forwarded-proto")
-            .and_then(|value| value.split(',').next())
-            .map_or("http", str::trim);
-        let host = self
-            .header("x-forwarded-host")
-            .and_then(|value| value.split(',').next())
-            .map(str::trim)
-            .or_else(|| self.header("host"))
-            .unwrap_or("localhost");
-        format!("{scheme}://{host}")
+        base_url(&self.headers)
     }
 
     /// The client address for accounting and per-IP limits, with proxies we trust skipped.
@@ -249,6 +237,21 @@ impl ApiRequest {
         self.input.query = canonicalize(&self.input.query);
         Ok(())
     }
+}
+
+/// `url('/')`: the request's scheme and host, with no trailing slash. Laravel trusts forwarded
+/// headers only from known proxies; the Rust web role always sits behind one.
+pub fn base_url(headers: &HeaderMap) -> String {
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let first = |value: &'_ str| value.split(',').next().map(str::trim).map(str::to_owned);
+    let scheme = header("x-forwarded-proto")
+        .and_then(first)
+        .unwrap_or_else(|| "http".to_owned());
+    let host = header("x-forwarded-host")
+        .and_then(first)
+        .or_else(|| header("host").map(str::to_owned))
+        .unwrap_or_else(|| "localhost".to_owned());
+    format!("{scheme}://{host}")
 }
 
 /// Container nesting. `json_decode($raw, false, 3)` accepts an object holding a list of scalars and
