@@ -16,6 +16,11 @@ foreach (['Accept' => '*/*', 'User-Agent' => 'golden'] + ($case['headers'] ?? []
 }
 
 $request = Illuminate\Http\Request::create($case['path'], $case['method'], [], [], [], $server, $case['body'] ?? null);
+if (isset($case['as_user'])) {
+    $app->instance('request', $request);
+    $kernel->bootstrap();
+    $app['auth']->guard('web')->setUser(App\Models\User::findOrFail($case['as_user']));
+}
 $response = $kernel->handle($request);
 $headers = [];
 foreach ($response->headers->allPreserveCase() as $name => $values) {
@@ -23,4 +28,7 @@ foreach ($response->headers->allPreserveCase() as $name => $values) {
         $headers[] = [strtolower($name), $value];
     }
 }
-echo json_encode(['status' => $response->getStatusCode(), 'headers' => $headers, 'body' => $response->getContent()], JSON_THROW_ON_ERROR);
+ob_start();
+$response->sendContent();
+$body = ob_get_clean();
+echo json_encode(['status' => $response->getStatusCode(), 'headers' => $headers, 'body' => $body], JSON_THROW_ON_ERROR);
