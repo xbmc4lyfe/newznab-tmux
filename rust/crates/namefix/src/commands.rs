@@ -73,6 +73,8 @@ pub enum Command {
         show: bool,
     },
     /// Fixes NZBSPLIT-wrapped names and recategorizes them (`releases:fix-nzbsplit`).
+    /// Finds releases much bigger or smaller than their files (`nntmux:find-size-mismatches`).
+    FindSizeMismatches(crate::size_mismatch::Args),
     FixNzbsplit {
         #[arg(long)]
         dry_run: bool,
@@ -276,6 +278,7 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
             let mut fixer = fixer(&ctx, FixNamesConfig::from_env(), &backends).await?;
             fixer.match_prefiles(limit, show).await
         }
+        Command::FindSizeMismatches(args) => find_size_mismatches(&ctx, args, &backends).await,
         Command::FixNzbsplit {
             dry_run,
             include_renamed,
@@ -580,6 +583,61 @@ async fn fixrelnames(ctx: &Ctx, kind: &str, backends: Backends) -> Result<()> {
     if failures > 0 {
         bail!("{failures} fix-names workers failed");
     }
+    Ok(())
+}
+
+async fn find_size_mismatches(
+    ctx: &Ctx,
+    args: crate::size_mismatch::Args,
+    backends: &Backends,
+) -> Result<()> {
+    use crate::size_mismatch::{find, number_format, rename};
+    let found = find(&ctx.db, &args).await?;
+    if found.is_empty() {
+        println!(
+            "No releases found with size mismatches above {}%{}",
+            args.threshold,
+            if args.season_pack {
+                " that are season packs"
+            } else {
+                ""
+            }
+        );
+        return Ok(());
+    }
+    if args.rename {
+        println!("\nAttempting to rename {} releases...\n", found.len());
+        let categorizer = Categorizer::load(&ctx.db).await?;
+        let mut updater = ReleaseUpdater::new(
+            ctx.db.clone(),
+            categorizer,
+            backends.search.clone(),
+            backends.cleaner,
+        );
+        for mismatch in &found {
+            rename(&ctx.db, &mut updater, mismatch).await?;
+        }
+    } else {
+        println!("Release ID\tSearchname\tRelease Size\tFiles Total\tDifference\tDiff %");
+        for mismatch in &found {
+            println!(
+                "{}\t{}\t{} GiB\t{} GiB\t{} GiB\t{}%",
+                mismatch.id,
+                mismatch.searchname.as_deref().unwrap_or(""),
+                number_format(mismatch.release_size),
+                number_format(mismatch.files_total_size),
+                number_format(mismatch.size_diff),
+                number_format(mismatch.diff_percent),
+            );
+        }
+        println!(
+            "\nFound {} releases with size mismatches above {}%",
+            found.len(),
+            args.threshold
+        );
+    }
+    let ids: Vec<String> = found.iter().map(|m| m.id.to_string()).collect();
+    println!("\nRelease IDs in CSV format:\n{}", ids.join(","));
     Ok(())
 }
 
