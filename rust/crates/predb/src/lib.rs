@@ -2,6 +2,7 @@
 //!
 //! Owner: ws-naming. See `rust/WORKSTREAMS.md`.
 
+pub mod feeds;
 pub mod filename;
 pub mod identity;
 pub mod season;
