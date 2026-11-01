@@ -47,3 +47,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 10 | Wave 66.4 plans: `BooksProcessor`, `CategorizationPipeline`, `CategorizationResult`, `CategorizationService`, `AbstractCategorizationPipe`, their Rust module and parity test | `9a6f92653` | None new |
 | 11 | Wave 66.2 plans: `CollectionHandler`, `HeaderParser`, `HeaderStorageService`, `HeaderStorageTransaction`, `MissedPartHandler`, their Rust module and parity test. Also corrects lesson 8 | `2699b9dbd` | 8 |
 | 12 | Wave 66.3 plans: `NativePerArticleObfuscation`, `PartHandler`, `PerArticleObfuscationGate`, `BookProcessingCandidateQuery`, `BookService`, their Rust module and parity test | `4eb535a46` | None new |
+| 13 | Wave 66.5 plans: `BookPipe`, `CategorizationPassable`, `ConsolePipe`, `GroupNamePipe`, `MiscPipe`, their Rust module and parity test. This finishes Wave 66 | `1ead7cd3f` | None new |
