@@ -208,37 +208,38 @@ status = "todo"
 kind = "route"
 id = "GET|POST|HEAD /browse/All"
 source = "App\\Http\\Controllers\\BrowseController@index"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /browse/group"
 source = "App\\Http\\Controllers\\BrowseController@group"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /browse/tags"
 source = "App\\Http\\Controllers\\BrowseController@tags"
-status = "todo"
+status = "dropped"
+note = "The route pointed at BrowseController::tags, a method that does not exist, so it could only error."
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /browse/{parentCategory}/{id?}"
 source = "App\\Http\\Controllers\\BrowseController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /browsegroup"
 source = "App\\Http\\Controllers\\BrowseGroupController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "GET|POST|HEAD /cart/index"
 source = "App\\Http\\Controllers\\CartController@index"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -298,7 +299,7 @@ status = "todo"
 kind = "route"
 id = "GET|POST|HEAD /nfo/{id?}"
 source = "App\\Http\\Controllers\\NfoController@showNfo"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -370,13 +371,13 @@ status = "ported"
 kind = "route"
 id = "POST /cart/add"
 source = "App\\Http\\Controllers\\CartController@store"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "POST /cart/delete/{id}"
 source = "App\\Http\\Controllers\\CartController@destroy"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
