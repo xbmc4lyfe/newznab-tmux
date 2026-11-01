@@ -630,10 +630,18 @@ async fn fix_nzbsplit(
     Ok(())
 }
 
-/// The `fixnames` role: standard and PreDB fulltext passes across the GUID partitions, plus the
-/// numbered source passes the tmux monitor ran.
+/// The partitions in `0..total` that a slot serves, so that the slots together cover them all
+/// whatever the concurrency.
+fn slot_partitions(total: usize, slot: usize, slots: usize) -> impl Iterator<Item = usize> {
+    (0..total).filter(move |partition| partition % slots.max(1) == slot)
+}
+
+/// The `fixnames` role: standard and PreDB fulltext passes across every GUID partition and PreDB
+/// shard. A cycle only counts as work if it moved something, because releases with PAR2 pending
+/// stay candidates and would otherwise be read again at once.
 pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
     let backends = Arc::new(backends(&ctx)?);
+    let slots = args.concurrency;
     run_slots(ctx, "fixnames", args, stop, move |ctx, slot| {
         let backends = backends.clone();
         async move {
@@ -644,14 +652,37 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
             if per_run <= 0 {
                 return Ok(false);
             }
-            let guid = LEFT_GUIDS[slot % LEFT_GUIDS.len()];
-            let (checked, _) =
-                standard_pass(&ctx, guid, per_run as usize, &backends, &mut DeferPar2).await?;
+            let mut moved = false;
+            for partition in slot_partitions(LEFT_GUIDS.len(), slot, slots) {
+                let guid = LEFT_GUIDS[partition];
+                let (_, fixed) =
+                    standard_pass(&ctx, guid, per_run as usize, &backends, &mut DeferPar2).await?;
+                moved |= fixed > 0;
+            }
             let workers = threads.clamp(1, 16);
-            let worker = (slot as i64 % workers) + 1;
-            let (processed, _) = predbft_pass(&ctx, worker, workers, per_run, &backends).await?;
-            Ok(checked > 0 || processed > 0)
+            for shard in slot_partitions(workers as usize, slot, slots) {
+                let (processed, incomplete) =
+                    predbft_pass(&ctx, shard as i64 + 1, workers, per_run, &backends).await?;
+                moved |= processed > incomplete;
+            }
+            Ok(moved)
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slot_partitions;
+
+    #[test]
+    fn slots_cover_every_partition_once() {
+        for (total, slots) in [(16, 4), (16, 1), (16, 3), (6, 4), (1, 4), (4, 16)] {
+            let mut seen: Vec<usize> = (0..slots)
+                .flat_map(|slot| slot_partitions(total, slot, slots))
+                .collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..total).collect::<Vec<_>>(), "{total} over {slots}");
+        }
+    }
 }
