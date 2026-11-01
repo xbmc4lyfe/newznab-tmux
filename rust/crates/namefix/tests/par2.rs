@@ -1196,7 +1196,36 @@ async fn the_chain_runs_when_enabled_with_work_and_then_rests() {
             .unwrap()
             .is_none()
     );
+    let mut connection = ctx.redis.clone();
+    let running = format!("{key}tmux:fix-names:chain:running");
+    let lease: i64 = redis::cmd("TTL")
+        .arg(&running)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        (1..=120).contains(&lease),
+        "a dead chain's claim must expire soon: {lease}"
+    );
+    // A claim that outlived its lease can't release its successor's.
+    let _: () = redis::cmd("SET")
+        .arg(&running)
+        .arg("successor")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
     first.finish().await;
+    let holder: Option<String> = redis::cmd("GET")
+        .arg(&running)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(holder.as_deref(), Some("successor"));
+    let _: () = redis::cmd("DEL")
+        .arg(&running)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
     assert!(
         fixnames_chain::claim(&ctx, &config, &key)
             .await

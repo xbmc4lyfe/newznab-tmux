@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use nntmux_categorize::cat;
 use nntmux_predb::filename::exact_value;
 use sqlx::{MySql, MySqlConnection, QueryBuilder, Row};
@@ -124,6 +124,19 @@ async fn assert_inventory_snapshot(
     Ok(())
 }
 
+/// The text the server stores for these bytes: outside strict mode it turns each byte that isn't
+/// valid UTF-8 into `?`, so PHP records the file rather than failing.
+fn server_text(name: &[u8]) -> String {
+    let mut text = String::with_capacity(name.len());
+    for chunk in name.utf8_chunks() {
+        text.push_str(chunk.valid());
+        for _ in chunk.invalid() {
+            text.push('?');
+        }
+    }
+    text
+}
+
 /// `ReleaseFile::addReleaseFiles` for a name with a 16 KiB hash: the row, its hash, and a flag
 /// for whether a search refresh is owed.
 async fn add_release_file(
@@ -134,9 +147,7 @@ async fn add_release_file(
     created_at: &str,
     hash16k: &str,
 ) -> Result<(u64, bool)> {
-    let Ok(name) = std::str::from_utf8(name) else {
-        bail!("Incorrect string value in a PAR2 file name");
-    };
+    let name = &server_text(name);
     let duplicate: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM release_files WHERE releases_id = ? AND name = ? LIMIT 1",
     )
@@ -512,5 +523,16 @@ async fn finish(
             Par2Outcome::Retryable
         }),
         false => Ok(Par2Outcome::Deferred),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::server_text;
+
+    #[test]
+    fn invalid_bytes_become_question_marks_as_the_server_stores_them() {
+        assert_eq!(server_text(b"raw\xff.rar"), "raw?.rar");
+        assert_eq!(server_text("caf\u{e9}.rar".as_bytes()), "caf\u{e9}.rar");
     }
 }

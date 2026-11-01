@@ -14,6 +14,7 @@ use redis::AsyncCommands;
 use sqlx::MySqlPool;
 
 use crate::par2_check::env_bool;
+use crate::par2_lock::RedisLock;
 use crate::queries::{self, FixNamesConfig, Source};
 
 const RUNNING_KEY: &str = "tmux:fix-names:chain:running";
@@ -23,8 +24,10 @@ const FULL_BACKLOG_KEY: &str = "tmux:fix-names:full-backlog";
 fn key(prefix: &str, name: &str) -> String {
     format!("{prefix}{name}")
 }
-/// A chain that dies without releasing its claim is retried after this long.
-const RUNNING_SECONDS: u64 = 6 * 3600;
+/// A chain that dies without releasing its claim is retried after this long. A running chain
+/// keeps renewing it.
+const RUNNING_SECONDS: u64 = 120;
+const RUNNING_RENEW_SECONDS: u64 = 30;
 /// How long to wait before looking for work again when there was none.
 const IDLE_REST_SECONDS: u64 = 30;
 const DEFAULT_FIX_TIMER: i64 = 300;
@@ -172,9 +175,31 @@ pub struct Claimed {
     ctx: Ctx,
     prefix: String,
     rest_seconds: u64,
+    lock: RedisLock,
+}
+
+/// Renews a claim until dropped, including when a panic unwinds the chain.
+pub struct Heartbeat(tokio::task::JoinHandle<()>);
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Claimed {
+    pub fn heartbeat(&self) -> Heartbeat {
+        let lock = self.lock.clone();
+        Heartbeat(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(RUNNING_RENEW_SECONDS)).await;
+                if !lock.refresh().await {
+                    tracing::warn!("Could not renew the fix-names chain claim");
+                }
+            }
+        }))
+    }
+
     pub async fn finish(self) {
         let mut redis = self.ctx.redis.clone();
         let rested: redis::RedisResult<()> = redis
@@ -183,7 +208,9 @@ impl Claimed {
         if let Err(error) = rested {
             tracing::warn!(%error, "Could not record the fix-names rest");
         }
-        let _: redis::RedisResult<i64> = redis.del(key(&self.prefix, RUNNING_KEY)).await;
+        if let Err(error) = self.lock.release().await {
+            tracing::warn!(%error, "Could not release the fix-names chain claim");
+        }
     }
 }
 
@@ -199,15 +226,8 @@ pub async fn claim(ctx: &Ctx, config: &FixNamesConfig, prefix: &str) -> Result<O
     if resting {
         return Ok(None);
     }
-    let started: Option<String> = redis::cmd("SET")
-        .arg(key(prefix, RUNNING_KEY))
-        .arg("1")
-        .arg("NX")
-        .arg("EX")
-        .arg(RUNNING_SECONDS)
-        .query_async(&mut redis)
-        .await?;
-    if started.is_none() {
+    let lock = RedisLock::new(ctx.redis.clone(), key(prefix, RUNNING_KEY), RUNNING_SECONDS);
+    if !lock.acquire().await? {
         return Ok(None);
     }
     let claimed = Claimed {
@@ -215,6 +235,7 @@ pub async fn claim(ctx: &Ctx, config: &FixNamesConfig, prefix: &str) -> Result<O
         ctx: ctx.clone(),
         prefix: prefix.to_owned(),
         rest_seconds: IDLE_REST_SECONDS,
+        lock: lock.clone(),
     };
     let levels = async {
         let work = has_pending_work(&ctx.db, config).await?;
@@ -240,7 +261,7 @@ pub async fn claim(ctx: &Ctx, config: &FixNamesConfig, prefix: &str) -> Result<O
         }
         Err(error) => {
             // Don't hold the pane for a failed look; the next poll tries again.
-            let _: redis::RedisResult<i64> = redis.del(key(prefix, RUNNING_KEY)).await;
+            lock.release().await.ok();
             Err(error)
         }
     }

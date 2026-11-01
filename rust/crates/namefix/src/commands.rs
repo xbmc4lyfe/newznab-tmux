@@ -694,7 +694,7 @@ fn slot_partitions(total: usize, slot: usize, slots: usize) -> impl Iterator<Ite
 
 /// One cycle of what the tmux monitor's fix-names pane ran: the numbered levels, when the
 /// pane would run them. Returns whether it ran.
-async fn run_chain(ctx: &Ctx, backends: &Backends) -> Result<bool> {
+async fn run_chain(ctx: &Ctx, backends: &Backends, stop: &Shutdown) -> Result<bool> {
     let config = FixNamesConfig::from_env();
     let Some(claimed) =
         fixnames_chain::claim(ctx, &config, &Par2Settings::from_env().key_prefix).await?
@@ -706,23 +706,27 @@ async fn run_chain(ctx: &Ctx, backends: &Backends) -> Result<bool> {
         "predb_id" => 3,
         _ => 1,
     };
+    let heartbeat = claimed.heartbeat();
     for level in claimed.levels.clone() {
-        // The pane checked for a drain between commands.
-        if ctx.paused().await? {
+        // The pane checked for a drain between commands. Without an answer, stop and let the
+        // claim go rather than hold it.
+        if ctx.paused().await.unwrap_or(true) {
             break;
         }
-        if let Err(error) = run_level(
-            ctx,
-            backends,
-            level,
-            true,
-            categories,
-            true,
-            config.batch_limit,
-            true,
-        )
-        .await
-        {
+        let outcome = tokio::select! {
+            () = stop.token().cancelled_owned() => break,
+            outcome = run_level(
+                ctx,
+                backends,
+                level,
+                true,
+                categories,
+                true,
+                config.batch_limit,
+                true,
+            ) => outcome,
+        };
+        if let Err(error) = outcome {
             tracing::warn!(
                 level,
                 error = format!("{error:#}"),
@@ -730,6 +734,7 @@ async fn run_chain(ctx: &Ctx, backends: &Backends) -> Result<bool> {
             );
         }
     }
+    drop(heartbeat);
     claimed.finish().await;
     Ok(true)
 }
@@ -744,17 +749,20 @@ async fn run_chain(ctx: &Ctx, backends: &Backends) -> Result<bool> {
 pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
     let backends = Arc::new(backends(&ctx)?);
     let slots = args.concurrency;
+    let shutdown = stop.clone();
     run_slots(ctx, "fixnames", args, stop, move |ctx, slot| {
-        let backends = backends.clone();
+        let (backends, shutdown) = (backends.clone(), shutdown.clone());
         async move {
             if ctx.paused().await? {
                 return Ok(false);
             }
             let mut moved = false;
             if slot == 0 {
-                moved |= run_chain(&ctx, &backends).await?;
+                moved |= run_chain(&ctx, &backends, &shutdown).await?;
             }
-            let predbft = crate::par2_check::env_bool("TMUX_FIX_NAMES_PREDBFT").unwrap_or(true);
+            // One launcher: the scheduler owns the pass while this is set.
+            let predbft = crate::par2_check::env_bool("TMUX_FIX_NAMES_PREDBFT").unwrap_or(true)
+                && !crate::par2_check::env_bool("TMUX_FIX_NAMES_PREDBFT_SCHEDULED").unwrap_or(true);
             let (per_run, threads) = post_processing_settings(&ctx).await?;
             if predbft && per_run > 0 {
                 let workers = threads.clamp(1, 16);
