@@ -34,7 +34,7 @@ pools:
       rust:
         toolchains: ["1.98.0"]
         components: [clippy, rustfmt]
-    apt_packages: [par2, unrar, python3]
+    apt_packages: [par2, unrar, python3, cmake, build-essential]
 
   # runs-on: ubuntu-24.04-arm (benchmark matrices)
   - name: linux-arm64
