@@ -317,8 +317,7 @@ status = "ported"
 kind = "schedule"
 id = "command: 'multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBac"
 source = "routes/console.php"
-status = "todo"
-note = "Waiting on the fixnames role reading TMUX_FIX_NAMES_PREDBFT and TMUX_FIX_NAMES_PREDBFT_SCHEDULED, so the pass keeps one launcher."
+status = "ported"
 
 [[entry]]
 kind = "schedule"

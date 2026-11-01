@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use chrono::Weekday;
-use nntmux_runtime::Ctx;
+use nntmux_runtime::{Ctx, busy};
 
 use crate::cadence::Cadence::{self, Daily, EveryMinutes, Weekly};
 use crate::engine::Task;
@@ -131,6 +131,25 @@ pub fn tasks() -> Vec<Task<Ctx>> {
                 Ok(())
             })
         }),
+        // The role runs this pass unless the schedule owns it, so it has exactly one launcher.
+        Task {
+            enabled: nntmux_namefix::predbft_scheduled,
+            ..task(
+                "multiprocessing:fixrelnames predbft",
+                EveryMinutes(5),
+                |ctx| {
+                    Box::pin(async move {
+                        // Renaming is processing, so it waits out a pause and a drain sees it.
+                        let Some(_busy) = busy::enter(&ctx, "fixnames").await? else {
+                            return Ok(());
+                        };
+                        let kind = "predbft".to_owned();
+                        nntmux_namefix::ctl(ctx, nntmux_namefix::Command::Fixrelnames { kind })
+                            .await
+                    })
+                },
+            )
+        },
         task("nntmux:remove-bad", Cadence::Hourly, |ctx| {
             Box::pin(async move {
                 resets::remove_bad(&ctx.db).await?;
