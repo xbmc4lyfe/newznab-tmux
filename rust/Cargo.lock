@@ -2462,19 +2462,25 @@ name = "nntmux-releases"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "hex",
+ "ipnet",
  "nntmux-categorize",
  "nntmux-core",
+ "nntmux-predb",
  "nntmux-runtime",
  "nntmux-testkit",
  "nntmux-verify",
+ "nntmux-webkit",
  "rand 0.9.5",
  "redis",
  "serde",
+ "serde_json",
  "sqlx",
  "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -2653,6 +2659,7 @@ dependencies = [
  "nntmux-admin",
  "nntmux-api",
  "nntmux-core",
+ "nntmux-releases",
  "nntmux-runtime",
  "nntmux-site",
  "nntmux-telemetry",

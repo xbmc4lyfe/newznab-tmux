@@ -6,6 +6,7 @@ pub mod archive_retry;
 pub mod crap;
 pub mod delete;
 pub mod import_database;
+pub mod internal;
 pub mod maintenance;
 pub mod nzb_clean;
 pub mod process;
@@ -26,6 +27,7 @@ use nntmux_verify::context::Verify;
 
 use tracing::error;
 
+pub use internal::router;
 pub use nntmux_verify::nzb;
 
 /// The handles release processing runs with.
