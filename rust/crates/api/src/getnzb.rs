@@ -2,11 +2,13 @@
 
 use std::collections::HashSet;
 use std::io::{Cursor, Write};
+use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use nntmux_runtime::Ctx;
 use sqlx::{AssertSqlSafe, QueryBuilder};
+use tracing::warn;
 use zip::write::SimpleFileOptions;
 
 use crate::auth::{self, User};
@@ -16,6 +18,7 @@ use crate::nzb;
 use crate::reply::{Reply, json_error, xml_error};
 use crate::request::ApiRequest;
 use crate::rows::imdb_id_is_valid;
+use crate::settings::Settings;
 use crate::usage::raw_url_encode;
 
 const SUFFIX: &str = ".nzb";
@@ -82,6 +85,7 @@ async fn downloads_today(ctx: &Ctx, user_id: i64) -> Result<i64> {
 /// already refused a POST with no CSRF token.
 pub async fn web(
     ctx: &Ctx,
+    settings: &Arc<Settings>,
     request: &ApiRequest,
     session_token: Option<&str>,
     path_guid: Option<&str>,
@@ -105,6 +109,7 @@ pub async fn web(
     };
     download(
         ctx,
+        settings,
         request,
         &user,
         &id,
@@ -117,6 +122,7 @@ pub async fn web(
 /// The controller from `authenticateUser` on, with the user already resolved.
 pub async fn download(
     ctx: &Ctx,
+    settings: &Arc<Settings>,
     request: &ApiRequest,
     user: &User,
     id: &str,
@@ -142,10 +148,11 @@ pub async fn download(
         .str("del")
         .is_some_and(|value| php_int(value) == 1);
     if request.input.str("zip") == Some("1") {
-        return zip_download(ctx, user, &guid, used, delete_from_cart, errors).await;
+        return zip_download(ctx, settings, user, &guid, used, delete_from_cart, errors).await;
     }
     single(
         ctx,
+        settings,
         request,
         user,
         &guid,
@@ -189,6 +196,25 @@ async fn release_info(ctx: &Ctx, guid: &str) -> Result<Option<ReleaseInfo>> {
     .await?)
 }
 
+/// The grab count changed, so the search documents did. Failures record their own retry, and a
+/// download shouldn't wait on Manticore.
+fn sync_index(ctx: &Ctx, settings: &Arc<Settings>, release_ids: &[i64]) {
+    let (ctx, settings, release_ids) = (ctx.clone(), settings.clone(), release_ids.to_vec());
+    tokio::spawn(async move {
+        match settings.search(&ctx) {
+            Ok(client) => {
+                for id in release_ids {
+                    client.update_release(&ctx.db, id).await;
+                }
+            }
+            Err(failure) => warn!(
+                error = format!("{failure:#}"),
+                "no search client for a grab update"
+            ),
+        }
+    });
+}
+
 /// Laravel's `e()`.
 pub fn html_escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -198,8 +224,10 @@ pub fn html_escape(text: &str) -> String {
         .replace('\'', "&#039;")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn single(
     ctx: &Ctx,
+    settings: &Arc<Settings>,
     request: &ApiRequest,
     user: &User,
     guid: &str,
@@ -219,6 +247,7 @@ async fn single(
             .bind(guid)
             .execute(&ctx.db)
             .await?;
+        sync_index(ctx, settings, &[i64::from(release.id)]);
     }
     let now = crate::usage::now_string();
     sqlx::query("INSERT INTO user_downloads (users_id, releases_id, timestamp) VALUES (?, ?, ?)")
@@ -294,6 +323,7 @@ async fn single(
 /// `zip=1`: several comma-separated GUIDs in one archive, each counted as a download.
 async fn zip_download(
     ctx: &Ctx,
+    settings: &Arc<Settings>,
     user: &User,
     ids: &str,
     used: i64,
@@ -360,6 +390,8 @@ async fn zip_download(
             )))
             .execute(&ctx.db)
             .await?;
+            let ids: Vec<i64> = release_ids.iter().map(|id| i64::from(*id)).collect();
+            sync_index(ctx, settings, &ids);
         }
         let mut insert =
             QueryBuilder::new("INSERT INTO user_downloads (users_id, releases_id, timestamp) ");

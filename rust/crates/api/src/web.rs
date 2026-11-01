@@ -14,6 +14,7 @@ use crate::filelist;
 use crate::json::{J, Style};
 use crate::nzb;
 use crate::reply::Reply;
+use crate::suggest;
 
 struct Category {
     id: u64,
@@ -170,6 +171,9 @@ pub fn router(download: MethodRouter<Ctx>) -> Router<Ctx> {
         .route_layer(from_fn(guard::verified))
         .route_layer(from_fn(guard::authenticated));
     let public = Router::new()
+        .route("/api/search/autocomplete", get(suggest::autocomplete))
+        .route("/api/search/suggest", get(suggest::suggest))
+        .route("/api/search/assist", get(suggest::assist))
         .route("/getnzb", download.clone())
         .route("/getnzb/{guid}", download);
     nntmux_webkit::stack(private.merge(public))
