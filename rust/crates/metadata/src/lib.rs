@@ -2,11 +2,13 @@
 //!
 //! Owner: ws-metadata. See `rust/WORKSTREAMS.md`.
 
+pub mod anime;
 pub mod cache;
 pub mod candidates;
 pub mod clients;
 pub mod http;
 pub mod images;
+pub mod movies;
 pub mod php;
 pub mod services;
 pub mod settings;
@@ -18,6 +20,7 @@ use nntmux_runtime::Ctx;
 
 pub use candidates::{book_work_condition, imdb_needs_lookup_sql, tv_work_condition};
 pub use settings::{LookupMode, MetadataSettings, Renamed};
+pub use tv::adder::{AddedShow, add_show_by_external_id, preview_show};
 pub use tv::commands::{
     TvMissingEpisodesOptions, TvRepairLinksOptions, TvUnmatchedOptions, tv_repair_links,
     tv_reprocess_missing_episodes,
@@ -40,6 +43,30 @@ pub enum Command {
     TvReprocessMissingEpisodes(TvMissingEpisodesOptions),
     /// `tv:reprocess-unmatched`: reprocess TV releases that aren't matched to any show.
     TvReprocessUnmatched(TvUnmatchedOptions),
+    /// `movie:reverify-matches`: re-verify movie IMDb matches against release names.
+    MovieReverifyMatches(movies::commands::MovieReverifyOptions),
+    /// `nntmux:fetch-movie`: force fetch a movie's data by IMDb id.
+    FetchMovie {
+        /// IMDb id with or without the tt prefix.
+        imdbid: String,
+    },
+    /// `anime:refresh`: refresh AniList data for existing anime releases.
+    AnimeRefresh(anime::commands::AnimeRefreshOptions),
+    /// `anime:migrate-covers`: rename covers from {id}.jpg to {id}-cover.jpg.
+    AnimeMigrateCovers {
+        /// Show what would be renamed without renaming.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// `nntmux:populate-anidb`: populate the AniList tables.
+    PopulateAnidb {
+        /// Populate info.
+        #[arg(long)]
+        info: bool,
+        /// Only this AniList ID.
+        #[arg(long)]
+        anilistid: Option<i64>,
+    },
 }
 
 pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
@@ -54,6 +81,22 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
         Command::TvReprocessUnmatched(options) => {
             tv::commands::tv_reprocess_unmatched(&ctx, options).await
         }
+        Command::MovieReverifyMatches(options) => {
+            movies::commands::movie_reverify_matches(&ctx, options).await
+        }
+        Command::FetchMovie { imdbid } => {
+            movies::commands::fetch_movie_command(&ctx, &imdbid).await
+        }
+        Command::AnimeRefresh(options) => anime::commands::anime_refresh(&ctx, options).await,
+        Command::AnimeMigrateCovers { dry_run } => {
+            let covers = services::Services::shared(&ctx)?.images.covers.clone();
+            let (renamed, skipped) = anime::commands::migrate_covers(&covers, dry_run)?;
+            println!("Renamed {renamed} file(s), skipped {skipped}.");
+            Ok(())
+        }
+        Command::PopulateAnidb { info, anilistid } => {
+            anime::commands::populate_anidb(&ctx, info, anilistid).await
+        }
     }
 }
 
@@ -62,12 +105,12 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
 // skips a lookup.
 
 pub async fn process_movies(
-    _ctx: &Ctx,
-    _group_id: i64,
-    _guid_char: &str,
-    _renamed: Renamed,
+    ctx: &Ctx,
+    group_id: i64,
+    guid_char: &str,
+    renamed: Renamed,
 ) -> Result<()> {
-    bail!("movie lookups aren't ported yet")
+    movies::run(ctx, group_id, guid_char, renamed).await
 }
 
 /// PHP's `processTv`: with no bucket it dispatches over the buckets, otherwise it runs
@@ -91,12 +134,12 @@ pub async fn process_tv_pipeline(
 }
 
 pub async fn process_anime(
-    _ctx: &Ctx,
-    _group_id: i64,
-    _guid_char: &str,
+    ctx: &Ctx,
+    group_id: i64,
+    guid_char: &str,
     _renamed: Renamed,
 ) -> Result<()> {
-    bail!("anime lookups aren't ported yet")
+    anime::run(ctx, group_id, guid_char).await
 }
 
 pub async fn process_books(

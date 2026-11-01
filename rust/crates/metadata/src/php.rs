@@ -27,6 +27,26 @@ pub fn bytes_to_string(bytes: Vec<u8>) -> String {
         .unwrap_or_else(|failure| String::from_utf8_lossy(failure.as_bytes()).into_owned())
 }
 
+/// `html_entity_decode`.
+pub fn entity_decode(text: &str) -> String {
+    html_escape::decode_html_entities(text).into_owned()
+}
+
+/// `empty()` for text.
+pub fn is_empty(text: &str) -> bool {
+    text.is_empty() || text == "0"
+}
+
+/// `(int) $text`: the leading number, truncated.
+pub fn leading_int(text: &str) -> i64 {
+    let text = trim(text);
+    let end = text
+        .char_indices()
+        .find(|(index, c)| !(c.is_ascii_digit() || (*index == 0 && matches!(c, '-' | '+'))))
+        .map_or(text.len(), |(index, _)| index);
+    text[..end].parse().unwrap_or(0)
+}
+
 /// `(string) $value`: scalars become text, anything else is empty.
 pub fn text(value: Option<&Value>) -> String {
     match value {
@@ -107,5 +127,12 @@ mod tests {
         );
         assert_eq!(ireplace_ascii("Theater", "er", "re"), "Theatre");
         assert_eq!(mb_substr("héllo", 2), "hé");
+        assert_eq!(
+            entity_decode("Tom &amp; Jerry&#39;s &eacute;"),
+            "Tom & Jerry's é"
+        );
+        assert_eq!(leading_int("7.8"), 7);
+        assert_eq!(leading_int("N/A"), 0);
+        assert_eq!(leading_int("10"), 10);
     }
 }

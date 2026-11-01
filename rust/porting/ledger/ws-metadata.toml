@@ -4,13 +4,13 @@
 kind = "command"
 id = "anime:migrate-covers"
 source = "app/Console/Commands/MigrateAnimeCovers.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "anime:refresh"
 source = "app/Console/Commands/RefreshAnimeData.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -28,13 +28,13 @@ status = "todo"
 kind = "command"
 id = "movie:reverify-matches"
 source = "app/Console/Commands/MovieReverifyMatches.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:populate-anidb"
 source = "app/Console/Commands/NntmuxPopulateAniDB.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -73,10 +73,16 @@ source = "app/Console/Commands/ReprocessUnmatchedTvReleases.php"
 status = "ported"
 
 [[entry]]
+kind = "library"
+id = "TvShowAdder"
+source = "app/Services/TvProcessing/TvShowAdder.php"
+status = "ported"
+
+[[entry]]
 kind = "command"
 id = "nntmux:fetch-movie"
 source = "app/Console/Commands/FetchMovieByImdb.php"
-status = "todo"
+status = "ported"
 note = "Moved from ws-ops."
 
 [[entry]]
