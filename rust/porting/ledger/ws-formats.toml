@@ -126,22 +126,22 @@ status = "todo"
 kind = "library"
 id = "nntp:client"
 source = "app/Services/NNTP/NNTPService.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "nntp:verification-pipeline"
 source = "docker/app/nzb-yenc-ffi/src/bulk_verification.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "nntp:fingerprint-client"
 source = "rust/fingerprint-worker/src/nntp.rs"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "library"
 id = "nntp:circuit-breaker"
 source = "rust/fingerprint-worker/src/breaker.rs"
-status = "todo"
+status = "ported"
