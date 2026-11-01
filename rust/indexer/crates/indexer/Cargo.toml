@@ -12,7 +12,12 @@ workspace = true
 anyhow.workspace = true
 clap.workspace = true
 indexer-config.workspace = true
+indexer-serve.workspace = true
+indexer-store.workspace = true
 indexer-telemetry.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

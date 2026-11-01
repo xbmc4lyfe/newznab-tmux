@@ -13,6 +13,8 @@ publish = false
 [workspace.dependencies]
 indexer-config = { path = "crates/config" }
 indexer-core = { path = "crates/core" }
+indexer-search = { path = "crates/search" }
+indexer-serve = { path = "crates/serve" }
 indexer-store = { path = "crates/store" }
 indexer-telemetry = { path = "crates/telemetry" }
 

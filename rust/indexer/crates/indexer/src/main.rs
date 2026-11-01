@@ -1,11 +1,14 @@
 //! The indexer binary, which runs every pipeline stage in one process.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use indexer_config::{CONFIG_PATH_ENV, Config};
+use indexer_serve::{Api, open_index, rebuild_index, serve_api};
+use indexer_store::{Catalog, StorePaths};
 use indexer_telemetry::{Telemetry, serve_metrics};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -34,6 +37,8 @@ enum Command {
     Run,
     /// Validate the configuration and print the effective values, with secrets hidden.
     Config,
+    /// Build the search index again from the catalog, then swap it in.
+    Reindex,
 }
 
 fn main() -> Result<()> {
@@ -45,14 +50,43 @@ fn main() -> Result<()> {
             print!("{}", config.to_toml()?);
             Ok(())
         }
+        Command::Reindex => reindex(&config),
     }
+}
+
+fn reindex(config: &Config) -> Result<()> {
+    let telemetry = Telemetry::init(&config.telemetry, env!("CARGO_PKG_VERSION"))?;
+    let paths = StorePaths::under(&config.storage.data_dir);
+    let result = Catalog::open_read_only(&paths.catalog)
+        .and_then(|catalog| rebuild_index(&catalog, &paths.search))
+        .map(drop);
+    if let Err(error) = &result {
+        error!("{error:#}");
+    }
+    telemetry.shutdown();
+    result
+}
+
+/// Opens the API's store and brings the search index up to date with the catalog, when the API
+/// is on. This blocks, so it runs before the async runtime starts.
+fn open_api(config: &Config) -> Result<Option<Api>> {
+    if config.api.listen.is_none() {
+        return Ok(None);
+    }
+    let paths = StorePaths::under(&config.storage.data_dir);
+    let catalog = Catalog::open_read_only(&paths.catalog)?;
+    let index = open_index(&catalog, &paths.search)?;
+    Ok(Some(Api::new(&config.api, &paths, Arc::new(index))?))
 }
 
 fn run(config: &Config) -> Result<()> {
     let telemetry = Telemetry::init(&config.telemetry, env!("CARGO_PKG_VERSION"))?;
-    let runtime = Runtime::new().context("starting the async runtime")?;
-    let result = runtime.block_on(supervise(config, &telemetry));
-    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+    let result = open_api(config).and_then(|api| {
+        let runtime = Runtime::new().context("starting the async runtime")?;
+        let result = runtime.block_on(supervise(config, &telemetry, api));
+        runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+        result
+    });
     if let Err(error) = &result {
         error!("{error:#}");
     }
@@ -62,7 +96,7 @@ fn run(config: &Config) -> Result<()> {
 
 /// Runs the tasks until a signal arrives or any task stops, because a stage that exits early
 /// would otherwise leave the rest running with a hole in the pipeline.
-async fn supervise(config: &Config, telemetry: &Telemetry) -> Result<()> {
+async fn supervise(config: &Config, telemetry: &Telemetry, api: Option<Api>) -> Result<()> {
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
 
@@ -79,6 +113,20 @@ async fn supervise(config: &Config, telemetry: &Telemetry) -> Result<()> {
             .await
             .context("metrics server failed")
     });
+
+    if let (Some(api), Some(addr)) = (api, config.api.listen) {
+        let listener = TcpListener::bind(addr)
+            .instrument(info_span!("api.bind", %addr))
+            .await
+            .with_context(|| format!("binding the API listener on {addr}"))?;
+        info!(api_addr = %listener.local_addr()?, "api listening");
+        let token = shutdown.clone();
+        tasks.spawn(async move {
+            serve_api(listener, api, token)
+                .await
+                .context("API server failed")
+        });
+    }
 
     let mut sigterm = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
     let mut failure = tokio::select! {

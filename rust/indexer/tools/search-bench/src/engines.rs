@@ -104,6 +104,7 @@ impl IndexerClient {
             min_size_bytes: q.min_size,
             offset,
             limit,
+            ..IndexerQuery::default()
         };
         let page = self.0.search(&query)?;
         Ok((page.ids.into_iter().map(|i| i as u32).collect(), page.total))

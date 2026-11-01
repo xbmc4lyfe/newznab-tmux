@@ -53,7 +53,9 @@ fn schema() -> (Schema, Fields) {
         words: b.add_text_field(WORDS, TextOptions::default().set_indexing_options(indexing)),
         id: b.add_i64_field(ID, INDEXED | FAST),
         sort_key: b.add_u64_field(SORT_KEY, FAST),
-        category: b.add_u64_field(CATEGORY, FAST),
+        // Indexed so that a category is a posting list, which an intersection can skip through,
+        // rather than a scan of the whole column.
+        category: b.add_u64_field(CATEGORY, INDEXED | FAST),
         size: b.add_u64_field(SIZE, FAST),
     };
     (b.build(), fields)
@@ -173,16 +175,29 @@ impl TantivyIndex {
         }
         if !q.categories.is_empty() {
             let ranges = q.categories.iter().map(|&(low, high)| {
-                let range = RangeQuery::new(
-                    Included(Term::from_field_u64(f.category, u64::from(low))),
-                    Included(Term::from_field_u64(f.category, u64::from(high))),
-                );
-                Box::new(range) as Box<dyn tantivy::query::Query>
+                let term = |c: u32| Term::from_field_u64(f.category, u64::from(c));
+                if low == high {
+                    let one = TermQuery::new(term(low), IndexRecordOption::Basic);
+                    return Box::new(one) as Box<dyn tantivy::query::Query>;
+                }
+                Box::new(RangeQuery::new(Included(term(low)), Included(term(high))))
             });
             clauses.push((Occur::Must, Box::new(BooleanQuery::union(ranges.collect()))));
         }
-        if let Some(min) = q.min_size_bytes {
-            let range = RangeQuery::new(Included(Term::from_field_u64(f.size, min)), Unbounded);
+        if q.min_size_bytes.is_some() || q.max_size_bytes.is_some() {
+            let bound = |size: Option<u64>| {
+                size.map_or(Unbounded, |s| Included(Term::from_field_u64(f.size, s)))
+            };
+            let range = RangeQuery::new(bound(q.min_size_bytes), bound(q.max_size_bytes));
+            clauses.push((Occur::Must, Box::new(range)));
+        }
+        if let Some(posted) = q.min_posted_at {
+            // The sort key keeps the time in its top half, and an undated release sorts as 0.
+            let low = posted.clamp(1, u32::MAX as i64) as u64;
+            let range = RangeQuery::new(
+                Included(Term::from_field_u64(f.sort_key, low << 32)),
+                Unbounded,
+            );
             clauses.push((Occur::Must, Box::new(range)));
         }
         BooleanQuery::new(clauses)
@@ -454,6 +469,31 @@ mod tests {
         assert_eq!(find(vec![(2000, 2999), (5040, 5040)], None), [3, 2, 1]);
         assert_eq!(find(vec![], Some(500)), [3, 1]);
         assert_eq!(find(vec![(5000, 5999)], Some(500)), [3]);
+    }
+
+    #[test]
+    fn filters_apply_a_size_ceiling_and_an_age_limit() {
+        let mut small = release(1, "Show.Small", 100);
+        small.size_bytes = 100;
+        let mut undated = release(2, "Show.Undated", 0);
+        undated.posted_at = None;
+        let (_dir, index) = indexed(&[small, undated, release(3, "Show.Big", 300)]);
+        let find = |max_size_bytes, min_posted_at| {
+            index
+                .search(&Query {
+                    text: "show".into(),
+                    max_size_bytes,
+                    min_posted_at,
+                    limit: 100,
+                    ..Query::default()
+                })
+                .unwrap()
+                .ids
+        };
+        assert_eq!(find(Some(500), None), [1]);
+        assert_eq!(find(None, Some(200)), [3]);
+        assert_eq!(find(None, Some(100)), [3, 1]);
+        assert_eq!(find(None, Some(-50)), [3, 1]);
     }
 
     #[test]

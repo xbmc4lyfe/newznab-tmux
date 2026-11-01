@@ -2,6 +2,16 @@
 # are the defaults. INDEXER_TELEMETRY__LOG_FILTER=debug overrides telemetry.log_filter,
 # and the other keys follow the same pattern.
 
+[api]
+# Serves the Newznab API at /api. The API is off when this is unset.
+# listen = "127.0.0.1:5060"
+# Keys a client may pass as apikey. Needs at least one when listen is set.
+api_keys = []
+# The address clients reach the API at, used in NZB links. Defaults to the Host header.
+# public_url = "https://indexer.example.test"
+# Results per page when a client asks for more, or for none. At most 500.
+max_results = 100
+
 [storage]
 data_dir = "data"
 

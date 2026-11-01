@@ -19,6 +19,7 @@ pub const CONFIG_PATH_ENV: &str = "INDEXER_CONFIG";
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub api: ApiConfig,
     pub storage: StorageConfig,
     pub telemetry: TelemetryConfig,
 }
@@ -42,6 +43,24 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        let api = &self.api;
+        if api.listen.is_some() {
+            ensure!(
+                api.api_keys.iter().any(|key| !key.expose().is_empty()),
+                "api.api_keys needs a key when api.listen is set"
+            );
+        }
+        ensure!(
+            (1..=MAX_API_LIMIT).contains(&api.max_results),
+            "api.max_results must be between 1 and {MAX_API_LIMIT}, got {}",
+            api.max_results
+        );
+        if let Some(url) = &api.public_url {
+            ensure!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "api.public_url must be an http:// or https:// URL, got {url}"
+            );
+        }
         let otlp = &self.telemetry.otlp;
         ensure!(
             (0.0..=1.0).contains(&otlp.sample_ratio),
@@ -59,6 +78,36 @@ impl Config {
 
     pub fn to_toml(&self) -> Result<String> {
         toml::to_string_pretty(self).context("serializing configuration")
+    }
+}
+
+/// The largest page the Newznab API will serve.
+pub const MAX_API_LIMIT: usize = 500;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApiConfig {
+    /// Serves the Newznab API at `/api`. The API is off when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listen: Option<SocketAddr>,
+    /// Keys a client may pass as `apikey`. Needs at least one when `listen` is set.
+    pub api_keys: Vec<Secret<String>>,
+    /// The address clients reach the API at, used in NZB links. Defaults to `http://` and the
+    /// request's `Host` header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
+    /// Results per page when a client asks for more, or for none. NZBHydra2 asks for 100.
+    pub max_results: usize,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            listen: None,
+            api_keys: Vec::new(),
+            public_url: None,
+            max_results: 100,
+        }
     }
 }
 
@@ -223,6 +272,11 @@ mod tests {
             assert!(load("[telemetry]\nlog_filtr = \"debug\"\n").is_err());
             assert!(load("[telemetry.otlp]\nsample_ratio = 1.5\n").is_err());
             assert!(load("[telemetry.otlp]\nendpoint = \"grpc://x:4317\"\n").is_err());
+            assert!(load("[api]\nlisten = \"127.0.0.1:0\"\n").is_err());
+            assert!(load("[api]\nlisten = \"127.0.0.1:0\"\napi_keys = [\"\"]\n").is_err());
+            assert!(load("[api]\nmax_results = 0\n").is_err());
+            assert!(load("[api]\npublic_url = \"example.test\"\n").is_err());
+            assert!(load("[api]\nlisten = \"127.0.0.1:0\"\napi_keys = [\"k\"]\n").is_ok());
 
             jail.set_env("INDEXER_TELEMETRY__LOG_FILTR", "debug");
             assert!(Config::load(None).is_err());

@@ -21,6 +21,8 @@ pub use rusqlite;
 pub struct StorePaths {
     pub catalog: PathBuf,
     pub nzbs: PathBuf,
+    /// The text index, which can always be rebuilt from the catalog.
+    pub search: PathBuf,
 }
 
 impl StorePaths {
@@ -28,6 +30,7 @@ impl StorePaths {
         Self {
             catalog: data_dir.join("catalog.db"),
             nzbs: data_dir.join("nzbs.db"),
+            search: data_dir.join("search"),
         }
     }
 }

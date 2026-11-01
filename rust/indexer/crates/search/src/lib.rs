@@ -33,6 +33,9 @@ pub struct Query {
     /// Inclusive category ranges, any of which may match. Empty means every category.
     pub categories: Vec<(u32, u32)>,
     pub min_size_bytes: Option<u64>,
+    pub max_size_bytes: Option<u64>,
+    /// Unix seconds. Leaves out releases posted earlier, and releases with no time.
+    pub min_posted_at: Option<i64>,
     pub offset: usize,
     /// How many IDs to return. Zero still reports the total.
     pub limit: usize,

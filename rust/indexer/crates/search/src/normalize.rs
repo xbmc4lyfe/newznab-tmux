@@ -3,7 +3,8 @@
 //! Names write the same thing many ways: `S01E02`, `S01.E02`, `S1E2` and `1x02`, or `H.264` and
 //! `H264`, or `It's` and `Its`. A release keeps its literal words and gains the canonical form of
 //! each of these, and a query asks for the canonical form only, so any spelling finds any other.
-//! Episodes stay exact: `S01E02` never matches `S01E03`.
+//! Episodes stay exact: `S01E02` never matches `S01E03`. An episode is also indexed under its
+//! season, so `S01` finds the season's episodes as well as its packs.
 
 use std::sync::OnceLock;
 use tantivy::tokenizer::{
@@ -86,10 +87,15 @@ fn canonical_forms(words: &[String]) -> Vec<String> {
             if let Some(e) = next.and_then(bare_episode) {
                 out.push(episode_word(season, e));
             }
+            out.push(season_word(season));
         } else if let Some((season, e)) = parse_cross(word) {
             out.push(episode_word(season, e));
+            out.push(season_word(season));
         } else if let (Some(season), Some(e)) = (bare_season(word), next.and_then(bare_episode)) {
             out.push(episode_word(season, e));
+            out.push(season_word(season));
+        } else if let Some(season) = bare_season(word) {
+            out.push(season_word(season));
         } else if let Some(codec) = next.and_then(|n| codec_word(word, n)) {
             out.push(codec);
         }
@@ -117,6 +123,8 @@ fn query_words(text: &str) -> Vec<String> {
         } else if let (Some(season), Some(e)) = (bare_season(word), next.and_then(bare_episode)) {
             out.push(episode_word(season, e));
             pair = true;
+        } else if let Some(season) = bare_season(word) {
+            out.push(season_word(season));
         } else if let Some(codec) = next.and_then(|n| codec_word(word, n)) {
             out.push(codec);
             pair = true;
@@ -130,6 +138,10 @@ fn query_words(text: &str) -> Vec<String> {
 
 fn episode_word(season: u32, episode: u32) -> String {
     format!("s{season:02}e{episode:02}")
+}
+
+fn season_word(season: u32) -> String {
+    format!("s{season:02}")
 }
 
 fn codec_word(first: &str, second: &str) -> Option<String> {
@@ -190,6 +202,24 @@ mod tests {
         for query in ["show s01e02", "show S01.E02", "show s1e2", "show 1x02"] {
             assert_eq!(parse_query(query).must, ["s01e02", "show"], "{query}");
         }
+    }
+
+    #[test]
+    fn a_season_finds_its_episodes_and_packs() {
+        for name in [
+            "Show.S03E02.1080p",
+            "Show.S3E2.1080p",
+            "Show.3x02.1080p",
+            "Show.S03.E02.1080p",
+            "Show.S03.1080p",
+            "Show.S3.1080p",
+        ] {
+            assert!(has(name, "s03"), "{name}");
+        }
+        for query in ["show s03", "show S3", "show s003"] {
+            assert_eq!(parse_query(query).must, ["s03", "show"], "{query}");
+        }
+        assert!(!has("Show.S03E02.1080p", "s02"));
     }
 
     #[test]
