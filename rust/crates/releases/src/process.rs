@@ -586,10 +586,7 @@ pub async fn process_ready_release_window(
     if stop_requested(db).await? {
         return Ok(Totals::default());
     }
-    let limit = settings
-        .release_creation_limit
-        .max(1)
-        .min(READY_WINDOW_SIZE);
+    let limit = settings.release_creation_limit.clamp(1, READY_WINDOW_SIZE);
     let key = format!("{READY_WINDOW_CURSOR}{group}");
     let mut state = match releases.verify.cache.get::<PriorityState>(&key).await {
         Some(saved) if saved.valid(Some(group)) => saved,
