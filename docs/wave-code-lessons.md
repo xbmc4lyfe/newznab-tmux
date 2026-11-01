@@ -19,6 +19,8 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 11. **Layers pile up when nothing gets removed.** `IsbnDbService` already had Wave 39.4 toggles when Wave 67.4 added a second set. Delete the old route when adding a new one, so each behavior has one path.
 12. **Share a helper once it repeats.** Each wave class carries its own state helper for routing and the library handle. After this slice, `app` still has 493 copies across 400 files. Put repeated plumbing in one place, so a fix lands once.
 13. **Keep one access decision.** `LogFileRepository`'s listing is its access whitelist, yet the Wave 67.6 plan computed its own `accepted` flag that nothing read. A second answer to "may this be read?" can only drift from the real one.
+14. **Keep the design worth keeping.** `LogSearchCoordinator` is real code that stays: it sends a search to the index only when the index is reachable and caught up, falls back to a scan otherwise, and says which engine produced each result. The Wave 67.5 plans added nothing to that. The indexer's search should use the same shape.
+15. **A check that stays red stops being a check.** The #1083 pull request noted that CI failed before PHPUnit on a stale hash pin already failing on master, then merged. Fix a broken check or remove it, because a known failure hides new ones.
 
 ## Slices
 
@@ -28,3 +30,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 1 | Wave 44.2 parity test only. Its PHP and Rust code goes with Wave 44 | `719bd8f9e` | 7, 8 |
 | 2 | Wave 67.4 metadata plans: `Company`, `Game`, `Platform`, `InvitationService`, `IsbnDbService`, their Rust module and parity test | `2fac89eed` | 9 to 11 |
 | 3 | Wave 67.6 plans: `LogFileRepository`, `LogReader`, `LogSearcher`, `SearchQuery`, `Mcp/ProcessRunner`, their Rust module and parity test | `382db8a64` | 12, 13 |
+| 4 | Wave 67.5 plans: `LogIndex`, `LogSearchCoordinator`, `ManticoreLogSearcher`, `LogEntry`, `LogEntryParser`, their Rust module and parity test | `2a092659e` | 14, 15 |
