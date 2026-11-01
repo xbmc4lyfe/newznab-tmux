@@ -2277,8 +2277,20 @@ name = "nntmux-postprocess"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "hex",
+ "nntmux-core",
  "nntmux-runtime",
+ "nntmux-testkit",
+ "nntmux-verify",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
