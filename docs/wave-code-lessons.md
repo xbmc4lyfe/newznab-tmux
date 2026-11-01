@@ -30,6 +30,7 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 22. **Size is a warning.** `IgdbHttpException` was already 392 lines when Wave 67.3 added 324 more. When an exception class grows that large, ask what the code is doing there.
 23. **Port what classifies, not what describes it.** Wave 66.6 added plans beside `TvPipe` and `MoviePipe`, and the pipes never called them. The real category rules stay in those pipes' own methods, so the indexer's identification work should read those methods and ignore any wave plan.
 24. **Tests must not lean on the ones before them.** Deleting a Wave 65.3 parity test made `test_provider_query_listener_records_normalized_durations` fail with `Target class [db] does not exist` when it runs after other tests, though it passes alone. It reads a global facade left by whichever test ran earlier. Give each test its own state, so deleting one can't break another.
+25. **Keep the real frame rule.** `FrameQualityScorer` stays as the reference for choosing preview frames: it never picks a blank frame, prefers normal brightness, then takes the most detailed one. The indexer's ffmpeg screens should start from that rule. The Wave 64.5 plans added nothing to it.
 
 ## Slices
 
@@ -57,3 +58,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 19 | Wave 65.1 plans: `MediaSourceStage`, `MediaToolFactory`, `Par2FileMapper`, `ThumbnailFrameSelector`, `MediaExtractionService`, their Rust module and parity test | `ed15b5be4` | None new |
 | 20 | Wave 64.4 plans: `MediaSourcePlan`, `Par2FileEntry`, `PersistenceMetrics`, `ArchivedMediaSlicer`, `ContainerSplicer`, their Rust module and parity test | `2a50c0765` | None new |
 | 21 | Wave 64.2 plans: `ProcessingConfiguration`, `ConsoleOutputService`, `AdditionalBatchResult`, `AdditionalWorkPlan`, `ArchiveCandidate`, their Rust module and parity test | `1597eaab5` | None new |
+| 22 | Wave 64.5 plans: `FfmpegFrameGrabber`, `FrameQualityScorer`, `ImageCandidateRanker`, `ImageInspector`, `MediaArticleFetcher`, their Rust module and parity test | `1190c6e0b` | 25 |
