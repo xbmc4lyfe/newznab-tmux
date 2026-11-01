@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Guarded rollout of the Rust stack: `just --justfile docker/Justfile deploy [service...]`.
+#
+#   1. One deploy at a time (a lock directory; a crashed run leaves it for the owner to inspect).
+#   2. The checkout must be on DEPLOY_GIT_BRANCH and match DEPLOY_GIT_REMOTE (fast-forwarded when
+#      only behind). Local or diverged commits stop the deploy.
+#   3. Build the image while the old stack keeps running.
+#   4. `docker compose up -d --wait`: `migrate` runs first, then each changed service is
+#      recreated. Workers get SIGTERM and finish their in-flight units within their
+#      stop_grace_period before the new container starts. Unchanged services are left alone.
+#   5. Every started line in DEPLOY_LOG gets a matching finished line with the exit code.
+#
+# Settings come from the environment (the Justfile loads docker/.env): DEPLOY_BY (required),
+# DEPLOY_SYNC_REMOTE, DEPLOY_GIT_REMOTE, DEPLOY_GIT_BRANCH, DEPLOY_HEALTH_TIMEOUT, DEPLOY_LOCK_DIR,
+# DEPLOY_LOG, APP_IMAGE, DRY_RUN=1 (print the plan and stop).
+set -euo pipefail
+
+stack=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+repo=$(dirname "$stack")
+compose="$stack/bin/compose"
+
+: "${DEPLOY_BY:?set DEPLOY_BY in docker/.env or on the command line}"
+remote=${DEPLOY_GIT_REMOTE:-origin}
+branch=${DEPLOY_GIT_BRANCH:-master}
+sync=${DEPLOY_SYNC_REMOTE:-1}
+timeout=${DEPLOY_HEALTH_TIMEOUT:-600}
+lock=${DEPLOY_LOCK_DIR:-$stack/.deploy.lock}
+log=${DEPLOY_LOG:-$stack/.deploy.log}
+image=${APP_IMAGE:-nntmux/rust:local}
+services=("$@")
+
+stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+if ! mkdir "$lock" 2>/dev/null; then
+    echo "Another deploy holds $lock ($(cat "$lock/owner" 2>/dev/null || echo unknown))." >&2
+    echo "If no deploy is running, inspect $log, then remove $lock by hand." >&2
+    exit 75
+fi
+printf '%s pid=%s at=%s\n' "$DEPLOY_BY" "$$" "$(stamp)" > "$lock/owner"
+started=0
+finish() {
+    rc=$?
+    if [ "$started" = 1 ]; then
+        printf '%s deploy result=finished rc=%s by=%s\n' "$(stamp)" "$rc" "$DEPLOY_BY" >> "$log"
+    fi
+    rm -rf "$lock"
+    exit "$rc"
+}
+trap finish EXIT
+
+cd "$repo"
+if [ "$sync" != 0 ]; then
+    current=$(git symbolic-ref --quiet --short HEAD || true)
+    if [ "$current" != "$branch" ]; then
+        echo "The checkout is on '${current:-a detached HEAD}', not $branch." >&2
+        exit 1
+    fi
+    git fetch --quiet "$remote" "$branch"
+    if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+        echo "The checkout has commits that aren't on $remote/$branch; push or drop them first." >&2
+        exit 1
+    fi
+    if [ "${DRY_RUN:-0}" = 1 ]; then
+        echo "Would fast-forward $(git rev-parse --short=12 HEAD) to $(git rev-parse --short=12 FETCH_HEAD)."
+    else
+        git merge --quiet --ff-only FETCH_HEAD
+    fi
+fi
+commit=$(git rev-parse --short=12 HEAD)
+
+if [ "${DRY_RUN:-0}" = 1 ]; then
+    echo "Would build $image from $commit and roll out: ${services[*]:-every default service}."
+    "$compose" up --dry-run --no-build -d "${services[@]}"
+    exit 0
+fi
+
+started=1
+printf '%s deploy result=started by=%s commit=%s services=%s\n' \
+    "$(stamp)" "$DEPLOY_BY" "$commit" "${services[*]:-all}" >> "$log"
+
+docker build --label "org.opencontainers.image.revision=$commit" -t "$image" "$repo"
+"$compose" up -d --wait --wait-timeout "$timeout" "${services[@]}"
+"$compose" ps
+echo "Deployed $commit."

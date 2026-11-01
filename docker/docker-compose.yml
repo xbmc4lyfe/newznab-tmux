@@ -1,39 +1,62 @@
-# NNTmux self-hosted stack. All persistent state is bind-mounted under docker/data and docker/logs.
-# Design: docker/docs/2026-10-08-nntmux-docker-stack-design.md   Lifecycle: just --justfile docker/Justfile help
+# NNTmux self-hosted stack, Rust-native. Persistent state is bind-mounted under docker/data and
+# docker/logs. Lifecycle: just --justfile docker/Justfile help
+#
+# Every app service runs the same image (nntmux/rust:local) with a different command. Workers
+# drain on SIGTERM: they stop claiming, finish in-flight units and exit, so `docker compose up -d`
+# with a new image is a safe rolling restart. `migrate` runs first and every app service waits
+# for it, so schema changes land before any new binary starts.
+#
+# Roles that aren't ported yet sit in the `pending` profile so a normal `up` doesn't start a
+# service that exits at once. Move a role out of the profile in the PR that ports it.
 name: ${COMPOSE_PROJECT_NAME:-nntmux}
 
 x-app: &app
-  image: ${APP_IMAGE:-nntmux/app:local}
+  image: ${APP_IMAGE:-nntmux/rust:local}
   init: true
   user: "33:33"
   restart: unless-stopped
   stop_signal: SIGTERM
-  # Indexer SIGTERM trap drains for 90s, leaving time to close tmux before Docker kills it.
   stop_grace_period: 120s
+  env_file: ./config/app.env
   environment:
     TZ: ${TZ:-UTC}
-    # www-data's login shell is nologin; tmux panes spawn $SHELL.
-    SHELL: /bin/bash
-    # Pulse's storage ingest upserts pulse_aggregates from every short-lived worker
-    # process and deadlocks under tmux fan-out; workers default off, web stays on.
-    # Opt in via docker/.env PULSE_ENABLED=true and config/app.env PULSE_PROCESSING_ENABLED=true.
-    PULSE_ENABLED: "${PULSE_ENABLED:-false}"
   volumes:
-    - ./config/app.env:/app/.env
     - ./data/storage:/app/storage
-    - ./data/install:/app/_install
   tmpfs:
     - /var/tmp/nntmux:uid=33,gid=33,mode=0770,size=2g
   networks: [nntmux]
-  depends_on:
-    mariadb:
-      condition: service_healthy
+  # Every role serves /metrics and /healthz here; Prometheus scrapes it.
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9187/healthz"]
+    interval: 15s
+    timeout: 5s
+    retries: 5
+    start_period: 30s
+  depends_on: &app-depends
+    migrate:
+      condition: service_completed_successfully
     redis:
       condition: service_healthy
     manticore:
       condition: service_healthy
 
+x-worker-memory: &worker-memory
+  mem_limit: ${WORKER_MEMORY:-2g}
+
 services:
+  # One-shot: applies pending migrations, then exits 0. It refuses a database that has tables
+  # but neither a rust_migrations record nor the full Laravel baseline.
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["nntmux-ctl", "migrate"]
+    healthcheck:
+      disable: true
+    depends_on:
+      mariadb:
+        condition: service_healthy
+        required: false
+
   proxy:
     image: ${CADDY_IMAGE:-caddy:2.10.2-alpine}
     restart: unless-stopped
@@ -56,82 +79,69 @@ services:
       retries: 3
     mem_limit: 256m
 
+  # The newznab API, RSS, NZB downloads and the site.
   web:
     <<: *app
-    image: ${WEB_IMAGE:-nntmux/web:local}
-    environment:
-      TZ: ${TZ:-UTC}
-      SHELL: /bin/bash
-      PULSE_ENABLED: "true"
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/up"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 60s
+    command: ["nntmux-web"]
+    stop_grace_period: 30s
     mem_limit: ${WEB_MEMORY:-1g}
 
-  horizon:
-    <<: *app
-    image: ${HORIZON_IMAGE:-nntmux/horizon:local}
-    # Fingerprint jobs can run for 1800s; Horizon allows 1860s before worker timeout.
-    stop_grace_period: 1920s
-    command: ["php", "artisan", "horizon"]
-    healthcheck:
-      test: ["CMD", "php", "artisan", "horizon:status"]
-      interval: 30s
-      timeout: 15s
-      retries: 3
-      start_period: 60s
-    mem_limit: ${HORIZON_MEMORY:-1g}
+  # Scheduled tasks (the Laravel scheduler's replacement). Takes a database lease, so a second
+  # copy waits instead of running tasks twice.
+  supervisor:
+    <<: [*app, *worker-memory]
+    command: ["nntmux-worker", "supervisor"]
 
-  scheduler:
-    <<: *app
-    image: ${SCHEDULER_IMAGE:-nntmux/scheduler:local}
-    # Detached scheduled tasks remain owned by the subreaper through shutdown.
-    stop_grace_period: 1920s
-    command: ["python3", "/app/docker/app/bin/scheduler.py"]
-    healthcheck:
-      test: ["CMD", "python3", "/app/docker/app/bin/scheduler.py", "status"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 60s
-    mem_limit: ${SCHEDULER_MEMORY:-2g}
+  releases:
+    <<: [*app, *worker-memory]
+    command: ["nntmux-worker", "releases"]
 
-  indexer:
+  fixnames:
+    <<: [*app, *worker-memory]
+    command: ["nntmux-worker", "fixnames"]
+
+  predb:
+    <<: [*app, *worker-memory]
+    command: ["nntmux-worker", "predb"]
+
+  # Fingerprint and verify units fetch from NNTP and can run for many minutes; give them the
+  # same 1920s grace Horizon had, so a rollout never cuts one off.
+  fingerprint:
+    <<: [*app, *worker-memory]
+    command: ["nntmux-worker", "fingerprint"]
+    stop_grace_period: 1920s
+
+  verify:
+    <<: [*app, *worker-memory]
+    command: ["nntmux-worker", "verify"]
+    stop_grace_period: 1920s
+
+  search-sync:
+    <<: [*app, *worker-memory]
+    command: ["nntmux-worker", "search-sync"]
+
+  # ── Not ported yet (ws-ingest, ws-postprocess, ws-admin). `--profile pending` starts them. ──
+  ingest:
+    <<: [*app, *worker-memory]
+    profiles: [pending]
+    command: ["nntmux-worker", "ingest"]
+
+  backfill:
+    <<: [*app, *worker-memory]
+    profiles: [pending]
+    command: ["nntmux-worker", "backfill"]
+
+  postprocess:
     <<: *app
-    image: ${INDEXER_IMAGE:-nntmux/indexer:local}
-    command: ["/usr/local/bin/nntmux-indexer"]
-    tty: true
-    stdin_open: true
-    environment:
-      TZ: ${TZ:-UTC}
-      SHELL: /bin/bash
-      PULSE_ENABLED: "${PULSE_ENABLED:-false}"
-      TERM: xterm-256color
-      TMUX_SESSION_NAME: nntmux
-      # Native decoding/planning belongs to CLI processing; web retains ffi.enable=false.
-      PHP_INI_SCAN_DIR: /usr/local/etc/php/conf.d:/usr/local/etc/php/indexer-conf.d
-      INDEXER_MAX_FAILURES: ${INDEXER_MAX_FAILURES:-10}
-      # Keep below the 120s container stop grace period.
-      INDEXER_DRAIN_TIMEOUT: ${INDEXER_DRAIN_TIMEOUT:-90}
-    healthcheck:
-      test: ["CMD-SHELL", "test -f /var/tmp/nntmux/indexer.ready && php artisan tmux:health-check --session=nntmux --require-session --quiet"]
-      interval: 60s
-      timeout: 20s
-      retries: 5
-      start_period: 120s
-    mem_limit: ${INDEXER_MEMORY:-8g}
-    depends_on:
-      mariadb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      manticore:
-        condition: service_healthy
-      web:
-        condition: service_healthy
+    profiles: [pending]
+    command: ["nntmux-worker", "postprocess"]
+    stop_grace_period: 1920s
+    mem_limit: ${POSTPROCESS_MEMORY:-4g}
+
+  mail:
+    <<: [*app, *worker-memory]
+    profiles: [pending]
+    command: ["nntmux-worker", "mail"]
 
   mariadb:
     image: ${MARIADB_IMAGE:-mariadb:11.4.8}
@@ -224,7 +234,7 @@ services:
       - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ../docker/monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
       - ./data/prometheus:/prometheus
     networks: [nntmux]
     mem_limit: 512m
@@ -235,31 +245,19 @@ services:
     networks: [nntmux]
     mem_limit: 128m
 
+  # Phase 1 has no admin UI to sign Grafana in, so Grafana uses its own login on a local port.
   grafana:
     image: grafana/grafana:13.2.3
     restart: unless-stopped
     user: "0:0"
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     environment:
       PROMETHEUS_URL: http://prometheus:9090
-      GF_SERVER_ROOT_URL: "${APP_URL:-http://localhost:${APP_PORT:-8080}}/grafana/"
-      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
       GF_SECURITY_ADMIN_USER: nntmux-grafana-admin
-      GF_SECURITY_ALLOW_EMBEDDING: "true"
-      GF_SECURITY_COOKIE_SAMESITE: lax
-      GF_AUTH_DISABLE_LOGIN_FORM: "true"
-      GF_AUTH_BASIC_ENABLED: "false"
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?run docker/bin/generate-env}
       GF_AUTH_ANONYMOUS_ENABLED: "false"
       GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_AUTH_JWT_ENABLED: "true"
-      GF_AUTH_JWT_URL_LOGIN: "false"
-      GF_AUTH_JWT_HEADER_NAME: X-JWT-Assertion
-      GF_AUTH_JWT_KEY_FILE: /etc/grafana/nntmux-jwt/grafana-jwt.pub
-      GF_AUTH_JWT_USERNAME_CLAIM: sub
-      GF_AUTH_JWT_EMAIL_CLAIM: email
-      GF_AUTH_JWT_EXPECT_CLAIMS: '{"iss": "nntmux", "aud": "grafana"}'
-      GF_AUTH_JWT_AUTO_SIGN_UP: "true"
-      GF_AUTH_JWT_ROLE_ATTRIBUTE_PATH: role
-      GF_AUTH_JWT_ROLE_ATTRIBUTE_STRICT: "true"
       GF_LIVE_MAX_CONNECTIONS: "0"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
@@ -267,9 +265,8 @@ services:
       GF_NEWS_NEWS_FEED_ENABLED: "false"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/nntmux/nntmux-host.json
     volumes:
-      - ../docker/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ../docker/monitoring/grafana/dashboards:/etc/grafana/dashboards/nntmux:ro
-      - ./data/storage/app/monitoring/public:/etc/grafana/nntmux-jwt:ro
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards/nntmux:ro
       - ./data/grafana:/var/lib/grafana
     networks: [nntmux]
     mem_limit: 512m

@@ -1,6 +1,4 @@
 # Prometheus config for the docker/ stack (docker/docker-compose.yml).
-# Ubuntu hosts get a generated /etc/prometheus/prometheus.yml from
-# scripts/install-monitoring.sh instead (targets differ per host).
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
@@ -30,7 +28,25 @@ scrape_configs:
     static_configs:
       - targets: ['manticore:9308']
 
-  # NNTmux application metrics pushed every minute by `monitoring:export-metrics`.
+  # Every Rust service serves /metrics on 9187. Roles in the Compose `pending` profile aren't
+  # listed, so ExporterDown doesn't fire for them; add a role here in the PR that ports it.
+  - job_name: nntmux-roles
+    static_configs:
+      - targets:
+          - web:9187
+          - supervisor:9187
+          - releases:9187
+          - fixnames:9187
+          - predb:9187
+          - fingerprint:9187
+          - verify:9187
+          - search-sync:9187
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '([^:]+):\d+'
+        target_label: role
+
+  # Database-derived NNTmux metrics pushed every minute by the supervisor's metrics export.
   - job_name: pushgateway
     honor_labels: true
     static_configs:
