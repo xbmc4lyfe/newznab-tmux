@@ -8,12 +8,14 @@ use nntmux_runtime::Ctx;
 use crate::auth::{self, User};
 use crate::getnzb::{self, Errors};
 use crate::input::{Input, Value, php_int};
+use crate::json::{J, Style};
 use crate::params;
 use crate::present_v2;
 use crate::reply::{Reply, json_error};
 use crate::request::ApiRequest;
 use crate::rows;
 use crate::settings::Settings;
+use crate::upload;
 use crate::usage::{self, Reservation, Statistics};
 
 /// `resolveUser`: token checks, then the atomic quota reservation.
@@ -316,14 +318,41 @@ pub async fn nzb_add(
             "Insufficient privileges/not authorized",
         ));
     }
-    let multipart = request
-        .header("content-type")
-        .is_some_and(|value| value.starts_with("multipart/"));
-    if multipart {
-        return Ok(not_ported());
-    }
-    Ok(Reply::v2_error(
-        400,
-        "Missing parameter (nzb file is required)",
-    ))
+    let Some(nzb) = request.file("nzb").cloned() else {
+        return Ok(Reply::v2_error(
+            400,
+            "Missing parameter (nzb file is required)",
+        ));
+    };
+    let nfo = request.file("nfo").cloned();
+    let folder = settings.upload_folder.clone();
+    let staged =
+        tokio::task::spawn_blocking(move || upload::stage(folder.as_deref(), &nzb, nfo.as_ref()))
+            .await?;
+    let staged = match staged {
+        Ok(staged) => staged,
+        Err(failure) => return Ok(Reply::v2_error(failure.status, &failure.message)),
+    };
+    let described = |filename: String, kind: &str| {
+        J::obj([("filename", J::Str(filename)), ("type", J::str(kind))])
+    };
+    let body = J::obj([
+        ("success", J::Bool(true)),
+        ("status", J::str("staged")),
+        ("name", J::Str(staged.name)),
+        ("category", request.input.str("cat").map_or(J::Null, J::str)),
+        (
+            "files",
+            J::obj([
+                ("nzb", described(staged.nzb_filename, "nzb")),
+                (
+                    "nfo",
+                    staged
+                        .nfo_filename
+                        .map_or(J::Null, |name| described(name, "nfo")),
+                ),
+            ]),
+        ),
+    ]);
+    Ok(Reply::json(201, &body, Style::Unescaped))
 }

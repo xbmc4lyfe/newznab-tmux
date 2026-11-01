@@ -26,6 +26,7 @@ mod request;
 mod rows;
 mod rss;
 mod settings;
+mod upload;
 pub mod usage;
 mod v1;
 mod v2;

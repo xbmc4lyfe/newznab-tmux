@@ -30,6 +30,7 @@ QUERY_ENV = {
     "APP_ENV": "production",
     "MAIL_FROM_ADDRESS": "admin@example.test",
     "MANTICORESEARCH_PORT": "39308",
+    "NZB_UPLOAD_FOLDER": "/tmp/nntmux-api-ref-uploads",
 } | {f"MANTICORESEARCH_INDEX_{name.upper()}": f"apiref_{name}_rt" for name in (
     "releases", "predb", "movies", "tvshows", "music", "books", "games", "console", "steam", "anime")}
 
