@@ -1,0 +1,147 @@
+# Library surfaces owned by ws-formats. These have no route or command of their own, so
+# each entry names what the other workstreams call. Status: todo, ported or dropped (with a note).
+
+[[entry]]
+kind = "library"
+id = "yenc:payload-decoder"
+source = "docker/app/nzb-yenc-ffi/src/payload_decoder.rs"
+status = "ported"
+
+[[entry]]
+kind = "library"
+id = "yenc:framing-metadata"
+source = "docker/app/nzb-yenc-ffi/src/yenc_framing.rs"
+status = "ported"
+
+[[entry]]
+kind = "library"
+id = "yenc:service"
+source = "app/Services/YencService.php"
+status = "ported"
+
+[[entry]]
+kind = "library"
+id = "yenc:article-frame"
+source = "app/Services/Yenc/ArticleFrame.php"
+status = "ported"
+
+[[entry]]
+kind = "library"
+id = "yenc:fingerprint-analysis"
+source = "rust/fingerprint-worker/src/yenc.rs"
+status = "ported"
+
+[[entry]]
+kind = "library"
+id = "yenc:experimental-rapidyenc-abi"
+source = "docker/app/nzb-yenc-ffi/src/abi_decoder.rs"
+status = "dropped"
+note = "C ABI behind an off-by-default feature; production used the lenient kernels"
+
+[[entry]]
+kind = "library"
+id = "formats:archive-metadata"
+source = "docker/app/nzb-yenc-ffi/src/formats.rs"
+status = "todo"
+
+[[entry]]
+kind = "library"
+id = "formats:par2"
+source = "docker/app/nzb-yenc-ffi/src/par2.rs"
+status = "todo"
+
+[[entry]]
+kind = "library"
+id = "formats:par2-source-ranges"
+source = "docker/app/nzb-yenc-ffi/src/par2_source_ranges.rs"
+status = "todo"
+
+[[entry]]
+kind = "library"
+id = "formats:seven-zip-ranges"
+source = "docker/app/nzb-yenc-ffi/src/seven_zip_ranges.rs"
+status = "todo"
+
+[[entry]]
+kind = "library"
+id = "formats:article-identity"
+source = "docker/app/nzb-yenc-ffi/src/article_identity.rs"
+status = "ported"
+
+[[entry]]
+kind = "library"
+id = "formats:article-xref"
+source = "docker/app/nzb-yenc-ffi/src/article_xref.rs"
+status = "ported"
+
+[[entry]]
+kind = "library"
+id = "formats:article-dates"
+source = "docker/app/nzb-yenc-ffi/src/article_dates.rs"
+status = "ported"
+
+[[entry]]
+kind = "library"
+id = "formats:article-fingerprint"
+source = "docker/app/nzb-yenc-ffi/src/article_fingerprint.rs"
+status = "todo"
+
+[[entry]]
+kind = "library"
+id = "formats:nntp-headers"
+source = "docker/app/nzb-yenc-ffi/src/nntp_headers.rs"
+status = "ported"
+
+[[entry]]
+kind = "library"
+id = "formats:nntp-body"
+source = "docker/app/nzb-yenc-ffi/src/nntp_body.rs"
+status = "ported"
+
+[[entry]]
+kind = "library"
+id = "formats:header-filename-identity"
+source = "docker/app/nzb-yenc-ffi/src/header_filename_identity.rs"
+status = "ported"
+
+[[entry]]
+kind = "library"
+id = "formats:per-article-obfuscation"
+source = "docker/app/nzb-yenc-ffi/src/per_article_obfuscation.rs"
+status = "todo"
+
+[[entry]]
+kind = "library"
+id = "formats:spot-check-sample-plan"
+source = "docker/app/nzb-yenc-ffi/src/sample_plan.rs"
+status = "todo"
+
+[[entry]]
+kind = "library"
+id = "formats:release-names-html"
+source = "docker/app/nzb-yenc-ffi/src/release_names.rs"
+status = "todo"
+
+[[entry]]
+kind = "library"
+id = "nntp:client"
+source = "app/Services/NNTP/NNTPService.php"
+status = "todo"
+
+[[entry]]
+kind = "library"
+id = "nntp:verification-pipeline"
+source = "docker/app/nzb-yenc-ffi/src/bulk_verification.rs"
+status = "todo"
+
+[[entry]]
+kind = "library"
+id = "nntp:fingerprint-client"
+source = "rust/fingerprint-worker/src/nntp.rs"
+status = "todo"
+
+[[entry]]
+kind = "library"
+id = "nntp:circuit-breaker"
+source = "rust/fingerprint-worker/src/breaker.rs"
+status = "todo"
