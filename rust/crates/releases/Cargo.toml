@@ -17,11 +17,7 @@ nntmux-ingest.workspace = true
 nntmux-runtime.workspace = true
 nntmux-predb.workspace = true
 nntmux-verify.workspace = true
-<<<<<<< HEAD
 nntmux-webkit.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-=======
 flate2.workspace = true
 hex.workspace = true
 rand.workspace = true
@@ -29,22 +25,16 @@ serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
 sha2.workspace = true
->>>>>>> origin/rust-native
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-<<<<<<< HEAD
-tower.workspace = true
-hex.workspace = true
-=======
 nntmux-api.workspace = true
-nntmux-predb.workspace = true
->>>>>>> origin/rust-native
 nntmux-testkit.workspace = true
 redis.workspace = true
+tower.workspace = true
 
 [lints]
 workspace = true
