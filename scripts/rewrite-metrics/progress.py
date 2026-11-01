@@ -17,6 +17,7 @@ Ledgers come from rust-native, or from master once rust-native is gone after the
 import argparse
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -37,19 +38,38 @@ def measure(tree, config):
         return json.loads(out.read_text())
 
 
-def read_ledgers(tree, excluded):
-    """Counts per workstream as {name: [done, total]}, skipping excluded files and ports of Rust."""
+def source_path(source):
+    """Ledger sources are file paths or Laravel handlers; App\\Foo\\Bar@baz becomes app/Foo/Bar.php."""
+    if source.startswith('App\\'):
+        return 'app/' + source[4:].partition('@')[0].replace('\\', '/') + '.php'
+    return source
+
+
+def owner(workstream, source, subsystems):
+    """Which subsystem an entry retires: its workstream's, split by source path if several share it."""
+    candidates = [row for row in subsystems if workstream in row['workstreams']]
+    if len(candidates) == 1:
+        return candidates[0]['key']
+    path = source_path(source)
+    for row in candidates or subsystems:
+        if any(re.search(pattern, path) for pattern in row['paths']):
+            return row['key']
+    return (candidates or subsystems[-1:])[0]['key']
+
+
+def read_ledgers(tree, excluded, subsystems):
+    """Counts per subsystem as {key: [done, total]}, skipping excluded files and ports of Rust."""
     counts = {}
     for path in sorted((tree / 'rust/porting/ledger').glob('*.toml')):
         if path.stem in excluded:
             continue
-        done = total = 0
         for entry in tomllib.loads(path.read_text(encoding='utf-8')).get('entry', []):
-            if entry.get('source', '').endswith('.rs'):
+            source = entry.get('source', '')
+            if source.endswith('.rs'):
                 continue
-            total += 1
-            done += entry.get('status') in ('ported', 'dropped')
-        counts[path.stem] = [done, total]
+            count = counts.setdefault(owner(path.stem, source, subsystems), [0, 0])
+            count[1] += 1
+            count[0] += entry.get('status') in ('ported', 'dropped')
     return counts
 
 
@@ -67,11 +87,6 @@ def compute(config, master, rust_native, ledgers, crates):
     subsystems = config['subsystem']
     follows_rest = set(config['ledger']['follows_rest'])
     catch_all = subsystems[-1]
-    workstreams = {}
-    for subsystem in subsystems:
-        workstreams[subsystem['key']] = list(subsystem['workstreams'])
-    known = {name for names in workstreams.values() for name in names}
-    workstreams[catch_all['key']] += sorted(set(ledgers) - known)
     known_crates = {name for subsystem in subsystems for name in subsystem['crates']}
     live = {branch: {row['key']: row['live'] for row in report['subsystems']} for branch, report in
             (('master', master), ('rust_native', rust_native)) if report}
@@ -79,8 +94,7 @@ def compute(config, master, rust_native, ledgers, crates):
     rows, retired, weighed = [], 0.0, 0
     for subsystem in subsystems:
         key = subsystem['key']
-        done = sum(ledgers.get(name, [0, 0])[0] for name in workstreams[key])
-        total = sum(ledgers.get(name, [0, 0])[1] for name in workstreams[key])
+        done, total = ledgers.get(key, (0, 0))
         share = done / total if total else 0.0
         names = list(subsystem['crates'])
         if subsystem is catch_all:
@@ -123,7 +137,7 @@ def main():
     if not (source / 'rust/porting/ledger').is_dir():
         parser.exit(1, 'Neither checkout has rust/porting/ledger\n')
     report = compute(config, measure(args.master, args.subsystems), measure(rust_native, args.subsystems) if rust_native else None,
-                     read_ledgers(source, set(config['ledger']['excluded'])), rust_lines(source))
+                     read_ledgers(source, set(config['ledger']['excluded']), config['subsystem']), rust_lines(source))
     args.output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     print(f"Rewrite progress: {report['headline_pct']}%")
 

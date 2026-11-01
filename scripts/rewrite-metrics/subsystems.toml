@@ -16,7 +16,8 @@
 
 # progress.py adds the headline. baseline_live is this subsystem's live PHP at the
 # baseline commit. workstreams and crates map it to the ledgers and Rust crates on
-# rust-native; a new workstream or crate that isn't listed counts toward platform.
+# rust-native. Entries of a workstream that's shared or not listed go by their source
+# path, and a crate that isn't listed counts toward platform.
 #
 # Baseline = the last tree before any pipeline-ffi work (#301, 2026-10-23).
 # progress_pct = share of these live PHP lines that are gone.

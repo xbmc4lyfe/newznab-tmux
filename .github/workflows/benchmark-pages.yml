@@ -145,9 +145,17 @@ jobs:
           ref: rust-native
           path: rewrite-rust-native
           persist-credentials: false
+      - name: Set up the PHP that app/ is written for
+        continue-on-error: true
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          coverage: none
       - name: Measure rewrite progress
         continue-on-error: true
+        timeout-minutes: 5
         run: |
+          set -o pipefail
           progress=(python3 -B scripts/rewrite-metrics/progress.py --master=. --output=benchmark-site/rewrite-progress.json)
           if [[ -d rewrite-rust-native/.git ]]; then
             progress+=(--rust-native=rewrite-rust-native)

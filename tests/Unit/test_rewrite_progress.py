@@ -45,7 +45,15 @@ class RewriteProgressTest(unittest.TestCase):
         (ledger / 'dropped.toml').write_text(entry('Vendor@route', 'dropped'))
         (ledger / 'ws-formats.toml').write_text(
             entry('src/yenc.rs', 'ported') + entry('app/A.php', 'ported') + entry('app/B.php', 'dropped') + entry('app/C.php', 'todo'))
-        self.assertEqual({'ws-formats': [2, 3]}, progress.read_ledgers(self.root, {'dropped'}))
+        self.assertEqual({'ingest': [2, 3]}, progress.read_ledgers(self.root, {'dropped'}, CONFIG['subsystem']))
+
+    def test_shared_and_unlisted_workstreams_go_by_source_path(self):
+        rows = CONFIG['subsystem']
+        self.assertEqual('categorization', progress.owner('ws-naming', 'app/Console/Commands/TestCategorization.php', rows))
+        self.assertEqual('namefix_predb', progress.owner('ws-naming', 'app/Console/Commands/FixReleaseNames.php', rows))
+        self.assertEqual('namefix_predb', progress.owner('ws-naming', 'unknown', rows))
+        self.assertEqual('api', progress.owner('ws-renamed', 'App\\Http\\Controllers\\Api\\ApiController@api', rows))
+        self.assertEqual('platform', progress.owner('ws-renamed', 'unknown', rows))
 
     def test_rust_lines_count_src_only(self):
         src = self.root / 'rust/crates/api/src'
@@ -56,7 +64,7 @@ class RewriteProgressTest(unittest.TestCase):
         self.assertEqual({'api': 2}, progress.rust_lines(self.root))
 
     def test_headline_weighs_by_baseline_lines(self):
-        report = progress.compute(CONFIG, metrics('aaa', 10), metrics('bbb', 0), {'ws-api': [1, 2], 'ws-ops': [0, 5]}, {'api': 7, 'new': 3})
+        report = progress.compute(CONFIG, metrics('aaa', 10), metrics('bbb', 0), {'api': [1, 2], 'ops': [0, 5]}, {'api': 7, 'new': 3})
         api = 5276 * 0.5
         expected = round(100 * api / (188303 - 23179), 1)
         self.assertEqual(expected, report['headline_pct'])
@@ -68,14 +76,13 @@ class RewriteProgressTest(unittest.TestCase):
         self.assertEqual({'done': 1, 'total': 7}, report['entries'])
         self.assertEqual(10, rows['api']['master_live'])
 
-    def test_unlisted_workstream_counts_toward_catch_all(self):
-        report = progress.compute(CONFIG, metrics('aaa', 1), None, {'ws-new': [1, 1]}, {})
-        self.assertEqual(1, report['entries']['total'])
+    def test_report_without_rust_native(self):
+        report = progress.compute(CONFIG, metrics('aaa', 1), None, {'api': [1, 1]}, {})
         self.assertIsNone(report['rust_native'])
-        self.assertEqual(0.0, report['headline_pct'])
+        self.assertEqual(1, report['entries']['total'])
 
     def test_front_page_renders_and_escapes(self):
-        report = progress.compute(CONFIG, metrics('aaa', 10), metrics('bbb', 0), {'ws-api': [1, 2]}, {'api': 7})
+        report = progress.compute(CONFIG, metrics('aaa', 10), metrics('bbb', 0), {'api': [1, 2]}, {'api': 7})
         report['subsystems'][0]['title'] = '<script>'
         path = self.root / 'rewrite-progress.json'
         path.write_text(json.dumps(report))
