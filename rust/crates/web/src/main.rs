@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use axum::extract::Request;
-use axum::middleware::map_request;
+use axum::middleware::{from_fn, map_request};
 use axum::{Extension, Router, ServiceExt};
 use nntmux_core::{Config, var_or};
 use nntmux_runtime::{Ctx, Shutdown};
@@ -28,8 +28,12 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .merge(nntmux_api::router())
-        .merge(nntmux_site::router())
-        .merge(nntmux_admin::router())
+        .merge(
+            Router::new()
+                .merge(nntmux_site::router())
+                .merge(nntmux_admin::router())
+                .layer(from_fn(nntmux_api::block_pages)),
+        )
         .layer(TraceLayer::new_for_http())
         // The web stack's layers run before the state exists, so they read it from here.
         .layer(Extension(ctx.clone()))
