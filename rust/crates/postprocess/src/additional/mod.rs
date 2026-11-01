@@ -3,5 +3,7 @@
 
 pub mod candidates;
 pub mod diagnose;
+pub mod download;
+pub mod nzb_contents;
 pub mod planner;
 pub mod queue;
