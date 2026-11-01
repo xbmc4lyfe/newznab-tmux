@@ -60,7 +60,7 @@ concurrency:
 jobs:
   compare:
     name: ${{ matrix.kind }} (${{ matrix.runner }})
-    runs-on: [spot, '${{ matrix.runner }}']
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -80,7 +80,7 @@ jobs:
           REQUESTED_MODE: ${{ inputs.mode }}
           REQUESTED_SAMPLES: ${{ inputs.samples }}
         run: |
-          test "$RUNNER_ENVIRONMENT" = github-hosted || test "$RUNNER_ENVIRONMENT" = self-hosted
+          test "$RUNNER_ENVIRONMENT" = github-hosted
           test "$RUNNER_OS" = Linux
           test "$RUNNER_ARCH" = ARM64
           test "$REQUESTED_MODE" = screen
@@ -268,7 +268,7 @@ jobs:
   filename-identity:
     name: filename-identity (${{ matrix.runner }})
     if: github.event_name != 'workflow_dispatch' || inputs.comparison != 'date-cpp-screen'
-    runs-on: [spot, '${{ matrix.runner }}']
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
