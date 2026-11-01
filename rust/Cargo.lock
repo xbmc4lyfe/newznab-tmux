@@ -2265,6 +2265,7 @@ dependencies = [
  "md-5 0.10.6",
  "nntmux-core",
  "nntmux-runtime",
+ "nntmux-search",
  "nntmux-testkit",
  "nntmux-webkit",
  "qrcode",
