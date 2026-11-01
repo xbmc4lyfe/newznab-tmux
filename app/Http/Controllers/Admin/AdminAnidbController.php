@@ -44,21 +44,21 @@ class AdminAnidbController extends BasePageController
         switch ($action) {
             case 'submit':
                 $anidbService->updateTitle(
-                    $request->input('anidbid'),
-                    $request->input('title'),
-                    $request->input('type'),
-                    $request->input('startdate'),
-                    $request->input('enddate'),
-                    $request->input('related'),
-                    $request->input('similar'),
-                    $request->input('creators'),
-                    $request->input('description'),
-                    $request->input('rating'),
-                    $request->input('categories'),
-                    $request->input('characters'),
-                    $request->input('epnos'),
-                    $request->input('airdates'),
-                    $request->input('episodetitles')
+                    (int) $request->input('anidbid'),
+                    (string) $request->input('title'),
+                    (string) $request->input('type'),
+                    (string) $request->input('startdate'),
+                    (string) $request->input('enddate'),
+                    (string) $request->input('related'),
+                    (string) $request->input('similar'),
+                    (string) $request->input('creators'),
+                    (string) $request->input('description'),
+                    (string) $request->input('rating'),
+                    (string) $request->input('categories'),
+                    (string) $request->input('characters'),
+                    (string) $request->input('epnos'),
+                    (string) $request->input('airdates'),
+                    (string) $request->input('episodetitles')
                 );
 
                 return redirect()->route('admin.anidb-list')->with('success', 'AniDB entry updated successfully');
