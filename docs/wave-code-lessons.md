@@ -53,3 +53,4 @@ To read deleted code, run `git show <commit>^:<path>` on the commit that removed
 | 15 | Wave 65.4 plans: `UsenetDownloadService`, `AdminDashboardSnapshotService`, `AnidbService`, `ArchiveProcessingService`, `BlacklistService`, their Rust module and parity test | `0ff724f0b` | None new |
 | 16 | Wave 65.2 plans: `NzbContentParser`, `ReleaseFileManager`, `ReleaseFilesArchiveFallback`, `ReleaseProcessor`, `ReleaseSearchSyncCoordinator`, their Rust module and parity test | `2c608b686` | None new |
 | 17 | Wave 65.3 plans: `SevenZipListingParser`, `MediaByteBudget`, `PersistenceMetricsCollector`, `ProcessingMetrics`, `ReleaseProcessingContext`, their Rust module and parity test | `df5fa307b` | 24 |
+| 18 | Wave 65.5 plans: `ApiCapabilitiesService`, `ApiReleaseRowCache`, `ApiUsageService`, `ApiUserResolver`, `ApiV1Presenter`, their Rust module and parity test | `99a5ed42a` | None new |
