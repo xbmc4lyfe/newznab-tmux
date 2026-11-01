@@ -5,6 +5,7 @@
 pub mod accounts;
 pub mod activity;
 pub mod disposable;
+pub mod populate;
 pub mod resets;
 pub mod runtime_state;
 pub mod stats;
@@ -29,6 +30,25 @@ pub enum Command {
     DisableExpiredPromotions,
     /// Complete registration periods past their end (`nntmux:disable-expired-registration-periods`).
     DisableExpiredRegistrationPeriods,
+    /// Rebuild Manticore indexes from the database (`nntmux:populate`).
+    Populate {
+        /// Index to rebuild: releases, predb, movies, tvshows, music, books, games, console, steam
+        /// or anime. Repeatable.
+        #[arg(long = "index")]
+        indexes: Vec<String>,
+        /// Rebuild every index.
+        #[arg(long)]
+        all: bool,
+        /// Ids per database window.
+        #[arg(long, default_value_t = 5000)]
+        count: i64,
+        /// Windows fetched and inserted at once.
+        #[arg(long, default_value_t = 4)]
+        parallel: usize,
+        /// Optimize the indexes instead of rebuilding them.
+        #[arg(long)]
+        optimize: bool,
+    },
     /// Reset the database to a blank state, keeping settings (`nntmux:resetdb`). Local only.
     ResetDb {
         /// Confirm: this removes all releases, NZBs, images and article tables.
@@ -115,6 +135,45 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 println!("Marked registration period as done: {name}");
             }
             println!("Completed {} expired registration period(s).", names.len());
+        }
+        Command::Populate {
+            indexes,
+            all,
+            count,
+            parallel,
+            optimize,
+        } => {
+            let client = nntmux_search::SearchClient::from_ctx(&ctx)?;
+            if optimize {
+                client.optimize_indexes().await?;
+                println!("Optimization completed successfully!");
+                return Ok(());
+            }
+            let selected: Vec<String> = if all {
+                populate::INDEXES
+                    .iter()
+                    .map(|index| (*index).to_owned())
+                    .collect()
+            } else {
+                indexes
+            };
+            if selected.is_empty() {
+                bail!("Name at least one --index, or pass --all.");
+            }
+            let options = populate::Options { count, parallel };
+            let mut failed = false;
+            for index in &selected {
+                match populate::populate(&client, &ctx.db, index, options).await {
+                    Ok(documents) => println!("{index}: {documents} documents indexed."),
+                    Err(failure) => {
+                        eprintln!("{index}: {failure:#}");
+                        failed = true;
+                    }
+                }
+            }
+            if failed {
+                bail!("Some indexes didn't populate.");
+            }
         }
         Command::ResetDb { yes } => {
             if !resets::is_local() {

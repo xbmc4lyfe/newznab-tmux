@@ -93,13 +93,15 @@ note = "Self-update for a checkout-based install. Deploys now ship images, and `
 kind = "command"
 id = "nntmux:offset-populate"
 source = "app/Console/Commands/NntmuxOffsetPopulate.php"
-status = "todo"
+status = "dropped"
+note = "`nntmux-ctl ops populate --parallel` fetches and inserts id windows concurrently in one process, which is what these forked workers were for."
 
 [[entry]]
 kind = "command"
 id = "nntmux:offset-worker"
 source = "app/Console/Commands/NntmuxOffsetWorker.php"
-status = "todo"
+status = "dropped"
+note = "`nntmux-ctl ops populate --parallel` fetches and inserts id windows concurrently in one process, which is what these forked workers were for."
 
 [[entry]]
 kind = "command"
@@ -111,7 +113,7 @@ status = "ported"
 kind = "command"
 id = "nntmux:populate"
 source = "app/Console/Commands/NntmuxPopulateSearchIndexes.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"

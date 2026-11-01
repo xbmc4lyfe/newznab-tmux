@@ -2368,6 +2368,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "crc32fast",
+ "futures-util",
  "nntmux-categorize",
  "nntmux-core",
  "nntmux-runtime",
