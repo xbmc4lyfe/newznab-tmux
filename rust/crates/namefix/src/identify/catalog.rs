@@ -176,7 +176,7 @@ fn load_targets(
 /// Every other release with a usable name can donate it.
 fn load_donor_names(catalog: &Connection, donors: &mut DonorIndex) -> Result<()> {
     let mut statement = catalog.prepare(
-        "SELECT r.id, r.search_name, p.title FROM releases r
+        "SELECT r.id, r.search_name, p.title, r.size_bytes FROM releases r
          LEFT JOIN predb p ON p.id = r.predb_id
          WHERE r.predb_id IS NOT NULL OR r.is_renamed = 1
             OR r.legacy_category NOT IN (10, 20)",
@@ -191,7 +191,7 @@ fn load_donor_names(catalog: &Connection, donors: &mut DonorIndex) -> Result<()>
             predb_title
         };
         if name::usable(&name) {
-            donors.add_name(id, name);
+            donors.add_name(id, name, row.get(3)?);
         }
     }
     Ok(())
@@ -669,7 +669,7 @@ pub fn holdout(options: &Options) -> Result<Holdout> {
                 ratio = Some(nzb.payload_bytes as f64 / 1_048_576.0 / f64::from(row.size_mib));
             }
         }
-        let donor = match donors.find(&target.facts, target.id) {
+        let donor = match donors.find(&target.facts, target.id, target.size_bytes) {
             DonorMatch::Found { key, name, .. } => Some((
                 key.method(),
                 name::folded(name) == name::folded(&right_title),
